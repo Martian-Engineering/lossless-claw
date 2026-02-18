@@ -1,0 +1,62 @@
+{
+  "id": "lcm",
+  "uiHints": {
+    "contextThreshold": {
+      "label": "Context Threshold",
+      "help": "Fraction of context window that triggers compaction (0.0–1.0)"
+    },
+    "incrementalMaxDepth": {
+      "label": "Incremental Max Depth",
+      "help": "How deep incremental compaction goes (0 = leaf only)"
+    },
+    "freshTailCount": {
+      "label": "Fresh Tail Count",
+      "help": "Number of recent messages protected from compaction"
+    },
+    "dbPath": {
+      "label": "Database Path",
+      "help": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "contextThreshold": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "incrementalMaxDepth": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "freshTailCount": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "leafMinFanout": {
+        "type": "integer",
+        "minimum": 2
+      },
+      "condensedMinFanout": {
+        "type": "integer",
+        "minimum": 2
+      },
+      "condensedMinFanoutHard": {
+        "type": "integer",
+        "minimum": 2
+      },
+      "dbPath": {
+        "type": "string"
+      },
+      "largeFileThresholdTokens": {
+        "type": "integer",
+        "minimum": 1000
+      }
+    }
+  }
+}
