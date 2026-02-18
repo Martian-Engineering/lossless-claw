@@ -15,7 +15,9 @@
     "vitest": "^3.0.0"
   },
   "peerDependencies": {
-    "openclaw": "*"
+    "openclaw": "*",
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*"
   },
   "openclaw": {
     "extensions": [
