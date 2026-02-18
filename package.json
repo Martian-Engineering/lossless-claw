@@ -1,7 +1,7 @@
 {
   "name": "@martian-engineering/open-lcm",
   "version": "0.1.0",
-  "description": "Long Context Memory plugin for OpenClaw — DAG-based conversation summarization with incremental compaction",
+  "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with incremental compaction",
   "type": "module",
   "main": "index.ts",
   "private": true,

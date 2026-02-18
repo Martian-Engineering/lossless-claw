@@ -1,5 +1,5 @@
 /**
- * @martian-engineering/open-lcm — Long Context Memory plugin for OpenClaw
+ * @martian-engineering/open-lcm — Lossless Context Management plugin for OpenClaw
  *
  * DAG-based conversation summarization with incremental compaction,
  * full-text search, and sub-agent expansion.
@@ -9,7 +9,7 @@ import { resolveLcmConfig } from "./src/db/config.js";
 
 const lcmPlugin = {
   id: "lcm",
-  name: "Long Context Memory",
+  name: "Lossless Context Management",
   description:
     "DAG-based conversation summarization with incremental compaction, full-text search, and sub-agent expansion",
 
