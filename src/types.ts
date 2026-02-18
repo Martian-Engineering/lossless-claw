@@ -85,7 +85,7 @@ export interface LcmDependencies {
   isSubagentSessionKey: IsSubagentSessionKeyFn;
 
   /** Normalize an agent ID */
-  normalizeAgentId: (id: string) => string;
+  normalizeAgentId: (id?: string) => string;
 
   /** Build system prompt for subagent sessions */
   buildSubagentSystemPrompt: (params: {
@@ -102,6 +102,9 @@ export interface LcmDependencies {
 
   /** Resolve the OpenClaw agent directory */
   resolveAgentDir: () => string;
+
+  /** Resolve runtime session id from an agent session key */
+  resolveSessionIdFromSessionKey: (sessionKey: string) => Promise<string | undefined>;
 
   /** Agent lane constant for subagents */
   agentLaneSubagent: string;

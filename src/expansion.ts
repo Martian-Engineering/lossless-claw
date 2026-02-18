@@ -182,8 +182,8 @@ export class ExpansionOrchestrator {
       conversationId: input.conversationId,
     });
 
-    const summaryIds = grepResult.summaries
-      .toSorted((a, b) => {
+    const summaryIds = [...grepResult.summaries]
+      .sort((a, b) => {
         const recencyDelta = b.createdAt.getTime() - a.createdAt.getTime();
         if (recencyDelta !== 0) {
           return recencyDelta;

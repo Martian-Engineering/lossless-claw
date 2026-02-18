@@ -1,9 +1,7 @@
 import { Type } from "@sinclair/typebox";
-import type { OpenClawConfig } from "../../config/config.js";
-import type { LcmContextEngine } from "../../plugins/lcm/engine.js";
+import type { LcmContextEngine } from "../engine.js";
+import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
-import { ensureContextEnginesInitialized } from "../../context-engine/init.js";
-import { resolveContextEngine } from "../../context-engine/registry.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 
@@ -25,9 +23,11 @@ const LcmDescribeSchema = Type.Object({
   ),
 });
 
-export function createLcmDescribeTool(options?: {
-  config?: OpenClawConfig;
+export function createLcmDescribeTool(input: {
+  deps: LcmDependencies;
+  lcm: LcmContextEngine;
   sessionId?: string;
+  sessionKey?: string;
 }): AnyAgentTool {
   return {
     name: "lcm_describe",
@@ -39,22 +39,14 @@ export function createLcmDescribeTool(options?: {
       "token counts, and file exploration results.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
-      ensureContextEnginesInitialized();
-      const engine = await resolveContextEngine(options?.config);
-
-      if (engine.info.id !== "lcm") {
-        return jsonResult({
-          error: "lcm_describe requires the LCM context engine to be active.",
-        });
-      }
-
-      const lcm = engine as LcmContextEngine;
-      const retrieval = lcm.getRetrieval();
+      const retrieval = input.lcm.getRetrieval();
       const p = params as Record<string, unknown>;
       const id = (p.id as string).trim();
       const conversationScope = await resolveLcmConversationScope({
-        lcm,
-        sessionId: options?.sessionId,
+        lcm: input.lcm,
+        deps: input.deps,
+        sessionId: input.sessionId,
+        sessionKey: input.sessionKey,
         params: p,
       });
       if (!conversationScope.allConversations && conversationScope.conversationId == null) {

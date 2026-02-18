@@ -1,20 +1,10 @@
 import crypto from "node:crypto";
-import type { LcmContextEngine } from "../../plugins/lcm/engine.js";
-import { loadConfig, type OpenClawConfig } from "../../config/config.js";
-import {
-  loadSessionStore,
-  resolveAgentIdFromSessionKey,
-  resolveStorePath,
-} from "../../config/sessions.js";
-import { callGateway } from "../../gateway/call.js";
+import type { LcmContextEngine } from "../engine.js";
 import {
   createDelegatedExpansionGrant,
   revokeDelegatedExpansionGrantForSession,
-} from "../../plugins/lcm/expansion-auth.js";
-import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
-import { AGENT_LANE_SUBAGENT } from "../lanes.js";
-import { buildSubagentSystemPrompt } from "../subagent-announce.js";
-import { readLatestAssistantReply } from "./agent-step.js";
+} from "../expansion-auth.js";
+import type { LcmDependencies } from "../types.js";
 
 const MAX_GATEWAY_TIMEOUT_MS = 2_147_483_647;
 
@@ -214,7 +204,7 @@ function buildDelegatedExpansionTask(params: {
  * wasn't passed explicitly in the tool call.
  */
 export async function resolveRequesterConversationScopeId(params: {
-  config?: OpenClawConfig;
+  deps: Pick<LcmDependencies, "resolveSessionIdFromSessionKey">;
   requesterSessionKey: string;
   lcm: LcmContextEngine;
 }): Promise<number | undefined> {
@@ -224,13 +214,7 @@ export async function resolveRequesterConversationScopeId(params: {
   }
 
   try {
-    const cfg = params.config ?? loadConfig();
-    const agentId = resolveAgentIdFromSessionKey(requesterSessionKey);
-    const storePath = resolveStorePath(cfg.session?.store, { agentId });
-    const store = loadSessionStore(storePath);
-    const sessionEntry = store[requesterSessionKey];
-    const runtimeSessionId =
-      typeof sessionEntry?.sessionId === "string" ? sessionEntry.sessionId.trim() : "";
+    const runtimeSessionId = await params.deps.resolveSessionIdFromSessionKey(requesterSessionKey);
     if (!runtimeSessionId) {
       return undefined;
     }
@@ -248,6 +232,15 @@ export async function resolveRequesterConversationScopeId(params: {
  * Each pass creates its own grant/session and always performs cleanup.
  */
 async function runDelegatedExpansionPass(params: {
+  deps: Pick<
+    LcmDependencies,
+    | "callGateway"
+    | "parseAgentSessionKey"
+    | "normalizeAgentId"
+    | "buildSubagentSystemPrompt"
+    | "readLatestAssistantReply"
+    | "agentLaneSubagent"
+  >;
   requesterSessionKey: string;
   conversationId: number;
   summaryIds: string[];
@@ -257,8 +250,8 @@ async function runDelegatedExpansionPass(params: {
   query?: string;
   pass: number;
 }): Promise<DelegatedExpansionPassResult> {
-  const requesterAgentId = normalizeAgentId(
-    parseAgentSessionKey(params.requesterSessionKey)?.agentId,
+  const requesterAgentId = params.deps.normalizeAgentId(
+    params.deps.parseAgentSessionKey(params.requesterSessionKey)?.agentId,
   );
   const childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
   let runId = "";
@@ -280,33 +273,32 @@ async function runDelegatedExpansionPass(params: {
       pass: params.pass,
       query: params.query,
     });
-    const response = await callGateway<{ runId?: string }>({
+    const response = (await params.deps.callGateway({
       method: "agent",
       params: {
         message,
         sessionKey: childSessionKey,
         deliver: false,
-        lane: AGENT_LANE_SUBAGENT,
-        extraSystemPrompt: buildSubagentSystemPrompt({
-          requesterSessionKey: params.requesterSessionKey,
-          childSessionKey,
-          label: "LCM delegated expansion",
-          task: "Run lcm_expand and return JSON findings",
+        lane: params.deps.agentLaneSubagent,
+        extraSystemPrompt: params.deps.buildSubagentSystemPrompt({
+          depth: 1,
+          maxDepth: 8,
+          taskSummary: "Run lcm_expand and return JSON findings",
         }),
       },
       timeoutMs: 10_000,
-    });
+    })) as { runId?: string };
     runId =
       typeof response?.runId === "string" && response.runId ? response.runId : crypto.randomUUID();
 
-    const wait = await callGateway<{ status?: string; error?: string }>({
+    const wait = (await params.deps.callGateway({
       method: "agent.wait",
       params: {
         runId,
         timeoutMs: MAX_GATEWAY_TIMEOUT_MS,
       },
       timeoutMs: MAX_GATEWAY_TIMEOUT_MS,
-    });
+    })) as { status?: string; error?: string };
     const status = typeof wait?.status === "string" ? wait.status : "error";
     if (status === "timeout") {
       return {
@@ -337,7 +329,14 @@ async function runDelegatedExpansionPass(params: {
       };
     }
 
-    const reply = await readLatestAssistantReply({ sessionKey: childSessionKey, limit: 80 });
+    const replyPayload = (await params.deps.callGateway({
+      method: "sessions.get",
+      params: { key: childSessionKey, limit: 80 },
+      timeoutMs: 10_000,
+    })) as { messages?: unknown[] };
+    const reply = params.deps.readLatestAssistantReply(
+      Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
+    );
     const parsed = parseDelegatedExpansionReply(reply);
     return {
       pass: params.pass,
@@ -366,7 +365,7 @@ async function runDelegatedExpansionPass(params: {
     };
   } finally {
     try {
-      await callGateway({
+      await params.deps.callGateway({
         method: "sessions.delete",
         params: { key: childSessionKey, deleteTranscript: true },
         timeoutMs: 10_000,
@@ -379,6 +378,15 @@ async function runDelegatedExpansionPass(params: {
 }
 
 export async function runDelegatedExpansionLoop(params: {
+  deps: Pick<
+    LcmDependencies,
+    | "callGateway"
+    | "parseAgentSessionKey"
+    | "normalizeAgentId"
+    | "buildSubagentSystemPrompt"
+    | "readLatestAssistantReply"
+    | "agentLaneSubagent"
+  >;
   requesterSessionKey: string;
   conversationId: number;
   summaryIds: string[];
@@ -398,6 +406,7 @@ export async function runDelegatedExpansionLoop(params: {
       visited.add(summaryId);
     }
     const result = await runDelegatedExpansionPass({
+      deps: params.deps,
       requesterSessionKey: params.requesterSessionKey,
       conversationId: params.conversationId,
       summaryIds: queue,

@@ -1,19 +1,11 @@
 import { Type } from "@sinclair/typebox";
 import crypto from "node:crypto";
-import type { OpenClawConfig } from "../../config/config.js";
-import type { LcmContextEngine } from "../../plugins/lcm/engine.js";
-import { ensureContextEnginesInitialized } from "../../context-engine/init.js";
-import { resolveContextEngine } from "../../context-engine/registry.js";
-import { callGateway } from "../../gateway/call.js";
-import { resolveLcmConfig } from "../../plugins/lcm/db/config.js";
+import type { LcmContextEngine } from "../engine.js";
 import {
   createDelegatedExpansionGrant,
   revokeDelegatedExpansionGrantForSession,
-} from "../../plugins/lcm/expansion-auth.js";
-import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
-import { AGENT_LANE_SUBAGENT } from "../lanes.js";
-import { buildSubagentSystemPrompt } from "../subagent-announce.js";
-import { readLatestAssistantReply } from "./agent-step.js";
+} from "../expansion-auth.js";
+import type { LcmDependencies } from "../types.js";
 import { jsonResult, type AnyAgentTool } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import {
@@ -260,12 +252,15 @@ async function resolveSummaryCandidates(params: {
   return Array.from(candidates.values());
 }
 
-export function createLcmExpandQueryTool(options?: {
-  config?: OpenClawConfig;
+export function createLcmExpandQueryTool(input: {
+  deps: LcmDependencies;
+  lcm: LcmContextEngine;
   /** Session id used for LCM conversation scoping. */
   sessionId?: string;
   /** Requester agent session key used for delegated child session/auth scoping. */
   requesterSessionKey?: string;
+  /** Session key for scope fallback when sessionId is unavailable. */
+  sessionKey?: string;
 }): AnyAgentTool {
   return {
     name: "lcm_expand_query",
@@ -276,16 +271,6 @@ export function createLcmExpandQueryTool(options?: {
       "and return a compact prompt-focused answer with cited summary IDs.",
     parameters: LcmExpandQuerySchema,
     async execute(_toolCallId, params) {
-      ensureContextEnginesInitialized();
-      const engine = await resolveContextEngine(options?.config);
-
-      if (engine.info.id !== "lcm") {
-        return jsonResult({
-          error: "lcm_expand_query requires the LCM context engine to be active.",
-        });
-      }
-
-      const lcm = engine as LcmContextEngine;
       const p = params as Record<string, unknown>;
       const explicitSummaryIds = normalizeSummaryIds(p.summaryIds as string[] | undefined);
       const query = typeof p.query === "string" ? p.query.trim() : "";
@@ -310,13 +295,15 @@ export function createLcmExpandQueryTool(options?: {
       }
 
       const requesterSessionKey =
-        (typeof options?.requesterSessionKey === "string"
-          ? options.requesterSessionKey
-          : options?.sessionId
+        (typeof input.requesterSessionKey === "string"
+          ? input.requesterSessionKey
+          : input.sessionId
         )?.trim() ?? "";
       const conversationScope = await resolveLcmConversationScope({
-        lcm,
-        sessionId: options?.sessionId,
+        lcm: input.lcm,
+        deps: input.deps,
+        sessionId: input.sessionId,
+        sessionKey: input.sessionKey,
         params: p,
       });
       let scopedConversationId = conversationScope.conversationId;
@@ -326,9 +313,9 @@ export function createLcmExpandQueryTool(options?: {
         requesterSessionKey
       ) {
         scopedConversationId = await resolveRequesterConversationScopeId({
-          config: options?.config,
+          deps: input.deps,
           requesterSessionKey,
-          lcm,
+          lcm: input.lcm,
         });
       }
 
@@ -344,7 +331,7 @@ export function createLcmExpandQueryTool(options?: {
 
       try {
         const candidates = await resolveSummaryCandidates({
-          lcm,
+          lcm: input.lcm,
           explicitSummaryIds,
           query: query || undefined,
           conversationId: scopedConversationId,
@@ -383,8 +370,8 @@ export function createLcmExpandQueryTool(options?: {
           });
         }
 
-        const requesterAgentId = normalizeAgentId(
-          parseAgentSessionKey(requesterSessionKey)?.agentId,
+        const requesterAgentId = input.deps.normalizeAgentId(
+          input.deps.parseAgentSessionKey(requesterSessionKey)?.agentId,
         );
         childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
 
@@ -392,7 +379,7 @@ export function createLcmExpandQueryTool(options?: {
           delegatedSessionKey: childSessionKey,
           issuerSessionId: requesterSessionKey || "main",
           allowedConversationIds: [sourceConversationId],
-          tokenCap: resolveLcmConfig().maxExpandTokens,
+          tokenCap: input.deps.config.maxExpandTokens,
           ttlMs: DELEGATED_WAIT_TIMEOUT_MS + 30_000,
         });
         grantCreated = true;
@@ -405,23 +392,22 @@ export function createLcmExpandQueryTool(options?: {
         });
 
         const childIdem = crypto.randomUUID();
-        const response = await callGateway<{ runId?: string }>({
+        const response = (await input.deps.callGateway({
           method: "agent",
           params: {
             message: task,
             sessionKey: childSessionKey,
             deliver: false,
-            lane: AGENT_LANE_SUBAGENT,
+            lane: input.deps.agentLaneSubagent,
             idempotencyKey: childIdem,
-            extraSystemPrompt: buildSubagentSystemPrompt({
-              requesterSessionKey,
-              childSessionKey,
-              label: "LCM expand query",
-              task: "Run lcm_expand and return prompt-focused JSON answer",
+            extraSystemPrompt: input.deps.buildSubagentSystemPrompt({
+              depth: 1,
+              maxDepth: 8,
+              taskSummary: "Run lcm_expand and return prompt-focused JSON answer",
             }),
           },
           timeoutMs: GATEWAY_TIMEOUT_MS,
-        });
+        })) as { runId?: string };
 
         const runId = typeof response?.runId === "string" ? response.runId.trim() : "";
         if (!runId) {
@@ -430,14 +416,14 @@ export function createLcmExpandQueryTool(options?: {
           });
         }
 
-        const wait = await callGateway<{ status?: string; error?: string }>({
+        const wait = (await input.deps.callGateway({
           method: "agent.wait",
           params: {
             runId,
             timeoutMs: DELEGATED_WAIT_TIMEOUT_MS,
           },
           timeoutMs: DELEGATED_WAIT_TIMEOUT_MS,
-        });
+        })) as { status?: string; error?: string };
         const status = typeof wait?.status === "string" ? wait.status : "error";
         if (status === "timeout") {
           return jsonResult({
@@ -453,10 +439,14 @@ export function createLcmExpandQueryTool(options?: {
           });
         }
 
-        const reply = await readLatestAssistantReply({
-          sessionKey: childSessionKey,
-          limit: 80,
-        });
+        const replyPayload = (await input.deps.callGateway({
+          method: "sessions.get",
+          params: { key: childSessionKey, limit: 80 },
+          timeoutMs: GATEWAY_TIMEOUT_MS,
+        })) as { messages?: unknown[] };
+        const reply = input.deps.readLatestAssistantReply(
+          Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
+        );
         const parsed = parseDelegatedExpandQueryReply(reply, summaryIds.length);
 
         return jsonResult({
@@ -474,7 +464,7 @@ export function createLcmExpandQueryTool(options?: {
       } finally {
         if (childSessionKey) {
           try {
-            await callGateway({
+            await input.deps.callGateway({
               method: "sessions.delete",
               params: { key: childSessionKey, deleteTranscript: true },
               timeoutMs: GATEWAY_TIMEOUT_MS,
