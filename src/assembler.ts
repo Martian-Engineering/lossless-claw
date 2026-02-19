@@ -1,4 +1,5 @@
 import type { ContextEngine } from "openclaw/plugin-sdk";
+import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
   ConversationStore,
   MessagePartRecord,
@@ -237,8 +238,6 @@ export class ContextAssembler {
   constructor(
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
-    private sanitizeToolUseResultPairing: (messages: unknown[]) => unknown[] = (messages) =>
-      messages,
   ) {}
 
   /**
@@ -349,7 +348,7 @@ export class ContextAssembler {
     }
 
     return {
-      messages: this.sanitizeToolUseResultPairing(rawMessages) as AgentMessage[],
+      messages: sanitizeToolUseResultPairing(rawMessages) as AgentMessage[],
       estimatedTokens,
       stats: {
         rawMessageCount,

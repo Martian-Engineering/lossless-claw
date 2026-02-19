@@ -529,7 +529,6 @@ export class LcmContextEngine implements ContextEngine {
     this.assembler = new ContextAssembler(
       this.conversationStore,
       this.summaryStore,
-      (messages) => this.deps.sanitizeToolUseResultPairing(messages),
     );
 
     const compactionConfig: CompactionConfig = {

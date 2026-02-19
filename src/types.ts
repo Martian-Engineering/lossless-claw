@@ -98,7 +98,7 @@ export interface LcmDependencies {
   readLatestAssistantReply: (messages: unknown[]) => string | undefined;
 
   /** Sanitize tool use/result pairing in message arrays */
-  sanitizeToolUseResultPairing: (messages: unknown[]) => unknown[];
+  // sanitizeToolUseResultPairing removed — now imported directly in assembler from transcript-repair.ts
 
   /** Resolve the OpenClaw agent directory */
   resolveAgentDir: () => string;

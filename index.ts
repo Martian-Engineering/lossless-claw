@@ -220,7 +220,6 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     normalizeAgentId,
     buildSubagentSystemPrompt,
     readLatestAssistantReply,
-    sanitizeToolUseResultPairing: (messages) => messages,
     resolveAgentDir: () => api.resolvePath("."),
     resolveSessionIdFromSessionKey: async (sessionKey) => {
       const key = sessionKey.trim();
