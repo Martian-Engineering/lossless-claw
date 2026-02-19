@@ -672,7 +672,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           throw new Error(`Unsupported gateway method in LCM plugin: ${params.method}`);
       }
     },
-    resolveModel: (modelRef) => {
+    resolveModel: (modelRef, providerHint) => {
       const raw = (modelRef ?? process.env.LCM_SUMMARY_MODEL ?? "").trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");
@@ -686,7 +686,12 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         }
       }
 
-      const provider = (process.env.LCM_SUMMARY_PROVIDER ?? process.env.OPENCLAW_PROVIDER ?? "openai").trim();
+      const provider = (
+        providerHint?.trim() ||
+        process.env.LCM_SUMMARY_PROVIDER ||
+        process.env.OPENCLAW_PROVIDER ||
+        "openai"
+      ).trim();
       return { provider, model: raw };
     },
     getApiKey: (provider) => resolveApiKey(provider),

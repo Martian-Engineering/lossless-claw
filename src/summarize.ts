@@ -239,15 +239,14 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
   let resolved: { provider: string; model: string };
   try {
-    resolved = params.deps.resolveModel(modelRef);
+    resolved = params.deps.resolveModel(modelRef, providerHint || undefined);
     console.error(`[lcm] createLcmSummarize: resolved model=${resolved.model}, provider=${resolved.provider}`);
   } catch (err) {
     console.error(`[lcm] createLcmSummarize: resolveModel FAILED:`, err instanceof Error ? err.message : err);
     return undefined;
   }
 
-  const provider = providerHint || resolved.provider;
-  const model = resolved.model;
+  const { provider, model } = resolved;
   if (!provider || !model) {
     console.error(`[lcm] createLcmSummarize: empty provider="${provider}" or model="${model}"`);
     return undefined;
