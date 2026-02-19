@@ -26,8 +26,8 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 ```bash
 # Clone the repo
-git clone https://github.com/Martian-Engineering/open-lcm.git
-cd open-lcm
+git clone https://github.com/Martian-Engineering/openclaw-lcm.git
+cd openclaw-lcm
 
 # Install dependencies
 npm install
@@ -41,7 +41,7 @@ Add the plugin to your OpenClaw config (`~/.openclaw/openclaw.json`):
 {
   "plugins": {
     "paths": [
-      "/path/to/open-lcm"
+      "/path/to/openclaw-lcm"
     ],
     "slots": {
       "contextEngine": "openclaw-lcm"
