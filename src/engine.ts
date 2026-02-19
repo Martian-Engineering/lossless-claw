@@ -922,7 +922,7 @@ export class LcmContextEngine implements ContextEngine {
   async bootstrap(params: { sessionId: string; sessionFile: string }): Promise<BootstrapResult> {
     this.ensureMigrated();
 
-    return this.withSessionQueue(params.sessionId, async () =>
+    const result = await this.withSessionQueue(params.sessionId, async () =>
       this.conversationStore.withTransaction(async () => {
         const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId);
         const conversationId = conversation.conversationId;
@@ -959,6 +959,16 @@ export class LcmContextEngine implements ContextEngine {
             inserted.map((record) => record.messageId),
           );
           await this.conversationStore.markConversationBootstrapped(conversationId);
+
+          // Prune HEARTBEAT_OK turns from the freshly imported data
+          if (this.config.pruneHeartbeatOk) {
+            const pruned = await this.pruneHeartbeatOkTurns(conversationId);
+            if (pruned > 0) {
+              console.error(
+                `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
+              );
+            }
+          }
 
           return {
             bootstrapped: true,
@@ -1003,6 +1013,31 @@ export class LcmContextEngine implements ContextEngine {
         };
       }),
     );
+
+    // Post-bootstrap pruning: clean HEARTBEAT_OK turns that were already
+    // in the DB from prior bootstrap cycles (before pruning was enabled).
+    if (this.config.pruneHeartbeatOk && result.bootstrapped === false) {
+      try {
+        const conversation = await this.conversationStore.getConversationBySessionId(
+          params.sessionId,
+        );
+        if (conversation) {
+          const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
+          if (pruned > 0) {
+            console.error(
+              `[lcm] bootstrap: retroactively pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversation.conversationId}`,
+            );
+          }
+        }
+      } catch (err) {
+        console.error(
+          `[lcm] bootstrap: heartbeat pruning failed:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+
+    return result;
   }
 
   private async ingestSingle(params: {
@@ -1569,6 +1604,107 @@ export class LcmContextEngine implements ContextEngine {
   getSummaryStore(): SummaryStore {
     return this.summaryStore;
   }
+
+  // ── Heartbeat pruning ──────────────────────────────────────────────────
+
+  /**
+   * Detect HEARTBEAT_OK turn cycles in a conversation and delete them.
+   *
+   * A HEARTBEAT_OK turn is: a user message (the heartbeat prompt), followed by
+   * any tool call/result messages, ending with an assistant message that is a
+   * heartbeat ack. The entire sequence has no durable information value for LCM.
+   *
+   * Detection: assistant content (trimmed, lowercased) starts with "heartbeat_ok"
+   * and any text after is not alphanumeric (matches OpenClaw core's ack detection).
+   * This catches both exact "HEARTBEAT_OK" and chatty variants like
+   * "HEARTBEAT_OK — weekend, no market".
+   *
+   * Returns the number of messages deleted.
+   */
+  private async pruneHeartbeatOkTurns(conversationId: number): Promise<number> {
+    const allMessages = await this.conversationStore.getMessages(conversationId);
+    if (allMessages.length === 0) {
+      return 0;
+    }
+
+    const toDelete: number[] = [];
+
+    // Walk through messages finding HEARTBEAT_OK assistant replies, then
+    // collect the entire turn (back to the preceding user message).
+    for (let i = 0; i < allMessages.length; i++) {
+      const msg = allMessages[i];
+      if (msg.role !== "assistant") {
+        continue;
+      }
+      if (!isHeartbeatOkContent(msg.content)) {
+        continue;
+      }
+
+      // Found a HEARTBEAT_OK reply. Walk backward to find the turn start
+      // (the preceding user message).
+      const turnMessageIds: number[] = [msg.messageId];
+      for (let j = i - 1; j >= 0; j--) {
+        const prev = allMessages[j];
+        turnMessageIds.push(prev.messageId);
+        if (prev.role === "user") {
+          break; // Found turn start
+        }
+      }
+
+      toDelete.push(...turnMessageIds);
+    }
+
+    if (toDelete.length === 0) {
+      return 0;
+    }
+
+    // Deduplicate (a message could theoretically appear in multiple turns)
+    const uniqueIds = [...new Set(toDelete)];
+    return this.conversationStore.deleteMessages(uniqueIds);
+  }
+}
+
+// ── Heartbeat detection ─────────────────────────────────────────────────────
+
+const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
+
+/**
+ * Detect whether an assistant message is a heartbeat ack.
+ *
+ * Matches the same pattern as OpenClaw core's heartbeat-events-filter:
+ * content starts with "heartbeat_ok" (case-insensitive) and any character
+ * immediately after is not alphanumeric or underscore.
+ *
+ * This catches:
+ *   - "HEARTBEAT_OK"
+ *   - "  HEARTBEAT_OK  "
+ *   - "HEARTBEAT_OK — weekend, no market."
+ *   - "Saturday 10:48 AM PT — weekend, no market. HEARTBEAT_OK"
+ *
+ * But not:
+ *   - "HEARTBEAT_OK_EXTENDED" (alphanumeric continuation)
+ */
+function isHeartbeatOkContent(content: string): boolean {
+  const trimmed = content.trim().toLowerCase();
+  if (!trimmed) {
+    return false;
+  }
+
+  // Check if it starts with the token
+  if (trimmed.startsWith(HEARTBEAT_OK_TOKEN)) {
+    const suffix = trimmed.slice(HEARTBEAT_OK_TOKEN.length);
+    if (suffix.length === 0) {
+      return true;
+    }
+    return !/[a-z0-9_]/.test(suffix[0]);
+  }
+
+  // Also check if it ends with the token (chatty prefix + HEARTBEAT_OK)
+  if (trimmed.endsWith(HEARTBEAT_OK_TOKEN)) {
+    return true;
+  }
+
+  return false;
 }
 
 // ── Emergency fallback summarization ────────────────────────────────────────

@@ -507,6 +507,46 @@ export class ConversationStore {
     return row?.max_seq ?? 0;
   }
 
+  // ── Deletion ──────────────────────────────────────────────────────────────
+
+  /**
+   * Delete messages and their associated records (context_items, FTS, message_parts).
+   *
+   * Skips messages referenced in summary_messages (already compacted) to avoid
+   * breaking the summary DAG. Returns the count of actually deleted messages.
+   */
+  async deleteMessages(messageIds: MessageId[]): Promise<number> {
+    if (messageIds.length === 0) {
+      return 0;
+    }
+
+    let deleted = 0;
+    for (const messageId of messageIds) {
+      // Skip if referenced by a summary (ON DELETE RESTRICT would fail anyway)
+      const refRow = this.db
+        .prepare(`SELECT 1 AS found FROM summary_messages WHERE message_id = ? LIMIT 1`)
+        .get(messageId) as unknown as { found: number } | undefined;
+      if (refRow) {
+        continue;
+      }
+
+      // Remove from context_items first (RESTRICT constraint)
+      this.db
+        .prepare(`DELETE FROM context_items WHERE item_type = 'message' AND message_id = ?`)
+        .run(messageId);
+
+      // Remove from FTS index
+      this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(messageId);
+
+      // Delete the message (message_parts cascade via ON DELETE CASCADE)
+      this.db.prepare(`DELETE FROM messages WHERE message_id = ?`).run(messageId);
+
+      deleted += 1;
+    }
+
+    return deleted;
+  }
+
   // ── Search ────────────────────────────────────────────────────────────────
 
   async searchMessages(input: MessageSearchInput): Promise<MessageSearchResult[]> {

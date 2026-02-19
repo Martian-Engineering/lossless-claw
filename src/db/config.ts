@@ -18,6 +18,8 @@ export type LcmConfig = {
   autocompactDisabled: boolean;
   /** IANA timezone for timestamps in summaries (from TZ env or system default) */
   timezone: string;
+  /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
+  pruneHeartbeatOk: boolean;
 };
 
 export function resolveLcmConfig(env: NodeJS.ProcessEnv = process.env): LcmConfig {
@@ -37,5 +39,6 @@ export function resolveLcmConfig(env: NodeJS.ProcessEnv = process.env): LcmConfi
     largeFileTokenThreshold: parseInt(env.LCM_LARGE_FILE_TOKEN_THRESHOLD ?? "25000", 10),
     autocompactDisabled: env.LCM_AUTOCOMPACT_DISABLED === "true",
     timezone: env.TZ ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+    pruneHeartbeatOk: env.LCM_PRUNE_HEARTBEAT_OK === "true",
   };
 }
