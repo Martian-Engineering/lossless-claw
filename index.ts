@@ -171,21 +171,36 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
     },
     callGateway: async (params) => {
-      const runtimeGateway = (api.runtime as unknown as {
-        gateway?: {
-          call?: (input: {
-            method: string;
-            params?: Record<string, unknown>;
-            timeoutMs?: number;
-          }) => Promise<unknown>;
-        };
-      }).gateway;
-
-      if (runtimeGateway?.call) {
-        return runtimeGateway.call(params);
+      const sub = api.runtime.subagent;
+      switch (params.method) {
+        case "agent":
+          return sub.run({
+            sessionKey: String(params.params?.sessionKey ?? ""),
+            message: String(params.params?.message ?? ""),
+            extraSystemPrompt: params.params?.extraSystemPrompt as string | undefined,
+            lane: params.params?.lane as string | undefined,
+            deliver: (params.params?.deliver as boolean) ?? false,
+            idempotencyKey: params.params?.idempotencyKey as string | undefined,
+          });
+        case "agent.wait":
+          return sub.waitForRun({
+            runId: String(params.params?.runId ?? ""),
+            timeoutMs: (params.params?.timeoutMs as number) ?? params.timeoutMs,
+          });
+        case "sessions.get":
+          return sub.getSession({
+            sessionKey: String(params.params?.key ?? ""),
+            limit: params.params?.limit as number | undefined,
+          });
+        case "sessions.delete":
+          await sub.deleteSession({
+            sessionKey: String(params.params?.key ?? ""),
+            deleteTranscript: (params.params?.deleteTranscript as boolean) ?? true,
+          });
+          return {};
+        default:
+          throw new Error(`Unsupported gateway method in LCM plugin: ${params.method}`);
       }
-
-      throw new Error("Gateway calls are unavailable in this runtime.");
     },
     resolveModel: (modelRef) => {
       const raw = (modelRef ?? process.env.LCM_SUMMARY_MODEL ?? "").trim();
