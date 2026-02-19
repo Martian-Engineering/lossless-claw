@@ -6,11 +6,9 @@
   "main": "index.ts",
   "private": true,
   "dependencies": {
-    "@sinclair/typebox": "0.34.48",
-    "better-sqlite3": "^11.8.1"
+    "@sinclair/typebox": "0.34.48"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
