@@ -47,6 +47,8 @@ export interface CompactionConfig {
   condensedTargetTokens: number;
   /** Maximum compaction rounds (default 10) */
   maxRounds: number;
+  /** IANA timezone for timestamps in summaries (default: UTC) */
+  timezone?: string;
 }
 
 type CompactionLevel = "normal" | "aggressive" | "fallback";
@@ -54,6 +56,7 @@ type CompactionPass = "leaf" | "condensed";
 type CompactionSummarizeOptions = {
   previousSummary?: string;
   isCondensed?: boolean;
+  depth?: number;
 };
 type CompactionSummarizeFn = (
   text: string,
@@ -80,6 +83,49 @@ type CondensedPhaseCandidate = {
 /** Estimate token count from character length (~4 chars per token). */
 function estimateTokens(content: string): number {
   return Math.ceil(content.length / 4);
+}
+
+/** Format a timestamp as `YYYY-MM-DD HH:mm TZ` for prompt source text. */
+function formatTimestamp(value: Date, timezone: string = "UTC"): string {
+  try {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    const parts = Object.fromEntries(
+      fmt.formatToParts(value).map((p) => [p.type, p.value]),
+    );
+    const tzAbbr = timezone === "UTC" ? "UTC" : shortTzAbbr(value, timezone);
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} ${tzAbbr}`;
+  } catch {
+    // Fallback to UTC on invalid timezone
+    const year = value.getUTCFullYear();
+    const month = String(value.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(value.getUTCDate()).padStart(2, "0");
+    const hours = String(value.getUTCHours()).padStart(2, "0");
+    const minutes = String(value.getUTCMinutes()).padStart(2, "0");
+    return `${year}-${month}-${day} ${hours}:${minutes} UTC`;
+  }
+}
+
+/** Extract short timezone abbreviation (e.g. "PST", "PDT", "EST"). */
+function shortTzAbbr(value: Date, timezone: string): string {
+  try {
+    const abbr = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      timeZoneName: "short",
+    })
+      .formatToParts(value)
+      .find((p) => p.type === "timeZoneName")?.value;
+    return abbr ?? timezone;
+  } catch {
+    return timezone;
+  }
 }
 
 /** Generate a deterministic summary ID from content + timestamp. */
@@ -949,7 +995,7 @@ export class CompactionEngine {
     previousSummaryContent?: string,
   ): Promise<{ summaryId: string; level: CompactionLevel; content: string }> {
     // Fetch full message content for each context item
-    const messageContents: { messageId: number; content: string }[] = [];
+    const messageContents: { messageId: number; content: string; createdAt: Date }[] = [];
     for (const item of messageItems) {
       if (item.messageId == null) {
         continue;
@@ -959,11 +1005,14 @@ export class CompactionEngine {
         messageContents.push({
           messageId: msg.messageId,
           content: msg.content,
+          createdAt: msg.createdAt,
         });
       }
     }
 
-    const concatenated = messageContents.map((m) => m.content).join("\n\n");
+    const concatenated = messageContents
+      .map((message) => `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${message.content}`)
+      .join("\n\n");
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
     );
@@ -988,6 +1037,15 @@ export class CompactionEngine {
       content: summary.content,
       tokenCount,
       fileIds,
+      earliestAt:
+        messageContents.length > 0
+          ? new Date(Math.min(...messageContents.map((message) => message.createdAt.getTime())))
+          : undefined,
+      latestAt:
+        messageContents.length > 0
+          ? new Date(Math.max(...messageContents.map((message) => message.createdAt.getTime())))
+          : undefined,
+      descendantCount: 0,
     });
 
     // Link to source messages
@@ -1032,7 +1090,15 @@ export class CompactionEngine {
       }
     }
 
-    const concatenated = summaryRecords.map((s) => s.content).join("\n\n");
+    const concatenated = summaryRecords
+      .map((summary) => {
+        const earliestAt = summary.earliestAt ?? summary.createdAt;
+        const latestAt = summary.latestAt ?? summary.createdAt;
+        const tz = this.config.timezone;
+        const header = `[${formatTimestamp(earliestAt, tz)} - ${formatTimestamp(latestAt, tz)}]`;
+        return `${header}\n${summary.content}`;
+      })
+      .join("\n\n");
     const fileIds = dedupeOrderedIds(
       summaryRecords.flatMap((summary) => [
         ...summary.fileIds,
@@ -1049,6 +1115,7 @@ export class CompactionEngine {
       options: {
         previousSummary: previousSummaryContent,
         isCondensed: true,
+        depth: targetDepth + 1,
       },
     });
 
@@ -1064,6 +1131,31 @@ export class CompactionEngine {
       content: condensed.content,
       tokenCount,
       fileIds,
+      earliestAt:
+        summaryRecords.length > 0
+          ? new Date(
+              Math.min(
+                ...summaryRecords.map((summary) =>
+                  (summary.earliestAt ?? summary.createdAt).getTime(),
+                ),
+              ),
+            )
+          : undefined,
+      latestAt:
+        summaryRecords.length > 0
+          ? new Date(
+              Math.max(
+                ...summaryRecords.map((summary) => (summary.latestAt ?? summary.createdAt).getTime()),
+              ),
+            )
+          : undefined,
+      descendantCount: summaryRecords.reduce((count, summary) => {
+        const childDescendants =
+          typeof summary.descendantCount === "number" && Number.isFinite(summary.descendantCount)
+            ? Math.max(0, Math.floor(summary.descendantCount))
+            : 0;
+        return count + childDescendants + 1;
+      }, 0),
     });
 
     // Link to parent summaries

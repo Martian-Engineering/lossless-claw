@@ -191,31 +191,44 @@ function pickToolCallId(parts: MessagePartRecord[]): string | undefined {
 }
 
 /**
- * Format a summary record into the content string the model sees.
- *
- * Format:
- *   [Summary ID: sum_xxx]
- *   [Parent Summaries: sum_a, sum_b]   ← only if parents exist
- *
- *   <content>
+ * Format a summary record into the XML payload string the model sees.
  */
 async function formatSummaryContent(
   summary: SummaryRecord,
   summaryStore: SummaryStore,
 ): Promise<string> {
-  const lines: string[] = [];
-  lines.push(`[Summary ID: ${summary.summaryId}]`);
+  const attributes = [
+    `id="${summary.summaryId}"`,
+    `kind="${summary.kind}"`,
+    `depth="${summary.depth}"`,
+    `descendant_count="${summary.descendantCount}"`,
+  ];
+  if (summary.earliestAt) {
+    attributes.push(`earliest_at="${summary.earliestAt.toISOString()}"`);
+  }
+  if (summary.latestAt) {
+    attributes.push(`latest_at="${summary.latestAt.toISOString()}"`);
+  }
 
-  // For condensed summaries, include parent references
+  const lines: string[] = [];
+  lines.push(`<summary ${attributes.join(" ")}>`); 
+
+  // For condensed summaries, include parent references.
   if (summary.kind === "condensed") {
     const parents = await summaryStore.getSummaryParents(summary.summaryId);
     if (parents.length > 0) {
-      lines.push(`[Parent Summaries: ${parents.map((p) => p.summaryId).join(", ")}]`);
+      lines.push("  <parents>");
+      for (const parent of parents) {
+        lines.push(`    <summary_ref id="${parent.summaryId}" />`);
+      }
+      lines.push("  </parents>");
     }
   }
 
-  lines.push("");
+  lines.push("  <content>");
   lines.push(summary.content);
+  lines.push("  </content>");
+  lines.push("</summary>");
   return lines.join("\n");
 }
 
@@ -453,7 +466,7 @@ export class ContextAssembler {
 
   /**
    * Resolve a context item that references a summary.
-   * Summaries are presented as user messages with a structured header.
+   * Summaries are presented as user messages with a structured XML wrapper.
    */
   private async resolveSummaryItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
     const summary = await this.summaryStore.getSummary(item.summaryId!);

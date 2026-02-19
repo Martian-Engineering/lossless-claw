@@ -14,8 +14,10 @@ type AgentMessageLike = {
   content?: unknown;
   toolCallId?: string;
   toolUseId?: string;
+  toolName?: string;
   stopReason?: string;
-  [key: string]: unknown;
+  isError?: boolean;
+  timestamp?: number;
 };
 
 type ToolCallLike = {

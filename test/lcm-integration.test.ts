@@ -341,6 +341,9 @@ function createMockSummaryStore() {
         content: string;
         tokenCount: number;
         fileIds?: string[];
+        earliestAt?: Date;
+        latestAt?: Date;
+        descendantCount?: number;
       }): Promise<SummaryRecord> => {
         const summary: SummaryRecord = {
           summaryId: input.summaryId,
@@ -350,6 +353,9 @@ function createMockSummaryStore() {
           content: input.content,
           tokenCount: input.tokenCount,
           fileIds: input.fileIds ?? [],
+          earliestAt: input.earliestAt ?? null,
+          latestAt: input.latestAt ?? null,
+          descendantCount: input.descendantCount ?? 0,
           createdAt: new Date(),
         };
         summaries.push(summary);
@@ -702,9 +708,9 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(result.stats.rawMessageCount).toBe(4);
     expect(result.stats.summaryCount).toBe(1);
 
-    // The summary should appear as a user message with the [Summary ID: ...] header
+    // The summary should appear as a user message with an XML summary wrapper.
     const summaryMsg = result.messages.find((m) =>
-      m.content.includes("[Summary ID: sum_test_001]"),
+      m.content.includes('<summary id="sum_test_001"'),
     );
     expect(summaryMsg).toBeDefined();
     expect(summaryMsg!.role).toBe("user");
@@ -857,7 +863,7 @@ describe("LCM integration: compaction", () => {
       tokenCountFn: () => 40,
     });
 
-    type SummarizeOptions = { previousSummary?: string; isCondensed?: boolean };
+    type SummarizeOptions = { previousSummary?: string; isCondensed?: boolean; depth?: number };
     const summarizeCalls: SummarizeOptions[] = [];
     const summarize = vi.fn(
       async (_text: string, _aggressive?: boolean, options?: SummarizeOptions) => {
@@ -916,7 +922,11 @@ describe("LCM integration: compaction", () => {
     });
 
     const summarize = vi.fn(
-      async (_text: string, _aggressive?: boolean, options?: { isCondensed?: boolean }) => {
+      async (
+        _text: string,
+        _aggressive?: boolean,
+        options?: { isCondensed?: boolean; depth?: number },
+      ) => {
         return options?.isCondensed ? "Condensed summary" : "Leaf summary";
       },
     );
@@ -969,7 +979,11 @@ describe("LCM integration: compaction", () => {
     });
 
     const summarize = vi.fn(
-      async (_text: string, _aggressive?: boolean, options?: { isCondensed?: boolean }) => {
+      async (
+        _text: string,
+        _aggressive?: boolean,
+        options?: { isCondensed?: boolean; depth?: number },
+      ) => {
         return options?.isCondensed ? "Condensed summary" : "Leaf summary";
       },
     );
@@ -1036,7 +1050,11 @@ describe("LCM integration: compaction", () => {
 
     let summarizeCount = 0;
     const summarize = vi.fn(
-      async (_text: string, _aggressive?: boolean, options?: { isCondensed?: boolean }) => {
+      async (
+        _text: string,
+        _aggressive?: boolean,
+        options?: { isCondensed?: boolean; depth?: number },
+      ) => {
         summarizeCount += 1;
         return options?.isCondensed ? `Condensed summary ${summarizeCount}` : "Leaf summary";
       },
@@ -1343,6 +1361,7 @@ describe("LCM integration: compaction", () => {
 
     expect(result.actionTaken).toBe(true);
     const firstSourceText = summarize.mock.calls[0]?.[0] as string;
+    expect(firstSourceText).toMatch(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]/);
     expect(firstSourceText).toContain("L0-A leaf context");
     expect(firstSourceText).toContain("L0-B leaf context");
     expect(firstSourceText).not.toContain("D1-A existing condensed context");
@@ -1398,13 +1417,14 @@ describe("LCM integration: compaction", () => {
       options?: {
         previousSummary?: string;
         isCondensed?: boolean;
+        depth?: number;
       };
     }> = [];
     const summarize = vi.fn(
       async (
         _text: string,
         _aggressive?: boolean,
-        options?: { previousSummary?: string; isCondensed?: boolean },
+        options?: { previousSummary?: string; isCondensed?: boolean; depth?: number },
       ) => {
         summarizeCalls.push({ options });
         return "Condensed output";
@@ -1425,6 +1445,7 @@ describe("LCM integration: compaction", () => {
     );
 
     expect(summarizeCalls[0]?.options?.isCondensed).toBe(true);
+    expect(summarizeCalls[0]?.options?.depth).toBe(2);
     expect(summarizeCalls[0]?.options?.previousSummary).toBeUndefined();
 
     const depthZeroConversation = await convStore.createConversation({
@@ -1482,6 +1503,7 @@ describe("LCM integration: compaction", () => {
     );
 
     const depthZeroCall = summarizeCalls[summarizeCalls.length - 1];
+    expect(depthZeroCall?.options?.depth).toBe(1);
     expect(depthZeroCall?.options?.previousSummary).toContain("Depth zero prior context");
   });
 
@@ -2278,7 +2300,7 @@ describe("LCM integration: full round-trip", () => {
     expect(assembleResult.stats.rawMessageCount).toBeGreaterThan(0);
 
     // At least one assembled message should contain summary content
-    const hasSummary = assembleResult.messages.some((m) => m.content.includes("[Summary ID:"));
+    const hasSummary = assembleResult.messages.some((m) => m.content.includes("<summary id="));
     expect(hasSummary).toBe(true);
 
     // Fresh tail messages (last 4) should be present
@@ -2399,7 +2421,7 @@ describe("LCM integration: full round-trip", () => {
     let sawSummary = false;
     let sawFreshAfterSummary = false;
     for (const msg of result.messages) {
-      if (msg.content.includes("[Summary ID:")) {
+      if (msg.content.includes("<summary id=")) {
         sawSummary = true;
       } else if (sawSummary && msg.content.includes("Sequential message")) {
         sawFreshAfterSummary = true;
