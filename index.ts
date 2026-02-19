@@ -253,7 +253,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 }
 
 const lcmPlugin = {
-  id: "lcm",
+  id: "openclaw-lcm",
   name: "Lossless Context Management",
   description:
     "DAG-based conversation summarization with incremental compaction, full-text search, and sub-agent expansion",
@@ -278,7 +278,7 @@ const lcmPlugin = {
     const deps = createLcmDependencies(api);
     const lcm = new LcmContextEngine(deps);
 
-    api.registerContextEngine("lcm", () => lcm);
+    api.registerContextEngine("openclaw-lcm", () => lcm);
     api.registerTool((ctx) =>
       createLcmGrepTool({
         deps,
