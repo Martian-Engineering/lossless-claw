@@ -190,6 +190,10 @@ function pickToolCallId(parts: MessagePartRecord[]): string | undefined {
   return undefined;
 }
 
+function toSafeCdata(value: string): string {
+  return value.replaceAll("]]>", "]]]]><![CDATA[>");
+}
+
 /**
  * Format a summary record into the XML payload string the model sees.
  */
@@ -225,11 +229,9 @@ async function formatSummaryContent(
     }
   }
 
-  lines.push("  <content>");
-  if (summary.content.length > 0) {
-    lines.push(summary.content);
-  }
-  lines.push("  </content>");
+  lines.push("  <content><![CDATA[");
+  lines.push(toSafeCdata(summary.content));
+  lines.push("]]></content>");
   lines.push("</summary>");
   return lines.join("\n");
 }
