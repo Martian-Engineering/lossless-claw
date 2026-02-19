@@ -345,18 +345,135 @@ No structural changes — same summary ID, same parent/child links, same context
 
 #### Interactive TUI integration
 
-In the DAG view, add a new keybinding:
+The DAG view already has a pattern for node-level actions: pressing `d` on a selected node
+triggers a dissolve with a dry-run preview overlay and y/n confirmation. Rewrite follows the
+same UX pattern but introduces an async step (the API call takes 5-30 seconds).
 
-- **`w`** (rewrite): Rewrite the selected summary
-  1. Show source text preview and selected prompt template
-  2. Call API and show before/after comparison
-  3. Prompt: `Apply? [y/n]`
-  4. On confirm, update database and refresh DAG view
+##### State machine
 
-- **`W`** (rewrite subtree): Rewrite the selected summary and all its descendants, bottom-up
-  1. Show count and estimated cost
-  2. Process bottom-up, showing progress
-  3. Refresh DAG view on completion
+Add a `pendingRewrite` field to the model struct, parallel to `pendingDissolve`:
+
+```go
+type rewriteState struct {
+    target     summaryNode         // the selected summary
+    sourceText string              // reconstructed source (with timestamps)
+    prompt     string              // the prompt that will be sent
+    depth      int                 // output depth (determines prompt variant)
+    timeRange  string              // "2026-02-17 15:37 – 21:14 UTC"
+    phase      rewritePhase        // preview → inflight → review → done
+    newContent string              // result from API (populated after inflight)
+    newTokens  int                 // token count of new content
+    err        error               // set if API call fails
+}
+
+type rewritePhase int
+const (
+    rewritePreview  rewritePhase = iota  // showing source + prompt before firing
+    rewriteInflight                       // API call in progress (spinner)
+    rewriteReview                         // showing old vs new, awaiting y/n
+)
+```
+
+##### Keybindings
+
+- **`w`** on a selected summary node: Start rewrite flow
+  1. Build source text (messages for leaves, child summaries for condensed — with timestamps)
+  2. Select prompt variant based on depth
+  3. Set `pendingRewrite` with phase=`rewritePreview`
+  4. Render shows: source text stats, time range, prompt variant, estimated tokens
+  5. Help bar: `enter: send to API | esc: cancel`
+
+- **`enter`** during preview phase: Fire API call
+  1. Transition to phase=`rewriteInflight`
+  2. Launch goroutine via `tea.Cmd` that calls `anthropicClient.summarize()`
+  3. Render shows spinner + "Rewriting sum_xxx with d1 prompt..."
+  4. On completion, custom `tea.Msg` arrives with result
+  5. Transition to phase=`rewriteReview`
+
+- **Review phase** render: Side-by-side or sequential old/new comparison
+  ```
+  ━━━ Rewrite: sum_f8ee4e7a5a7b7090 (d1, 36 children) ━━━
+  Time range: 2026-02-17 15:37 – 21:14 UTC
+
+  OLD (1523 tokens):
+    Goals & Context
+    Working on OpenClaw's LCM system...
+    [scrollable with Shift+J/K]
+
+  NEW (1401 tokens):
+    Timeline:
+    - 15:30 Feb 17: Started LCM depth-aware condensation...
+    [scrollable with Shift+J/K]
+
+  Δ tokens: -122 (1523 → 1401)
+
+  y/enter: apply | n/esc: discard | d: show diff
+  ```
+
+- **`y`/`enter`** during review: Apply the rewrite
+  1. `UPDATE summaries SET content = ?, token_count = ? WHERE summary_id = ?`
+  2. Refresh DAG view (reload summary graph)
+  3. Clear `pendingRewrite`, update status: "Rewrote sum_xxx: 1523t → 1401t (-122)"
+
+- **`n`/`esc`** at any phase: Cancel, clear `pendingRewrite`
+
+- **`d`** during review: Toggle unified diff view of old vs new content
+
+##### Async pattern (new for this TUI)
+
+The TUI is currently fully synchronous — dissolve works because it's a local DB operation.
+Rewrite introduces the first async `tea.Cmd`. The pattern:
+
+```go
+// Custom message type for rewrite completion
+type rewriteResultMsg struct {
+    content string
+    tokens  int
+    err     error
+}
+
+// In handleSummariesKey, when user presses enter during preview:
+func (m *model) startRewriteAPI() tea.Cmd {
+    rw := m.pendingRewrite
+    return func() tea.Msg {
+        client := &anthropicClient{apiKey: rw.apiKey}
+        content, err := client.summarize(context.Background(), rw.prompt, rw.targetTokens)
+        return rewriteResultMsg{
+            content: content,
+            tokens:  estimateTokenCount(content),
+            err:     err,
+        }
+    }
+}
+
+// In Update(), handle the result message:
+case rewriteResultMsg:
+    if m.pendingRewrite == nil {
+        return m, nil
+    }
+    if msg.err != nil {
+        m.pendingRewrite.err = msg.err
+        m.status = "Rewrite failed: " + msg.err.Error()
+        m.pendingRewrite = nil
+        return m, nil
+    }
+    m.pendingRewrite.newContent = msg.content
+    m.pendingRewrite.newTokens = msg.tokens
+    m.pendingRewrite.phase = rewriteReview
+```
+
+This is the standard Bubble Tea async pattern. The goroutine runs in the background, and
+the TUI remains responsive (can cancel with `esc`, status bar shows "Rewriting...").
+
+##### Subtree rewrite (`W`)
+
+- **`W`** (shift+w): Rewrite selected node and all descendants, bottom-up
+  1. Walk DAG to collect all descendant summaries
+  2. Sort bottom-up: leaves first, then d1, d2, etc.; chronological within each depth
+  3. Show plan: "Rewrite 38 summaries (25 leaves, 10 d1, 2 d2, 1 d3)? [y/n]"
+  4. On confirm, process sequentially with progress: "Rewriting 7/38: sum_xxx (d1)..."
+  5. Each completion updates the DB immediately so subsequent rewrites see fresh content
+  6. On finish, refresh DAG and show summary: "Rewrote 38 summaries. Total: 45,230t → 38,100t (-7,130)"
 
 ### Future: Operator-customizable prompts
 
