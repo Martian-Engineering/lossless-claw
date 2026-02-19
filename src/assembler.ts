@@ -1,11 +1,12 @@
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { sanitizeToolUseResultPairing } from "../../agents/session-transcript-repair.js";
+import type { ContextEngine } from "openclaw/plugin-sdk";
 import type {
   ConversationStore,
   MessagePartRecord,
   MessageRole,
 } from "./store/conversation-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
+
+type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -236,6 +237,8 @@ export class ContextAssembler {
   constructor(
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
+    private sanitizeToolUseResultPairing: (messages: unknown[]) => unknown[] = (messages) =>
+      messages,
   ) {}
 
   /**
@@ -346,7 +349,7 @@ export class ContextAssembler {
     }
 
     return {
-      messages: sanitizeToolUseResultPairing(rawMessages),
+      messages: this.sanitizeToolUseResultPairing(rawMessages) as AgentMessage[],
       estimatedTokens,
       stats: {
         rawMessageCount,

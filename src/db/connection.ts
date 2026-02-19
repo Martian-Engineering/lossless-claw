@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
+import Database from "better-sqlite3";
 import { mkdirSync } from "fs";
 import { dirname } from "path";
-import { requireNodeSqlite } from "../../../memory/sqlite.js";
 
 type ConnectionEntry = {
   db: DatabaseSync;
@@ -41,8 +41,7 @@ export function getLcmConnection(dbPath: string): DatabaseSync {
   // Ensure parent directory exists
   mkdirSync(dirname(dbPath), { recursive: true });
 
-  const { DatabaseSync } = requireNodeSqlite();
-  const db = new DatabaseSync(dbPath);
+  const db = new Database(dbPath) as unknown as DatabaseSync;
 
   // Enable WAL mode for better concurrent read performance
   db.exec("PRAGMA journal_mode = WAL");

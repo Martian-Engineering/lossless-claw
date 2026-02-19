@@ -182,8 +182,8 @@ export class ExpansionOrchestrator {
       conversationId: input.conversationId,
     });
 
-    const summaryIds = grepResult.summaries
-      .toSorted((a, b) => {
+    const summaryIds = [...grepResult.summaries]
+      .sort((a, b) => {
         const recencyDelta = b.createdAt.getTime() - a.createdAt.getTime();
         if (recencyDelta !== 0) {
           return recencyDelta;
@@ -318,7 +318,7 @@ export function buildExpansionToolDefinition(options: {
   return {
     name: "lcm_expand",
     description:
-      "Expand compacted conversation summaries from LCM (Long Context Management). " +
+      "Expand compacted conversation summaries from LCM (Lossless Context Management). " +
       "Traverses the summary DAG to retrieve children and source messages. " +
       "Use this to drill into previously-compacted context when you need detail " +
       "that was summarised away. Returns a compact text payload with cited IDs for follow-up.",

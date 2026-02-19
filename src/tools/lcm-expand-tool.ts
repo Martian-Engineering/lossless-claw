@@ -1,21 +1,18 @@
 import { Type } from "@sinclair/typebox";
-import type { OpenClawConfig } from "../../config/config.js";
-import type { LcmContextEngine } from "../../plugins/lcm/engine.js";
+import type { LcmContextEngine } from "../engine.js";
+import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
-import { ensureContextEnginesInitialized } from "../../context-engine/init.js";
-import { resolveContextEngine } from "../../context-engine/registry.js";
 import {
   getRuntimeExpansionAuthManager,
   resolveDelegatedExpansionGrantId,
   wrapWithAuth,
-} from "../../plugins/lcm/expansion-auth.js";
-import { decideLcmExpansionRouting } from "../../plugins/lcm/expansion-policy.js";
+} from "../expansion-auth.js";
+import { decideLcmExpansionRouting } from "../expansion-policy.js";
 import {
   ExpansionOrchestrator,
   distillForSubagent,
   type ExpansionResult,
-} from "../../plugins/lcm/expansion.js";
-import { isSubagentSessionKey } from "../../routing/session-key.js";
+} from "../expansion.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import {
@@ -123,10 +120,12 @@ function buildOrchestrationObservability(input: {
 /**
  * Build the runtime LCM expansion tool with route-vs-delegate orchestration.
  */
-export function createLcmExpandTool(options?: {
-  config?: OpenClawConfig;
+export function createLcmExpandTool(input: {
+  deps: LcmDependencies;
+  lcm: LcmContextEngine;
   /** Runtime session key (used for delegated expansion auth scoping). */
   sessionId?: string;
+  sessionKey?: string;
 }): AnyAgentTool {
   return {
     name: "lcm_expand",
@@ -140,17 +139,7 @@ export function createLcmExpandTool(options?: {
       "with cited IDs for follow-up.",
     parameters: LcmExpandSchema,
     async execute(_toolCallId, params) {
-      ensureContextEnginesInitialized();
-      const engine = await resolveContextEngine(options?.config);
-
-      if (engine.info.id !== "lcm") {
-        return jsonResult({
-          error: "lcm_expand requires the LCM context engine to be active.",
-        });
-      }
-
-      const lcm = engine as LcmContextEngine;
-      const retrieval = lcm.getRetrieval();
+      const retrieval = input.lcm.getRetrieval();
       const orchestrator = new ExpansionOrchestrator(retrieval);
       const runtimeAuthManager = getRuntimeExpansionAuthManager();
 
@@ -164,14 +153,15 @@ export function createLcmExpandTool(options?: {
           ? Math.max(1, requestedTokenCap)
           : undefined;
       const includeMessages = typeof p.includeMessages === "boolean" ? p.includeMessages : false;
-      const sessionKey = typeof options?.sessionId === "string" ? options.sessionId.trim() : "";
-      if (!isSubagentSessionKey(sessionKey)) {
+      const sessionKey =
+        (typeof input.sessionKey === "string" ? input.sessionKey : input.sessionId)?.trim() ?? "";
+      if (!input.deps.isSubagentSessionKey(sessionKey)) {
         return jsonResult({
           error:
             "lcm_expand is only available in sub-agent sessions. Use lcm_expand_query to ask a focused question against expanded summaries, or lcm_describe/lcm_grep for lighter lookups.",
         });
       }
-      const isDelegatedSession = isSubagentSessionKey(sessionKey);
+      const isDelegatedSession = input.deps.isSubagentSessionKey(sessionKey);
       const delegatedGrantId = isDelegatedSession
         ? (resolveDelegatedExpansionGrantId(sessionKey) ?? undefined)
         : undefined;
@@ -188,8 +178,10 @@ export function createLcmExpandTool(options?: {
       }
 
       const conversationScope = await resolveLcmConversationScope({
-        lcm,
-        sessionId: options?.sessionId,
+        lcm: input.lcm,
+        deps: input.deps,
+        sessionId: input.sessionId,
+        sessionKey: input.sessionKey,
         params: p,
       });
 
@@ -270,6 +262,7 @@ export function createLcmExpandTool(options?: {
           const delegated =
             canDelegate && resolvedConversationId != null
               ? await runDelegatedExpansionLoop({
+                  deps: input.deps,
                   requesterSessionKey: sessionKey,
                   conversationId: resolvedConversationId,
                   summaryIds: matchedSummaryIds,
@@ -380,6 +373,7 @@ export function createLcmExpandTool(options?: {
             resolvedConversationId != null;
           const delegated = canDelegate
             ? await runDelegatedExpansionLoop({
+                deps: input.deps,
                 requesterSessionKey: sessionKey,
                 conversationId: resolvedConversationId,
                 summaryIds: normalizedSummaryIds,

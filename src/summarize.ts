@@ -1,9 +1,5 @@
-import { completeSimple, type TextContent } from "@mariozechner/pi-ai";
-import type { OpenClawConfig } from "../../config/config.js";
-import { resolveOpenClawAgentDir } from "../../agents/agent-paths.js";
-import { getApiKeyForModel, requireApiKey } from "../../agents/model-auth.js";
-import { resolveModel } from "../../agents/pi-embedded-runner/model.js";
 import { resolveLcmConfig } from "./db/config.js";
+import type { LcmDependencies } from "./types.js";
 
 export type LcmSummarizeOptions = {
   previousSummary?: string;
@@ -26,7 +22,6 @@ export type LcmSummarizerLegacyParams = {
 
 type SummaryMode = "normal" | "aggressive";
 
-const SUMMARY_TIMEOUT_MS = 45_000;
 const DEFAULT_CONDENSED_TARGET_TOKENS = 2000;
 
 /** Approximate token estimate used for target-sizing prompts. */
@@ -34,9 +29,13 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-/** Narrows pi-ai response blocks to plain text content blocks. */
-function isTextContentBlock(block: { type: string }): block is TextContent {
-  return block.type === "text";
+/** Narrows completion response blocks to plain text blocks. */
+function isTextBlock(block: unknown): block is { type: string; text: string } {
+  if (!block || typeof block !== "object" || Array.isArray(block)) {
+    return false;
+  }
+  const record = block as { type?: unknown; text?: unknown };
+  return record.type === "text" && typeof record.text === "string";
 }
 
 /**
@@ -179,51 +178,35 @@ function buildDeterministicFallbackSummary(text: string, targetTokens: number): 
  * choose a fallback summarizer.
  */
 export async function createLcmSummarizeFromLegacyParams(params: {
+  deps: LcmDependencies;
   legacyParams: LcmSummarizerLegacyParams;
   customInstructions?: string;
 }): Promise<LcmSummarizeFn | undefined> {
-  const provider =
+  const providerHint =
     typeof params.legacyParams.provider === "string" ? params.legacyParams.provider.trim() : "";
-  const model =
+  const modelHint =
     typeof params.legacyParams.model === "string" ? params.legacyParams.model.trim() : "";
+  const modelRef = modelHint || undefined;
 
+  let resolved: { provider: string; model: string };
+  try {
+    resolved = params.deps.resolveModel(modelRef);
+  } catch {
+    return undefined;
+  }
+
+  const provider = providerHint || resolved.provider;
+  const model = resolved.model;
   if (!provider || !model) {
     return undefined;
   }
 
-  const agentDir =
-    typeof params.legacyParams.agentDir === "string"
-      ? params.legacyParams.agentDir
-      : resolveOpenClawAgentDir();
-  const cfg = params.legacyParams.config as OpenClawConfig | undefined;
-
-  const resolved = resolveModel(provider, model, agentDir, cfg);
-  if (!resolved.model) {
+  let apiKey: string;
+  try {
+    apiKey =
+      params.deps.getApiKey(provider, model) ?? params.deps.requireApiKey(provider, model);
+  } catch {
     return undefined;
-  }
-
-  const resolvedModel = resolved.model;
-
-  const authProfileId =
-    typeof params.legacyParams.authProfileId === "string"
-      ? params.legacyParams.authProfileId
-      : undefined;
-
-  const auth = await getApiKeyForModel({
-    model: resolvedModel,
-    cfg,
-    profileId: authProfileId,
-    agentDir,
-  });
-
-  let apiKey: string | undefined;
-  if (resolvedModel.provider === "github-copilot") {
-    const { resolveCopilotApiToken } = await import("../../providers/github-copilot-token.js");
-    const githubToken = requireApiKey(auth, resolvedModel.provider);
-    const copilotToken = await resolveCopilotApiToken({ githubToken });
-    apiKey = copilotToken.token;
-  } else if (auth.mode !== "aws-sdk") {
-    apiKey = requireApiKey(auth, resolvedModel.provider);
   }
 
   const runtimeLcmConfig = resolveLcmConfig();
@@ -265,43 +248,31 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           customInstructions: params.customInstructions,
         });
 
-    const controller = new AbortController();
-    const timeout = setTimeout(controller.abort.bind(controller), SUMMARY_TIMEOUT_MS);
-
-    try {
-      const result = await completeSimple(
-        resolvedModel,
+    const result = await params.deps.complete({
+      provider,
+      model,
+      apiKey,
+      messages: [
         {
-          messages: [
-            {
-              role: "user",
-              content: prompt,
-              timestamp: Date.now(),
-            },
-          ],
+          role: "user",
+          content: prompt,
         },
-        {
-          apiKey,
-          maxTokens: targetTokens,
-          temperature: aggressive ? 0.1 : 0.2,
-          signal: controller.signal,
-        },
-      );
+      ],
+      maxTokens: targetTokens,
+      temperature: aggressive ? 0.1 : 0.2,
+    });
 
-      const summary = result.content
-        .filter(isTextContentBlock)
-        .map((block) => block.text.trim())
-        .filter(Boolean)
-        .join("\n")
-        .trim();
+    const summary = result.content
+      .filter(isTextBlock)
+      .map((block) => block.text.trim())
+      .filter(Boolean)
+      .join("\n")
+      .trim();
 
-      if (!summary) {
-        return buildDeterministicFallbackSummary(text, targetTokens);
-      }
-
-      return summary;
-    } finally {
-      clearTimeout(timeout);
+    if (!summary) {
+      return buildDeterministicFallbackSummary(text, targetTokens);
     }
+
+    return summary;
   };
 }

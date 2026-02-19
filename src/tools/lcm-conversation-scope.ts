@@ -1,4 +1,5 @@
-import type { LcmContextEngine } from "../../plugins/lcm/engine.js";
+import type { LcmContextEngine } from "../engine.js";
+import type { LcmDependencies } from "../types.js";
 
 export type LcmConversationScope = {
   conversationId?: number;
@@ -39,10 +40,12 @@ export function parseIsoTimestampParam(
  */
 export async function resolveLcmConversationScope(input: {
   lcm: LcmContextEngine;
-  sessionId?: string;
   params: Record<string, unknown>;
+  sessionId?: string;
+  sessionKey?: string;
+  deps?: Pick<LcmDependencies, "resolveSessionIdFromSessionKey">;
 }): Promise<LcmConversationScope> {
-  const { lcm, sessionId, params } = input;
+  const { lcm, params } = input;
 
   const explicitConversationId =
     typeof params.conversationId === "number" && Number.isFinite(params.conversationId)
@@ -56,14 +59,15 @@ export async function resolveLcmConversationScope(input: {
     return { conversationId: undefined, allConversations: true };
   }
 
-  const normalizedSessionId = sessionId?.trim();
+  let normalizedSessionId = input.sessionId?.trim();
+  if (!normalizedSessionId && input.sessionKey && input.deps) {
+    normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(input.sessionKey.trim());
+  }
   if (!normalizedSessionId) {
     return { conversationId: undefined, allConversations: false };
   }
 
-  const conversation = await lcm
-    .getConversationStore()
-    .getConversationBySessionId(normalizedSessionId);
+  const conversation = await lcm.getConversationStore().getConversationBySessionId(normalizedSessionId);
   if (!conversation) {
     return { conversationId: undefined, allConversations: false };
   }

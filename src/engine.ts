@@ -1,15 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { SessionManager } from "@mariozechner/pi-coding-agent";
-import { loadConfig } from "../../config/config.js";
-import {
-  loadSessionStore,
-  resolveAgentIdFromSessionKey,
-  resolveStorePath,
-} from "../../config/sessions.js";
 import type {
   ContextEngine,
   ContextEngineInfo,
@@ -20,10 +13,10 @@ import type {
   IngestResult,
   SubagentEndReason,
   SubagentSpawnPreparation,
-} from "../../context-engine/types.js";
+} from "openclaw/plugin-sdk";
 import { ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
-import { resolveLcmConfig, type LcmConfig } from "./db/config.js";
+import type { LcmConfig } from "./db/config.js";
 import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
 import { runLcmMigrations } from "./db/migration.js";
 import {
@@ -45,6 +38,9 @@ import {
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams } from "./summarize.js";
+import type { LcmDependencies } from "./types.js";
+
+type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -446,22 +442,53 @@ function isBootstrapMessage(value: unknown): value is AgentMessage {
   return "content" in msg || ("command" in msg && "output" in msg);
 }
 
-/**
- * Load the active leaf-path context from a session file using SessionManager
- * semantics (open + buildSessionContext).
- */
+/** Load recoverable messages from a JSON/JSONL session file. */
 function readLeafPathMessages(sessionFile: string): AgentMessage[] {
-  const sessionManager = SessionManager.open(sessionFile) as unknown as {
-    setSessionFile?: (path: string) => void;
-    buildSessionContext?: () => { messages?: unknown };
-  };
-  sessionManager.setSessionFile?.(sessionFile);
-  const context = sessionManager.buildSessionContext?.();
-  const messages = context?.messages;
-  if (!Array.isArray(messages)) {
+  let raw = "";
+  try {
+    raw = readFileSync(sessionFile, "utf8");
+  } catch {
     return [];
   }
-  return messages.filter(isBootstrapMessage);
+
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed.filter(isBootstrapMessage);
+    } catch {
+      return [];
+    }
+  }
+
+  const messages: AgentMessage[] = [];
+  const lines = raw.split(/\r?\n/);
+  for (const line of lines) {
+    const item = line.trim();
+    if (!item) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(item);
+      const candidate =
+        parsed && typeof parsed === "object" && "message" in parsed
+          ? (parsed as { message?: unknown }).message
+          : parsed;
+      if (isBootstrapMessage(candidate)) {
+        messages.push(candidate);
+      }
+    } catch {
+      // Skip malformed lines.
+    }
+  }
+  return messages;
 }
 
 function messageIdentity(role: string, content: string): string {
@@ -488,16 +515,22 @@ export class LcmContextEngine implements ContextEngine {
   private sessionOperationQueues = new Map<string, Promise<void>>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
+  private deps: LcmDependencies;
 
-  constructor(config?: LcmConfig) {
-    this.config = config ?? resolveLcmConfig();
+  constructor(deps: LcmDependencies) {
+    this.deps = deps;
+    this.config = deps.config;
 
     const db = getLcmConnection(this.config.databasePath);
 
     this.conversationStore = new ConversationStore(db);
     this.summaryStore = new SummaryStore(db);
 
-    this.assembler = new ContextAssembler(this.conversationStore, this.summaryStore);
+    this.assembler = new ContextAssembler(
+      this.conversationStore,
+      this.summaryStore,
+      (messages) => this.deps.sanitizeToolUseResultPairing(messages),
+    );
 
     const compactionConfig: CompactionConfig = {
       contextThreshold: this.config.contextThreshold,
@@ -595,13 +628,7 @@ export class LcmContextEngine implements ContextEngine {
       return undefined;
     }
     try {
-      const cfg = loadConfig();
-      const agentId = resolveAgentIdFromSessionKey(trimmedKey);
-      const storePath = resolveStorePath(cfg.session?.store, { agentId });
-      const store = loadSessionStore(storePath);
-      const sessionEntry = store[trimmedKey];
-      const runtimeSessionId =
-        typeof sessionEntry?.sessionId === "string" ? sessionEntry.sessionId.trim() : "";
+      const runtimeSessionId = await this.deps.resolveSessionIdFromSessionKey(trimmedKey);
       if (!runtimeSessionId) {
         return undefined;
       }
@@ -624,6 +651,7 @@ export class LcmContextEngine implements ContextEngine {
     }
     try {
       const runtimeSummarizer = await createLcmSummarizeFromLegacyParams({
+        deps: this.deps,
         legacyParams: lp,
         customInstructions: params.customInstructions,
       });
@@ -658,6 +686,7 @@ export class LcmContextEngine implements ContextEngine {
 
     try {
       const summarize = await createLcmSummarizeFromLegacyParams({
+        deps: this.deps,
         legacyParams: { provider, model },
       });
       if (!summarize) {
