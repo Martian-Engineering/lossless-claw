@@ -1542,7 +1542,11 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   async dispose(): Promise<void> {
-    closeLcmConnection(this.config.databasePath);
+    // No-op for plugin singleton — the connection is shared across runs.
+    // OpenClaw's runner calls dispose() after every run, but the plugin
+    // registers a single engine instance reused by the factory. Closing
+    // the DB here would break subsequent runs with "database is not open".
+    // The connection is cleaned up on process exit via closeLcmConnection().
   }
 
   // ── Public accessors for retrieval (used by subagent expansion) ─────────
