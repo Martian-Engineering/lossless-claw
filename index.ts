@@ -1,5 +1,5 @@
 /**
- * @martian-engineering/open-lcm — Lossless Context Management plugin for OpenClaw
+ * @martian-engineering/openclaw-lcm — Lossless Context Management plugin for OpenClaw
  *
  * DAG-based conversation summarization with incremental compaction,
  * full-text search, and sub-agent expansion.

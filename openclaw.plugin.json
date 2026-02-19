@@ -1,5 +1,5 @@
 {
-  "id": "lcm",
+  "id": "openclaw-lcm",
   "uiHints": {
     "contextThreshold": {
       "label": "Context Threshold",
