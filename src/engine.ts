@@ -529,6 +529,7 @@ export class LcmContextEngine implements ContextEngine {
     this.assembler = new ContextAssembler(
       this.conversationStore,
       this.summaryStore,
+      this.config.timezone,
     );
 
     const compactionConfig: CompactionConfig = {

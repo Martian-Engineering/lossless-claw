@@ -190,12 +190,36 @@ function pickToolCallId(parts: MessagePartRecord[]): string | undefined {
   return undefined;
 }
 
+/** Format a Date for XML attributes in the agent's timezone. */
+function formatDateForAttribute(date: Date, timezone?: string): string {
+  const tz = timezone ?? "UTC";
+  try {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+    const p = Object.fromEntries(
+      fmt.formatToParts(date).map((part) => [part.type, part.value]),
+    );
+    return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}`;
+  } catch {
+    return date.toISOString();
+  }
+}
+
 /**
  * Format a summary record into the XML payload string the model sees.
  */
 async function formatSummaryContent(
   summary: SummaryRecord,
   summaryStore: SummaryStore,
+  timezone?: string,
 ): Promise<string> {
   const attributes = [
     `id="${summary.summaryId}"`,
@@ -204,10 +228,10 @@ async function formatSummaryContent(
     `descendant_count="${summary.descendantCount}"`,
   ];
   if (summary.earliestAt) {
-    attributes.push(`earliest_at="${summary.earliestAt.toISOString()}"`);
+    attributes.push(`earliest_at="${formatDateForAttribute(summary.earliestAt, timezone)}"`);
   }
   if (summary.latestAt) {
-    attributes.push(`latest_at="${summary.latestAt.toISOString()}"`);
+    attributes.push(`latest_at="${formatDateForAttribute(summary.latestAt, timezone)}"`);
   }
 
   const lines: string[] = [];
@@ -251,6 +275,7 @@ export class ContextAssembler {
   constructor(
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
+    private timezone?: string,
   ) {}
 
   /**
@@ -474,7 +499,7 @@ export class ContextAssembler {
       return null;
     }
 
-    const content = await formatSummaryContent(summary, this.summaryStore);
+    const content = await formatSummaryContent(summary, this.summaryStore, this.timezone);
     const tokens = estimateTokens(content);
 
     // Cast: summaries are synthetic user messages without full AgentMessage metadata
