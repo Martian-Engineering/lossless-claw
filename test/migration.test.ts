@@ -15,7 +15,7 @@ afterEach(() => {
 });
 
 describe("runLcmMigrations summary depth backfill", () => {
-  it("adds depth and computes condensed depth from summary parent lineage", () => {
+  it("adds depth and metadata from summary lineage", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "openclaw-lcm-migration-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "legacy.db");
@@ -38,6 +38,24 @@ describe("runLcmMigrations summary depth backfill", () => {
         token_count INTEGER NOT NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         file_ids TEXT NOT NULL DEFAULT '[]'
+      );
+
+      CREATE TABLE messages (
+        message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+        content TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (conversation_id, seq)
+      );
+
+      CREATE TABLE summary_messages (
+        summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+        message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE RESTRICT,
+        ordinal INTEGER NOT NULL,
+        PRIMARY KEY (summary_id, message_id)
       );
 
       CREATE TABLE summary_parents (
@@ -63,6 +81,22 @@ describe("runLcmMigrations summary depth backfill", () => {
     insertSummaryStmt.run("sum_condensed_2", 1, "condensed", "condensed-2", 10);
     insertSummaryStmt.run("sum_condensed_orphan", 1, "condensed", "condensed-orphan", 10);
 
+    const insertMessageStmt = db.prepare(
+      `INSERT INTO messages (message_id, conversation_id, seq, role, content, token_count, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    insertMessageStmt.run(1, 1, 1, "user", "m1", 5, "2026-01-01 10:00:00");
+    insertMessageStmt.run(2, 1, 2, "assistant", "m2", 5, "2026-01-01 11:30:00");
+    insertMessageStmt.run(3, 1, 3, "user", "m3", 5, "2026-01-01 12:45:00");
+
+    const linkMessageStmt = db.prepare(
+      `INSERT INTO summary_messages (summary_id, message_id, ordinal)
+       VALUES (?, ?, ?)`,
+    );
+    linkMessageStmt.run("sum_leaf_a", 1, 0);
+    linkMessageStmt.run("sum_leaf_a", 2, 1);
+    linkMessageStmt.run("sum_leaf_b", 3, 0);
+
     const linkStmt = db.prepare(
       `INSERT INTO summary_parents (summary_id, parent_summary_id, ordinal)
        VALUES (?, ?, ?)`,
@@ -77,20 +111,51 @@ describe("runLcmMigrations summary depth backfill", () => {
       name?: string;
     }>;
     expect(summaryColumns.some((column) => column.name === "depth")).toBe(true);
+    expect(summaryColumns.some((column) => column.name === "earliest_at")).toBe(true);
+    expect(summaryColumns.some((column) => column.name === "latest_at")).toBe(true);
+    expect(summaryColumns.some((column) => column.name === "descendant_count")).toBe(true);
 
     const depthRows = db
       .prepare(
-        `SELECT summary_id, depth
+        `SELECT summary_id, depth, earliest_at, latest_at, descendant_count
          FROM summaries
          ORDER BY summary_id`,
       )
-      .all() as Array<{ summary_id: string; depth: number }>;
+      .all() as Array<{
+      summary_id: string;
+      depth: number;
+      earliest_at: string | null;
+      latest_at: string | null;
+      descendant_count: number;
+    }>;
     const depthBySummaryId = new Map(depthRows.map((row) => [row.summary_id, row.depth]));
+    const earliestBySummaryId = new Map(depthRows.map((row) => [row.summary_id, row.earliest_at]));
+    const latestBySummaryId = new Map(depthRows.map((row) => [row.summary_id, row.latest_at]));
+    const descendantCountBySummaryId = new Map(
+      depthRows.map((row) => [row.summary_id, row.descendant_count]),
+    );
 
     expect(depthBySummaryId.get("sum_leaf_a")).toBe(0);
     expect(depthBySummaryId.get("sum_leaf_b")).toBe(0);
     expect(depthBySummaryId.get("sum_condensed_1")).toBe(1);
     expect(depthBySummaryId.get("sum_condensed_2")).toBe(2);
     expect(depthBySummaryId.get("sum_condensed_orphan")).toBe(1);
+
+    expect(earliestBySummaryId.get("sum_leaf_a")).toContain("2026-01-01T10:00:00");
+    expect(latestBySummaryId.get("sum_leaf_a")).toContain("2026-01-01T11:30:00");
+    expect(earliestBySummaryId.get("sum_leaf_b")).toContain("2026-01-01T12:45:00");
+    expect(latestBySummaryId.get("sum_leaf_b")).toContain("2026-01-01T12:45:00");
+    expect(earliestBySummaryId.get("sum_condensed_1")).toContain("2026-01-01T10:00:00");
+    expect(latestBySummaryId.get("sum_condensed_1")).toContain("2026-01-01T12:45:00");
+    expect(earliestBySummaryId.get("sum_condensed_2")).toContain("2026-01-01T10:00:00");
+    expect(latestBySummaryId.get("sum_condensed_2")).toContain("2026-01-01T12:45:00");
+    expect(earliestBySummaryId.get("sum_condensed_orphan")).toBeTypeOf("string");
+    expect(latestBySummaryId.get("sum_condensed_orphan")).toBeTypeOf("string");
+
+    expect(descendantCountBySummaryId.get("sum_leaf_a")).toBe(0);
+    expect(descendantCountBySummaryId.get("sum_leaf_b")).toBe(0);
+    expect(descendantCountBySummaryId.get("sum_condensed_1")).toBe(2);
+    expect(descendantCountBySummaryId.get("sum_condensed_2")).toBe(3);
+    expect(descendantCountBySummaryId.get("sum_condensed_orphan")).toBe(0);
   });
 });

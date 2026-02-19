@@ -6,7 +6,16 @@ type SummaryColumnInfo = {
 
 type SummaryDepthRow = {
   summary_id: string;
+  conversation_id: number;
   kind: "leaf" | "condensed";
+  depth: number;
+  created_at: string;
+};
+
+type SummaryMessageTimeRangeRow = {
+  summary_id: string;
+  earliest_at: string | null;
+  latest_at: string | null;
 };
 
 type SummaryParentEdgeRow = {
@@ -20,6 +29,42 @@ function ensureSummaryDepthColumn(db: DatabaseSync): void {
   if (!hasDepth) {
     db.exec(`ALTER TABLE summaries ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`);
   }
+}
+
+function ensureSummaryMetadataColumns(db: DatabaseSync): void {
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const hasEarliestAt = summaryColumns.some((col) => col.name === "earliest_at");
+  const hasLatestAt = summaryColumns.some((col) => col.name === "latest_at");
+  const hasDescendantCount = summaryColumns.some((col) => col.name === "descendant_count");
+
+  if (!hasEarliestAt) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN earliest_at TEXT`);
+  }
+  if (!hasLatestAt) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN latest_at TEXT`);
+  }
+  if (!hasDescendantCount) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN descendant_count INTEGER NOT NULL DEFAULT 0`);
+  }
+}
+
+function parseTimestamp(value: string | null | undefined): Date | null {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+
+  const direct = new Date(value);
+  if (!Number.isNaN(direct.getTime())) {
+    return direct;
+  }
+
+  const normalized = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function isoStringOrNull(value: Date | null): string | null {
+  return value ? value.toISOString() : null;
 }
 
 function backfillSummaryDepths(db: DatabaseSync): void {
@@ -39,7 +84,7 @@ function backfillSummaryDepths(db: DatabaseSync): void {
     const conversationId = row.conversation_id;
     const summaries = db
       .prepare(
-        `SELECT summary_id, kind
+        `SELECT summary_id, conversation_id, kind, depth, created_at
          FROM summaries
          WHERE conversation_id = ?`,
       )
@@ -125,6 +170,140 @@ function backfillSummaryDepths(db: DatabaseSync): void {
   }
 }
 
+function backfillSummaryMetadata(db: DatabaseSync): void {
+  const conversationRows = db
+    .prepare(`SELECT DISTINCT conversation_id FROM summaries`)
+    .all() as Array<{ conversation_id: number }>;
+  if (conversationRows.length === 0) {
+    return;
+  }
+
+  const updateMetadataStmt = db.prepare(
+    `UPDATE summaries
+     SET earliest_at = ?, latest_at = ?, descendant_count = ?
+     WHERE summary_id = ?`,
+  );
+
+  for (const conversationRow of conversationRows) {
+    const conversationId = conversationRow.conversation_id;
+    const summaries = db
+      .prepare(
+        `SELECT summary_id, conversation_id, kind, depth, created_at
+         FROM summaries
+         WHERE conversation_id = ?
+         ORDER BY depth ASC, created_at ASC`,
+      )
+      .all(conversationId) as SummaryDepthRow[];
+    if (summaries.length === 0) {
+      continue;
+    }
+
+    const leafRanges = db
+      .prepare(
+        `SELECT sm.summary_id, MIN(m.created_at) AS earliest_at, MAX(m.created_at) AS latest_at
+         FROM summary_messages sm
+         JOIN messages m ON m.message_id = sm.message_id
+         JOIN summaries s ON s.summary_id = sm.summary_id
+         WHERE s.conversation_id = ? AND s.kind = 'leaf'
+         GROUP BY sm.summary_id`,
+      )
+      .all(conversationId) as SummaryMessageTimeRangeRow[];
+    const leafRangeBySummaryId = new Map(
+      leafRanges.map((row) => [row.summary_id, { earliestAt: row.earliest_at, latestAt: row.latest_at }]),
+    );
+
+    const edges = db
+      .prepare(
+        `SELECT summary_id, parent_summary_id
+         FROM summary_parents
+         WHERE summary_id IN (
+           SELECT summary_id FROM summaries WHERE conversation_id = ?
+         )`,
+      )
+      .all(conversationId) as SummaryParentEdgeRow[];
+    const parentsBySummaryId = new Map<string, string[]>();
+    for (const edge of edges) {
+      const existing = parentsBySummaryId.get(edge.summary_id) ?? [];
+      existing.push(edge.parent_summary_id);
+      parentsBySummaryId.set(edge.summary_id, existing);
+    }
+
+    const metadataBySummaryId = new Map<
+      string,
+      { earliestAt: Date | null; latestAt: Date | null; descendantCount: number }
+    >();
+
+    for (const summary of summaries) {
+      const fallbackDate = parseTimestamp(summary.created_at);
+      if (summary.kind === "leaf") {
+        const range = leafRangeBySummaryId.get(summary.summary_id);
+        const earliestAt = parseTimestamp(range?.earliestAt ?? summary.created_at) ?? fallbackDate;
+        const latestAt = parseTimestamp(range?.latestAt ?? summary.created_at) ?? fallbackDate;
+
+        metadataBySummaryId.set(summary.summary_id, {
+          earliestAt,
+          latestAt,
+          descendantCount: 0,
+        });
+        continue;
+      }
+
+      const parentIds = parentsBySummaryId.get(summary.summary_id) ?? [];
+      if (parentIds.length === 0) {
+        metadataBySummaryId.set(summary.summary_id, {
+          earliestAt: fallbackDate,
+          latestAt: fallbackDate,
+          descendantCount: 0,
+        });
+        continue;
+      }
+
+      let earliestAt: Date | null = null;
+      let latestAt: Date | null = null;
+      let descendantCount = 0;
+
+      for (const parentId of parentIds) {
+        const parentMetadata = metadataBySummaryId.get(parentId);
+        if (!parentMetadata) {
+          continue;
+        }
+
+        const parentEarliest = parentMetadata.earliestAt;
+        if (parentEarliest && (!earliestAt || parentEarliest < earliestAt)) {
+          earliestAt = parentEarliest;
+        }
+
+        const parentLatest = parentMetadata.latestAt;
+        if (parentLatest && (!latestAt || parentLatest > latestAt)) {
+          latestAt = parentLatest;
+        }
+
+        descendantCount += Math.max(0, parentMetadata.descendantCount) + 1;
+      }
+
+      metadataBySummaryId.set(summary.summary_id, {
+        earliestAt: earliestAt ?? fallbackDate,
+        latestAt: latestAt ?? fallbackDate,
+        descendantCount: Math.max(0, descendantCount),
+      });
+    }
+
+    for (const summary of summaries) {
+      const metadata = metadataBySummaryId.get(summary.summary_id);
+      if (!metadata) {
+        continue;
+      }
+
+      updateMetadataStmt.run(
+        isoStringOrNull(metadata.earliestAt),
+        isoStringOrNull(metadata.latestAt),
+        Math.max(0, metadata.descendantCount),
+        summary.summary_id,
+      );
+    }
+  }
+}
+
 export function runLcmMigrations(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
@@ -154,6 +333,9 @@ export function runLcmMigrations(db: DatabaseSync): void {
       depth INTEGER NOT NULL DEFAULT 0,
       content TEXT NOT NULL,
       token_count INTEGER NOT NULL,
+      earliest_at TEXT,
+      latest_at TEXT,
+      descendant_count INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       file_ids TEXT NOT NULL DEFAULT '[]'
     );
@@ -254,7 +436,9 @@ export function runLcmMigrations(db: DatabaseSync): void {
   }
 
   ensureSummaryDepthColumn(db);
+  ensureSummaryMetadataColumns(db);
   backfillSummaryDepths(db);
+  backfillSummaryMetadata(db);
 
   // FTS5 virtual tables for full-text search (cannot use IF NOT EXISTS, so check manually)
   const hasFts = db

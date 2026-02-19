@@ -12,6 +12,9 @@ export type CreateSummaryInput = {
   content: string;
   tokenCount: number;
   fileIds?: string[];
+  earliestAt?: Date;
+  latestAt?: Date;
+  descendantCount?: number;
 };
 
 export type SummaryRecord = {
@@ -22,6 +25,9 @@ export type SummaryRecord = {
   content: string;
   tokenCount: number;
   fileIds: string[];
+  earliestAt: Date | null;
+  latestAt: Date | null;
+  descendantCount: number;
   createdAt: Date;
 };
 
@@ -83,6 +89,9 @@ interface SummaryRow {
   content: string;
   token_count: number;
   file_ids: string;
+  earliest_at: string | null;
+  latest_at: string | null;
+  descendant_count: number | null;
   created_at: string;
 }
 
@@ -148,6 +157,14 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
     content: row.content,
     tokenCount: row.token_count,
     fileIds,
+    earliestAt: row.earliest_at ? new Date(row.earliest_at) : null,
+    latestAt: row.latest_at ? new Date(row.latest_at) : null,
+    descendantCount:
+      typeof row.descendant_count === "number" &&
+      Number.isFinite(row.descendant_count) &&
+      row.descendant_count >= 0
+        ? Math.floor(row.descendant_count)
+        : 0,
     createdAt: new Date(row.created_at),
   };
 }
@@ -196,6 +213,14 @@ export class SummaryStore {
 
   async insertSummary(input: CreateSummaryInput): Promise<SummaryRecord> {
     const fileIds = JSON.stringify(input.fileIds ?? []);
+    const earliestAt = input.earliestAt instanceof Date ? input.earliestAt.toISOString() : null;
+    const latestAt = input.latestAt instanceof Date ? input.latestAt.toISOString() : null;
+    const descendantCount =
+      typeof input.descendantCount === "number" &&
+      Number.isFinite(input.descendantCount) &&
+      input.descendantCount >= 0
+        ? Math.floor(input.descendantCount)
+        : 0;
     const depth =
       typeof input.depth === "number" && Number.isFinite(input.depth) && input.depth >= 0
         ? Math.floor(input.depth)
@@ -205,8 +230,19 @@ export class SummaryStore {
 
     this.db
       .prepare(
-        `INSERT INTO summaries (summary_id, conversation_id, kind, depth, content, token_count, file_ids)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO summaries (
+          summary_id,
+          conversation_id,
+          kind,
+          depth,
+          content,
+          token_count,
+          file_ids,
+          earliest_at,
+          latest_at,
+          descendant_count
+        )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.summaryId,
@@ -216,6 +252,9 @@ export class SummaryStore {
         input.content,
         input.tokenCount,
         fileIds,
+        earliestAt,
+        latestAt,
+        descendantCount,
       );
 
     // Index in FTS5 as best-effort; compaction flow must continue even if
@@ -231,7 +270,8 @@ export class SummaryStore {
 
     const row = this.db
       .prepare(
-        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids, created_at
+        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+                earliest_at, latest_at, descendant_count, created_at
        FROM summaries WHERE summary_id = ?`,
       )
       .get(input.summaryId) as unknown as SummaryRow;
@@ -242,7 +282,8 @@ export class SummaryStore {
   async getSummary(summaryId: string): Promise<SummaryRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids, created_at
+        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+                earliest_at, latest_at, descendant_count, created_at
        FROM summaries WHERE summary_id = ?`,
       )
       .get(summaryId) as unknown as SummaryRow | undefined;
@@ -252,7 +293,8 @@ export class SummaryStore {
   async getSummariesByConversation(conversationId: number): Promise<SummaryRecord[]> {
     const rows = this.db
       .prepare(
-        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids, created_at
+        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+                earliest_at, latest_at, descendant_count, created_at
        FROM summaries
        WHERE conversation_id = ?
        ORDER BY created_at`,
@@ -309,7 +351,8 @@ export class SummaryStore {
   async getSummaryChildren(parentSummaryId: string): Promise<SummaryRecord[]> {
     const rows = this.db
       .prepare(
-        `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count, s.file_ids, s.created_at
+        `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
+                s.file_ids, s.earliest_at, s.latest_at, s.descendant_count, s.created_at
        FROM summaries s
        JOIN summary_parents sp ON sp.summary_id = s.summary_id
        WHERE sp.parent_summary_id = ?
@@ -322,7 +365,8 @@ export class SummaryStore {
   async getSummaryParents(summaryId: string): Promise<SummaryRecord[]> {
     const rows = this.db
       .prepare(
-        `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count, s.file_ids, s.created_at
+        `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
+                s.file_ids, s.earliest_at, s.latest_at, s.descendant_count, s.created_at
        FROM summaries s
        JOIN summary_parents sp ON sp.parent_summary_id = s.summary_id
        WHERE sp.summary_id = ?
@@ -599,7 +643,8 @@ export class SummaryStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids, created_at
+        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+                earliest_at, latest_at, descendant_count, created_at
          FROM summaries
          ${whereClause}
          ORDER BY created_at DESC`,

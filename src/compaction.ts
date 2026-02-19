@@ -54,6 +54,7 @@ type CompactionPass = "leaf" | "condensed";
 type CompactionSummarizeOptions = {
   previousSummary?: string;
   isCondensed?: boolean;
+  depth?: number;
 };
 type CompactionSummarizeFn = (
   text: string,
@@ -80,6 +81,16 @@ type CondensedPhaseCandidate = {
 /** Estimate token count from character length (~4 chars per token). */
 function estimateTokens(content: string): number {
   return Math.ceil(content.length / 4);
+}
+
+/** Format a timestamp as `YYYY-MM-DD HH:mm UTC` for prompt source text. */
+function formatTimestamp(value: Date): string {
+  const year = value.getUTCFullYear();
+  const month = String(value.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(value.getUTCDate()).padStart(2, "0");
+  const hours = String(value.getUTCHours()).padStart(2, "0");
+  const minutes = String(value.getUTCMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hours}:${minutes} UTC`;
 }
 
 /** Generate a deterministic summary ID from content + timestamp. */
@@ -949,7 +960,7 @@ export class CompactionEngine {
     previousSummaryContent?: string,
   ): Promise<{ summaryId: string; level: CompactionLevel; content: string }> {
     // Fetch full message content for each context item
-    const messageContents: { messageId: number; content: string }[] = [];
+    const messageContents: { messageId: number; content: string; createdAt: Date }[] = [];
     for (const item of messageItems) {
       if (item.messageId == null) {
         continue;
@@ -959,11 +970,14 @@ export class CompactionEngine {
         messageContents.push({
           messageId: msg.messageId,
           content: msg.content,
+          createdAt: msg.createdAt,
         });
       }
     }
 
-    const concatenated = messageContents.map((m) => m.content).join("\n\n");
+    const concatenated = messageContents
+      .map((message) => `[${formatTimestamp(message.createdAt)}]\n${message.content}`)
+      .join("\n\n");
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
     );
@@ -988,6 +1002,15 @@ export class CompactionEngine {
       content: summary.content,
       tokenCount,
       fileIds,
+      earliestAt:
+        messageContents.length > 0
+          ? new Date(Math.min(...messageContents.map((message) => message.createdAt.getTime())))
+          : undefined,
+      latestAt:
+        messageContents.length > 0
+          ? new Date(Math.max(...messageContents.map((message) => message.createdAt.getTime())))
+          : undefined,
+      descendantCount: 0,
     });
 
     // Link to source messages
@@ -1032,7 +1055,14 @@ export class CompactionEngine {
       }
     }
 
-    const concatenated = summaryRecords.map((s) => s.content).join("\n\n");
+    const concatenated = summaryRecords
+      .map((summary) => {
+        const earliestAt = summary.earliestAt ?? summary.createdAt;
+        const latestAt = summary.latestAt ?? summary.createdAt;
+        const header = `[${formatTimestamp(earliestAt)} - ${formatTimestamp(latestAt)}]`;
+        return `${header}\n${summary.content}`;
+      })
+      .join("\n\n");
     const fileIds = dedupeOrderedIds(
       summaryRecords.flatMap((summary) => [
         ...summary.fileIds,
@@ -1049,6 +1079,7 @@ export class CompactionEngine {
       options: {
         previousSummary: previousSummaryContent,
         isCondensed: true,
+        depth: targetDepth + 1,
       },
     });
 
@@ -1064,6 +1095,31 @@ export class CompactionEngine {
       content: condensed.content,
       tokenCount,
       fileIds,
+      earliestAt:
+        summaryRecords.length > 0
+          ? new Date(
+              Math.min(
+                ...summaryRecords.map((summary) =>
+                  (summary.earliestAt ?? summary.createdAt).getTime(),
+                ),
+              ),
+            )
+          : undefined,
+      latestAt:
+        summaryRecords.length > 0
+          ? new Date(
+              Math.max(
+                ...summaryRecords.map((summary) => (summary.latestAt ?? summary.createdAt).getTime()),
+              ),
+            )
+          : undefined,
+      descendantCount: summaryRecords.reduce((count, summary) => {
+        const childDescendants =
+          typeof summary.descendantCount === "number" && Number.isFinite(summary.descendantCount)
+            ? Math.max(0, Math.floor(summary.descendantCount))
+            : 0;
+        return count + childDescendants + 1;
+      }, 0),
     });
 
     // Link to parent summaries
