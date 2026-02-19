@@ -20,7 +20,7 @@ export type LcmConfig = {
 
 export function resolveLcmConfig(env: NodeJS.ProcessEnv = process.env): LcmConfig {
   return {
-    enabled: env.LCM_ENABLED === "true",
+    enabled: env.LCM_ENABLED !== "false",
     databasePath: env.LCM_DATABASE_PATH ?? join(homedir(), ".openclaw", "lcm.db"),
     contextThreshold: parseFloat(env.LCM_CONTEXT_THRESHOLD ?? "0.75"),
     freshTailCount: parseInt(env.LCM_FRESH_TAIL_COUNT ?? "32", 10),
