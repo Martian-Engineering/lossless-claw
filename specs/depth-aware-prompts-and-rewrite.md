@@ -75,15 +75,23 @@ function buildCondensedSummaryPrompt(params: {
 
 The `depth` parameter is the target depth of the node being created (i.e., `targetDepth + 1` from `condensedPass`). It's already available in `condensedPass` as `targetDepth` — just needs threading through.
 
-#### d1 Prompt (leaves → depth 1)
+#### d1 Prompt — `condensed-d1.tmpl` (leaves → depth 1)
 
 ```
 You are compacting leaf-level conversation summaries into a single condensed memory node.
 
 You are preparing context for a fresh model instance that will continue this conversation.
-It already has <previous_context> — do NOT repeat information that appears there unchanged.
+{{if .PreviousContext -}}
+It already has the following preceding summary as context — do NOT repeat information
+that appears there unchanged. Focus on what is new, changed, or resolved:
 
-Focus on what is new, changed, or resolved:
+<previous_context>
+{{.PreviousContext}}
+</previous_context>
+
+{{else -}}
+Focus on what matters for continuation:
+{{end -}}
 - Decisions made and their rationale (only when rationale matters going forward)
 - Decisions from earlier that were altered or superseded, and what replaced them
 - Tasks or topics completed, with outcomes (not just "done" — what was the result?)
@@ -92,7 +100,9 @@ Focus on what is new, changed, or resolved:
 - Specific references (names, paths, URLs, identifiers) that future turns will need
 
 Drop minutiae — operational details that won't affect future turns:
+{{- if .PreviousContext}}
 - Context that hasn't changed since previous_context (the model already has it)
+{{- end}}
 - Intermediate exploration or dead ends when the conclusion is known (keep the conclusion)
 - Transient states that are already resolved
 - Tool-internal mechanics and process scaffolding
@@ -104,10 +114,10 @@ Include a timeline with timestamps (to the hour or half-hour) for significant ev
 decisions, completions, state changes. Present information in chronological order.
 Mark decisions that supersede earlier ones.
 
-Target length: about {targetTokens} tokens.
+Target length: about {{.TargetTokens}} tokens.
 ```
 
-#### d2 Prompt (d1s → depth 2)
+#### d2 Prompt — `condensed-d2.tmpl` (d1s → depth 2)
 
 ```
 You are condensing multiple session-level summaries into a higher-level memory node.
@@ -141,10 +151,10 @@ Include a timeline with timestamps (date and approximate time of day) for key mi
 decisions, completions, phase transitions. The reader should understand both what happened
 and roughly when.
 
-Target length: about {targetTokens} tokens.
+Target length: about {{.TargetTokens}} tokens.
 ```
 
-#### d3+ Prompt (d2s → depth 3+)
+#### d3+ Prompt — `condensed-d3.tmpl` (d2s → depth 3+)
 
 ```
 You are creating a high-level memory node from multiple phase-level summaries.
@@ -171,7 +181,7 @@ Use plain text. Be ruthlessly concise.
 
 Include a brief timeline with dates (or date ranges) for major milestones and decisions.
 
-Target length: about {targetTokens} tokens.
+Target length: about {{.TargetTokens}} tokens.
 ```
 
 ### 3. Summary time range tracking (optional schema addition)
@@ -475,44 +485,211 @@ the TUI remains responsive (can cancel with `esc`, status bar shows "Rewriting..
   5. Each completion updates the DB immediately so subsequent rewrites see fresh content
   6. On finish, refresh DAG and show summary: "Rewrote 38 summaries. Total: 45,230t → 38,100t (-7,130)"
 
-### Future: Operator-customizable prompts
+### Prompt Template System
 
-#### Prompt template directory
+Prompts are Go `text/template` files, not hardcoded strings. Defaults are embedded in the
+binary via `//go:embed`; filesystem overrides take precedence.
+
+#### Template files
 
 ```
-~/.openclaw/lcm-prompts/
-  leaf.txt           # Leaf summary prompt template
-  condensed-d1.txt   # Depth 1 condensed prompt
-  condensed-d2.txt   # Depth 2 condensed prompt
-  condensed-d3.txt   # Depth 3+ condensed prompt
+prompts/              # embedded in binary via //go:embed
+  leaf.tmpl           # Leaf summary prompt (depth 0)
+  condensed-d1.tmpl   # Depth 1 condensed prompt
+  condensed-d2.tmpl   # Depth 2 condensed prompt
+  condensed-d3.tmpl   # Depth 3+ condensed prompt
 ```
 
-Templates use `{targetTokens}`, `{previousContext}`, and `{conversationSegment}` as placeholders. If the directory doesn't exist or a file is missing, fall back to built-in defaults.
+Filesystem override location (checked first):
+```
+~/.config/lcm-tui/prompts/
+  leaf.tmpl
+  condensed-d1.tmpl
+  condensed-d2.tmpl
+  condensed-d3.tmpl
+```
 
-This allows operators to:
-- Tune summary style for their use case (coding-heavy, research-heavy, mixed)
-- Add domain-specific preservation/drop rules
-- Experiment with different prompt strategies without code changes
+Resolution order per template: filesystem path → embedded default. A missing filesystem
+file silently falls back to embedded. Partial overrides work — override just `condensed-d1.tmpl`
+and the rest use defaults.
 
-#### Configuration in openclaw.json
+#### Template variables
 
-```json
-{
-  "plugins": {
-    "lcm": {
-      "promptDir": "~/.openclaw/lcm-prompts"
-    }
-  }
+All templates receive a `PromptVars` struct:
+
+```go
+type PromptVars struct {
+    TargetTokens    int    // token budget for the output
+    PreviousContext string // content of preceding summary (empty if none)
+    ChildCount      int    // number of source items (messages or child summaries)
+    TimeRange       string // formatted range, e.g. "2026-02-17 15:37 – 21:14 UTC"
+    Depth           int    // output depth (0=leaf, 1=d1, etc.)
 }
 ```
 
-For the initial implementation, prompts are hardcoded in summarize.ts (and their Go equivalents in lcm-tui rewrite.go). The prompt-dir mechanism is a follow-up.
+#### Conditional blocks for optional fields
+
+The key design problem: `PreviousContext` is only meaningful for d1 summaries, and even
+then only when a preceding summary exists. Go's `text/template` handles this naturally —
+`{{if .PreviousContext}}` is falsy on empty string:
+
+```
+{{if .PreviousContext -}}
+The model already has this preceding summary as context — do NOT repeat information
+that appears there unchanged. Focus on what is new, changed, or resolved:
+
+<previous_context>
+{{.PreviousContext}}
+</previous_context>
+
+{{else -}}
+Focus on what matters for continuation:
+{{end -}}
+```
+
+This pattern works for any optional field. Template authors can use `{{if}}`, `{{range}}`,
+`{{with}}`, and all standard Go template directives.
+
+#### Template loading in Go
+
+```go
+import "embed"
+
+//go:embed prompts/*.tmpl
+var defaultPrompts embed.FS
+
+const defaultPromptDir = "~/.config/lcm-tui/prompts"
+
+func loadPromptTemplate(name string, overrideDir string) (*template.Template, error) {
+    // Check filesystem override first
+    if overrideDir != "" {
+        overridePath := filepath.Join(expandHome(overrideDir), name)
+        if data, err := os.ReadFile(overridePath); err == nil {
+            return template.New(name).Parse(string(data))
+        }
+    }
+    // Check default filesystem location
+    defaultPath := filepath.Join(expandHome(defaultPromptDir), name)
+    if data, err := os.ReadFile(defaultPath); err == nil {
+        return template.New(name).Parse(string(data))
+    }
+    // Fall back to embedded default
+    data, err := defaultPrompts.ReadFile("prompts/" + name)
+    if err != nil {
+        return nil, fmt.Errorf("missing embedded prompt template %q: %w", name, err)
+    }
+    return template.New(name).Parse(string(data))
+}
+
+func promptNameForDepth(depth int) string {
+    switch {
+    case depth == 0:
+        return "leaf.tmpl"
+    case depth == 1:
+        return "condensed-d1.tmpl"
+    case depth == 2:
+        return "condensed-d2.tmpl"
+    default:
+        return "condensed-d3.tmpl"
+    }
+}
+
+func renderPrompt(depth int, vars PromptVars, overrideDir string) (string, error) {
+    name := promptNameForDepth(depth)
+    tmpl, err := loadPromptTemplate(name, overrideDir)
+    if err != nil {
+        return "", err
+    }
+    var buf bytes.Buffer
+    if err := tmpl.Execute(&buf, vars); err != nil {
+        return "", fmt.Errorf("execute template %q: %w", name, err)
+    }
+    return buf.String(), nil
+}
+```
+
+#### `lcm-tui prompts` subcommand
+
+For discoverability and iteration workflow:
+
+```
+lcm-tui prompts --list                  # show active template sources (embedded vs override)
+lcm-tui prompts --export [dir]          # dump all defaults to dir (default: ~/.config/lcm-tui/prompts/)
+lcm-tui prompts --show <name>           # print active template to stdout (e.g. "condensed-d1")
+lcm-tui prompts --diff <name>           # diff override vs embedded default
+lcm-tui prompts --render <name> [flags] # render template with sample vars for preview
+```
+
+`--export` enables the iteration workflow: export defaults → edit in your editor → `w` on a
+node in the TUI to test → see the result → tweak → repeat. No recompilation needed.
+
+`--list` output example:
+```
+leaf.tmpl           embedded (no override)
+condensed-d1.tmpl   ~/.config/lcm-tui/prompts/condensed-d1.tmpl (override)
+condensed-d2.tmpl   embedded (no override)
+condensed-d3.tmpl   embedded (no override)
+```
+
+`--render` lets you preview what a prompt looks like with realistic variable values before
+actually sending it to an API:
+```
+lcm-tui prompts --render condensed-d1 --target-tokens 2000 --previous-context "Some prior summary..."
+```
+
+#### CLI and TUI integration
+
+The `--prompt-dir` flag is available on both the `rewrite` subcommand and threaded into the
+TUI's rewrite flow:
+
+```
+lcm-tui rewrite 642 --all --apply --prompt-dir ~/my-prompts/
+```
+
+In the TUI, the prompt dir is resolved at startup from (in order):
+1. `--prompt-dir` CLI flag (if lcm-tui was launched with it)
+2. `~/.config/lcm-tui/prompts/` (default filesystem location)
+3. Embedded defaults
+
+The TUI rewrite preview phase (before firing the API call) shows the rendered prompt text,
+so you can see exactly what will be sent — including which template source was used.
+
+#### Relationship to open-lcm plugin (TypeScript)
+
+The open-lcm plugin (TypeScript, runs inside OpenClaw) and lcm-tui (Go, standalone binary)
+need the same prompt logic. Two approaches:
+
+**Option A: Duplicate prompts in both codebases.** Simple, no cross-language dependency.
+The prompts are ~50 lines each and change infrequently. Divergence risk is low and
+acceptable during active development.
+
+**Option B: Shared prompt files on disk.** Both open-lcm and lcm-tui read from
+`~/.config/lcm-tui/prompts/` (or a shared location). Open-lcm would need its own
+`text/template`-compatible parser in TypeScript — doable but adds complexity.
+
+**Recommendation:** Option A for now. The prompts will stabilize through iteration with the
+rewrite tool, then be ported to open-lcm's TypeScript. Once they're stable, Option B can be
+revisited if drift becomes a problem.
 
 ---
 
 ## Implementation Plan
 
-### Phase 1: Timestamp injection + depth-aware prompts (open-lcm)
+### Phase 1: lcm-tui prompt templates + rewrite tool
+
+**Files:** new `prompts/*.tmpl`, new `rewrite.go`, new `prompts.go`, modify `main.go`
+
+1. Create `prompts/` directory with 4 `.tmpl` files (embedded via `//go:embed`)
+2. Implement `prompts.go`: template loading, resolution, rendering, `PromptVars` type
+3. Implement `prompts` subcommand (`--list`, `--export`, `--show`, `--diff`, `--render`)
+4. Implement `rewrite.go`: source text construction (timestamped), prompt rendering,
+   bottom-up ordering, dry-run output with diff, `--apply` mode, API client reuse from repair.go
+5. Wire `w`/`W` keybindings into TUI DAG view with async `tea.Cmd` pattern
+6. Test on conversation 642: rewrite individual nodes, compare old vs new quality
+
+Estimated: ~800-1000 lines across rewrite.go + prompts.go + templates.
+
+### Phase 2: Timestamp injection + depth-aware prompts in open-lcm (TypeScript)
 
 **Files:** `src/summarize.ts`, `src/compaction.ts`
 
@@ -522,28 +699,15 @@ For the initial implementation, prompts are hardcoded in summarize.ts (and their
 4. Modify `condensedPass` to prepend time ranges to each child summary
 5. Add `depth` to `LcmSummarizeOptions`
 6. Thread `depth` from `condensedPass` through to `buildCondensedSummaryPrompt`
-7. Replace single condensed prompt with depth-dispatching d1/d2/d3+ prompts
+7. Port the 4 prompt templates from Go `text/template` to TypeScript string interpolation
 8. Update tests
 
 Estimated: ~100-150 lines changed across 2 files + tests.
 
-### Phase 2: Rewrite tool (lcm-tui)
+### Phase 3: Iteration and stabilization
 
-**Files:** new `rewrite.go`, modify `main.go`
-
-1. Implement `rewrite` subcommand with source text construction (timestamped)
-2. Implement depth-aware prompt selection (Go equivalents of the three prompts)
-3. Implement bottom-up ordering logic
-4. Implement dry-run output with diff
-5. Implement `--apply` mode with database writes
-6. Add `w`/`W` keybindings to TUI DAG view
-7. Test on conversation 642
-
-Estimated: ~600-800 lines in rewrite.go (comparable to repair.go).
-
-### Phase 3: Operator customization (future)
-
-1. Prompt template directory loading
-2. openclaw.json config for prompt-dir
-3. lcm-tui `--prompt-dir` flag
-4. Documentation for operators
+1. Use `lcm-tui rewrite` to A/B test prompt variants on real conversations
+2. Compare token efficiency, information retention, and readability
+3. Iterate on templates without recompilation
+4. Once prompts stabilize, ensure TypeScript port matches
+5. Consider shared prompt files (Option B) if maintaining two copies becomes painful
