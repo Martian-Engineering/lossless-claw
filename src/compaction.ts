@@ -299,12 +299,12 @@ export class CompactionEngine {
     let level = leafResult.level;
 
     const incrementalMaxDepth = this.resolveIncrementalMaxDepth();
-    const condensedFanout = this.resolveCondensedMinFanout();
     const condensedMinChunkTokens = this.resolveCondensedMinChunkTokens();
     if (incrementalMaxDepth > 0) {
       for (let targetDepth = 0; targetDepth < incrementalMaxDepth; targetDepth++) {
+        const fanout = this.resolveFanoutForDepth(targetDepth, false);
         const chunk = await this.selectOldestChunkAtDepth(conversationId, targetDepth);
-        if (chunk.items.length < condensedFanout || chunk.summaryTokens < condensedMinChunkTokens) {
+        if (chunk.items.length < fanout || chunk.summaryTokens < condensedMinChunkTokens) {
           break;
         }
 
