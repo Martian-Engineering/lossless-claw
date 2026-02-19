@@ -247,7 +247,7 @@ Low-level DAG expansion (sub-agent only). Main agents should use `lcm_expand_que
 
 ## Database
 
-LCM uses SQLite (via better-sqlite3, inherited from OpenClaw). The default database path is `~/.openclaw/lcm.db`.
+LCM uses SQLite via Node's built-in `node:sqlite` module. The default database path is `~/.openclaw/lcm.db`.
 
 ### Schema overview
 
