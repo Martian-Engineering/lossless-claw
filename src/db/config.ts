@@ -16,6 +16,8 @@ export type LcmConfig = {
   maxExpandTokens: number;
   largeFileTokenThreshold: number;
   autocompactDisabled: boolean;
+  /** IANA timezone for timestamps in summaries (from TZ env or system default) */
+  timezone: string;
 };
 
 export function resolveLcmConfig(env: NodeJS.ProcessEnv = process.env): LcmConfig {
@@ -34,5 +36,6 @@ export function resolveLcmConfig(env: NodeJS.ProcessEnv = process.env): LcmConfi
     maxExpandTokens: parseInt(env.LCM_MAX_EXPAND_TOKENS ?? "4000", 10),
     largeFileTokenThreshold: parseInt(env.LCM_LARGE_FILE_TOKEN_THRESHOLD ?? "25000", 10),
     autocompactDisabled: env.LCM_AUTOCOMPACT_DISABLED === "true",
+    timezone: env.TZ ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
   };
 }

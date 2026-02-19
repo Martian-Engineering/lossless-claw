@@ -542,6 +542,7 @@ export class LcmContextEngine implements ContextEngine {
       leafTargetTokens: this.config.leafTargetTokens,
       condensedTargetTokens: this.config.condensedTargetTokens,
       maxRounds: 10,
+      timezone: this.config.timezone,
     };
     this.compaction = new CompactionEngine(
       this.conversationStore,

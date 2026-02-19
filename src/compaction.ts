@@ -47,6 +47,8 @@ export interface CompactionConfig {
   condensedTargetTokens: number;
   /** Maximum compaction rounds (default 10) */
   maxRounds: number;
+  /** IANA timezone for timestamps in summaries (default: UTC) */
+  timezone?: string;
 }
 
 type CompactionLevel = "normal" | "aggressive" | "fallback";
@@ -83,14 +85,47 @@ function estimateTokens(content: string): number {
   return Math.ceil(content.length / 4);
 }
 
-/** Format a timestamp as `YYYY-MM-DD HH:mm UTC` for prompt source text. */
-function formatTimestamp(value: Date): string {
-  const year = value.getUTCFullYear();
-  const month = String(value.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(value.getUTCDate()).padStart(2, "0");
-  const hours = String(value.getUTCHours()).padStart(2, "0");
-  const minutes = String(value.getUTCMinutes()).padStart(2, "0");
-  return `${year}-${month}-${day} ${hours}:${minutes} UTC`;
+/** Format a timestamp as `YYYY-MM-DD HH:mm TZ` for prompt source text. */
+function formatTimestamp(value: Date, timezone: string = "UTC"): string {
+  try {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    const parts = Object.fromEntries(
+      fmt.formatToParts(value).map((p) => [p.type, p.value]),
+    );
+    const tzAbbr = timezone === "UTC" ? "UTC" : shortTzAbbr(value, timezone);
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} ${tzAbbr}`;
+  } catch {
+    // Fallback to UTC on invalid timezone
+    const year = value.getUTCFullYear();
+    const month = String(value.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(value.getUTCDate()).padStart(2, "0");
+    const hours = String(value.getUTCHours()).padStart(2, "0");
+    const minutes = String(value.getUTCMinutes()).padStart(2, "0");
+    return `${year}-${month}-${day} ${hours}:${minutes} UTC`;
+  }
+}
+
+/** Extract short timezone abbreviation (e.g. "PST", "PDT", "EST"). */
+function shortTzAbbr(value: Date, timezone: string): string {
+  try {
+    const abbr = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      timeZoneName: "short",
+    })
+      .formatToParts(value)
+      .find((p) => p.type === "timeZoneName")?.value;
+    return abbr ?? timezone;
+  } catch {
+    return timezone;
+  }
 }
 
 /** Generate a deterministic summary ID from content + timestamp. */
@@ -976,7 +1011,7 @@ export class CompactionEngine {
     }
 
     const concatenated = messageContents
-      .map((message) => `[${formatTimestamp(message.createdAt)}]\n${message.content}`)
+      .map((message) => `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${message.content}`)
       .join("\n\n");
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
@@ -1059,7 +1094,8 @@ export class CompactionEngine {
       .map((summary) => {
         const earliestAt = summary.earliestAt ?? summary.createdAt;
         const latestAt = summary.latestAt ?? summary.createdAt;
-        const header = `[${formatTimestamp(earliestAt)} - ${formatTimestamp(latestAt)}]`;
+        const tz = this.config.timezone;
+        const header = `[${formatTimestamp(earliestAt, tz)} - ${formatTimestamp(latestAt, tz)}]`;
         return `${header}\n${summary.content}`;
       })
       .join("\n\n");
