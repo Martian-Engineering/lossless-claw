@@ -24,6 +24,54 @@ type SummaryMode = "normal" | "aggressive";
 
 const DEFAULT_CONDENSED_TARGET_TOKENS = 2000;
 
+/** Normalize provider ids for stable config/profile lookup. */
+function normalizeProviderId(provider: string): string {
+  return provider.trim().toLowerCase();
+}
+
+/**
+ * Resolve provider API override from legacy OpenClaw config.
+ *
+ * When model ids are custom/forward-compat, this hint allows deps.complete to
+ * construct a valid pi-ai Model object even if getModel(provider, model) misses.
+ */
+function resolveProviderApiFromLegacyConfig(
+  config: unknown,
+  provider: string,
+): string | undefined {
+  if (!config || typeof config !== "object") {
+    return undefined;
+  }
+  const providers = (config as { models?: { providers?: Record<string, unknown> } }).models
+    ?.providers;
+  if (!providers || typeof providers !== "object") {
+    return undefined;
+  }
+
+  const direct = providers[provider];
+  if (direct && typeof direct === "object") {
+    const api = (direct as { api?: unknown }).api;
+    if (typeof api === "string" && api.trim()) {
+      return api.trim();
+    }
+  }
+
+  const normalizedProvider = normalizeProviderId(provider);
+  for (const [entryProvider, value] of Object.entries(providers)) {
+    if (normalizeProviderId(entryProvider) !== normalizedProvider) {
+      continue;
+    }
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    const api = (value as { api?: unknown }).api;
+    if (typeof api === "string" && api.trim()) {
+      return api.trim();
+    }
+  }
+  return undefined;
+}
+
 /** Approximate token estimate used for target-sizing prompts. */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
@@ -187,27 +235,35 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   const modelHint =
     typeof params.legacyParams.model === "string" ? params.legacyParams.model.trim() : "";
   const modelRef = modelHint || undefined;
+  console.error(`[lcm] createLcmSummarize: providerHint="${providerHint}", modelHint="${modelHint}", modelRef="${modelRef}"`);
 
   let resolved: { provider: string; model: string };
   try {
     resolved = params.deps.resolveModel(modelRef);
-  } catch {
+    console.error(`[lcm] createLcmSummarize: resolved model=${resolved.model}, provider=${resolved.provider}`);
+  } catch (err) {
+    console.error(`[lcm] createLcmSummarize: resolveModel FAILED:`, err instanceof Error ? err.message : err);
     return undefined;
   }
 
   const provider = providerHint || resolved.provider;
   const model = resolved.model;
   if (!provider || !model) {
+    console.error(`[lcm] createLcmSummarize: empty provider="${provider}" or model="${model}"`);
     return undefined;
   }
+  const authProfileId =
+    typeof params.legacyParams.authProfileId === "string" &&
+    params.legacyParams.authProfileId.trim()
+      ? params.legacyParams.authProfileId.trim()
+      : undefined;
+  const agentDir =
+    typeof params.legacyParams.agentDir === "string" && params.legacyParams.agentDir.trim()
+      ? params.legacyParams.agentDir.trim()
+      : undefined;
+  const providerApi = resolveProviderApiFromLegacyConfig(params.legacyParams.config, provider);
 
-  let apiKey: string;
-  try {
-    apiKey =
-      params.deps.getApiKey(provider, model) ?? params.deps.requireApiKey(provider, model);
-  } catch {
-    return undefined;
-  }
+  const apiKey = params.deps.getApiKey(provider, model);
 
   const runtimeLcmConfig = resolveLcmConfig();
   const condensedTargetTokens =
@@ -252,6 +308,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       provider,
       model,
       apiKey,
+      providerApi,
+      authProfileId,
+      agentDir,
+      runtimeConfig: params.legacyParams.config,
       messages: [
         {
           role: "user",
@@ -270,6 +330,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       .trim();
 
     if (!summary) {
+      console.error(`[lcm] summarize got empty content from LLM (${result.content.length} blocks, types: ${result.content.map(b => b.type).join(",")}), falling back to truncation`);
       return buildDeterministicFallbackSummary(text, targetTokens);
     }
 

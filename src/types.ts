@@ -14,7 +14,11 @@ import type { LcmConfig } from "./db/config.js";
 export type CompleteFn = (params: {
   provider?: string;
   model: string;
-  apiKey: string;
+  apiKey?: string;
+  providerApi?: string;
+  authProfileId?: string;
+  agentDir?: string;
+  runtimeConfig?: unknown;
   messages: Array<{ role: string; content: unknown }>;
   system?: string;
   maxTokens: number;
