@@ -4,15 +4,17 @@ Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/op
 
 ## What it does
 
-When a conversation grows beyond the model's context window, OpenClaw normally truncates older messages. LCM instead:
+When a conversation grows beyond the model's context window, OpenClaw (just like all of the other agents) normally truncates older messages. LCM instead:
 
 1. **Persists every message** in a SQLite database, organized by conversation
-2. **Summarizes chunks** of older messages into leaf summaries using your configured LLM
+2. **Summarizes chunks** of older messages into summaries using your configured LLM
 3. **Condenses summaries** into higher-level nodes as they accumulate, forming a DAG (directed acyclic graph)
-4. **Assembles context** each turn by combining summaries + recent raw messages under a token budget
-5. **Provides tools** (`lcm_grep`, `lcm_describe`, `lcm_expand_query`) so agents can search and recall details from compacted history
+4. **Assembles context** each turn by combining summaries + recent raw messages
+5. **Provides tools** (`lcm_grep`, `lcm_describe`, `lcm_expand`) so agents can search and recall details from compacted history
 
 Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.
+
+**It feels like talking to an agent that never forgets. Because it doesn't. In normal operation, you'll never need to think about compaction again.**
 
 ## Installation
 
