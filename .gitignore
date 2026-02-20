@@ -7,3 +7,4 @@ dist/
 # TUI
 tui/lcm-tui
 dist/
+tui/tui
