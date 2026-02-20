@@ -1,10 +1,27 @@
 {
-  "name": "@martian-engineering/lossless-claw",
+  "name": "lossless-claw",
   "version": "0.1.0",
-  "description": "Lossless Context Management plugin for OpenClaw \u2014 DAG-based conversation summarization with incremental compaction",
+  "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with incremental compaction",
   "type": "module",
   "main": "index.ts",
-  "private": true,
+  "license": "MIT",
+  "author": "Josh Lehman <josh@martian.engineering>",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "context-management",
+    "llm",
+    "summarization",
+    "conversation-memory",
+    "dag"
+  ],
+  "files": [
+    "index.ts",
+    "src/**/*.ts",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
   "dependencies": {
     "@sinclair/typebox": "0.34.48"
   },
