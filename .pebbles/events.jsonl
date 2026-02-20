@@ -14,3 +14,4 @@
 {"type":"close","timestamp":"2026-02-20T15:42:48.356723Z","issue_id":"open-lcm-2b7","payload":{}}
 {"type":"create","timestamp":"2026-02-20T18:27:44.70641Z","issue_id":"lossless-claw-1c2","payload":{"description":"In the sessions list screen, display an estimate of the total tokens contained in each session JSONL file. Use the existing len/4 estimator. Helps users gauge raw content size before drilling in.","priority":"2","title":"TUI sessions view: show estimated total tokens per session file","type":"enhancement"}}
 {"type":"status_update","timestamp":"2026-02-20T18:29:58.353543Z","issue_id":"lossless-claw-1c2","payload":{"status":"in_progress"}}
+{"type":"close","timestamp":"2026-02-20T18:32:05.700988Z","issue_id":"lossless-claw-1c2","payload":{}}

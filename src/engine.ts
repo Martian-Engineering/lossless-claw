@@ -647,9 +647,7 @@ export class LcmContextEngine implements ContextEngine {
     customInstructions?: string;
   }): Promise<(text: string, aggressive?: boolean) => Promise<string>> {
     const lp = params.legacyParams ?? {};
-    console.error(`[lcm] resolveSummarize called, legacyParams keys: ${Object.keys(lp).join(",")}, has summarize fn: ${typeof lp.summarize === "function"}`);
     if (typeof lp.summarize === "function") {
-      console.error(`[lcm] resolveSummarize: using legacy summarize function`);
       return lp.summarize as (text: string, aggressive?: boolean) => Promise<string>;
     }
     try {
@@ -659,7 +657,6 @@ export class LcmContextEngine implements ContextEngine {
         customInstructions: params.customInstructions,
       });
       if (runtimeSummarizer) {
-        console.error(`[lcm] resolveSummarize: got runtime summarizer`);
         return runtimeSummarizer;
       }
       console.error(`[lcm] resolveSummarize: createLcmSummarizeFromLegacyParams returned undefined`);

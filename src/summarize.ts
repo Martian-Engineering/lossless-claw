@@ -338,12 +338,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   const modelHint =
     typeof params.legacyParams.model === "string" ? params.legacyParams.model.trim() : "";
   const modelRef = modelHint || undefined;
-  console.error(`[lcm] createLcmSummarize: providerHint="${providerHint}", modelHint="${modelHint}", modelRef="${modelRef}"`);
 
   let resolved: { provider: string; model: string };
   try {
     resolved = params.deps.resolveModel(modelRef, providerHint || undefined);
-    console.error(`[lcm] createLcmSummarize: resolved model=${resolved.model}, provider=${resolved.provider}`);
   } catch (err) {
     console.error(`[lcm] createLcmSummarize: resolveModel FAILED:`, err instanceof Error ? err.message : err);
     return undefined;
