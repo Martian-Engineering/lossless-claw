@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -275,6 +276,12 @@ func loadSessions(agent agentEntry, lcmDBPath string) ([]sessionEntry, error) {
 	return sessions, nil
 }
 
+// messageTypePattern matches `"type":"message"` or `"type": "message"` near the
+// start of a JSONL line. This avoids full JSON unmarshal per line, which is
+// critical for large session files (100MB+).
+var messageTypePattern = []byte(`"type":"message"`)
+var messageTypePatternSpaced = []byte(`"type": "message"`)
+
 func countMessages(path string) (int, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -292,11 +299,10 @@ func countMessages(path string) (int, error) {
 		if len(line) == 0 {
 			continue
 		}
-		var item sessionLine
-		if err := json.Unmarshal(line, &item); err != nil {
-			continue
-		}
-		if item.Type == "message" {
+		// Fast path: check for "type":"message" pattern in the line bytes.
+		// The "type" field is always near the start of JSONL session lines,
+		// and "message" doesn't appear as a type value in nested content.
+		if bytes.Contains(line, messageTypePattern) || bytes.Contains(line, messageTypePatternSpaced) {
 			count++
 		}
 	}
