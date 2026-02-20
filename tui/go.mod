@@ -1,4 +1,4 @@
-module github.com/Martian-Engineering/openclaw-lcm/tui
+module github.com/Martian-Engineering/lossless-claw/tui
 
 go 1.24.5
 

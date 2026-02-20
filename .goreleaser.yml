@@ -38,4 +38,4 @@ changelog:
 release:
   github:
     owner: Martian-Engineering
-    name: openclaw-lcm
+    name: lossless-claw

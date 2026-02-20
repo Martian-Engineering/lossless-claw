@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes how openclaw-lcm works internally — the data model, compaction lifecycle, context assembly, and expansion system.
+This document describes how lossless-claw works internally — the data model, compaction lifecycle, context assembly, and expansion system.
 
 ## Data model
 

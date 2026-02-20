@@ -86,7 +86,7 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
 }
 
 function createEngine(): LcmContextEngine {
-  const tempDir = mkdtempSync(join(tmpdir(), "openclaw-lcm-engine-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
   return new LcmContextEngine(createTestDeps(config));
@@ -98,13 +98,13 @@ function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
 }
 
 function createSessionFilePath(name: string): string {
-  const tempDir = mkdtempSync(join(tmpdir(), "openclaw-lcm-session-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-session-"));
   tempDirs.push(tempDir);
   return join(tempDir, `${name}.jsonl`);
 }
 
 function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine {
-  const tempDir = mkdtempSync(join(tmpdir(), "openclaw-lcm-engine-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
   tempDirs.push(tempDir);
   const config = {
     ...createTestConfig(join(tempDir, "lcm.db")),
@@ -115,7 +115,7 @@ function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine
 
 async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
   const originalHome = process.env.HOME;
-  const tempHome = mkdtempSync(join(tmpdir(), "openclaw-lcm-home-"));
+  const tempHome = mkdtempSync(join(tmpdir(), "lossless-claw-home-"));
   tempDirs.push(tempHome);
   process.env.HOME = tempHome;
 
@@ -360,7 +360,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
 
 describe("LcmContextEngine connection lifecycle", () => {
   it("keeps shared sqlite handle open while another engine instance is active", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "openclaw-lcm-shared-db-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-shared-db-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "lcm.db");
 

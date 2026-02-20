@@ -16,7 +16,7 @@ afterEach(() => {
 
 describe("runLcmMigrations summary depth backfill", () => {
   it("adds depth and metadata from summary lineage", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "openclaw-lcm-migration-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "legacy.db");
     const db = getLcmConnection(dbPath);

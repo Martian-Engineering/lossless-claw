@@ -2,7 +2,7 @@
 
 ## Overview
 
-Extract LCM from OpenClaw's in-tree `src/plugins/lcm/` into this standalone plugin package `@martian-engineering/open-lcm`. The source code has already been copied into `src/` and `test/` directories but all imports still reference OpenClaw core internals. The main task is to refactor imports using dependency injection.
+Extract LCM from OpenClaw's in-tree `src/plugins/lcm/` into this standalone plugin package `@martian-engineering/lossless-claw`. The source code has already been copied into `src/` and `test/` directories but all imports still reference OpenClaw core internals. The main task is to refactor imports using dependency injection.
 
 ## Architecture
 

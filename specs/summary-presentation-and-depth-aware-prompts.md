@@ -2,7 +2,7 @@
 
 **Status:** Ready for implementation  
 **Date:** 2026-02-19  
-**Scope:** openclaw-lcm plugin (TypeScript) — schema, assembly, and summarization  
+**Scope:** lossless-claw plugin (TypeScript) — schema, assembly, and summarization  
 **Prerequisite:** TUI prompts (already implemented in lcm-tui)
 
 ## Problem

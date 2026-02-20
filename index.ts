@@ -1,5 +1,5 @@
 /**
- * @martian-engineering/openclaw-lcm — Lossless Context Management plugin for OpenClaw
+ * @martian-engineering/lossless-claw — Lossless Context Management plugin for OpenClaw
  *
  * DAG-based conversation summarization with incremental compaction,
  * full-text search, and sub-agent expansion.
@@ -743,7 +743,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 }
 
 const lcmPlugin = {
-  id: "openclaw-lcm",
+  id: "lossless-claw",
   name: "Lossless Context Management",
   description:
     "DAG-based conversation summarization with incremental compaction, full-text search, and sub-agent expansion",
@@ -768,7 +768,7 @@ const lcmPlugin = {
     const deps = createLcmDependencies(api);
     const lcm = new LcmContextEngine(deps);
 
-    api.registerContextEngine("openclaw-lcm", () => lcm);
+    api.registerContextEngine("lossless-claw", () => lcm);
     api.registerTool((ctx) =>
       createLcmGrepTool({
         deps,

@@ -1,7 +1,7 @@
 {
-  "name": "@martian-engineering/openclaw-lcm",
+  "name": "@martian-engineering/lossless-claw",
   "version": "0.1.0",
-  "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with incremental compaction",
+  "description": "Lossless Context Management plugin for OpenClaw \u2014 DAG-based conversation summarization with incremental compaction",
   "type": "module",
   "main": "index.ts",
   "private": true,
@@ -21,5 +21,13 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Martian-Engineering/lossless-claw.git"
+  },
+  "homepage": "https://github.com/Martian-Engineering/lossless-claw#readme",
+  "bugs": {
+    "url": "https://github.com/Martian-Engineering/lossless-claw/issues"
   }
 }

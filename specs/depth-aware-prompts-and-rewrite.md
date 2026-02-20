@@ -2,7 +2,7 @@
 
 **Status:** Draft  
 **Date:** 2026-02-19  
-**Scope:** OpenClaw LCM (open-lcm plugin) + lcm-tui
+**Scope:** Lossless Claw plugin + lcm-tui
 
 ## Problem
 
@@ -654,21 +654,21 @@ In the TUI, the prompt dir is resolved at startup from (in order):
 The TUI rewrite preview phase (before firing the API call) shows the rendered prompt text,
 so you can see exactly what will be sent — including which template source was used.
 
-#### Relationship to open-lcm plugin (TypeScript)
+#### Relationship to lossless-claw plugin (TypeScript)
 
-The open-lcm plugin (TypeScript, runs inside OpenClaw) and lcm-tui (Go, standalone binary)
+The lossless-claw plugin (TypeScript, runs inside OpenClaw) and lcm-tui (Go, standalone binary)
 need the same prompt logic. Two approaches:
 
 **Option A: Duplicate prompts in both codebases.** Simple, no cross-language dependency.
 The prompts are ~50 lines each and change infrequently. Divergence risk is low and
 acceptable during active development.
 
-**Option B: Shared prompt files on disk.** Both open-lcm and lcm-tui read from
+**Option B: Shared prompt files on disk.** Both lossless-claw and lcm-tui read from
 `~/.config/lcm-tui/prompts/` (or a shared location). Open-lcm would need its own
 `text/template`-compatible parser in TypeScript — doable but adds complexity.
 
 **Recommendation:** Option A for now. The prompts will stabilize through iteration with the
-rewrite tool, then be ported to open-lcm's TypeScript. Once they're stable, Option B can be
+rewrite tool, then be ported to lossless-claw's TypeScript. Once they're stable, Option B can be
 revisited if drift becomes a problem.
 
 ---
@@ -689,7 +689,7 @@ revisited if drift becomes a problem.
 
 Estimated: ~800-1000 lines across rewrite.go + prompts.go + templates.
 
-### Phase 2: Timestamp injection + depth-aware prompts in open-lcm (TypeScript)
+### Phase 2: Timestamp injection + depth-aware prompts in lossless-claw (TypeScript)
 
 **Files:** `src/summarize.ts`, `src/compaction.ts`
 

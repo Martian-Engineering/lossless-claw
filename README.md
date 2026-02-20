@@ -1,4 +1,4 @@
-# openclaw-lcm
+# lossless-claw
 
 Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://voltropy.com/LCM). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
 
@@ -26,8 +26,8 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 ```bash
 # Clone the repo
-git clone https://github.com/Martian-Engineering/openclaw-lcm.git
-cd openclaw-lcm
+git clone https://github.com/Martian-Engineering/lossless-claw.git
+cd lossless-claw
 
 # Install dependencies
 npm install
@@ -41,10 +41,10 @@ Add the plugin to your OpenClaw config (`~/.openclaw/openclaw.json`):
 {
   "plugins": {
     "paths": [
-      "/path/to/openclaw-lcm"
+      "/path/to/lossless-claw"
     ],
     "slots": {
-      "contextEngine": "openclaw-lcm"
+      "contextEngine": "lossless-claw"
     }
   }
 }
@@ -60,13 +60,13 @@ LCM is configured through a combination of plugin config and environment variabl
 
 ### Plugin config
 
-Add an `openclaw-lcm` block under `plugins.config` in your OpenClaw config:
+Add an `lossless-claw` block under `plugins.config` in your OpenClaw config:
 
 ```json
 {
   "plugins": {
     "config": {
-      "openclaw-lcm": {
+      "lossless-claw": {
         "enabled": true,
         "freshTailCount": 32,
         "contextThreshold": 0.75,
@@ -253,7 +253,7 @@ The repo includes an interactive terminal UI (`tui/`) for inspecting, repairing,
 
 **From GitHub releases** (recommended):
 
-Download the latest binary for your platform from [Releases](https://github.com/Martian-Engineering/openclaw-lcm/releases).
+Download the latest binary for your platform from [Releases](https://github.com/Martian-Engineering/lossless-claw/releases).
 
 **Build from source:**
 
@@ -261,7 +261,7 @@ Download the latest binary for your platform from [Releases](https://github.com/
 cd tui
 go build -o lcm-tui .
 # or: make build
-# or: go install github.com/Martian-Engineering/openclaw-lcm/tui@latest
+# or: go install github.com/Martian-Engineering/lossless-claw/tui@latest
 ```
 
 Requires Go 1.24+.

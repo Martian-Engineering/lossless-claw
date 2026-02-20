@@ -7,9 +7,9 @@ Add LCM to your OpenClaw config:
 ```json
 {
   "plugins": {
-    "paths": ["/path/to/openclaw-lcm"],
+    "paths": ["/path/to/lossless-claw"],
     "slots": {
-      "contextEngine": "openclaw-lcm"
+      "contextEngine": "lossless-claw"
     }
   }
 }
