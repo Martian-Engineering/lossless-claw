@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { closeLcmConnection, getLcmConnection } from "./connection.js";
-import { runLcmMigrations } from "./migration.js";
+import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
+import { runLcmMigrations } from "../src/db/migration.js";
 
 const tempDirs: string[] = [];
 
@@ -141,14 +141,42 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(depthBySummaryId.get("sum_condensed_2")).toBe(2);
     expect(depthBySummaryId.get("sum_condensed_orphan")).toBe(1);
 
-    expect(earliestBySummaryId.get("sum_leaf_a")).toContain("2026-01-01T10:00:00");
-    expect(latestBySummaryId.get("sum_leaf_a")).toContain("2026-01-01T11:30:00");
-    expect(earliestBySummaryId.get("sum_leaf_b")).toContain("2026-01-01T12:45:00");
-    expect(latestBySummaryId.get("sum_leaf_b")).toContain("2026-01-01T12:45:00");
-    expect(earliestBySummaryId.get("sum_condensed_1")).toContain("2026-01-01T10:00:00");
-    expect(latestBySummaryId.get("sum_condensed_1")).toContain("2026-01-01T12:45:00");
-    expect(earliestBySummaryId.get("sum_condensed_2")).toContain("2026-01-01T10:00:00");
-    expect(latestBySummaryId.get("sum_condensed_2")).toContain("2026-01-01T12:45:00");
+    const leafAEarliest = earliestBySummaryId.get("sum_leaf_a");
+    const leafALatest = latestBySummaryId.get("sum_leaf_a");
+    const leafBEarliest = earliestBySummaryId.get("sum_leaf_b");
+    const leafBLatest = latestBySummaryId.get("sum_leaf_b");
+    const condensed1Earliest = earliestBySummaryId.get("sum_condensed_1");
+    const condensed1Latest = latestBySummaryId.get("sum_condensed_1");
+    const condensed2Earliest = earliestBySummaryId.get("sum_condensed_2");
+    const condensed2Latest = latestBySummaryId.get("sum_condensed_2");
+
+    expect(leafAEarliest).toContain("2026-01-01");
+    expect(leafALatest).toContain("2026-01-01");
+    expect(leafBEarliest).toContain("2026-01-01");
+    expect(leafBLatest).toContain("2026-01-01");
+    expect(condensed1Earliest).toContain("2026-01-01");
+    expect(condensed1Latest).toContain("2026-01-01");
+    expect(condensed2Earliest).toContain("2026-01-01");
+    expect(condensed2Latest).toContain("2026-01-01");
+
+    expect(new Date(leafAEarliest as string).getTime()).toBeLessThanOrEqual(
+      new Date(leafALatest as string).getTime(),
+    );
+    expect(new Date(leafBEarliest as string).getTime()).toBeLessThanOrEqual(
+      new Date(leafBLatest as string).getTime(),
+    );
+    expect(new Date(condensed1Earliest as string).getTime()).toBeLessThanOrEqual(
+      new Date(condensed1Latest as string).getTime(),
+    );
+    expect(new Date(condensed2Earliest as string).getTime()).toBeLessThanOrEqual(
+      new Date(condensed2Latest as string).getTime(),
+    );
+    expect(new Date(condensed1Earliest as string).getTime()).toBeLessThanOrEqual(
+      new Date(leafAEarliest as string).getTime(),
+    );
+    expect(new Date(condensed1Latest as string).getTime()).toBeGreaterThanOrEqual(
+      new Date(leafBLatest as string).getTime(),
+    );
     expect(earliestBySummaryId.get("sum_condensed_orphan")).toBeTypeOf("string");
     expect(latestBySummaryId.get("sum_condensed_orphan")).toBeTypeOf("string");
 

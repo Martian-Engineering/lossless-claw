@@ -1,32 +1,95 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { LcmContextEngine } from "../../plugins/lcm/engine.js";
-import { createLcmExpandQueryTool } from "./lcm-expand-query-tool.js";
+import type { LcmContextEngine } from "../src/engine.js";
+import {
+  resolveDelegatedExpansionGrantId,
+  resetDelegatedExpansionGrantsForTests,
+} from "../src/expansion-auth.js";
+import { createLcmExpandQueryTool } from "../src/tools/lcm-expand-query-tool.js";
+import type { LcmDependencies } from "../src/types.js";
 
 const callGatewayMock = vi.fn();
-const createGrantMock = vi.fn();
-const revokeGrantMock = vi.fn();
 
-vi.mock("../../gateway/call.js", () => ({
-  callGateway: (opts: unknown) => callGatewayMock(opts),
-}));
-
-vi.mock("../../context-engine/init.js", () => ({
-  ensureContextEnginesInitialized: vi.fn(),
-}));
-
-const resolveContextEngineMock = vi.fn();
-vi.mock("../../context-engine/registry.js", () => ({
-  resolveContextEngine: (...args: unknown[]) => resolveContextEngineMock(...args),
-}));
-
-vi.mock("../../plugins/lcm/expansion-auth.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../plugins/lcm/expansion-auth.js")>();
+function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
+  const trimmed = sessionKey.trim();
+  if (!trimmed.startsWith("agent:")) {
+    return null;
+  }
+  const parts = trimmed.split(":");
+  if (parts.length < 3) {
+    return null;
+  }
   return {
-    ...actual,
-    createDelegatedExpansionGrant: (...args: unknown[]) => createGrantMock(...args),
-    revokeDelegatedExpansionGrantForSession: (...args: unknown[]) => revokeGrantMock(...args),
+    agentId: parts[1] ?? "main",
+    suffix: parts.slice(2).join(":"),
   };
-});
+}
+
+function readLatestAssistantReply(messages: unknown[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i] as { role?: unknown; content?: unknown };
+    if (message.role !== "assistant") {
+      continue;
+    }
+    if (typeof message.content === "string") {
+      return message.content;
+    }
+    if (Array.isArray(message.content)) {
+      const text = message.content
+        .map((part) => {
+          const block = part as { type?: unknown; text?: unknown };
+          return block.type === "text" && typeof block.text === "string" ? block.text : "";
+        })
+        .join("\n")
+        .trim();
+      if (text) {
+        return text;
+      }
+    }
+  }
+  return undefined;
+}
+
+function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
+  return {
+    config: {
+      enabled: true,
+      databasePath: ":memory:",
+      contextThreshold: 0.75,
+      freshTailCount: 8,
+      leafMinFanout: 8,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      incrementalMaxDepth: 0,
+      leafChunkTokens: 20_000,
+      leafTargetTokens: 600,
+      condensedTargetTokens: 900,
+      maxExpandTokens: 120,
+      largeFileTokenThreshold: 25_000,
+      autocompactDisabled: false,
+    },
+    complete: vi.fn(),
+    callGateway: (params: { method: string; params?: Record<string, unknown> }) =>
+      callGatewayMock(params),
+    resolveModel: () => ({ provider: "anthropic", model: "claude-opus-4-5" }),
+    getApiKey: () => undefined,
+    requireApiKey: () => "",
+    parseAgentSessionKey,
+    isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
+    normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
+    buildSubagentSystemPrompt: () => "subagent prompt",
+    readLatestAssistantReply,
+    resolveAgentDir: () => "/tmp/openclaw-agent",
+    resolveSessionIdFromSessionKey: async () => undefined,
+    agentLaneSubagent: "subagent",
+    log: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
+    ...overrides,
+  } as LcmDependencies;
+}
 
 function makeRetrieval() {
   return {
@@ -62,12 +125,8 @@ function makeEngine(params: {
 describe("createLcmExpandQueryTool", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    resolveContextEngineMock.mockReset();
-    createGrantMock.mockReset();
-    revokeGrantMock.mockReset();
-
-    createGrantMock.mockReturnValue({ grantId: "grant-1" });
-    revokeGrantMock.mockReturnValue(true);
+    callGatewayMock.mockReset();
+    resetDelegatedExpansionGrantsForTests();
   });
 
   it("returns a focused delegated answer for explicit summaryIds", async () => {
@@ -76,17 +135,18 @@ describe("createLcmExpandQueryTool", () => {
       type: "summary",
       summary: { conversationId: 42 },
     });
-    resolveContextEngineMock.mockResolvedValue(makeEngine({ retrieval }));
 
+    let delegatedSessionKey = "";
     callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
+      const request = opts as { method?: string; params?: Record<string, unknown> };
       if (request.method === "agent") {
+        delegatedSessionKey = String(request.params?.sessionKey ?? "");
         return { runId: "run-1" };
       }
       if (request.method === "agent.wait") {
         return { status: "ok" };
       }
-      if (request.method === "chat.history") {
+      if (request.method === "sessions.get") {
         return {
           messages: [
             {
@@ -114,6 +174,8 @@ describe("createLcmExpandQueryTool", () => {
     });
 
     const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
       sessionId: "agent:main:main",
       requesterSessionKey: "agent:main:main",
     });
@@ -133,31 +195,21 @@ describe("createLcmExpandQueryTool", () => {
       truncated: false,
     });
 
-    expect(createGrantMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        issuerSessionId: "agent:main:main",
-        allowedConversationIds: [42],
-      }),
-    );
-
     const agentCall = callGatewayMock.mock.calls
       .map(([opts]) => opts as { method?: string; params?: Record<string, unknown> })
       .find((entry) => entry.method === "agent");
     expect(agentCall?.params?.message).toContain("lcm_expand");
 
-    const delegatedSessionKey = (
-      createGrantMock.mock.calls[0][0] as { delegatedSessionKey: string }
-    ).delegatedSessionKey;
-    expect(revokeGrantMock).toHaveBeenCalledWith(delegatedSessionKey, {
-      removeBinding: true,
-    });
+    expect(delegatedSessionKey).not.toBe("");
+    expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
   });
 
   it("returns a validation error when prompt is missing", async () => {
     const retrieval = makeRetrieval();
-    resolveContextEngineMock.mockResolvedValue(makeEngine({ retrieval }));
 
     const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
       sessionId: "agent:main:main",
       requesterSessionKey: "agent:main:main",
     });
@@ -170,7 +222,6 @@ describe("createLcmExpandQueryTool", () => {
       error: "prompt is required.",
     });
     expect(callGatewayMock).not.toHaveBeenCalled();
-    expect(createGrantMock).not.toHaveBeenCalled();
   });
 
   it("returns timeout when delegated run exceeds 120 seconds", async () => {
@@ -179,11 +230,12 @@ describe("createLcmExpandQueryTool", () => {
       type: "summary",
       summary: { conversationId: 42 },
     });
-    resolveContextEngineMock.mockResolvedValue(makeEngine({ retrieval }));
 
+    let delegatedSessionKey = "";
     callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
+      const request = opts as { method?: string; params?: Record<string, unknown> };
       if (request.method === "agent") {
+        delegatedSessionKey = String(request.params?.sessionKey ?? "");
         return { runId: "run-timeout" };
       }
       if (request.method === "agent.wait") {
@@ -196,6 +248,8 @@ describe("createLcmExpandQueryTool", () => {
     });
 
     const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
       sessionId: "agent:main:main",
       requesterSessionKey: "agent:main:main",
     });
@@ -213,13 +267,8 @@ describe("createLcmExpandQueryTool", () => {
       ([opts]) => (opts as { method?: string }).method,
     );
     expect(methods).toContain("sessions.delete");
-
-    const delegatedSessionKey = (
-      createGrantMock.mock.calls[0][0] as { delegatedSessionKey: string }
-    ).delegatedSessionKey;
-    expect(revokeGrantMock).toHaveBeenCalledWith(delegatedSessionKey, {
-      removeBinding: true,
-    });
+    expect(delegatedSessionKey).not.toBe("");
+    expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
   });
 
   it("cleans up delegated session and grant when agent call fails", async () => {
@@ -228,11 +277,12 @@ describe("createLcmExpandQueryTool", () => {
       type: "summary",
       summary: { conversationId: 42 },
     });
-    resolveContextEngineMock.mockResolvedValue(makeEngine({ retrieval }));
 
+    let delegatedSessionKey = "";
     callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
+      const request = opts as { method?: string; params?: Record<string, unknown> };
       if (request.method === "agent") {
+        delegatedSessionKey = String(request.params?.sessionKey ?? "");
         throw new Error("agent spawn failed");
       }
       if (request.method === "sessions.delete") {
@@ -242,6 +292,8 @@ describe("createLcmExpandQueryTool", () => {
     });
 
     const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
       sessionId: "agent:main:main",
       requesterSessionKey: "agent:main:main",
     });
@@ -259,13 +311,8 @@ describe("createLcmExpandQueryTool", () => {
       ([opts]) => (opts as { method?: string }).method,
     );
     expect(methods).toContain("sessions.delete");
-
-    const delegatedSessionKey = (
-      createGrantMock.mock.calls[0][0] as { delegatedSessionKey: string }
-    ).delegatedSessionKey;
-    expect(revokeGrantMock).toHaveBeenCalledWith(delegatedSessionKey, {
-      removeBinding: true,
-    });
+    expect(delegatedSessionKey).not.toBe("");
+    expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
   });
 
   it("greps summaries first when query is provided", async () => {
@@ -290,17 +337,16 @@ describe("createLcmExpandQueryTool", () => {
       ],
       totalMatches: 2,
     });
-    resolveContextEngineMock.mockResolvedValue(makeEngine({ retrieval, conversationId: 7 }));
 
     callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
+      const request = opts as { method?: string; params?: Record<string, unknown> };
       if (request.method === "agent") {
         return { runId: "run-query" };
       }
       if (request.method === "agent.wait") {
         return { status: "ok" };
       }
-      if (request.method === "chat.history") {
+      if (request.method === "sessions.get") {
         return {
           messages: [
             {
@@ -328,7 +374,9 @@ describe("createLcmExpandQueryTool", () => {
     });
 
     const tool = createLcmExpandQueryTool({
-      sessionId: "agent:main:main",
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval, conversationId: 7 }),
+      sessionId: "session-1",
       requesterSessionKey: "agent:main:main",
     });
     const result = await tool.execute("call-5", {

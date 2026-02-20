@@ -1,97 +1,81 @@
-import { completeSimple } from "@mariozechner/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getApiKeyForModel } from "../../agents/model-auth.js";
-import { resolveModel } from "../../agents/pi-embedded-runner/model.js";
-import { resolveCopilotApiToken } from "../../providers/github-copilot-token.js";
-import { createLcmSummarizeFromLegacyParams } from "./summarize.js";
+import { createLcmSummarizeFromLegacyParams } from "../src/summarize.js";
+import type { LcmDependencies } from "../src/types.js";
 
-vi.mock("@mariozechner/pi-ai", () => ({
-  completeSimple: vi.fn(),
-}));
-
-vi.mock("../../agents/agent-paths.js", () => ({
-  resolveOpenClawAgentDir: vi.fn(() => "/tmp/openclaw-agent"),
-}));
-
-vi.mock("../../agents/model-auth.js", () => ({
-  getApiKeyForModel: vi.fn(async () => ({
-    apiKey: "test-api-key",
-    mode: "api-key",
-    source: "test",
-  })),
-  requireApiKey: vi.fn((auth: { apiKey?: string }, provider: string) => {
-    if (auth.apiKey?.trim()) {
-      return auth.apiKey;
-    }
-    throw new Error(`No API key resolved for provider ${provider}`);
-  }),
-}));
-
-vi.mock("../../agents/pi-embedded-runner/model.js", () => ({
-  resolveModel: vi.fn(() => ({
-    model: {
-      id: "claude-opus-4-5",
-      provider: "anthropic",
-      api: "messages",
-      contextWindow: 200_000,
-      maxTokens: 8_000,
+function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
+  return {
+    config: {
+      enabled: true,
+      databasePath: ":memory:",
+      contextThreshold: 0.75,
+      freshTailCount: 8,
+      leafMinFanout: 8,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      incrementalMaxDepth: 0,
+      leafChunkTokens: 20_000,
+      leafTargetTokens: 600,
+      condensedTargetTokens: 900,
+      maxExpandTokens: 120,
+      largeFileTokenThreshold: 25_000,
+      autocompactDisabled: false,
     },
-    error: null,
-    authStorage: {},
-    modelRegistry: {},
-  })),
-}));
-
-vi.mock("../../providers/github-copilot-token.js", () => ({
-  resolveCopilotApiToken: vi.fn(async () => ({ token: "copilot-runtime-token" })),
-}));
-
-const mockedCompleteSimple = vi.mocked(completeSimple);
-const mockedGetApiKeyForModel = vi.mocked(getApiKeyForModel);
-const mockedResolveModel = vi.mocked(resolveModel);
-const mockedResolveCopilotApiToken = vi.mocked(resolveCopilotApiToken);
+    complete: vi.fn(async () => ({
+      content: [{ type: "text", text: "summary output" }],
+    })),
+    callGateway: vi.fn(async () => ({})),
+    resolveModel: vi.fn(() => ({
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+    })),
+    getApiKey: vi.fn(() => "test-api-key"),
+    requireApiKey: vi.fn(() => "test-api-key"),
+    parseAgentSessionKey: vi.fn(() => null),
+    isSubagentSessionKey: vi.fn(() => false),
+    normalizeAgentId: vi.fn(() => "main"),
+    buildSubagentSystemPrompt: vi.fn(() => ""),
+    readLatestAssistantReply: vi.fn(() => undefined),
+    resolveAgentDir: vi.fn(() => "/tmp/openclaw-agent"),
+    resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
+    agentLaneSubagent: "subagent",
+    log: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
+    ...overrides,
+  } as LcmDependencies;
+}
 
 describe("createLcmSummarizeFromLegacyParams", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockedCompleteSimple.mockResolvedValue({
-      content: [{ type: "text", text: "summary output" }],
-    } as never);
-    mockedResolveModel.mockReturnValue({
-      model: {
-        id: "claude-opus-4-5",
-        provider: "anthropic",
-        api: "messages",
-        contextWindow: 200_000,
-        maxTokens: 8_000,
-      } as never,
-      error: null,
-      authStorage: {} as never,
-      modelRegistry: {} as never,
-    });
-    mockedGetApiKeyForModel.mockResolvedValue({
-      apiKey: "test-api-key",
-      mode: "api-key",
-      source: "test",
-    });
-    mockedResolveCopilotApiToken.mockResolvedValue({ token: "copilot-runtime-token" });
   });
 
-  it("returns undefined when provider/model are missing", async () => {
+  it("returns undefined when model resolution fails", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => {
+        throw new Error("no model");
+      }),
+    });
+
     await expect(
       createLcmSummarizeFromLegacyParams({
+        deps,
         legacyParams: {
           provider: "anthropic",
+          model: "claude-opus-4-5",
         },
       }),
     ).resolves.toBeUndefined();
-
-    expect(mockedResolveModel).not.toHaveBeenCalled();
-    expect(mockedCompleteSimple).not.toHaveBeenCalled();
   });
 
   it("builds distinct normal vs aggressive prompts", async () => {
+    const deps = makeDeps();
+
     const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
       legacyParams: {
         provider: "anthropic",
         model: "claude-opus-4-5",
@@ -104,24 +88,26 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     await summarize!("A".repeat(8_000), false);
     await summarize!("A".repeat(8_000), true);
 
-    expect(mockedCompleteSimple).toHaveBeenCalledTimes(2);
+    const completeMock = vi.mocked(deps.complete);
+    expect(completeMock).toHaveBeenCalledTimes(2);
 
-    const normalPrompt = mockedCompleteSimple.mock.calls[0]?.[1]?.messages?.[0]?.content as string;
-    const aggressivePrompt = mockedCompleteSimple.mock.calls[1]?.[1]?.messages?.[0]
-      ?.content as string;
+    const normalPrompt = completeMock.mock.calls[0]?.[0]?.messages?.[0]?.content as string;
+    const aggressivePrompt = completeMock.mock.calls[1]?.[0]?.messages?.[0]?.content as string;
 
     expect(normalPrompt).toContain("Normal summary policy:");
     expect(aggressivePrompt).toContain("Aggressive summary policy:");
     expect(normalPrompt).toContain("Keep implementation caveats.");
 
-    const normalMaxTokens = Number(mockedCompleteSimple.mock.calls[0]?.[2]?.maxTokens ?? 0);
-    const aggressiveMaxTokens = Number(mockedCompleteSimple.mock.calls[1]?.[2]?.maxTokens ?? 0);
+    const normalMaxTokens = Number(completeMock.mock.calls[0]?.[0]?.maxTokens ?? 0);
+    const aggressiveMaxTokens = Number(completeMock.mock.calls[1]?.[0]?.maxTokens ?? 0);
     expect(aggressiveMaxTokens).toBeLessThan(normalMaxTokens);
-    expect(mockedCompleteSimple.mock.calls[1]?.[2]?.temperature).toBe(0.1);
+    expect(completeMock.mock.calls[1]?.[0]?.temperature).toBe(0.1);
   });
 
-  it("does not pass reasoning overrides for condensed summaries", async () => {
+  it("uses condensed prompt mode for condensed summaries", async () => {
+    const deps = makeDeps();
     const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
       legacyParams: {
         provider: "anthropic",
         model: "claude-opus-4-5",
@@ -130,9 +116,10 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     await summarize!("A".repeat(8_000), false, { isCondensed: true });
 
-    expect(mockedCompleteSimple).toHaveBeenCalledTimes(1);
-    const prompt = mockedCompleteSimple.mock.calls[0]?.[1]?.messages?.[0]?.content as string;
-    const requestOptions = mockedCompleteSimple.mock.calls[0]?.[2] as {
+    const completeMock = vi.mocked(deps.complete);
+    expect(completeMock).toHaveBeenCalledTimes(1);
+    const prompt = completeMock.mock.calls[0]?.[0]?.messages?.[0]?.content as string;
+    const requestOptions = completeMock.mock.calls[0]?.[0] as {
       reasoning?: "high" | "medium" | "low";
     };
 
@@ -140,44 +127,34 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(requestOptions.reasoning).toBeUndefined();
   });
 
-  it("resolves and uses copilot runtime token when provider is github-copilot", async () => {
-    mockedResolveModel.mockReturnValue({
-      model: {
-        id: "gpt-5.3-codex",
-        provider: "github-copilot",
-        api: "openai-codex-responses",
-        contextWindow: 128_000,
-        maxTokens: 8_000,
-      } as never,
-      error: null,
-      authStorage: {} as never,
-      modelRegistry: {} as never,
-    });
-    mockedGetApiKeyForModel.mockResolvedValue({
-      apiKey: "gh-token",
-      mode: "token",
-      source: "profile:copilot",
+  it("passes resolved API key to completion calls", async () => {
+    const deps = makeDeps({
+      getApiKey: vi.fn(() => "resolved-api-key"),
     });
 
     const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
       legacyParams: {
-        provider: "github-copilot",
-        model: "gpt-5.3-codex",
+        provider: "anthropic",
+        model: "claude-opus-4-5",
       },
     });
 
-    await summarize!("Copilot summary input");
+    await summarize!("Summary input");
 
-    expect(mockedResolveCopilotApiToken).toHaveBeenCalledWith({ githubToken: "gh-token" });
-    expect(mockedCompleteSimple.mock.calls[0]?.[2]?.apiKey).toBe("copilot-runtime-token");
+    const completeMock = vi.mocked(deps.complete);
+    expect(completeMock.mock.calls[0]?.[0]?.apiKey).toBe("resolved-api-key");
   });
 
   it("falls back deterministically when model returns empty summary output", async () => {
-    mockedCompleteSimple.mockResolvedValue({
-      content: [],
-    } as never);
+    const deps = makeDeps({
+      complete: vi.fn(async () => ({
+        content: [],
+      })),
+    });
 
     const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
       legacyParams: {
         provider: "anthropic",
         model: "claude-opus-4-5",

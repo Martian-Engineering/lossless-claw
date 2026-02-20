@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { sanitizeFts5Query } from "./fts5-sanitize.js";
+import { sanitizeFts5Query } from "../src/store/fts5-sanitize.js";
 
 describe("sanitizeFts5Query", () => {
   it("quotes simple tokens", () => {

@@ -5,7 +5,7 @@ import {
   formatFileReference,
   generateExplorationSummary,
   parseFileBlocks,
-} from "./large-files.js";
+} from "../src/large-files.js";
 
 describe("large-files parseFileBlocks", () => {
   it("parses multiple <file> blocks and attributes", () => {

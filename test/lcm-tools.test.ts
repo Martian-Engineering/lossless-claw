@@ -2,23 +2,67 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createDelegatedExpansionGrant,
   resetDelegatedExpansionGrantsForTests,
-} from "../../plugins/lcm/expansion-auth.js";
-import { createLcmDescribeTool } from "./lcm-describe-tool.js";
-import { createLcmExpandTool } from "./lcm-expand-tool.js";
-import { createLcmGrepTool } from "./lcm-grep-tool.js";
+} from "../src/expansion-auth.js";
+import { createLcmDescribeTool } from "../src/tools/lcm-describe-tool.js";
+import { createLcmExpandTool } from "../src/tools/lcm-expand-tool.js";
+import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
+import type { LcmDependencies } from "../src/types.js";
 
-const mocks = vi.hoisted(() => ({
-  ensureContextEnginesInitialized: vi.fn(),
-  resolveContextEngine: vi.fn(),
-}));
+function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
+  const trimmed = sessionKey.trim();
+  if (!trimmed.startsWith("agent:")) {
+    return null;
+  }
+  const parts = trimmed.split(":");
+  if (parts.length < 3) {
+    return null;
+  }
+  return {
+    agentId: parts[1] ?? "main",
+    suffix: parts.slice(2).join(":"),
+  };
+}
 
-vi.mock("../../context-engine/init.js", () => ({
-  ensureContextEnginesInitialized: mocks.ensureContextEnginesInitialized,
-}));
-
-vi.mock("../../context-engine/registry.js", () => ({
-  resolveContextEngine: mocks.resolveContextEngine,
-}));
+function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
+  return {
+    config: {
+      enabled: true,
+      databasePath: ":memory:",
+      contextThreshold: 0.75,
+      freshTailCount: 8,
+      leafMinFanout: 8,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      incrementalMaxDepth: 0,
+      leafChunkTokens: 20_000,
+      leafTargetTokens: 600,
+      condensedTargetTokens: 900,
+      maxExpandTokens: 120,
+      largeFileTokenThreshold: 25_000,
+      autocompactDisabled: false,
+    },
+    complete: vi.fn(),
+    callGateway: vi.fn(async () => ({})),
+    resolveModel: () => ({ provider: "anthropic", model: "claude-opus-4-5" }),
+    getApiKey: () => undefined,
+    requireApiKey: () => "",
+    parseAgentSessionKey,
+    isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
+    normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
+    buildSubagentSystemPrompt: () => "subagent prompt",
+    readLatestAssistantReply: () => undefined,
+    resolveAgentDir: () => "/tmp/openclaw-agent",
+    resolveSessionIdFromSessionKey: async () => undefined,
+    agentLaneSubagent: "subagent",
+    log: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
+    ...overrides,
+  } as LcmDependencies;
+}
 
 function buildLcmEngine(params: {
   retrieval: {
@@ -50,12 +94,10 @@ function buildLcmEngine(params: {
 
 describe("LCM tools session scoping", () => {
   beforeEach(() => {
-    mocks.ensureContextEnginesInitialized.mockClear();
-    mocks.resolveContextEngine.mockReset();
     resetDelegatedExpansionGrantsForTests();
   });
 
-  it("lcm_expand query mode infers conversationId from session", async () => {
+  it("lcm_expand query mode infers conversationId from delegated grant", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
         messages: [],
@@ -78,9 +120,6 @@ describe("LCM tools session scoping", () => {
       })),
       describe: vi.fn(),
     };
-    mocks.resolveContextEngine.mockResolvedValue(
-      buildLcmEngine({ retrieval, conversationId: 42 }) as never,
-    );
 
     createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:session-1",
@@ -88,7 +127,12 @@ describe("LCM tools session scoping", () => {
       allowedConversationIds: [42],
       tokenCap: 120,
     });
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:session-1" });
+
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval }) as never,
+      sessionId: "agent:main:subagent:session-1",
+    });
     const result = await tool.execute("call-1", { query: "recent snippet" });
 
     expect(retrieval.grep).toHaveBeenCalledWith(
@@ -117,11 +161,12 @@ describe("LCM tools session scoping", () => {
       expand: vi.fn(),
       describe: vi.fn(),
     };
-    mocks.resolveContextEngine.mockResolvedValue(
-      buildLcmEngine({ retrieval, conversationId: 42 }) as never,
-    );
 
-    const tool = createLcmGrepTool({ sessionId: "session-1" });
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
     const result = await tool.execute("call-2", {
       pattern: "deployment",
       since: "2026-01-01T00:00:00.000Z",
@@ -158,11 +203,12 @@ describe("LCM tools session scoping", () => {
         },
       })),
     };
-    mocks.resolveContextEngine.mockResolvedValue(
-      buildLcmEngine({ retrieval, conversationId: 42 }) as never,
-    );
 
-    const tool = createLcmDescribeTool({ sessionId: "session-1" });
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
     const scoped = await tool.execute("call-3", { id: "sum_foreign" });
     expect((scoped.details as { error?: string }).error).toContain("Not found in conversation 42");
 

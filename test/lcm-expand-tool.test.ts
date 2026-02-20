@@ -1,26 +1,71 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { LcmContextEngine } from "../../plugins/lcm/engine.js";
-import { ensureContextEnginesInitialized } from "../../context-engine/init.js";
-import { resolveContextEngine } from "../../context-engine/registry.js";
+import type { LcmContextEngine } from "../src/engine.js";
 import {
   createDelegatedExpansionGrant,
   resetDelegatedExpansionGrantsForTests,
   revokeDelegatedExpansionGrantForSession,
-} from "../../plugins/lcm/expansion-auth.js";
-import { createLcmExpandTool } from "./lcm-expand-tool.js";
+} from "../src/expansion-auth.js";
+import { createLcmExpandTool } from "../src/tools/lcm-expand-tool.js";
+import type { LcmDependencies } from "../src/types.js";
 
 const callGatewayMock = vi.fn();
-vi.mock("../../gateway/call.js", () => ({
-  callGateway: (opts: unknown) => callGatewayMock(opts),
-}));
 
-vi.mock("../../context-engine/init.js", () => ({
-  ensureContextEnginesInitialized: vi.fn(),
-}));
+function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
+  const trimmed = sessionKey.trim();
+  if (!trimmed.startsWith("agent:")) {
+    return null;
+  }
+  const parts = trimmed.split(":");
+  if (parts.length < 3) {
+    return null;
+  }
+  return {
+    agentId: parts[1] ?? "main",
+    suffix: parts.slice(2).join(":"),
+  };
+}
 
-vi.mock("../../context-engine/registry.js", () => ({
-  resolveContextEngine: vi.fn(),
-}));
+function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
+  return {
+    config: {
+      enabled: true,
+      databasePath: ":memory:",
+      contextThreshold: 0.75,
+      freshTailCount: 8,
+      leafMinFanout: 8,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      incrementalMaxDepth: 0,
+      leafChunkTokens: 20_000,
+      leafTargetTokens: 600,
+      condensedTargetTokens: 900,
+      maxExpandTokens: 120,
+      largeFileTokenThreshold: 25_000,
+      autocompactDisabled: false,
+    },
+    complete: vi.fn(),
+    callGateway: (params: { method: string; params?: Record<string, unknown> }) =>
+      callGatewayMock(params),
+    resolveModel: () => ({ provider: "anthropic", model: "claude-opus-4-5" }),
+    getApiKey: () => undefined,
+    requireApiKey: () => "",
+    parseAgentSessionKey,
+    isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
+    normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
+    buildSubagentSystemPrompt: () => "subagent prompt",
+    readLatestAssistantReply: () => undefined,
+    resolveAgentDir: () => "/tmp/openclaw-agent",
+    resolveSessionIdFromSessionKey: async () => undefined,
+    agentLaneSubagent: "subagent",
+    log: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
+    ...overrides,
+  } as LcmDependencies;
+}
 
 function makeMockRetrieval() {
   return {
@@ -33,42 +78,52 @@ function makeMockRetrieval() {
   };
 }
 
-function makeEngine(mockRetrieval: ReturnType<typeof makeMockRetrieval>): LcmContextEngine {
+function makeEngine(params: {
+  retrieval: ReturnType<typeof makeMockRetrieval>;
+  conversationId?: number;
+}): LcmContextEngine {
   return {
     info: { id: "lcm" },
-    getRetrieval: () => mockRetrieval,
+    getRetrieval: () => params.retrieval,
     getConversationStore: () => ({
-      getConversationBySessionId: vi.fn().mockResolvedValue(null),
+      getConversationBySessionId: vi.fn().mockResolvedValue(
+        typeof params.conversationId === "number"
+          ? {
+              conversationId: params.conversationId,
+              sessionId: "session-1",
+              title: null,
+              bootstrappedAt: null,
+              createdAt: new Date("2026-01-01T00:00:00.000Z"),
+              updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+            }
+          : null,
+      ),
     }),
   } as unknown as LcmContextEngine;
 }
 
-const ORIGINAL_MAX_EXPAND = process.env.LCM_MAX_EXPAND_TOKENS;
 const MAIN_SESSION_RESTRICTION_ERROR =
-  "lcm_expand is only available in sub-agent sessions. Use lcm_describe or lcm_grep to inspect summaries, or delegate expansion to a sub-agent.";
+  "lcm_expand is only available in sub-agent sessions. Use lcm_expand_query to ask a focused question against expanded summaries, or lcm_describe/lcm_grep for lighter lookups.";
 
 describe("createLcmExpandTool expansion limits", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     callGatewayMock.mockReset();
-    process.env.LCM_MAX_EXPAND_TOKENS = "120";
     resetDelegatedExpansionGrantsForTests();
   });
 
   afterEach(() => {
     resetDelegatedExpansionGrantsForTests();
-    if (ORIGINAL_MAX_EXPAND === undefined) {
-      delete process.env.LCM_MAX_EXPAND_TOKENS;
-      return;
-    }
-    process.env.LCM_MAX_EXPAND_TOKENS = ORIGINAL_MAX_EXPAND;
   });
 
   it("rejects lcm_expand from main sessions", async () => {
     const mockRetrieval = makeMockRetrieval();
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:main",
+    });
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:main" });
     const result = await tool.execute("call-main-rejected", { summaryIds: ["sum_a"] });
 
     expect(result.details).toMatchObject({
@@ -86,7 +141,6 @@ describe("createLcmExpandTool expansion limits", () => {
       estimatedTokens: 40,
       truncated: false,
     });
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
 
     createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:unbounded",
@@ -95,14 +149,17 @@ describe("createLcmExpandTool expansion limits", () => {
       tokenCap: 120,
     });
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:unbounded" });
-    await tool.execute("call-1", { summaryIds: ["sum_a"] });
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:unbounded",
+    });
+    await tool.execute("call-1", { summaryIds: ["sum_a"], conversationId: 7 });
 
-    expect(ensureContextEnginesInitialized).toHaveBeenCalledTimes(1);
     expect(mockRetrieval.expand).toHaveBeenCalledWith(
       expect.objectContaining({
         summaryId: "sum_a",
-        tokenCap: Infinity,
+        tokenCap: Number.POSITIVE_INFINITY,
       }),
     );
   });
@@ -120,7 +177,6 @@ describe("createLcmExpandTool expansion limits", () => {
       estimatedTokens: 25,
       truncated: false,
     });
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
 
     createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:query",
@@ -129,7 +185,12 @@ describe("createLcmExpandTool expansion limits", () => {
       tokenCap: 120,
     });
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:query" });
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:query",
+    });
+
     await tool.execute("call-2", {
       query: "auth",
       conversationId: 7,
@@ -146,9 +207,12 @@ describe("createLcmExpandTool expansion limits", () => {
 
   it("rejects delegated sub-agent expansion when no grant is propagated", async () => {
     const mockRetrieval = makeMockRetrieval();
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:no-grant" });
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:no-grant",
+    });
     const result = await tool.execute("call-missing-grant", { summaryIds: ["sum_a"] });
 
     expect(result.details).toMatchObject({
@@ -159,13 +223,16 @@ describe("createLcmExpandTool expansion limits", () => {
 
   it("allows delegated sub-agent expansion with a valid grant", async () => {
     const mockRetrieval = makeMockRetrieval();
+    mockRetrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
     mockRetrieval.expand.mockResolvedValue({
       children: [],
       messages: [],
       estimatedTokens: 40,
       truncated: false,
     });
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
 
     createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:granted",
@@ -174,8 +241,15 @@ describe("createLcmExpandTool expansion limits", () => {
       tokenCap: 120,
     });
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:granted" });
-    const result = await tool.execute("call-valid-grant", { summaryIds: ["sum_a"] });
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:granted",
+    });
+    const result = await tool.execute("call-valid-grant", {
+      summaryIds: ["sum_a"],
+      conversationId: 42,
+    });
 
     expect(mockRetrieval.expand).toHaveBeenCalledOnce();
     expect(result.details).toMatchObject({
@@ -187,7 +261,10 @@ describe("createLcmExpandTool expansion limits", () => {
 
   it("rejects delegated expansion with an expired grant", async () => {
     const mockRetrieval = makeMockRetrieval();
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
+    mockRetrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
 
     createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:expired",
@@ -196,8 +273,15 @@ describe("createLcmExpandTool expansion limits", () => {
       ttlMs: 0,
     });
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:expired" });
-    const result = await tool.execute("call-expired-grant", { summaryIds: ["sum_a"] });
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:expired",
+    });
+    const result = await tool.execute("call-expired-grant", {
+      summaryIds: ["sum_a"],
+      conversationId: 42,
+    });
 
     expect(result.details).toMatchObject({
       error: expect.stringMatching(/authorization failed.*expired/i),
@@ -207,7 +291,10 @@ describe("createLcmExpandTool expansion limits", () => {
 
   it("rejects delegated expansion with a revoked grant", async () => {
     const mockRetrieval = makeMockRetrieval();
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
+    mockRetrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
 
     createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:revoked",
@@ -216,8 +303,15 @@ describe("createLcmExpandTool expansion limits", () => {
     });
     revokeDelegatedExpansionGrantForSession("agent:main:subagent:revoked");
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:revoked" });
-    const result = await tool.execute("call-revoked-grant", { summaryIds: ["sum_a"] });
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:revoked",
+    });
+    const result = await tool.execute("call-revoked-grant", {
+      summaryIds: ["sum_a"],
+      conversationId: 42,
+    });
 
     expect(result.details).toMatchObject({
       error: expect.stringMatching(/authorization failed.*revoked/i),
@@ -227,7 +321,6 @@ describe("createLcmExpandTool expansion limits", () => {
 
   it("rejects delegated expansion outside conversation scope", async () => {
     const mockRetrieval = makeMockRetrieval();
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
 
     createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:conversation-scope",
@@ -236,7 +329,11 @@ describe("createLcmExpandTool expansion limits", () => {
       tokenCap: 120,
     });
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:conversation-scope" });
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:conversation-scope",
+    });
     const result = await tool.execute("call-conv-scope", {
       summaryIds: ["sum_a"],
       conversationId: 8,
@@ -256,7 +353,6 @@ describe("createLcmExpandTool expansion limits", () => {
       estimatedTokens: 5,
       truncated: false,
     });
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
 
     createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:token-cap",
@@ -265,7 +361,11 @@ describe("createLcmExpandTool expansion limits", () => {
       tokenCap: 50,
     });
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:token-cap" });
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:token-cap",
+    });
     const result = await tool.execute("call-token-cap", {
       summaryIds: ["sum_a"],
       conversationId: 7,
@@ -287,7 +387,6 @@ describe("createLcmExpandTool expansion limits", () => {
       summaries: [],
       totalMatches: 0,
     });
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
 
     createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:route-only",
@@ -296,7 +395,11 @@ describe("createLcmExpandTool expansion limits", () => {
       tokenCap: 120,
     });
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:route-only" });
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:route-only",
+    });
     const result = await tool.execute("call-route-only", {
       query: "nothing to see",
       conversationId: 7,
@@ -334,7 +437,6 @@ describe("createLcmExpandTool expansion limits", () => {
       estimatedTokens: 10,
       truncated: false,
     });
-    vi.mocked(resolveContextEngine).mockResolvedValue(makeEngine(mockRetrieval));
 
     createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:direct-only",
@@ -343,7 +445,11 @@ describe("createLcmExpandTool expansion limits", () => {
       tokenCap: 120,
     });
 
-    const tool = createLcmExpandTool({ sessionId: "agent:main:subagent:direct-only" });
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:direct-only",
+    });
     const result = await tool.execute("call-delegated", {
       query: "deep chain",
       conversationId: 7,

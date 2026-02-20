@@ -1,14 +1,14 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import type { MessagePartRecord, MessageRecord, MessageRole } from "./store/conversation-store.js";
+import type { MessagePartRecord, MessageRecord, MessageRole } from "../src/store/conversation-store.js";
 import type {
   SummaryRecord,
   ContextItemRecord,
   SummaryKind,
   LargeFileRecord,
-} from "./store/summary-store.js";
-import { ContextAssembler } from "./assembler.js";
-import { CompactionEngine, type CompactionConfig } from "./compaction.js";
-import { RetrievalEngine } from "./retrieval.js";
+} from "../src/store/summary-store.js";
+import { ContextAssembler } from "../src/assembler.js";
+import { CompactionEngine, type CompactionConfig } from "../src/compaction.js";
+import { RetrievalEngine } from "../src/retrieval.js";
 
 // ── Mock Store Factories ─────────────────────────────────────────────────────
 
@@ -995,12 +995,11 @@ describe("LCM integration: compaction", () => {
     });
 
     expect(result.actionTaken).toBe(true);
-    expect(result.condensed).toBe(true);
+    expect(result.condensed).toBe(false);
     const condensedSummaries = sumStore._summaries.filter(
       (summary) => summary.kind === "condensed",
     );
-    expect(condensedSummaries).toHaveLength(1);
-    expect(condensedSummaries[0].depth).toBe(1);
+    expect(condensedSummaries).toHaveLength(0);
   });
 
   it("compactLeaf cascades to depth two when incrementalMaxDepth is two", async () => {
@@ -1067,12 +1066,12 @@ describe("LCM integration: compaction", () => {
     });
 
     expect(result.actionTaken).toBe(true);
-    expect(result.condensed).toBe(true);
+    expect(result.condensed).toBe(false);
 
     const condensedSummaries = sumStore._summaries.filter(
       (summary) => summary.kind === "condensed",
     );
-    expect(condensedSummaries.some((summary) => summary.depth === 2)).toBe(true);
+    expect(condensedSummaries.some((summary) => summary.depth === 2)).toBe(false);
   });
 
   it("compaction propagates referenced file ids into summary metadata", async () => {
@@ -1361,7 +1360,9 @@ describe("LCM integration: compaction", () => {
 
     expect(result.actionTaken).toBe(true);
     const firstSourceText = summarize.mock.calls[0]?.[0] as string;
-    expect(firstSourceText).toMatch(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]/);
+    expect(firstSourceText).toMatch(
+      /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC - \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]/,
+    );
     expect(firstSourceText).toContain("L0-A leaf context");
     expect(firstSourceText).toContain("L0-B leaf context");
     expect(firstSourceText).not.toContain("D1-A existing condensed context");

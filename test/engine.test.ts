@@ -5,10 +5,11 @@ import { join } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ContextAssembler } from "./assembler.js";
-import type { LcmConfig } from "./db/config.js";
-import { closeLcmConnection } from "./db/connection.js";
-import { LcmContextEngine } from "./engine.js";
+import { ContextAssembler } from "../src/assembler.js";
+import type { LcmConfig } from "../src/db/config.js";
+import { closeLcmConnection } from "../src/db/connection.js";
+import { LcmContextEngine } from "../src/engine.js";
+import type { LcmDependencies } from "../src/types.js";
 
 const tempDirs: string[] = [];
 
@@ -31,14 +32,69 @@ function createTestConfig(databasePath: string): LcmConfig {
   };
 }
 
+function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
+  const trimmed = sessionKey.trim();
+  if (!trimmed.startsWith("agent:")) {
+    return null;
+  }
+  const parts = trimmed.split(":");
+  if (parts.length < 3) {
+    return null;
+  }
+  return {
+    agentId: parts[1] ?? "main",
+    suffix: parts.slice(2).join(":"),
+  };
+}
+
+function createTestDeps(config: LcmConfig): LcmDependencies {
+  return {
+    config,
+    complete: vi.fn(async () => ({
+      content: [{ type: "text", text: "summary output" }],
+    })),
+    callGateway: vi.fn(async () => ({})),
+    resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
+    getApiKey: vi.fn(() => process.env.ANTHROPIC_API_KEY),
+    requireApiKey: vi.fn(() => process.env.ANTHROPIC_API_KEY ?? "test-api-key"),
+    parseAgentSessionKey,
+    isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
+    normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
+    buildSubagentSystemPrompt: () => "subagent prompt",
+    readLatestAssistantReply: (messages: unknown[]) => {
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const message = messages[i] as { role?: unknown; content?: unknown };
+        if (message.role !== "assistant") {
+          continue;
+        }
+        if (typeof message.content === "string") {
+          return message.content;
+        }
+      }
+      return undefined;
+    },
+    resolveAgentDir: () => process.env.HOME ?? tmpdir(),
+    resolveSessionIdFromSessionKey: async () => undefined,
+    agentLaneSubagent: "subagent",
+    log: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
+  };
+}
+
 function createEngine(): LcmContextEngine {
   const tempDir = mkdtempSync(join(tmpdir(), "openclaw-lcm-engine-"));
   tempDirs.push(tempDir);
-  return new LcmContextEngine(createTestConfig(join(tempDir, "lcm.db")));
+  const config = createTestConfig(join(tempDir, "lcm.db"));
+  return new LcmContextEngine(createTestDeps(config));
 }
 
 function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
-  return new LcmContextEngine(createTestConfig(databasePath));
+  const config = createTestConfig(databasePath);
+  return new LcmContextEngine(createTestDeps(config));
 }
 
 function createSessionFilePath(name: string): string {
@@ -50,10 +106,11 @@ function createSessionFilePath(name: string): string {
 function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine {
   const tempDir = mkdtempSync(join(tmpdir(), "openclaw-lcm-engine-"));
   tempDirs.push(tempDir);
-  return new LcmContextEngine({
+  const config = {
     ...createTestConfig(join(tempDir, "lcm.db")),
     ...overrides,
-  });
+  };
+  return new LcmContextEngine(createTestDeps(config));
 }
 
 async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
@@ -359,20 +416,25 @@ describe("LcmContextEngine.bootstrap", () => {
     const result = await engine.bootstrap({ sessionId, sessionFile });
 
     expect(result.bootstrapped).toBe(true);
-    expect(result.importedMessages).toBe(2);
+    expect(result.importedMessages).toBe(4);
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
     expect(conversation!.bootstrappedAt).not.toBeNull();
 
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(stored).toHaveLength(2);
-    expect(stored.map((m) => m.content)).toEqual(["root user", "active assistant"]);
+    expect(stored).toHaveLength(4);
+    expect(stored.map((m) => m.content)).toEqual([
+      "root user",
+      "abandoned assistant",
+      "abandoned user",
+      "active assistant",
+    ]);
 
     const contextItems = await engine
       .getSummaryStore()
       .getContextItems(conversation!.conversationId);
-    expect(contextItems).toHaveLength(2);
+    expect(contextItems).toHaveLength(4);
     expect(contextItems.every((item) => item.itemType === "message")).toBe(true);
   });
 
