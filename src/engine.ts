@@ -681,8 +681,8 @@ export class LcmContextEngine implements ContextEngine {
     }
     this.largeFileTextSummarizerResolved = true;
 
-    const provider = process.env.LCM_LARGE_FILE_SUMMARY_PROVIDER?.trim() ?? "";
-    const model = process.env.LCM_LARGE_FILE_SUMMARY_MODEL?.trim() ?? "";
+    const provider = this.deps.config.largeFileSummaryProvider;
+    const model = this.deps.config.largeFileSummaryModel;
     if (!provider || !model) {
       return undefined;
     }

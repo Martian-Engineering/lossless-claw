@@ -17,7 +17,11 @@ const BASE_CONFIG: LcmConfig = {
   condensedTargetTokens: 900,
   maxExpandTokens: 250,
   largeFileTokenThreshold: 25_000,
+  largeFileSummaryProvider: "",
+  largeFileSummaryModel: "",
   autocompactDisabled: false,
+  timezone: "UTC",
+  pruneHeartbeatOk: false,
 };
 
 function makeExpansionResult() {
