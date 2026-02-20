@@ -1,5 +1,7 @@
 # lossless-claw
 
+> ⚠️ **Current requirement:** This plugin currently requires a custom OpenClaw build with [PR #22201](https://github.com/openclaw/openclaw/pull/22201) applied until that PR is merged upstream.
+
 Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://voltropy.com/LCM). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
 
 ## What it does
