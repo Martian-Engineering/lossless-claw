@@ -564,6 +564,18 @@ func loadSummaryGraph(dbPath, sessionID string) (summaryGraph, error) {
 }
 
 func lookupConversationID(db *sql.DB, sessionID string) (int64, error) {
+	// Check if the conversations table exists (fresh install / LCM not yet initialized)
+	var tableExists int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'conversations'
+	`).Scan(&tableExists); err != nil {
+		return 0, fmt.Errorf("check LCM schema: %w", err)
+	}
+	if tableExists == 0 {
+		return 0, fmt.Errorf("LCM database has no tables yet — start a conversation first so the plugin can initialize the schema")
+	}
+
 	var conversationID int64
 	err := db.QueryRow(`
 		SELECT conversation_id
