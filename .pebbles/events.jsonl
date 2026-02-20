@@ -16,3 +16,5 @@
 {"type":"status_update","timestamp":"2026-02-20T18:29:58.353543Z","issue_id":"lossless-claw-1c2","payload":{"status":"in_progress"}}
 {"type":"close","timestamp":"2026-02-20T18:32:05.700988Z","issue_id":"lossless-claw-1c2","payload":{}}
 {"type":"create","timestamp":"2026-02-20T19:36:50.034471Z","issue_id":"lossless-claw-f22","payload":{"description":"OpenClaw security scanner flags engine.ts as env-harvesting (false positive from process.env + 'post' in comment). Move all process.env reads out of engine.ts into LcmConfig/snapshotPluginEnv in index.ts. See specs/env-config-extraction.md for full plan.","priority":"2","title":"Extract env var reads from engine.ts into config module","type":"task"}}
+{"type":"status_update","timestamp":"2026-02-20T19:37:27.306265Z","issue_id":"lossless-claw-f22","payload":{"status":"in_progress"}}
+{"type":"close","timestamp":"2026-02-20T19:40:19.14537Z","issue_id":"lossless-claw-f22","payload":{}}
