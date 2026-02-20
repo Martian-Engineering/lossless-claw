@@ -2,24 +2,25 @@
 
 ## Quick start
 
-Install the plugin and add it to your OpenClaw config:
+Install the plugin with OpenClaw's plugin installer:
 
 ```bash
-npm install @martian-engineering/lossless-claw
+openclaw plugins install @martian-engineering/lossless-claw
 ```
 
-```json
-{
-  "plugins": {
-    "paths": ["node_modules/@martian-engineering/lossless-claw"],
-    "slots": {
-      "contextEngine": "lossless-claw"
-    }
-  }
-}
+If you're running from a local OpenClaw checkout:
+
+```bash
+pnpm openclaw plugins install @martian-engineering/lossless-claw
 ```
 
-If installed from source, use the absolute path to the repo instead of `node_modules/...`.
+For local development of this plugin, link your working copy:
+
+```bash
+openclaw plugins install --link /path/to/lossless-claw
+```
+
+`openclaw plugins install` handles plugin registration/enabling and slot selection automatically.
 
 Set recommended environment variables:
 

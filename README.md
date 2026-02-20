@@ -26,53 +26,43 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 ### Install the plugin
 
-**From npm** (recommended):
+Use OpenClaw's plugin installer (recommended):
 
 ```bash
-npm install @martian-engineering/lossless-claw
+openclaw plugins install @martian-engineering/lossless-claw
 ```
 
-**From source** (for development):
+If you're running from a local OpenClaw checkout, use:
 
 ```bash
-git clone https://github.com/Martian-Engineering/lossless-claw.git
-cd lossless-claw
-npm install
+pnpm openclaw plugins install @martian-engineering/lossless-claw
 ```
+
+For local plugin development, link your working copy instead of copying files:
+
+```bash
+openclaw plugins install --link /path/to/lossless-claw
+# or from a local OpenClaw checkout:
+# pnpm openclaw plugins install --link /path/to/lossless-claw
+```
+
+The install command records the plugin, enables it, and applies compatible slot selection (including `contextEngine` when applicable).
 
 ### Configure OpenClaw
 
-Add the plugin to your OpenClaw config (`~/.openclaw/openclaw.json`):
+In most cases, no manual JSON edits are needed after `openclaw plugins install`.
+
+If you need to set it manually, ensure the context engine slot points at lossless-claw:
 
 ```json
 {
   "plugins": {
-    "paths": [
-      "node_modules/@martian-engineering/lossless-claw"
-    ],
     "slots": {
       "contextEngine": "lossless-claw"
     }
   }
 }
 ```
-
-If installed from source, use the absolute path to the cloned repo instead:
-
-```json
-{
-  "plugins": {
-    "paths": [
-      "/path/to/lossless-claw"
-    ],
-    "slots": {
-      "contextEngine": "lossless-claw"
-    }
-  }
-}
-```
-
-The `slots.contextEngine` setting tells OpenClaw to route all context management through LCM instead of the built-in legacy engine.
 
 Restart OpenClaw after configuration changes.
 
