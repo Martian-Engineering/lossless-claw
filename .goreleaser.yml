@@ -1,0 +1,41 @@
+version: 2
+
+project_name: lcm-tui
+
+builds:
+  - id: lcm-tui
+    dir: tui
+    binary: lcm-tui
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: lcm-tui
+    builds:
+      - lcm-tui
+    name_template: "lcm-tui_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format: tar.gz
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: Martian-Engineering
+    name: openclaw-lcm

@@ -245,6 +245,60 @@ Returns a compact answer with cited summary IDs.
 
 Low-level DAG expansion (sub-agent only). Main agents should use `lcm_expand_query` instead; this tool is available to delegated sub-agents spawned by `lcm_expand_query`.
 
+## TUI
+
+The repo includes an interactive terminal UI (`tui/`) for inspecting, repairing, and managing the LCM database. It's a separate Go binary — not part of the npm package.
+
+### Install
+
+**From GitHub releases** (recommended):
+
+Download the latest binary for your platform from [Releases](https://github.com/Martian-Engineering/openclaw-lcm/releases).
+
+**Build from source:**
+
+```bash
+cd tui
+go build -o lcm-tui .
+# or: make build
+# or: go install github.com/Martian-Engineering/openclaw-lcm/tui@latest
+```
+
+Requires Go 1.24+.
+
+### Usage
+
+```bash
+lcm-tui [--db path/to/lcm.db] [--sessions path/to/sessions/dir]
+```
+
+Defaults to `~/.openclaw/lcm.db` and auto-discovers session directories.
+
+### Features
+
+- **Conversation browser** — List all conversations with message/summary counts and token totals
+- **Summary DAG view** — Navigate the full summary hierarchy with depth, kind, token counts, and parent/child relationships
+- **Context view** — See exactly what the model sees: ordered context items with token breakdowns (summaries + fresh tail messages)
+- **Dissolve** — Surgically restore a condensed summary back to its parent summaries (with ordinal shift preview)
+- **Rewrite** — Re-summarize nodes using actual OpenClaw prompts with scrollable diffs and auto-accept mode
+- **Repair** — Fix corrupted summaries (fallback truncations, empty content) using proper LLM summarization
+- **Transplant** — Deep-copy summary DAGs between conversations (preserves all messages, message_parts, summary_messages)
+- **Previous context viewer** — Inspect the `previous_context` text used during summarization
+
+### Keybindings
+
+| Key | Action |
+|-----|--------|
+| `c` | Context view (from conversation list) |
+| `s` | Summary DAG view |
+| `d` | Dissolve a condensed summary |
+| `r` | Rewrite a summary |
+| `R` | Repair corrupted summaries |
+| `t` | Transplant summaries between conversations |
+| `p` | View previous_context |
+| `Enter` | Expand/select |
+| `Esc`/`q` | Back/quit |
+
 ## Database
 
 LCM uses SQLite via Node's built-in `node:sqlite` module. The default database path is `~/.openclaw/lcm.db`.
@@ -312,6 +366,15 @@ src/
 test/                       # Vitest test suite
 specs/                      # Design specifications
 openclaw.plugin.json        # Plugin manifest with config schema and UI hints
+tui/                        # Interactive terminal UI (Go)
+  main.go                   # Entry point and bubbletea app
+  data.go                   # Data loading and SQLite queries
+  dissolve.go               # Summary dissolution
+  repair.go                 # Corrupted summary repair
+  rewrite.go                # Summary re-summarization
+  transplant.go             # Cross-conversation DAG copy
+  prompts/                  # Depth-aware prompt templates
+.goreleaser.yml             # GoReleaser config for TUI binary releases
 ```
 
 ## License

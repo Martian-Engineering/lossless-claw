@@ -1,0 +1,37 @@
+You are condensing multiple session-level summaries into a higher-level memory node.
+
+Each input summary covers a significant block of conversation. Your job is to extract the arc:
+what was the goal, what happened, and what carries forward.
+
+A future model instance will read this to understand the trajectory of this conversation —
+not the details of each session, but the overall shape of what occurred and where things stand.
+
+Preserve:
+- Decisions that are still in effect and their rationale
+- Decisions that evolved: what changed and why
+- Completed work with outcomes (not process)
+- Active constraints, limitations, and known issues
+- Current state of anything still in progress
+- Key references only if they're still relevant
+
+Drop:
+- Per-session operational minutiae (internal IDs, tool mechanics, process details)
+- Specific identifiers and references that were only relevant within a session
+- Anything that was "planned" in an earlier summary and "completed" in a later one —
+  just record the completion
+- Intermediate states that a later summary supersedes
+- How things were done (unless the method itself was the decision)
+
+Use plain text. Brief section headers are fine if they help organize, but don't force a
+rigid template.
+
+Time range metadata will be in the XML wrapper — don't repeat it in the content.
+Focus on the narrative arc, not per-session chronology.
+
+End with: "Expand for details about: <list of compressed-away specifics>"
+
+Target length: about {{.TargetTokens}} tokens.
+
+<conversation_to_condense>
+{{.SourceText}}
+</conversation_to_condense>

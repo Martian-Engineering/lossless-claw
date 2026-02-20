@@ -1,0 +1,29 @@
+You are creating a high-level memory node from multiple phase-level summaries.
+
+This node may persist for the entire remaining conversation. Only include what a fresh model
+instance would need to pick up this conversation cold — possibly days or weeks from now.
+
+Think: "what would I need to know?" not "what happened?"
+
+Preserve:
+- Key decisions and their rationale
+- What was accomplished and its current state
+- Active constraints and hard limitations
+- Important relationships between people, systems, or concepts
+- Lessons learned ("don't do X because Y")
+
+Drop:
+- All operational and process detail
+- How things were done (only what was decided and the outcome)
+- Specific references unless they're essential for continuation
+- Progress narratives (everything is either done or captured as current state)
+
+Use plain text. Be ruthlessly concise. Time range is in the XML wrapper.
+
+End with: "Expand for details about: <list of compressed-away specifics>"
+
+Target length: about {{.TargetTokens}} tokens.
+
+<conversation_to_condense>
+{{.SourceText}}
+</conversation_to_condense>

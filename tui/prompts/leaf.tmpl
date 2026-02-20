@@ -1,0 +1,29 @@
+You summarize a SEGMENT of an OpenClaw conversation for future model turns.
+Treat this as incremental memory compaction input, not a full-conversation summary.
+
+Normal summary policy:
+- Preserve key decisions, rationale, constraints, and active tasks.
+- Keep essential technical details needed to continue work safely.
+- Remove obvious repetition and conversational filler.
+
+Operator instructions: (none)
+
+Output requirements:
+- Plain text only.
+- No preamble, headings, or markdown formatting.
+- Keep it concise while preserving required details.
+- Track file operations (created, modified, deleted, renamed) with file paths and current status.
+- If no file operations appear, include exactly: "Files: none".
+- If timestamps appear in the input, note the approximate time range covered and preserve timestamps for key events (decisions, completions, state changes). These are needed by later condensation passes.
+- End with a line: "Expand for details about: <comma-separated list of what was dropped or compressed — e.g., exact commands, full error output, tool call sequences, verbatim config values>"
+- Target length: about {{.TargetTokens}} tokens or less.
+{{if .PreviousContext}}
+
+<previous_context>
+{{.PreviousContext}}
+</previous_context>
+{{end}}
+
+<conversation_segment>
+{{.SourceText}}
+</conversation_segment>

@@ -1,0 +1,43 @@
+You are compacting leaf-level conversation summaries into a single condensed memory node.
+
+You are preparing context for a fresh model instance that will continue this conversation.
+{{if .PreviousContext -}}
+It already has the following preceding summary as context — do NOT repeat information
+that appears there unchanged. Focus on what is new, changed, or resolved:
+
+<previous_context>
+{{.PreviousContext}}
+</previous_context>
+
+{{else -}}
+Focus on what matters for continuation:
+{{end -}}
+- Decisions made and their rationale (only when rationale matters going forward)
+- Decisions from earlier that were altered or superseded, and what replaced them
+- Tasks or topics completed, with outcomes (not just "done" — what was the result?)
+- Things still in progress: current state, what remains
+- Blockers, open questions, and unresolved tensions
+- Specific references (names, paths, URLs, identifiers) that future turns will need
+
+Drop minutiae — operational details that won't affect future turns:
+{{- if .PreviousContext}}
+- Context that hasn't changed since previous_context (the model already has it)
+{{- end}}
+- Intermediate exploration or dead ends when the conclusion is known (keep the conclusion)
+- Transient states that are already resolved
+- Tool-internal mechanics and process scaffolding
+- Verbose references when shorter forms would suffice
+
+Use plain text. No mandatory structure — organize however makes the content clearest.
+
+Mention sequence and causality ("after fixing X, moved to Y") but keep timestamps
+light — the summary will be wrapped in XML with a time range attribute.
+Mark decisions that supersede earlier ones.
+
+End with: "Expand for details about: <list of compressed-away specifics>"
+
+Target length: about {{.TargetTokens}} tokens.
+
+<conversation_to_condense>
+{{.SourceText}}
+</conversation_to_condense>
