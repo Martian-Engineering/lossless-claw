@@ -1408,7 +1408,7 @@ func (m model) renderSessions() string {
 	for idx := offset; idx < min(len(m.sessions), offset+visible); idx++ {
 		session := m.sessions[idx]
 		messageCount := formatMessageCount(session.messageCount)
-		extras := ""
+		extras := fmt.Sprintf("  est:%dt", session.estimatedTokens)
 		if session.conversationID > 0 {
 			extras += fmt.Sprintf("  conv_id:%d", session.conversationID)
 		}

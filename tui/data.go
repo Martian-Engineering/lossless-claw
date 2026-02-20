@@ -34,14 +34,15 @@ type agentEntry struct {
 
 // sessionEntry describes one JSONL session file.
 type sessionEntry struct {
-	id             string
-	filename       string
-	path           string
-	updatedAt      time.Time
-	conversationID int64
-	messageCount   int
-	summaryCount   int
-	fileCount      int
+	id              string
+	filename        string
+	path            string
+	updatedAt       time.Time
+	conversationID  int64
+	messageCount    int
+	estimatedTokens int
+	summaryCount    int
+	fileCount       int
 }
 
 // sessionFileEntry stores lightweight metadata used for incremental loading.
@@ -49,6 +50,7 @@ type sessionFileEntry struct {
 	filename  string
 	path      string
 	updatedAt time.Time
+	byteSize  int64
 }
 
 // sessionMessage is a normalized chat message used by the conversation viewer.
@@ -209,6 +211,7 @@ func discoverSessionFiles(agent agentEntry) ([]sessionFileEntry, error) {
 			filename:  filename,
 			path:      path,
 			updatedAt: info.ModTime(),
+			byteSize:  info.Size(),
 		})
 	}
 
@@ -244,11 +247,12 @@ func loadSessionBatch(files []sessionFileEntry, offset, limit int, lcmDBPath str
 		id := strings.TrimSuffix(file.filename, filepath.Ext(file.filename))
 		sessionIDs = append(sessionIDs, id)
 		sessions = append(sessions, sessionEntry{
-			id:           id,
-			filename:     file.filename,
-			path:         file.path,
-			updatedAt:    file.updatedAt,
-			messageCount: messageCount,
+			id:              id,
+			filename:        file.filename,
+			path:            file.path,
+			updatedAt:       file.updatedAt,
+			messageCount:    messageCount,
+			estimatedTokens: estimateTokenCountFromBytes(file.byteSize),
 		})
 	}
 
@@ -310,6 +314,14 @@ func countMessages(path string) (int, error) {
 		return 0, fmt.Errorf("scan session %q: %w", path, err)
 	}
 	return count, nil
+}
+
+// estimateTokenCountFromBytes applies a rough bytes/4 heuristic to estimate token count.
+func estimateTokenCountFromBytes(byteCount int64) int {
+	if byteCount <= 0 {
+		return 0
+	}
+	return int(byteCount / 4)
 }
 
 func parseSessionMessages(path string) ([]sessionMessage, error) {
