@@ -39,8 +39,29 @@ function normalizeAgentId(agentId: string | undefined): string {
   return normalized.length > 0 ? normalized : "main";
 }
 
+type PluginEnvSnapshot = {
+  lcmSummaryModel: string;
+  lcmSummaryProvider: string;
+  openclawProvider: string;
+  agentDir: string;
+  home: string;
+};
+
+type ReadEnvFn = (key: string) => string | undefined;
+
+/** Capture plugin env values once during initialization. */
+function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnapshot {
+  return {
+    lcmSummaryModel: env.LCM_SUMMARY_MODEL?.trim() ?? "",
+    lcmSummaryProvider: env.LCM_SUMMARY_PROVIDER?.trim() ?? "",
+    openclawProvider: env.OPENCLAW_PROVIDER?.trim() ?? "",
+    agentDir: env.OPENCLAW_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
+    home: env.HOME?.trim() ?? "",
+  };
+}
+
 /** Resolve common provider API keys from environment. */
-function resolveApiKey(provider: string): string | undefined {
+function resolveApiKey(provider: string, readEnv: ReadEnvFn): string | undefined {
   const keyMap: Record<string, string[]> = {
     openai: ["OPENAI_API_KEY"],
     anthropic: ["ANTHROPIC_API_KEY"],
@@ -59,7 +80,7 @@ function resolveApiKey(provider: string): string | undefined {
   keys.push(normalizedProviderEnv);
 
   for (const key of keys) {
-    const value = process.env[key]?.trim();
+    const value = readEnv(key)?.trim();
     if (value) {
       return value;
     }
@@ -255,19 +276,19 @@ function mergeAuthProfileStores(stores: AuthProfileStore[]): AuthProfileStore | 
 }
 
 /** Determine candidate auth store paths ordered by precedence. */
-function resolveAuthStorePaths(agentDir?: string): string[] {
+function resolveAuthStorePaths(params: { agentDir?: string; envSnapshot: PluginEnvSnapshot }): string[] {
   const paths: string[] = [];
-  const directAgentDir = agentDir?.trim();
+  const directAgentDir = params.agentDir?.trim();
   if (directAgentDir) {
     paths.push(join(directAgentDir, "auth-profiles.json"));
   }
 
-  const envAgentDir = process.env.OPENCLAW_AGENT_DIR?.trim() || process.env.PI_CODING_AGENT_DIR?.trim();
+  const envAgentDir = params.envSnapshot.agentDir;
   if (envAgentDir) {
     paths.push(join(envAgentDir, "auth-profiles.json"));
   }
 
-  const home = process.env.HOME?.trim();
+  const home = params.envSnapshot.home;
   if (home) {
     paths.push(join(home, ".openclaw", "agents", "main", "agent", "auth-profiles.json"));
   }
@@ -334,8 +355,12 @@ async function resolveApiKeyFromAuthProfiles(params: {
   agentDir?: string;
   runtimeConfig?: unknown;
   piAiModule: PiAiModule;
+  envSnapshot: PluginEnvSnapshot;
 }): Promise<string | undefined> {
-  const storesWithPaths = resolveAuthStorePaths(params.agentDir)
+  const storesWithPaths = resolveAuthStorePaths({
+    agentDir: params.agentDir,
+    envSnapshot: params.envSnapshot,
+  })
     .map((path) => {
       try {
         const parsed = parseAuthProfileStore(readFileSync(path, "utf8"));
@@ -526,7 +551,9 @@ function readLatestAssistantReply(messages: unknown[]): string | undefined {
 
 /** Construct LCM dependencies from plugin API/runtime surfaces. */
 function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
-  const config = resolveLcmConfig(process.env);
+  const envSnapshot = snapshotPluginEnv();
+  const readEnv: ReadEnvFn = (key) => process.env[key];
+  const config = resolveLcmConfig();
 
   return {
     config,
@@ -602,7 +629,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 maxTokens: 8_000,
               };
 
-        let resolvedApiKey = apiKey?.trim() || resolveApiKey(providerId);
+        let resolvedApiKey = apiKey?.trim() || resolveApiKey(providerId, readEnv);
         if (!resolvedApiKey && typeof mod.getEnvApiKey === "function") {
           resolvedApiKey = mod.getEnvApiKey(providerId)?.trim();
         }
@@ -613,6 +640,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             agentDir,
             runtimeConfig,
             piAiModule: mod,
+            envSnapshot,
           });
         }
 
@@ -673,7 +701,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
     },
     resolveModel: (modelRef, providerHint) => {
-      const raw = (modelRef ?? process.env.LCM_SUMMARY_MODEL ?? "").trim();
+      const raw = (modelRef ?? envSnapshot.lcmSummaryModel).trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");
       }
@@ -688,15 +716,15 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 
       const provider = (
         providerHint?.trim() ||
-        process.env.LCM_SUMMARY_PROVIDER ||
-        process.env.OPENCLAW_PROVIDER ||
+        envSnapshot.lcmSummaryProvider ||
+        envSnapshot.openclawProvider ||
         "openai"
       ).trim();
       return { provider, model: raw };
     },
-    getApiKey: (provider) => resolveApiKey(provider),
+    getApiKey: (provider) => resolveApiKey(provider, readEnv),
     requireApiKey: (provider) => {
-      const key = resolveApiKey(provider);
+      const key = resolveApiKey(provider, readEnv);
       if (!key) {
         throw new Error(`Missing API key for provider '${provider}'.`);
       }
@@ -756,7 +784,7 @@ const lcmPlugin = {
           ? (value as Record<string, unknown>)
           : {};
       const enabled = typeof raw.enabled === "boolean" ? raw.enabled : undefined;
-      const config = resolveLcmConfig(process.env);
+      const config = resolveLcmConfig();
       if (enabled !== undefined) {
         config.enabled = enabled;
       }

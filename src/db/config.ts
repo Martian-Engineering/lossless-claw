@@ -15,6 +15,10 @@ export type LcmConfig = {
   condensedTargetTokens: number;
   maxExpandTokens: number;
   largeFileTokenThreshold: number;
+  /** Provider override for large-file text summarization. */
+  largeFileSummaryProvider: string;
+  /** Model override for large-file text summarization. */
+  largeFileSummaryModel: string;
   autocompactDisabled: boolean;
   /** IANA timezone for timestamps in summaries (from TZ env or system default) */
   timezone: string;
@@ -37,6 +41,8 @@ export function resolveLcmConfig(env: NodeJS.ProcessEnv = process.env): LcmConfi
     condensedTargetTokens: parseInt(env.LCM_CONDENSED_TARGET_TOKENS ?? "2000", 10),
     maxExpandTokens: parseInt(env.LCM_MAX_EXPAND_TOKENS ?? "4000", 10),
     largeFileTokenThreshold: parseInt(env.LCM_LARGE_FILE_TOKEN_THRESHOLD ?? "25000", 10),
+    largeFileSummaryProvider: env.LCM_LARGE_FILE_SUMMARY_PROVIDER?.trim() ?? "",
+    largeFileSummaryModel: env.LCM_LARGE_FILE_SUMMARY_MODEL?.trim() ?? "",
     autocompactDisabled: env.LCM_AUTOCOMPACT_DISABLED === "true",
     timezone: env.TZ ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
     pruneHeartbeatOk: env.LCM_PRUNE_HEARTBEAT_OK === "true",

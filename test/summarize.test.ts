@@ -18,7 +18,11 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       condensedTargetTokens: 900,
       maxExpandTokens: 120,
       largeFileTokenThreshold: 25_000,
+      largeFileSummaryProvider: "",
+      largeFileSummaryModel: "",
       autocompactDisabled: false,
+      timezone: "UTC",
+      pruneHeartbeatOk: false,
     },
     complete: vi.fn(async () => ({
       content: [{ type: "text", text: "summary output" }],
