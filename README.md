@@ -26,18 +26,38 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 ### Install the plugin
 
+**From npm** (recommended):
+
 ```bash
-# Clone the repo
+npm install @martian-engineering/lossless-claw
+```
+
+**From source** (for development):
+
+```bash
 git clone https://github.com/Martian-Engineering/lossless-claw.git
 cd lossless-claw
-
-# Install dependencies
 npm install
 ```
 
 ### Configure OpenClaw
 
 Add the plugin to your OpenClaw config (`~/.openclaw/openclaw.json`):
+
+```json
+{
+  "plugins": {
+    "paths": [
+      "node_modules/@martian-engineering/lossless-claw"
+    ],
+    "slots": {
+      "contextEngine": "lossless-claw"
+    }
+  }
+}
+```
+
+If installed from source, use the absolute path to the cloned repo instead:
 
 ```json
 {

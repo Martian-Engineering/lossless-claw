@@ -2,18 +2,24 @@
 
 ## Quick start
 
-Add LCM to your OpenClaw config:
+Install the plugin and add it to your OpenClaw config:
+
+```bash
+npm install @martian-engineering/lossless-claw
+```
 
 ```json
 {
   "plugins": {
-    "paths": ["/path/to/lossless-claw"],
+    "paths": ["node_modules/@martian-engineering/lossless-claw"],
     "slots": {
       "contextEngine": "lossless-claw"
     }
   }
 }
 ```
+
+If installed from source, use the absolute path to the repo instead of `node_modules/...`.
 
 Set recommended environment variables:
 
