@@ -215,8 +215,8 @@ All mutating operations (ingest, compact) are serialized per-session using a pro
 
 LCM needs to call an LLM for summarization. It resolves credentials through a three-tier cascade:
 
-1. **Explicit API key** — If provided in legacy params
+1. **Auth profiles** — OpenClaw's OAuth/token/API-key profile system (`auth-profiles.json`), checked in priority order
 2. **Environment variables** — Standard provider env vars (`ANTHROPIC_API_KEY`, etc.)
-3. **Auth profiles** — OpenClaw's OAuth/token/API-key profile system (`auth-profiles.json`)
+3. **Custom provider key** — From models config (e.g., `models.json`)
 
 For OAuth providers (e.g., Anthropic via Claude Max), LCM handles token refresh and credential persistence automatically.
