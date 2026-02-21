@@ -348,6 +348,52 @@ Everything runs in a single transaction.
 | `--apply` | Execute transplant |
 | `--dry-run` | Show what would be transplanted (default) |
 
+### `lcm-tui backfill`
+
+Imports a pre-LCM JSONL session into `conversations/messages/context_items`, runs iterative depth-aware compaction with Anthropic + prompt templates, optionally forces a single-root fold, and can transplant the result to another conversation.
+
+```bash
+# Preview import + compaction plan (no writes)
+lcm-tui backfill my-agent session_abc123
+
+# Import + compact
+lcm-tui backfill my-agent session_abc123 --apply
+
+# Re-run compaction for an already-imported session
+lcm-tui backfill my-agent session_abc123 --apply --recompact
+
+# Force a single summary root when possible
+lcm-tui backfill my-agent session_abc123 --apply --recompact --single-root
+
+# Import + compact + transplant into an active conversation
+lcm-tui backfill my-agent session_abc123 --apply --transplant-to 653
+```
+
+All write paths are transactional:
+1. Import transaction (conversation/messages/message_parts/context)
+2. Per-pass compaction transactions (leaf/condensed replacements)
+3. Optional transplant transaction (reuse of transplant command internals)
+
+An idempotency guard prevents duplicate imports for the same `session_id`.
+
+| Flag | Description |
+|------|-------------|
+| `--apply` | Execute import/compaction/transplant |
+| `--dry-run` | Show what would run, without writes (default) |
+| `--recompact` | Re-run compaction for already-imported sessions (message import remains idempotent) |
+| `--single-root` | Force condensed folding until one summary remains when possible |
+| `--transplant-to <conv_id>` | Transplant backfilled summaries into target conversation |
+| `--title <text>` | Override imported conversation title |
+| `--leaf-chunk-tokens <n>` | Max source tokens per leaf chunk |
+| `--leaf-target-tokens <n>` | Target output tokens for leaf summaries |
+| `--condensed-target-tokens <n>` | Target output tokens for condensed summaries |
+| `--leaf-fanout <n>` | Min leaves required for d1 condensation |
+| `--condensed-fanout <n>` | Min summaries required for d2+ condensation |
+| `--hard-fanout <n>` | Min summaries for forced single-root passes |
+| `--fresh-tail <n>` | Preserve freshest N raw messages from leaf compaction |
+| `--model <id>` | Anthropic model |
+| `--prompt-dir <path>` | Custom depth-prompt directory |
+
 ### `lcm-tui prompts`
 
 Manage and inspect depth-aware prompt templates. Templates control how the LLM summarizes at each depth level.
@@ -404,7 +450,7 @@ All templates end with an `"Expand for details about:"` footer listing topics av
 
 ## Authentication
 
-The TUI needs an Anthropic API key for rewrite and repair operations. It resolves credentials in this order:
+The TUI needs an Anthropic API key for rewrite, repair, and backfill compaction operations. It resolves credentials in this order:
 
 1. `ANTHROPIC_API_KEY` environment variable
 2. OpenClaw config (`~/.openclaw/openclaw.json`) — reads the `anthropic:default` auth profile mode
@@ -416,9 +462,9 @@ If the auth profile mode is `oauth` (not `api_key`), the TUI cannot use it — s
 
 ## Database
 
-The TUI operates directly on the SQLite database at `~/.openclaw/lcm.db`. All write operations (rewrite, dissolve, repair, transplant) use transactions. Changes take effect on the next conversation turn — the running OpenClaw instance picks up database changes automatically.
+The TUI operates directly on the SQLite database at `~/.openclaw/lcm.db`. All write operations (rewrite, dissolve, repair, transplant, backfill) use transactions. Changes take effect on the next conversation turn — the running OpenClaw instance picks up database changes automatically.
 
-**Backup recommendation:** Before batch operations (repair `--all`, rewrite `--all`, transplant), copy the database:
+**Backup recommendation:** Before batch operations (repair `--all`, rewrite `--all`, transplant, backfill), copy the database:
 
 ```bash
 cp ~/.openclaw/lcm.db ~/.openclaw/lcm.db.bak-$(date +%Y%m%d)

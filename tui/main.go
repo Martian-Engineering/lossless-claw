@@ -138,6 +138,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "backfill" {
+		if err := runBackfillCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "lcm-tui backfill failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "transplant" {
 		if err := runTransplantCommand(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "lcm-tui transplant failed: %v\n", err)
