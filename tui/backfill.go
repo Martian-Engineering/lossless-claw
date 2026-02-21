@@ -21,6 +21,7 @@ type backfillOptions struct {
 	apply                bool
 	dryRun               bool
 	singleRoot           bool
+	recompact            bool
 	agent                string
 	sessionID            string
 	title                string
@@ -140,6 +141,9 @@ func runBackfillCommand(args []string) error {
 		}
 		if plan.hasData {
 			fmt.Printf("Backfill dry-run: session %s already imported as conversation %d (%d messages, %d context items, %d summaries).\n", input.sessionID, plan.conversationID, plan.messageCount, plan.contextCount, plan.summaryCount)
+			if opts.recompact {
+				fmt.Println("Recompact mode: would skip import and rerun compaction on existing conversation.")
+			}
 		} else {
 			fmt.Printf("Backfill dry-run: would import %d messages from %s into a new conversation.\n", len(input.messages), input.sessionPath)
 		}
@@ -154,6 +158,9 @@ func runBackfillCommand(args []string) error {
 		)
 		if opts.singleRoot {
 			fmt.Println("Single-root mode: enabled (forced fold when possible).")
+		}
+		if opts.recompact {
+			fmt.Println("Recompact mode: enabled (run compaction for already-imported sessions).")
 		}
 		if opts.hasTransplantTarget {
 			if plan.hasData {
@@ -191,8 +198,10 @@ func runBackfillCommand(args []string) error {
 			input.sessionID,
 			result.conversationID,
 		)
+	} else if opts.recompact {
+		fmt.Printf("Idempotency guard: session %s already imported in conversation %d, skipping import and re-running compaction.\n", input.sessionID, result.conversationID)
 	} else {
-		fmt.Printf("Idempotency guard: session %s already imported in conversation %d, skipping import/compaction.\n", input.sessionID, result.conversationID)
+		fmt.Printf("Idempotency guard: session %s already imported in conversation %d, skipping import.\n", input.sessionID, result.conversationID)
 	}
 
 	fmt.Printf("Compaction passes: leaf=%d condensed=%d single-root=%d\n", stats.leafPasses, stats.condensedPasses, stats.rootFoldPasses)
@@ -223,7 +232,8 @@ func runBackfillWorkflow(ctx context.Context, db *sql.DB, opts backfillOptions, 
 		}
 	}
 
-	if result.imported {
+	shouldCompact := result.imported || (!result.imported && opts.recompact)
+	if shouldCompact {
 		if summarize == nil {
 			return backfillImportResult{}, backfillCompactionStats{}, errors.New("backfill summarize function is required for apply mode")
 		}
@@ -257,6 +267,7 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 	apply := fs.Bool("apply", false, "apply import and compaction")
 	dryRun := fs.Bool("dry-run", true, "show plan without writing")
 	singleRoot := fs.Bool("single-root", false, "force condensed folding until one summary remains when possible")
+	recompact := fs.Bool("recompact", false, "rerun compaction on an existing imported conversation")
 	transplantTo := fs.Int64("transplant-to", 0, "target conversation ID to transplant backfilled summaries into")
 	title := fs.String("title", "", "conversation title override")
 	leafChunk := fs.Int("leaf-chunk-tokens", 20000, "max input tokens per leaf chunk")
@@ -284,6 +295,7 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 		apply:                *apply,
 		dryRun:               *dryRun,
 		singleRoot:           *singleRoot,
+		recompact:            *recompact,
 		agent:                strings.TrimSpace(fs.Arg(0)),
 		sessionID:            normalizeBackfillSessionID(fs.Arg(1)),
 		title:                strings.TrimSpace(*title),
@@ -369,7 +381,7 @@ func normalizeBackfillArgs(args []string) ([]string, error) {
 			i++
 			continue
 		}
-		if arg == "--apply" || arg == "--dry-run" || arg == "--single-root" {
+		if arg == "--apply" || arg == "--dry-run" || arg == "--single-root" || arg == "--recompact" {
 			flags = append(flags, arg)
 			continue
 		}
@@ -390,6 +402,7 @@ func backfillUsageText() string {
 Flags:
   --dry-run                    show backfill plan without writes (default)
   --apply                      import + compact + optional transplant
+  --recompact                  re-run compaction on already-imported session data
   --single-root                force condensed folding until one summary remains when possible
   --transplant-to <conv_id>    transplant backfilled summaries into target conversation
   --title <text>               conversation title override

@@ -266,6 +266,116 @@ func TestBackfillImportIdempotencyGuard(t *testing.T) {
 	assertCountQuery(t, db, `SELECT COUNT(*) FROM context_items WHERE conversation_id = ?`, len(input.messages), first.conversationID)
 }
 
+func TestBackfillWorkflowExistingImportedSessionSkipsCompactionWithoutRecompact(t *testing.T) {
+	db := newBackfillTestDB(t)
+	ctx := context.Background()
+
+	input := backfillSessionInput{
+		agent:       "agent-existing",
+		sessionID:   "session-existing",
+		title:       "Existing Session",
+		messages:    makeBackfillMessages(6),
+		sessionPath: "/tmp/session-existing.jsonl",
+	}
+	importResult, err := applyBackfillImport(ctx, db, input)
+	if err != nil {
+		t.Fatalf("seed import: %v", err)
+	}
+
+	summarizer := &stubBackfillSummarizer{}
+	opts := backfillOptions{
+		apply:                true,
+		leafChunkTokens:      160,
+		leafTargetTokens:     64,
+		condensedTargetToken: 96,
+		leafFanout:           2,
+		condensedFanout:      2,
+		hardFanout:           2,
+		freshTailCount:       0,
+	}
+
+	result, stats, err := runBackfillWorkflow(ctx, db, opts, input, summarizer.summarize)
+	if err != nil {
+		t.Fatalf("run workflow existing session without recompact: %v", err)
+	}
+	if result.imported {
+		t.Fatalf("expected idempotency guard to skip message import")
+	}
+	if result.conversationID != importResult.conversationID {
+		t.Fatalf("expected existing conversation ID %d, got %d", importResult.conversationID, result.conversationID)
+	}
+	if stats.leafPasses != 0 || stats.condensedPasses != 0 || stats.rootFoldPasses != 0 {
+		t.Fatalf("expected no compaction passes without --recompact, got %+v", stats)
+	}
+	if summarizer.counter != 0 {
+		t.Fatalf("expected summarizer not to run without --recompact")
+	}
+
+	assertCountQuery(t, db, `SELECT COUNT(*) FROM messages WHERE conversation_id = ?`, len(input.messages), importResult.conversationID)
+	assertCountQuery(t, db, `SELECT COUNT(*) FROM context_items WHERE conversation_id = ? AND item_type = 'message'`, len(input.messages), importResult.conversationID)
+	assertCountQuery(t, db, `SELECT COUNT(*) FROM summaries WHERE conversation_id = ?`, 0, importResult.conversationID)
+}
+
+func TestBackfillWorkflowRecompactSingleRootOnExistingSession(t *testing.T) {
+	db := newBackfillTestDB(t)
+	ctx := context.Background()
+
+	mustExec(t, db, `
+		INSERT INTO conversations (conversation_id, session_id, title, bootstrapped_at, created_at, updated_at)
+		VALUES (77, 'session-recompact', 'Recompact Session', datetime('now'), datetime('now'), datetime('now'))
+	`)
+	mustExec(t, db, `
+		INSERT INTO summaries (summary_id, conversation_id, kind, depth, content, token_count, created_at, file_ids)
+		VALUES
+			('sum_recompact_a', 77, 'condensed', 2, 'phase-a', 120, datetime('now', '-2 hour'), '[]'),
+			('sum_recompact_b', 77, 'condensed', 2, 'phase-b', 120, datetime('now', '-1 hour'), '[]')
+	`)
+	mustExec(t, db, `
+		INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id, created_at)
+		VALUES
+			(77, 0, 'summary', 'sum_recompact_a', datetime('now', '-2 hour')),
+			(77, 1, 'summary', 'sum_recompact_b', datetime('now', '-1 hour'))
+	`)
+
+	input := backfillSessionInput{
+		agent:       "agent-recompact",
+		sessionID:   "session-recompact",
+		title:       "Recompact Session",
+		messages:    makeBackfillMessages(5),
+		sessionPath: "/tmp/session-recompact.jsonl",
+	}
+	summarizer := &stubBackfillSummarizer{}
+	opts := backfillOptions{
+		apply:                true,
+		recompact:            true,
+		singleRoot:           true,
+		leafChunkTokens:      300,
+		leafTargetTokens:     64,
+		condensedTargetToken: 96,
+		leafFanout:           2,
+		condensedFanout:      3,
+		hardFanout:           2,
+		freshTailCount:       0,
+	}
+
+	result, stats, err := runBackfillWorkflow(ctx, db, opts, input, summarizer.summarize)
+	if err != nil {
+		t.Fatalf("run workflow with recompact single-root: %v", err)
+	}
+	if result.imported {
+		t.Fatalf("expected idempotency guard to skip message import")
+	}
+	if stats.rootFoldPasses == 0 {
+		t.Fatalf("expected forced single-root fold pass with --recompact and --single-root")
+	}
+	if summarizer.counter == 0 {
+		t.Fatalf("expected compaction summarizer to run")
+	}
+
+	assertCountQuery(t, db, `SELECT COUNT(*) FROM messages WHERE conversation_id = ?`, 0, 77)
+	assertCountQuery(t, db, `SELECT COUNT(*) FROM context_items WHERE conversation_id = ? AND item_type = 'summary'`, 1, 77)
+}
+
 type stubBackfillSummarizer struct {
 	counter int
 }

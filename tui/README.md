@@ -54,6 +54,7 @@ lcm-tui rewrite 44 --all --apply --diff              # re-summarize everything
 lcm-tui dissolve 44 --summary-id sum_abc --apply     # undo a condensation
 lcm-tui transplant 18 653 --apply                    # copy DAG between conversations
 lcm-tui backfill my-agent session_abc --apply        # import + compact historical session
+lcm-tui backfill my-agent session_abc --apply --recompact --single-root # re-fold existing import to one root
 lcm-tui prompts --list                               # show active prompt sources
 ```
 

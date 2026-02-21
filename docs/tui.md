@@ -359,8 +359,11 @@ lcm-tui backfill my-agent session_abc123
 # Import + compact
 lcm-tui backfill my-agent session_abc123 --apply
 
+# Re-run compaction for an already-imported session
+lcm-tui backfill my-agent session_abc123 --apply --recompact
+
 # Force a single summary root when possible
-lcm-tui backfill my-agent session_abc123 --apply --single-root
+lcm-tui backfill my-agent session_abc123 --apply --recompact --single-root
 
 # Import + compact + transplant into an active conversation
 lcm-tui backfill my-agent session_abc123 --apply --transplant-to 653
@@ -377,6 +380,7 @@ An idempotency guard prevents duplicate imports for the same `session_id`.
 |------|-------------|
 | `--apply` | Execute import/compaction/transplant |
 | `--dry-run` | Show what would run, without writes (default) |
+| `--recompact` | Re-run compaction for already-imported sessions (message import remains idempotent) |
 | `--single-root` | Force condensed folding until one summary remains when possible |
 | `--transplant-to <conv_id>` | Transplant backfilled summaries into target conversation |
 | `--title <text>` | Override imported conversation title |
