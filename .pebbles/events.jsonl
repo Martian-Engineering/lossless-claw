@@ -18,3 +18,10 @@
 {"type":"create","timestamp":"2026-02-20T19:36:50.034471Z","issue_id":"lossless-claw-f22","payload":{"description":"OpenClaw security scanner flags engine.ts as env-harvesting (false positive from process.env + 'post' in comment). Move all process.env reads out of engine.ts into LcmConfig/snapshotPluginEnv in index.ts. See specs/env-config-extraction.md for full plan.","priority":"2","title":"Extract env var reads from engine.ts into config module","type":"task"}}
 {"type":"status_update","timestamp":"2026-02-20T19:37:27.306265Z","issue_id":"lossless-claw-f22","payload":{"status":"in_progress"}}
 {"type":"close","timestamp":"2026-02-20T19:40:19.14537Z","issue_id":"lossless-claw-f22","payload":{}}
+{"type":"close","timestamp":"2026-02-20T21:25:24.665336Z","issue_id":"lossless-claw-1c2","payload":{}}
+{"type":"close","timestamp":"2026-02-20T21:25:27.916091Z","issue_id":"lossless-claw-f22","payload":{}}
+{"type":"create","timestamp":"2026-02-21T00:36:04.443786Z","issue_id":"lossless-claw-77d","payload":{"description":"Implement specs/historical-session-backfill.md: new backfill command for importing pre-LCM session JSONL, iterative depth-aware compaction, optional single-root fold, optional transplant-to target conversation, tests + docs.","priority":"1","title":"Add lcm-tui historical session backfill command","type":"feature"}}
+{"type":"status_update","timestamp":"2026-02-21T00:36:26.464901Z","issue_id":"lossless-claw-77d","payload":{"status":"in_progress"}}
+{"type":"close","timestamp":"2026-02-21T00:47:02.401577Z","issue_id":"lossless-claw-77d","payload":{}}
+{"type":"status_update","timestamp":"2026-02-21T04:18:08.898717Z","issue_id":"lossless-claw-77d","payload":{"status":"in_progress"}}
+{"type":"close","timestamp":"2026-02-21T04:20:44.742609Z","issue_id":"lossless-claw-77d","payload":{}}
