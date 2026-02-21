@@ -38,6 +38,7 @@ lcm-tui --db /path/to/lcm.db    # custom database path
 - **Dissolve** (`d`) — reverse a condensation, restoring parent summaries to active context
 - **Repair** — find and fix corrupted summaries (fallback truncations from failed API calls)
 - **Transplant** — deep-copy summary DAGs between conversations with full message/edge rewiring
+- **Backfill** — import pre-LCM JSONL sessions, compact depth-aware history, optional single-root fold + transplant
 
 **Prompt Management**
 - Four depth-aware templates: leaf, d1 (session), d2 (arc), d3+ (durable)
@@ -52,6 +53,7 @@ lcm-tui repair 44 --apply                           # fix corrupted summaries
 lcm-tui rewrite 44 --all --apply --diff              # re-summarize everything
 lcm-tui dissolve 44 --summary-id sum_abc --apply     # undo a condensation
 lcm-tui transplant 18 653 --apply                    # copy DAG between conversations
+lcm-tui backfill my-agent session_abc --apply        # import + compact historical session
 lcm-tui prompts --list                               # show active prompt sources
 ```
 
@@ -61,9 +63,9 @@ Full reference with keybindings, screen descriptions, flag tables, and troublesh
 
 ## Architecture
 
-The TUI reads directly from the LCM SQLite database (`~/.openclaw/lcm.db`) and session JSONL files (`~/.openclaw/agents/`). Write operations (rewrite, repair, dissolve, transplant) use transactions. Changes take effect on the next conversation turn — no restart needed.
+The TUI reads directly from the LCM SQLite database (`~/.openclaw/lcm.db`) and session JSONL files (`~/.openclaw/agents/`). Write operations (rewrite, repair, dissolve, transplant, backfill) use transactions. Changes take effect on the next conversation turn — no restart needed.
 
-Rewrite and repair operations call the Anthropic API directly (requires `ANTHROPIC_API_KEY` or an `api_key`-mode auth profile in OpenClaw config).
+Rewrite, repair, and backfill compaction operations call the Anthropic API directly (requires `ANTHROPIC_API_KEY` or an `api_key`-mode auth profile in OpenClaw config).
 
 ## License
 
