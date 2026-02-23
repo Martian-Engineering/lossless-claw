@@ -35,6 +35,7 @@ type backfillOptions struct {
 	hardFanout           int
 	freshTailCount       int
 	promptDir            string
+	provider             string
 	model                string
 }
 
@@ -176,14 +177,15 @@ func runBackfillCommand(args []string) error {
 		return nil
 	}
 
-	apiKey, err := resolveAnthropicAPIKey(paths)
+	apiKey, err := resolveProviderAPIKey(paths, opts.provider)
 	if err != nil {
 		return err
 	}
 	client := &anthropicClient{
-		apiKey: apiKey,
-		http:   &http.Client{Timeout: defaultHTTPTimeout},
-		model:  opts.model,
+		provider: opts.provider,
+		apiKey:   apiKey,
+		http:     &http.Client{Timeout: defaultHTTPTimeout},
+		model:    opts.model,
 	}
 
 	result, stats, err := runBackfillWorkflow(ctx, db, opts, input, client.summarize)
@@ -278,7 +280,8 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 	hardFanout := fs.Int("hard-fanout", 2, "minimum summaries used in forced single-root fold")
 	freshTail := fs.Int("fresh-tail", 32, "number of freshest raw messages to preserve from leaf compaction")
 	promptDir := fs.String("prompt-dir", "", "custom prompt template directory")
-	model := fs.String("model", anthropicModel, "Anthropic model")
+	provider := fs.String("provider", "", "provider id (e.g. anthropic, openai)")
+	model := fs.String("model", "", "summary model id")
 
 	normalized, err := normalizeBackfillArgs(args)
 	if err != nil {
@@ -309,6 +312,7 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 		hardFanout:           *hardFanout,
 		freshTailCount:       *freshTail,
 		promptDir:            strings.TrimSpace(*promptDir),
+		provider:             strings.TrimSpace(*provider),
 		model:                strings.TrimSpace(*model),
 	}
 	if opts.apply {
@@ -347,9 +351,7 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 	if opts.promptDir != "" {
 		opts.promptDir = expandHomePath(opts.promptDir)
 	}
-	if opts.model == "" {
-		opts.model = anthropicModel
-	}
+	opts.provider, opts.model = resolveSummaryProviderModel(opts.provider, opts.model)
 	return opts, nil
 }
 
@@ -368,6 +370,7 @@ func normalizeBackfillArgs(args []string) ([]string, error) {
 		"--hard-fanout":             true,
 		"--fresh-tail":              true,
 		"--prompt-dir":              true,
+		"--provider":                true,
 		"--model":                   true,
 	}
 
@@ -414,7 +417,8 @@ Flags:
   --hard-fanout <n>            min summaries per forced single-root pass (default 2)
   --fresh-tail <n>             preserve freshest N raw messages from leaf compaction (default 32)
   --prompt-dir <path>          custom prompt template directory
-  --model <id>                 Anthropic model (default claude-sonnet-4-20250514)
+  --provider <id>              API provider (inferred from model when omitted)
+  --model <id>                 API model (default: provider-specific)
 `)
 }
 

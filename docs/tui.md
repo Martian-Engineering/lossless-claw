@@ -176,7 +176,7 @@ Lists files that exceeded the large file threshold (default 25k tokens) and were
 Re-summarizes a single summary node using the current depth-aware prompt templates. The process:
 
 1. **Preview** — shows the prompt that will be sent, including source material, target token count, previous context, and time range
-2. **API call** — sends to Anthropic's API (Claude Sonnet by default)
+2. **API call** — sends to the configured provider API (Anthropic by default)
 3. **Review** — shows old and new content side-by-side with token delta. Toggle unified diff view with `d`. Scroll with `j`/`k`.
 
 | Key (Preview) | Action |
@@ -280,6 +280,9 @@ lcm-tui rewrite 44 --depth 0 --apply
 # Rewrite everything bottom-up
 lcm-tui rewrite 44 --all --apply --diff
 
+# Rewrite with OpenAI Responses API
+lcm-tui rewrite 44 --summary sum_abc123 --provider openai --model gpt-5.3-codex --apply
+
 # Use custom prompt templates
 lcm-tui rewrite 44 --all --apply --prompt-dir ~/.config/lcm-tui/prompts
 ```
@@ -292,7 +295,8 @@ lcm-tui rewrite 44 --all --apply --prompt-dir ~/.config/lcm-tui/prompts
 | `--apply` | Write changes to database |
 | `--dry-run` | Show before/after without writing (default) |
 | `--diff` | Show unified diff |
-| `--model <model>` | Anthropic model (default: `claude-sonnet-4-20250514`) |
+| `--provider <id>` | API provider (inferred from `--model` when omitted) |
+| `--model <model>` | API model (default depends on provider) |
 | `--prompt-dir <path>` | Custom prompt template directory |
 | `--timestamps` | Inject timestamps into source text (default: true) |
 | `--tz <timezone>` | Timezone for timestamps (default: system local) |
@@ -350,7 +354,7 @@ Everything runs in a single transaction.
 
 ### `lcm-tui backfill`
 
-Imports a pre-LCM JSONL session into `conversations/messages/context_items`, runs iterative depth-aware compaction with Anthropic + prompt templates, optionally forces a single-root fold, and can transplant the result to another conversation.
+Imports a pre-LCM JSONL session into `conversations/messages/context_items`, runs iterative depth-aware compaction with the configured provider + prompt templates, optionally forces a single-root fold, and can transplant the result to another conversation.
 
 ```bash
 # Preview import + compaction plan (no writes)
@@ -367,6 +371,9 @@ lcm-tui backfill my-agent session_abc123 --apply --recompact --single-root
 
 # Import + compact + transplant into an active conversation
 lcm-tui backfill my-agent session_abc123 --apply --transplant-to 653
+
+# Backfill using OpenAI
+lcm-tui backfill my-agent session_abc123 --apply --provider openai --model gpt-5.3-codex
 ```
 
 All write paths are transactional:
@@ -391,7 +398,8 @@ An idempotency guard prevents duplicate imports for the same `session_id`.
 | `--condensed-fanout <n>` | Min summaries required for d2+ condensation |
 | `--hard-fanout <n>` | Min summaries for forced single-root passes |
 | `--fresh-tail <n>` | Preserve freshest N raw messages from leaf compaction |
-| `--model <id>` | Anthropic model |
+| `--provider <id>` | API provider (inferred from model when omitted) |
+| `--model <id>` | API model (default depends on provider) |
 | `--prompt-dir <path>` | Custom depth-prompt directory |
 
 ### `lcm-tui prompts`
@@ -450,15 +458,25 @@ All templates end with an `"Expand for details about:"` footer listing topics av
 
 ## Authentication
 
-The TUI needs an Anthropic API key for rewrite, repair, and backfill compaction operations. It resolves credentials in this order:
+The TUI resolves API keys by provider for rewrite, repair, and backfill compaction operations.
 
-1. `ANTHROPIC_API_KEY` environment variable
-2. OpenClaw config (`~/.openclaw/openclaw.json`) — reads the `anthropic:default` auth profile mode
+- Anthropic: `ANTHROPIC_API_KEY`
+- OpenAI: `OPENAI_API_KEY`
+
+Resolution order:
+1. Provider API key environment variable
+2. OpenClaw config (`~/.openclaw/openclaw.json`) — checks matching provider auth profile mode
 3. OpenClaw env file
 4. `~/.zshrc` export
-5. Various credential file candidates under `~/.openclaw/`
+5. Credential file candidates under `~/.openclaw/`
 
-If the auth profile mode is `oauth` (not `api_key`), the TUI cannot use it — set `ANTHROPIC_API_KEY` explicitly for repair/rewrite commands.
+If the provider auth profile mode is `oauth` (not `api_key`), set the provider API key environment variable explicitly.
+
+Interactive rewrite (`w`/`W`) can be configured with:
+- `LCM_TUI_SUMMARY_PROVIDER`
+- `LCM_TUI_SUMMARY_MODEL`
+
+It also honors `LCM_SUMMARY_PROVIDER` / `LCM_SUMMARY_MODEL` as fallback.
 
 ## Database
 
@@ -474,7 +492,7 @@ cp ~/.openclaw/lcm.db ~/.openclaw/lcm.db.bak-$(date +%Y%m%d)
 
 **"No LCM summaries found"** — The session may not have an associated conversation in the LCM database. Check that the `conv_id` column shows a non-zero value in the session list. Sessions without LCM tracking won't have summaries.
 
-**Rewrite returns empty/bad content** — Check the API key is valid and the model is accessible. The TUI uses `claude-sonnet-4-20250514` by default; override with `--model` if needed.
+**Rewrite returns empty/bad content** — Check provider/model access and API key. If normalization still yields empty text, the TUI now returns diagnostics including `provider`, `model`, and response `block_types` to help pinpoint adapter mismatches.
 
 **Dissolve fails with "not condensed"** — Only condensed summaries (depth > 0) can be dissolved. Leaf summaries have no parent summaries to restore.
 

@@ -22,6 +22,7 @@ type rewriteOptions struct {
 	depthSet   bool
 	all        bool
 	promptDir  string
+	provider   string
 	model      string
 	showDiff   bool
 	timestamps bool
@@ -90,26 +91,28 @@ func runRewriteCommand(args []string) error {
 
 	var client *anthropicClient
 	if !opts.dryRun {
-		apiKey, err := resolveAnthropicAPIKey(paths)
+		apiKey, err := resolveProviderAPIKey(paths, opts.provider)
 		if err != nil {
 			return err
 		}
 		client = &anthropicClient{
-			apiKey: apiKey,
-			http:   &http.Client{Timeout: defaultHTTPTimeout},
-			model:  opts.model,
+			provider: opts.provider,
+			apiKey:   apiKey,
+			http:     &http.Client{Timeout: defaultHTTPTimeout},
+			model:    opts.model,
 		}
 	} else {
-		apiKey, err := resolveAnthropicAPIKey(paths)
+		apiKey, err := resolveProviderAPIKey(paths, opts.provider)
 		if err == nil {
 			client = &anthropicClient{
-				apiKey: apiKey,
-				http:   &http.Client{Timeout: defaultHTTPTimeout},
-				model:  opts.model,
+				provider: opts.provider,
+				apiKey:   apiKey,
+				http:     &http.Client{Timeout: defaultHTTPTimeout},
+				model:    opts.model,
 			}
 		}
 		if client == nil {
-			return errors.New("unable to resolve Anthropic API key for dry-run rewrite preview")
+			return fmt.Errorf("unable to resolve API key for provider %q during dry-run rewrite preview", opts.provider)
 		}
 	}
 
@@ -189,7 +192,8 @@ func parseRewriteArgs(args []string) (rewriteOptions, int64, error) {
 	depth := fs.Int("depth", 0, "rewrite summaries at a specific depth")
 	all := fs.Bool("all", false, "rewrite all summaries (bottom-up)")
 	promptDir := fs.String("prompt-dir", "", "custom prompt template directory")
-	model := fs.String("model", anthropicModel, "Anthropic model")
+	provider := fs.String("provider", "", "provider id (e.g. anthropic, openai)")
+	model := fs.String("model", "", "summary model id")
 	showDiff := fs.Bool("diff", false, "show unified diff")
 	timestamps := fs.Bool("timestamps", true, "inject timestamps into source text")
 	tzName := fs.String("tz", "", "timezone for timestamps (e.g. America/Los_Angeles; default: system local)")
@@ -218,6 +222,7 @@ func parseRewriteArgs(args []string) (rewriteOptions, int64, error) {
 		depth:      *depth,
 		all:        *all,
 		promptDir:  strings.TrimSpace(*promptDir),
+		provider:   strings.TrimSpace(*provider),
 		model:      strings.TrimSpace(*model),
 		showDiff:   *showDiff,
 		timestamps: *timestamps,
@@ -227,9 +232,7 @@ func parseRewriteArgs(args []string) (rewriteOptions, int64, error) {
 	if opts.promptDir != "" {
 		opts.promptDir = expandHomePath(opts.promptDir)
 	}
-	if opts.model == "" {
-		opts.model = anthropicModel
-	}
+	opts.provider, opts.model = resolveSummaryProviderModel(opts.provider, opts.model)
 	if opts.apply {
 		opts.dryRun = false
 	}
@@ -270,7 +273,7 @@ func normalizeRewriteArgs(args []string) ([]string, error) {
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		takesValue := arg == "--summary" || arg == "--depth" || arg == "--prompt-dir" || arg == "--model" || arg == "--tz"
+		takesValue := arg == "--summary" || arg == "--depth" || arg == "--prompt-dir" || arg == "--provider" || arg == "--model" || arg == "--tz"
 		if takesValue {
 			if i+1 >= len(args) {
 				return nil, fmt.Errorf("missing value for %s", arg)
@@ -279,7 +282,7 @@ func normalizeRewriteArgs(args []string) ([]string, error) {
 			i++
 			continue
 		}
-		if strings.HasPrefix(arg, "--summary=") || strings.HasPrefix(arg, "--depth=") || strings.HasPrefix(arg, "--prompt-dir=") || strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "--tz=") {
+		if strings.HasPrefix(arg, "--summary=") || strings.HasPrefix(arg, "--depth=") || strings.HasPrefix(arg, "--prompt-dir=") || strings.HasPrefix(arg, "--provider=") || strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "--tz=") {
 			flags = append(flags, arg)
 			continue
 		}
@@ -318,7 +321,8 @@ Flags:
   --dry-run           show before/after (default)
   --apply             write changes to DB
   --prompt-dir <path> custom template directory
-  --model <model>     API model (default claude-sonnet-4-20250514)
+  --provider <id>     API provider (inferred from model when omitted)
+  --model <model>     API model (default: provider-specific)
   --diff              show unified diff
   --timestamps        inject timestamps into source text (default true)
   --tz <timezone>     timezone for timestamps (e.g. America/Los_Angeles; default: system local)

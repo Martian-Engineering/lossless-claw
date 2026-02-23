@@ -23,8 +23,10 @@ import (
 
 const (
 	corruptedSummaryMarker = "[LCM fallback summary; truncated for context management]"
+	defaultLLMProvider     = "anthropic"
 	anthropicModel         = "claude-sonnet-4-20250514"
 	anthropicVersion       = "2023-06-01"
+	openAIResponsesModel   = "gpt-5.3-codex"
 	condensedTargetTokens  = 2000
 	defaultHTTPTimeout     = 180 * time.Second
 )
@@ -77,9 +79,10 @@ type sqlQueryer interface {
 }
 
 type anthropicClient struct {
-	apiKey string
-	http   *http.Client
-	model  string
+	provider string
+	apiKey   string
+	http     *http.Client
+	model    string
 }
 
 type anthropicRequest struct {
@@ -105,6 +108,29 @@ type anthropicContentBlock struct {
 
 type anthropicErrorEnvelope struct {
 	Type  string `json:"type"`
+	Error struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+type openAIResponsesRequest struct {
+	Model           string                        `json:"model"`
+	Input           []openAIResponsesInputMessage `json:"input"`
+	MaxOutputTokens int                           `json:"max_output_tokens"`
+}
+
+type openAIResponsesInputMessage struct {
+	Role    string                          `json:"role"`
+	Content []openAIResponsesInputTextBlock `json:"content"`
+}
+
+type openAIResponsesInputTextBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type openAIErrorEnvelope struct {
 	Error struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
@@ -146,8 +172,10 @@ func runRepairCommand(args []string) error {
 			return err
 		}
 		client = &anthropicClient{
-			apiKey: apiKey,
-			http:   &http.Client{Timeout: defaultHTTPTimeout},
+			provider: defaultLLMProvider,
+			apiKey:   apiKey,
+			http:     &http.Client{Timeout: defaultHTTPTimeout},
+			model:    anthropicModel,
 		}
 	}
 
@@ -881,17 +909,28 @@ Files
 }
 
 func (c *anthropicClient) summarize(ctx context.Context, prompt string, targetTokens int) (string, error) {
+	provider, model := resolveSummaryProviderModel(c.provider, c.model)
 	if strings.TrimSpace(c.apiKey) == "" {
-		return "", errors.New("missing Anthropic API key")
+		return "", fmt.Errorf("missing API key for provider %q", provider)
+	}
+	if c.http == nil {
+		return "", errors.New("missing HTTP client")
 	}
 	if targetTokens <= 0 {
 		targetTokens = condensedTargetTokens
 	}
-	model := strings.TrimSpace(c.model)
-	if model == "" {
-		model = anthropicModel
-	}
 
+	switch provider {
+	case "anthropic":
+		return c.summarizeAnthropic(ctx, model, prompt, targetTokens)
+	case "openai", "openai-codex", "github-copilot":
+		return c.summarizeOpenAI(ctx, model, prompt, targetTokens)
+	default:
+		return "", fmt.Errorf("unsupported summarize provider %q (model %q)", provider, model)
+	}
+}
+
+func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
 	reqBody := anthropicRequest{
 		Model:       model,
 		MaxTokens:   targetTokens,
@@ -932,61 +971,367 @@ func (c *anthropicClient) summarize(ctx context.Context, prompt string, targetTo
 		return "", fmt.Errorf("Anthropic API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	var parsed anthropicResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("decode Anthropic response: %w", err)
+	result, blockTypes, err := extractAnthropicSummary(body)
+	if err != nil {
+		return "", err
 	}
-	var chunks []string
-	for _, block := range parsed.Content {
-		if block.Type == "text" {
-			chunks = append(chunks, block.Text)
-		}
-	}
-	result := strings.TrimSpace(strings.Join(chunks, "\n"))
 	if result == "" {
-		return "", errors.New("Anthropic response did not include text content")
+		return "", fmt.Errorf(
+			"empty summary after normalization (provider=anthropic model=%s block_types=%s)",
+			model,
+			formatBlockTypes(blockTypes),
+		)
 	}
 	return result, nil
 }
 
-func resolveAnthropicAPIKey(paths appDataPaths) (string, error) {
-	if env := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")); env != "" {
-		return env, nil
+func (c *anthropicClient) summarizeOpenAI(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
+	reqBody := openAIResponsesRequest{
+		Model:           model,
+		MaxOutputTokens: targetTokens,
+		Input: []openAIResponsesInputMessage{
+			{
+				Role: "user",
+				Content: []openAIResponsesInputTextBlock{
+					{
+						Type: "input_text",
+						Text: prompt,
+					},
+				},
+			},
+		},
+	}
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal OpenAI request: %w", err)
 	}
 
-	mode, err := readAnthropicProfileMode(paths.openclawConfig)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/responses", bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("build OpenAI request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("call OpenAI API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read OpenAI response: %w", err)
+	}
+
+	if resp.StatusCode >= 300 {
+		var apiErr openAIErrorEnvelope
+		if json.Unmarshal(body, &apiErr) == nil && strings.TrimSpace(apiErr.Error.Message) != "" {
+			return "", fmt.Errorf("OpenAI API %d %s: %s", resp.StatusCode, apiErr.Error.Type, apiErr.Error.Message)
+		}
+		return "", fmt.Errorf("OpenAI API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	result, blockTypes, err := extractOpenAISummary(body)
 	if err != nil {
 		return "", err
 	}
-	if mode != "api_key" {
-		return "", fmt.Errorf("anthropic profile mode is %q; set ANTHROPIC_API_KEY for repair command", mode)
+	if result == "" {
+		return "", fmt.Errorf(
+			"empty summary after normalization (provider=openai model=%s block_types=%s)",
+			model,
+			formatBlockTypes(blockTypes),
+		)
+	}
+	return result, nil
+}
+
+func extractAnthropicSummary(body []byte) (string, []string, error) {
+	var parsed anthropicResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", nil, fmt.Errorf("decode Anthropic response: %w", err)
 	}
 
-	if key, err := readKeyFromEnvFile(paths.openclawEnv); err == nil && key != "" {
+	chunks := make([]string, 0, len(parsed.Content))
+	blockTypes := make([]string, 0, len(parsed.Content))
+	for _, block := range parsed.Content {
+		typ := strings.TrimSpace(block.Type)
+		if typ != "" {
+			blockTypes = append(blockTypes, typ)
+		}
+		if typ == "text" {
+			chunks = append(chunks, block.Text)
+		}
+	}
+	return normalizeTextFragments(chunks), uniqueSortedStrings(blockTypes), nil
+}
+
+func extractOpenAISummary(body []byte) (string, []string, error) {
+	var parsed any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", nil, fmt.Errorf("decode OpenAI response: %w", err)
+	}
+	root, ok := parsed.(map[string]any)
+	if !ok {
+		return "", nil, errors.New("decode OpenAI response: expected top-level object")
+	}
+
+	typeSet := map[string]struct{}{}
+	collectTypeLabels(parsed, typeSet)
+
+	chunks := make([]string, 0, 8)
+	if value, ok := root["output_text"]; ok {
+		appendTextValue(&chunks, value)
+	}
+	if value, ok := root["output"]; ok {
+		collectTextLikeFields(value, &chunks)
+	}
+	if value, ok := root["content"]; ok {
+		collectTextLikeFields(value, &chunks)
+	}
+	// Compatibility fallback for adapters that return a flat content array.
+	if len(chunks) == 0 {
+		collectTextLikeFields(parsed, &chunks)
+	}
+
+	return normalizeTextFragments(chunks), uniqueSortedMapKeys(typeSet), nil
+}
+
+func normalizeTextFragments(chunks []string) string {
+	normalized := make([]string, 0, len(chunks))
+	seen := make(map[string]struct{}, len(chunks))
+	for _, chunk := range chunks {
+		trimmed := strings.TrimSpace(chunk)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		normalized = append(normalized, trimmed)
+	}
+	return strings.TrimSpace(strings.Join(normalized, "\n"))
+}
+
+func collectTypeLabels(value any, set map[string]struct{}) {
+	switch node := value.(type) {
+	case map[string]any:
+		if rawType, ok := node["type"].(string); ok {
+			if trimmed := strings.TrimSpace(rawType); trimmed != "" {
+				set[trimmed] = struct{}{}
+			}
+		}
+		for _, child := range node {
+			collectTypeLabels(child, set)
+		}
+	case []any:
+		for _, child := range node {
+			collectTypeLabels(child, set)
+		}
+	}
+}
+
+func collectTextLikeFields(value any, out *[]string) {
+	switch node := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"text", "output_text", "thinking"} {
+			appendTextValue(out, node[key])
+		}
+		for _, key := range []string{"content", "summary", "output", "message", "response"} {
+			if child, ok := node[key]; ok {
+				collectTextLikeFields(child, out)
+			}
+		}
+	case []any:
+		for _, child := range node {
+			collectTextLikeFields(child, out)
+		}
+	}
+}
+
+func appendTextValue(out *[]string, value any) {
+	switch raw := value.(type) {
+	case string:
+		*out = append(*out, raw)
+	case map[string]any:
+		if text, ok := raw["value"].(string); ok {
+			*out = append(*out, text)
+		}
+		if text, ok := raw["text"].(string); ok {
+			*out = append(*out, text)
+		}
+	case []any:
+		for _, child := range raw {
+			appendTextValue(out, child)
+		}
+	}
+}
+
+func formatBlockTypes(blockTypes []string) string {
+	types := uniqueSortedStrings(blockTypes)
+	if len(types) == 0 {
+		return "(none)"
+	}
+	return strings.Join(types, ",")
+}
+
+func uniqueSortedMapKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" {
+			continue
+		}
+		keys = append(keys, trimmed)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func uniqueSortedStrings(values []string) []string {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		set[trimmed] = struct{}{}
+	}
+	return uniqueSortedMapKeys(set)
+}
+
+func resolveSummaryProviderModel(providerHint, modelHint string) (string, string) {
+	provider := normalizeProviderID(providerHint)
+	model := strings.TrimSpace(modelHint)
+
+	if model == "" {
+		if provider == "openai" || provider == "openai-codex" || provider == "github-copilot" {
+			model = openAIResponsesModel
+		} else {
+			model = anthropicModel
+		}
+	}
+
+	if slash := strings.Index(model, "/"); slash > 0 && slash < len(model)-1 {
+		modelProvider := normalizeProviderID(model[:slash])
+		modelName := strings.TrimSpace(model[slash+1:])
+		if provider == "" {
+			provider = modelProvider
+			model = modelName
+		} else if provider == modelProvider {
+			model = modelName
+		}
+	}
+
+	if provider == "" {
+		provider = inferProviderFromModel(model)
+	}
+	return provider, model
+}
+
+func normalizeProviderID(provider string) string {
+	return strings.ToLower(strings.TrimSpace(provider))
+}
+
+func inferProviderFromModel(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.HasPrefix(lower, "claude"):
+		return "anthropic"
+	case strings.HasPrefix(lower, "gpt-"),
+		strings.HasPrefix(lower, "o1"),
+		strings.HasPrefix(lower, "o3"),
+		strings.HasPrefix(lower, "o4"),
+		strings.Contains(lower, "codex"):
+		return "openai"
+	default:
+		return defaultLLMProvider
+	}
+}
+
+func resolveAnthropicAPIKey(paths appDataPaths) (string, error) {
+	return resolveProviderAPIKey(paths, "anthropic")
+}
+
+func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) {
+	normalizedProvider := normalizeProviderID(provider)
+	if normalizedProvider == "" {
+		normalizedProvider = defaultLLMProvider
+	}
+	envCandidates := providerAPIEnvCandidates(normalizedProvider)
+
+	for _, keyName := range envCandidates {
+		if value := strings.TrimSpace(os.Getenv(keyName)); value != "" {
+			return value, nil
+		}
+	}
+
+	mode, err := readProviderProfileMode(paths.openclawConfig, normalizedProvider)
+	if err != nil {
+		return "", err
+	}
+	if mode != "" && mode != "api_key" {
+		return "", fmt.Errorf("%s profile mode is %q; set %s explicitly", normalizedProvider, mode, envCandidates[0])
+	}
+
+	if key, err := readKeyFromEnvFileCandidates(paths.openclawEnv, envCandidates); err == nil && key != "" {
 		return key, nil
 	}
 
 	home, _ := os.UserHomeDir()
-	if key, err := readKeyFromEnvFile(filepath.Join(home, ".zshrc")); err == nil && key != "" {
+	if key, err := readKeyFromEnvFileCandidates(filepath.Join(home, ".zshrc"), envCandidates); err == nil && key != "" {
 		return key, nil
 	}
 
 	candidates := []string{
 		filepath.Join(paths.openclawDir, "auth-tokens.json"),
 		filepath.Join(paths.openclawCredsDir, "auth-tokens.json"),
-		filepath.Join(paths.openclawCredsDir, "anthropic.json"),
-		filepath.Join(paths.openclawCredsDir, "providers", "anthropic.json"),
+		filepath.Join(paths.openclawCredsDir, normalizedProvider+".json"),
+		filepath.Join(paths.openclawCredsDir, "providers", normalizedProvider+".json"),
 	}
 	for _, path := range candidates {
-		if key, err := readLikelyAnthropicKey(path); err == nil && key != "" {
+		if key, err := readLikelyProviderKey(path, normalizedProvider, envCandidates); err == nil && key != "" {
 			return key, nil
 		}
 	}
 
-	return "", errors.New("unable to resolve Anthropic API key; set ANTHROPIC_API_KEY")
+	return "", fmt.Errorf(
+		"unable to resolve API key for provider %q; set one of: %s",
+		normalizedProvider,
+		strings.Join(envCandidates, ", "),
+	)
+}
+
+func providerAPIEnvCandidates(provider string) []string {
+	switch normalizeProviderID(provider) {
+	case "anthropic":
+		return []string{"ANTHROPIC_API_KEY"}
+	case "openai", "openai-codex":
+		return []string{"OPENAI_API_KEY"}
+	case "github-copilot":
+		return []string{"GITHUB_COPILOT_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN"}
+	default:
+		derived := strings.ToUpper(strings.ReplaceAll(normalizeProviderID(provider), "-", "_"))
+		if derived == "" {
+			return []string{"ANTHROPIC_API_KEY"}
+		}
+		return []string{derived + "_API_KEY"}
+	}
 }
 
 func readAnthropicProfileMode(configPath string) (string, error) {
+	mode, err := readProviderProfileMode(configPath, "anthropic")
+	if err != nil {
+		return "", err
+	}
+	if mode == "" {
+		return "", errors.New("OpenClaw config does not define anthropic:default or anthropic:manual profile")
+	}
+	return mode, nil
+}
+
+func readProviderProfileMode(configPath, provider string) (string, error) {
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
 		return "", fmt.Errorf("read OpenClaw config %q: %w", configPath, err)
@@ -1004,15 +1349,23 @@ func readAnthropicProfileMode(configPath string) (string, error) {
 		return "", fmt.Errorf("parse OpenClaw config %q: %w", configPath, err)
 	}
 
-	for _, name := range []string{"anthropic:default", "anthropic:manual"} {
-		if profile, ok := parsed.Auth.Profiles[name]; ok && profile.Provider == "anthropic" {
+	normalizedProvider := normalizeProviderID(provider)
+	for _, name := range []string{normalizedProvider + ":default", normalizedProvider + ":manual"} {
+		if profile, ok := parsed.Auth.Profiles[name]; ok {
+			if normalizeProviderID(profile.Provider) == normalizedProvider {
+				return strings.TrimSpace(profile.Mode), nil
+			}
+		}
+	}
+	for _, profile := range parsed.Auth.Profiles {
+		if normalizeProviderID(profile.Provider) == normalizedProvider {
 			return strings.TrimSpace(profile.Mode), nil
 		}
 	}
-	return "", errors.New("OpenClaw config does not define anthropic:default or anthropic:manual profile")
+	return "", nil
 }
 
-func readKeyFromEnvFile(path string) (string, error) {
+func readKeyFromEnvFileCandidates(path string, envCandidates []string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -1026,13 +1379,15 @@ func readKeyFromEnvFile(path string) (string, error) {
 			continue
 		}
 		line = strings.TrimPrefix(line, "export ")
-		if !strings.HasPrefix(line, "ANTHROPIC_API_KEY=") {
-			continue
-		}
-		val := strings.TrimPrefix(line, "ANTHROPIC_API_KEY=")
-		val = strings.Trim(strings.TrimSpace(val), `"'`)
-		if strings.HasPrefix(val, "sk-ant-") {
-			return val, nil
+		for _, envName := range envCandidates {
+			prefix := envName + "="
+			if !strings.HasPrefix(line, prefix) {
+				continue
+			}
+			val := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, prefix)), `"'`)
+			if looksLikeAPIKey(val) {
+				return val, nil
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -1041,7 +1396,7 @@ func readKeyFromEnvFile(path string) (string, error) {
 	return "", nil
 }
 
-func readLikelyAnthropicKey(path string) (string, error) {
+func readLikelyProviderKey(path, provider string, envCandidates []string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
@@ -1049,7 +1404,7 @@ func readLikelyAnthropicKey(path string) (string, error) {
 
 	var asAny any
 	if json.Unmarshal(data, &asAny) == nil {
-		if key := walkForAnthropicKey(asAny); key != "" {
+		if key := walkForProviderKey(asAny, provider, envCandidates); key != "" {
 			return key, nil
 		}
 	}
@@ -1057,43 +1412,89 @@ func readLikelyAnthropicKey(path string) (string, error) {
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "ANTHROPIC_API_KEY=") {
-			val := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "ANTHROPIC_API_KEY=")), `"'`)
-			if strings.HasPrefix(val, "sk-ant-") {
-				return val, nil
+		for _, envName := range envCandidates {
+			prefix := envName + "="
+			if strings.HasPrefix(line, prefix) {
+				val := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, prefix)), `"'`)
+				if looksLikeProviderKey(provider, val) {
+					return val, nil
+				}
 			}
 		}
 	}
 	return "", nil
 }
 
-func walkForAnthropicKey(node any) string {
+func walkForProviderKey(node any, provider string, envCandidates []string) string {
 	switch v := node.(type) {
 	case map[string]any:
 		for key, child := range v {
-			lower := strings.ToLower(key)
-			if lower == "api_key" || lower == "anthropic_api_key" || lower == "key" || lower == "token" {
-				if s, ok := child.(string); ok && strings.HasPrefix(strings.TrimSpace(s), "sk-ant-") {
+			lower := strings.ToLower(strings.TrimSpace(key))
+			for _, envName := range envCandidates {
+				if lower == strings.ToLower(envName) {
+					if s, ok := child.(string); ok && looksLikeProviderKey(provider, s) {
+						return strings.TrimSpace(s)
+					}
+				}
+			}
+			if lower == "api_key" || lower == provider+"_api_key" || lower == "key" || lower == "token" || strings.Contains(lower, "api_key") {
+				if s, ok := child.(string); ok && looksLikeProviderKey(provider, s) {
 					return strings.TrimSpace(s)
 				}
 			}
-			if nested := walkForAnthropicKey(child); nested != "" {
+			if nested := walkForProviderKey(child, provider, envCandidates); nested != "" {
 				return nested
 			}
 		}
 	case []any:
 		for _, child := range v {
-			if nested := walkForAnthropicKey(child); nested != "" {
+			if nested := walkForProviderKey(child, provider, envCandidates); nested != "" {
 				return nested
 			}
 		}
 	case string:
 		trimmed := strings.TrimSpace(v)
-		if strings.HasPrefix(trimmed, "sk-ant-") {
+		if looksLikeProviderKey(provider, trimmed) {
 			return trimmed
 		}
 	}
 	return ""
+}
+
+func looksLikeProviderKey(provider, value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if !looksLikeAPIKey(trimmed) {
+		return false
+	}
+	switch normalizeProviderID(provider) {
+	case "anthropic":
+		return strings.HasPrefix(trimmed, "sk-ant-")
+	case "openai", "openai-codex", "github-copilot":
+		return strings.HasPrefix(trimmed, "sk-") || strings.HasPrefix(trimmed, "sess-")
+	default:
+		return true
+	}
+}
+
+func looksLikeAPIKey(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || strings.Contains(trimmed, " ") || strings.Contains(trimmed, "\t") {
+		return false
+	}
+	return len(trimmed) >= 16
+}
+
+// Backward-compatible wrappers for Anthropic-specific helpers.
+func readKeyFromEnvFile(path string) (string, error) {
+	return readKeyFromEnvFileCandidates(path, providerAPIEnvCandidates("anthropic"))
+}
+
+func readLikelyAnthropicKey(path string) (string, error) {
+	return readLikelyProviderKey(path, "anthropic", providerAPIEnvCandidates("anthropic"))
+}
+
+func walkForAnthropicKey(node any) string {
+	return walkForProviderKey(node, "anthropic", providerAPIEnvCandidates("anthropic"))
 }
 
 func shortSHA256(s string) string {

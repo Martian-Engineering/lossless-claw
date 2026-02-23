@@ -66,7 +66,7 @@ Full reference with keybindings, screen descriptions, flag tables, and troublesh
 
 The TUI reads directly from the LCM SQLite database (`~/.openclaw/lcm.db`) and session JSONL files (`~/.openclaw/agents/`). Write operations (rewrite, repair, dissolve, transplant, backfill) use transactions. Changes take effect on the next conversation turn — no restart needed.
 
-Rewrite, repair, and backfill compaction operations call the Anthropic API directly (requires `ANTHROPIC_API_KEY` or an `api_key`-mode auth profile in OpenClaw config).
+Rewrite, repair, and backfill compaction operations call provider APIs directly. By default they use Anthropic (`claude-sonnet-4-20250514`), and rewrite/backfill also support OpenAI (`--provider openai --model gpt-5.3-codex`) with `OPENAI_API_KEY`.
 
 ## License
 

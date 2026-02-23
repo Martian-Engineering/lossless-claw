@@ -59,6 +59,7 @@ type rewriteState struct {
 	diffView        bool
 	scrollOffset    int
 	spinnerFrame    int
+	provider        string
 	apiKey          string
 	model           string
 	err             error
@@ -1021,7 +1022,8 @@ func (m *model) advanceSubtreeQueue() {
 		return
 	}
 
-	apiKey, err := resolveAnthropicAPIKey(m.paths)
+	provider, model := resolveInteractiveRewriteProviderModel()
+	apiKey, err := resolveProviderAPIKey(m.paths, provider)
 	if err != nil {
 		m.status = "Error: " + err.Error()
 		m.subtreeQueue = nil
@@ -1042,8 +1044,9 @@ func (m *model) advanceSubtreeQueue() {
 		targetTokens:    targetTokens,
 		previousContext: previousContext,
 		phase:           rewritePreview,
+		provider:        provider,
 		apiKey:          apiKey,
-		model:           anthropicModel,
+		model:           model,
 	}
 	m.status = fmt.Sprintf("Subtree rewrite [%d/%d]: %s (d%d)", progress, m.subtreeTotal, item.summaryID, item.depth)
 }
@@ -1110,7 +1113,8 @@ func (m *model) startPendingRewrite() {
 		return
 	}
 
-	apiKey, err := resolveAnthropicAPIKey(m.paths)
+	provider, model := resolveInteractiveRewriteProviderModel()
+	apiKey, err := resolveProviderAPIKey(m.paths, provider)
 	if err != nil {
 		m.status = "Error: " + err.Error()
 		return
@@ -1130,8 +1134,9 @@ func (m *model) startPendingRewrite() {
 		targetTokens:    targetTokens,
 		previousContext: previousContext,
 		phase:           rewritePreview,
+		provider:        provider,
 		apiKey:          apiKey,
-		model:           anthropicModel,
+		model:           model,
 	}
 	m.status = fmt.Sprintf("Ready to rewrite %s", summaryID)
 }
@@ -1143,9 +1148,10 @@ func (m model) startPendingRewriteAPI() tea.Cmd {
 	pending := *m.pendingRewrite
 	return func() tea.Msg {
 		client := &anthropicClient{
-			apiKey: pending.apiKey,
-			http:   &http.Client{Timeout: defaultHTTPTimeout},
-			model:  pending.model,
+			provider: pending.provider,
+			apiKey:   pending.apiKey,
+			http:     &http.Client{Timeout: defaultHTTPTimeout},
+			model:    pending.model,
 		}
 		content, err := client.summarize(context.Background(), pending.prompt, pending.targetTokens)
 		if err != nil {
@@ -1157,6 +1163,19 @@ func (m model) startPendingRewriteAPI() tea.Cmd {
 			tokens:    estimateTokenCount(content),
 		}
 	}
+}
+
+func resolveInteractiveRewriteProviderModel() (string, string) {
+	provider := strings.TrimSpace(os.Getenv("LCM_TUI_SUMMARY_PROVIDER"))
+	if provider == "" {
+		provider = strings.TrimSpace(os.Getenv("LCM_SUMMARY_PROVIDER"))
+	}
+
+	model := strings.TrimSpace(os.Getenv("LCM_TUI_SUMMARY_MODEL"))
+	if model == "" {
+		model = strings.TrimSpace(os.Getenv("LCM_SUMMARY_MODEL"))
+	}
+	return resolveSummaryProviderModel(provider, model)
 }
 
 func rewriteSpinnerTickCmd() tea.Cmd {
@@ -1566,7 +1585,7 @@ func (m model) renderRewriteOverlay() string {
 		if len(m.subtreeQueue) > 0 {
 			lines = append(lines, fmt.Sprintf("Enter: rewrite | A: rewrite & auto-accept remaining | Esc: cancel  [%d remaining]", len(m.subtreeQueue)))
 		} else {
-			lines = append(lines, "Press Enter to rewrite with Anthropic. Press Esc to cancel.")
+			lines = append(lines, fmt.Sprintf("Press Enter to rewrite with %s/%s. Press Esc to cancel.", rw.provider, rw.model))
 		}
 		return strings.Join(lines, "\n")
 	case rewriteInflight:
