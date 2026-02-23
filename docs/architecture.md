@@ -67,8 +67,10 @@ The **leaf pass** converts raw messages into leaf summaries:
 3. Concatenate message content with timestamps.
 4. Resolve the most recent prior summary for continuity (passed as `previous_context` so the LLM avoids repeating known information).
 5. Send to the LLM with the leaf prompt.
-6. If the summary is larger than the input (LLM failure), retry with the aggressive prompt. If still too large, fall back to deterministic truncation.
-7. Persist the summary, link to source messages, and replace the message range in context_items.
+6. Normalize provider response blocks (Anthropic/OpenAI text, output_text, and nested content/summary shapes) into plain text.
+7. If normalization is empty, log provider/model/block-type diagnostics and fall back to deterministic truncation.
+8. If the summary is larger than the input (LLM failure), retry with the aggressive prompt. If still too large, fall back to deterministic truncation.
+9. Persist the summary, link to source messages, and replace the message range in context_items.
 
 ### Condensation
 

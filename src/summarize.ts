@@ -78,13 +78,119 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-/** Narrows completion response blocks to plain text blocks. */
-function isTextBlock(block: unknown): block is { type: string; text: string } {
-  if (!block || typeof block !== "object" || Array.isArray(block)) {
-    return false;
+/** Narrow unknown values to plain object records. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Normalize text fragments from provider-specific block shapes.
+ *
+ * Deduplicates exact repeated fragments while preserving first-seen order so
+ * providers that mirror output in multiple fields don't duplicate summaries.
+ */
+function normalizeTextFragments(chunks: string[]): string {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+
+  for (const chunk of chunks) {
+    const trimmed = chunk.trim();
+    if (!trimmed || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    normalized.push(trimmed);
   }
-  const record = block as { type?: unknown; text?: unknown };
-  return record.type === "text" && typeof record.text === "string";
+  return normalized.join("\n").trim();
+}
+
+/** Collect all nested `type` labels for diagnostics on normalization failures. */
+function collectBlockTypes(value: unknown, out: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectBlockTypes(entry, out);
+    }
+    return;
+  }
+  if (!isRecord(value)) {
+    return;
+  }
+
+  if (typeof value.type === "string" && value.type.trim()) {
+    out.add(value.type.trim());
+  }
+  for (const nested of Object.values(value)) {
+    collectBlockTypes(nested, out);
+  }
+}
+
+/** Collect text payloads from common provider response shapes. */
+function collectTextLikeFields(value: unknown, out: string[]): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectTextLikeFields(entry, out);
+    }
+    return;
+  }
+  if (!isRecord(value)) {
+    return;
+  }
+
+  for (const key of ["text", "output_text", "thinking"]) {
+    appendTextValue(value[key], out);
+  }
+  for (const key of ["content", "summary", "output", "message", "response"]) {
+    if (key in value) {
+      collectTextLikeFields(value[key], out);
+    }
+  }
+}
+
+/** Append raw textual values and nested text wrappers (`value`, `text`). */
+function appendTextValue(value: unknown, out: string[]): void {
+  if (typeof value === "string") {
+    out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      appendTextValue(entry, out);
+    }
+    return;
+  }
+  if (!isRecord(value)) {
+    return;
+  }
+
+  if (typeof value.value === "string") {
+    out.push(value.value);
+  }
+  if (typeof value.text === "string") {
+    out.push(value.text);
+  }
+}
+
+/** Normalize provider completion content into a plain-text summary payload. */
+function normalizeCompletionSummary(content: unknown): { summary: string; blockTypes: string[] } {
+  const chunks: string[] = [];
+  const blockTypeSet = new Set<string>();
+
+  collectTextLikeFields(content, chunks);
+  collectBlockTypes(content, blockTypeSet);
+
+  const blockTypes = [...blockTypeSet].sort((a, b) => a.localeCompare(b));
+  return {
+    summary: normalizeTextFragments(chunks),
+    blockTypes,
+  };
+}
+
+/** Format normalized block types for concise diagnostics. */
+function formatBlockTypes(blockTypes: string[]): string {
+  if (blockTypes.length === 0) {
+    return "(none)";
+  }
+  return blockTypes.join(",");
 }
 
 /**
@@ -426,15 +532,15 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       temperature: aggressive ? 0.1 : 0.2,
     });
 
-    const summary = result.content
-      .filter(isTextBlock)
-      .map((block) => block.text.trim())
-      .filter(Boolean)
-      .join("\n")
-      .trim();
+    const normalized = normalizeCompletionSummary(result.content);
+    const summary = normalized.summary;
 
     if (!summary) {
-      console.error(`[lcm] summarize got empty content from LLM (${result.content.length} blocks, types: ${result.content.map(b => b.type).join(",")}), falling back to truncation`);
+      console.error(
+        `[lcm] summarize empty normalized summary; provider=${provider} model=${model} block_types=${formatBlockTypes(
+          normalized.blockTypes,
+        )}; response_blocks=${result.content.length}; falling back to truncation`,
+      );
       return buildDeterministicFallbackSummary(text, targetTokens);
     }
 

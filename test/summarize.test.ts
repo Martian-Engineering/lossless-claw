@@ -171,4 +171,74 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(summary.length).toBeGreaterThan(0);
     expect(summary).toContain("[LCM fallback summary; truncated for context management]");
   });
+
+  it("normalizes OpenAI output_text and reasoning summary blocks", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "openai",
+        model: "gpt-5.3-codex",
+      })),
+      complete: vi.fn(async () => ({
+        content: [
+          {
+            type: "reasoning",
+            summary: [{ type: "summary_text", text: "Reasoning summary line." }],
+          },
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Final condensed summary." }],
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "openai",
+        model: "gpt-5.3-codex",
+      },
+    });
+
+    const summary = await summarize!("Input segment");
+
+    expect(summary).toContain("Reasoning summary line.");
+    expect(summary).toContain("Final condensed summary.");
+  });
+
+  it("logs provider/model/block diagnostics when normalized summary is empty", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "openai",
+          model: "gpt-5.3-codex",
+        })),
+        complete: vi.fn(async () => ({
+          content: [{ type: "reasoning" }],
+        })),
+      });
+
+      const summarize = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: {
+          provider: "openai",
+          model: "gpt-5.3-codex",
+        },
+      });
+
+      const summary = await summarize!("A".repeat(12_000));
+      expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+
+      const diagnostics = consoleError.mock.calls
+        .flatMap((call) => call.map((entry) => String(entry)))
+        .join(" ");
+      expect(diagnostics).toContain("provider=openai");
+      expect(diagnostics).toContain("model=gpt-5.3-codex");
+      expect(diagnostics).toContain("block_types=reasoning");
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
 });
