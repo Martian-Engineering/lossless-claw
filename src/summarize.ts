@@ -590,8 +590,25 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
     const normalized = normalizeCompletionSummary(result.content);
     let summary = normalized.summary;
+    let summarySource: "content" | "envelope" | "retry" | "fallback" = "content";
 
-    // --- Empty-summary hardening: diagnostics → retry → deterministic fallback ---
+    // --- Empty-summary hardening: envelope → retry → deterministic fallback ---
+    if (!summary) {
+      // Envelope-aware extraction: some providers place summary text in
+      // top-level response fields (output, message, response) rather than
+      // inside the content array.  Re-run normalization against the full
+      // response envelope before spending an API call on a retry.
+      const envelopeNormalized = normalizeCompletionSummary(result);
+      if (envelopeNormalized.summary) {
+        summary = envelopeNormalized.summary;
+        summarySource = "envelope";
+        console.error(
+          `[lcm] recovered summary from response envelope; provider=${provider}; model=${model}; ` +
+            `block_types=${formatBlockTypes(envelopeNormalized.blockTypes)}; source=envelope`,
+        );
+      }
+    }
+
     if (!summary) {
       const responseDiag = extractResponseDiagnostics(result);
       const diagParts = [
@@ -633,9 +650,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         summary = retryNormalized.summary;
 
         if (summary) {
+          summarySource = "retry";
           console.error(
-            `[lcm] retry succeeded; provider=${provider} model=${model}; ` +
-              `block_types=${formatBlockTypes(retryNormalized.blockTypes)}`,
+            `[lcm] retry succeeded; provider=${provider}; model=${model}; ` +
+              `block_types=${formatBlockTypes(retryNormalized.blockTypes)}; source=retry`,
           );
         } else {
           const retryDiag = extractResponseDiagnostics(retryResult);
@@ -662,7 +680,17 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     }
 
     if (!summary) {
+      summarySource = "fallback";
+      console.error(
+        `[lcm] all extraction attempts exhausted; provider=${provider}; model=${model}; source=fallback`,
+      );
       return buildDeterministicFallbackSummary(text, targetTokens);
+    }
+
+    if (summarySource !== "content") {
+      console.error(
+        `[lcm] summary resolved via non-content path; provider=${provider}; model=${model}; source=${summarySource}`,
+      );
     }
 
     return summary;

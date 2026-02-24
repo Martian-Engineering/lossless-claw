@@ -433,4 +433,217 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
     });
   });
+
+  // --- Envelope-aware extraction tests ---
+
+  describe("envelope-aware summary extraction", () => {
+    it("recovers summary from top-level output_text when content is empty", async () => {
+      // OpenAI Responses API provides a convenience `output_text` field at the
+      // response envelope level that concatenates all output_text parts.
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "gpt-5.3-codex",
+          })),
+          complete: vi.fn(async () => ({
+            content: [],
+            output_text: "Summary recovered from envelope output_text.",
+          })),
+        });
+
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        const summary = await summarize!("A".repeat(8_000), false);
+
+        // Should recover from envelope without retry.
+        expect(summary).toBe("Summary recovered from envelope output_text.");
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((c) => c.map(String))
+          .join(" ");
+        expect(diagnostics).toContain("source=envelope");
+        expect(diagnostics).toContain("recovered summary from response envelope");
+        // Should NOT contain retry-related messages.
+        expect(diagnostics).not.toContain("retrying with conservative settings");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("recovers summary from Response.output array when content is empty", async () => {
+      // OpenAI Responses API: content=[] but Response.output contains a
+      // message item with output_text parts (heterogeneous output array).
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "openai-codex",
+          })),
+          complete: vi.fn(async () => ({
+            content: [],
+            output: [
+              {
+                type: "message",
+                role: "assistant",
+                content: [
+                  { type: "output_text", text: "Summary from output message." },
+                ],
+              },
+            ],
+          })),
+        });
+
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "openai-codex" },
+        });
+
+        const summary = await summarize!("B".repeat(8_000), false);
+
+        expect(summary).toBe("Summary from output message.");
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((c) => c.map(String))
+          .join(" ");
+        expect(diagnostics).toContain("source=envelope");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("recovers from envelope when content has reasoning-only blocks", async () => {
+      // content has reasoning blocks with no extractable text, but Response.output
+      // contains the actual assistant message alongside the reasoning.
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "gpt-5.3-codex",
+          })),
+          complete: vi.fn(async () => ({
+            content: [{ type: "reasoning" }],
+            output: [
+              { type: "reasoning", summary: [] },
+              {
+                type: "message",
+                role: "assistant",
+                content: [
+                  { type: "output_text", text: "Actual summary after reasoning." },
+                ],
+              },
+            ],
+          })),
+        });
+
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        const summary = await summarize!("C".repeat(8_000), false);
+
+        expect(summary).toBe("Actual summary after reasoning.");
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((c) => c.map(String))
+          .join(" ");
+        expect(diagnostics).toContain("source=envelope");
+        expect(diagnostics).not.toContain("retrying");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("proceeds to retry when envelope also has no extractable text", async () => {
+      // Both content and envelope have only tool-call items — no text anywhere.
+      // Envelope extraction fails, so retry should fire.
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "openai-codex",
+          })),
+          complete: vi.fn(async () => ({
+            content: [],
+            output: [
+              { type: "function_call", name: "run_code", call_id: "fc_1" },
+            ],
+          })),
+        });
+
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "openai-codex" },
+        });
+
+        const longInput = "D".repeat(10_000);
+        const summary = await summarize!(longInput, false);
+
+        // Envelope also empty → should retry (2 calls) → fallback.
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+        expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((c) => c.map(String))
+          .join(" ");
+        // Should NOT contain envelope recovery.
+        expect(diagnostics).not.toContain("source=envelope");
+        // Should contain retry path.
+        expect(diagnostics).toContain("retrying with conservative settings");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("deduplicates text found in both content and envelope output", async () => {
+      // Edge case: content has reasoning.summary with text, AND the same text
+      // appears in output. Content normalization finds it, so envelope is never
+      // tried. Verify no duplication and no envelope path.
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "openai",
+          model: "gpt-5.3-codex",
+        })),
+        complete: vi.fn(async () => ({
+          content: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "Deduplicated summary." }],
+            },
+          ],
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "Deduplicated summary." }],
+            },
+          ],
+          output_text: "Deduplicated summary.",
+        })),
+      });
+
+      const summarize = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+      });
+
+      const summary = await summarize!("E".repeat(4_000), false);
+
+      // Content normalization succeeds — envelope never tried.
+      expect(summary).toBe("Deduplicated summary.");
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+    });
+  });
 });
