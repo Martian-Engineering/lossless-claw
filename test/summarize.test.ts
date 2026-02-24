@@ -97,10 +97,12 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const normalPrompt = completeMock.mock.calls[0]?.[0]?.messages?.[0]?.content as string;
     const aggressivePrompt = completeMock.mock.calls[1]?.[0]?.messages?.[0]?.content as string;
+    const systemPrompt = completeMock.mock.calls[0]?.[0]?.system as string | undefined;
 
     expect(normalPrompt).toContain("Normal summary policy:");
     expect(aggressivePrompt).toContain("Aggressive summary policy:");
     expect(normalPrompt).toContain("Keep implementation caveats.");
+    expect(systemPrompt).toContain("context-compaction summarization engine");
 
     const normalMaxTokens = Number(completeMock.mock.calls[0]?.[0]?.maxTokens ?? 0);
     const aggressiveMaxTokens = Number(completeMock.mock.calls[1]?.[0]?.maxTokens ?? 0);
@@ -241,6 +243,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(diagnostics).toContain("provider=openai");
       expect(diagnostics).toContain("model=gpt-5.3-codex");
       expect(diagnostics).toContain("block_types=reasoning");
+      expect(diagnostics).toContain("content_preview=");
     } finally {
       consoleError.mockRestore();
     }
@@ -330,6 +333,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         expect(diagnostics).toContain("empty normalized summary on first attempt");
         expect(diagnostics).toContain("retry also returned empty summary");
         expect(diagnostics).toContain("block_types=tool_use");
+        expect(diagnostics).toContain('"type":"tool_use"');
       } finally {
         consoleError.mockRestore();
       }
@@ -386,13 +390,25 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           complete: vi.fn(async () => ({
             content: [],
             id: "req_abc123",
+            provider: "openai-codex",
             model: "gpt-5.3-codex-20260101",
+            request_provider: "openai-codex",
+            request_model: "gpt-5.3-codex",
+            request_api: "openai-codex-responses",
+            request_reasoning: "low",
+            request_has_system: "true",
+            request_temperature: "(omitted)",
+            request_temperature_sent: "false",
             usage: {
               prompt_tokens: 500,
               completion_tokens: 0,
               total_tokens: 500,
+              input: 500,
+              output: 0,
             },
-            finish_reason: "stop",
+            stopReason: "stop",
+            errorMessage: "upstream timeout while acquiring provider connection",
+            error: { code: "provider_timeout", retriable: true },
           })),
         });
 
@@ -408,9 +424,56 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           .join(" ");
         // First-attempt diagnostics should contain envelope metadata.
         expect(diagnostics).toContain("id=req_abc123");
+        expect(diagnostics).toContain("resp_provider=openai-codex");
         expect(diagnostics).toContain("resp_model=gpt-5.3-codex-20260101");
+        expect(diagnostics).toContain("request_api=openai-codex-responses");
+        expect(diagnostics).toContain("request_reasoning=low");
+        expect(diagnostics).toContain("request_has_system=true");
+        expect(diagnostics).toContain("request_temperature=(omitted)");
+        expect(diagnostics).toContain("request_temperature_sent=false");
         expect(diagnostics).toContain("completion_tokens=0");
+        expect(diagnostics).toContain("input=500");
         expect(diagnostics).toContain("finish=stop");
+        expect(diagnostics).toContain("error_message=upstream timeout");
+        expect(diagnostics).toContain("error_preview=");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("redacts sensitive keys from diagnostic content previews", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "gpt-5.3-codex",
+          })),
+          complete: vi.fn(async () => ({
+            content: [
+              {
+                type: "tool_use",
+                name: "http",
+                input: { authorization: "Bearer super-secret-token", body: "x".repeat(1500) },
+              },
+            ],
+          })),
+        });
+
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        await summarize!("E".repeat(8_000), false);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((call) => call.map((entry) => String(entry)))
+          .join(" ");
+        expect(diagnostics).toContain("content_preview=");
+        expect(diagnostics).toContain('"authorization":"[redacted]"');
+        expect(diagnostics).not.toContain("super-secret-token");
+        expect(diagnostics).toContain("[truncated:");
       } finally {
         consoleError.mockRestore();
       }

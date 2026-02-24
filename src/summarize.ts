@@ -24,6 +24,14 @@ export type LcmSummarizerLegacyParams = {
 type SummaryMode = "normal" | "aggressive";
 
 const DEFAULT_CONDENSED_TARGET_TOKENS = 2000;
+const LCM_SUMMARIZER_SYSTEM_PROMPT =
+  "You are a context-compaction summarization engine. Follow user instructions exactly and return plain text summary content only.";
+const DIAGNOSTIC_MAX_DEPTH = 4;
+const DIAGNOSTIC_MAX_ARRAY_ITEMS = 8;
+const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
+const DIAGNOSTIC_MAX_CHARS = 1200;
+const DIAGNOSTIC_SENSITIVE_KEY_PATTERN =
+  /(api[-_]?key|authorization|token|secret|password|cookie|set-cookie|private[-_]?key|bearer)/i;
 
 /** Normalize provider ids for stable config/profile lookup. */
 function normalizeProviderId(provider: string): string {
@@ -193,6 +201,78 @@ function formatBlockTypes(blockTypes: string[]): string {
   return blockTypes.join(",");
 }
 
+/** Truncate long diagnostic text values to keep logs bounded and readable. */
+function truncateDiagnosticText(value: string, maxChars = DIAGNOSTIC_MAX_CHARS): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  return `${value.slice(0, maxChars)}...[truncated:${value.length - maxChars} chars]`;
+}
+
+/** Build a JSON-safe, redacted, depth-limited clone for diagnostic logging. */
+function sanitizeForDiagnostics(value: unknown, depth = 0): unknown {
+  if (depth >= DIAGNOSTIC_MAX_DEPTH) {
+    return "[max-depth]";
+  }
+  if (typeof value === "string") {
+    return truncateDiagnosticText(value);
+  }
+  if (
+    value === null ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return value;
+  }
+  if (value === undefined) {
+    return "[undefined]";
+  }
+  if (typeof value === "function") {
+    return "[function]";
+  }
+  if (typeof value === "symbol") {
+    return "[symbol]";
+  }
+  if (Array.isArray(value)) {
+    const head = value
+      .slice(0, DIAGNOSTIC_MAX_ARRAY_ITEMS)
+      .map((entry) => sanitizeForDiagnostics(entry, depth + 1));
+    if (value.length > DIAGNOSTIC_MAX_ARRAY_ITEMS) {
+      head.push(`[+${value.length - DIAGNOSTIC_MAX_ARRAY_ITEMS} more items]`);
+    }
+    return head;
+  }
+  if (!isRecord(value)) {
+    return String(value);
+  }
+
+  const out: Record<string, unknown> = {};
+  const entries = Object.entries(value);
+  for (const [key, entry] of entries.slice(0, DIAGNOSTIC_MAX_OBJECT_KEYS)) {
+    out[key] = DIAGNOSTIC_SENSITIVE_KEY_PATTERN.test(key)
+      ? "[redacted]"
+      : sanitizeForDiagnostics(entry, depth + 1);
+  }
+  if (entries.length > DIAGNOSTIC_MAX_OBJECT_KEYS) {
+    out.__truncated_keys__ = entries.length - DIAGNOSTIC_MAX_OBJECT_KEYS;
+  }
+  return out;
+}
+
+/** Encode diagnostic payloads in a compact JSON string with safety guards. */
+function formatDiagnosticPayload(value: unknown): string {
+  try {
+    const json = JSON.stringify(sanitizeForDiagnostics(value));
+    if (!json) {
+      return "\"\"";
+    }
+    return truncateDiagnosticText(json);
+  } catch {
+    return "\"[unserializable]\"";
+  }
+}
+
 /**
  * Extract safe diagnostic metadata from a provider response envelope.
  *
@@ -223,8 +303,20 @@ function extractResponseDiagnostics(result: unknown): string {
     } else {
       parts.push(`content_kind=${typeof contentVal}`);
     }
+    parts.push(`content_preview=${formatDiagnosticPayload(contentVal)}`);
   } else {
     parts.push("content_kind=missing");
+  }
+
+  // Preview common non-content payload envelopes used by provider SDKs.
+  const envelopePayload: Record<string, unknown> = {};
+  for (const key of ["summary", "output", "message", "response"]) {
+    if (key in result) {
+      envelopePayload[key] = result[key];
+    }
+  }
+  if (Object.keys(envelopePayload).length > 0) {
+    parts.push(`payload_preview=${formatDiagnosticPayload(envelopePayload)}`);
   }
 
   // Request / response id — present in most provider envelopes.
@@ -239,12 +331,37 @@ function extractResponseDiagnostics(result: unknown): string {
   if (typeof result.model === "string" && result.model.trim()) {
     parts.push(`resp_model=${result.model.trim()}`);
   }
+  if (typeof result.provider === "string" && result.provider.trim()) {
+    parts.push(`resp_provider=${result.provider.trim()}`);
+  }
+  for (const key of [
+    "request_provider",
+    "request_model",
+    "request_api",
+    "request_reasoning",
+    "request_has_system",
+    "request_temperature",
+    "request_temperature_sent",
+  ]) {
+    const val = result[key];
+    if (typeof val === "string" && val.trim()) {
+      parts.push(`${key}=${val.trim()}`);
+    }
+  }
 
   // Usage counters — safe numeric diagnostics.
   if (isRecord(result.usage)) {
     const u = result.usage;
     const tokens: string[] = [];
-    for (const k of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
+    for (const k of [
+      "prompt_tokens",
+      "completion_tokens",
+      "total_tokens",
+      "input",
+      "output",
+      "cacheRead",
+      "cacheWrite",
+    ]) {
       if (typeof u[k] === "number") {
         tokens.push(`${k}=${u[k]}`);
       }
@@ -258,11 +375,23 @@ function extractResponseDiagnostics(result: unknown): string {
   const finishReason =
     typeof result.finish_reason === "string"
       ? result.finish_reason
+      : typeof result.stopReason === "string"
+        ? result.stopReason
       : typeof result.stop_reason === "string"
         ? result.stop_reason
         : undefined;
   if (finishReason) {
     parts.push(`finish=${finishReason}`);
+  }
+
+  // Provider-level error payloads (most useful when finish=error and content is empty).
+  const errorMessage = result.errorMessage;
+  if (typeof errorMessage === "string" && errorMessage.trim()) {
+    parts.push(`error_message=${truncateDiagnosticText(errorMessage.trim(), 400)}`);
+  }
+  const errorPayload = result.error;
+  if (errorPayload !== undefined) {
+    parts.push(`error_preview=${formatDiagnosticPayload(errorPayload)}`);
   }
 
   return parts.join("; ");
@@ -597,6 +726,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       authProfileId,
       agentDir,
       runtimeConfig: params.legacyParams.config,
+      system: LCM_SUMMARIZER_SYSTEM_PROMPT,
       messages: [
         {
           role: "user",
@@ -654,6 +784,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           authProfileId,
           agentDir,
           runtimeConfig: params.legacyParams.config,
+          system: LCM_SUMMARIZER_SYSTEM_PROMPT,
           messages: [
             {
               role: "user",

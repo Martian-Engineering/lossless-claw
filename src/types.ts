@@ -11,6 +11,17 @@ import type { LcmConfig } from "./db/config.js";
  * Minimal LLM completion interface needed by LCM for summarization.
  * Matches the signature of completeSimple from @mariozechner/pi-ai.
  */
+export type CompletionContentBlock = {
+  type: string;
+  text?: string;
+  [key: string]: unknown;
+};
+
+export type CompletionResult = {
+  content: CompletionContentBlock[];
+  [key: string]: unknown;
+};
+
 export type CompleteFn = (params: {
   provider?: string;
   model: string;
@@ -24,7 +35,7 @@ export type CompleteFn = (params: {
   maxTokens: number;
   temperature?: number;
   reasoning?: string;
-}) => Promise<{ content: Array<{ type: string; text?: string }> }>;
+}) => Promise<CompletionResult>;
 
 /**
  * Gateway RPC call interface.

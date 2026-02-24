@@ -49,6 +49,13 @@ type PluginEnvSnapshot = {
 
 type ReadEnvFn = (key: string) => string | undefined;
 
+type CompleteSimpleOptions = {
+  apiKey?: string;
+  maxTokens: number;
+  temperature?: number;
+  reasoning?: string;
+};
+
 /** Capture plugin env values once during initialization. */
 function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnapshot {
   return {
@@ -130,13 +137,17 @@ type PiAiModule = {
       contextWindow?: number;
       maxTokens?: number;
     },
-    request: { messages: Array<{ role: string; content: unknown; timestamp?: number }> },
+    request: {
+      systemPrompt?: string;
+      messages: Array<{ role: string; content: unknown; timestamp?: number }>;
+    },
     options: {
       apiKey?: string;
       maxTokens: number;
       temperature?: number;
+      reasoning?: string;
     },
-  ) => Promise<{ content?: Array<{ type: string; text?: string }> }>;
+  ) => Promise<Record<string, unknown> & { content?: Array<{ type: string; text?: string }> }>;
   getModel?: (provider: string, modelId: string) => unknown;
   getModels?: (provider: string) => unknown[];
   getEnvApiKey?: (provider: string) => string | undefined;
@@ -171,6 +182,39 @@ function inferApiFromProvider(provider: string): string {
     "amazon-bedrock": "bedrock-converse-stream",
   };
   return map[normalized] ?? "openai-responses";
+}
+
+/** Codex Responses rejects `temperature`; omit it for that API family. */
+export function shouldOmitTemperatureForApi(api: string | undefined): boolean {
+  return (api ?? "").trim().toLowerCase() === "openai-codex-responses";
+}
+
+/** Build provider-aware options for pi-ai completeSimple. */
+export function buildCompleteSimpleOptions(params: {
+  api: string | undefined;
+  apiKey: string | undefined;
+  maxTokens: number;
+  temperature: number | undefined;
+  reasoning: string | undefined;
+}): CompleteSimpleOptions {
+  const options: CompleteSimpleOptions = {
+    apiKey: params.apiKey,
+    maxTokens: params.maxTokens,
+  };
+
+  if (
+    typeof params.temperature === "number" &&
+    Number.isFinite(params.temperature) &&
+    !shouldOmitTemperatureForApi(params.api)
+  ) {
+    options.temperature = params.temperature;
+  }
+
+  if (typeof params.reasoning === "string" && params.reasoning.trim()) {
+    options.reasoning = params.reasoning.trim();
+  }
+
+  return options;
 }
 
 /** Select provider-specific config values with case-insensitive provider keys. */
@@ -566,8 +610,10 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       agentDir,
       runtimeConfig,
       messages,
+      system,
       maxTokens,
       temperature,
+      reasoning,
     }) => {
       try {
         const piAiModuleId = "@mariozechner/pi-ai";
@@ -644,24 +690,62 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           });
         }
 
+        const completeOptions = buildCompleteSimpleOptions({
+          api: resolvedModel.api,
+          apiKey: resolvedApiKey,
+          maxTokens,
+          temperature,
+          reasoning,
+        });
+
         const result = await mod.completeSimple(
           resolvedModel,
           {
+            ...(typeof system === "string" && system.trim()
+              ? { systemPrompt: system.trim() }
+              : {}),
             messages: messages.map((message) => ({
               role: message.role,
               content: message.content,
               timestamp: Date.now(),
             })),
           },
-          {
-            apiKey: resolvedApiKey,
-            maxTokens,
-            temperature,
-          },
+          completeOptions,
         );
 
+        if (!isRecord(result)) {
+          return {
+            content: [],
+            request_provider: providerId,
+            request_model: modelId,
+            request_api: resolvedModel.api,
+            request_reasoning:
+              typeof reasoning === "string" && reasoning.trim() ? reasoning.trim() : "(none)",
+            request_has_system:
+              typeof system === "string" && system.trim().length > 0 ? "true" : "false",
+            request_temperature:
+              typeof completeOptions.temperature === "number"
+                ? String(completeOptions.temperature)
+                : "(omitted)",
+            request_temperature_sent:
+              typeof completeOptions.temperature === "number" ? "true" : "false",
+          };
+        }
+
         return {
-          content: Array.isArray(result?.content) ? result.content : [],
+          ...result,
+          content: Array.isArray(result.content) ? result.content : [],
+          request_provider: providerId,
+          request_model: modelId,
+          request_api: resolvedModel.api,
+          request_reasoning:
+            typeof reasoning === "string" && reasoning.trim() ? reasoning.trim() : "(none)",
+          request_has_system: typeof system === "string" && system.trim().length > 0 ? "true" : "false",
+          request_temperature:
+            typeof completeOptions.temperature === "number"
+              ? String(completeOptions.temperature)
+              : "(omitted)",
+          request_temperature_sent: typeof completeOptions.temperature === "number" ? "true" : "false",
         };
       } catch (err) {
         console.error(`[lcm] completeSimple error:`, err instanceof Error ? err.message : err);
@@ -715,8 +799,8 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
 
       const provider = (
-        providerHint?.trim() ||
         envSnapshot.lcmSummaryProvider ||
+        providerHint?.trim() ||
         envSnapshot.openclawProvider ||
         "openai"
       ).trim();
