@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,7 +30,28 @@ const (
 const (
 	sessionInitialLoadSize = 50
 	sessionBatchLoadSize   = 50
+
+	defaultConversationWindowSize = 200
+	minConversationWindowSize     = 1
+	maxConversationWindowSize     = 10_000
 )
+
+type conversationViewportMode int
+
+const (
+	conversationViewportTop conversationViewportMode = iota
+	conversationViewportBottom
+)
+
+type conversationWindowState struct {
+	enabled         bool
+	windowSize      int
+	conversationID  int64
+	oldestMessageID int64
+	newestMessageID int64
+	hasOlder        bool
+	hasNewer        bool
+}
 
 type rewritePhase int
 
@@ -102,6 +125,8 @@ type model struct {
 	convViewport viewport.Model
 	width        int
 	height       int
+
+	conversationWindow conversationWindowState
 
 	summarySources   map[string][]summarySource
 	summarySourceErr map[string]string
@@ -188,6 +213,9 @@ func newModel() model {
 		screen:           screenAgents,
 		summarySources:   make(map[string][]summarySource),
 		summarySourceErr: make(map[string]string),
+		conversationWindow: conversationWindowState{
+			windowSize: resolveConversationWindowSize(),
+		},
 	}
 
 	paths, err := resolveDataPaths()
@@ -351,19 +379,11 @@ func (m model) handleSessionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = "No session selected"
 			return m, nil
 		}
-		messages, err := parseSessionMessages(session.path)
-		if err != nil {
+		if err := m.openConversationForSession(session); err != nil {
 			m.status = "Error: " + err.Error()
 			return m, nil
 		}
-		m.messages = messages
 		m.screen = screenConversation
-		m.refreshConversationViewport()
-		if session.conversationID > 0 {
-			m.status = fmt.Sprintf("Loaded %d messages from %s (conv_id:%d)", len(messages), session.filename, session.conversationID)
-		} else {
-			m.status = fmt.Sprintf("Loaded %d messages from %s", len(messages), session.filename)
-		}
 	case "b", "backspace":
 		m.screen = screenAgents
 		m.sessionFiles = nil
@@ -401,23 +421,21 @@ func (m model) handleConversationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.convViewport.GotoTop()
 	case "G":
 		m.convViewport.GotoBottom()
+	case "[":
+		if err := m.loadOlderConversationWindow(); err != nil {
+			m.status = "Error: " + err.Error()
+		}
+	case "]":
+		if err := m.loadNewerConversationWindow(); err != nil {
+			m.status = "Error: " + err.Error()
+		}
 	case "b", "backspace":
 		m.screen = screenSessions
 		m.status = "Back to sessions"
 	case "r":
-		session, ok := m.currentSession()
-		if !ok {
-			m.status = "No session selected"
-			return m, nil
-		}
-		messages, err := parseSessionMessages(session.path)
-		if err != nil {
+		if err := m.reloadConversationWindow(); err != nil {
 			m.status = "Error: " + err.Error()
-			return m, nil
 		}
-		m.messages = messages
-		m.refreshConversationViewport()
-		m.status = fmt.Sprintf("Reloaded %d messages", len(messages))
 	case "l":
 		session, ok := m.currentSession()
 		if !ok {
@@ -765,6 +783,166 @@ func (m model) handleContextKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.status = "Back to conversation"
 	}
 	return m, nil
+}
+
+// openConversationForSession loads messages for the selected session into the conversation view.
+func (m *model) openConversationForSession(session sessionEntry) error {
+	m.conversationWindow.enabled = false
+	m.conversationWindow.conversationID = 0
+	m.conversationWindow.oldestMessageID = 0
+	m.conversationWindow.newestMessageID = 0
+	m.conversationWindow.hasOlder = false
+	m.conversationWindow.hasNewer = false
+
+	if session.conversationID > 0 {
+		return m.loadLatestConversationWindowForSession(session, "Loaded")
+	}
+	return m.loadConversationFromSessionFile(session, "Loaded")
+}
+
+// reloadConversationWindow refreshes the conversation using the same loading mode as open.
+func (m *model) reloadConversationWindow() error {
+	session, ok := m.currentSession()
+	if !ok {
+		return fmt.Errorf("no session selected")
+	}
+	if session.conversationID > 0 {
+		return m.loadLatestConversationWindowForSession(session, "Reloaded")
+	}
+	return m.loadConversationFromSessionFile(session, "Reloaded")
+}
+
+// loadOlderConversationWindow pages to an older keyset window in the active conversation.
+func (m *model) loadOlderConversationWindow() error {
+	if !m.conversationWindow.enabled || m.conversationWindow.conversationID <= 0 {
+		m.status = "Older/newer paging requires an LCM-tracked conversation (conv_id)"
+		return nil
+	}
+	if !m.conversationWindow.hasOlder {
+		m.status = "No older messages available"
+		return nil
+	}
+
+	queryStart := time.Now()
+	page, err := loadConversationWindowBefore(
+		m.paths.lcmDBPath,
+		m.conversationWindow.conversationID,
+		m.conversationWindow.oldestMessageID,
+		m.conversationWindow.windowSize,
+	)
+	queryDuration := time.Since(queryStart)
+	if err != nil {
+		return err
+	}
+	m.applyConversationWindowPage(page, conversationViewportBottom, "Loaded older window", queryDuration)
+	return nil
+}
+
+// loadNewerConversationWindow pages to a newer keyset window in the active conversation.
+func (m *model) loadNewerConversationWindow() error {
+	if !m.conversationWindow.enabled || m.conversationWindow.conversationID <= 0 {
+		m.status = "Older/newer paging requires an LCM-tracked conversation (conv_id)"
+		return nil
+	}
+	if !m.conversationWindow.hasNewer {
+		m.status = "No newer messages available"
+		return nil
+	}
+
+	queryStart := time.Now()
+	page, err := loadConversationWindowAfter(
+		m.paths.lcmDBPath,
+		m.conversationWindow.conversationID,
+		m.conversationWindow.newestMessageID,
+		m.conversationWindow.windowSize,
+	)
+	queryDuration := time.Since(queryStart)
+	if err != nil {
+		return err
+	}
+	m.applyConversationWindowPage(page, conversationViewportTop, "Loaded newer window", queryDuration)
+	return nil
+}
+
+// loadLatestConversationWindowForSession fetches the newest keyset window for a session.
+func (m *model) loadLatestConversationWindowForSession(session sessionEntry, action string) error {
+	queryStart := time.Now()
+	page, err := loadLatestConversationWindow(m.paths.lcmDBPath, session.conversationID, m.conversationWindow.windowSize)
+	queryDuration := time.Since(queryStart)
+	if err != nil {
+		return err
+	}
+	m.conversationWindow.enabled = true
+	m.conversationWindow.conversationID = session.conversationID
+	m.applyConversationWindowPage(page, conversationViewportBottom, action, queryDuration)
+	return nil
+}
+
+// loadConversationFromSessionFile is a fallback path for sessions without LCM conversation IDs.
+func (m *model) loadConversationFromSessionFile(session sessionEntry, action string) error {
+	parseStart := time.Now()
+	messages, err := parseSessionMessages(session.path)
+	parseDuration := time.Since(parseStart)
+	if err != nil {
+		return err
+	}
+	m.messages = messages
+	renderDuration := m.refreshConversationViewportWithMode(conversationViewportBottom)
+	m.status = fmt.Sprintf(
+		"%s %d messages from %s (file parse:%s render:%s)",
+		action,
+		len(messages),
+		session.filename,
+		formatDuration(parseDuration),
+		formatDuration(renderDuration),
+	)
+	log.Printf(
+		"[lcm-tui] conversation file-load action=%s session=%s messages=%d parse=%s render=%s",
+		strings.ToLower(action),
+		session.id,
+		len(messages),
+		formatDuration(parseDuration),
+		formatDuration(renderDuration),
+	)
+	return nil
+}
+
+// applyConversationWindowPage updates the active window state and refreshes the viewport.
+func (m *model) applyConversationWindowPage(page conversationWindowPage, viewportMode conversationViewportMode, action string, queryDuration time.Duration) {
+	m.messages = page.messages
+	m.conversationWindow.oldestMessageID = page.oldestMessageID
+	m.conversationWindow.newestMessageID = page.newestMessageID
+	m.conversationWindow.hasOlder = page.hasOlder
+	m.conversationWindow.hasNewer = page.hasNewer
+
+	renderDuration := m.refreshConversationViewportWithMode(viewportMode)
+	windowRange := "empty"
+	if page.oldestMessageID > 0 {
+		windowRange = fmt.Sprintf("%d..%d", page.oldestMessageID, page.newestMessageID)
+	}
+	m.status = fmt.Sprintf(
+		"%s %d msgs (window:%s size:%d older:%t newer:%t query:%s render:%s)",
+		action,
+		len(page.messages),
+		windowRange,
+		m.conversationWindow.windowSize,
+		page.hasOlder,
+		page.hasNewer,
+		formatDuration(queryDuration),
+		formatDuration(renderDuration),
+	)
+	log.Printf(
+		"[lcm-tui] conversation window action=%s conv_id=%d messages=%d range=%s size=%d older=%t newer=%t query=%s render=%s",
+		strings.ToLower(action),
+		m.conversationWindow.conversationID,
+		len(page.messages),
+		windowRange,
+		m.conversationWindow.windowSize,
+		page.hasOlder,
+		page.hasNewer,
+		formatDuration(queryDuration),
+		formatDuration(renderDuration),
+	)
 }
 
 func (m *model) expandOrToggleSelectedSummary() {
@@ -1341,7 +1519,7 @@ func (m model) renderHelp() string {
 	case screenSessions:
 		return "up/down: move | enter: open conversation | b: back | r: reload | q: quit"
 	case screenConversation:
-		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | r: reload | l: LCM summaries | c: context | f: LCM files | b: back | q: quit"
+		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | [ / ]: older/newer window | r: reload | l: LCM summaries | c: context | f: LCM files | b: back | q: quit"
 	case screenSummaries:
 		if m.pendingRewrite != nil {
 			switch m.pendingRewrite.phase {
@@ -1905,18 +2083,29 @@ func (m *model) resizeViewport() {
 	m.convViewport.Height = height
 }
 
-func (m *model) refreshConversationViewport() {
+func (m *model) refreshConversationViewport() time.Duration {
+	return m.refreshConversationViewportWithMode(conversationViewportBottom)
+}
+
+// refreshConversationViewportWithMode re-renders conversation text and sets the viewport anchor.
+func (m *model) refreshConversationViewportWithMode(mode conversationViewportMode) time.Duration {
+	start := time.Now()
 	if m.convViewport.Width <= 0 || m.convViewport.Height <= 0 {
-		return
+		return time.Since(start)
 	}
 	if len(m.messages) == 0 {
 		m.convViewport.SetContent("No messages loaded")
 		m.convViewport.GotoTop()
-		return
+		return time.Since(start)
 	}
 	content := renderConversationText(m.messages, m.convViewport.Width)
 	m.convViewport.SetContent(content)
-	m.convViewport.GotoBottom()
+	if mode == conversationViewportTop {
+		m.convViewport.GotoTop()
+	} else {
+		m.convViewport.GotoBottom()
+	}
+	return time.Since(start)
 }
 
 func renderConversationText(messages []sessionMessage, width int) string {
@@ -2091,6 +2280,33 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// resolveConversationWindowSize reads the default conversation window size from env.
+func resolveConversationWindowSize() int {
+	value := strings.TrimSpace(os.Getenv("LCM_TUI_CONVERSATION_WINDOW_SIZE"))
+	if value == "" {
+		return defaultConversationWindowSize
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		log.Printf("[lcm-tui] invalid LCM_TUI_CONVERSATION_WINDOW_SIZE=%q, using default %d", value, defaultConversationWindowSize)
+		return defaultConversationWindowSize
+	}
+	if parsed < minConversationWindowSize {
+		return minConversationWindowSize
+	}
+	if parsed > maxConversationWindowSize {
+		return maxConversationWindowSize
+	}
+	return parsed
+}
+
+func formatDuration(duration time.Duration) string {
+	if duration < time.Millisecond {
+		return "<1ms"
+	}
+	return fmt.Sprintf("%dms", duration.Milliseconds())
 }
 
 func (m *model) loadInitialSessions(agent agentEntry) error {

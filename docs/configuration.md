@@ -102,6 +102,13 @@ export LCM_SUMMARY_PROVIDER=anthropic
 
 Using a cheaper/faster model for summarization can reduce costs, but quality matters — poor summaries compound as they're condensed into higher-level nodes.
 
+## TUI conversation window size
+
+`LCM_TUI_CONVERSATION_WINDOW_SIZE` (default `200`) controls how many messages `lcm-tui` loads per keyset-paged conversation window when a session has an LCM `conversation_id`.
+
+- Smaller values reduce render/query cost for very large conversations.
+- Larger values show more context per page but increase render time.
+
 ## Database management
 
 The SQLite database lives at `LCM_DATABASE_PATH` (default `~/.openclaw/lcm.db`). 

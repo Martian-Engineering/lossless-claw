@@ -72,12 +72,16 @@ A scrollable, color-coded view of the raw session messages. Each message shows i
 
 This is the raw session data, not the LCM-managed context. Use it to understand what actually happened in the conversation.
 
+For sessions with an LCM `conv_id`, the conversation view uses keyset-paged windows by `message_id` (newest window first) instead of hydrating full history.
+
 | Key | Action |
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | Scroll one line |
 | `PgUp`/`PgDn` | Scroll half page |
 | `g` | Jump to top |
 | `G` | Jump to bottom |
+| `[` | Load older message window |
+| `]` | Load newer message window |
 | `l` | Open **Summary DAG** view |
 | `c` | Open **Context** view |
 | `f` | Open **Large Files** view |
@@ -475,6 +479,7 @@ If the provider auth profile mode is `oauth` (not `api_key`), set the provider A
 Interactive rewrite (`w`/`W`) can be configured with:
 - `LCM_TUI_SUMMARY_PROVIDER`
 - `LCM_TUI_SUMMARY_MODEL`
+- `LCM_TUI_CONVERSATION_WINDOW_SIZE` (default `200`)
 
 It also honors `LCM_SUMMARY_PROVIDER` / `LCM_SUMMARY_MODEL` as fallback.
 

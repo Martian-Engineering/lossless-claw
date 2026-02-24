@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,6 +61,16 @@ type sessionMessage struct {
 	timestamp string
 	role      string
 	text      string
+	messageID int64
+}
+
+// conversationWindowPage contains one keyset-paged window of conversation messages.
+type conversationWindowPage struct {
+	messages        []sessionMessage
+	hasOlder        bool
+	hasNewer        bool
+	oldestMessageID int64
+	newestMessageID int64
 }
 
 // summaryNode holds one summary record and its graph children.
@@ -362,12 +373,181 @@ func parseSessionMessages(path string) ([]sessionMessage, error) {
 			timestamp: pickTimestamp(item.Timestamp, msg.Timestamp),
 			role:      role,
 			text:      normalizeMessageContent(msg.Content),
+			messageID: 0,
 		})
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("scan session %q: %w", path, err)
 	}
 	return messages, nil
+}
+
+// loadLatestConversationWindow returns the newest fixed-size message window for a conversation.
+func loadLatestConversationWindow(dbPath string, conversationID int64, limit int) (conversationWindowPage, error) {
+	return loadConversationWindow(dbPath, conversationID, limit, "latest", 0)
+}
+
+// loadConversationWindowBefore returns the previous message window before a cursor message ID.
+func loadConversationWindowBefore(dbPath string, conversationID, beforeMessageID int64, limit int) (conversationWindowPage, error) {
+	return loadConversationWindow(dbPath, conversationID, limit, "before", beforeMessageID)
+}
+
+// loadConversationWindowAfter returns the next message window after a cursor message ID.
+func loadConversationWindowAfter(dbPath string, conversationID, afterMessageID int64, limit int) (conversationWindowPage, error) {
+	return loadConversationWindow(dbPath, conversationID, limit, "after", afterMessageID)
+}
+
+// loadConversationWindow executes one keyset-paged message query and computes paging boundaries.
+func loadConversationWindow(dbPath string, conversationID int64, limit int, mode string, cursorMessageID int64) (conversationWindowPage, error) {
+	if conversationID <= 0 {
+		return conversationWindowPage{}, fmt.Errorf("conversation ID must be > 0")
+	}
+	if limit <= 0 {
+		limit = 1
+	}
+
+	db, err := openLCMDB(dbPath)
+	if err != nil {
+		return conversationWindowPage{}, err
+	}
+	defer db.Close()
+
+	baseQuery := `
+		SELECT message_id, role, content, created_at
+		FROM messages
+		WHERE conversation_id = ?
+	`
+	args := []any{conversationID}
+	orderClause := "ORDER BY message_id ASC"
+	reverse := false
+
+	switch mode {
+	case "latest":
+		orderClause = "ORDER BY message_id DESC"
+		reverse = true
+	case "before":
+		baseQuery += " AND message_id < ?"
+		args = append(args, cursorMessageID)
+		orderClause = "ORDER BY message_id DESC"
+		reverse = true
+	case "after":
+		baseQuery += " AND message_id > ?"
+		args = append(args, cursorMessageID)
+	case "":
+		return conversationWindowPage{}, fmt.Errorf("missing conversation window mode")
+	default:
+		return conversationWindowPage{}, fmt.Errorf("unknown conversation window mode %q", mode)
+	}
+
+	args = append(args, limit)
+	query := baseQuery + "\n" + orderClause + "\nLIMIT ?"
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return conversationWindowPage{}, fmt.Errorf("query conversation %d (%s window): %w", conversationID, mode, err)
+	}
+	defer rows.Close()
+
+	page := conversationWindowPage{
+		messages: make([]sessionMessage, 0, limit),
+	}
+	for rows.Next() {
+		var msgID int64
+		var role, content string
+		var createdAt sql.NullString
+		if err := rows.Scan(&msgID, &role, &content, &createdAt); err != nil {
+			return conversationWindowPage{}, fmt.Errorf("scan conversation %d (%s window): %w", conversationID, mode, err)
+		}
+		if role == "" {
+			role = "unknown"
+		}
+		page.messages = append(page.messages, sessionMessage{
+			id:        strconv.FormatInt(msgID, 10),
+			role:      role,
+			timestamp: createdAt.String,
+			text:      sanitizeForTerminal(content),
+			messageID: msgID,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return conversationWindowPage{}, fmt.Errorf("iterate conversation %d (%s window): %w", conversationID, mode, err)
+	}
+
+	if reverse && len(page.messages) > 1 {
+		for left, right := 0, len(page.messages)-1; left < right; left, right = left+1, right-1 {
+			page.messages[left], page.messages[right] = page.messages[right], page.messages[left]
+		}
+	}
+	if len(page.messages) == 0 {
+		return computeEmptyConversationWindowPage(db, conversationID, mode, cursorMessageID)
+	}
+
+	page.oldestMessageID = page.messages[0].messageID
+	page.newestMessageID = page.messages[len(page.messages)-1].messageID
+
+	hasOlder, err := conversationMessageExistsBefore(db, conversationID, page.oldestMessageID)
+	if err != nil {
+		return conversationWindowPage{}, err
+	}
+	page.hasOlder = hasOlder
+
+	hasNewer, err := conversationMessageExistsAfter(db, conversationID, page.newestMessageID)
+	if err != nil {
+		return conversationWindowPage{}, err
+	}
+	page.hasNewer = hasNewer
+	return page, nil
+}
+
+// computeEmptyConversationWindowPage returns boundary flags when a window query yields no rows.
+func computeEmptyConversationWindowPage(db *sql.DB, conversationID int64, mode string, cursorMessageID int64) (conversationWindowPage, error) {
+	page := conversationWindowPage{}
+	switch mode {
+	case "before":
+		hasNewer, err := conversationMessageExistsAfter(db, conversationID, cursorMessageID)
+		if err != nil {
+			return conversationWindowPage{}, err
+		}
+		page.hasNewer = hasNewer
+	case "after":
+		hasOlder, err := conversationMessageExistsBefore(db, conversationID, cursorMessageID)
+		if err != nil {
+			return conversationWindowPage{}, err
+		}
+		page.hasOlder = hasOlder
+	}
+	return page, nil
+}
+
+// conversationMessageExistsBefore checks whether any message has ID lower than the given boundary.
+func conversationMessageExistsBefore(db *sql.DB, conversationID, boundaryMessageID int64) (bool, error) {
+	var exists int
+	if err := db.QueryRow(`
+		SELECT CASE
+			WHEN EXISTS (
+				SELECT 1 FROM messages
+				WHERE conversation_id = ? AND message_id < ?
+			) THEN 1 ELSE 0
+		END
+	`, conversationID, boundaryMessageID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("query older messages for conversation %d: %w", conversationID, err)
+	}
+	return exists == 1, nil
+}
+
+// conversationMessageExistsAfter checks whether any message has ID higher than the given boundary.
+func conversationMessageExistsAfter(db *sql.DB, conversationID, boundaryMessageID int64) (bool, error) {
+	var exists int
+	if err := db.QueryRow(`
+		SELECT CASE
+			WHEN EXISTS (
+				SELECT 1 FROM messages
+				WHERE conversation_id = ? AND message_id > ?
+			) THEN 1 ELSE 0
+		END
+	`, conversationID, boundaryMessageID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("query newer messages for conversation %d: %w", conversationID, err)
+	}
+	return exists == 1, nil
 }
 
 func pickTimestamp(primary string, fallback any) string {

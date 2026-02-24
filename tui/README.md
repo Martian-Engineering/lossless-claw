@@ -28,6 +28,7 @@ lcm-tui --db /path/to/lcm.db    # custom database path
 
 **Browse & Inspect**
 - **Agent/session browser** — drill down from agents → sessions → conversations
+- **Windowed conversation paging** — keyset pagination by `message_id` for large LCM conversations
 - **Summary DAG** — expandable tree of the full summary hierarchy with depth, kind, token counts, and source messages
 - **Context view** — see the exact ordered list of summaries + messages the model receives each turn
 - **Large files** — inspect intercepted oversized files and their exploration summaries
