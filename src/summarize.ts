@@ -194,6 +194,62 @@ function formatBlockTypes(blockTypes: string[]): string {
 }
 
 /**
+ * Extract safe diagnostic metadata from a provider response envelope.
+ *
+ * Picks common metadata fields (request id, model echo, usage counters) without
+ * leaking secrets like API keys or auth tokens. The result object from
+ * `deps.complete` is typed narrowly but real provider responses carry extra
+ * fields that are useful for debugging empty-summary incidents.
+ */
+function extractResponseDiagnostics(result: unknown): string {
+  if (!isRecord(result)) {
+    return "";
+  }
+
+  const parts: string[] = [];
+
+  // Request / response id — present in most provider envelopes.
+  for (const key of ["id", "request_id", "x-request-id"]) {
+    const val = result[key];
+    if (typeof val === "string" && val.trim()) {
+      parts.push(`${key}=${val.trim()}`);
+    }
+  }
+
+  // Model echo — useful when the provider selects a different checkpoint.
+  if (typeof result.model === "string" && result.model.trim()) {
+    parts.push(`resp_model=${result.model.trim()}`);
+  }
+
+  // Usage counters — safe numeric diagnostics.
+  if (isRecord(result.usage)) {
+    const u = result.usage;
+    const tokens: string[] = [];
+    for (const k of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
+      if (typeof u[k] === "number") {
+        tokens.push(`${k}=${u[k]}`);
+      }
+    }
+    if (tokens.length > 0) {
+      parts.push(tokens.join(","));
+    }
+  }
+
+  // Finish reason — helps explain empty content.
+  const finishReason =
+    typeof result.finish_reason === "string"
+      ? result.finish_reason
+      : typeof result.stop_reason === "string"
+        ? result.stop_reason
+        : undefined;
+  if (finishReason) {
+    parts.push(`finish=${finishReason}`);
+  }
+
+  return parts.join("; ");
+}
+
+/**
  * Resolve a practical target token count for leaf and condensed summaries.
  * Aggressive leaf mode intentionally aims lower so compaction converges faster.
  */
@@ -533,14 +589,79 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     });
 
     const normalized = normalizeCompletionSummary(result.content);
-    const summary = normalized.summary;
+    let summary = normalized.summary;
+
+    // --- Empty-summary hardening: diagnostics → retry → deterministic fallback ---
+    if (!summary) {
+      const responseDiag = extractResponseDiagnostics(result);
+      const diagParts = [
+        `[lcm] empty normalized summary on first attempt`,
+        `provider=${provider}`,
+        `model=${model}`,
+        `block_types=${formatBlockTypes(normalized.blockTypes)}`,
+        `response_blocks=${result.content.length}`,
+      ];
+      if (responseDiag) {
+        diagParts.push(responseDiag);
+      }
+      console.error(`${diagParts.join("; ")}; retrying with conservative settings`);
+
+      // Single retry with conservative parameters: low temperature and low
+      // reasoning budget to coax a textual response from providers that
+      // sometimes return reasoning-only or empty blocks on the first pass.
+      try {
+        const retryResult = await params.deps.complete({
+          provider,
+          model,
+          apiKey,
+          providerApi,
+          authProfileId,
+          agentDir,
+          runtimeConfig: params.legacyParams.config,
+          messages: [
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+          maxTokens: targetTokens,
+          temperature: 0.05,
+          reasoning: "low",
+        });
+
+        const retryNormalized = normalizeCompletionSummary(retryResult.content);
+        summary = retryNormalized.summary;
+
+        if (summary) {
+          console.error(
+            `[lcm] retry succeeded; provider=${provider} model=${model}; ` +
+              `block_types=${formatBlockTypes(retryNormalized.blockTypes)}`,
+          );
+        } else {
+          const retryDiag = extractResponseDiagnostics(retryResult);
+          const retryParts = [
+            `[lcm] retry also returned empty summary`,
+            `provider=${provider}`,
+            `model=${model}`,
+            `block_types=${formatBlockTypes(retryNormalized.blockTypes)}`,
+            `response_blocks=${retryResult.content.length}`,
+          ];
+          if (retryDiag) {
+            retryParts.push(retryDiag);
+          }
+          console.error(`${retryParts.join("; ")}; falling back to truncation`);
+        }
+      } catch (retryErr) {
+        // Retry is best-effort; log and proceed to deterministic fallback.
+        console.error(
+          `[lcm] retry failed; provider=${provider} model=${model}; error=${
+            retryErr instanceof Error ? retryErr.message : String(retryErr)
+          }; falling back to truncation`,
+        );
+      }
+    }
 
     if (!summary) {
-      console.error(
-        `[lcm] summarize empty normalized summary; provider=${provider} model=${model} block_types=${formatBlockTypes(
-          normalized.blockTypes,
-        )}; response_blocks=${result.content.length}; falling back to truncation`,
-      );
       return buildDeterministicFallbackSummary(text, targetTokens);
     }
 

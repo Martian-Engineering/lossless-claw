@@ -150,7 +150,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(completeMock.mock.calls[0]?.[0]?.apiKey).toBe("resolved-api-key");
   });
 
-  it("falls back deterministically when model returns empty summary output", async () => {
+  it("falls back deterministically when model returns empty summary output after retry", async () => {
     const deps = makeDeps({
       complete: vi.fn(async () => ({
         content: [],
@@ -167,6 +167,10 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const longInput = "A".repeat(12_000);
     const summary = await summarize!(longInput, false);
+
+    // Should have called complete twice: original + retry.
+    const completeMock = vi.mocked(deps.complete);
+    expect(completeMock).toHaveBeenCalledTimes(2);
 
     expect(summary.length).toBeGreaterThan(0);
     expect(summary).toContain("[LCM fallback summary; truncated for context management]");
@@ -240,5 +244,193 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  // --- Empty-summary hardening: focused tests ---
+
+  describe("empty-summary retry and diagnostics", () => {
+    it("retries with conservative settings when first attempt returns empty content array", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        let callCount = 0;
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "gpt-5.3-codex",
+          })),
+          complete: vi.fn(async () => {
+            callCount++;
+            if (callCount === 1) {
+              // First call returns empty content array.
+              return { content: [] };
+            }
+            // Retry succeeds with a valid text block.
+            return { content: [{ type: "text", text: "Recovered summary from retry." }] };
+          }),
+        });
+
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        const summary = await summarize!("A".repeat(8_000), false);
+
+        // Retry should have succeeded — no fallback truncation marker.
+        expect(summary).toBe("Recovered summary from retry.");
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+
+        // Retry call should use conservative settings.
+        const retryArgs = vi.mocked(deps.complete).mock.calls[1]?.[0];
+        expect(retryArgs?.temperature).toBe(0.05);
+        expect(retryArgs?.reasoning).toBe("low");
+
+        // Should log the retry-succeeded diagnostic.
+        const diagnostics = consoleError.mock.calls
+          .flatMap((c) => c.map(String))
+          .join(" ");
+        expect(diagnostics).toContain("retry succeeded");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("falls back to truncation when retry also returns empty for non-text-only blocks", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "openai-codex",
+          })),
+          // Both attempts return only tool_use blocks — no extractable text.
+          complete: vi.fn(async () => ({
+            content: [
+              { type: "tool_use", id: "tu_1", name: "bash", input: { cmd: "ls" } },
+            ],
+          })),
+        });
+
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "openai-codex" },
+        });
+
+        const longInput = "B".repeat(10_000);
+        const summary = await summarize!(longInput, false);
+
+        // Both calls fail → deterministic fallback.
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+        expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+
+        // Diagnostics should mention both first-attempt and retry failure.
+        const diagnostics = consoleError.mock.calls
+          .flatMap((c) => c.map(String))
+          .join(" ");
+        expect(diagnostics).toContain("empty normalized summary on first attempt");
+        expect(diagnostics).toContain("retry also returned empty summary");
+        expect(diagnostics).toContain("block_types=tool_use");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("falls back gracefully when retry throws an exception", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        let callCount = 0;
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "gpt-5.3-codex",
+          })),
+          complete: vi.fn(async () => {
+            callCount++;
+            if (callCount === 1) {
+              return { content: [] };
+            }
+            throw new Error("rate limit exceeded");
+          }),
+        });
+
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        const longInput = "C".repeat(10_000);
+        const summary = await summarize!(longInput, false);
+
+        // Retry threw → deterministic fallback.
+        expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((c) => c.map(String))
+          .join(" ");
+        expect(diagnostics).toContain("retry failed");
+        expect(diagnostics).toContain("rate limit exceeded");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("logs response envelope metadata (request-id, usage) in diagnostics", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "gpt-5.3-codex",
+          })),
+          // Return a response with metadata fields alongside empty content.
+          complete: vi.fn(async () => ({
+            content: [],
+            id: "req_abc123",
+            model: "gpt-5.3-codex-20260101",
+            usage: {
+              prompt_tokens: 500,
+              completion_tokens: 0,
+              total_tokens: 500,
+            },
+            finish_reason: "stop",
+          })),
+        });
+
+        const summarize = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+        });
+
+        await summarize!("D".repeat(8_000), false);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((c) => c.map(String))
+          .join(" ");
+        // First-attempt diagnostics should contain envelope metadata.
+        expect(diagnostics).toContain("id=req_abc123");
+        expect(diagnostics).toContain("resp_model=gpt-5.3-codex-20260101");
+        expect(diagnostics).toContain("completion_tokens=0");
+        expect(diagnostics).toContain("finish=stop");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("does not retry when Anthropic provider returns a valid summary", async () => {
+      const deps = makeDeps({
+        // Default makeDeps uses anthropic + returns valid text — no retry expected.
+      });
+
+      const summarize = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: { provider: "anthropic", model: "claude-opus-4-5" },
+      });
+
+      const summary = await summarize!("Some conversation text", false);
+
+      expect(summary).toBe("summary output");
+      // Only the single original call — no retry.
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+    });
   });
 });
