@@ -208,6 +208,25 @@ function extractResponseDiagnostics(result: unknown): string {
 
   const parts: string[] = [];
 
+  // Envelope-shape diagnostics for empty-block incidents.
+  const topLevelKeys = Object.keys(result).slice(0, 24);
+  if (topLevelKeys.length > 0) {
+    parts.push(`keys=${topLevelKeys.join(",")}`);
+  }
+  if ("content" in result) {
+    const contentVal = result.content;
+    if (Array.isArray(contentVal)) {
+      parts.push(`content_kind=array`);
+      parts.push(`content_len=${contentVal.length}`);
+    } else if (contentVal === null) {
+      parts.push(`content_kind=null`);
+    } else {
+      parts.push(`content_kind=${typeof contentVal}`);
+    }
+  } else {
+    parts.push("content_kind=missing");
+  }
+
   // Request / response id — present in most provider envelopes.
   for (const key of ["id", "request_id", "x-request-id"]) {
     const val = result[key];
