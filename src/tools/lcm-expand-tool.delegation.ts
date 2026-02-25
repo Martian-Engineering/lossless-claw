@@ -5,6 +5,13 @@ import {
   revokeDelegatedExpansionGrantForSession,
 } from "../expansion-auth.js";
 import type { LcmDependencies } from "../types.js";
+import {
+  clearDelegatedExpansionContext,
+  evaluateExpansionRecursionGuard,
+  recordExpansionDelegationTelemetry,
+  resolveExpansionRequestId,
+  stampDelegatedExpansionContext,
+} from "./lcm-expansion-recursion-guard.js";
 
 const MAX_GATEWAY_TIMEOUT_MS = 2_147_483_647;
 
@@ -156,6 +163,9 @@ function buildDelegatedExpansionTask(params: {
   includeMessages: boolean;
   pass: number;
   query?: string;
+  requestId: string;
+  expansionDepth: number;
+  originSessionKey: string;
 }) {
   const payload: {
     summaryIds: string[];
@@ -179,6 +189,11 @@ function buildDelegatedExpansionTask(params: {
     "",
     "Call `lcm_expand` using exactly this JSON payload:",
     JSON.stringify(payload, null, 2),
+    "",
+    "Delegated expansion metadata (for tracing):",
+    `- requestId: ${params.requestId}`,
+    `- expansionDepth: ${params.expansionDepth}`,
+    `- originSessionKey: ${params.originSessionKey}`,
     "",
     "Then return ONLY JSON with this shape:",
     "{",
@@ -240,6 +255,7 @@ async function runDelegatedExpansionPass(params: {
     | "buildSubagentSystemPrompt"
     | "readLatestAssistantReply"
     | "agentLaneSubagent"
+    | "log"
   >;
   requesterSessionKey: string;
   conversationId: number;
@@ -249,6 +265,9 @@ async function runDelegatedExpansionPass(params: {
   includeMessages: boolean;
   query?: string;
   pass: number;
+  requestId: string;
+  parentExpansionDepth: number;
+  originSessionKey: string;
 }): Promise<DelegatedExpansionPassResult> {
   const requesterAgentId = params.deps.normalizeAgentId(
     params.deps.parseAgentSessionKey(params.requesterSessionKey)?.agentId,
@@ -262,6 +281,13 @@ async function runDelegatedExpansionPass(params: {
     allowedConversationIds: [params.conversationId],
     ttlMs: MAX_GATEWAY_TIMEOUT_MS,
   });
+  stampDelegatedExpansionContext({
+    sessionKey: childSessionKey,
+    requestId: params.requestId,
+    expansionDepth: params.parentExpansionDepth + 1,
+    originSessionKey: params.originSessionKey,
+    stampedBy: "runDelegatedExpansionLoop",
+  });
 
   try {
     const message = buildDelegatedExpansionTask({
@@ -272,6 +298,9 @@ async function runDelegatedExpansionPass(params: {
       includeMessages: params.includeMessages,
       pass: params.pass,
       query: params.query,
+      requestId: params.requestId,
+      expansionDepth: params.parentExpansionDepth + 1,
+      originSessionKey: params.originSessionKey,
     });
     const response = (await params.deps.callGateway({
       method: "agent",
@@ -374,6 +403,7 @@ async function runDelegatedExpansionPass(params: {
       // Cleanup is best-effort.
     }
     revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+    clearDelegatedExpansionContext(childSessionKey);
   }
 }
 
@@ -386,6 +416,7 @@ export async function runDelegatedExpansionLoop(params: {
     | "buildSubagentSystemPrompt"
     | "readLatestAssistantReply"
     | "agentLaneSubagent"
+    | "log"
   >;
   requesterSessionKey: string;
   conversationId: number;
@@ -394,7 +425,44 @@ export async function runDelegatedExpansionLoop(params: {
   tokenCap?: number;
   includeMessages: boolean;
   query?: string;
+  requestId?: string;
 }): Promise<DelegatedExpansionLoopResult> {
+  const requestId = params.requestId?.trim() || resolveExpansionRequestId(params.requesterSessionKey);
+  const recursionCheck = evaluateExpansionRecursionGuard({
+    sessionKey: params.requesterSessionKey,
+    requestId,
+  });
+  recordExpansionDelegationTelemetry({
+    deps: params.deps,
+    component: "runDelegatedExpansionLoop",
+    event: "start",
+    requestId,
+    sessionKey: params.requesterSessionKey,
+    expansionDepth: recursionCheck.expansionDepth,
+    originSessionKey: recursionCheck.originSessionKey,
+  });
+  if (recursionCheck.blocked) {
+    recordExpansionDelegationTelemetry({
+      deps: params.deps,
+      component: "runDelegatedExpansionLoop",
+      event: "block",
+      requestId,
+      sessionKey: params.requesterSessionKey,
+      expansionDepth: recursionCheck.expansionDepth,
+      originSessionKey: recursionCheck.originSessionKey,
+      reason: recursionCheck.reason,
+    });
+    return {
+      status: "error",
+      passes: [],
+      citedIds: [],
+      totalTokens: 0,
+      truncated: true,
+      text: "Delegated expansion blocked by recursion guard.",
+      error: recursionCheck.message,
+    };
+  }
+
   const passes: DelegatedExpansionPassResult[] = [];
   const visited = new Set<string>();
   const cited = new Set<string>();
@@ -415,10 +483,25 @@ export async function runDelegatedExpansionLoop(params: {
       includeMessages: params.includeMessages,
       query: params.query,
       pass,
+      requestId,
+      parentExpansionDepth: recursionCheck.expansionDepth,
+      originSessionKey: recursionCheck.originSessionKey,
     });
     passes.push(result);
 
     if (result.status !== "ok") {
+      if (result.status === "timeout") {
+        recordExpansionDelegationTelemetry({
+          deps: params.deps,
+          component: "runDelegatedExpansionLoop",
+          event: "timeout",
+          requestId,
+          sessionKey: params.requesterSessionKey,
+          expansionDepth: recursionCheck.expansionDepth,
+          originSessionKey: recursionCheck.originSessionKey,
+          runId: result.runId,
+        });
+      }
       const okPasses = passes.filter((entry) => entry.status === "ok");
       for (const okPass of okPasses) {
         for (const summaryId of okPass.citedIds) {
@@ -449,6 +532,15 @@ export async function runDelegatedExpansionLoop(params: {
     pass += 1;
   }
 
+  recordExpansionDelegationTelemetry({
+    deps: params.deps,
+    component: "runDelegatedExpansionLoop",
+    event: "success",
+    requestId,
+    sessionKey: params.requesterSessionKey,
+    expansionDepth: recursionCheck.expansionDepth,
+    originSessionKey: recursionCheck.originSessionKey,
+  });
   return {
     status: "ok",
     passes,

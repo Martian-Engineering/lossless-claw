@@ -12,6 +12,14 @@ import {
   normalizeSummaryIds,
   resolveRequesterConversationScopeId,
 } from "./lcm-expand-tool.delegation.js";
+import {
+  clearDelegatedExpansionContext,
+  evaluateExpansionRecursionGuard,
+  recordExpansionDelegationTelemetry,
+  resolveExpansionRequestId,
+  resolveNextExpansionDepth,
+  stampDelegatedExpansionContext,
+} from "./lcm-expansion-recursion-guard.js";
 
 const DELEGATED_WAIT_TIMEOUT_MS = 120_000;
 const GATEWAY_TIMEOUT_MS = 10_000;
@@ -73,6 +81,9 @@ function buildDelegatedExpandQueryTask(params: {
   conversationId: number;
   prompt: string;
   maxTokens: number;
+  requestId: string;
+  expansionDepth: number;
+  originSessionKey: string;
 }) {
   const payload = {
     summaryIds: params.summaryIds,
@@ -87,6 +98,11 @@ function buildDelegatedExpandQueryTask(params: {
     "",
     "Step 2: Use the `lcm_expand` result as source context and answer this prompt:",
     params.prompt,
+    "",
+    "Delegated expansion metadata (for tracing):",
+    `- requestId: ${params.requestId}`,
+    `- expansionDepth: ${params.expansionDepth}`,
+    `- originSessionKey: ${params.originSessionKey}`,
     "",
     "Return ONLY JSON with this shape:",
     "{",
@@ -294,11 +310,46 @@ export function createLcmExpandQueryTool(input: {
         });
       }
 
-      const requesterSessionKey =
+      const callerSessionKey =
         (typeof input.requesterSessionKey === "string"
           ? input.requesterSessionKey
           : input.sessionId
         )?.trim() ?? "";
+      const requestId = resolveExpansionRequestId(callerSessionKey);
+      const recursionCheck = evaluateExpansionRecursionGuard({
+        sessionKey: callerSessionKey,
+        requestId,
+      });
+      recordExpansionDelegationTelemetry({
+        deps: input.deps,
+        component: "lcm_expand_query",
+        event: "start",
+        requestId,
+        sessionKey: callerSessionKey,
+        expansionDepth: recursionCheck.expansionDepth,
+        originSessionKey: recursionCheck.originSessionKey,
+      });
+      if (recursionCheck.blocked) {
+        recordExpansionDelegationTelemetry({
+          deps: input.deps,
+          component: "lcm_expand_query",
+          event: "block",
+          requestId,
+          sessionKey: callerSessionKey,
+          expansionDepth: recursionCheck.expansionDepth,
+          originSessionKey: recursionCheck.originSessionKey,
+          reason: recursionCheck.reason,
+        });
+        return jsonResult({
+          errorCode: recursionCheck.code,
+          error: recursionCheck.message,
+          requestId: recursionCheck.requestId,
+          expansionDepth: recursionCheck.expansionDepth,
+          originSessionKey: recursionCheck.originSessionKey,
+          reason: recursionCheck.reason,
+        });
+      }
+
       const conversationScope = await resolveLcmConversationScope({
         lcm: input.lcm,
         deps: input.deps,
@@ -310,11 +361,11 @@ export function createLcmExpandQueryTool(input: {
       if (
         !conversationScope.allConversations &&
         scopedConversationId == null &&
-        requesterSessionKey
+        callerSessionKey
       ) {
         scopedConversationId = await resolveRequesterConversationScopeId({
           deps: input.deps,
-          requesterSessionKey,
+          requesterSessionKey: callerSessionKey,
           lcm: input.lcm,
         });
       }
@@ -371,16 +422,25 @@ export function createLcmExpandQueryTool(input: {
         }
 
         const requesterAgentId = input.deps.normalizeAgentId(
-          input.deps.parseAgentSessionKey(requesterSessionKey)?.agentId,
+          input.deps.parseAgentSessionKey(callerSessionKey)?.agentId,
         );
         childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
+        const childExpansionDepth = resolveNextExpansionDepth(callerSessionKey);
+        const originSessionKey = recursionCheck.originSessionKey || callerSessionKey || "main";
 
         createDelegatedExpansionGrant({
           delegatedSessionKey: childSessionKey,
-          issuerSessionId: requesterSessionKey || "main",
+          issuerSessionId: callerSessionKey || "main",
           allowedConversationIds: [sourceConversationId],
           tokenCap: input.deps.config.maxExpandTokens,
           ttlMs: DELEGATED_WAIT_TIMEOUT_MS + 30_000,
+        });
+        stampDelegatedExpansionContext({
+          sessionKey: childSessionKey,
+          requestId,
+          expansionDepth: childExpansionDepth,
+          originSessionKey,
+          stampedBy: "lcm_expand_query",
         });
         grantCreated = true;
 
@@ -389,6 +449,9 @@ export function createLcmExpandQueryTool(input: {
           conversationId: sourceConversationId,
           prompt,
           maxTokens,
+          requestId,
+          expansionDepth: childExpansionDepth,
+          originSessionKey,
         });
 
         const childIdem = crypto.randomUUID();
@@ -426,6 +489,16 @@ export function createLcmExpandQueryTool(input: {
         })) as { status?: string; error?: string };
         const status = typeof wait?.status === "string" ? wait.status : "error";
         if (status === "timeout") {
+          recordExpansionDelegationTelemetry({
+            deps: input.deps,
+            component: "lcm_expand_query",
+            event: "timeout",
+            requestId,
+            sessionKey: callerSessionKey,
+            expansionDepth: childExpansionDepth,
+            originSessionKey,
+            runId,
+          });
           return jsonResult({
             error: "lcm_expand_query timed out waiting for delegated expansion (120s).",
           });
@@ -448,6 +521,16 @@ export function createLcmExpandQueryTool(input: {
           Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
         );
         const parsed = parseDelegatedExpandQueryReply(reply, summaryIds.length);
+        recordExpansionDelegationTelemetry({
+          deps: input.deps,
+          component: "lcm_expand_query",
+          event: "success",
+          requestId,
+          sessionKey: callerSessionKey,
+          expansionDepth: childExpansionDepth,
+          originSessionKey,
+          runId,
+        });
 
         return jsonResult({
           answer: parsed.answer,
@@ -475,6 +558,9 @@ export function createLcmExpandQueryTool(input: {
         }
         if (grantCreated && childSessionKey) {
           revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+        }
+        if (childSessionKey) {
+          clearDelegatedExpansionContext(childSessionKey);
         }
       }
     },

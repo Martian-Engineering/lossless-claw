@@ -1,9 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LcmContextEngine } from "../src/engine.js";
 import {
+  createDelegatedExpansionGrant,
   resolveDelegatedExpansionGrantId,
   resetDelegatedExpansionGrantsForTests,
 } from "../src/expansion-auth.js";
+import {
+  getDelegatedExpansionContextForTests,
+  getExpansionDelegationTelemetrySnapshotForTests,
+  resetExpansionDelegationGuardForTests,
+  stampDelegatedExpansionContext,
+} from "../src/tools/lcm-expansion-recursion-guard.js";
 import { createLcmExpandQueryTool } from "../src/tools/lcm-expand-query-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
@@ -131,6 +138,7 @@ describe("createLcmExpandQueryTool", () => {
     vi.clearAllMocks();
     callGatewayMock.mockReset();
     resetDelegatedExpansionGrantsForTests();
+    resetExpansionDelegationGuardForTests();
   });
 
   it("returns a focused delegated answer for explicit summaryIds", async () => {
@@ -141,10 +149,14 @@ describe("createLcmExpandQueryTool", () => {
     });
 
     let delegatedSessionKey = "";
+    let delegatedContext:
+      | ReturnType<typeof getDelegatedExpansionContextForTests>
+      | undefined;
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string; params?: Record<string, unknown> };
       if (request.method === "agent") {
         delegatedSessionKey = String(request.params?.sessionKey ?? "");
+        delegatedContext = getDelegatedExpansionContextForTests(delegatedSessionKey);
         return { runId: "run-1" };
       }
       if (request.method === "agent.wait") {
@@ -205,7 +217,19 @@ describe("createLcmExpandQueryTool", () => {
     expect(agentCall?.params?.message).toContain("lcm_expand");
 
     expect(delegatedSessionKey).not.toBe("");
+    expect(delegatedContext).toMatchObject({
+      requestId: expect.any(String),
+      expansionDepth: 1,
+      originSessionKey: "agent:main:main",
+      stampedBy: "lcm_expand_query",
+    });
     expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
+    expect(getExpansionDelegationTelemetrySnapshotForTests()).toMatchObject({
+      start: 1,
+      block: 0,
+      timeout: 0,
+      success: 1,
+    });
   });
 
   it("returns a validation error when prompt is missing", async () => {
@@ -273,6 +297,12 @@ describe("createLcmExpandQueryTool", () => {
     expect(methods).toContain("sessions.delete");
     expect(delegatedSessionKey).not.toBe("");
     expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
+    expect(getExpansionDelegationTelemetrySnapshotForTests()).toMatchObject({
+      start: 1,
+      block: 0,
+      timeout: 1,
+      success: 0,
+    });
   });
 
   it("cleans up delegated session and grant when agent call fails", async () => {
@@ -410,6 +440,61 @@ describe("createLcmExpandQueryTool", () => {
       sourceConversationId: 7,
       expandedSummaryCount: 2,
       citedIds: ["sum_x", "sum_y"],
+    });
+  });
+
+  it("blocks delegated re-entry with deterministic recursion errors", async () => {
+    const retrieval = makeRetrieval();
+    const delegatedSessionKey = "agent:main:subagent:recursive";
+    createDelegatedExpansionGrant({
+      delegatedSessionKey,
+      issuerSessionId: "agent:main:main",
+      allowedConversationIds: [42],
+      tokenCap: 120,
+    });
+    stampDelegatedExpansionContext({
+      sessionKey: delegatedSessionKey,
+      requestId: "req-recursive",
+      expansionDepth: 1,
+      originSessionKey: "agent:main:main",
+      stampedBy: "test",
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: delegatedSessionKey,
+      requesterSessionKey: delegatedSessionKey,
+    });
+
+    const first = await tool.execute("call-recursive-1", {
+      summaryIds: ["sum_a"],
+      prompt: "Should block recursion",
+      conversationId: 42,
+    });
+    expect(first.details).toMatchObject({
+      errorCode: "EXPANSION_RECURSION_BLOCKED",
+      reason: "depth_cap",
+      requestId: "req-recursive",
+    });
+
+    const second = await tool.execute("call-recursive-2", {
+      summaryIds: ["sum_a"],
+      prompt: "Should block recursion again",
+      conversationId: 42,
+    });
+    expect(second.details).toMatchObject({
+      errorCode: "EXPANSION_RECURSION_BLOCKED",
+      reason: "idempotent_reentry",
+      requestId: "req-recursive",
+    });
+
+    expect(callGatewayMock).not.toHaveBeenCalled();
+    expect(getExpansionDelegationTelemetrySnapshotForTests()).toMatchObject({
+      start: 2,
+      block: 2,
+      timeout: 0,
+      success: 0,
     });
   });
 });
