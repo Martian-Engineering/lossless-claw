@@ -205,7 +205,10 @@ function buildDelegatedExpansionTask(params: {
     "}",
     "",
     "Rules:",
+    "- In delegated context, use `lcm_expand` directly for retrieval.",
+    "- DO NOT call `lcm_expand_query` from this delegated session.",
     "- Keep summary concise and factual.",
+    "- Synthesize findings from the `lcm_expand` result before returning.",
     "- citedIds/followUpSummaryIds must contain unique summary IDs only.",
     "- If no follow-up is needed, return an empty followUpSummaryIds array.",
   ]

@@ -214,7 +214,12 @@ describe("createLcmExpandQueryTool", () => {
     const agentCall = callGatewayMock.mock.calls
       .map(([opts]) => opts as { method?: string; params?: Record<string, unknown> })
       .find((entry) => entry.method === "agent");
-    expect(agentCall?.params?.message).toContain("lcm_expand");
+    const rawMessage = agentCall?.params?.message;
+    expect(typeof rawMessage).toBe("string");
+    const message = typeof rawMessage === "string" ? rawMessage : "";
+    expect(message).toContain("lcm_expand");
+    expect(message).toContain("DO NOT call `lcm_expand_query` from this delegated session.");
+    expect(message).toContain("Synthesize the final answer from the `lcm_expand` output.");
 
     expect(delegatedSessionKey).not.toBe("");
     expect(delegatedContext).toMatchObject({
@@ -477,6 +482,12 @@ describe("createLcmExpandQueryTool", () => {
       reason: "depth_cap",
       requestId: "req-recursive",
     });
+    expect((first.details as { error?: string }).error).toContain(
+      "Recovery: In delegated sub-agent sessions, call `lcm_expand` directly",
+    );
+    expect((first.details as { error?: string }).error).toContain(
+      "Do NOT call `lcm_expand_query` from delegated context.",
+    );
 
     const second = await tool.execute("call-recursive-2", {
       summaryIds: ["sum_a"],

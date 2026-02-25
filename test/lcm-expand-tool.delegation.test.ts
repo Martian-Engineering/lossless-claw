@@ -139,6 +139,8 @@ describe("runDelegatedExpansionLoop recursion guard", () => {
     expect(result.status).toBe("ok");
     expect(result.citedIds).toEqual(["sum_a"]);
     expect(lastAgentMessage).toContain("requestId");
+    expect(lastAgentMessage).toContain("DO NOT call `lcm_expand_query` from this delegated session.");
+    expect(lastAgentMessage).toContain("use `lcm_expand` directly");
     expect(getExpansionDelegationTelemetrySnapshotForTests()).toMatchObject({
       start: 1,
       block: 0,
@@ -168,6 +170,10 @@ describe("runDelegatedExpansionLoop recursion guard", () => {
 
     expect(result.status).toBe("error");
     expect(result.error).toContain("EXPANSION_RECURSION_BLOCKED");
+    expect(result.error).toContain(
+      "Recovery: In delegated sub-agent sessions, call `lcm_expand` directly",
+    );
+    expect(result.error).toContain("Do NOT call `lcm_expand_query` from delegated context.");
     expect(callGatewayMock).not.toHaveBeenCalled();
     expect(getExpansionDelegationTelemetrySnapshotForTests()).toMatchObject({
       start: 1,

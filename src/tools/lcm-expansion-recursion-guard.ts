@@ -79,6 +79,18 @@ function resolveFallbackDelegatedContext(
 }
 
 /**
+ * Build actionable recovery guidance for recursion-blocked delegated calls.
+ */
+function buildExpansionRecursionRecoveryGuidance(originSessionKey: string): string {
+  return (
+    "Recovery: In delegated sub-agent sessions, call `lcm_expand` directly and synthesize " +
+    "your answer from that result. Do NOT call `lcm_expand_query` from delegated context. " +
+    `If deeper delegation is required, return to the origin session (${originSessionKey}) ` +
+    "and call `lcm_expand_query` there."
+  );
+}
+
+/**
  * Create a stable request identifier for delegated expansion orchestration.
  */
 export function createExpansionRequestId(): string {
@@ -193,7 +205,8 @@ export function evaluateExpansionRecursionGuard(params: {
     message:
       `${EXPANSION_RECURSION_ERROR_CODE}: Expansion delegation blocked at depth ` +
       `${delegatedContext.expansionDepth} (${reason}; requestId=${requestId}; ` +
-      `origin=${delegatedContext.originSessionKey}).`,
+      `origin=${delegatedContext.originSessionKey}). ` +
+      buildExpansionRecursionRecoveryGuidance(delegatedContext.originSessionKey),
     requestId,
     expansionDepth: delegatedContext.expansionDepth,
     originSessionKey: delegatedContext.originSessionKey,
