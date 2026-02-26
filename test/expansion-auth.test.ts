@@ -539,7 +539,7 @@ describe("wrapWithAuth", () => {
     expect(calledWith.tokenCap).toBe(800);
   });
 
-  it("does not inject tokenCap when request omits it", async () => {
+  it("injects remaining tokenCap when request omits it", async () => {
     const grant = manager.createGrant({
       issuerSessionId: "sess1",
       allowedConversationIds: [1],
@@ -558,7 +558,59 @@ describe("wrapWithAuth", () => {
     await authorized.expand(grant.grantId, request);
 
     const calledWith = mockExpand.mock.calls[0][0];
-    expect(calledWith.tokenCap).toBeUndefined();
+    expect(calledWith.tokenCap).toBe(4000);
+  });
+
+  it("clamps requested tokenCap to remaining grant budget", async () => {
+    const grant = manager.createGrant({
+      issuerSessionId: "sess1",
+      allowedConversationIds: [1],
+      tokenCap: 1000,
+    });
+    mockExpand
+      .mockResolvedValueOnce(makeExpansionResult({ totalTokens: 700 }))
+      .mockResolvedValueOnce(makeExpansionResult({ totalTokens: 200 }));
+
+    const authorized = wrapWithAuth(mockOrchestrator, manager);
+
+    await authorized.expand(grant.grantId, {
+      summaryIds: ["sum_a"],
+      conversationId: 1,
+      tokenCap: 700,
+    });
+    await authorized.expand(grant.grantId, {
+      summaryIds: ["sum_b"],
+      conversationId: 1,
+      tokenCap: 900,
+    });
+
+    expect(mockExpand).toHaveBeenCalledTimes(2);
+    expect(mockExpand.mock.calls[0][0].tokenCap).toBe(700);
+    expect(mockExpand.mock.calls[1][0].tokenCap).toBe(300);
+  });
+
+  it("fails when grant token budget is exhausted across calls", async () => {
+    const grant = manager.createGrant({
+      issuerSessionId: "sess1",
+      allowedConversationIds: [1],
+      tokenCap: 500,
+    });
+    mockExpand.mockResolvedValueOnce(makeExpansionResult({ totalTokens: 500 }));
+
+    const authorized = wrapWithAuth(mockOrchestrator, manager);
+    await authorized.expand(grant.grantId, {
+      summaryIds: ["sum_a"],
+      conversationId: 1,
+      tokenCap: 500,
+    });
+
+    await expect(
+      authorized.expand(grant.grantId, {
+        summaryIds: ["sum_b"],
+        conversationId: 1,
+        tokenCap: 50,
+      }),
+    ).rejects.toThrow(/budget exhausted/i);
   });
 });
 

@@ -747,6 +747,18 @@ export class CompactionEngine {
     return estimateTokens(summary.content);
   }
 
+  /** Resolve message token count with content-length fallback. */
+  private resolveMessageTokenCount(message: { tokenCount: number; content: string }): number {
+    if (
+      typeof message.tokenCount === "number" &&
+      Number.isFinite(message.tokenCount) &&
+      message.tokenCount > 0
+    ) {
+      return message.tokenCount;
+    }
+    return estimateTokens(message.content);
+  }
+
   private resolveLeafMinFanout(): number {
     if (
       typeof this.config.leafMinFanout === "number" &&
@@ -995,7 +1007,8 @@ export class CompactionEngine {
     previousSummaryContent?: string,
   ): Promise<{ summaryId: string; level: CompactionLevel; content: string }> {
     // Fetch full message content for each context item
-    const messageContents: { messageId: number; content: string; createdAt: Date }[] = [];
+    const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
+      [];
     for (const item of messageItems) {
       if (item.messageId == null) {
         continue;
@@ -1006,6 +1019,7 @@ export class CompactionEngine {
           messageId: msg.messageId,
           content: msg.content,
           createdAt: msg.createdAt,
+          tokenCount: this.resolveMessageTokenCount(msg),
         });
       }
     }
@@ -1046,6 +1060,11 @@ export class CompactionEngine {
           ? new Date(Math.max(...messageContents.map((message) => message.createdAt.getTime())))
           : undefined,
       descendantCount: 0,
+      descendantTokenCount: 0,
+      sourceMessageTokenCount: messageContents.reduce(
+        (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
+        0,
+      ),
     });
 
     // Link to source messages
@@ -1155,6 +1174,22 @@ export class CompactionEngine {
             ? Math.max(0, Math.floor(summary.descendantCount))
             : 0;
         return count + childDescendants + 1;
+      }, 0),
+      descendantTokenCount: summaryRecords.reduce((count, summary) => {
+        const childDescendantTokens =
+          typeof summary.descendantTokenCount === "number" &&
+          Number.isFinite(summary.descendantTokenCount)
+            ? Math.max(0, Math.floor(summary.descendantTokenCount))
+            : 0;
+        return count + Math.max(0, Math.floor(summary.tokenCount)) + childDescendantTokens;
+      }, 0),
+      sourceMessageTokenCount: summaryRecords.reduce((count, summary) => {
+        const sourceTokens =
+          typeof summary.sourceMessageTokenCount === "number" &&
+          Number.isFinite(summary.sourceMessageTokenCount)
+            ? Math.max(0, Math.floor(summary.sourceMessageTokenCount))
+            : 0;
+        return count + sourceTokens;
       }, 0),
     });
 

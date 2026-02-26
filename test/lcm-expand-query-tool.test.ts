@@ -218,8 +218,10 @@ describe("createLcmExpandQueryTool", () => {
     expect(typeof rawMessage).toBe("string");
     const message = typeof rawMessage === "string" ? rawMessage : "";
     expect(message).toContain("lcm_expand");
+    expect(message).toContain("lcm_describe");
     expect(message).toContain("DO NOT call `lcm_expand_query` from this delegated session.");
-    expect(message).toContain("Synthesize the final answer from the `lcm_expand` output.");
+    expect(message).toContain("Synthesize the final answer from retrieved evidence, not assumptions.");
+    expect(message).toContain("Expansion token budget");
 
     expect(delegatedSessionKey).not.toBe("");
     expect(delegatedContext).toMatchObject({

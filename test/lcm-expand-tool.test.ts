@@ -137,7 +137,7 @@ describe("createLcmExpandTool expansion limits", () => {
     expect(mockRetrieval.grep).not.toHaveBeenCalled();
   });
 
-  it("uses unbounded tokenCap when tokenCap is omitted for summary expansion", async () => {
+  it("uses remaining grant tokenCap when tokenCap is omitted for summary expansion", async () => {
     const mockRetrieval = makeMockRetrieval();
     mockRetrieval.expand.mockResolvedValue({
       children: [],
@@ -163,12 +163,12 @@ describe("createLcmExpandTool expansion limits", () => {
     expect(mockRetrieval.expand).toHaveBeenCalledWith(
       expect.objectContaining({
         summaryId: "sum_a",
-        tokenCap: Number.POSITIVE_INFINITY,
+        tokenCap: 120,
       }),
     );
   });
 
-  it("passes through oversized tokenCap for query expansion", async () => {
+  it("clamps oversized tokenCap for query expansion to remaining grant budget", async () => {
     const mockRetrieval = makeMockRetrieval();
     mockRetrieval.grep.mockResolvedValue({
       messages: [],
@@ -204,7 +204,7 @@ describe("createLcmExpandTool expansion limits", () => {
     expect(mockRetrieval.expand).toHaveBeenCalledWith(
       expect.objectContaining({
         summaryId: "sum_match",
-        tokenCap: 9_999,
+        tokenCap: 120,
       }),
     );
   });
@@ -349,7 +349,7 @@ describe("createLcmExpandTool expansion limits", () => {
     expect(mockRetrieval.expand).not.toHaveBeenCalled();
   });
 
-  it("allows delegated expansion over grant token cap", async () => {
+  it("clamps delegated expansion tokenCap to grant budget", async () => {
     const mockRetrieval = makeMockRetrieval();
     mockRetrieval.expand.mockResolvedValue({
       children: [],
@@ -381,7 +381,12 @@ describe("createLcmExpandTool expansion limits", () => {
       totalTokens: 5,
       truncated: false,
     });
-    expect(mockRetrieval.expand).toHaveBeenCalled();
+    expect(mockRetrieval.expand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        summaryId: "sum_a",
+        tokenCap: 50,
+      }),
+    );
   });
 
   it("keeps route-only query probes local when there are no matches", async () => {

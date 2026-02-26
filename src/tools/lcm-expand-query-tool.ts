@@ -58,6 +58,13 @@ const LcmExpandQuerySchema = Type.Object({
       minimum: 1,
     }),
   ),
+  tokenCap: Type.Optional(
+    Type.Number({
+      description:
+        "Expansion retrieval token budget across all delegated lcm_expand calls for this query.",
+      minimum: 1,
+    }),
+  ),
 });
 
 type ExpandQueryReply = {
@@ -79,24 +86,33 @@ type SummaryCandidate = {
 function buildDelegatedExpandQueryTask(params: {
   summaryIds: string[];
   conversationId: number;
+  query?: string;
   prompt: string;
   maxTokens: number;
+  tokenCap: number;
   requestId: string;
   expansionDepth: number;
   originSessionKey: string;
 }) {
-  const payload = {
-    summaryIds: params.summaryIds,
-    conversationId: params.conversationId,
-    includeMessages: false,
-  };
+  const seedSummaryIds = params.summaryIds.length > 0 ? params.summaryIds.join(", ") : "(none)";
   return [
-    "Run LCM expansion, then answer the user's prompt from the expanded context.",
+    "You are an autonomous LCM retrieval navigator. Plan and execute retrieval before answering.",
     "",
-    "Step 1: Call `lcm_expand` using exactly this JSON payload:",
-    JSON.stringify(payload, null, 2),
+    "Available tools: lcm_describe, lcm_expand, lcm_grep",
+    `Conversation scope: ${params.conversationId}`,
+    `Expansion token budget (total across this run): ${params.tokenCap}`,
+    `Seed summary IDs: ${seedSummaryIds}`,
+    params.query ? `Routing query: ${params.query}` : undefined,
     "",
-    "Step 2: Use the `lcm_expand` result as source context and answer this prompt:",
+    "Strategy:",
+    "1. Start with `lcm_describe` on seed summaries to inspect subtree manifests and branch costs.",
+    "2. If additional candidates are needed, use `lcm_grep` scoped to summaries.",
+    "3. Select branches that fit remaining budget; prefer high-signal paths first.",
+    "4. Call `lcm_expand` selectively (do not expand everything blindly).",
+    "5. Keep includeMessages=false by default; use includeMessages=true only for specific leaf evidence.",
+    `6. Stay within ${params.tokenCap} total expansion tokens across all lcm_expand calls.`,
+    "",
+    "User prompt to answer:",
     params.prompt,
     "",
     "Delegated expansion metadata (for tracing):",
@@ -116,11 +132,11 @@ function buildDelegatedExpandQueryTask(params: {
     "Rules:",
     "- In delegated context, call `lcm_expand` directly for source retrieval.",
     "- DO NOT call `lcm_expand_query` from this delegated session.",
-    "- Synthesize the final answer from the `lcm_expand` output.",
+    "- Synthesize the final answer from retrieved evidence, not assumptions.",
     `- Keep answer concise and focused (target <= ${params.maxTokens} tokens).`,
     "- citedIds must be unique summary IDs.",
     "- expandedSummaryCount should reflect how many summaries were expanded/used.",
-    "- totalSourceTokens should be the estimated source token volume from expansion.",
+    "- totalSourceTokens should estimate total tokens consumed from expansion calls.",
     "- truncated should indicate whether source expansion appears truncated.",
   ].join("\n");
 }
@@ -300,6 +316,11 @@ export function createLcmExpandQueryTool(input: {
         typeof requestedMaxTokens === "number" && Number.isFinite(requestedMaxTokens)
           ? Math.max(1, requestedMaxTokens)
           : DEFAULT_MAX_ANSWER_TOKENS;
+      const requestedTokenCap = typeof p.tokenCap === "number" ? Math.trunc(p.tokenCap) : undefined;
+      const expansionTokenCap =
+        typeof requestedTokenCap === "number" && Number.isFinite(requestedTokenCap)
+          ? Math.max(1, requestedTokenCap)
+          : Math.max(1, Math.trunc(input.deps.config.maxExpandTokens));
 
       if (!prompt) {
         return jsonResult({
@@ -435,7 +456,7 @@ export function createLcmExpandQueryTool(input: {
           delegatedSessionKey: childSessionKey,
           issuerSessionId: callerSessionKey || "main",
           allowedConversationIds: [sourceConversationId],
-          tokenCap: input.deps.config.maxExpandTokens,
+          tokenCap: expansionTokenCap,
           ttlMs: DELEGATED_WAIT_TIMEOUT_MS + 30_000,
         });
         stampDelegatedExpansionContext({
@@ -450,8 +471,10 @@ export function createLcmExpandQueryTool(input: {
         const task = buildDelegatedExpandQueryTask({
           summaryIds,
           conversationId: sourceConversationId,
+          query: query || undefined,
           prompt,
           maxTokens,
+          tokenCap: expansionTokenCap,
           requestId,
           expansionDepth: childExpansionDepth,
           originSessionKey,

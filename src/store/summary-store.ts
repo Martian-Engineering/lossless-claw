@@ -15,6 +15,8 @@ export type CreateSummaryInput = {
   earliestAt?: Date;
   latestAt?: Date;
   descendantCount?: number;
+  descendantTokenCount?: number;
+  sourceMessageTokenCount?: number;
 };
 
 export type SummaryRecord = {
@@ -28,7 +30,16 @@ export type SummaryRecord = {
   earliestAt: Date | null;
   latestAt: Date | null;
   descendantCount: number;
+  descendantTokenCount: number;
+  sourceMessageTokenCount: number;
   createdAt: Date;
+};
+
+export type SummarySubtreeNodeRecord = SummaryRecord & {
+  depthFromRoot: number;
+  parentSummaryId: string | null;
+  path: string;
+  childCount: number;
 };
 
 export type ContextItemRecord = {
@@ -92,7 +103,16 @@ interface SummaryRow {
   earliest_at: string | null;
   latest_at: string | null;
   descendant_count: number | null;
+  descendant_token_count: number | null;
+  source_message_token_count: number | null;
   created_at: string;
+}
+
+interface SummarySubtreeRow extends SummaryRow {
+  depth_from_root: number;
+  parent_summary_id: string | null;
+  path: string;
+  child_count: number | null;
 }
 
 interface ContextItemRow {
@@ -165,6 +185,18 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
       row.descendant_count >= 0
         ? Math.floor(row.descendant_count)
         : 0,
+    descendantTokenCount:
+      typeof row.descendant_token_count === "number" &&
+      Number.isFinite(row.descendant_token_count) &&
+      row.descendant_token_count >= 0
+        ? Math.floor(row.descendant_token_count)
+        : 0,
+    sourceMessageTokenCount:
+      typeof row.source_message_token_count === "number" &&
+      Number.isFinite(row.source_message_token_count) &&
+      row.source_message_token_count >= 0
+        ? Math.floor(row.source_message_token_count)
+        : 0,
     createdAt: new Date(row.created_at),
   };
 }
@@ -221,6 +253,18 @@ export class SummaryStore {
       input.descendantCount >= 0
         ? Math.floor(input.descendantCount)
         : 0;
+    const descendantTokenCount =
+      typeof input.descendantTokenCount === "number" &&
+      Number.isFinite(input.descendantTokenCount) &&
+      input.descendantTokenCount >= 0
+        ? Math.floor(input.descendantTokenCount)
+        : 0;
+    const sourceMessageTokenCount =
+      typeof input.sourceMessageTokenCount === "number" &&
+      Number.isFinite(input.sourceMessageTokenCount) &&
+      input.sourceMessageTokenCount >= 0
+        ? Math.floor(input.sourceMessageTokenCount)
+        : 0;
     const depth =
       typeof input.depth === "number" && Number.isFinite(input.depth) && input.depth >= 0
         ? Math.floor(input.depth)
@@ -240,9 +284,11 @@ export class SummaryStore {
           file_ids,
           earliest_at,
           latest_at,
-          descendant_count
+          descendant_count,
+          descendant_token_count,
+          source_message_token_count
         )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.summaryId,
@@ -255,6 +301,8 @@ export class SummaryStore {
         earliestAt,
         latestAt,
         descendantCount,
+        descendantTokenCount,
+        sourceMessageTokenCount,
       );
 
     // Index in FTS5 as best-effort; compaction flow must continue even if
@@ -272,6 +320,7 @@ export class SummaryStore {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, created_at
+                , descendant_token_count, source_message_token_count
        FROM summaries WHERE summary_id = ?`,
       )
       .get(input.summaryId) as unknown as SummaryRow;
@@ -284,6 +333,7 @@ export class SummaryStore {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, created_at
+                , descendant_token_count, source_message_token_count
        FROM summaries WHERE summary_id = ?`,
       )
       .get(summaryId) as unknown as SummaryRow | undefined;
@@ -295,6 +345,7 @@ export class SummaryStore {
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, created_at
+                , descendant_token_count, source_message_token_count
        FROM summaries
        WHERE conversation_id = ?
        ORDER BY created_at`,
@@ -353,6 +404,7 @@ export class SummaryStore {
       .prepare(
         `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
                 s.file_ids, s.earliest_at, s.latest_at, s.descendant_count, s.created_at
+                , s.descendant_token_count, s.source_message_token_count
        FROM summaries s
        JOIN summary_parents sp ON sp.summary_id = s.summary_id
        WHERE sp.parent_summary_id = ?
@@ -367,6 +419,7 @@ export class SummaryStore {
       .prepare(
         `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
                 s.file_ids, s.earliest_at, s.latest_at, s.descendant_count, s.created_at
+                , s.descendant_token_count, s.source_message_token_count
        FROM summaries s
        JOIN summary_parents sp ON sp.parent_summary_id = s.summary_id
        WHERE sp.summary_id = ?
@@ -374,6 +427,71 @@ export class SummaryStore {
       )
       .all(summaryId) as unknown as SummaryRow[];
     return rows.map(toSummaryRecord);
+  }
+
+  async getSummarySubtree(summaryId: string): Promise<SummarySubtreeNodeRecord[]> {
+    const rows = this.db
+      .prepare(
+        `WITH RECURSIVE subtree(summary_id, parent_summary_id, depth_from_root, path) AS (
+           SELECT ?, NULL, 0, ''
+           UNION ALL
+           SELECT
+             sp.summary_id,
+             sp.parent_summary_id,
+             subtree.depth_from_root + 1,
+             CASE
+               WHEN subtree.path = '' THEN printf('%04d', sp.ordinal)
+               ELSE subtree.path || '.' || printf('%04d', sp.ordinal)
+             END
+           FROM summary_parents sp
+           JOIN subtree ON sp.parent_summary_id = subtree.summary_id
+         )
+         SELECT
+           s.summary_id,
+           s.conversation_id,
+           s.kind,
+           s.depth,
+           s.content,
+           s.token_count,
+           s.file_ids,
+           s.earliest_at,
+           s.latest_at,
+           s.descendant_count,
+           s.descendant_token_count,
+           s.source_message_token_count,
+           s.created_at,
+           subtree.depth_from_root,
+           subtree.parent_summary_id,
+           subtree.path,
+           (
+             SELECT COUNT(*) FROM summary_parents sp2
+             WHERE sp2.parent_summary_id = s.summary_id
+           ) AS child_count
+         FROM subtree
+         JOIN summaries s ON s.summary_id = subtree.summary_id
+         ORDER BY subtree.depth_from_root ASC, subtree.path ASC, s.created_at ASC`,
+      )
+      .all(summaryId) as unknown as SummarySubtreeRow[];
+
+    const seen = new Set<string>();
+    const output: SummarySubtreeNodeRecord[] = [];
+    for (const row of rows) {
+      if (seen.has(row.summary_id)) {
+        continue;
+      }
+      seen.add(row.summary_id);
+      output.push({
+        ...toSummaryRecord(row),
+        depthFromRoot: Math.max(0, Math.floor(row.depth_from_root ?? 0)),
+        parentSummaryId: row.parent_summary_id ?? null,
+        path: typeof row.path === "string" ? row.path : "",
+        childCount:
+          typeof row.child_count === "number" && Number.isFinite(row.child_count)
+            ? Math.max(0, Math.floor(row.child_count))
+            : 0,
+      });
+    }
+    return output;
   }
 
   // ── Context items ─────────────────────────────────────────────────────────
@@ -644,7 +762,8 @@ export class SummaryStore {
     const rows = this.db
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
-                earliest_at, latest_at, descendant_count, created_at
+                earliest_at, latest_at, descendant_count, descendant_token_count,
+                source_message_token_count, created_at
          FROM summaries
          ${whereClause}
          ORDER BY created_at DESC`,

@@ -9,6 +9,7 @@ type SummaryDepthRow = {
   conversation_id: number;
   kind: "leaf" | "condensed";
   depth: number;
+  token_count: number;
   created_at: string;
 };
 
@@ -16,6 +17,7 @@ type SummaryMessageTimeRangeRow = {
   summary_id: string;
   earliest_at: string | null;
   latest_at: string | null;
+  source_message_token_count: number | null;
 };
 
 type SummaryParentEdgeRow = {
@@ -36,6 +38,10 @@ function ensureSummaryMetadataColumns(db: DatabaseSync): void {
   const hasEarliestAt = summaryColumns.some((col) => col.name === "earliest_at");
   const hasLatestAt = summaryColumns.some((col) => col.name === "latest_at");
   const hasDescendantCount = summaryColumns.some((col) => col.name === "descendant_count");
+  const hasDescendantTokenCount = summaryColumns.some((col) => col.name === "descendant_token_count");
+  const hasSourceMessageTokenCount = summaryColumns.some(
+    (col) => col.name === "source_message_token_count",
+  );
 
   if (!hasEarliestAt) {
     db.exec(`ALTER TABLE summaries ADD COLUMN earliest_at TEXT`);
@@ -45,6 +51,12 @@ function ensureSummaryMetadataColumns(db: DatabaseSync): void {
   }
   if (!hasDescendantCount) {
     db.exec(`ALTER TABLE summaries ADD COLUMN descendant_count INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!hasDescendantTokenCount) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN descendant_token_count INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!hasSourceMessageTokenCount) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN source_message_token_count INTEGER NOT NULL DEFAULT 0`);
   }
 }
 
@@ -84,7 +96,7 @@ function backfillSummaryDepths(db: DatabaseSync): void {
     const conversationId = row.conversation_id;
     const summaries = db
       .prepare(
-        `SELECT summary_id, conversation_id, kind, depth, created_at
+        `SELECT summary_id, conversation_id, kind, depth, token_count, created_at
          FROM summaries
          WHERE conversation_id = ?`,
       )
@@ -180,7 +192,8 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
 
   const updateMetadataStmt = db.prepare(
     `UPDATE summaries
-     SET earliest_at = ?, latest_at = ?, descendant_count = ?
+     SET earliest_at = ?, latest_at = ?, descendant_count = ?,
+         descendant_token_count = ?, source_message_token_count = ?
      WHERE summary_id = ?`,
   );
 
@@ -188,7 +201,7 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
     const conversationId = conversationRow.conversation_id;
     const summaries = db
       .prepare(
-        `SELECT summary_id, conversation_id, kind, depth, created_at
+        `SELECT summary_id, conversation_id, kind, depth, token_count, created_at
          FROM summaries
          WHERE conversation_id = ?
          ORDER BY depth ASC, created_at ASC`,
@@ -200,7 +213,11 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
 
     const leafRanges = db
       .prepare(
-        `SELECT sm.summary_id, MIN(m.created_at) AS earliest_at, MAX(m.created_at) AS latest_at
+        `SELECT
+           sm.summary_id,
+           MIN(m.created_at) AS earliest_at,
+           MAX(m.created_at) AS latest_at,
+           COALESCE(SUM(m.token_count), 0) AS source_message_token_count
          FROM summary_messages sm
          JOIN messages m ON m.message_id = sm.message_id
          JOIN summaries s ON s.summary_id = sm.summary_id
@@ -209,7 +226,14 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
       )
       .all(conversationId) as SummaryMessageTimeRangeRow[];
     const leafRangeBySummaryId = new Map(
-      leafRanges.map((row) => [row.summary_id, { earliestAt: row.earliest_at, latestAt: row.latest_at }]),
+      leafRanges.map((row) => [
+        row.summary_id,
+        {
+          earliestAt: row.earliest_at,
+          latestAt: row.latest_at,
+          sourceMessageTokenCount: row.source_message_token_count,
+        },
+      ]),
     );
 
     const edges = db
@@ -230,8 +254,17 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
 
     const metadataBySummaryId = new Map<
       string,
-      { earliestAt: Date | null; latestAt: Date | null; descendantCount: number }
+      {
+        earliestAt: Date | null;
+        latestAt: Date | null;
+        descendantCount: number;
+        descendantTokenCount: number;
+        sourceMessageTokenCount: number;
+      }
     >();
+    const tokenCountBySummaryId = new Map(
+      summaries.map((summary) => [summary.summary_id, Math.max(0, Math.floor(summary.token_count ?? 0))]),
+    );
 
     for (const summary of summaries) {
       const fallbackDate = parseTimestamp(summary.created_at);
@@ -244,6 +277,11 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
           earliestAt,
           latestAt,
           descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: Math.max(
+            0,
+            Math.floor(range?.sourceMessageTokenCount ?? 0),
+          ),
         });
         continue;
       }
@@ -254,6 +292,8 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
           earliestAt: fallbackDate,
           latestAt: fallbackDate,
           descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: 0,
         });
         continue;
       }
@@ -261,6 +301,8 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
       let earliestAt: Date | null = null;
       let latestAt: Date | null = null;
       let descendantCount = 0;
+      let descendantTokenCount = 0;
+      let sourceMessageTokenCount = 0;
 
       for (const parentId of parentIds) {
         const parentMetadata = metadataBySummaryId.get(parentId);
@@ -279,12 +321,18 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
         }
 
         descendantCount += Math.max(0, parentMetadata.descendantCount) + 1;
+        const parentTokenCount = tokenCountBySummaryId.get(parentId) ?? 0;
+        descendantTokenCount +=
+          Math.max(0, parentTokenCount) + Math.max(0, parentMetadata.descendantTokenCount);
+        sourceMessageTokenCount += Math.max(0, parentMetadata.sourceMessageTokenCount);
       }
 
       metadataBySummaryId.set(summary.summary_id, {
         earliestAt: earliestAt ?? fallbackDate,
         latestAt: latestAt ?? fallbackDate,
         descendantCount: Math.max(0, descendantCount),
+        descendantTokenCount: Math.max(0, descendantTokenCount),
+        sourceMessageTokenCount: Math.max(0, sourceMessageTokenCount),
       });
     }
 
@@ -298,6 +346,8 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
         isoStringOrNull(metadata.earliestAt),
         isoStringOrNull(metadata.latestAt),
         Math.max(0, metadata.descendantCount),
+        Math.max(0, metadata.descendantTokenCount),
+        Math.max(0, metadata.sourceMessageTokenCount),
         summary.summary_id,
       );
     }
@@ -336,6 +386,8 @@ export function runLcmMigrations(db: DatabaseSync): void {
       earliest_at TEXT,
       latest_at TEXT,
       descendant_count INTEGER NOT NULL DEFAULT 0,
+      descendant_token_count INTEGER NOT NULL DEFAULT 0,
+      source_message_token_count INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       file_ids TEXT NOT NULL DEFAULT '[]'
     );

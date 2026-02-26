@@ -56,6 +56,7 @@ const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 export class ExpansionAuthManager {
   private grants: Map<string, ExpansionGrant> = new Map();
+  private consumedTokensByGrantId: Map<string, number> = new Map();
 
   /**
    * Create a new expansion grant with the given parameters.
@@ -79,6 +80,7 @@ export class ExpansionAuthManager {
     };
 
     this.grants.set(grantId, grant);
+    this.consumedTokensByGrantId.set(grantId, 0);
     return grant;
   }
 
@@ -111,6 +113,36 @@ export class ExpansionAuthManager {
     }
     grant.revoked = true;
     return true;
+  }
+
+  /**
+   * Resolve remaining token budget for an active grant.
+   */
+  getRemainingTokenBudget(grantId: string): number | null {
+    const grant = this.getGrant(grantId);
+    if (!grant) {
+      return null;
+    }
+    const consumed = Math.max(0, this.consumedTokensByGrantId.get(grantId) ?? 0);
+    return Math.max(0, Math.floor(grant.tokenCap) - consumed);
+  }
+
+  /**
+   * Consume token budget for a grant, clamped to the grant token cap.
+   */
+  consumeTokenBudget(grantId: string, consumedTokens: number): number | null {
+    const grant = this.getGrant(grantId);
+    if (!grant) {
+      return null;
+    }
+    const safeConsumed =
+      typeof consumedTokens === "number" && Number.isFinite(consumedTokens)
+        ? Math.max(0, Math.floor(consumedTokens))
+        : 0;
+    const previous = Math.max(0, this.consumedTokensByGrantId.get(grantId) ?? 0);
+    const next = Math.min(Math.max(1, Math.floor(grant.tokenCap)), previous + safeConsumed);
+    this.consumedTokensByGrantId.set(grantId, next);
+    return Math.max(0, Math.floor(grant.tokenCap) - next);
   }
 
   /**
@@ -177,6 +209,7 @@ export class ExpansionAuthManager {
     for (const [grantId, grant] of this.grants) {
       if (grant.revoked || grant.expiresAt.getTime() <= now) {
         this.grants.delete(grantId);
+        this.consumedTokensByGrantId.delete(grantId);
         removed++;
       }
     }
@@ -293,7 +326,26 @@ export function wrapWithAuth(
       if (!validation.valid) {
         throw new Error(`Expansion authorization failed: ${validation.reason}`);
       }
-      return orchestrator.expand(request);
+
+      const remainingBudget = authManager.getRemainingTokenBudget(grantId);
+      if (remainingBudget == null) {
+        throw new Error("Expansion authorization failed: Grant not found");
+      }
+      if (remainingBudget <= 0) {
+        throw new Error("Expansion authorization failed: Grant token budget exhausted");
+      }
+
+      const requestedTokenCap =
+        typeof request.tokenCap === "number" && Number.isFinite(request.tokenCap)
+          ? Math.max(1, Math.trunc(request.tokenCap))
+          : remainingBudget;
+      const effectiveTokenCap = Math.max(1, Math.min(requestedTokenCap, remainingBudget));
+      const result = await orchestrator.expand({
+        ...request,
+        tokenCap: effectiveTokenCap,
+      });
+      authManager.consumeTokenBudget(grantId, result.totalTokens);
+      return result;
     },
   };
 }

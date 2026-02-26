@@ -344,6 +344,8 @@ function createMockSummaryStore() {
         earliestAt?: Date;
         latestAt?: Date;
         descendantCount?: number;
+        descendantTokenCount?: number;
+        sourceMessageTokenCount?: number;
       }): Promise<SummaryRecord> => {
         const summary: SummaryRecord = {
           summaryId: input.summaryId,
@@ -356,6 +358,8 @@ function createMockSummaryStore() {
           earliestAt: input.earliestAt ?? null,
           latestAt: input.latestAt ?? null,
           descendantCount: input.descendantCount ?? 0,
+          descendantTokenCount: input.descendantTokenCount ?? 0,
+          sourceMessageTokenCount: input.sourceMessageTokenCount ?? 0,
           createdAt: new Date(),
         };
         summaries.push(summary);
@@ -422,6 +426,61 @@ function createMockSummaryStore() {
           .map((sp) => sp.summaryId),
       );
       return summaries.filter((s) => childIds.has(s.summaryId));
+    }),
+
+    getSummarySubtree: vi.fn(async (rootSummaryId: string) => {
+      const root = summaries.find((summary) => summary.summaryId === rootSummaryId);
+      if (!root) {
+        return [];
+      }
+      const output: Array<
+        SummaryRecord & {
+          depthFromRoot: number;
+          parentSummaryId: string | null;
+          path: string;
+          childCount: number;
+        }
+      > = [];
+      const queue: Array<{
+        summaryId: string;
+        parentSummaryId: string | null;
+        depthFromRoot: number;
+        path: string;
+      }> = [{ summaryId: rootSummaryId, parentSummaryId: null, depthFromRoot: 0, path: "" }];
+      const seen = new Set<string>();
+      while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || seen.has(current.summaryId)) {
+          continue;
+        }
+        seen.add(current.summaryId);
+        const summary = summaries.find((candidate) => candidate.summaryId === current.summaryId);
+        if (!summary) {
+          continue;
+        }
+        const children = summaryParents
+          .filter((edge) => edge.parentSummaryId === current.summaryId)
+          .toSorted((a, b) => a.ordinal - b.ordinal);
+        output.push({
+          ...summary,
+          depthFromRoot: current.depthFromRoot,
+          parentSummaryId: current.parentSummaryId,
+          path: current.path,
+          childCount: children.length,
+        });
+        for (const child of children) {
+          queue.push({
+            summaryId: child.summaryId,
+            parentSummaryId: current.summaryId,
+            depthFromRoot: current.depthFromRoot + 1,
+            path:
+              current.path === ""
+                ? `${String(child.ordinal).padStart(4, "0")}`
+                : `${current.path}.${String(child.ordinal).padStart(4, "0")}`,
+          });
+        }
+      }
+      return output;
     }),
 
     // ── Search ──────────────────────────────────────────────────────────

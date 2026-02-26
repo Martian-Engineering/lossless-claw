@@ -282,6 +282,7 @@ async function runDelegatedExpansionPass(params: {
     delegatedSessionKey: childSessionKey,
     issuerSessionId: params.requesterSessionKey,
     allowedConversationIds: [params.conversationId],
+    tokenCap: params.tokenCap,
     ttlMs: MAX_GATEWAY_TIMEOUT_MS,
   });
   stampDelegatedExpansionContext({

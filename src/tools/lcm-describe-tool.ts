@@ -1,5 +1,9 @@
 import { Type } from "@sinclair/typebox";
 import type { LcmContextEngine } from "../engine.js";
+import {
+  getRuntimeExpansionAuthManager,
+  resolveDelegatedExpansionGrantId,
+} from "../expansion-auth.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
@@ -21,7 +25,24 @@ const LcmDescribeSchema = Type.Object({
         "Set true to explicitly allow lookups across all conversations. Ignored when conversationId is provided.",
     }),
   ),
+  tokenCap: Type.Optional(
+    Type.Number({
+      description: "Optional budget cap used for subtree manifest budget-fit annotations.",
+      minimum: 1,
+    }),
+  ),
 });
+
+function normalizeRequestedTokenCap(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return Math.max(1, Math.trunc(value));
+}
+
+function formatIso(value: Date | null | undefined): string {
+  return value instanceof Date ? value.toISOString() : "-";
+}
 
 export function createLcmDescribeTool(input: {
   deps: LcmDependencies;
@@ -77,33 +98,99 @@ export function createLcmDescribeTool(input: {
 
       if (result.type === "summary" && result.summary) {
         const s = result.summary;
+        const requestedTokenCap = normalizeRequestedTokenCap((params as Record<string, unknown>).tokenCap);
+        const sessionKey =
+          (typeof input.sessionKey === "string" ? input.sessionKey : input.sessionId)?.trim() ?? "";
+        const delegatedGrantId = input.deps.isSubagentSessionKey(sessionKey)
+          ? (resolveDelegatedExpansionGrantId(sessionKey) ?? "")
+          : "";
+        const delegatedRemainingBudget =
+          delegatedGrantId !== ""
+            ? getRuntimeExpansionAuthManager().getRemainingTokenBudget(delegatedGrantId)
+            : null;
+        const defaultTokenCap = Math.max(1, Math.trunc(input.deps.config.maxExpandTokens));
+        const resolvedTokenCap = (() => {
+          const base =
+            requestedTokenCap ??
+            (typeof delegatedRemainingBudget === "number" ? delegatedRemainingBudget : defaultTokenCap);
+          if (typeof delegatedRemainingBudget === "number") {
+            return Math.max(0, Math.min(base, delegatedRemainingBudget));
+          }
+          return Math.max(1, base);
+        })();
+
+        const manifestNodes = s.subtree.map((node) => {
+          const summariesOnlyCost = Math.max(0, node.tokenCount + node.descendantTokenCount);
+          const withMessagesCost = Math.max(0, summariesOnlyCost + node.sourceMessageTokenCount);
+          return {
+            summaryId: node.summaryId,
+            parentSummaryId: node.parentSummaryId,
+            depthFromRoot: node.depthFromRoot,
+            depth: node.depth,
+            kind: node.kind,
+            tokenCount: node.tokenCount,
+            descendantCount: node.descendantCount,
+            descendantTokenCount: node.descendantTokenCount,
+            sourceMessageTokenCount: node.sourceMessageTokenCount,
+            childCount: node.childCount,
+            earliestAt: node.earliestAt,
+            latestAt: node.latestAt,
+            path: node.path,
+            costs: {
+              summariesOnly: summariesOnlyCost,
+              withMessages: withMessagesCost,
+            },
+            budgetFit: {
+              summariesOnly: summariesOnlyCost <= resolvedTokenCap,
+              withMessages: withMessagesCost <= resolvedTokenCap,
+            },
+          };
+        });
+
         const lines: string[] = [];
-        lines.push(`## LCM Summary: ${id}`);
-        lines.push("");
-        lines.push(`**Conversation:** ${s.conversationId}`);
-        lines.push(`**Kind:** ${s.kind}`);
-        lines.push(`**Tokens:** ~${s.tokenCount.toLocaleString()}`);
-        lines.push(`**Created:** ${s.createdAt.toISOString()}`);
+        lines.push(`LCM_SUMMARY ${id}`);
+        lines.push(
+          `meta conv=${s.conversationId} kind=${s.kind} depth=${s.depth} tok=${s.tokenCount} ` +
+            `descTok=${s.descendantTokenCount} srcTok=${s.sourceMessageTokenCount} ` +
+            `desc=${s.descendantCount} range=${formatIso(s.earliestAt)}..${formatIso(s.latestAt)} ` +
+            `budgetCap=${resolvedTokenCap}`,
+        );
         if (s.parentIds.length > 0) {
-          lines.push(`**Parents:** ${s.parentIds.join(", ")}`);
+          lines.push(`parents ${s.parentIds.join(" ")}`);
         }
         if (s.childIds.length > 0) {
-          lines.push(`**Children:** ${s.childIds.join(", ")}`);
+          lines.push(`children ${s.childIds.join(" ")}`);
         }
-        if (s.messageIds.length > 0) {
-          lines.push(`**Messages:** ${s.messageIds.length} linked`);
+        lines.push("manifest");
+        for (const node of manifestNodes) {
+          lines.push(
+            `d${node.depthFromRoot} ${node.summaryId} k=${node.kind} tok=${node.tokenCount} ` +
+              `descTok=${node.descendantTokenCount} srcTok=${node.sourceMessageTokenCount} ` +
+              `desc=${node.descendantCount} child=${node.childCount} ` +
+              `range=${formatIso(node.earliestAt)}..${formatIso(node.latestAt)} ` +
+              `cost[s=${node.costs.summariesOnly},m=${node.costs.withMessages}] ` +
+              `budget[s=${node.budgetFit.summariesOnly ? "in" : "over"},` +
+              `m=${node.budgetFit.withMessages ? "in" : "over"}]`,
+          );
         }
-        if (s.fileIds.length > 0) {
-          lines.push(`**Files:** ${s.fileIds.join(", ")}`);
-        }
-        lines.push("");
-        lines.push("## Content");
-        lines.push("");
+        lines.push("content");
         lines.push(s.content);
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: result,
+          details: {
+            ...result,
+            manifest: {
+              tokenCap: resolvedTokenCap,
+              budgetSource:
+                requestedTokenCap != null
+                  ? "request"
+                  : typeof delegatedRemainingBudget === "number"
+                    ? "delegated_grant_remaining"
+                    : "config_default",
+              nodes: manifestNodes,
+            },
+          },
         };
       }
 

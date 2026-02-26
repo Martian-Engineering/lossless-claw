@@ -20,11 +20,32 @@ export interface DescribeResult {
     conversationId: number;
     kind: "leaf" | "condensed";
     content: string;
+    depth: number;
     tokenCount: number;
+    descendantCount: number;
+    descendantTokenCount: number;
+    sourceMessageTokenCount: number;
     fileIds: string[];
     parentIds: string[];
     childIds: string[];
     messageIds: number[];
+    earliestAt: Date | null;
+    latestAt: Date | null;
+    subtree: Array<{
+      summaryId: string;
+      parentSummaryId: string | null;
+      depthFromRoot: number;
+      kind: "leaf" | "condensed";
+      depth: number;
+      tokenCount: number;
+      descendantCount: number;
+      descendantTokenCount: number;
+      sourceMessageTokenCount: number;
+      earliestAt: Date | null;
+      latestAt: Date | null;
+      childCount: number;
+      path: string;
+    }>;
     createdAt: Date;
   };
   /** File-specific fields */
@@ -127,10 +148,11 @@ export class RetrievalEngine {
     }
 
     // Fetch lineage in parallel
-    const [parents, children, messageIds] = await Promise.all([
+    const [parents, children, messageIds, subtree] = await Promise.all([
       this.summaryStore.getSummaryParents(id),
       this.summaryStore.getSummaryChildren(id),
       this.summaryStore.getSummaryMessages(id),
+      this.summaryStore.getSummarySubtree(id),
     ]);
 
     return {
@@ -140,11 +162,32 @@ export class RetrievalEngine {
         conversationId: summary.conversationId,
         kind: summary.kind,
         content: summary.content,
+        depth: summary.depth,
         tokenCount: summary.tokenCount,
+        descendantCount: summary.descendantCount,
+        descendantTokenCount: summary.descendantTokenCount,
+        sourceMessageTokenCount: summary.sourceMessageTokenCount,
         fileIds: summary.fileIds,
         parentIds: parents.map((p) => p.summaryId),
         childIds: children.map((c) => c.summaryId),
         messageIds,
+        earliestAt: summary.earliestAt,
+        latestAt: summary.latestAt,
+        subtree: subtree.map((node) => ({
+          summaryId: node.summaryId,
+          parentSummaryId: node.parentSummaryId,
+          depthFromRoot: node.depthFromRoot,
+          kind: node.kind,
+          depth: node.depth,
+          tokenCount: node.tokenCount,
+          descendantCount: node.descendantCount,
+          descendantTokenCount: node.descendantTokenCount,
+          sourceMessageTokenCount: node.sourceMessageTokenCount,
+          earliestAt: node.earliestAt,
+          latestAt: node.latestAt,
+          childCount: node.childCount,
+          path: node.path,
+        })),
         createdAt: summary.createdAt,
       },
     };

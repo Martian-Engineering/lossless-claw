@@ -198,11 +198,34 @@ describe("LCM tools session scoping", () => {
           conversationId: 99,
           kind: "leaf",
           content: "foreign summary",
+          depth: 0,
           tokenCount: 12,
+          descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: 12,
           fileIds: [],
           parentIds: [],
           childIds: [],
           messageIds: [],
+          earliestAt: new Date("2026-01-01T00:00:00.000Z"),
+          latestAt: new Date("2026-01-01T00:00:00.000Z"),
+          subtree: [
+            {
+              summaryId: "sum_foreign",
+              parentSummaryId: null,
+              depthFromRoot: 0,
+              kind: "leaf",
+              depth: 0,
+              tokenCount: 12,
+              descendantCount: 0,
+              descendantTokenCount: 0,
+              sourceMessageTokenCount: 12,
+              earliestAt: new Date("2026-01-01T00:00:00.000Z"),
+              latestAt: new Date("2026-01-01T00:00:00.000Z"),
+              childCount: 0,
+              path: "",
+            },
+          ],
           createdAt: new Date("2026-01-01T00:00:00.000Z"),
         },
       })),
@@ -220,6 +243,7 @@ describe("LCM tools session scoping", () => {
       id: "sum_foreign",
       allConversations: true,
     });
-    expect((cross.content[0] as { text: string }).text).toContain("**Conversation:** 99");
+    expect((cross.content[0] as { text: string }).text).toContain("meta conv=99");
+    expect((cross.content[0] as { text: string }).text).toContain("manifest");
   });
 });

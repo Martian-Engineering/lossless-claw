@@ -114,10 +114,13 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(summaryColumns.some((column) => column.name === "earliest_at")).toBe(true);
     expect(summaryColumns.some((column) => column.name === "latest_at")).toBe(true);
     expect(summaryColumns.some((column) => column.name === "descendant_count")).toBe(true);
+    expect(summaryColumns.some((column) => column.name === "descendant_token_count")).toBe(true);
+    expect(summaryColumns.some((column) => column.name === "source_message_token_count")).toBe(true);
 
     const depthRows = db
       .prepare(
-        `SELECT summary_id, depth, earliest_at, latest_at, descendant_count
+        `SELECT summary_id, depth, earliest_at, latest_at, descendant_count,
+                descendant_token_count, source_message_token_count
          FROM summaries
          ORDER BY summary_id`,
       )
@@ -127,12 +130,20 @@ describe("runLcmMigrations summary depth backfill", () => {
       earliest_at: string | null;
       latest_at: string | null;
       descendant_count: number;
+      descendant_token_count: number;
+      source_message_token_count: number;
     }>;
     const depthBySummaryId = new Map(depthRows.map((row) => [row.summary_id, row.depth]));
     const earliestBySummaryId = new Map(depthRows.map((row) => [row.summary_id, row.earliest_at]));
     const latestBySummaryId = new Map(depthRows.map((row) => [row.summary_id, row.latest_at]));
     const descendantCountBySummaryId = new Map(
       depthRows.map((row) => [row.summary_id, row.descendant_count]),
+    );
+    const descendantTokenCountBySummaryId = new Map(
+      depthRows.map((row) => [row.summary_id, row.descendant_token_count]),
+    );
+    const sourceMessageTokenCountBySummaryId = new Map(
+      depthRows.map((row) => [row.summary_id, row.source_message_token_count]),
     );
 
     expect(depthBySummaryId.get("sum_leaf_a")).toBe(0);
@@ -185,5 +196,17 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(descendantCountBySummaryId.get("sum_condensed_1")).toBe(2);
     expect(descendantCountBySummaryId.get("sum_condensed_2")).toBe(3);
     expect(descendantCountBySummaryId.get("sum_condensed_orphan")).toBe(0);
+
+    expect(descendantTokenCountBySummaryId.get("sum_leaf_a")).toBe(0);
+    expect(descendantTokenCountBySummaryId.get("sum_leaf_b")).toBe(0);
+    expect(descendantTokenCountBySummaryId.get("sum_condensed_1")).toBe(20);
+    expect(descendantTokenCountBySummaryId.get("sum_condensed_2")).toBe(30);
+    expect(descendantTokenCountBySummaryId.get("sum_condensed_orphan")).toBe(0);
+
+    expect(sourceMessageTokenCountBySummaryId.get("sum_leaf_a")).toBe(10);
+    expect(sourceMessageTokenCountBySummaryId.get("sum_leaf_b")).toBe(5);
+    expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_1")).toBe(15);
+    expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_2")).toBe(15);
+    expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_orphan")).toBe(0);
   });
 });
