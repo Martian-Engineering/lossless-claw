@@ -23,6 +23,8 @@ export interface AssembleContextResult {
   messages: AgentMessage[];
   /** Total estimated tokens */
   estimatedTokens: number;
+  /** Optional dynamic system prompt guidance derived from DAG state */
+  systemPromptAddition?: string;
   /** Stats about what was assembled */
   stats: {
     rawMessageCount: number;
@@ -36,6 +38,77 @@ export interface AssembleContextResult {
 /** Simple token estimate: ~4 chars per token, same as VoltCode's Token.estimate */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+type SummaryPromptSignal = Pick<SummaryRecord, "kind" | "depth" | "descendantCount">;
+
+/**
+ * Build LCM usage guidance for the runtime system prompt.
+ *
+ * Guidance is emitted only when summaries are present in assembled context.
+ * Depth-aware: minimal for shallow compaction, full guidance for deep trees.
+ */
+function buildSystemPromptAddition(summarySignals: SummaryPromptSignal[]): string | undefined {
+  if (summarySignals.length === 0) {
+    return undefined;
+  }
+
+  const maxDepth = summarySignals.reduce((deepest, signal) => Math.max(deepest, signal.depth), 0);
+  const condensedCount = summarySignals.filter((signal) => signal.kind === "condensed").length;
+  const heavilyCompacted = maxDepth >= 2 || condensedCount >= 2;
+
+  const sections: string[] = [];
+
+  // Core recall workflow — always present when summaries exist
+  sections.push(
+    "## LCM Recall",
+    "",
+    "Summaries above are compressed context — maps to details, not the details themselves.",
+    "",
+    "**Recall priority:** LCM tools first, then qmd (for Granola/Limitless/pre-LCM data), then memory_search as last resort.",
+    "",
+    "**Tool escalation:**",
+    "1. `lcm_grep` — search by regex or full-text across messages and summaries",
+    "2. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
+    "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, returns answer with cited summary IDs (~120s, don't ration it)",
+    "",
+    "**`lcm_expand_query` usage** — two patterns (always requires `prompt`):",
+    "- With IDs: `lcm_expand_query(summaryIds: [\"sum_xxx\"], prompt: \"What config changes were discussed?\")`",
+    "- With search: `lcm_expand_query(query: \"database migration\", prompt: \"What strategy was decided?\")`",
+    "- Optional: `maxTokens` (default 2000), `conversationId`, `allConversations: true`",
+    "",
+    "**Summaries include \"Expand for details about:\" footers** listing compressed specifics. Use `lcm_expand_query` with that summary's ID to retrieve them.",
+  );
+
+  // Precision/evidence rules — always present but stronger when heavily compacted
+  if (heavilyCompacted) {
+    sections.push(
+      "",
+      "**\u26a0 Deeply compacted context — expand before asserting specifics.**",
+      "",
+      "Default recall flow for precision work:",
+      "1) `lcm_grep` to locate relevant summary/message IDs",
+      "2) `lcm_expand_query` with a focused prompt",
+      "3) Answer with citations to summary IDs used",
+      "",
+      "**Uncertainty checklist (run before answering):**",
+      "- Am I making exact factual claims from a condensed summary?",
+      "- Could compaction have omitted a crucial detail?",
+      "- Would this answer fail if the user asks for proof?",
+      "",
+      "If yes to any \u2192 expand first.",
+      "",
+      "**Do not guess** exact commands, SHAs, file paths, timestamps, config values, or causal claims from condensed summaries. Expand first or state that you need to expand.",
+    );
+  } else {
+    sections.push(
+      "",
+      "**For precision/evidence questions** (exact commands, SHAs, paths, timestamps, config values, root-cause chains): expand before answering.",
+      "Do not guess from condensed summaries — expand first or state uncertainty.",
+    );
+  }
+
+  return sections.join("\n");
 }
 
 /**
@@ -267,6 +340,8 @@ interface ResolvedItem {
   tokens: number;
   /** Whether this came from a raw message (vs. a summary) */
   isMessage: boolean;
+  /** Summary metadata used for dynamic system prompt guidance */
+  summarySignal?: SummaryPromptSignal;
 }
 
 // ── ContextAssembler ─────────────────────────────────────────────────────────
@@ -309,13 +384,19 @@ export class ContextAssembler {
     // Count stats from the full (pre-truncation) set
     let rawMessageCount = 0;
     let summaryCount = 0;
+    const summarySignals: SummaryPromptSignal[] = [];
     for (const item of resolved) {
       if (item.isMessage) {
         rawMessageCount++;
       } else {
         summaryCount++;
+        if (item.summarySignal) {
+          summarySignals.push(item.summarySignal);
+        }
       }
     }
+
+    const systemPromptAddition = buildSystemPromptAddition(summarySignals);
 
     // Step 3: Split into evictable prefix and protected fresh tail
     const tailStart = Math.max(0, resolved.length - freshTailCount);
@@ -388,6 +469,7 @@ export class ContextAssembler {
     return {
       messages: sanitizeToolUseResultPairing(rawMessages) as AgentMessage[],
       estimatedTokens,
+      systemPromptAddition,
       stats: {
         rawMessageCount,
         summaryCount,
@@ -508,6 +590,11 @@ export class ContextAssembler {
       message: { role: "user" as const, content } as AgentMessage,
       tokens,
       isMessage: false,
+      summarySignal: {
+        kind: summary.kind,
+        depth: summary.depth,
+        descendantCount: summary.descendantCount,
+      },
     };
   }
 }

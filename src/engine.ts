@@ -41,6 +41,7 @@ import { createLcmSummarizeFromLegacyParams } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
+type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1269,10 +1270,14 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
-      return {
+      const result: AssembleResultWithSystemPrompt = {
         messages: assembled.messages,
         estimatedTokens: assembled.estimatedTokens,
+        ...(assembled.systemPromptAddition
+          ? { systemPromptAddition: assembled.systemPromptAddition }
+          : {}),
       };
+      return result;
     } catch {
       return {
         messages: params.messages,

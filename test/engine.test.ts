@@ -802,6 +802,130 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[1]?.role).toBe("toolResult");
     expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_2");
   });
+
+  it("omits dynamic LCM system prompt guidance when no summaries exist", async () => {
+    const engine = createEngine();
+    const sessionId = "session-no-summary-guidance";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "plain context one" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "plain context two" } as AgentMessage,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
+    expect(promptAddition).toBeUndefined();
+  });
+
+  it("adds recall workflow guidance when summaries are present", async () => {
+    const engine = createEngine();
+    const sessionId = "session-summary-guidance";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "seed message" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_guidance_leaf",
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Leaf summary content",
+      tokenCount: 16,
+      descendantCount: 0,
+    });
+    await engine
+      .getSummaryStore()
+      .appendContextSummary(conversation!.conversationId, "sum_guidance_leaf");
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
+    // Core recall section
+    expect(promptAddition).toContain("## LCM Recall");
+    expect(promptAddition).toContain("maps to details, not the details themselves");
+    expect(promptAddition).toContain("**Recall priority:** LCM tools first");
+    // Tool escalation
+    expect(promptAddition).toContain("1. `lcm_grep`");
+    expect(promptAddition).toContain("2. `lcm_describe`");
+    expect(promptAddition).toContain("3. `lcm_expand_query`");
+    // Usage patterns
+    expect(promptAddition).toContain("lcm_expand_query(summaryIds:");
+    expect(promptAddition).toContain("lcm_expand_query(query:");
+    // Expand for details footer guidance
+    expect(promptAddition).toContain("Expand for details about:");
+    // Shallow precision guidance (not full checklist)
+    expect(promptAddition).toContain("precision/evidence questions");
+    expect(promptAddition).toContain("Do not guess from condensed summaries");
+    // Should NOT include deep-compaction-specific content
+    expect(promptAddition).not.toContain("Uncertainty checklist");
+    expect(promptAddition).not.toContain("Deeply compacted context");
+  });
+
+  it("emphasizes expand-before-asserting when summaries are deeply compacted", async () => {
+    const engine = createEngine();
+    const sessionId = "session-deep-summary-guidance";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "seed message" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_guidance_deep",
+      conversationId: conversation!.conversationId,
+      kind: "condensed",
+      depth: 2,
+      content: "Deep condensed summary",
+      tokenCount: 24,
+      descendantCount: 12,
+    });
+    await engine
+      .getSummaryStore()
+      .appendContextSummary(conversation!.conversationId, "sum_guidance_deep");
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
+    // Deep-specific guidance
+    expect(promptAddition).toContain("Deeply compacted context");
+    expect(promptAddition).toContain("expand before asserting specifics");
+    // Full recall flow
+    expect(promptAddition).toContain("1) `lcm_grep` to locate relevant summary/message IDs");
+    expect(promptAddition).toContain("2) `lcm_expand_query` with a focused prompt");
+    expect(promptAddition).toContain("3) Answer with citations to summary IDs used");
+    // Uncertainty checklist
+    expect(promptAddition).toContain("Uncertainty checklist");
+    expect(promptAddition).toContain("Am I making exact factual claims from a condensed summary?");
+    expect(promptAddition).toContain("Could compaction have omitted a crucial detail?");
+    // Refusal-to-guess
+    expect(promptAddition).toContain("Do not guess");
+    expect(promptAddition).toContain("Expand first or state that you need to expand");
+  });
 });
 
 describe("LcmContextEngine fidelity and token budget", () => {
