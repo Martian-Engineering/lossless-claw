@@ -1133,6 +1133,84 @@ describe("LCM integration: compaction", () => {
     expect(condensedSummaries.some((summary) => summary.depth === 2)).toBe(false);
   });
 
+
+  it("compactLeaf cascades without depth limit when incrementalMaxDepth is -1 (unlimited)", async () => {
+    const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafMinFanout: 2,
+      condensedMinFanout: 2,
+      leafChunkTokens: 500,
+      condensedTargetTokens: 10,
+      incrementalMaxDepth: -1,
+    });
+
+    await convStore.createConversation({ sessionId: "incremental-depth-unlimited" });
+
+    // Seed enough depth-0 leaves to trigger depth-0 condensation (fanout=2)
+    for (const suffix of ["a", "b", "c"]) {
+      await sumStore.insertSummary({
+        summaryId: `sum_unlimited_leaf_${suffix}`,
+        conversationId: CONV_ID,
+        kind: "leaf",
+        depth: 0,
+        content: `Depth zero leaf ${suffix}`,
+        tokenCount: 60,
+      });
+      await sumStore.appendContextSummary(CONV_ID, `sum_unlimited_leaf_${suffix}`);
+    }
+
+    // Seed depth-1 summaries so depth-1 condensation can also fire
+    for (const suffix of ["a", "b"]) {
+      await sumStore.insertSummary({
+        summaryId: `sum_unlimited_d1_${suffix}`,
+        conversationId: CONV_ID,
+        kind: "condensed",
+        depth: 1,
+        content: `Existing depth one summary ${suffix}`,
+        tokenCount: 60,
+      });
+      await sumStore.appendContextSummary(CONV_ID, `sum_unlimited_d1_${suffix}`);
+    }
+
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => `Leaf source turn ${i}: ${"u".repeat(160)}`,
+      tokenCountFn: () => 120,
+    });
+
+    const depthsSummarized: number[] = [];
+    const summarize = vi.fn(
+      async (
+        _text: string,
+        _aggressive?: boolean,
+        options?: { isCondensed?: boolean; depth?: number },
+      ) => {
+        if (options?.depth !== undefined) depthsSummarized.push(options.depth);
+        return options?.isCondensed ? `Condensed at depth ${options.depth}` : "Leaf summary";
+      },
+    );
+    const result = await incrementalEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 1_200,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+
+    // With unlimited depth (-1) and sufficient material at depth 0,
+    // the cascade should produce at least one condensed pass.
+    // A capped incrementalMaxDepth=0 would produce zero condensed calls.
+    const condensedCalls = summarize.mock.calls.filter(
+      (_call, i) => summarize.mock.calls[i][2]?.isCondensed,
+    );
+    expect(condensedCalls.length).toBeGreaterThanOrEqual(1);
+
+    // Verify depth-0 condensation happened (produces a depth-1 summary)
+    expect(depthsSummarized).toContain(1);
+  });
+
+
   it("compaction propagates referenced file ids into summary metadata", async () => {
     const productionTailEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,

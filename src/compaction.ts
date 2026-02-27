@@ -795,14 +795,13 @@ export class CompactionEngine {
   private resolveIncrementalMaxDepth(): number {
     if (
       typeof this.config.incrementalMaxDepth === "number" &&
-      Number.isFinite(this.config.incrementalMaxDepth) &&
-      this.config.incrementalMaxDepth > 0
+      Number.isFinite(this.config.incrementalMaxDepth)
     ) {
-      return Math.floor(this.config.incrementalMaxDepth);
+      if (this.config.incrementalMaxDepth < 0) return Infinity;
+      if (this.config.incrementalMaxDepth > 0) return Math.floor(this.config.incrementalMaxDepth);
     }
     return 0;
   }
-
   private resolveFanoutForDepth(targetDepth: number, hardTrigger: boolean): number {
     if (hardTrigger) {
       return this.resolveCondensedMinFanoutHard();
