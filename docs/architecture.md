@@ -87,7 +87,7 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 **Incremental (after each turn):**
 - Checks if raw tokens outside the fresh tail exceed `leafChunkTokens`
 - If so, runs one leaf pass
-- If `incrementalMaxDepth > 0`, follows with condensation passes up to that depth
+- If `incrementalMaxDepth != 0`, follows with condensation passes up to that depth (`-1` for unlimited)
 - Best-effort: failures don't break the conversation
 
 **Full sweep (manual `/compact` or overflow):**

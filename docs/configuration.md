@@ -26,7 +26,7 @@ Set recommended environment variables:
 
 ```bash
 export LCM_FRESH_TAIL_COUNT=32
-export LCM_INCREMENTAL_MAX_DEPTH=1
+export LCM_INCREMENTAL_MAX_DEPTH=-1
 ```
 
 Restart OpenClaw.
@@ -70,8 +70,9 @@ For coding conversations with tool calls (which generate many messages per logic
 `LCM_INCREMENTAL_MAX_DEPTH` (default `0`) controls whether condensation happens automatically after leaf passes.
 
 - **0** — Only leaf summaries are created incrementally. Condensation only happens during manual `/compact` or overflow.
-- **1** — After each leaf pass, attempt to condense d0 summaries into d1. Good default for active conversations.
-- **2+** — Deeper automatic condensation. Rarely needed; the full sweep handles this during overflow.
+- **1** — After each leaf pass, attempt to condense d0 summaries into d1.
+- **2+** — Deeper automatic condensation up to the specified depth.
+- **-1** — Unlimited depth. Condensation cascades as deep as needed after each leaf pass. Recommended for long-running sessions.
 
 ### Summary target tokens
 

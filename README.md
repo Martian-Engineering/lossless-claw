@@ -84,7 +84,7 @@ Add an `lossless-claw` block under `plugins.config` in your OpenClaw config:
         "enabled": true,
         "freshTailCount": 32,
         "contextThreshold": 0.75,
-        "incrementalMaxDepth": 1
+        "incrementalMaxDepth": -1
       }
     }
   }
@@ -102,7 +102,7 @@ Add an `lossless-claw` block under `plugins.config` in your OpenClaw config:
 | `LCM_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |
 | `LCM_CONDENSED_MIN_FANOUT` | `4` | Minimum summaries per condensed node |
 | `LCM_CONDENSED_MIN_FANOUT_HARD` | `2` | Relaxed fanout for forced compaction sweeps |
-| `LCM_INCREMENTAL_MAX_DEPTH` | `0` | How deep incremental compaction goes (0 = leaf only) |
+| `LCM_INCREMENTAL_MAX_DEPTH` | `0` | How deep incremental compaction goes (0 = leaf only, -1 = unlimited) |
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Max source tokens per leaf compaction chunk |
 | `LCM_LEAF_TARGET_TOKENS` | `1200` | Target token count for leaf summaries |
 | `LCM_CONDENSED_TARGET_TOKENS` | `2000` | Target token count for condensed summaries |
@@ -110,18 +110,18 @@ Add an `lossless-claw` block under `plugins.config` in your OpenClaw config:
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File blocks above this size are intercepted and stored separately |
 | `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514`) |
 | `LCM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider override for summarization |
-| `LCM_INCREMENTAL_MAX_DEPTH` | `0` | Depth limit for incremental condensation after leaf passes |
+| `LCM_INCREMENTAL_MAX_DEPTH` | `0` | Depth limit for incremental condensation after leaf passes (-1 = unlimited) |
 
 ### Recommended starting configuration
 
 ```
 LCM_FRESH_TAIL_COUNT=32
-LCM_INCREMENTAL_MAX_DEPTH=1
+LCM_INCREMENTAL_MAX_DEPTH=-1
 LCM_CONTEXT_THRESHOLD=0.75
 ```
 
 - **freshTailCount=32** protects the last 32 messages from compaction, giving the model enough recent context for continuity.
-- **incrementalMaxDepth=1** enables automatic condensation of leaf summaries after each compaction pass (without this, only leaf summaries are created and condensation only happens during manual `/compact` or overflow).
+- **incrementalMaxDepth=-1** enables unlimited automatic condensation after each compaction pass — the DAG cascades as deep as needed. Set to `0` (default) for leaf-only, or a positive integer for a specific depth cap.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
 
 ## How it works
@@ -171,7 +171,7 @@ This gives the model enough information to know what was discussed, when, and ho
 
 Compaction runs in two modes:
 
-- **Proactive (after each turn):** If raw messages outside the fresh tail exceed `leafChunkTokens`, a leaf pass runs. If `incrementalMaxDepth > 0`, condensation follows.
+- **Proactive (after each turn):** If raw messages outside the fresh tail exceed `leafChunkTokens`, a leaf pass runs. If `incrementalMaxDepth != 0`, condensation follows (cascading to the configured depth, or unlimited with `-1`).
 - **Reactive (overflow/manual):** When total context exceeds `contextThreshold × tokenBudget`, a full sweep runs: all eligible leaf chunks are compacted, then condensation proceeds depth-by-depth until stable.
 
 ### Depth-aware prompts
