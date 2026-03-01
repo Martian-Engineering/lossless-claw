@@ -80,6 +80,7 @@ export type ConversationRecord = {
 
 export type MessageSearchInput = {
   conversationId?: ConversationId;
+  conversationIds?: ConversationId[];
   query: string;
   mode: "regex" | "full_text";
   since?: Date;
@@ -557,17 +558,26 @@ export class ConversationStore {
         input.query,
         limit,
         input.conversationId,
+        input.conversationIds,
         input.since,
         input.before,
       );
     }
-    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
+    return this.searchRegex(
+      input.query,
+      limit,
+      input.conversationId,
+      input.conversationIds,
+      input.since,
+      input.before,
+    );
   }
 
   private searchFullText(
     query: string,
     limit: number,
     conversationId?: ConversationId,
+    conversationIds?: ConversationId[],
     since?: Date,
     before?: Date,
   ): MessageSearchResult[] {
@@ -576,6 +586,14 @@ export class ConversationStore {
     if (conversationId != null) {
       where.push("m.conversation_id = ?");
       args.push(conversationId);
+    } else if (Array.isArray(conversationIds) && conversationIds.length > 0) {
+      const normalized = conversationIds
+        .filter((value): value is number => Number.isFinite(value))
+        .map((value) => Math.trunc(value));
+      if (normalized.length > 0) {
+        where.push(`m.conversation_id IN (${normalized.map(() => "?").join(", ")})`);
+        args.push(...normalized);
+      }
     }
     if (since) {
       where.push("julianday(m.created_at) >= julianday(?)");
@@ -607,6 +625,7 @@ export class ConversationStore {
     pattern: string,
     limit: number,
     conversationId?: ConversationId,
+    conversationIds?: ConversationId[],
     since?: Date,
     before?: Date,
   ): MessageSearchResult[] {
@@ -618,6 +637,14 @@ export class ConversationStore {
     if (conversationId != null) {
       where.push("conversation_id = ?");
       args.push(conversationId);
+    } else if (Array.isArray(conversationIds) && conversationIds.length > 0) {
+      const normalized = conversationIds
+        .filter((value): value is number => Number.isFinite(value))
+        .map((value) => Math.trunc(value));
+      if (normalized.length > 0) {
+        where.push(`conversation_id IN (${normalized.map(() => "?").join(", ")})`);
+        args.push(...normalized);
+      }
     }
     if (since) {
       where.push("julianday(created_at) >= julianday(?)");

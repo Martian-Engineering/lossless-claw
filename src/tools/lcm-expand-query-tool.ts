@@ -32,6 +32,18 @@ const LcmExpandQuerySchema = Type.Object({
   prompt: Type.String({
     description: "Question to answer using expanded context.",
   }),
+  scope: Type.Optional(
+    Type.String({
+      description: 'Conversation memory scope: "current" (default) or "agent".',
+      enum: ["current", "agent"],
+    }),
+  ),
+  agentId: Type.Optional(
+    Type.String({
+      description:
+        "Optional agent ID override used when scope=agent. When omitted, inferred from session metadata.",
+    }),
+  ),
   conversationId: Type.Optional(
     Type.Number({
       description:
@@ -219,6 +231,7 @@ async function resolveSummaryCandidates(params: {
   explicitSummaryIds: string[];
   query?: string;
   conversationId?: number;
+  conversationIds?: number[];
 }): Promise<SummaryCandidate[]> {
   const retrieval = params.lcm.getRetrieval();
   const candidates = new Map<string, SummaryCandidate>();
@@ -240,6 +253,7 @@ async function resolveSummaryCandidates(params: {
       mode: "full_text",
       scope: "summaries",
       conversationId: params.conversationId,
+      conversationIds: params.conversationIds,
     });
     for (const summary of grepResult.summaries) {
       candidates.set(summary.summaryId, {
@@ -305,11 +319,13 @@ export function createLcmExpandQueryTool(input: {
         sessionId: input.sessionId,
         sessionKey: input.sessionKey,
         params: p,
+        requestedScope: p.scope === "agent" ? "agent" : "current",
       });
       let scopedConversationId = conversationScope.conversationId;
       if (
         !conversationScope.allConversations &&
         scopedConversationId == null &&
+        (!conversationScope.conversationIds || conversationScope.conversationIds.length === 0) &&
         requesterSessionKey
       ) {
         scopedConversationId = await resolveRequesterConversationScopeId({
@@ -319,7 +335,11 @@ export function createLcmExpandQueryTool(input: {
         });
       }
 
-      if (!conversationScope.allConversations && scopedConversationId == null) {
+      if (
+        !conversationScope.allConversations &&
+        scopedConversationId == null &&
+        (!conversationScope.conversationIds || conversationScope.conversationIds.length === 0)
+      ) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
@@ -335,6 +355,8 @@ export function createLcmExpandQueryTool(input: {
           explicitSummaryIds,
           query: query || undefined,
           conversationId: scopedConversationId,
+          conversationIds:
+            scopedConversationId == null ? conversationScope.conversationIds : undefined,
         });
 
         if (candidates.length === 0) {
@@ -456,6 +478,14 @@ export function createLcmExpandQueryTool(input: {
           expandedSummaryCount: parsed.expandedSummaryCount,
           totalSourceTokens: parsed.totalSourceTokens,
           truncated: parsed.truncated,
+          scope: {
+            mode: conversationScope.mode,
+            conversationId: scopedConversationId,
+            conversationIds: conversationScope.conversationIds,
+            agentId: conversationScope.agentId,
+            warnings: conversationScope.warnings,
+          },
+          provenance: conversationScope.provenance,
         });
       } catch (error) {
         return jsonResult({

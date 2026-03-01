@@ -9,6 +9,7 @@ import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig } from "./src/db/config.js";
 import { LcmContextEngine } from "./src/engine.js";
+import { registerAgentMemoryScopeContextEngine } from "./src/plugins/agent-memory-scope/register.js";
 import { createLcmDescribeTool } from "./src/tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "./src/tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "./src/tools/lcm-expand-tool.js";
@@ -527,6 +528,49 @@ function readLatestAssistantReply(messages: unknown[]): string | undefined {
 /** Construct LCM dependencies from plugin API/runtime surfaces. */
 function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   const config = resolveLcmConfig(process.env);
+  const sessionMetaCache = new Map<
+    string,
+    { sessionKey?: string; channel?: string; chatType?: string }
+  >();
+  const sessionIdCache = new Map<string, string>();
+
+  function readAgentSessionStore(agentId: string): Record<string, Record<string, unknown>> {
+    const cfg = api.runtime.config.loadConfig();
+    const storePath = api.runtime.channel.session.resolveStorePath(cfg.session?.store, {
+      agentId: normalizeAgentId(agentId),
+    });
+    const raw = readFileSync(storePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed as Record<string, Record<string, unknown>>;
+  }
+
+  function cacheSessionMetaFromStore(store: Record<string, Record<string, unknown>>): void {
+    for (const [sessionKey, value] of Object.entries(store)) {
+      if (!value || typeof value !== "object") {
+        continue;
+      }
+      const sessionId =
+        typeof value.sessionId === "string" && value.sessionId.trim() ? value.sessionId.trim() : undefined;
+      if (!sessionId) {
+        continue;
+      }
+      const meta = {
+        sessionKey,
+        channel: typeof value.channel === "string" ? value.channel : undefined,
+        chatType:
+          typeof value.chatType === "string"
+            ? value.chatType
+            : typeof value.chat_type === "string"
+              ? value.chat_type
+              : undefined,
+      };
+      sessionMetaCache.set(sessionId, meta);
+      sessionIdCache.set(sessionKey, sessionId);
+    }
+  }
 
   return {
     config,
@@ -717,20 +761,57 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         return undefined;
       }
 
+      const cached = sessionIdCache.get(key);
+      if (cached) {
+        return cached;
+      }
+
       try {
-        const cfg = api.runtime.config.loadConfig();
         const parsed = parseAgentSessionKey(key);
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = api.runtime.channel.session.resolveStorePath(cfg.session?.store, {
-          agentId,
-        });
-        const raw = readFileSync(storePath, "utf8");
-        const store = JSON.parse(raw) as Record<string, { sessionId?: string } | undefined>;
+        const store = readAgentSessionStore(agentId);
+        cacheSessionMetaFromStore(store);
         const sessionId = store[key]?.sessionId;
         return typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : undefined;
       } catch {
         return undefined;
       }
+    },
+    resolveAgentIdFromSessionKey: async (sessionKey) => {
+      const parsed = parseAgentSessionKey(sessionKey.trim());
+      if (!parsed?.agentId) {
+        return undefined;
+      }
+      return normalizeAgentId(parsed.agentId);
+    },
+    listAgentSessionIds: async (agentId) => {
+      const normalizedAgentId = normalizeAgentId(agentId);
+      try {
+        const store = readAgentSessionStore(normalizedAgentId);
+        cacheSessionMetaFromStore(store);
+        return Array.from(
+          new Set(
+            Object.values(store)
+              .map((entry) =>
+                entry && typeof entry.sessionId === "string" ? entry.sessionId.trim() : "",
+              )
+              .filter(Boolean),
+          ),
+        );
+      } catch {
+        return [];
+      }
+    },
+    resolveSessionMeta: async (sessionId) => {
+      const normalized = sessionId.trim();
+      if (!normalized) {
+        return undefined;
+      }
+      const cached = sessionMetaCache.get(normalized);
+      if (cached) {
+        return cached;
+      }
+      return undefined;
     },
     agentLaneSubagent: "subagent",
     log: {
@@ -769,6 +850,7 @@ const lcmPlugin = {
     const lcm = new LcmContextEngine(deps);
 
     api.registerContextEngine("lossless-claw", () => lcm);
+    registerAgentMemoryScopeContextEngine(api, lcm);
     api.registerTool((ctx) =>
       createLcmGrepTool({
         deps,

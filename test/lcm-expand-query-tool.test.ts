@@ -408,4 +408,77 @@ describe("createLcmExpandQueryTool", () => {
       citedIds: ["sum_x", "sum_y"],
     });
   });
+
+  it("supports scope=agent candidate retrieval and requires narrowing to one conversation", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_a",
+          conversationId: 7,
+          kind: "leaf",
+          snippet: "a",
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_b",
+          conversationId: 9,
+          kind: "leaf",
+          snippet: "b",
+          createdAt: new Date("2026-01-01T00:01:00.000Z"),
+        },
+      ],
+      totalMatches: 2,
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps({
+        resolveAgentIdFromSessionKey: async () => "main",
+        listAgentSessionIds: async () => ["sid-7", "sid-9"],
+      }),
+      lcm: {
+        info: { id: "lcm", name: "LCM", version: "0.0.0" },
+        getRetrieval: () => retrieval,
+        getConversationStore: () => ({
+          getConversationBySessionId: vi.fn(async (sessionId: string) =>
+            sessionId === "sid-7"
+              ? {
+                  conversationId: 7,
+                  sessionId,
+                  title: null,
+                  bootstrappedAt: null,
+                  createdAt: new Date("2026-01-01T00:00:00.000Z"),
+                  updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+                }
+              : {
+                  conversationId: 9,
+                  sessionId,
+                  title: null,
+                  bootstrappedAt: null,
+                  createdAt: new Date("2026-01-01T00:00:00.000Z"),
+                  updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+                },
+          ),
+        }),
+      } as unknown as LcmContextEngine,
+      sessionKey: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-agent-scope", {
+      query: "regression",
+      prompt: "what changed?",
+      scope: "agent",
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationIds: [7, 9],
+        conversationId: undefined,
+      }),
+    );
+    expect(result.details).toMatchObject({
+      error: expect.stringContaining("Unable to resolve a single conversation scope"),
+    });
+  });
 });

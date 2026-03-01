@@ -60,6 +60,12 @@ export type ParseAgentSessionKeyFn = (sessionKey: string) => {
 
 export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 
+export type SessionMeta = {
+  sessionKey?: string;
+  channel?: string;
+  chatType?: string;
+};
+
 /**
  * Dependencies injected into the LCM engine at registration time.
  * These replace all direct imports from OpenClaw core.
@@ -110,6 +116,12 @@ export interface LcmDependencies {
 
   /** Resolve runtime session id from an agent session key */
   resolveSessionIdFromSessionKey: (sessionKey: string) => Promise<string | undefined>;
+  /** Resolve runtime agent id from an agent session key */
+  resolveAgentIdFromSessionKey?: (sessionKey: string) => Promise<string | undefined>;
+  /** List runtime session ids for one agent */
+  listAgentSessionIds?: (agentId: string) => Promise<string[]>;
+  /** Resolve optional session metadata for provenance fields */
+  resolveSessionMeta?: (sessionId: string) => Promise<SessionMeta | undefined>;
 
   /** Agent lane constant for subagents */
   agentLaneSubagent: string;

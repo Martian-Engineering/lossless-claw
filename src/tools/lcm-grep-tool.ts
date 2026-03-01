@@ -22,6 +22,13 @@ const LcmGrepSchema = Type.Object({
   scope: Type.Optional(
     Type.String({
       description:
+        'Backwards-compatible scope selector. Accepts search scope ("messages" | "summaries" | "both") or memory scope ("current" | "agent").',
+      enum: ["messages", "summaries", "both", "current", "agent"],
+    }),
+  ),
+  searchScope: Type.Optional(
+    Type.String({
+      description:
         'What to search: "messages" for raw messages, "summaries" for compacted summaries, "both" for all. Default: "both".',
       enum: ["messages", "summaries", "both"],
     }),
@@ -36,6 +43,12 @@ const LcmGrepSchema = Type.Object({
     Type.Boolean({
       description:
         "Set true to explicitly search across all conversations. Ignored when conversationId is provided.",
+    }),
+  ),
+  agentId: Type.Optional(
+    Type.String({
+      description:
+        "Optional agent ID override for memory scope=agent. When omitted, inferred from sessionKey.",
     }),
   ),
   since: Type.Optional(
@@ -65,6 +78,24 @@ function truncateSnippet(content: string, maxLen: number = 200): string {
   return singleLine.substring(0, maxLen - 3) + "...";
 }
 
+function parseGrepScopes(params: Record<string, unknown>): {
+  searchScope: "messages" | "summaries" | "both";
+  memoryScope: "current" | "agent";
+} {
+  const rawScope = typeof params.scope === "string" ? params.scope.trim() : "";
+  const rawSearchScope = typeof params.searchScope === "string" ? params.searchScope.trim() : "";
+
+  let searchScope: "messages" | "summaries" | "both" = "both";
+  if (rawSearchScope === "messages" || rawSearchScope === "summaries" || rawSearchScope === "both") {
+    searchScope = rawSearchScope;
+  } else if (rawScope === "messages" || rawScope === "summaries" || rawScope === "both") {
+    searchScope = rawScope;
+  }
+
+  const memoryScope: "current" | "agent" = rawScope === "agent" ? "agent" : "current";
+  return { searchScope, memoryScope };
+}
+
 export function createLcmGrepTool(input: {
   deps: LcmDependencies;
   lcm: LcmContextEngine;
@@ -87,7 +118,7 @@ export function createLcmGrepTool(input: {
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
       const mode = (p.mode as "regex" | "full_text") ?? "regex";
-      const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
+      const { searchScope, memoryScope } = parseGrepScopes(p);
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
       let since: Date | undefined;
       let before: Date | undefined;
@@ -110,8 +141,13 @@ export function createLcmGrepTool(input: {
         sessionId: input.sessionId,
         sessionKey: input.sessionKey,
         params: p,
+        requestedScope: memoryScope,
       });
-      if (!conversationScope.allConversations && conversationScope.conversationId == null) {
+      if (
+        !conversationScope.allConversations &&
+        conversationScope.conversationId == null &&
+        (!conversationScope.conversationIds || conversationScope.conversationIds.length === 0)
+      ) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
@@ -121,8 +157,9 @@ export function createLcmGrepTool(input: {
       const result = await retrieval.grep({
         query: pattern,
         mode,
-        scope,
+        scope: searchScope,
         conversationId: conversationScope.conversationId,
+        conversationIds: conversationScope.conversationIds,
         limit,
         since,
         before,
@@ -131,11 +168,22 @@ export function createLcmGrepTool(input: {
       const lines: string[] = [];
       lines.push("## LCM Grep Results");
       lines.push(`**Pattern:** \`${pattern}\``);
-      lines.push(`**Mode:** ${mode} | **Scope:** ${scope}`);
+      lines.push(`**Mode:** ${mode} | **Search scope:** ${searchScope}`);
+      lines.push(`**Memory scope:** ${conversationScope.mode}`);
       if (conversationScope.allConversations) {
         lines.push("**Conversation scope:** all conversations");
+      } else if (conversationScope.conversationIds && conversationScope.conversationIds.length > 0) {
+        lines.push(
+          `**Conversation scope:** ${conversationScope.conversationIds.length} conversation(s)`,
+        );
       } else if (conversationScope.conversationId != null) {
         lines.push(`**Conversation scope:** ${conversationScope.conversationId}`);
+      }
+      if (conversationScope.agentId) {
+        lines.push(`**Agent:** ${conversationScope.agentId}`);
+      }
+      if (conversationScope.warnings.length > 0) {
+        lines.push(`**Warnings:** ${conversationScope.warnings.join(" | ")}`);
       }
       if (since || before) {
         lines.push(
@@ -191,6 +239,14 @@ export function createLcmGrepTool(input: {
           messageCount: result.messages.length,
           summaryCount: result.summaries.length,
           totalMatches: result.totalMatches,
+          scope: {
+            mode: conversationScope.mode,
+            conversationId: conversationScope.conversationId,
+            conversationIds: conversationScope.conversationIds,
+            agentId: conversationScope.agentId,
+            warnings: conversationScope.warnings,
+          },
+          provenance: conversationScope.provenance,
         },
       };
     },

@@ -44,6 +44,7 @@ export interface GrepInput {
   mode: "regex" | "full_text";
   scope: "messages" | "summaries" | "both";
   conversationId?: number;
+  conversationIds?: number[];
   since?: Date;
   before?: Date;
   limit?: number;
@@ -179,9 +180,9 @@ export class RetrievalEngine {
    * Depending on `scope`, searches messages, summaries, or both (in parallel).
    */
   async grep(input: GrepInput): Promise<GrepResult> {
-    const { query, mode, scope, conversationId, since, before, limit } = input;
+    const { query, mode, scope, conversationId, conversationIds, since, before, limit } = input;
 
-    const searchInput = { query, mode, conversationId, since, before, limit };
+    const searchInput = { query, mode, conversationId, conversationIds, since, before, limit };
 
     let messages: MessageSearchResult[] = [];
     let summaries: SummarySearchResult[] = [];
