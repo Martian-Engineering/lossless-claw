@@ -35,6 +35,7 @@ const TOOL_CALL_TYPES = new Set([
   "functionCall",
   "function_call",
 ]);
+const OPENAI_FUNCTION_CALL_TYPES = new Set(["functionCall", "function_call"]);
 
 function extractToolCallId(block: { id?: unknown; call_id?: unknown }): string | null {
   if (typeof block.id === "string" && block.id) {
@@ -53,6 +54,7 @@ function normalizeAssistantReasoningBlocks<T extends AgentMessageLike>(message: 
 
   let sawToolCall = false;
   let reasoningAfterToolCall = false;
+  let functionCallCount = 0;
 
   for (const block of message.content) {
     if (!block || typeof block !== "object") {
@@ -69,13 +71,19 @@ function normalizeAssistantReasoningBlocks<T extends AgentMessageLike>(message: 
 
     if (typeof type === "string" && TOOL_CALL_TYPES.has(type)) {
       sawToolCall = true;
+      if (OPENAI_FUNCTION_CALL_TYPES.has(type)) {
+        functionCallCount += 1;
+      }
       continue;
     }
 
     return message;
   }
 
-  if (!reasoningAfterToolCall) {
+  // Only repair the specific OpenAI shape we need: a single function call that
+  // has one or more reasoning blocks after it. Multi-call turns may use
+  // interleaved reasoning intentionally, so leave them untouched.
+  if (!reasoningAfterToolCall || functionCallCount !== 1) {
     return message;
   }
 
