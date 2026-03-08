@@ -597,7 +597,11 @@ function readLatestAssistantReply(messages: unknown[]): string | undefined {
 function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   const envSnapshot = snapshotPluginEnv();
   const readEnv: ReadEnvFn = (key) => process.env[key];
-  const config = resolveLcmConfig(process.env, _parsedPluginConfig);
+  const pluginConfig =
+    api.pluginConfig && typeof api.pluginConfig === "object" && !Array.isArray(api.pluginConfig)
+      ? api.pluginConfig
+      : undefined;
+  const config = resolveLcmConfig(process.env, pluginConfig);
 
   return {
     config,
@@ -854,9 +858,6 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   };
 }
 
-/** Cached config from configSchema.parse — available by the time register() runs. */
-let _parsedPluginConfig: Record<string, unknown> | undefined;
-
 const lcmPlugin = {
   id: "lossless-claw",
   name: "Lossless Context Management",
@@ -869,7 +870,6 @@ const lcmPlugin = {
         value && typeof value === "object" && !Array.isArray(value)
           ? (value as Record<string, unknown>)
           : {};
-      _parsedPluginConfig = raw;
       return resolveLcmConfig(process.env, raw);
     },
   },

@@ -71,7 +71,10 @@ export function resolveLcmConfig(
         ? env.LCM_ENABLED !== "false"
         : toBool(pc.enabled) ?? true,
     databasePath:
-      env.LCM_DATABASE_PATH ?? toStr(pc.databasePath) ?? join(homedir(), ".openclaw", "lcm.db"),
+      env.LCM_DATABASE_PATH
+      ?? toStr(pc.dbPath)
+      ?? toStr(pc.databasePath)
+      ?? join(homedir(), ".openclaw", "lcm.db"),
     contextThreshold:
       (env.LCM_CONTEXT_THRESHOLD !== undefined ? parseFloat(env.LCM_CONTEXT_THRESHOLD) : undefined)
         ?? toNumber(pc.contextThreshold) ?? 0.75,
@@ -104,7 +107,9 @@ export function resolveLcmConfig(
         ?? toNumber(pc.maxExpandTokens) ?? 4000,
     largeFileTokenThreshold:
       (env.LCM_LARGE_FILE_TOKEN_THRESHOLD !== undefined ? parseInt(env.LCM_LARGE_FILE_TOKEN_THRESHOLD, 10) : undefined)
-        ?? toNumber(pc.largeFileTokenThreshold) ?? 25000,
+        ?? toNumber(pc.largeFileThresholdTokens)
+        ?? toNumber(pc.largeFileTokenThreshold)
+        ?? 25000,
     largeFileSummaryProvider:
       env.LCM_LARGE_FILE_SUMMARY_PROVIDER?.trim() ?? toStr(pc.largeFileSummaryProvider) ?? "",
     largeFileSummaryModel:

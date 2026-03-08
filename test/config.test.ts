@@ -103,12 +103,26 @@ describe("resolveLcmConfig", () => {
     expect(config.databasePath).toBe("/custom/path/lcm.db");
   });
 
+  it("accepts manifest dbPath from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      dbPath: "/manifest/path/lcm.db",
+    });
+    expect(config.databasePath).toBe("/manifest/path/lcm.db");
+  });
+
   it("env databasePath overrides plugin config", () => {
     const config = resolveLcmConfig(
       { LCM_DATABASE_PATH: "/env/path/lcm.db" } as NodeJS.ProcessEnv,
       { databasePath: "/plugin/path/lcm.db" },
     );
     expect(config.databasePath).toBe("/env/path/lcm.db");
+  });
+
+  it("accepts manifest largeFileThresholdTokens from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      largeFileThresholdTokens: 12345,
+    });
+    expect(config.largeFileTokenThreshold).toBe(12345);
   });
 
   it("ships a manifest that accepts unlimited incremental depth", () => {
