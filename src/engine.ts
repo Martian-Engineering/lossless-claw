@@ -60,6 +60,39 @@ function safeString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function appendTextValue(value: unknown, out: string[]): void {
+  if (typeof value === "string") {
+    out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      appendTextValue(entry, out);
+    }
+    return;
+  }
+  if (!value || typeof value !== "object") {
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  appendTextValue(record.text, out);
+  appendTextValue(record.value, out);
+}
+
+function extractReasoningText(record: Record<string, unknown>): string | undefined {
+  const chunks: string[] = [];
+  appendTextValue(record.summary, chunks);
+  if (chunks.length === 0) {
+    return undefined;
+  }
+
+  const normalized = chunks
+    .map((chunk) => chunk.trim())
+    .filter((chunk, idx, arr) => chunk.length > 0 && arr.indexOf(chunk) === idx);
+  return normalized.length > 0 ? normalized.join("\n") : undefined;
+}
+
 function normalizeUnknownBlock(value: unknown): {
   type: string;
   text?: string;
@@ -76,7 +109,12 @@ function normalizeUnknownBlock(value: unknown): {
   const rawType = safeString(record.type);
   return {
     type: rawType ?? "agent",
-    text: safeString(record.text) ?? safeString(record.thinking),
+    text:
+      safeString(record.text) ??
+      safeString(record.thinking) ??
+      ((rawType === "reasoning" || rawType === "thinking")
+        ? extractReasoningText(record)
+        : undefined),
     metadata: { raw: record },
   };
 }
@@ -89,7 +127,12 @@ function toPartType(type: string): MessagePartType {
     case "reasoning":
       return "reasoning";
     case "tool_use":
+    case "toolUse":
     case "tool-use":
+    case "toolCall":
+    case "functionCall":
+    case "function_call":
+    case "function_call_output":
     case "tool_result":
     case "toolResult":
     case "tool":
@@ -215,7 +258,12 @@ function buildMessageParts(params: {
   const role = typeof message.role === "string" ? message.role : "unknown";
   const topLevel = message as unknown as Record<string, unknown>;
   const topLevelToolCallId =
-    safeString(topLevel.toolCallId) ?? safeString(topLevel.tool_call_id) ?? safeString(topLevel.id);
+    safeString(topLevel.toolCallId) ??
+    safeString(topLevel.tool_call_id) ??
+    safeString(topLevel.toolUseId) ??
+    safeString(topLevel.tool_use_id) ??
+    safeString(topLevel.call_id) ??
+    safeString(topLevel.id);
 
   // BashExecutionMessage: preserve a synthetic text part so output is round-trippable.
   if (!("content" in message) && "command" in message && "output" in message) {
@@ -284,14 +332,19 @@ function buildMessageParts(params: {
   for (let ordinal = 0; ordinal < message.content.length; ordinal++) {
     const block = normalizeUnknownBlock(message.content[ordinal]);
     const metadataRecord = block.metadata.raw as Record<string, unknown> | undefined;
+    const partType = toPartType(block.type);
     const toolCallId =
       safeString(metadataRecord?.toolCallId) ??
       safeString(metadataRecord?.tool_call_id) ??
+      safeString(metadataRecord?.toolUseId) ??
+      safeString(metadataRecord?.tool_use_id) ??
+      safeString(metadataRecord?.call_id) ??
+      (partType === "tool" ? safeString(metadataRecord?.id) : undefined) ??
       topLevelToolCallId;
 
     parts.push({
       sessionId,
-      partType: toPartType(block.type),
+      partType,
       ordinal,
       textContent: block.text ?? null,
       toolCallId,
@@ -302,6 +355,8 @@ function buildMessageParts(params: {
       toolInput:
         metadataRecord?.input !== undefined
           ? toJson(metadataRecord.input)
+          : metadataRecord?.arguments !== undefined
+            ? toJson(metadataRecord.arguments)
           : metadataRecord?.toolInput !== undefined
             ? toJson(metadataRecord.toolInput)
             : (safeString(metadataRecord?.tool_input) ?? null),

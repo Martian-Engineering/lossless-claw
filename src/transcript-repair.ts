@@ -27,7 +27,72 @@ type ToolCallLike = {
 
 // -- Extraction helpers (from tool-call-id.ts) --
 
-const TOOL_CALL_TYPES = new Set(["toolCall", "toolUse", "functionCall"]);
+const TOOL_CALL_TYPES = new Set([
+  "toolCall",
+  "toolUse",
+  "tool_use",
+  "tool-use",
+  "functionCall",
+  "function_call",
+]);
+
+function extractToolCallId(block: { id?: unknown; call_id?: unknown }): string | null {
+  if (typeof block.id === "string" && block.id) {
+    return block.id;
+  }
+  if (typeof block.call_id === "string" && block.call_id) {
+    return block.call_id;
+  }
+  return null;
+}
+
+function normalizeAssistantReasoningBlocks<T extends AgentMessageLike>(message: T): T {
+  if (!Array.isArray(message.content)) {
+    return message;
+  }
+
+  let sawToolCall = false;
+  let reasoningAfterToolCall = false;
+
+  for (const block of message.content) {
+    if (!block || typeof block !== "object") {
+      return message;
+    }
+
+    const type = (block as { type?: unknown }).type;
+    if (type === "reasoning" || type === "thinking") {
+      if (sawToolCall) {
+        reasoningAfterToolCall = true;
+      }
+      continue;
+    }
+
+    if (typeof type === "string" && TOOL_CALL_TYPES.has(type)) {
+      sawToolCall = true;
+      continue;
+    }
+
+    return message;
+  }
+
+  if (!reasoningAfterToolCall) {
+    return message;
+  }
+
+  const reasoning = message.content.filter((block) => {
+    const type = (block as { type?: unknown }).type;
+    return type === "reasoning" || type === "thinking";
+  });
+  const toolCalls = message.content.filter((block) => {
+    const type = (block as { type?: unknown }).type;
+    return typeof type === "string" && TOOL_CALL_TYPES.has(type);
+  });
+
+  return {
+    ...message,
+    content: [...reasoning, ...toolCalls],
+  };
+}
 
 function extractToolCallsFromAssistant(msg: AgentMessageLike): ToolCallLike[] {
   const content = msg.content;
@@ -40,13 +105,14 @@ function extractToolCallsFromAssistant(msg: AgentMessageLike): ToolCallLike[] {
     if (!block || typeof block !== "object") {
       continue;
     }
-    const rec = block as { type?: unknown; id?: unknown; name?: unknown };
-    if (typeof rec.id !== "string" || !rec.id) {
+    const rec = block as { type?: unknown; id?: unknown; call_id?: unknown; name?: unknown };
+    const id = extractToolCallId(rec);
+    if (!id) {
       continue;
     }
     if (typeof rec.type === "string" && TOOL_CALL_TYPES.has(rec.type)) {
       toolCalls.push({
-        id: rec.id,
+        id,
         name: typeof rec.name === "string" ? rec.name : undefined,
       });
     }
@@ -134,18 +200,23 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(message
       continue;
     }
 
+    const normalizedAssistant = normalizeAssistantReasoningBlocks(msg);
+    if (normalizedAssistant !== msg) {
+      changed = true;
+    }
+
     // Skip tool call extraction for aborted or errored assistant messages.
     // When stopReason is "error" or "aborted", the tool_use blocks may be incomplete
     // and should not have synthetic tool_results created.
-    const stopReason = msg.stopReason;
+    const stopReason = normalizedAssistant.stopReason;
     if (stopReason === "error" || stopReason === "aborted") {
-      out.push(msg);
+      out.push(normalizedAssistant as T);
       continue;
     }
 
-    const toolCalls = extractToolCallsFromAssistant(msg);
+    const toolCalls = extractToolCallsFromAssistant(normalizedAssistant);
     if (toolCalls.length === 0) {
-      out.push(msg);
+      out.push(normalizedAssistant as T);
       continue;
     }
 
@@ -190,7 +261,7 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(message
       }
     }
 
-    out.push(msg);
+    out.push(normalizedAssistant as T);
 
     if (spanResultsById.size > 0 && remainder.length > 0) {
       moved = true;

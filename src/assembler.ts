@@ -144,6 +144,116 @@ function getOriginalRole(parts: MessagePartRecord[]): string | null {
   return null;
 }
 
+function getPartMetadata(part: MessagePartRecord): {
+  originalRole?: string;
+  rawType?: string;
+  raw?: unknown;
+} {
+  const decoded = parseJson(part.metadata);
+  if (!decoded || typeof decoded !== "object") {
+    return {};
+  }
+
+  const record = decoded as {
+    originalRole?: unknown;
+    rawType?: unknown;
+    raw?: unknown;
+  };
+  return {
+    originalRole:
+      typeof record.originalRole === "string" && record.originalRole.length > 0
+        ? record.originalRole
+        : undefined,
+    rawType:
+      typeof record.rawType === "string" && record.rawType.length > 0
+        ? record.rawType
+        : undefined,
+    raw: record.raw,
+  };
+}
+
+function parseStoredValue(value: string | null): unknown {
+  if (typeof value !== "string" || value.length === 0) {
+    return undefined;
+  }
+  const parsed = parseJson(value);
+  return parsed !== undefined ? parsed : value;
+}
+
+function reasoningBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
+  const type = rawType === "thinking" ? "thinking" : "reasoning";
+  if (typeof part.textContent === "string" && part.textContent.length > 0) {
+    return type === "thinking"
+      ? { type, thinking: part.textContent }
+      : { type, text: part.textContent };
+  }
+  return { type };
+}
+
+function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
+  const type =
+    rawType === "function_call" ||
+    rawType === "functionCall" ||
+    rawType === "tool_use" ||
+    rawType === "tool-use" ||
+    rawType === "toolUse" ||
+    rawType === "toolCall"
+      ? rawType
+      : "toolCall";
+  const input = parseStoredValue(part.toolInput);
+  const block: Record<string, unknown> = { type };
+
+  if (type === "function_call") {
+    if (typeof part.toolCallId === "string" && part.toolCallId.length > 0) {
+      block.call_id = part.toolCallId;
+    }
+    if (typeof part.toolName === "string" && part.toolName.length > 0) {
+      block.name = part.toolName;
+    }
+    if (input !== undefined) {
+      block.arguments = input;
+    }
+    return block;
+  }
+
+  if (typeof part.toolCallId === "string" && part.toolCallId.length > 0) {
+    block.id = part.toolCallId;
+  }
+  if (typeof part.toolName === "string" && part.toolName.length > 0) {
+    block.name = part.toolName;
+  }
+
+  if (input !== undefined) {
+    if (type === "functionCall") {
+      block.arguments = input;
+    } else {
+      block.input = input;
+    }
+  }
+  return block;
+}
+
+function toolResultBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
+  const type =
+    rawType === "function_call_output" || rawType === "toolResult" || rawType === "tool_result"
+      ? rawType
+      : "tool_result";
+  const output = parseStoredValue(part.toolOutput) ?? part.textContent ?? "";
+  const block: Record<string, unknown> = { type, output };
+
+  if (type === "function_call_output") {
+    if (typeof part.toolCallId === "string" && part.toolCallId.length > 0) {
+      block.call_id = part.toolCallId;
+    }
+    return block;
+  }
+
+  if (typeof part.toolCallId === "string" && part.toolCallId.length > 0) {
+    block.tool_use_id = part.toolCallId;
+  }
+  return block;
+}
+
 function toRuntimeRole(
   dbRole: MessageRole,
   parts: MessagePartRecord[],
@@ -173,26 +283,39 @@ function toRuntimeRole(
 }
 
 function blockFromPart(part: MessagePartRecord): unknown {
-  const decoded = parseJson(part.metadata);
-  if (decoded && typeof decoded === "object") {
-    const raw = (decoded as { raw?: unknown }).raw;
-    if (raw && typeof raw === "object") {
-      return raw;
-    }
+  const metadata = getPartMetadata(part);
+  if (metadata.raw && typeof metadata.raw === "object") {
+    return metadata.raw;
   }
 
-  if (part.partType === "text" || part.partType === "reasoning") {
-    return { type: "text", text: part.textContent ?? "" };
+  if (part.partType === "reasoning") {
+    return reasoningBlockFromPart(part, metadata.rawType);
   }
   if (part.partType === "tool") {
-    const toolOutput = parseJson(part.toolOutput);
-    if (toolOutput !== undefined) {
-      return toolOutput;
+    if (metadata.originalRole === "toolResult" || metadata.rawType === "function_call_output") {
+      return toolResultBlockFromPart(part, metadata.rawType);
     }
-    if (typeof part.textContent === "string") {
-      return { type: "text", text: part.textContent };
-    }
-    return { type: "text", text: part.toolOutput ?? part.toolInput ?? "" };
+    return toolCallBlockFromPart(part, metadata.rawType);
+  }
+  if (
+    metadata.rawType === "function_call" ||
+    metadata.rawType === "functionCall" ||
+    metadata.rawType === "tool_use" ||
+    metadata.rawType === "tool-use" ||
+    metadata.rawType === "toolUse" ||
+    metadata.rawType === "toolCall"
+  ) {
+    return toolCallBlockFromPart(part, metadata.rawType);
+  }
+  if (
+    metadata.rawType === "function_call_output" ||
+    metadata.rawType === "tool_result" ||
+    metadata.rawType === "toolResult"
+  ) {
+    return toolResultBlockFromPart(part, metadata.rawType);
+  }
+  if (part.partType === "text") {
+    return { type: "text", text: part.textContent ?? "" };
   }
 
   if (typeof part.textContent === "string" && part.textContent.length > 0) {

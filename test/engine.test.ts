@@ -803,6 +803,65 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_2");
   });
 
+  it("repairs OpenAI function_call transcripts without dropping reasoning blocks", async () => {
+    const engine = createEngine();
+    const sessionId = "session-openai-function-call";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            summary: [{ type: "summary_text", text: "Need to inspect the working directory." }],
+          },
+          {
+            type: "function_call",
+            call_id: "fc_1",
+            name: "bash",
+            arguments: '{"cmd":"pwd"}',
+          },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "interleaved user turn" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "fc_1",
+        toolName: "bash",
+        content: [{ type: "function_call_output", call_id: "fc_1", output: "/tmp" }],
+        isError: false,
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(result.messages).toHaveLength(3);
+
+    const assistant = result.messages[0] as {
+      role: string;
+      content?: Array<{ type?: string; call_id?: string }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content?.map((block) => block.type)).toEqual(["reasoning", "function_call"]);
+    expect(assistant.content?.[1]?.call_id).toBe("fc_1");
+
+    expect(result.messages[1]?.role).toBe("toolResult");
+    expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("fc_1");
+    expect(result.messages[2]?.role).toBe("user");
+  });
+
   it("omits dynamic LCM system prompt guidance when no summaries exist", async () => {
     const engine = createEngine();
     const sessionId = "session-no-summary-guidance";
@@ -1029,6 +1088,104 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(assembledMessage.toolCallId).toBe("call_123");
     expect(Array.isArray(assembledMessage.content)).toBe(true);
     expect((assembledMessage.content as Array<{ type?: string }>)[0]?.type).toBe("tool_result");
+  });
+
+  it("reconstructs OpenAI reasoning and function call blocks when raw metadata is missing", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            summary: [{ type: "summary_text", text: "Need shell output before replying." }],
+          },
+          {
+            type: "function_call",
+            call_id: "fc_2",
+            name: "bash",
+            arguments: '{"cmd":"pwd"}',
+          },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "fc_2",
+        toolName: "bash",
+        content: [{ type: "function_call_output", call_id: "fc_2", output: { cwd: "/tmp" } }],
+        isError: false,
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(2);
+
+    const assistantParts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[0].messageId);
+    expect(assistantParts.map((part) => part.partType)).toEqual(["reasoning", "tool"]);
+    expect(assistantParts[1].toolCallId).toBe("fc_2");
+
+    const toolResultParts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(toolResultParts).toHaveLength(1);
+    expect(toolResultParts[0].partType).toBe("tool");
+    expect(toolResultParts[0].toolCallId).toBe("fc_2");
+
+    const db = (engine.getConversationStore() as unknown as {
+      db: { prepare: (sql: string) => { run: (metadata: string, partId: string) => void } };
+    }).db;
+
+    for (const part of [...assistantParts, ...toolResultParts]) {
+      const metadata = JSON.parse(part.metadata ?? "{}") as Record<string, unknown>;
+      delete metadata.raw;
+      db.prepare("UPDATE message_parts SET metadata = ? WHERE part_id = ?").run(
+        JSON.stringify(metadata),
+        part.partId,
+      );
+    }
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    expect(assembled.messages).toHaveLength(2);
+
+    const assistant = assembled.messages[0] as {
+      role: string;
+      content?: Array<{ type?: string; text?: string; call_id?: string; arguments?: unknown }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content?.map((block) => block.type)).toEqual(["reasoning", "function_call"]);
+    expect(assistant.content?.[0]?.text).toBe("Need shell output before replying.");
+    expect(assistant.content?.[1]?.call_id).toBe("fc_2");
+    expect(assistant.content?.[1]?.arguments).toBe('{"cmd":"pwd"}');
+
+    const toolResult = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      content?: Array<{ type?: string; call_id?: string; output?: unknown }>;
+    };
+    expect(toolResult.role).toBe("toolResult");
+    expect(toolResult.toolCallId).toBe("fc_2");
+    expect(toolResult.content?.[0]?.type).toBe("function_call_output");
+    expect(toolResult.content?.[0]?.call_id).toBe("fc_2");
+    expect(toolResult.content?.[0]?.output).toEqual({ cwd: "/tmp" });
   });
 
   it("maps unknown roles to assistant instead of silently coercing to user", async () => {
