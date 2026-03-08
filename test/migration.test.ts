@@ -209,4 +209,19 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_2")).toBe(15);
     expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_orphan")).toBe(0);
   });
+
+  it("skips FTS tables when fts5 is unavailable", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "no-fts.db");
+    const db = getLcmConnection(dbPath);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const ftsTables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts%'")
+      .all() as Array<{ name: string }>;
+
+    expect(ftsTables).toEqual([]);
+  });
 });

@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
+import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -203,7 +204,14 @@ function toMessagePartRecord(row: MessagePartRow): MessagePartRecord {
 // ── ConversationStore ─────────────────────────────────────────────────────────
 
 export class ConversationStore {
-  constructor(private db: DatabaseSync) {}
+  private readonly fts5Available: boolean;
+
+  constructor(
+    private db: DatabaseSync,
+    options?: { fts5Available?: boolean },
+  ) {
+    this.fts5Available = options?.fts5Available ?? true;
+  }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
 
@@ -292,10 +300,7 @@ export class ConversationStore {
 
     const messageId = Number(result.lastInsertRowid);
 
-    // Index in FTS5
-    this.db
-      .prepare(`INSERT INTO messages_fts(rowid, content) VALUES (?, ?)`)
-      .run(messageId, input.content);
+    this.indexMessageForFullText(messageId, input.content);
 
     const row = this.db
       .prepare(
@@ -315,7 +320,6 @@ export class ConversationStore {
       `INSERT INTO messages (conversation_id, seq, role, content, token_count)
        VALUES (?, ?, ?, ?, ?)`,
     );
-    const insertFtsStmt = this.db.prepare(`INSERT INTO messages_fts(rowid, content) VALUES (?, ?)`);
     const selectStmt = this.db.prepare(
       `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
        FROM messages WHERE message_id = ?`,
@@ -332,7 +336,7 @@ export class ConversationStore {
       );
 
       const messageId = Number(result.lastInsertRowid);
-      insertFtsStmt.run(messageId, input.content);
+      this.indexMessageForFullText(messageId, input.content);
       const row = selectStmt.get(messageId) as unknown as MessageRow;
       records.push(toMessageRecord(row));
     }
@@ -535,8 +539,7 @@ export class ConversationStore {
         .prepare(`DELETE FROM context_items WHERE item_type = 'message' AND message_id = ?`)
         .run(messageId);
 
-      // Remove from FTS index
-      this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(messageId);
+      this.deleteMessageFromFullText(messageId);
 
       // Delete the message (message_parts cascade via ON DELETE CASCADE)
       this.db.prepare(`DELETE FROM messages WHERE message_id = ?`).run(messageId);
@@ -553,15 +556,52 @@ export class ConversationStore {
     const limit = input.limit ?? 50;
 
     if (input.mode === "full_text") {
-      return this.searchFullText(
-        input.query,
-        limit,
-        input.conversationId,
-        input.since,
-        input.before,
-      );
+      if (this.fts5Available) {
+        try {
+          return this.searchFullText(
+            input.query,
+            limit,
+            input.conversationId,
+            input.since,
+            input.before,
+          );
+        } catch {
+          return this.searchLike(
+            input.query,
+            limit,
+            input.conversationId,
+            input.since,
+            input.before,
+          );
+        }
+      }
+      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before);
     }
     return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
+  }
+
+  private indexMessageForFullText(messageId: MessageId, content: string): void {
+    if (!this.fts5Available) {
+      return;
+    }
+    try {
+      this.db
+        .prepare(`INSERT INTO messages_fts(rowid, content) VALUES (?, ?)`)
+        .run(messageId, content);
+    } catch {
+      // Full-text indexing is optional. Message persistence must still succeed.
+    }
+  }
+
+  private deleteMessageFromFullText(messageId: MessageId): void {
+    if (!this.fts5Available) {
+      return;
+    }
+    try {
+      this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(messageId);
+    } catch {
+      // Ignore FTS cleanup failures; the source row deletion is authoritative.
+    }
   }
 
   private searchFullText(
@@ -601,6 +641,55 @@ export class ConversationStore {
        LIMIT ?`;
     const rows = this.db.prepare(sql).all(...args) as unknown as MessageSearchRow[];
     return rows.map(toSearchResult);
+  }
+
+  private searchLike(
+    query: string,
+    limit: number,
+    conversationId?: ConversationId,
+    since?: Date,
+    before?: Date,
+  ): MessageSearchResult[] {
+    const plan = buildLikeSearchPlan("content", query);
+    if (plan.terms.length === 0) {
+      return [];
+    }
+
+    const where: string[] = [...plan.where];
+    const args: Array<string | number> = [...plan.args];
+    if (conversationId != null) {
+      where.push("conversation_id = ?");
+      args.push(conversationId);
+    }
+    if (since) {
+      where.push("julianday(created_at) >= julianday(?)");
+      args.push(since.toISOString());
+    }
+    if (before) {
+      where.push("julianday(created_at) < julianday(?)");
+      args.push(before.toISOString());
+    }
+    args.push(limit);
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+         FROM messages
+         ${whereClause}
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(...args) as unknown as MessageRow[];
+
+    return rows.map((row) => ({
+      messageId: row.message_id,
+      conversationId: row.conversation_id,
+      role: row.role,
+      snippet: createFallbackSnippet(row.content, plan.terms),
+      createdAt: new Date(row.created_at),
+      rank: 0,
+    }));
   }
 
   private searchRegex(

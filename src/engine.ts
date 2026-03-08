@@ -18,6 +18,7 @@ import { ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
+import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
 import {
   createDelegatedExpansionGrant,
@@ -513,6 +514,7 @@ export class LcmContextEngine implements ContextEngine {
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
   private migrated = false;
+  private readonly fts5Available: boolean;
   private sessionOperationQueues = new Map<string, Promise<void>>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
@@ -523,9 +525,16 @@ export class LcmContextEngine implements ContextEngine {
     this.config = deps.config;
 
     const db = getLcmConnection(this.config.databasePath);
+    this.fts5Available = getLcmDbFeatures(db).fts5Available;
 
-    this.conversationStore = new ConversationStore(db);
-    this.summaryStore = new SummaryStore(db);
+    this.conversationStore = new ConversationStore(db, { fts5Available: this.fts5Available });
+    this.summaryStore = new SummaryStore(db, { fts5Available: this.fts5Available });
+
+    if (!this.fts5Available) {
+      this.deps.log.warn(
+        "[lcm] FTS5 unavailable in the current Node runtime; full_text search will fall back to LIKE and indexing is disabled",
+      );
+    }
 
     this.assembler = new ContextAssembler(
       this.conversationStore,
@@ -561,7 +570,7 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
     const db = getLcmConnection(this.config.databasePath);
-    runLcmMigrations(db);
+    runLcmMigrations(db, { fts5Available: this.fts5Available });
     this.migrated = true;
   }
 

@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
+import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -239,7 +240,14 @@ function toLargeFileRecord(row: LargeFileRow): LargeFileRecord {
 // ── SummaryStore ──────────────────────────────────────────────────────────────
 
 export class SummaryStore {
-  constructor(private db: DatabaseSync) {}
+  private readonly fts5Available: boolean;
+
+  constructor(
+    private db: DatabaseSync,
+    options?: { fts5Available?: boolean },
+  ) {
+    this.fts5Available = options?.fts5Available ?? true;
+  }
 
   // ── Summary CRUD ──────────────────────────────────────────────────────────
 
@@ -305,17 +313,6 @@ export class SummaryStore {
         sourceMessageTokenCount,
       );
 
-    // Index in FTS5 as best-effort; compaction flow must continue even if
-    // FTS indexing fails for any reason.
-    try {
-      this.db
-        .prepare(`INSERT INTO summaries_fts(summary_id, content) VALUES (?, ?)`)
-        .run(input.summaryId, input.content);
-    } catch {
-      // FTS indexing failed — search won't find this summary but
-      // compaction and assembly will still work correctly.
-    }
-
     const row = this.db
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
@@ -324,6 +321,21 @@ export class SummaryStore {
        FROM summaries WHERE summary_id = ?`,
       )
       .get(input.summaryId) as unknown as SummaryRow;
+
+    // Index in FTS5 as best-effort; compaction flow must continue even if
+    // FTS indexing fails for any reason.
+    if (!this.fts5Available) {
+      return toSummaryRecord(row);
+    }
+
+    try {
+      this.db
+        .prepare(`INSERT INTO summaries_fts(summary_id, content) VALUES (?, ?)`)
+        .run(input.summaryId, input.content);
+    } catch {
+      // FTS indexing failed — search won't find this summary but
+      // compaction and assembly will still work correctly.
+    }
 
     return toSummaryRecord(row);
   }
@@ -685,13 +697,26 @@ export class SummaryStore {
     const limit = input.limit ?? 50;
 
     if (input.mode === "full_text") {
-      return this.searchFullText(
-        input.query,
-        limit,
-        input.conversationId,
-        input.since,
-        input.before,
-      );
+      if (this.fts5Available) {
+        try {
+          return this.searchFullText(
+            input.query,
+            limit,
+            input.conversationId,
+            input.since,
+            input.before,
+          );
+        } catch {
+          return this.searchLike(
+            input.query,
+            limit,
+            input.conversationId,
+            input.since,
+            input.before,
+          );
+        }
+      }
+      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before);
     }
     return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
   }
@@ -733,6 +758,57 @@ export class SummaryStore {
        LIMIT ?`;
     const rows = this.db.prepare(sql).all(...args) as unknown as SummarySearchRow[];
     return rows.map(toSearchResult);
+  }
+
+  private searchLike(
+    query: string,
+    limit: number,
+    conversationId?: number,
+    since?: Date,
+    before?: Date,
+  ): SummarySearchResult[] {
+    const plan = buildLikeSearchPlan("content", query);
+    if (plan.terms.length === 0) {
+      return [];
+    }
+
+    const where: string[] = [...plan.where];
+    const args: Array<string | number> = [...plan.args];
+    if (conversationId != null) {
+      where.push("conversation_id = ?");
+      args.push(conversationId);
+    }
+    if (since) {
+      where.push("julianday(created_at) >= julianday(?)");
+      args.push(since.toISOString());
+    }
+    if (before) {
+      where.push("julianday(created_at) < julianday(?)");
+      args.push(before.toISOString());
+    }
+    args.push(limit);
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+                earliest_at, latest_at, descendant_count, descendant_token_count,
+                source_message_token_count, created_at
+         FROM summaries
+         ${whereClause}
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(...args) as unknown as SummaryRow[];
+
+    return rows.map((row) => ({
+      summaryId: row.summary_id,
+      conversationId: row.conversation_id,
+      kind: row.kind,
+      snippet: createFallbackSnippet(row.content, plan.terms),
+      createdAt: new Date(row.created_at),
+      rank: 0,
+    }));
   }
 
   private searchRegex(

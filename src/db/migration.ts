@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { getLcmDbFeatures } from "./features.js";
 
 type SummaryColumnInfo = {
   name?: string;
@@ -354,7 +355,10 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
   }
 }
 
-export function runLcmMigrations(db: DatabaseSync): void {
+export function runLcmMigrations(
+  db: DatabaseSync,
+  options?: { fts5Available?: boolean },
+): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -491,6 +495,11 @@ export function runLcmMigrations(db: DatabaseSync): void {
   ensureSummaryMetadataColumns(db);
   backfillSummaryDepths(db);
   backfillSummaryMetadata(db);
+
+  const fts5Available = options?.fts5Available ?? getLcmDbFeatures(db).fts5Available;
+  if (!fts5Available) {
+    return;
+  }
 
   // FTS5 virtual tables for full-text search (cannot use IF NOT EXISTS, so check manually)
   const hasFts = db
