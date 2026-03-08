@@ -190,6 +190,27 @@ function reasoningBlockFromPart(part: MessagePartRecord, rawType?: string): unkn
   return { type };
 }
 
+/**
+ * Detect if a raw block is an OpenClaw-normalised OpenAI reasoning item.
+ * OpenClaw converts OpenAI `{type:"reasoning", id:"rs_…", encrypted_content:"…"}`
+ * into `{type:"thinking", thinking:"", thinkingSignature:"{…}"}`.
+ * When we reassemble for the OpenAI provider we need the original back.
+ */
+function tryRestoreOpenAIReasoning(raw: Record<string, unknown>): Record<string, unknown> | null {
+  if (raw.type !== "thinking") return null;
+  const sig = raw.thinkingSignature;
+  if (typeof sig !== "string" || !sig.startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(sig) as Record<string, unknown>;
+    if (parsed.type === "reasoning" && typeof parsed.id === "string") {
+      return parsed;
+    }
+  } catch {
+    // not valid JSON — leave as-is
+  }
+  return null;
+}
+
 function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
   const type =
     rawType === "function_call" ||
@@ -285,6 +306,10 @@ function toRuntimeRole(
 function blockFromPart(part: MessagePartRecord): unknown {
   const metadata = getPartMetadata(part);
   if (metadata.raw && typeof metadata.raw === "object") {
+    // If this is an OpenClaw-normalised OpenAI reasoning block, restore the original
+    // OpenAI format so the Responses API gets the {type:"reasoning", id:"rs_…"} it expects.
+    const restored = tryRestoreOpenAIReasoning(metadata.raw as Record<string, unknown>);
+    if (restored) return restored;
     return metadata.raw;
   }
 
