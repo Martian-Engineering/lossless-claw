@@ -24,6 +24,8 @@
     "LICENSE"
   ],
   "dependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
     "@sinclair/typebox": "0.34.48"
   },
   "devDependencies": {
@@ -31,9 +33,7 @@
     "vitest": "^3.0.0"
   },
   "peerDependencies": {
-    "openclaw": "*",
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-ai": "*"
+    "openclaw": "*"
   },
   "openclaw": {
     "extensions": [
