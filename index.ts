@@ -667,11 +667,23 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           return { content: [] };
         }
 
+        // When runtimeConfig is undefined (e.g. resolveLargeFileTextSummarizer
+        // passes legacyParams without config), fall back to the plugin API so
+        // provider-level baseUrl/headers/apiKey are always resolvable.
+        let effectiveRuntimeConfig = runtimeConfig;
+        if (!isRecord(effectiveRuntimeConfig)) {
+          try {
+            effectiveRuntimeConfig = api.runtime.config.loadConfig();
+          } catch {
+            // loadConfig may not be available in all contexts; leave undefined.
+          }
+        }
+
         const knownModel =
           typeof mod.getModel === "function" ? mod.getModel(providerId, modelId) : undefined;
         const fallbackApi =
           providerApi?.trim() ||
-          resolveProviderApiFromRuntimeConfig(runtimeConfig, providerId) ||
+          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
           (() => {
             if (typeof mod.getModels !== "function") {
               return undefined;
@@ -685,6 +697,21 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           })() ||
           inferApiFromProvider(providerId);
 
+        // Resolve provider-level config (baseUrl, headers, etc.) from runtime config.
+        // Custom/proxy providers (e.g. bailian, local proxies) store their baseUrl and
+        // apiKey under models.providers.<provider> in openclaw.json.  Without this
+        // lookup the resolved model object lacks baseUrl, which crashes pi-ai's
+        // detectCompat() ("Cannot read properties of undefined (reading 'includes')"),
+        // and the apiKey is unresolvable, causing 401 errors.  See #19.
+        const providerLevelConfig: Record<string, unknown> = (() => {
+          if (!isRecord(effectiveRuntimeConfig)) return {};
+          const providers = (effectiveRuntimeConfig as { models?: { providers?: Record<string, unknown> } })
+            .models?.providers;
+          if (!providers) return {};
+          const cfg = findProviderConfigValue(providers, providerId);
+          return isRecord(cfg) ? cfg : {};
+        })();
+
         const resolvedModel =
           isRecord(knownModel) &&
           typeof knownModel.api === "string" &&
@@ -695,6 +722,18 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 id: knownModel.id,
                 provider: knownModel.provider,
                 api: knownModel.api,
+                // Merge baseUrl/headers from provider config if not already on the model.
+                // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
+                // baseUrl is undefined.
+                baseUrl:
+                  typeof knownModel.baseUrl === "string"
+                    ? knownModel.baseUrl
+                    : typeof providerLevelConfig.baseUrl === "string"
+                      ? providerLevelConfig.baseUrl
+                      : "",
+                ...(knownModel.headers == null && isRecord(providerLevelConfig.headers)
+                  ? { headers: providerLevelConfig.headers }
+                  : {}),
               }
             : {
                 id: modelId,
@@ -711,6 +750,14 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 },
                 contextWindow: 200_000,
                 maxTokens: 8_000,
+                // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
+                // baseUrl is undefined.
+                baseUrl: typeof providerLevelConfig.baseUrl === "string"
+                  ? providerLevelConfig.baseUrl
+                  : "",
+                ...(isRecord(providerLevelConfig.headers)
+                  ? { headers: providerLevelConfig.headers }
+                  : {}),
               };
 
         let resolvedApiKey = apiKey?.trim() || resolveApiKey(providerId, readEnv);
@@ -722,10 +769,25 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             provider: providerId,
             authProfileId,
             agentDir,
-            runtimeConfig,
+            runtimeConfig: effectiveRuntimeConfig,
             piAiModule: mod,
             envSnapshot,
           });
+        }
+        // Fallback: read apiKey from models.providers config (e.g. proxy providers
+        // with keys like "not-needed-for-cli-proxy").
+        if (!resolvedApiKey && isRecord(effectiveRuntimeConfig)) {
+          const providers = (effectiveRuntimeConfig as { models?: { providers?: Record<string, unknown> } })
+            .models?.providers;
+          if (providers) {
+            const providerCfg = findProviderConfigValue(providers, providerId);
+            if (isRecord(providerCfg) && typeof providerCfg.apiKey === "string") {
+              const cfgKey = providerCfg.apiKey.trim();
+              if (cfgKey) {
+                resolvedApiKey = cfgKey;
+              }
+            }
+          }
         }
 
         const completeOptions = buildCompleteSimpleOptions({
