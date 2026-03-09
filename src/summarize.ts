@@ -672,8 +672,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       : undefined;
   const providerApi = resolveProviderApiFromLegacyConfig(params.legacyParams.config, provider);
 
-  const apiKey = params.deps.getApiKey(provider, model);
-
   const condensedTargetTokens =
     Number.isFinite(params.deps.config.condensedTargetTokens) &&
     params.deps.config.condensedTargetTokens > 0
@@ -691,6 +689,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
     const mode: SummaryMode = aggressive ? "aggressive" : "normal";
     const isCondensed = options?.isCondensed === true;
+    const apiKey = await params.deps.getApiKey(provider, model, {
+      profileId: authProfileId,
+    });
     const targetTokens = resolveTargetTokens({
       inputTokens: estimateTokens(text),
       mode,

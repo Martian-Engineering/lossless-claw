@@ -28,6 +28,10 @@ function buildApi(pluginConfig: Record<string, unknown>): {
         getSession: vi.fn(),
         deleteSession: vi.fn(),
       },
+      modelAuth: {
+        getApiKeyForModel: vi.fn(async () => undefined),
+        resolveApiKeyForProvider: vi.fn(async () => undefined),
+      },
       config: {
         loadConfig: vi.fn(() => ({})),
       },

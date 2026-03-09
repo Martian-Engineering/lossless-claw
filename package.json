@@ -23,6 +23,9 @@
     "README.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "vitest run --dir test"
+  },
   "dependencies": {
     "@mariozechner/pi-agent-core": "*",
     "@mariozechner/pi-ai": "*",
