@@ -264,6 +264,9 @@ function buildMessageParts(params: {
     safeString(topLevel.tool_use_id) ??
     safeString(topLevel.call_id) ??
     safeString(topLevel.id);
+  const topLevelToolName =
+    safeString(topLevel.toolName) ??
+    safeString(topLevel.tool_name);
 
   // BashExecutionMessage: preserve a synthetic text part so output is round-trippable.
   if (!("content" in message) && "command" in message && "output" in message) {
@@ -351,7 +354,8 @@ function buildMessageParts(params: {
       toolName:
         safeString(metadataRecord?.name) ??
         safeString(metadataRecord?.toolName) ??
-        safeString(metadataRecord?.tool_name),
+        safeString(metadataRecord?.tool_name) ??
+        topLevelToolName,
       toolInput:
         metadataRecord?.input !== undefined
           ? toJson(metadataRecord.input)

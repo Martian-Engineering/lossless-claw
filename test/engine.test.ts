@@ -1090,6 +1090,58 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect((assembledMessage.content as Array<{ type?: string }>)[0]?.type).toBe("tool_result");
   });
 
+  it("preserves toolName through ingest-assemble round-trip for Gemini compatibility", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_456", name: "bash", input: { command: "ls" } }],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_456",
+        toolName: "bash",
+        content: [{ type: "text", text: "file1.txt\nfile2.txt" }],
+        isError: false,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const parts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(parts[0].toolName).toBe("bash");
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const result = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      toolName?: string;
+      isError?: boolean;
+    };
+    expect(result.role).toBe("toolResult");
+    expect(result.toolCallId).toBe("call_456");
+    expect(result.toolName).toBe("bash");
+    expect(result.isError).toBe(false);
+  });
+
   it("reconstructs OpenAI reasoning and function call blocks when raw metadata is missing", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();

@@ -262,6 +262,10 @@ function toolResultBlockFromPart(part: MessagePartRecord, rawType?: string): unk
   const output = parseStoredValue(part.toolOutput) ?? part.textContent ?? "";
   const block: Record<string, unknown> = { type, output };
 
+  if (typeof part.toolName === "string" && part.toolName.length > 0) {
+    block.name = part.toolName;
+  }
+
   if (type === "function_call_output") {
     if (typeof part.toolCallId === "string" && part.toolCallId.length > 0) {
       block.call_id = part.toolCallId;
@@ -406,6 +410,31 @@ function pickToolCallId(parts: MessagePartRecord[]): string | undefined {
     const maybeSnake = (raw as { tool_call_id?: unknown }).tool_call_id;
     if (typeof maybeSnake === "string" && maybeSnake.length > 0) {
       return maybeSnake;
+    }
+  }
+  return undefined;
+}
+
+function pickToolName(parts: MessagePartRecord[]): string | undefined {
+  for (const part of parts) {
+    if (typeof part.toolName === "string" && part.toolName.length > 0) {
+      return part.toolName;
+    }
+    const decoded = parseJson(part.metadata);
+    if (!decoded || typeof decoded !== "object") {
+      continue;
+    }
+    const raw = (decoded as { raw?: unknown }).raw;
+    if (!raw || typeof raw !== "object") {
+      continue;
+    }
+    const maybe = (raw as { name?: unknown }).name;
+    if (typeof maybe === "string" && maybe.length > 0) {
+      return maybe;
+    }
+    const maybeCamel = (raw as { toolName?: unknown }).toolName;
+    if (typeof maybeCamel === "string" && maybeCamel.length > 0) {
+      return maybeCamel;
     }
   }
   return undefined;
@@ -674,12 +703,14 @@ export class ContextAssembler {
 
     const parts = await this.conversationStore.getMessageParts(msg.messageId);
     const roleFromStore = toRuntimeRole(msg.role, parts);
-    const toolCallId = roleFromStore === "toolResult" ? pickToolCallId(parts) : undefined;
+    const isToolResult = roleFromStore === "toolResult";
+    const toolCallId = isToolResult ? pickToolCallId(parts) : undefined;
+    const toolName = isToolResult ? (pickToolName(parts) ?? "unknown") : undefined;
     // Tool results without a call id cannot be serialized for Anthropic-compatible APIs.
     // This happens for legacy/bootstrap rows that have role=tool but no message_parts.
     // Preserve the text by degrading to assistant content instead of emitting invalid toolResult.
     const role: "user" | "assistant" | "toolResult" =
-      roleFromStore === "toolResult" && !toolCallId ? "assistant" : roleFromStore;
+      isToolResult && !toolCallId ? "assistant" : roleFromStore;
     const content = contentFromParts(parts, role, msg.content);
     const contentText =
       typeof content === "string" ? content : (JSON.stringify(content) ?? msg.content);
@@ -713,6 +744,8 @@ export class ContextAssembler {
               role,
               content,
               ...(toolCallId ? { toolCallId } : {}),
+              ...(toolName ? { toolName } : {}),
+              ...(role === "toolResult" ? { isError: false } : {}),
             } as AgentMessage),
       tokens: tokenCount,
       isMessage: true,
