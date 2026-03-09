@@ -116,9 +116,16 @@ function resolveApiKey(provider: string, readEnv: ReadEnvFn): string | undefined
   return undefined;
 }
 
+/** A SecretRef pointing to a value inside secrets.json via a nested path. */
+type SecretRef = {
+  source?: string;
+  provider?: string;
+  id: string;
+};
+
 type AuthProfileCredential =
-  | { type: "api_key"; provider: string; key?: string; email?: string }
-  | { type: "token"; provider: string; token?: string; expires?: number; email?: string }
+  | { type: "api_key"; provider: string; key?: string; keyRef?: SecretRef; email?: string }
+  | { type: "token"; provider: string; token?: string; tokenRef?: SecretRef; expires?: number; email?: string }
   | ({
       type: "oauth";
       provider: string;
@@ -413,6 +420,46 @@ function resolveAuthProfileCandidates(params: {
   return candidates;
 }
 
+/**
+ * Resolve a SecretRef (tokenRef/keyRef) to a credential string.
+ *
+ * OpenClaw's auth-profiles support a level of indirection: instead of storing
+ * the raw API key or token inline, a credential can reference it via a
+ * SecretRef. Two resolution strategies are supported:
+ *
+ * 1. `source: "env"` — read the value from an environment variable whose
+ *    name is `ref.id` (e.g. `{ source: "env", id: "ANTHROPIC_API_KEY" }`).
+ *
+ * 2. File-based (default) — `ref.id` is a slash-delimited path into
+ *    `~/.openclaw/secrets.json` (e.g. `{ id: "/auth/anthropic_oat_primary" }`
+ *    resolves to `secrets.auth.anthropic_oat_primary`).
+ */
+function resolveSecretRef(ref: SecretRef | undefined, home: string): string | undefined {
+  if (!ref?.id) return undefined;
+
+  // source: env — read directly from environment variable
+  if (ref.source === "env") {
+    const val = process.env[ref.id]?.trim();
+    return val || undefined;
+  }
+
+  // File-based (source: "file" or unset) — read from secrets.json
+  try {
+    const secretsPath = join(home, ".openclaw", "secrets.json");
+    const raw = readFileSync(secretsPath, "utf8");
+    const secrets = JSON.parse(raw) as Record<string, unknown>;
+    const parts = ref.id.replace(/^\//, "").split("/");
+    let current: unknown = secrets;
+    for (const part of parts) {
+      if (!current || typeof current !== "object") return undefined;
+      current = (current as Record<string, unknown>)[part];
+    }
+    return typeof current === "string" && current.trim() ? current.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Resolve OAuth/api-key/token credentials from auth-profiles store. */
 async function resolveApiKeyFromAuthProfiles(params: {
   provider: string;
@@ -467,7 +514,9 @@ async function resolveApiKeyFromAuthProfiles(params: {
     }
 
     if (credential.type === "api_key") {
-      const key = credential.key?.trim();
+      const key =
+        credential.key?.trim() ||
+        resolveSecretRef(credential.keyRef, params.envSnapshot.home);
       if (key) {
         return key;
       }
@@ -475,7 +524,9 @@ async function resolveApiKeyFromAuthProfiles(params: {
     }
 
     if (credential.type === "token") {
-      const token = credential.token?.trim();
+      const token =
+        credential.token?.trim() ||
+        resolveSecretRef(credential.tokenRef, params.envSnapshot.home);
       if (!token) {
         continue;
       }
