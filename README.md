@@ -2,6 +2,15 @@
 
 Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://papers.voltropy.com/LCM). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
 
+## Table of contents
+
+- [What it does](#what-it-does)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Documentation](#documentation)
+- [Development](#development)
+- [License](#license)
+
 ## What it does
 
 Two ways to learn: read the below, or [check out this super cool animated visualization](https://losslesscontext.ai).
@@ -18,7 +27,7 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 **It feels like talking to an agent that never forgets. Because it doesn't. In normal operation, you'll never need to think about compaction again.**
 
-## Installation
+## Quick start
 
 ### Prerequisites
 
@@ -67,168 +76,6 @@ If you need to set it manually, ensure the context engine slot points at lossles
 ```
 
 Restart OpenClaw after configuration changes.
-
-### Optional: enable FTS5 for fast full-text search
-
-`lossless-claw` works without FTS5 as of the current release. When FTS5 is unavailable in the
-Node runtime that runs the OpenClaw gateway, the plugin:
-
-- keeps persisting messages and summaries
-- falls back from `"full_text"` search to a slower `LIKE`-based search
-- loses FTS ranking/snippet quality
-
-If you want native FTS5 search performance and ranking, the **exact Node runtime that runs the
-gateway** must have SQLite FTS5 compiled in.
-
-#### Probe the gateway runtime
-
-Run this with the same `node` binary your gateway uses:
-
-```bash
-node --input-type=module - <<'NODE'
-import { DatabaseSync } from 'node:sqlite';
-const db = new DatabaseSync(':memory:');
-const options = db.prepare('pragma compile_options').all().map((row) => row.compile_options);
-
-console.log(options.filter((value) => value.includes('FTS')).join('\n') || 'no fts compile options');
-
-try {
-  db.exec("CREATE VIRTUAL TABLE t USING fts5(content)");
-  console.log("fts5: ok");
-} catch (err) {
-  console.log("fts5: fail");
-  console.log(err instanceof Error ? err.message : String(err));
-}
-NODE
-```
-
-Expected output:
-
-```text
-ENABLE_FTS5
-fts5: ok
-```
-
-If you get `fts5: fail`, build or install an FTS5-capable Node and point the gateway at that runtime.
-
-#### Build an FTS5-capable Node on macOS
-
-This workflow was verified with Node `v22.15.0`.
-
-```bash
-cd ~/Projects
-git clone --depth 1 --branch v22.15.0 https://github.com/nodejs/node.git node-fts5
-cd node-fts5
-```
-
-Edit `deps/sqlite/sqlite.gyp` and add `SQLITE_ENABLE_FTS5` to the `defines` list for the `sqlite`
-target:
-
-```diff
- 'defines': [
-   'SQLITE_DEFAULT_MEMSTATUS=0',
-+  'SQLITE_ENABLE_FTS5',
-   'SQLITE_ENABLE_MATH_FUNCTIONS',
-   'SQLITE_ENABLE_SESSION',
-   'SQLITE_ENABLE_PREUPDATE_HOOK'
- ],
-```
-
-Important:
-
-- patch `deps/sqlite/sqlite.gyp`, not only `node.gyp`
-- `node:sqlite` uses the embedded SQLite built from `deps/sqlite/sqlite.gyp`
-
-Build the runtime:
-
-```bash
-./configure --prefix="$PWD/out-install"
-make -j8 node
-```
-
-Expose the binary under a Node-compatible basename that OpenClaw recognizes:
-
-```bash
-mkdir -p ~/Projects/node-fts5/bin
-ln -sfn ~/Projects/node-fts5/out/Release/node ~/Projects/node-fts5/bin/node-22.15.0
-```
-
-Use a basename like `node-22.15.0`, `node`, or `nodejs`. Names like
-`node-v22.15.0-fts5` may not be recognized correctly by OpenClaw's CLI/runtime parsing.
-
-Verify the new runtime:
-
-```bash
-~/Projects/node-fts5/bin/node-22.15.0 --version
-~/Projects/node-fts5/bin/node-22.15.0 --input-type=module - <<'NODE'
-import { DatabaseSync } from 'node:sqlite';
-const db = new DatabaseSync(':memory:');
-db.exec("CREATE VIRTUAL TABLE t USING fts5(content)");
-console.log("fts5: ok");
-NODE
-```
-
-#### Point the OpenClaw gateway at that runtime on macOS
-
-Back up the existing LaunchAgent plist first:
-
-```bash
-cp ~/Library/LaunchAgents/ai.openclaw.gateway.plist \
-  ~/Library/LaunchAgents/ai.openclaw.gateway.plist.bak-$(date +%Y%m%d-%H%M%S)
-```
-
-Replace the runtime path, then reload the agent:
-
-```bash
-/usr/libexec/PlistBuddy -c 'Set :ProgramArguments:0 /Users/youruser/Projects/node-fts5/bin/node-22.15.0' \
-  ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-
-launchctl bootout gui/$UID ~/Library/LaunchAgents/ai.openclaw.gateway.plist 2>/dev/null || true
-launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-launchctl kickstart -k gui/$UID/ai.openclaw.gateway
-```
-
-Verify the live runtime:
-
-```bash
-launchctl print gui/$UID/ai.openclaw.gateway | sed -n '1,80p'
-```
-
-You should see:
-
-```text
-program = /Users/youruser/Projects/node-fts5/bin/node-22.15.0
-```
-
-#### Verify `lossless-claw`
-
-Check the logs:
-
-```bash
-tail -n 60 ~/.openclaw/logs/gateway.log
-tail -n 60 ~/.openclaw/logs/gateway.err.log
-```
-
-You want:
-
-- `[gateway] [lcm] Plugin loaded ...`
-- no new `no such module: fts5`
-
-Then force one turn through the gateway and verify the DB fills:
-
-```bash
-/Users/youruser/Projects/node-fts5/bin/node-22.15.0 \
-  /path/to/openclaw/dist/index.js \
-  agent --session-id fts5-smoke --message 'Reply with exactly: ok' --timeout 60
-
-sqlite3 ~/.openclaw/lcm.db '
-  select count(*) as conversations from conversations;
-  select count(*) as messages from messages;
-  select count(*) as summaries from summaries;
-'
-```
-
-Those counts should increase after a real turn.
 
 ## Configuration
 
@@ -332,212 +179,14 @@ For most long-lived LCM setups, a good starting point is:
 }
 ```
 
-## How it works
+## Documentation
 
-See [docs/architecture.md](docs/architecture.md) for the full technical deep-dive. Here's the summary:
-
-### The DAG
-
-LCM builds a directed acyclic graph of summaries:
-
-```
-Raw messages → Leaf summaries (d0) → Condensed (d1) → Condensed (d2) → ...
-```
-
-- **Leaf summaries** (depth 0) are created from chunks of raw messages. They preserve timestamps, decisions, file operations, and key details.
-- **Condensed summaries** (depth 1+) merge multiple summaries at the same depth into a higher-level node. Each depth tier uses a different prompt strategy optimized for its level of abstraction.
-- **Parent links** connect each condensed summary to its source summaries, enabling drill-down via `lcm_expand_query`.
-
-### Context assembly
-
-Each turn, the assembler builds model context by:
-
-1. Fetching the conversation's **context items** (an ordered list of summary and message references)
-2. Resolving each item into an `AgentMessage`
-3. Protecting the **fresh tail** (most recent N messages) from eviction
-4. Filling remaining token budget from oldest to newest, dropping the oldest items first if over budget
-5. Wrapping summaries in XML with metadata (id, depth, timestamps, descendant count)
-
-The model sees something like:
-
-```xml
-<summary id="sum_abc123" kind="condensed" depth="1" descendant_count="8"
-         earliest_at="2026-02-17T07:37:00" latest_at="2026-02-17T15:43:00">
-  <parents>
-    <summary_ref id="sum_def456" />
-    <summary_ref id="sum_ghi789" />
-  </parents>
-  <content>
-    ...summary text...
-  </content>
-</summary>
-```
-
-This gives the model enough information to know what was discussed, when, and how to drill deeper via the expansion tools.
-
-### Compaction triggers
-
-Compaction runs in two modes:
-
-- **Proactive (after each turn):** If raw messages outside the fresh tail exceed `leafChunkTokens`, a leaf pass runs. If `incrementalMaxDepth != 0`, condensation follows (cascading to the configured depth, or unlimited with `-1`).
-- **Reactive (overflow/manual):** When total context exceeds `contextThreshold × tokenBudget`, a full sweep runs: all eligible leaf chunks are compacted, then condensation proceeds depth-by-depth until stable.
-
-### Depth-aware prompts
-
-Each summary depth gets a tailored prompt:
-
-| Depth | Kind | Strategy |
-|-------|------|----------|
-| 0 | Leaf | Narrative with timestamps, file tracking, preserves operational detail |
-| 1 | Condensed | Chronological session summary, deduplicates against `previous_context` |
-| 2 | Condensed | Arc-focused: goals, outcomes, what carries forward. Self-contained. |
-| 3+ | Condensed | Durable context only: key decisions, relationships, lessons learned |
-
-All summaries end with an "Expand for details about:" footer listing what was compressed, guiding agents on when to use `lcm_expand_query`.
-
-### Large file handling
-
-Files over `largeFileTokenThreshold` (default 25k tokens) embedded in messages are intercepted during ingestion:
-
-1. Content is stored to `~/.openclaw/lcm-files/<conversation_id>/<file_id>.<ext>`
-2. A ~200 token exploration summary replaces the file in the message
-3. The `lcm_describe` tool can retrieve the full file content on demand
-
-This prevents large file pastes from consuming the entire context window.
-
-## Agent tools
-
-LCM registers four tools that agents can use to search and recall compacted history:
-
-### `lcm_grep`
-
-Full-text and regex search across messages and summaries.
-
-```
-lcm_grep(pattern: "database migration", mode: "full_text")
-lcm_grep(pattern: "config\\.threshold", mode: "regex", scope: "summaries")
-```
-
-Parameters:
-- `pattern` — Search string (regex or full-text)
-- `mode` — `"regex"` (default) or `"full_text"`
-- `scope` — `"messages"`, `"summaries"`, or `"both"` (default)
-- `conversationId` — Scope to a specific conversation
-- `allConversations` — Search across all conversations
-- `since` / `before` — ISO timestamp filters
-- `limit` — Max results (default 50, max 200)
-
-### `lcm_describe`
-
-Inspect a specific summary or stored file by ID.
-
-```
-lcm_describe(id: "sum_abc123")
-lcm_describe(id: "file_def456")
-```
-
-Returns the full content, metadata, parent/child relationships, and token counts. For files, returns the stored content.
-
-### `lcm_expand_query`
-
-Deep recall via delegated sub-agent. Finds relevant summaries, expands them by walking the DAG down to source material, and answers a focused question.
-
-```
-lcm_expand_query(
-  query: "database migration",
-  prompt: "What migration strategy was decided on?"
-)
-
-lcm_expand_query(
-  summaryIds: ["sum_abc123"],
-  prompt: "What were the exact config changes?"
-)
-```
-
-Parameters:
-- `prompt` — The question to answer (required)
-- `query` — Text query to find relevant summaries (when you don't have IDs)
-- `summaryIds` — Specific summary IDs to expand (when you have them)
-- `maxTokens` — Answer length cap (default 2000)
-- `conversationId` / `allConversations` — Scope control
-
-Returns a compact answer with cited summary IDs.
-
-### `lcm_expand`
-
-Low-level DAG expansion (sub-agent only). Main agents should use `lcm_expand_query` instead; this tool is available to delegated sub-agents spawned by `lcm_expand_query`.
-
-## TUI
-
-The repo includes an interactive terminal UI (`tui/`) for inspecting, repairing, and managing the LCM database. It's a separate Go binary — not part of the npm package.
-
-### Install
-
-**From GitHub releases** (recommended):
-
-Download the latest binary for your platform from [Releases](https://github.com/Martian-Engineering/lossless-claw/releases).
-
-**Build from source:**
-
-```bash
-cd tui
-go build -o lcm-tui .
-# or: make build
-# or: go install github.com/Martian-Engineering/lossless-claw/tui@latest
-```
-
-Requires Go 1.24+.
-
-### Usage
-
-```bash
-lcm-tui [--db path/to/lcm.db] [--sessions path/to/sessions/dir]
-```
-
-Defaults to `~/.openclaw/lcm.db` and auto-discovers session directories.
-
-### Features
-
-- **Conversation browser** — List all conversations with message/summary counts and token totals
-- **Summary DAG view** — Navigate the full summary hierarchy with depth, kind, token counts, and parent/child relationships
-- **Context view** — See exactly what the model sees: ordered context items with token breakdowns (summaries + fresh tail messages)
-- **Dissolve** — Surgically restore a condensed summary back to its parent summaries (with ordinal shift preview)
-- **Rewrite** — Re-summarize nodes using actual OpenClaw prompts with scrollable diffs and auto-accept mode
-- **Repair** — Fix corrupted summaries (fallback truncations, empty content) using proper LLM summarization
-- **Transplant** — Deep-copy summary DAGs between conversations (preserves all messages, message_parts, summary_messages)
-- **Previous context viewer** — Inspect the `previous_context` text used during summarization
-
-### Keybindings
-
-| Key | Action |
-|-----|--------|
-| `c` | Context view (from conversation list) |
-| `s` | Summary DAG view |
-| `d` | Dissolve a condensed summary |
-| `r` | Rewrite a summary |
-| `R` | Repair corrupted summaries |
-| `t` | Transplant summaries between conversations |
-| `p` | View previous_context |
-| `Enter` | Expand/select |
-| `Esc`/`q` | Back/quit |
-
-## Database
-
-LCM uses SQLite via Node's built-in `node:sqlite` module. The default database path is `~/.openclaw/lcm.db`.
-
-### Schema overview
-
-- **conversations** — Maps session IDs to conversation IDs
-- **messages** — Every ingested message with role, content, token count, timestamps
-- **message_parts** — Structured content blocks (text, tool calls, reasoning, files) linked to messages
-- **summaries** — The summary DAG nodes with content, depth, kind, token counts, timestamps
-- **summary_messages** — Links leaf summaries to their source messages
-- **summary_parents** — Links condensed summaries to their parent summaries
-- **context_items** — The ordered context list for each conversation (what the model sees)
-- **large_files** — Metadata for intercepted large files
-- **expansion_grants** — Delegation grants for sub-agent expansion queries
-
-Migrations run automatically on first use. The schema is forward-compatible; new columns are added with defaults.
+- [Configuration guide](docs/configuration.md)
+- [Architecture](docs/architecture.md)
+- [Agent tools](docs/agent-tools.md)
+- [TUI Reference](docs/tui.md)
+- [lcm-tui](tui/README.md)
+- [Optional: enable FTS5 for fast full-text search](docs/fts5.md)
 
 ## Development
 
