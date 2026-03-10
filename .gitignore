@@ -8,3 +8,4 @@ dist/
 tui/lcm-tui
 dist/
 tui/tui
+pnpm-lock.yaml

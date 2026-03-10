@@ -1,4 +1,5 @@
 import type { LcmDependencies } from "./types.js";
+import { calculateTokens } from "./token-utils.js";
 
 export type LcmSummarizeOptions = {
   previousSummary?: string;
@@ -78,11 +79,6 @@ function resolveProviderApiFromLegacyConfig(
     }
   }
   return undefined;
-}
-
-/** Approximate token estimate used for target-sizing prompts. */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
 }
 
 /** Narrow unknown values to plain object records. */
@@ -693,7 +689,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       profileId: authProfileId,
     });
     const targetTokens = resolveTargetTokens({
-      inputTokens: estimateTokens(text),
+      inputTokens: calculateTokens(text, params.deps.config.useTokenizer, params.deps.tokenizer),
       mode,
       isCondensed,
       condensedTargetTokens,

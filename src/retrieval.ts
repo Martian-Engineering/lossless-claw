@@ -9,6 +9,8 @@ import type {
   SummarySearchResult,
   LargeFileRecord,
 } from "./store/summary-store.js";
+import type { TokenizerService } from "./types.js";
+import { calculateTokens } from "./token-utils.js";
 
 // ── Public interfaces ────────────────────────────────────────────────────────
 
@@ -107,19 +109,14 @@ export interface ExpandResult {
   truncated: boolean;
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Rough token estimate: ~4 chars per token. */
-function estimateTokens(content: string): number {
-  return Math.ceil(content.length / 4);
-}
-
 // ── RetrievalEngine ──────────────────────────────────────────────────────────
 
 export class RetrievalEngine {
   constructor(
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
+    private useTokenizer?: boolean,
+    private tokenizer?: TokenizerService,
   ) {}
 
   // ── describe ─────────────────────────────────────────────────────────────
@@ -337,7 +334,7 @@ export class RetrievalEngine {
           continue;
         }
 
-        const tokenCount = msg.tokenCount || estimateTokens(msg.content);
+        const tokenCount = msg.tokenCount || calculateTokens(msg.content, this.useTokenizer, this.tokenizer);
 
         if (result.estimatedTokens + tokenCount > tokenCap) {
           result.truncated = true;

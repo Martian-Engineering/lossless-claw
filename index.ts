@@ -13,7 +13,8 @@ import { createLcmDescribeTool } from "./src/tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "./src/tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "./src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "./src/tools/lcm-grep-tool.js";
-import type { LcmDependencies } from "./src/types.js";
+import type { LcmDependencies, TokenizerService } from "./src/types.js";
+import { HuggingFaceTokenizer } from "./src/tokenizers/huggingface.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
@@ -1262,6 +1263,13 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       error: (msg) => api.logger.error(msg),
       debug: (msg) => api.logger.debug?.(msg),
     },
+    tokenizer: config.useTokenizer
+      ? (() => {
+          const t = new HuggingFaceTokenizer(envSnapshot.openclawDefaultModel || "glm-5", config.proxy);
+          api.logger.info(`[lcm] Tokenizer created (model=${envSnapshot.openclawDefaultModel || "glm-5"}, proxy=${config.proxy || "none"})`);
+          return t;
+        })()
+      : undefined,
   };
 }
 
@@ -1317,7 +1325,7 @@ const lcmPlugin = {
     );
 
     api.logger.info(
-      `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
+      `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold}, useTokenizer=${deps.config.useTokenizer}${deps.config.proxy ? `, proxy=${deps.config.proxy}` : ""})`,
     );
   },
 };

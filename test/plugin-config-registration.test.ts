@@ -139,7 +139,7 @@ describe("lcm plugin registration", () => {
       largeFileTokenThreshold: 12345,
     });
     expect(infoLog).toHaveBeenCalledWith(
-      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
+      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, useTokenizer=false)`,
     );
   });
 
