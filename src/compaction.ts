@@ -86,7 +86,7 @@ function estimateTokens(content: string): number {
 }
 
 /** Format a timestamp as `YYYY-MM-DD HH:mm TZ` for prompt source text. */
-function formatTimestamp(value: Date, timezone: string = "UTC"): string {
+export function formatTimestamp(value: Date, timezone: string = "UTC"): string {
   try {
     const fmt = new Intl.DateTimeFormat("en-CA", {
       timeZone: timezone,

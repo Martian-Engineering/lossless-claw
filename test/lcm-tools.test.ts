@@ -145,8 +145,12 @@ describe("LCM tools session scoping", () => {
     expect((result.details as { expansionCount?: number }).expansionCount).toBe(1);
   });
 
-  it("lcm_grep forwards since/before and includes ISO timestamps in text output", async () => {
+  it("lcm_grep forwards since/before and includes local timestamps in text output", async () => {
     const createdAt = new Date("2026-01-03T00:00:00.000Z");
+    // Import formatTimestamp to generate expected output
+    const { formatTimestamp } = await import("../src/compaction.js");
+    const timezone = "UTC"; // Test environment uses UTC
+    const expectedTimestamp = formatTimestamp(createdAt, timezone);
     const retrieval = {
       grep: vi.fn(async () => ({
         messages: [
@@ -184,7 +188,7 @@ describe("LCM tools session scoping", () => {
         before: expect.any(Date),
       }),
     );
-    expect((result.content[0] as { text: string }).text).toContain(createdAt.toISOString());
+    expect((result.content[0] as { text: string }).text).toContain(expectedTimestamp);
   });
 
   it("lcm_describe blocks cross-conversation lookup unless allConversations=true", async () => {
