@@ -99,3 +99,5 @@
 {"type":"close","timestamp":"2026-03-10T07:38:21.356547Z","issue_id":"lossless-claw-2dc.3","payload":{}}
 {"type":"status_update","timestamp":"2026-03-10T07:38:21.398683Z","issue_id":"lossless-claw-2dc","payload":{"status":"in_progress"}}
 {"type":"comment","timestamp":"2026-03-10T07:38:21.439666Z","issue_id":"lossless-claw-2dc","payload":{"body":"Repo-side release workflow scaffolding is implemented and validated locally. Remaining work requires maintainer action outside the repo: configure npm trusted publishing for .github/workflows/publish.yml, optionally add a protected GitHub Environment, and then exercise the first release through the manual publish workflow."}}
+{"type":"comment","timestamp":"2026-03-10T19:46:41.040536Z","issue_id":"lossless-claw-2dc","payload":{"body":"Maintainer completed the external setup: npm trusted publisher configured, GitHub environment npm-publish created, required reviewer set to Josh, self-review remains allowed."}}
+{"type":"close","timestamp":"2026-03-10T19:46:41.088577Z","issue_id":"lossless-claw-2dc","payload":{}}
