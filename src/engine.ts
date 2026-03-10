@@ -60,6 +60,10 @@ function safeString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function safeBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
 function appendTextValue(value: unknown, out: string[]): void {
   if (typeof value === "string") {
     out.push(value);
@@ -264,6 +268,12 @@ function buildMessageParts(params: {
     safeString(topLevel.tool_use_id) ??
     safeString(topLevel.call_id) ??
     safeString(topLevel.id);
+  const topLevelToolName =
+    safeString(topLevel.toolName) ??
+    safeString(topLevel.tool_name);
+  const topLevelIsError =
+    safeBoolean(topLevel.isError) ??
+    safeBoolean(topLevel.is_error);
 
   // BashExecutionMessage: preserve a synthetic text part so output is round-trippable.
   if (!("content" in message) && "command" in message && "output" in message) {
@@ -307,6 +317,9 @@ function buildMessageParts(params: {
         textContent: message.content,
         metadata: toJson({
           originalRole: role,
+          toolCallId: topLevelToolCallId,
+          toolName: topLevelToolName,
+          isError: topLevelIsError,
         }),
       },
     ];
@@ -351,7 +364,8 @@ function buildMessageParts(params: {
       toolName:
         safeString(metadataRecord?.name) ??
         safeString(metadataRecord?.toolName) ??
-        safeString(metadataRecord?.tool_name),
+        safeString(metadataRecord?.tool_name) ??
+        topLevelToolName,
       toolInput:
         metadataRecord?.input !== undefined
           ? toJson(metadataRecord.input)
@@ -368,6 +382,9 @@ function buildMessageParts(params: {
             : (safeString(metadataRecord?.tool_output) ?? null),
       metadata: toJson({
         originalRole: role,
+        toolCallId: topLevelToolCallId,
+        toolName: topLevelToolName,
+        isError: topLevelIsError,
         rawType: block.type,
         raw: metadataRecord ?? message.content[ordinal],
       }),
@@ -563,6 +580,12 @@ export class LcmContextEngine implements ContextEngine {
   };
 
   private config: LcmConfig;
+
+  /** Get the configured timezone, falling back to system timezone. */
+  get timezone(): string {
+    return this.config.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+  }
+
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
   private assembler: ContextAssembler;

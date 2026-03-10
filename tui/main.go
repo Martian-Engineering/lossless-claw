@@ -2118,7 +2118,7 @@ func renderConversationText(messages []sessionMessage, width int) string {
 			header = strings.ToUpper(msg.role)
 		}
 
-		body := msg.text
+		body := conversationMessageDisplayText(msg)
 		if strings.TrimSpace(body) == "" {
 			body = "(no text content)"
 		}
@@ -2129,6 +2129,39 @@ func renderConversationText(messages []sessionMessage, width int) string {
 		chunks = append(chunks, styledHeader+"\n"+styledBody)
 	}
 	return strings.Join(chunks, "\n\n")
+}
+
+const (
+	conversationDisplayMaxCharsDefault = 32_000
+	conversationDisplayMaxCharsTool    = 8_000
+)
+
+// conversationMessageDisplayText caps oversized message bodies for terminal rendering.
+// Large tool outputs dominate viewport wrap/render time, so the TUI shows a truncated
+// preview while leaving the stored conversation data untouched.
+func conversationMessageDisplayText(msg sessionMessage) string {
+	limit := conversationDisplayMaxCharsDefault
+	switch strings.ToLower(strings.TrimSpace(msg.role)) {
+	case "tool", "toolresult":
+		limit = conversationDisplayMaxCharsTool
+	}
+	return truncateDisplayText(msg.text, limit)
+}
+
+// truncateDisplayText trims text at a rune boundary and adds a display-only notice.
+func truncateDisplayText(text string, limit int) string {
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+
+	truncated := text
+	for i := range text {
+		if i >= limit {
+			truncated = text[:i]
+			break
+		}
+	}
+	return truncated + fmt.Sprintf("\n\n[display truncated in conversation view, %d chars total]", len(text))
 }
 
 func colorizeDiffLine(line string) string {

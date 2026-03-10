@@ -949,7 +949,11 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 		return "", fmt.Errorf("build Anthropic request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", c.apiKey)
+	if isOAuthToken(c.apiKey) {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	} else {
+		req.Header.Set("x-api-key", c.apiKey)
+	}
 	req.Header.Set("anthropic-version", anthropicVersion)
 
 	resp, err := c.http.Do(req)
@@ -1267,6 +1271,20 @@ func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) 
 		}
 	}
 
+	// Check CLAUDE_CODE_OAUTH_TOKEN env var (setup-token / OAuth support).
+	if normalizedProvider == "anthropic" {
+		if oauthToken := strings.TrimSpace(os.Getenv("CLAUDE_CODE_OAUTH_TOKEN")); oauthToken != "" {
+			return oauthToken, nil
+		}
+	}
+
+	// Check ~/.openclaw/secrets.json for setup-token fallback.
+	if normalizedProvider == "anthropic" {
+		if key, err := readSetupTokenFromSecrets(paths.openclawDir); err == nil && key != "" {
+			return key, nil
+		}
+	}
+
 	mode, err := readProviderProfileMode(paths.openclawConfig, normalizedProvider)
 	if err != nil {
 		return "", err
@@ -1301,6 +1319,29 @@ func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) 
 		normalizedProvider,
 		strings.Join(envCandidates, ", "),
 	)
+}
+
+// readSetupTokenFromSecrets reads an Anthropic setup-token from ~/.openclaw/secrets.json.
+func readSetupTokenFromSecrets(openclawDir string) (string, error) {
+	secretsPath := filepath.Join(openclawDir, "secrets.json")
+	data, err := os.ReadFile(secretsPath)
+	if err != nil {
+		return "", err
+	}
+	var secrets map[string]string
+	if err := json.Unmarshal(data, &secrets); err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(secrets["anthropic-setup-token"])
+	if token != "" && looksLikeAPIKey(token) {
+		return token, nil
+	}
+	return "", nil
+}
+
+// isOAuthToken returns true if the token uses the OAuth setup-token prefix.
+func isOAuthToken(token string) bool {
+	return strings.HasPrefix(token, "sk-ant-oat")
 }
 
 func providerAPIEnvCandidates(provider string) []string {

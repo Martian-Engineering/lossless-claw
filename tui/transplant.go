@@ -149,7 +149,7 @@ func runTransplantCommand(args []string) error {
 		return err
 	}
 
-	fmt.Printf("\nDone. %d summaries copied. %d context items prepended to conversation %d.\n", copied, len(plan.sourceContext), targetConversationID)
+	fmt.Printf("\nDone. %d summaries copied. %d context items merged into conversation %d.\n", copied, len(plan.sourceContext), targetConversationID)
 	return nil
 }
 
@@ -621,7 +621,7 @@ func printTransplantDryRunReport(plan transplantPlan) {
 	fmt.Printf("  %d summaries + %d messages\n\n", plan.targetContext.summaries, plan.targetContext.messages)
 
 	fmt.Println("After transplant:")
-	fmt.Printf("  %d new context items prepended\n", len(plan.sourceContext))
+	fmt.Printf("  %d new context items merged by depth\n", len(plan.sourceContext))
 	fmt.Printf("  %d summaries copied (new IDs, owned by conversation %d)\n", len(plan.ordered), plan.targetConversationID)
 	fmt.Printf("  Estimated token overhead in context: ~%d tokens\n", plan.contextTokenOverhead)
 
@@ -703,7 +703,7 @@ func applyTransplant(ctx context.Context, db *sql.DB, plan transplantPlan) (int,
 		}
 	}
 
-	if err := prependTransplantedContextItems(ctx, tx, plan.targetConversationID, plan.sourceContext, oldToNew); err != nil {
+	if err := mergeTransplantedContextItems(ctx, tx, plan.targetConversationID, plan.sourceContext, oldToNew); err != nil {
 		return len(plan.ordered), err
 	}
 
@@ -1102,14 +1102,18 @@ func copyRemappedParentEdges(ctx context.Context, q sqlQueryer, oldSummaryID, ne
 	return nil
 }
 
-// prependTransplantedContextItems inserts transplanted summaries at ordinals
-// 0..N-1 while preserving the target's existing context order.
-func prependTransplantedContextItems(ctx context.Context, q sqlQueryer, targetConversationID int64, sourceContext []transplantContextSummary, oldToNew map[string]string) error {
-	prependCount := len(sourceContext)
-	if prependCount == 0 {
+// mergeTransplantedContextItems inserts transplanted summaries into the target
+// conversation's context and reorders all summary-type items by depth (descending),
+// then created_at (ascending). This preserves the depth-descending invariant that
+// the context engine expects, rather than blindly prepending which can interleave
+// depths incorrectly at the transplant boundary. Messages remain after all summaries.
+func mergeTransplantedContextItems(ctx context.Context, q sqlQueryer, targetConversationID int64, sourceContext []transplantContextSummary, oldToNew map[string]string) error {
+	if len(sourceContext) == 0 {
 		return nil
 	}
 
+	// Step 1: Shift all existing ordinals up to make room for inserts without
+	// UNIQUE constraint violations. We use a large temporary offset.
 	var maxOrdinal sql.NullInt64
 	if err := q.QueryRowContext(ctx, `
 		SELECT MAX(ordinal)
@@ -1119,7 +1123,7 @@ func prependTransplantedContextItems(ctx context.Context, q sqlQueryer, targetCo
 		return fmt.Errorf("query max target context ordinal for conversation %d: %w", targetConversationID, err)
 	}
 
-	tempShift := int64(prependCount + 1)
+	tempShift := int64(len(sourceContext) + 1)
 	if maxOrdinal.Valid {
 		tempShift += maxOrdinal.Int64
 	}
@@ -1132,27 +1136,67 @@ func prependTransplantedContextItems(ctx context.Context, q sqlQueryer, targetCo
 		return fmt.Errorf("temporarily shift context ordinals for conversation %d: %w", targetConversationID, err)
 	}
 
-	normalizeDelta := tempShift - int64(prependCount)
-	if _, err := q.ExecContext(ctx, `
-		UPDATE context_items
-		SET ordinal = ordinal - ?
-		WHERE conversation_id = ?
-	`, normalizeDelta, targetConversationID); err != nil {
-		return fmt.Errorf("normalize context ordinals for conversation %d: %w", targetConversationID, err)
-	}
-
+	// Step 2: Insert transplanted summaries with temporary high ordinals.
+	// They'll be reordered in step 3.
 	for i, source := range sourceContext {
 		newSummaryID, ok := oldToNew[source.summaryID]
 		if !ok {
 			return fmt.Errorf("missing remapped summary ID for context summary %s", source.summaryID)
 		}
 
+		tempOrd := tempShift + int64(i) + 1
 		if _, err := q.ExecContext(ctx, `
 			INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
 			VALUES (?, ?, 'summary', ?)
-		`, targetConversationID, i, newSummaryID); err != nil {
+		`, targetConversationID, tempOrd, newSummaryID); err != nil {
 			return fmt.Errorf("insert transplanted context item %d (%s): %w", i, source.summaryID, err)
 		}
+	}
+
+	// Step 3: Reorder all summary context items by depth DESC, then created_at ASC.
+	// This merges transplanted and existing summaries into the correct order.
+	if _, err := q.ExecContext(ctx, `
+		WITH ranked_summaries AS (
+			SELECT ci.rowid AS ci_rowid,
+				ROW_NUMBER() OVER (
+					ORDER BY s.depth DESC, s.created_at ASC, ci.summary_id ASC
+				) - 1 AS new_ordinal
+			FROM context_items ci
+			JOIN summaries s ON s.summary_id = ci.summary_id
+			WHERE ci.conversation_id = ? AND ci.item_type = 'summary'
+		)
+		UPDATE context_items
+		SET ordinal = (
+			SELECT new_ordinal FROM ranked_summaries
+			WHERE ranked_summaries.ci_rowid = context_items.rowid
+		)
+		WHERE conversation_id = ? AND item_type = 'summary'
+	`, targetConversationID, targetConversationID); err != nil {
+		return fmt.Errorf("reorder summary context items for conversation %d: %w", targetConversationID, err)
+	}
+
+	// Step 4: Reorder message context items to follow after all summaries.
+	if _, err := q.ExecContext(ctx, `
+		WITH summary_count AS (
+			SELECT COUNT(*) AS cnt
+			FROM context_items
+			WHERE conversation_id = ? AND item_type = 'summary'
+		),
+		ranked_messages AS (
+			SELECT ci.rowid AS ci_rowid,
+				ROW_NUMBER() OVER (ORDER BY ci.ordinal ASC) - 1
+					+ (SELECT cnt FROM summary_count) AS new_ordinal
+			FROM context_items ci
+			WHERE ci.conversation_id = ? AND ci.item_type = 'message'
+		)
+		UPDATE context_items
+		SET ordinal = (
+			SELECT new_ordinal FROM ranked_messages
+			WHERE ranked_messages.ci_rowid = context_items.rowid
+		)
+		WHERE conversation_id = ? AND item_type = 'message'
+	`, targetConversationID, targetConversationID, targetConversationID); err != nil {
+		return fmt.Errorf("reorder message context items for conversation %d: %w", targetConversationID, err)
 	}
 
 	return nil

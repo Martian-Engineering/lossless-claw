@@ -59,6 +59,46 @@ type CompleteSimpleOptions = {
   reasoning?: string;
 };
 
+type RuntimeModelAuthResult = {
+  apiKey?: string;
+};
+
+type RuntimeModelAuthModel = {
+  id: string;
+  provider: string;
+  api: string;
+  name?: string;
+  reasoning?: boolean;
+  input?: string[];
+  cost?: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
+  contextWindow?: number;
+  maxTokens?: number;
+};
+
+type RuntimeModelAuth = {
+  getApiKeyForModel: (params: {
+    model: RuntimeModelAuthModel;
+    cfg?: OpenClawPluginApi["config"];
+    profileId?: string;
+    preferredProfile?: string;
+  }) => Promise<RuntimeModelAuthResult | undefined>;
+  resolveApiKeyForProvider: (params: {
+    provider: string;
+    cfg?: OpenClawPluginApi["config"];
+    profileId?: string;
+    preferredProfile?: string;
+  }) => Promise<RuntimeModelAuthResult | undefined>;
+};
+
+const MODEL_AUTH_PR_URL = "https://github.com/openclaw/openclaw/pull/41090";
+const MODEL_AUTH_MERGE_COMMIT = "4790e40";
+const MODEL_AUTH_REQUIRED_RELEASE = "the first OpenClaw release after 2026.3.8";
+
 /** Capture plugin env values once during initialization. */
 function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnapshot {
   return {
@@ -290,6 +330,53 @@ function resolveProviderApiFromRuntimeConfig(
   }
   const api = value.api;
   return typeof api === "string" && api.trim() ? api.trim() : undefined;
+}
+
+/** Resolve runtime.modelAuth from plugin runtime when available. */
+function getRuntimeModelAuth(api: OpenClawPluginApi): RuntimeModelAuth | undefined {
+  const runtime = api.runtime as OpenClawPluginApi["runtime"] & {
+    modelAuth?: RuntimeModelAuth;
+  };
+  return runtime.modelAuth;
+}
+
+/** Build the minimal model shape required by runtime.modelAuth.getApiKeyForModel(). */
+function buildModelAuthLookupModel(params: {
+  provider: string;
+  model: string;
+  api?: string;
+}): RuntimeModelAuthModel {
+  return {
+    id: params.model,
+    name: params.model,
+    provider: params.provider,
+    api: params.api?.trim() || inferApiFromProvider(params.provider),
+    reasoning: false,
+    input: ["text"],
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    },
+    contextWindow: 200_000,
+    maxTokens: 8_000,
+  };
+}
+
+/** Normalize an auth result down to the API key that pi-ai expects. */
+function resolveApiKeyFromAuthResult(auth: RuntimeModelAuthResult | undefined): string | undefined {
+  const apiKey = auth?.apiKey?.trim();
+  return apiKey ? apiKey : undefined;
+}
+
+function buildLegacyAuthFallbackWarning(): string {
+  return [
+    "[lcm] OpenClaw runtime.modelAuth is unavailable; using legacy auth-profiles fallback.",
+    `Stock lossless-claw 0.2.7 expects OpenClaw plugin runtime support from PR #41090 (${MODEL_AUTH_PR_URL}).`,
+    `OpenClaw 2026.3.8 and 2026.3.8-beta.1 do not include merge commit ${MODEL_AUTH_MERGE_COMMIT};`,
+    `${MODEL_AUTH_REQUIRED_RELEASE} is required for stock lossless-claw 0.2.7 without this fallback patch.`,
+  ].join(" ");
 }
 
 /** Parse auth-profiles JSON into a minimal store shape. */
@@ -559,6 +646,17 @@ async function resolveApiKeyFromAuthProfiles(params: {
 
   const persistPath =
     params.agentDir?.trim() ? join(params.agentDir.trim(), "auth-profiles.json") : storesWithPaths[0]?.path;
+  const secretConfig = (() => {
+    if (isRecord(params.runtimeConfig)) {
+      const runtimeProviders = (params.runtimeConfig as {
+        secrets?: { providers?: Record<string, unknown> };
+      }).secrets?.providers;
+      if (isRecord(runtimeProviders) && Object.keys(runtimeProviders).length > 0) {
+        return params.runtimeConfig;
+      }
+    }
+    return params.appConfig ?? params.runtimeConfig;
+  })();
 
   for (const profileId of candidates) {
     const credential = mergedStore.profiles[profileId];
@@ -575,7 +673,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
         resolveSecretRef({
           ref: credential.keyRef,
           home: params.envSnapshot.home,
-          config: params.runtimeConfig ?? params.appConfig,
+          config: secretConfig,
         });
       if (key) {
         return key;
@@ -589,7 +687,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
         resolveSecretRef({
           ref: credential.tokenRef,
           home: params.envSnapshot.home,
-          config: params.runtimeConfig ?? params.appConfig,
+          config: secretConfig,
         });
       if (!token) {
         continue;
@@ -733,6 +831,7 @@ function readLatestAssistantReply(messages: unknown[]): string | undefined {
 function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   const envSnapshot = snapshotPluginEnv();
   envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(api.config);
+  const modelAuth = getRuntimeModelAuth(api);
   const readEnv: ReadEnvFn = (key) => process.env[key];
   const pluginConfig =
     api.pluginConfig && typeof api.pluginConfig === "object" && !Array.isArray(api.pluginConfig)
@@ -750,6 +849,10 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     if (typeof summaryProvider === "string") {
       envSnapshot.pluginSummaryProvider = summaryProvider.trim();
     }
+  }
+
+  if (!modelAuth) {
+    api.logger.warn(buildLegacyAuthFallbackWarning());
   }
 
   return {
@@ -782,11 +885,23 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           return { content: [] };
         }
 
+        // When runtimeConfig is undefined (e.g. resolveLargeFileTextSummarizer
+        // passes legacyParams without config), fall back to the plugin API so
+        // provider-level baseUrl/headers/apiKey are always resolvable.
+        let effectiveRuntimeConfig = runtimeConfig;
+        if (!isRecord(effectiveRuntimeConfig)) {
+          try {
+            effectiveRuntimeConfig = api.runtime.config.loadConfig();
+          } catch {
+            // loadConfig may not be available in all contexts; leave undefined.
+          }
+        }
+
         const knownModel =
           typeof mod.getModel === "function" ? mod.getModel(providerId, modelId) : undefined;
         const fallbackApi =
           providerApi?.trim() ||
-          resolveProviderApiFromRuntimeConfig(runtimeConfig, providerId) ||
+          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
           (() => {
             if (typeof mod.getModels !== "function") {
               return undefined;
@@ -800,6 +915,21 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           })() ||
           inferApiFromProvider(providerId);
 
+        // Resolve provider-level config (baseUrl, headers, etc.) from runtime config.
+        // Custom/proxy providers (e.g. bailian, local proxies) store their baseUrl and
+        // apiKey under models.providers.<provider> in openclaw.json.  Without this
+        // lookup the resolved model object lacks baseUrl, which crashes pi-ai's
+        // detectCompat() ("Cannot read properties of undefined (reading 'includes')"),
+        // and the apiKey is unresolvable, causing 401 errors.  See #19.
+        const providerLevelConfig: Record<string, unknown> = (() => {
+          if (!isRecord(effectiveRuntimeConfig)) return {};
+          const providers = (effectiveRuntimeConfig as { models?: { providers?: Record<string, unknown> } })
+            .models?.providers;
+          if (!providers) return {};
+          const cfg = findProviderConfigValue(providers, providerId);
+          return isRecord(cfg) ? cfg : {};
+        })();
+
         const resolvedModel =
           isRecord(knownModel) &&
           typeof knownModel.api === "string" &&
@@ -810,6 +940,18 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 id: knownModel.id,
                 provider: knownModel.provider,
                 api: knownModel.api,
+                // Merge baseUrl/headers from provider config if not already on the model.
+                // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
+                // baseUrl is undefined.
+                baseUrl:
+                  typeof knownModel.baseUrl === "string"
+                    ? knownModel.baseUrl
+                    : typeof providerLevelConfig.baseUrl === "string"
+                      ? providerLevelConfig.baseUrl
+                      : "",
+                ...(knownModel.headers == null && isRecord(providerLevelConfig.headers)
+                  ? { headers: providerLevelConfig.headers }
+                  : {}),
               }
             : {
                 id: modelId,
@@ -826,22 +968,64 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 },
                 contextWindow: 200_000,
                 maxTokens: 8_000,
+                // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
+                // baseUrl is undefined.
+                baseUrl: typeof providerLevelConfig.baseUrl === "string"
+                  ? providerLevelConfig.baseUrl
+                  : "",
+                ...(isRecord(providerLevelConfig.headers)
+                  ? { headers: providerLevelConfig.headers }
+                  : {}),
               };
 
-        let resolvedApiKey = apiKey?.trim() || resolveApiKey(providerId, readEnv);
-        if (!resolvedApiKey && typeof mod.getEnvApiKey === "function") {
+        let resolvedApiKey = apiKey?.trim();
+        if (!resolvedApiKey && modelAuth) {
+          try {
+            resolvedApiKey = resolveApiKeyFromAuthResult(
+              await modelAuth.resolveApiKeyForProvider({
+                provider: providerId,
+                cfg: api.config,
+                ...(authProfileId ? { profileId: authProfileId } : {}),
+              }),
+            );
+          } catch (err) {
+            console.error(
+              `[lcm] modelAuth.resolveApiKeyForProvider FAILED:`,
+              err instanceof Error ? err.message : err,
+            );
+          }
+        }
+        if (!resolvedApiKey && !modelAuth) {
+          resolvedApiKey = resolveApiKey(providerId, readEnv);
+        }
+        if (!resolvedApiKey && !modelAuth && typeof mod.getEnvApiKey === "function") {
           resolvedApiKey = mod.getEnvApiKey(providerId)?.trim();
         }
-        if (!resolvedApiKey) {
+        if (!resolvedApiKey && !modelAuth) {
           resolvedApiKey = await resolveApiKeyFromAuthProfiles({
             provider: providerId,
             authProfileId,
             agentDir,
-            runtimeConfig,
             appConfig: api.config,
+            runtimeConfig: effectiveRuntimeConfig,
             piAiModule: mod,
             envSnapshot,
           });
+        }
+        // Fallback: read apiKey from models.providers config (e.g. proxy providers
+        // with keys like "not-needed-for-cli-proxy").
+        if (!resolvedApiKey && isRecord(effectiveRuntimeConfig)) {
+          const providers = (effectiveRuntimeConfig as { models?: { providers?: Record<string, unknown> } })
+            .models?.providers;
+          if (providers) {
+            const providerCfg = findProviderConfigValue(providers, providerId);
+            if (isRecord(providerCfg) && typeof providerCfg.apiKey === "string") {
+              const cfgKey = providerCfg.apiKey.trim();
+              if (cfgKey) {
+                resolvedApiKey = cfgKey;
+              }
+            }
+          }
         }
 
         const completeOptions = buildCompleteSimpleOptions({
@@ -965,11 +1149,79 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       ).trim();
       return { provider, model: raw };
     },
-    getApiKey: (provider) => resolveApiKey(provider, readEnv),
-    requireApiKey: (provider) => {
-      const key = resolveApiKey(provider, readEnv);
+    getApiKey: async (provider, model, options) => {
+      if (modelAuth) {
+        try {
+          const modelAuthKey = resolveApiKeyFromAuthResult(
+            await modelAuth.getApiKeyForModel({
+              model: buildModelAuthLookupModel({ provider, model }),
+              cfg: api.config,
+              ...(options?.profileId ? { profileId: options.profileId } : {}),
+              ...(options?.preferredProfile ? { preferredProfile: options.preferredProfile } : {}),
+            }),
+          );
+          if (modelAuthKey) {
+            return modelAuthKey;
+          }
+        } catch {
+          // Fall through to auth-profile lookup for older OpenClaw runtimes.
+        }
+      }
+
+      const envKey = resolveApiKey(provider, readEnv);
+      if (envKey) {
+        return envKey;
+      }
+
+      const piAiModuleId = "@mariozechner/pi-ai";
+      const mod = (await import(piAiModuleId)) as PiAiModule;
+      return resolveApiKeyFromAuthProfiles({
+        provider,
+        authProfileId: options?.profileId,
+        agentDir: api.resolvePath("."),
+        runtimeConfig: api.config,
+        piAiModule: mod,
+        envSnapshot,
+      });
+    },
+    requireApiKey: async (provider, model, options) => {
+      const key = await (async () => {
+        if (modelAuth) {
+          try {
+            const modelAuthKey = resolveApiKeyFromAuthResult(
+              await modelAuth.getApiKeyForModel({
+                model: buildModelAuthLookupModel({ provider, model }),
+                cfg: api.config,
+                ...(options?.profileId ? { profileId: options.profileId } : {}),
+                ...(options?.preferredProfile ? { preferredProfile: options.preferredProfile } : {}),
+              }),
+            );
+            if (modelAuthKey) {
+              return modelAuthKey;
+            }
+          } catch {
+            // Fall through to auth-profile lookup for older OpenClaw runtimes.
+          }
+        }
+
+        const envKey = resolveApiKey(provider, readEnv);
+        if (envKey) {
+          return envKey;
+        }
+
+        const piAiModuleId = "@mariozechner/pi-ai";
+        const mod = (await import(piAiModuleId)) as PiAiModule;
+        return resolveApiKeyFromAuthProfiles({
+          provider,
+          authProfileId: options?.profileId,
+          agentDir: api.resolvePath("."),
+          runtimeConfig: api.config,
+          piAiModule: mod,
+          envSnapshot,
+        });
+      })();
       if (!key) {
-        throw new Error(`Missing API key for provider '${provider}'.`);
+        throw new Error(`Missing API key for provider '${provider}' (model '${model}').`);
       }
       return key;
     },

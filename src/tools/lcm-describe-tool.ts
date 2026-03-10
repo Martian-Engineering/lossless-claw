@@ -8,6 +8,7 @@ import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import { formatTimestamp } from "../compaction.js";
 
 const LcmDescribeSchema = Type.Object({
   id: Type.String({
@@ -40,8 +41,12 @@ function normalizeRequestedTokenCap(value: unknown): number | undefined {
   return Math.max(1, Math.trunc(value));
 }
 
-function formatIso(value: Date | null | undefined): string {
-  return value instanceof Date ? value.toISOString() : "-";
+function formatIso(value: Date | null | undefined, timezone?: string): string {
+  if (!(value instanceof Date)) return "-";
+  if (timezone) {
+    return formatTimestamp(value, timezone);
+  }
+  return value.toISOString();
 }
 
 export function createLcmDescribeTool(input: {
@@ -61,6 +66,7 @@ export function createLcmDescribeTool(input: {
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
       const retrieval = input.lcm.getRetrieval();
+      const timezone = input.lcm.timezone;
       const p = params as Record<string, unknown>;
       const id = (p.id as string).trim();
       const conversationScope = await resolveLcmConversationScope({
@@ -152,7 +158,7 @@ export function createLcmDescribeTool(input: {
         lines.push(
           `meta conv=${s.conversationId} kind=${s.kind} depth=${s.depth} tok=${s.tokenCount} ` +
             `descTok=${s.descendantTokenCount} srcTok=${s.sourceMessageTokenCount} ` +
-            `desc=${s.descendantCount} range=${formatIso(s.earliestAt)}..${formatIso(s.latestAt)} ` +
+            `desc=${s.descendantCount} range=${formatIso(s.earliestAt, timezone)}..${formatIso(s.latestAt, timezone)} ` +
             `budgetCap=${resolvedTokenCap}`,
         );
         if (s.parentIds.length > 0) {
@@ -167,7 +173,7 @@ export function createLcmDescribeTool(input: {
             `d${node.depthFromRoot} ${node.summaryId} k=${node.kind} tok=${node.tokenCount} ` +
               `descTok=${node.descendantTokenCount} srcTok=${node.sourceMessageTokenCount} ` +
               `desc=${node.descendantCount} child=${node.childCount} ` +
-              `range=${formatIso(node.earliestAt)}..${formatIso(node.latestAt)} ` +
+              `range=${formatIso(node.earliestAt, timezone)}..${formatIso(node.latestAt, timezone)} ` +
               `cost[s=${node.costs.summariesOnly},m=${node.costs.withMessages}] ` +
               `budget[s=${node.budgetFit.summariesOnly ? "in" : "over"},` +
               `m=${node.budgetFit.withMessages ? "in" : "over"}]`,
@@ -205,7 +211,7 @@ export function createLcmDescribeTool(input: {
         if (f.byteSize != null) {
           lines.push(`**Size:** ${f.byteSize.toLocaleString()} bytes`);
         }
-        lines.push(`**Created:** ${f.createdAt.toISOString()}`);
+        lines.push(`**Created:** ${formatIso(f.createdAt, timezone)}`);
         if (f.explorationSummary) {
           lines.push("");
           lines.push("## Exploration Summary");

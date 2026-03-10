@@ -1,0 +1,22 @@
+changelog:
+  exclude:
+    labels:
+      - chore
+      - no-release-notes
+  categories:
+    - title: Features
+      labels:
+        - feat
+        - enhancement
+    - title: Fixes
+      labels:
+        - fix
+        - bug
+    - title: Documentation
+      labels:
+        - docs
+    - title: Internal
+      labels:
+        - refactor
+        - test
+        - ci
