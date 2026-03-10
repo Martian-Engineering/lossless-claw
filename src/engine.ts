@@ -60,6 +60,10 @@ function safeString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function safeBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
 function appendTextValue(value: unknown, out: string[]): void {
   if (typeof value === "string") {
     out.push(value);
@@ -267,6 +271,9 @@ function buildMessageParts(params: {
   const topLevelToolName =
     safeString(topLevel.toolName) ??
     safeString(topLevel.tool_name);
+  const topLevelIsError =
+    safeBoolean(topLevel.isError) ??
+    safeBoolean(topLevel.is_error);
 
   // BashExecutionMessage: preserve a synthetic text part so output is round-trippable.
   if (!("content" in message) && "command" in message && "output" in message) {
@@ -310,6 +317,9 @@ function buildMessageParts(params: {
         textContent: message.content,
         metadata: toJson({
           originalRole: role,
+          toolCallId: topLevelToolCallId,
+          toolName: topLevelToolName,
+          isError: topLevelIsError,
         }),
       },
     ];
@@ -372,6 +382,9 @@ function buildMessageParts(params: {
             : (safeString(metadataRecord?.tool_output) ?? null),
       metadata: toJson({
         originalRole: role,
+        toolCallId: topLevelToolCallId,
+        toolName: topLevelToolName,
+        isError: topLevelIsError,
         rawType: block.type,
         raw: metadataRecord ?? message.content[ordinal],
       }),

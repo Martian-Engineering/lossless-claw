@@ -399,6 +399,10 @@ function pickToolCallId(parts: MessagePartRecord[]): string | undefined {
     if (!decoded || typeof decoded !== "object") {
       continue;
     }
+    const metadataToolCallId = (decoded as { toolCallId?: unknown }).toolCallId;
+    if (typeof metadataToolCallId === "string" && metadataToolCallId.length > 0) {
+      return metadataToolCallId;
+    }
     const raw = (decoded as { raw?: unknown }).raw;
     if (!raw || typeof raw !== "object") {
       continue;
@@ -424,6 +428,10 @@ function pickToolName(parts: MessagePartRecord[]): string | undefined {
     if (!decoded || typeof decoded !== "object") {
       continue;
     }
+    const metadataToolName = (decoded as { toolName?: unknown }).toolName;
+    if (typeof metadataToolName === "string" && metadataToolName.length > 0) {
+      return metadataToolName;
+    }
     const raw = (decoded as { raw?: unknown }).raw;
     if (!raw || typeof raw !== "object") {
       continue;
@@ -435,6 +443,20 @@ function pickToolName(parts: MessagePartRecord[]): string | undefined {
     const maybeCamel = (raw as { toolName?: unknown }).toolName;
     if (typeof maybeCamel === "string" && maybeCamel.length > 0) {
       return maybeCamel;
+    }
+  }
+  return undefined;
+}
+
+function pickToolIsError(parts: MessagePartRecord[]): boolean | undefined {
+  for (const part of parts) {
+    const decoded = parseJson(part.metadata);
+    if (!decoded || typeof decoded !== "object") {
+      continue;
+    }
+    const metadataIsError = (decoded as { isError?: unknown }).isError;
+    if (typeof metadataIsError === "boolean") {
+      return metadataIsError;
     }
   }
   return undefined;
@@ -706,6 +728,7 @@ export class ContextAssembler {
     const isToolResult = roleFromStore === "toolResult";
     const toolCallId = isToolResult ? pickToolCallId(parts) : undefined;
     const toolName = isToolResult ? (pickToolName(parts) ?? "unknown") : undefined;
+    const toolIsError = isToolResult ? pickToolIsError(parts) : undefined;
     // Tool results without a call id cannot be serialized for Anthropic-compatible APIs.
     // This happens for legacy/bootstrap rows that have role=tool but no message_parts.
     // Preserve the text by degrading to assistant content instead of emitting invalid toolResult.
@@ -745,7 +768,7 @@ export class ContextAssembler {
               content,
               ...(toolCallId ? { toolCallId } : {}),
               ...(toolName ? { toolName } : {}),
-              ...(role === "toolResult" ? { isError: false } : {}),
+              ...(role === "toolResult" && toolIsError !== undefined ? { isError: toolIsError } : {}),
             } as AgentMessage),
       tokens: tokenCount,
       isMessage: true,

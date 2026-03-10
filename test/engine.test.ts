@@ -1142,6 +1142,117 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(result.isError).toBe(false);
   });
 
+  it("preserves toolResult error state through ingest-assemble round-trip", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_457", name: "bash", input: { command: "false" } }],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_457",
+        toolName: "bash",
+        content: [{ type: "text", text: "command failed" }],
+        isError: true,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const parts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(JSON.parse(parts[0].metadata ?? "{}")).toMatchObject({ isError: true });
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const result = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      toolName?: string;
+      isError?: boolean;
+    };
+    expect(result.role).toBe("toolResult");
+    expect(result.toolCallId).toBe("call_457");
+    expect(result.toolName).toBe("bash");
+    expect(result.isError).toBe(true);
+  });
+
+  it("preserves top-level tool metadata for string-content tool results", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_458", name: "bash", input: { command: "pwd" } }],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_458",
+        toolName: "bash",
+        content: "/tmp/project",
+        isError: false,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const parts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(parts[0].partType).toBe("text");
+    expect(JSON.parse(parts[0].metadata ?? "{}")).toMatchObject({
+      toolCallId: "call_458",
+      toolName: "bash",
+      isError: false,
+    });
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const result = assembled.messages[1] as {
+      role: string;
+      toolCallId?: string;
+      toolName?: string;
+      isError?: boolean;
+      content?: unknown;
+    };
+    expect(result.role).toBe("toolResult");
+    expect(result.toolCallId).toBe("call_458");
+    expect(result.toolName).toBe("bash");
+    expect(result.isError).toBe(false);
+    expect(result.content).toEqual([{ type: "text", text: "/tmp/project" }]);
+  });
+
   it("reconstructs OpenAI reasoning and function call blocks when raw metadata is missing", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();
