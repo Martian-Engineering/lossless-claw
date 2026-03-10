@@ -123,6 +123,12 @@ type SecretRef = {
   id: string;
 };
 
+type SecretProviderConfig = {
+  source?: string;
+  path?: string;
+  mode?: string;
+};
+
 type AuthProfileCredential =
   | { type: "api_key"; provider: string; key?: string; keyRef?: SecretRef; email?: string }
   | { type: "token"; provider: string; token?: string; tokenRef?: SecretRef; expires?: number; email?: string }
@@ -430,11 +436,19 @@ function resolveAuthProfileCandidates(params: {
  * 1. `source: "env"` — read the value from an environment variable whose
  *    name is `ref.id` (e.g. `{ source: "env", id: "ANTHROPIC_API_KEY" }`).
  *
- * 2. File-based (default) — `ref.id` is a slash-delimited path into
- *    `~/.openclaw/secrets.json` (e.g. `{ id: "/auth/anthropic_oat_primary" }`
- *    resolves to `secrets.auth.anthropic_oat_primary`).
+ * 2. File-based — resolve against a configured `secrets.providers.<provider>`
+ *    file provider when available. JSON-mode providers walk slash-delimited
+ *    paths, while singleValue providers use the sentinel id `value`.
+ *
+ * 3. Legacy fallback — when no file provider config is available, fall back to
+ *    `~/.openclaw/secrets.json` for backward compatibility.
  */
-function resolveSecretRef(ref: SecretRef | undefined, home: string): string | undefined {
+function resolveSecretRef(params: {
+  ref: SecretRef | undefined;
+  home: string;
+  config?: unknown;
+}): string | undefined {
+  const ref = params.ref;
   if (!ref?.id) return undefined;
 
   // source: env — read directly from environment variable
@@ -443,9 +457,50 @@ function resolveSecretRef(ref: SecretRef | undefined, home: string): string | un
     return val || undefined;
   }
 
-  // File-based (source: "file" or unset) — read from secrets.json
+  // File-based provider config — use configured file provider when present.
   try {
-    const secretsPath = join(home, ".openclaw", "secrets.json");
+    const providers = isRecord(params.config)
+      ? (params.config as { secrets?: { providers?: Record<string, unknown> } }).secrets?.providers
+      : undefined;
+    const providerName = ref.provider?.trim() || "default";
+    const provider =
+      providers && isRecord(providers)
+        ? providers[providerName]
+        : undefined;
+    if (isRecord(provider) && provider.source === "file" && typeof provider.path === "string") {
+      const configuredPath = provider.path.trim();
+      const filePath =
+        configuredPath.startsWith("~/") && params.home
+          ? join(params.home, configuredPath.slice(2))
+          : configuredPath;
+      if (!filePath) {
+        return undefined;
+      }
+      const raw = readFileSync(filePath, "utf8");
+      if (provider.mode === "singleValue") {
+        if (ref.id.trim() !== "value") {
+          return undefined;
+        }
+        const value = raw.trim();
+        return value || undefined;
+      }
+
+      const secrets = JSON.parse(raw) as Record<string, unknown>;
+      const parts = ref.id.replace(/^\//, "").split("/");
+      let current: unknown = secrets;
+      for (const part of parts) {
+        if (!current || typeof current !== "object") return undefined;
+        current = (current as Record<string, unknown>)[part];
+      }
+      return typeof current === "string" && current.trim() ? current.trim() : undefined;
+    }
+  } catch {
+    // Fall through to the legacy secrets.json lookup below.
+  }
+
+  // Legacy file fallback (source: "file" or unset) — read from ~/.openclaw/secrets.json
+  try {
+    const secretsPath = join(params.home, ".openclaw", "secrets.json");
     const raw = readFileSync(secretsPath, "utf8");
     const secrets = JSON.parse(raw) as Record<string, unknown>;
     const parts = ref.id.replace(/^\//, "").split("/");
@@ -466,6 +521,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
   authProfileId?: string;
   agentDir?: string;
   runtimeConfig?: unknown;
+  appConfig?: unknown;
   piAiModule: PiAiModule;
   envSnapshot: PluginEnvSnapshot;
 }): Promise<string | undefined> {
@@ -516,7 +572,11 @@ async function resolveApiKeyFromAuthProfiles(params: {
     if (credential.type === "api_key") {
       const key =
         credential.key?.trim() ||
-        resolveSecretRef(credential.keyRef, params.envSnapshot.home);
+        resolveSecretRef({
+          ref: credential.keyRef,
+          home: params.envSnapshot.home,
+          config: params.runtimeConfig ?? params.appConfig,
+        });
       if (key) {
         return key;
       }
@@ -526,7 +586,11 @@ async function resolveApiKeyFromAuthProfiles(params: {
     if (credential.type === "token") {
       const token =
         credential.token?.trim() ||
-        resolveSecretRef(credential.tokenRef, params.envSnapshot.home);
+        resolveSecretRef({
+          ref: credential.tokenRef,
+          home: params.envSnapshot.home,
+          config: params.runtimeConfig ?? params.appConfig,
+        });
       if (!token) {
         continue;
       }
@@ -774,6 +838,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             authProfileId,
             agentDir,
             runtimeConfig,
+            appConfig: api.config,
             piAiModule: mod,
             envSnapshot,
           });
