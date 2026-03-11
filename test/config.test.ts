@@ -13,6 +13,8 @@ describe("resolveLcmConfig", () => {
     expect(config.leafMinFanout).toBe(8);
     expect(config.condensedMinFanout).toBe(4);
     expect(config.condensedMinFanoutHard).toBe(2);
+    expect(config.summaryProvider).toBe("");
+    expect(config.summaryModel).toBe("");
     expect(config.autocompactDisabled).toBe(false);
     expect(config.pruneHeartbeatOk).toBe(false);
   });
@@ -181,6 +183,48 @@ describe("resolveLcmConfig", () => {
     );
 
     expect(config.ignoreSessionPatterns).toEqual(["agent:*:cron:*"]);
+  });
+
+  it("uses summary model overrides from env vars", () => {
+    const config = resolveLcmConfig({
+      LCM_SUMMARY_PROVIDER: "anthropic",
+      LCM_SUMMARY_MODEL: "claude-3-5-haiku",
+    } as NodeJS.ProcessEnv, {});
+
+    expect(config.summaryProvider).toBe("anthropic");
+    expect(config.summaryModel).toBe("claude-3-5-haiku");
+  });
+
+  it("uses summary model overrides from plugin config when env vars are absent", () => {
+    const config = resolveLcmConfig({}, {
+      summaryProvider: "openai",
+      summaryModel: "gpt-5-mini",
+    });
+
+    expect(config.summaryProvider).toBe("openai");
+    expect(config.summaryModel).toBe("gpt-5-mini");
+  });
+
+  it("prefers env summary overrides over plugin config", () => {
+    const config = resolveLcmConfig({
+      LCM_SUMMARY_PROVIDER: "anthropic",
+      LCM_SUMMARY_MODEL: "claude-3-5-haiku",
+    } as NodeJS.ProcessEnv, {
+      summaryProvider: "openai",
+      summaryModel: "gpt-5-mini",
+    });
+
+    expect(config.summaryProvider).toBe("anthropic");
+    expect(config.summaryModel).toBe("claude-3-5-haiku");
+  });
+
+  it("defaults summary overrides to empty strings when unset", () => {
+    const config = resolveLcmConfig({}, {
+      freshTailCount: 16,
+    });
+
+    expect(config.summaryProvider).toBe("");
+    expect(config.summaryModel).toBe("");
   });
 
   it("ships a manifest that accepts unlimited incremental depth", () => {

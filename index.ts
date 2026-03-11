@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig } from "./src/db/config.js";
+import type { LcmConfig } from "./src/db/config.js";
 import { LcmContextEngine } from "./src/engine.js";
 import { createLcmDescribeTool } from "./src/tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "./src/tools/lcm-expand-query-tool.js";
@@ -40,10 +41,6 @@ function normalizeAgentId(agentId: string | undefined): string {
 }
 
 type PluginEnvSnapshot = {
-  lcmSummaryModel: string;
-  lcmSummaryProvider: string;
-  pluginSummaryModel: string;
-  pluginSummaryProvider: string;
   openclawProvider: string;
   openclawDefaultModel: string;
   agentDir: string;
@@ -102,10 +99,6 @@ const MODEL_AUTH_REQUIRED_RELEASE = "the first OpenClaw release after 2026.3.8";
 /** Capture plugin env values once during initialization. */
 function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnapshot {
   return {
-    lcmSummaryModel: env.LCM_SUMMARY_MODEL?.trim() ?? "",
-    lcmSummaryProvider: env.LCM_SUMMARY_PROVIDER?.trim() ?? "",
-    pluginSummaryModel: "",
-    pluginSummaryProvider: "",
     openclawProvider: env.OPENCLAW_PROVIDER?.trim() ?? "",
     openclawDefaultModel: "",
     agentDir: env.OPENCLAW_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
@@ -126,6 +119,41 @@ function readDefaultModelFromConfig(config: unknown): string {
 
   const primary = (model as { primary?: unknown } | undefined)?.primary;
   return typeof primary === "string" ? primary.trim() : "";
+}
+
+/** Format a provider/model pair for logs. */
+function formatProviderModel(params: { provider: string; model: string }): string {
+  return `${params.provider}/${params.model}`;
+}
+
+/** Build a startup log showing which compaction model LCM will use. */
+function buildCompactionModelLog(params: {
+  config: LcmConfig;
+  defaultModelRef: string;
+  defaultProvider: string;
+}): string {
+  const usingOverride = Boolean(params.config.summaryModel || params.config.summaryProvider);
+  const raw = (params.config.summaryModel || params.defaultModelRef).trim();
+  if (!raw) {
+    return "[lcm] Compaction summarization model: (unconfigured)";
+  }
+
+  if (raw.includes("/")) {
+    const [provider, ...rest] = raw.split("/");
+    const model = rest.join("/").trim();
+    if (provider && model) {
+      return `[lcm] Compaction summarization model: ${formatProviderModel({
+        provider: provider.trim(),
+        model,
+      })} (${usingOverride ? "override" : "default"})`;
+    }
+  }
+
+  const provider = (params.config.summaryProvider || params.defaultProvider || "openai").trim();
+  return `[lcm] Compaction summarization model: ${formatProviderModel({
+    provider,
+    model: raw,
+  })} (${usingOverride ? "override" : "default"})`;
 }
 
 /** Resolve common provider API keys from environment. */
@@ -839,18 +867,6 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       : undefined;
   const config = resolveLcmConfig(process.env, pluginConfig);
 
-  // Read model overrides from plugin config
-  if (pluginConfig) {
-    const summaryModel = pluginConfig.summaryModel;
-    const summaryProvider = pluginConfig.summaryProvider;
-    if (typeof summaryModel === "string") {
-      envSnapshot.pluginSummaryModel = summaryModel.trim();
-    }
-    if (typeof summaryProvider === "string") {
-      envSnapshot.pluginSummaryProvider = summaryProvider.trim();
-    }
-  }
-
   if (!modelAuth) {
     api.logger.warn(buildLegacyAuthFallbackWarning());
   }
@@ -1125,7 +1141,10 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
     },
     resolveModel: (modelRef, providerHint) => {
-      const raw = (modelRef?.trim() || envSnapshot.openclawDefaultModel).trim();
+      const raw =
+        (modelRef?.trim() ||
+         config.summaryModel ||
+         envSnapshot.openclawDefaultModel).trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");
       }
@@ -1138,7 +1157,12 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         }
       }
 
-      const provider = (providerHint?.trim() || envSnapshot.openclawProvider || "openai").trim();
+      const provider = (
+        providerHint?.trim() ||
+        config.summaryProvider ||
+        envSnapshot.openclawProvider ||
+        "openai"
+      ).trim();
       return { provider, model: raw };
     },
     getApiKey: async (provider, model, options) => {
@@ -1324,6 +1348,13 @@ const lcmPlugin = {
 
     api.logger.info(
       `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
+    );
+    api.logger.info(
+      buildCompactionModelLog({
+        config: deps.config,
+        defaultModelRef: readDefaultModelFromConfig(api.config),
+        defaultProvider: process.env.OPENCLAW_PROVIDER?.trim() ?? "",
+      }),
     );
   },
 };

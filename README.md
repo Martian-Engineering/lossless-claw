@@ -97,13 +97,17 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
           "incrementalMaxDepth": -1,
           "ignoreSessionPatterns": [
             "agent:*:cron:*"
-          ]
+          ],
+          "summaryProvider": "anthropic",
+          "summaryModel": "claude-3-5-haiku"
         }
       }
     }
   }
 }
 ```
+
+`summaryModel` and `summaryProvider` let you pin compaction summarization to a cheaper or faster model than your main OpenClaw session model. When unset, LCM uses OpenClaw's configured default model/provider.
 
 ### Environment variables
 
@@ -165,9 +169,16 @@ Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the 
 - The chosen expansion target must also be available in OpenClaw's normal model catalog. If it is not already configured elsewhere, add it under the top-level `models` map as shown above.
 - If you prefer splitting provider and model, set `config.expansionProvider` and use a bare `config.expansionModel`.
 
+Plugin config equivalents:
+
+- `summaryModel`
+- `summaryProvider`
+
+Environment variables still win over plugin config when both are set.
+
 ### Summary model priority
 
-When choosing which model to use for summarization, lossless-claw follows this priority order (highest to lowest):
+For compaction summarization, lossless-claw resolves the model in this order:
 
 1. Plugin config `summaryModel` (from `plugins.entries.lossless-claw.config.summaryModel`)
 2. Environment variable `LCM_SUMMARY_MODEL`

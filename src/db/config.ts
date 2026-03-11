@@ -17,6 +17,10 @@ export type LcmConfig = {
   condensedTargetTokens: number;
   maxExpandTokens: number;
   largeFileTokenThreshold: number;
+  /** Provider override for compaction summarization. */
+  summaryProvider: string;
+  /** Model override for compaction summarization. */
+  summaryModel: string;
   /** Provider override for large-file text summarization. */
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
@@ -145,14 +149,14 @@ export function resolveLcmConfig(
         ?? toNumber(pc.largeFileThresholdTokens)
         ?? toNumber(pc.largeFileTokenThreshold)
         ?? 25000,
+    summaryProvider:
+      env.LCM_SUMMARY_PROVIDER?.trim() ?? toStr(pc.summaryProvider) ?? "",
+    summaryModel:
+      env.LCM_SUMMARY_MODEL?.trim() ?? toStr(pc.summaryModel) ?? "",
     largeFileSummaryProvider:
       env.LCM_LARGE_FILE_SUMMARY_PROVIDER?.trim() ?? toStr(pc.largeFileSummaryProvider) ?? "",
     largeFileSummaryModel:
       env.LCM_LARGE_FILE_SUMMARY_MODEL?.trim() ?? toStr(pc.largeFileSummaryModel) ?? "",
-    summaryModel:
-      env.LCM_SUMMARY_MODEL?.trim() ?? toStr(pc.summaryModel) ?? "",
-    summaryProvider:
-      env.LCM_SUMMARY_PROVIDER?.trim() ?? toStr(pc.summaryProvider) ?? "",
     expansionProvider:
       env.LCM_EXPANSION_PROVIDER?.trim() ?? toStr(pc.expansionProvider) ?? "",
     expansionModel:
