@@ -461,7 +461,7 @@ export class ConversationStore {
     return records;
   }
 
-  async getMessage(messageId: MessageId): Promise<MessageRecord | null> {
+  async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
     const d = this.d.reset();
     const row = await this.db.queryOne<MessageRow>(
       `SELECT ${MSG_COLS} FROM messages WHERE message_id = ${d.p()}`,
@@ -553,30 +553,26 @@ export class ConversationStore {
 
   // ── Message parts operations ──────────────────────────────────────────────
 
-  async createMessagePart(messageId: MessageId, input: CreateMessagePartInput): Promise<MessagePartRecord> {
-    const partId = randomUUID();
-    const d = this.d.reset();
-    await this.db.run(
-      `INSERT INTO message_parts
-       (part_id, message_id, session_id, part_type, ordinal, text_content,
-        tool_call_id, tool_name, tool_input, tool_output, metadata)
-       VALUES (${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()},
-               ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()})`,
-      [
-        partId, messageId, input.sessionId, input.partType, input.ordinal,
-        input.textContent, input.toolCallId, input.toolName, input.toolInput, input.toolOutput, input.metadata,
-      ],
-    );
-
-    d.reset();
-    const row = await this.db.queryOne<MessagePartRow>(
-      `SELECT ${PART_COLS} FROM message_parts WHERE part_id = ${d.p()}`,
-      [partId],
-    );
-    if (!row) {
-      throw new Error(`Failed to retrieve created message part with ID ${partId}`);
+  async createMessageParts(messageId: MessageId, parts: CreateMessagePartInput[]): Promise<void> {
+    if (parts.length === 0) {
+      return;
     }
-    return toMessagePartRecord(row);
+
+    for (const input of parts) {
+      const partId = randomUUID();
+      const d = this.d.reset();
+      await this.db.run(
+        `INSERT INTO message_parts
+         (part_id, message_id, session_id, part_type, ordinal, text_content,
+          tool_call_id, tool_name, tool_input, tool_output, metadata)
+         VALUES (${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()},
+                 ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()})`,
+        [
+          partId, messageId, input.sessionId, input.partType, input.ordinal,
+          input.textContent, input.toolCallId, input.toolName, input.toolInput, input.toolOutput, input.metadata,
+        ],
+      );
+    }
   }
 
   /** Batch insert multiple message parts. Matches upstream API. */
