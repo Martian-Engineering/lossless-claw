@@ -37,7 +37,17 @@ export interface AssembleContextResult {
 
 /** Simple token estimate: ~4 chars per token, same as VoltCode's Token.estimate */
 function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
+  let count = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!;
+    // CJK Unified Ideographs + Extension A: ~1.5 tokens per char
+    if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF)) {
+      count += 1.5;
+    } else {
+      count += 0.25;
+    }
+  }
+  return Math.ceil(count);
 }
 
 type SummaryPromptSignal = Pick<SummaryRecord, "kind" | "depth" | "descendantCount">;
