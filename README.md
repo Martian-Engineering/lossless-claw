@@ -94,7 +94,10 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
         "config": {
           "freshTailCount": 32,
           "contextThreshold": 0.75,
-          "incrementalMaxDepth": -1
+          "incrementalMaxDepth": -1,
+          "ignoreSessionPatterns": [
+            "agent:*:cron:*"
+          ]
         }
       }
     }
@@ -108,6 +111,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 |----------|---------|-------------|
 | `LCM_ENABLED` | `true` | Enable/disable the plugin |
 | `LCM_DATABASE_PATH` | `~/.openclaw/lcm.db` | Path to the SQLite database |
+| `LCM_IGNORE_SESSION_PATTERNS` | `""` | Comma-separated glob patterns for session keys to exclude from LCM storage |
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window that triggers compaction (0.0–1.0) |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Number of recent messages protected from compaction |
 | `LCM_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |
@@ -190,6 +194,47 @@ LCM_CONTEXT_THRESHOLD=0.75
 - **freshTailCount=32** protects the last 32 messages from compaction, giving the model enough recent context for continuity.
 - **incrementalMaxDepth=-1** enables unlimited automatic condensation after each compaction pass — the DAG cascades as deep as needed. Set to `0` (default) for leaf-only, or a positive integer for a specific depth cap.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
+
+### Session exclusion patterns
+
+Use `ignoreSessionPatterns` or `LCM_IGNORE_SESSION_PATTERNS` to keep low-value sessions completely out of LCM. Matching sessions do not create conversations, do not store messages, and do not participate in compaction or delegated expansion grants.
+
+Pattern rules:
+
+- `*` matches any characters except `:`
+- `**` matches anything, including `:`
+- Patterns match the full session key
+
+Examples:
+
+- `agent:*:cron:*` excludes cron sessions for any agent
+- `agent:main:subagent:**` excludes all main-agent subagent sessions
+- `agent:ops:**` excludes every session under the `ops` agent id
+
+Environment variable example:
+
+```bash
+LCM_IGNORE_SESSION_PATTERNS=agent:*:cron:*,agent:main:subagent:batch-**
+```
+
+Plugin config example:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "config": {
+          "ignoreSessionPatterns": [
+            "agent:*:cron:*",
+            "agent:main:subagent:batch-**"
+          ]
+        }
+      }
+    }
+  }
+}
+```
 
 ### OpenClaw session reset settings
 

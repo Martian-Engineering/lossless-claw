@@ -28,6 +28,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
     config: {
       enabled: true,
       databasePath: ":memory:",
+      ignoreSessionPatterns: [],
       contextThreshold: 0.75,
       freshTailCount: 8,
       leafMinFanout: 8,

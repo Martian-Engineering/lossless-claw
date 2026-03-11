@@ -121,6 +121,7 @@ describe("lcm plugin registration", () => {
       incrementalMaxDepth: -1,
       freshTailCount: 7,
       dbPath,
+      ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
       largeFileThresholdTokens: 12345,
     });
 
@@ -136,10 +137,14 @@ describe("lcm plugin registration", () => {
       incrementalMaxDepth: -1,
       freshTailCount: 7,
       databasePath: dbPath,
+      ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
       largeFileTokenThreshold: 12345,
     });
     expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:*, agent:main:subagent:**",
     );
   });
 

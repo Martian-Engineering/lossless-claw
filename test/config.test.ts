@@ -6,6 +6,7 @@ describe("resolveLcmConfig", () => {
   it("uses hardcoded defaults when no env or plugin config", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.enabled).toBe(true);
+    expect(config.ignoreSessionPatterns).toEqual([]);
     expect(config.contextThreshold).toBe(0.75);
     expect(config.freshTailCount).toBe(32);
     expect(config.incrementalMaxDepth).toBe(0);
@@ -21,6 +22,7 @@ describe("resolveLcmConfig", () => {
       contextThreshold: 0.5,
       freshTailCount: 16,
       incrementalMaxDepth: -1,
+      ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
       leafMinFanout: 4,
       condensedMinFanout: 2,
       autocompactDisabled: true,
@@ -28,6 +30,10 @@ describe("resolveLcmConfig", () => {
       enabled: false,
     });
     expect(config.enabled).toBe(false);
+    expect(config.ignoreSessionPatterns).toEqual([
+      "agent:*:cron:*",
+      "agent:main:subagent:**",
+    ]);
     expect(config.contextThreshold).toBe(0.5);
     expect(config.freshTailCount).toBe(16);
     expect(config.incrementalMaxDepth).toBe(-1);
@@ -44,16 +50,22 @@ describe("resolveLcmConfig", () => {
       LCM_INCREMENTAL_MAX_DEPTH: "3",
       LCM_ENABLED: "false",
       LCM_AUTOCOMPACT_DISABLED: "true",
+      LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
       freshTailCount: 16,
       incrementalMaxDepth: -1,
+      ignoreSessionPatterns: ["agent:*:test:*"],
       enabled: true,
       autocompactDisabled: false,
     };
     const config = resolveLcmConfig(env, pluginConfig);
     expect(config.enabled).toBe(false); // env wins
+    expect(config.ignoreSessionPatterns).toEqual([
+      "agent:*:cron:*",
+      "agent:main:subagent:**",
+    ]);
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
@@ -80,9 +92,14 @@ describe("resolveLcmConfig", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: "0.6",
       freshTailCount: "24",
+      ignoreSessionPatterns: "agent:*:cron:*, agent:main:subagent:**",
     });
     expect(config.contextThreshold).toBe(0.6);
     expect(config.freshTailCount).toBe(24);
+    expect(config.ignoreSessionPatterns).toEqual([
+      "agent:*:cron:*",
+      "agent:main:subagent:**",
+    ]);
   });
 
   it("ignores invalid plugin config values", () => {
@@ -153,6 +170,17 @@ describe("resolveLcmConfig", () => {
     );
     expect(config.expansionModel).toBe("anthropic/claude-sonnet-4-6");
     expect(config.expansionProvider).toBe("openrouter");
+  });
+
+  it("keeps empty ignore session patterns out of resolved config", () => {
+    const config = resolveLcmConfig(
+      { LCM_IGNORE_SESSION_PATTERNS: " agent:*:cron:* , , " } as NodeJS.ProcessEnv,
+      {
+        ignoreSessionPatterns: ["agent:*:test:*"],
+      },
+    );
+
+    expect(config.ignoreSessionPatterns).toEqual(["agent:*:cron:*"]);
   });
 
   it("ships a manifest that accepts unlimited incremental depth", () => {

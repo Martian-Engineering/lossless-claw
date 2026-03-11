@@ -4,6 +4,8 @@ import { join } from "path";
 export type LcmConfig = {
   enabled: boolean;
   databasePath: string;
+  /** Glob patterns for session keys to exclude from LCM storage entirely. */
+  ignoreSessionPatterns: string[];
   contextThreshold: number;
   freshTailCount: number;
   leafMinFanout: number;
@@ -61,6 +63,24 @@ function toStr(value: unknown): string | undefined {
   return undefined;
 }
 
+/** Coerce a plugin config value into a trimmed string array when possible. */
+function toStrArray(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const normalized = value
+      .map((entry) => toStr(entry))
+      .filter((entry): entry is string => typeof entry === "string");
+    return normalized.length > 0 ? normalized : [];
+  }
+  const single = toStr(value);
+  if (!single) {
+    return undefined;
+  }
+  return single
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 /**
  * Resolve LCM configuration with three-tier precedence:
  *   1. Environment variables (highest — backward compat)
@@ -83,6 +103,13 @@ export function resolveLcmConfig(
       ?? toStr(pc.dbPath)
       ?? toStr(pc.databasePath)
       ?? join(homedir(), ".openclaw", "lcm.db"),
+    ignoreSessionPatterns:
+      env.LCM_IGNORE_SESSION_PATTERNS !== undefined
+        ? env.LCM_IGNORE_SESSION_PATTERNS
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+        : toStrArray(pc.ignoreSessionPatterns) ?? [],
     contextThreshold:
       (env.LCM_CONTEXT_THRESHOLD !== undefined ? parseFloat(env.LCM_CONTEXT_THRESHOLD) : undefined)
         ?? toNumber(pc.contextThreshold) ?? 0.75,

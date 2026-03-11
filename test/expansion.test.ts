@@ -6,6 +6,7 @@ import { buildExpansionToolDefinition } from "../src/expansion.js";
 const BASE_CONFIG: LcmConfig = {
   enabled: true,
   databasePath: ":memory:",
+  ignoreSessionPatterns: [],
   contextThreshold: 0.75,
   freshTailCount: 8,
   leafMinFanout: 8,

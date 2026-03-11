@@ -17,6 +17,10 @@
       "label": "Database Path",
       "help": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
     },
+    "ignoreSessionPatterns": {
+      "label": "Ignored Sessions",
+      "help": "Glob patterns for session keys to exclude from LCM storage"
+    },
     "summaryModel": {
       "label": "Summary Model",
       "help": "Model override for LCM summarization (e.g., 'gpt-5.4' to reuse the session provider, or 'openai-resp/gpt-5.4' for a full cross-provider ref)"
@@ -68,6 +72,12 @@
       },
       "dbPath": {
         "type": "string"
+      },
+      "ignoreSessionPatterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
       },
       "largeFileThresholdTokens": {
         "type": "integer",

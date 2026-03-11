@@ -9,6 +9,12 @@ import { ContextAssembler } from "../src/assembler.js";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
+import {
+  createDelegatedExpansionGrant,
+  getRuntimeExpansionAuthManager,
+  resetDelegatedExpansionGrantsForTests,
+  resolveDelegatedExpansionGrantId,
+} from "../src/expansion-auth.js";
 import type { LcmDependencies } from "../src/types.js";
 
 const tempDirs: string[] = [];
@@ -17,6 +23,7 @@ function createTestConfig(databasePath: string): LcmConfig {
   return {
     enabled: true,
     databasePath,
+    ignoreSessionPatterns: [],
     contextThreshold: 0.75,
     freshTailCount: 8,
     leafMinFanout: 8,
@@ -53,7 +60,10 @@ function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: st
   };
 }
 
-function createTestDeps(config: LcmConfig): LcmDependencies {
+function createTestDeps(
+  config: LcmConfig,
+  overrides?: Partial<LcmDependencies>,
+): LcmDependencies {
   return {
     config,
     complete: vi.fn(async () => ({
@@ -88,6 +98,7 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
       error: vi.fn(),
       debug: vi.fn(),
     },
+    ...overrides,
   };
 }
 
@@ -117,6 +128,19 @@ function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine
     ...overrides,
   };
   return new LcmContextEngine(createTestDeps(config));
+}
+
+function createEngineWithDeps(
+  configOverrides: Partial<LcmConfig>,
+  depOverrides?: Partial<LcmDependencies>,
+): LcmContextEngine {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = {
+    ...createTestConfig(join(tempDir, "lcm.db")),
+    ...configOverrides,
+  };
+  return new LcmContextEngine(createTestDeps(config, depOverrides));
 }
 
 async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
@@ -184,6 +208,7 @@ async function ingestAndReadStoredContent(params: {
 
 afterEach(() => {
   closeLcmConnection();
+  resetDelegatedExpansionGrantsForTests();
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -193,6 +218,268 @@ describe("LcmContextEngine metadata", () => {
   it("advertises ownsCompaction capability", () => {
     const engine = createEngine();
     expect(engine.info.ownsCompaction).toBe(true);
+  });
+});
+
+describe("LcmContextEngine ignored sessions", () => {
+  const ignoredSessionId = "agent:main:cron:nightly";
+  const includedSessionId = "agent:main:chat:nightly";
+
+  it("skips bootstrap for ignored sessions while bootstrapping included sessions", async () => {
+    const sessionFile = createSessionFilePath("ignored-bootstrap");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "bootstrap me" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "bootstrap reply" }],
+    } as AgentMessage);
+
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:*"],
+    });
+
+    const ignored = await engine.bootstrap({ sessionId: ignoredSessionId, sessionFile });
+    const included = await engine.bootstrap({ sessionId: includedSessionId, sessionFile });
+
+    expect(ignored).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "session excluded by pattern",
+    });
+    expect(included.bootstrapped).toBe(true);
+    expect(included.importedMessages).toBe(2);
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
+    ).toBeNull();
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(includedSessionId),
+    ).not.toBeNull();
+  });
+
+  it("skips ingest for ignored sessions while storing included sessions", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:*"],
+    });
+
+    const ignored = await engine.ingest({
+      sessionId: ignoredSessionId,
+      message: makeMessage({ role: "user", content: "drop me" }),
+    });
+    const included = await engine.ingest({
+      sessionId: includedSessionId,
+      message: makeMessage({ role: "user", content: "keep me" }),
+    });
+
+    expect(ignored).toEqual({ ingested: false });
+    expect(included).toEqual({ ingested: true });
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
+    ).toBeNull();
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(includedSessionId),
+    ).not.toBeNull();
+  });
+
+  it("skips ingestBatch for ignored sessions while storing included sessions", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:*"],
+    });
+
+    const ignored = await engine.ingestBatch({
+      sessionId: ignoredSessionId,
+      messages: [
+        makeMessage({ role: "user", content: "drop batch user" }),
+        makeMessage({ role: "assistant", content: "drop batch assistant" }),
+      ],
+    });
+    const included = await engine.ingestBatch({
+      sessionId: includedSessionId,
+      messages: [
+        makeMessage({ role: "user", content: "keep batch user" }),
+        makeMessage({ role: "assistant", content: "keep batch assistant" }),
+      ],
+    });
+
+    expect(ignored).toEqual({ ingestedCount: 0 });
+    expect(included).toEqual({ ingestedCount: 2 });
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
+    ).toBeNull();
+
+    const includedConversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(includedSessionId);
+    expect(includedConversation).not.toBeNull();
+    expect(
+      await engine.getConversationStore().getMessageCount(includedConversation!.conversationId),
+    ).toBe(2);
+  });
+
+  it("skips afterTurn for ignored sessions while persisting included sessions", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:*"],
+    });
+
+    await engine.afterTurn({
+      sessionId: ignoredSessionId,
+      sessionFile: createSessionFilePath("ignored-after-turn"),
+      messages: [makeMessage({ role: "assistant", content: "ignored turn" })],
+      prePromptMessageCount: 0,
+    });
+    await engine.afterTurn({
+      sessionId: includedSessionId,
+      sessionFile: createSessionFilePath("included-after-turn"),
+      messages: [makeMessage({ role: "assistant", content: "included turn" })],
+      prePromptMessageCount: 0,
+    });
+
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
+    ).toBeNull();
+
+    const includedConversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(includedSessionId);
+    expect(includedConversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(
+      includedConversation!.conversationId,
+    );
+    expect(stored.map((message) => message.content)).toEqual(["included turn"]);
+  });
+
+  it("passes through assemble for ignored sessions while assembling included sessions from LCM", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:*"],
+    });
+
+    await engine.ingest({
+      sessionId: includedSessionId,
+      message: makeMessage({ role: "user", content: "persisted context" }),
+    });
+
+    const liveMessages = [makeMessage({ role: "user", content: "live ignored turn" })];
+    const ignored = await engine.assemble({
+      sessionId: ignoredSessionId,
+      messages: liveMessages,
+      tokenBudget: 500,
+    });
+    const included = await engine.assemble({
+      sessionId: includedSessionId,
+      messages: [],
+      tokenBudget: 500,
+    });
+
+    expect(ignored).toEqual({
+      messages: liveMessages,
+      estimatedTokens: 0,
+    });
+    expect(included.messages).toHaveLength(1);
+    expect(included.messages[0]?.content).toBe("persisted context");
+  });
+
+  it("skips compact for ignored sessions while compact still evaluates included sessions", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:*"],
+    });
+
+    const ignored = await engine.compact({
+      sessionId: ignoredSessionId,
+      sessionFile: createSessionFilePath("ignored-compact"),
+      tokenBudget: 1000,
+    });
+
+    await engine.ingest({
+      sessionId: includedSessionId,
+      message: makeMessage({ role: "user", content: "compact me maybe" }),
+    });
+    const included = await engine.compact({
+      sessionId: includedSessionId,
+      sessionFile: createSessionFilePath("included-compact"),
+      tokenBudget: 1000,
+    });
+
+    expect(ignored).toEqual({
+      ok: true,
+      compacted: false,
+      reason: "session excluded",
+    });
+    expect(included.ok).toBe(true);
+    expect(included.reason).not.toBe("session excluded");
+  });
+
+  it("skips prepareSubagentSpawn for ignored sessions while creating grants for included sessions", async () => {
+    const childSessionKey = "agent:main:subagent:worker-123";
+    const includedParentSessionKey = "agent:main:chat:parent";
+    const runtimeSessionId = "runtime-parent-session";
+    const engine = createEngineWithDeps(
+      { ignoreSessionPatterns: ["agent:*:cron:*"] },
+      {
+        resolveSessionIdFromSessionKey: vi.fn(async (sessionKey: string) =>
+          sessionKey === includedParentSessionKey ? runtimeSessionId : undefined,
+        ),
+      },
+    );
+
+    await engine.ingest({
+      sessionId: runtimeSessionId,
+      message: makeMessage({ role: "user", content: "parent context" }),
+    });
+
+    const ignored = await engine.prepareSubagentSpawn({
+      parentSessionKey: ignoredSessionId,
+      childSessionKey,
+    });
+    const included = await engine.prepareSubagentSpawn({
+      parentSessionKey: includedParentSessionKey,
+      childSessionKey,
+    });
+
+    expect(ignored).toBeUndefined();
+    expect(included).toBeDefined();
+    expect(resolveDelegatedExpansionGrantId(childSessionKey)).not.toBeNull();
+
+    included?.rollback();
+    expect(resolveDelegatedExpansionGrantId(childSessionKey)).toBeNull();
+  });
+
+  it("skips onSubagentEnded for ignored sessions while cleaning up included child grants", async () => {
+    const ignoredChildSessionKey = "agent:main:cron:child";
+    const includedChildSessionKey = "agent:main:subagent:child";
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: ignoredChildSessionKey,
+      issuerSessionId: "issuer-1",
+      allowedConversationIds: [1],
+    });
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: includedChildSessionKey,
+      issuerSessionId: "issuer-2",
+      allowedConversationIds: [2],
+    });
+
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:*"],
+    });
+
+    await engine.onSubagentEnded({
+      childSessionKey: ignoredChildSessionKey,
+      reason: "deleted",
+    });
+    await engine.onSubagentEnded({
+      childSessionKey: includedChildSessionKey,
+      reason: "deleted",
+    });
+
+    expect(resolveDelegatedExpansionGrantId(ignoredChildSessionKey)).not.toBeNull();
+    expect(resolveDelegatedExpansionGrantId(includedChildSessionKey)).toBeNull();
+    expect(
+      getRuntimeExpansionAuthManager().getGrant(
+        resolveDelegatedExpansionGrantId(ignoredChildSessionKey)!,
+      ),
+    ).not.toBeNull();
   });
 });
 
