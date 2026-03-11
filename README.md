@@ -123,6 +123,8 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_LARGE_FILE_SUMMARY_MODEL` | `""` | Model override for large-file summarization |
 | `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514` or `claude-sonnet-4-20250514`) |
 | `LCM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider used with a bare `LCM_SUMMARY_MODEL` value when you want to override the session provider |
+| `LCM_EXPANSION_MODEL` | *(from OpenClaw)* | Model override for `lcm_expand_query` sub-agent (e.g. `anthropic/claude-haiku-4-5`) |
+| `LCM_EXPANSION_PROVIDER` | *(from OpenClaw)* | Provider override for `lcm_expand_query` sub-agent |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
 

@@ -125,7 +125,42 @@ describe("resolveLcmConfig", () => {
     expect(config.largeFileTokenThreshold).toBe(12345);
   });
 
+  it("reads expansionModel and expansionProvider from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      expansionModel: "anthropic/claude-haiku-4-5",
+      expansionProvider: "anthropic",
+    });
+    expect(config.expansionModel).toBe("anthropic/claude-haiku-4-5");
+    expect(config.expansionProvider).toBe("anthropic");
+  });
+
+  it("defaults expansionModel and expansionProvider to empty string", () => {
+    const config = resolveLcmConfig({}, {});
+    expect(config.expansionModel).toBe("");
+    expect(config.expansionProvider).toBe("");
+  });
+
+  it("env vars override expansionModel and expansionProvider", () => {
+    const config = resolveLcmConfig(
+      {
+        LCM_EXPANSION_MODEL: "anthropic/claude-sonnet-4-6",
+        LCM_EXPANSION_PROVIDER: "openrouter",
+      } as NodeJS.ProcessEnv,
+      {
+        expansionModel: "anthropic/claude-haiku-4-5",
+        expansionProvider: "anthropic",
+      },
+    );
+    expect(config.expansionModel).toBe("anthropic/claude-sonnet-4-6");
+    expect(config.expansionProvider).toBe("openrouter");
+  });
+
   it("ships a manifest that accepts unlimited incremental depth", () => {
     expect(manifest.configSchema.properties.incrementalMaxDepth.minimum).toBe(-1);
+  });
+
+  it("ships a manifest with expansionModel and expansionProvider in schema", () => {
+    expect(manifest.configSchema.properties.expansionModel).toEqual({ type: "string" });
+    expect(manifest.configSchema.properties.expansionProvider).toEqual({ type: "string" });
   });
 });

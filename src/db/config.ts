@@ -23,6 +23,10 @@ export type LcmConfig = {
   summaryModel: string;
   /** Provider override for conversation summarization. */
   summaryProvider: string;
+  /** Provider override for lcm_expand_query sub-agent. */
+  expansionProvider: string;
+  /** Model override for lcm_expand_query sub-agent. */
+  expansionModel: string;
   autocompactDisabled: boolean;
   /** IANA timezone for timestamps in summaries (from TZ env or system default) */
   timezone: string;
@@ -122,6 +126,10 @@ export function resolveLcmConfig(
       env.LCM_SUMMARY_MODEL?.trim() ?? toStr(pc.summaryModel) ?? "",
     summaryProvider:
       env.LCM_SUMMARY_PROVIDER?.trim() ?? toStr(pc.summaryProvider) ?? "",
+    expansionProvider:
+      env.LCM_EXPANSION_PROVIDER?.trim() ?? toStr(pc.expansionProvider) ?? "",
+    expansionModel:
+      env.LCM_EXPANSION_MODEL?.trim() ?? toStr(pc.expansionModel) ?? "",
     autocompactDisabled:
       env.LCM_AUTOCOMPACT_DISABLED !== undefined
         ? env.LCM_AUTOCOMPACT_DISABLED === "true"
