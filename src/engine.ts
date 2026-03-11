@@ -1212,6 +1212,59 @@ export class LcmContextEngine implements ContextEngine {
    * Reconcile session-file history with persisted messages and append only the
    * tail that is present in JSONL but missing from LCM.
    */
+  /**
+   * Scan historical messages for any that are missing from the DB and import
+   * them.  Used when the tail matches but a count mismatch reveals mid-history
+   * gaps (e.g. process crash during a turn meant afterTurn never persisted
+   * those messages to LCM).
+   */
+  private async importMissingMessages(params: {
+    sessionId: string;
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+    storedHistoricalMessages: Array<{ role: string; content: string; tokenCount: number }>;
+  }): Promise<number> {
+    const { sessionId, conversationId, historicalMessages, storedHistoricalMessages } = params;
+
+    // Running occurrence counter for each (role, content) identity as we walk
+    // through the historical messages in order.
+    const historicalRunning = new Map<string, number>();
+    // Cache DB counts per identity to avoid repeated queries.
+    const dbCountCache = new Map<string, number>();
+    let imported = 0;
+
+    for (let i = 0; i < storedHistoricalMessages.length; i++) {
+      const stored = storedHistoricalMessages[i];
+      const identity = messageIdentity(stored.role, stored.content);
+      const runCount = (historicalRunning.get(identity) ?? 0) + 1;
+      historicalRunning.set(identity, runCount);
+
+      if (!dbCountCache.has(identity)) {
+        dbCountCache.set(
+          identity,
+          await this.conversationStore.countMessagesByIdentity(
+            conversationId,
+            stored.role,
+            stored.content,
+          ),
+        );
+      }
+
+      if (runCount > dbCountCache.get(identity)!) {
+        const result = await this.ingestSingle({ sessionId, message: historicalMessages[i] });
+        if (result.ingested) {
+          imported++;
+          dbCountCache.set(identity, dbCountCache.get(identity)! + 1);
+        }
+      }
+    }
+
+    if (imported > 0) {
+      console.error(`[lcm] reconcile: imported ${imported} missing mid-history messages`);
+    }
+    return imported;
+  }
+
   private async reconcileSessionTail(params: {
     sessionId: string;
     sessionKey?: string;
@@ -1249,7 +1302,25 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
       if (dbOccurrences === historicalOccurrences) {
-        return { importedMessages: 0, hasOverlap: true };
+        // Guard against mid-history gaps: if the JSONL has more messages than
+        // the DB, a turn's messages were lost (e.g. process crash before
+        // afterTurn could persist them).  The tail matches because a later
+        // turn wrote to both JSONL and DB, but the gap is in the middle.
+        const dbCount = await this.conversationStore.getMessageCount(conversationId);
+        if (historicalMessages.length <= dbCount) {
+          return { importedMessages: 0, hasOverlap: true };
+        }
+        console.error(
+          `[lcm] reconcile: tail matches but mid-history gap detected ` +
+            `(jsonl=${historicalMessages.length}, db=${dbCount}) — scanning for missing messages`,
+        );
+        const imported = await this.importMissingMessages({
+          sessionId,
+          conversationId,
+          historicalMessages,
+          storedHistoricalMessages,
+        });
+        return { importedMessages: imported, hasOverlap: true };
       }
     }
 
@@ -1412,6 +1483,10 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         if (reconcile.importedMessages > 0) {
+          console.error(
+            `[lcm] bootstrap: reconciled ${reconcile.importedMessages} missing messages ` +
+              `for conversation ${conversationId}`,
+          );
           return {
             bootstrapped: true,
             importedMessages: reconcile.importedMessages,
