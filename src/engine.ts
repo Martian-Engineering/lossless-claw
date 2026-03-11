@@ -3,7 +3,6 @@ import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
 import type {
   ContextEngine,
   ContextEngineInfo,
@@ -18,8 +17,9 @@ import type {
 import { blockFromPart, ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
+import { createLcmConnection, closeLcmConnection, getLcmConnection } from "./db/connection.js";
 import { getLcmDbFeatures } from "./db/features.js";
-import { runLcmMigrations } from "./db/migration.js";
+import { runLcmMigrations, ensurePostgresSchema } from "./db/migration.js";
 import {
   createDelegatedExpansionGrant,
   getRuntimeExpansionAuthManager,
@@ -772,9 +772,8 @@ export class LcmContextEngine implements ContextEngine {
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
-  private readonly db: DatabaseSync;
   private migrated = false;
-  private readonly fts5Available: boolean;
+  private readonly fullTextAvailable: boolean;
   private readonly ignoreSessionPatterns: RegExp[];
   private readonly statelessSessionPatterns: RegExp[];
   private sessionOperationQueues = new Map<string, Promise<void>>();
@@ -782,36 +781,45 @@ export class LcmContextEngine implements ContextEngine {
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
 
-  constructor(deps: LcmDependencies, database: DatabaseSync) {
+  constructor(deps: LcmDependencies) {
     this.deps = deps;
     this.config = deps.config;
     this.ignoreSessionPatterns = compileSessionPatterns(this.config.ignoreSessionPatterns);
     this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
-    this.db = database;
 
-    this.fts5Available = getLcmDbFeatures(this.db).fts5Available;
+    const db = createLcmConnection(this.config);
+    const features = getLcmDbFeatures(this.config.backend);
+    this.fullTextAvailable = features.fullTextAvailable;
 
     // Run migrations eagerly at construction time so the schema exists
     // before any lifecycle hook fires.
     let migrationOk = false;
     try {
-      runLcmMigrations(this.db, { fts5Available: this.fts5Available });
-      this.migrated = true;
+      if (this.config.backend === 'sqlite') {
+        // For SQLite, get the raw connection for sync migrations
+        const sqliteDb = getLcmConnection(this.config.databasePath);
+        runLcmMigrations(sqliteDb, { fts5Available: this.fullTextAvailable });
 
-      // Verify tables were actually created
-      const tables = this.db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .all() as Array<{ name: string }>;
-      if (tables.length === 0) {
-        this.deps.log.warn(
-          "[lcm] Migration completed but database has zero tables — DB may be non-functional",
-        );
+        // Verify tables were actually created
+        const tables = sqliteDb
+          .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+          .all() as Array<{ name: string }>;
+        if (tables.length === 0) {
+          this.deps.log.warn(
+            "[lcm] Migration completed but database has zero tables — DB may be non-functional",
+          );
+        } else {
+          migrationOk = true;
+          this.deps.log.debug(
+            `[lcm] Migration successful — ${tables.length} tables: ${tables.map((t) => t.name).join(", ")}`,
+          );
+        }
       } else {
+        // For Postgres, schema is ensured asynchronously; assume OK for now.
+        // The ensureMigrated() call will run ensurePostgresSchema on first use.
         migrationOk = true;
-        this.deps.log.debug(
-          `[lcm] Migration successful — ${tables.length} tables: ${tables.map((t) => t.name).join(", ")}`,
-        );
       }
+      this.migrated = migrationOk;
     } catch (err) {
       this.deps.log.error(
         `[lcm] Migration failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -828,12 +836,16 @@ export class LcmContextEngine implements ContextEngine {
       ownsCompaction: migrationOk,
     };
 
-    this.conversationStore = new ConversationStore(this.db, {
-      fts5Available: this.fts5Available,
+    this.conversationStore = new ConversationStore(db, {
+      fullTextAvailable: this.fullTextAvailable,
+      backend: features.backend,
     });
-    this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    this.summaryStore = new SummaryStore(db, {
+      fullTextAvailable: this.fullTextAvailable,
+      backend: features.backend,
+    });
 
-    if (!this.fts5Available) {
+    if (!this.fullTextAvailable) {
       this.deps.log.warn(
         "[lcm] FTS5 unavailable in the current Node runtime; full_text search will fall back to LIKE and indexing is disabled",
       );
@@ -918,11 +930,23 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /** Ensure DB schema is up-to-date. Called lazily on first bootstrap/ingest/assemble/compact. */
-  private ensureMigrated(): void {
+  private async ensureMigrated(): Promise<void> {
     if (this.migrated) {
       return;
     }
-    runLcmMigrations(this.db, { fts5Available: this.fts5Available });
+    if (this.config.backend === 'postgres') {
+      try {
+        const db = createLcmConnection(this.config);
+        await ensurePostgresSchema(db);
+      } catch (err: any) {
+        this.deps.log.warn(`[lcm] Postgres schema migration failed: ${err.message}`);
+      }
+      this.migrated = true;
+      return;
+    }
+
+    const sqliteDb = getLcmConnection(this.config.databasePath);
+    runLcmMigrations(sqliteDb, { fts5Available: this.fullTextAvailable });
     this.migrated = true;
   }
 
@@ -1314,7 +1338,7 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
 
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
@@ -1515,7 +1539,7 @@ export class LcmContextEngine implements ContextEngine {
     if (this.isStatelessSession(params.sessionKey)) {
       return { ingested: false };
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       () => this.ingestSingle(params),
@@ -1534,7 +1558,7 @@ export class LcmContextEngine implements ContextEngine {
     if (this.isStatelessSession(params.sessionKey)) {
       return { ingestedCount: 0 };
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
     if (params.messages.length === 0) {
       return { ingestedCount: 0 };
     }
@@ -1578,7 +1602,7 @@ export class LcmContextEngine implements ContextEngine {
     if (this.isStatelessSession(params.sessionKey)) {
       return;
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
 
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
@@ -1670,7 +1694,7 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     try {
-      this.ensureMigrated();
+      await this.ensureMigrated();
 
       const conversation = await this.conversationStore.getConversationForSession({
         sessionId: params.sessionId,
@@ -1746,7 +1770,7 @@ export class LcmContextEngine implements ContextEngine {
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
-    this.ensureMigrated();
+    await this.ensureMigrated();
     const conversation = await this.conversationStore.getConversationForSession({
       sessionId,
       sessionKey,
@@ -1789,7 +1813,7 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
@@ -1889,7 +1913,7 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
@@ -2048,7 +2072,7 @@ export class LcmContextEngine implements ContextEngine {
     ) {
       return undefined;
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
 
     const childSessionKey = params.childSessionKey.trim();
     const parentSessionKey = params.parentSessionKey.trim();

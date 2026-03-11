@@ -4,23 +4,9 @@ import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
-import { formatTimestamp } from "../compaction.js";
+
 
 const MAX_RESULT_CHARS = 40_000; // ~10k tokens
-
-function formatDisplayTime(
-  value: Date | string | number | null | undefined,
-  timezone: string,
-): string {
-  if (value == null) {
-    return "-";
-  }
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "-";
-  }
-  return formatTimestamp(date, timezone);
-}
 
 const LcmGrepSchema = Type.Object({
   pattern: Type.String({
@@ -94,12 +80,11 @@ export function createLcmGrepTool(input: {
       "Searches across messages and/or summaries stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
       "active context. Returns matching snippets with their summary/message IDs " +
-      "for follow-up with lcm_expand or lcm_describe.",
+      "for follow-up with lcm_expand or lcm_describe. " +
+
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
       const retrieval = input.lcm.getRetrieval();
-      const timezone = input.lcm.timezone;
-
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
       const mode = (p.mode as "regex" | "full_text") ?? "regex";
@@ -155,8 +140,8 @@ export function createLcmGrepTool(input: {
       }
       if (since || before) {
         lines.push(
-          `**Time filter:** ${since ? `since ${formatDisplayTime(since, timezone)}` : "since -∞"} | ${
-            before ? `before ${formatDisplayTime(before, timezone)}` : "before +∞"
+          `**Time filter:** ${since ? `since ${since.toISOString()}` : "since -∞"} | ${
+            before ? `before ${before.toISOString()}` : "before +∞"
           }`,
         );
       }
@@ -170,7 +155,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const msg of result.messages) {
           const snippet = truncateSnippet(msg.snippet);
-          const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatDisplayTime(msg.createdAt, timezone)}): ${snippet}`;
+          const line = `- [msg#${msg.messageId}] (${msg.role}, ${msg.createdAt.toISOString()}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
@@ -186,7 +171,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const sum of result.summaries) {
           const snippet = truncateSnippet(sum.snippet);
-          const line = `- [${sum.summaryId}] (${sum.kind}, ${formatDisplayTime(sum.createdAt, timezone)}): ${snippet}`;
+          const line = `- [${sum.summaryId}] (${sum.kind}, ${sum.createdAt.toISOString()}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
