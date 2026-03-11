@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { DbClient } from "../db/db-interface.js";
 import { SqliteClient } from "../db/sqlite-client.js";
 import { Dialect, type Backend } from "../db/dialect.js";
+import { EmbeddingClient, toVectorLiteral, type EmbeddingConfig } from "../embeddings.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { sanitizeTsQuery } from "./tsquery-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
@@ -97,7 +98,7 @@ export type ConversationRecord = {
 export type MessageSearchInput = {
   conversationId?: ConversationId;
   query: string;
-  mode: "regex" | "full_text";
+  mode: "regex" | "full_text" | "semantic";
   since?: Date;
   before?: Date;
   limit?: number;
@@ -228,6 +229,7 @@ const PART_COLS = "part_id, message_id, session_id, part_type, ordinal, text_con
 export class ConversationStore {
   private readonly fullTextAvailable: boolean;
   private readonly d: Dialect;
+  private readonly embeddingClient: EmbeddingClient | null;
   /**
    * Root (non-transactional) database client.
    * Query methods use the `db` getter which returns the transaction-scoped
@@ -244,11 +246,18 @@ export class ConversationStore {
 
   constructor(
     db: DbClient | DatabaseSync,
-    options?: { fullTextAvailable?: boolean; fts5Available?: boolean; backend?: Backend },
+    options?: { fullTextAvailable?: boolean; fts5Available?: boolean; backend?: Backend; embeddingConfig?: EmbeddingConfig },
   ) {
     this._rootDb = ensureDbClient(db);
     this.fullTextAvailable = options?.fullTextAvailable ?? options?.fts5Available ?? true;
     this.d = new Dialect(options?.backend ?? "sqlite");
+
+    if (this.d.pg && options?.embeddingConfig) {
+      const client = new EmbeddingClient(options.embeddingConfig);
+      this.embeddingClient = client.isConfigured() ? client : null;
+    } else {
+      this.embeddingClient = null;
+    }
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -414,6 +423,7 @@ export class ConversationStore {
     const messageId = result.lastInsertId!;
 
     await this.indexMessageForFullText(messageId, input.content);
+    this.embedOnInsert(messageId, input.content).catch(() => {});
 
     d.reset();
     const row = await this.db.queryOne<MessageRow>(
@@ -641,6 +651,16 @@ export class ConversationStore {
 
   async searchMessages(input: MessageSearchInput): Promise<MessageSearchResult[]> {
     const limit = input.limit ?? 50;
+
+    if (input.mode === "semantic") {
+      try {
+        return await this.searchSemantic(
+          input.query, limit, input.conversationId, input.since, input.before,
+        );
+      } catch {
+        return this.searchMessages({ ...input, mode: "full_text" });
+      }
+    }
 
     if (input.mode === "full_text") {
       if (this.fullTextAvailable) {
@@ -898,4 +918,59 @@ export class ConversationStore {
     });
   }
 
+  // ── Embedding helpers ──────────────────────────────────────────────────
+
+  private async embedOnInsert(messageId: MessageId, content: string): Promise<void> {
+    if (!this.embeddingClient || !this.d.pg) return;
+    if (!content || content.trim().length === 0) return;
+
+    const embedding = await this.embeddingClient.embedOne(content);
+    await this.db.run(
+      `UPDATE messages SET embedding = $1 WHERE message_id = $2`,
+      [toVectorLiteral(embedding), messageId],
+    );
+  }
+
+  async searchSemantic(
+    query: string, limit: number,
+    conversationId?: ConversationId, since?: Date, before?: Date,
+  ): Promise<MessageSearchResult[]> {
+    if (!this.d.pg || !this.embeddingClient) {
+      throw new Error("Semantic search requires PostgreSQL with pgvector and a configured embedding API key");
+    }
+
+    const queryEmbedding = await this.embeddingClient.embedOne(query);
+    const vectorLiteral = toVectorLiteral(queryEmbedding);
+
+    const d = this.d.reset();
+    const where: string[] = ["embedding IS NOT NULL"];
+    const params: unknown[] = [];
+
+    if (conversationId !== undefined) { where.push(`conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`created_at < ${d.p()}`); params.push(before.toISOString()); }
+
+    const result = await this.db.query<MessageRow & { rank: number }>(
+      `SELECT message_id, conversation_id, role, content, created_at,
+         1 - (embedding <=> '${vectorLiteral}'::vector) AS rank
+       FROM messages
+       WHERE ${where.join(" AND ")}
+       ORDER BY embedding <=> '${vectorLiteral}'::vector
+       LIMIT ${limit}`,
+      params,
+    );
+
+    return result.rows.map((row) => ({
+      messageId: row.message_id,
+      conversationId: row.conversation_id,
+      role: row.role,
+      snippet: row.content.substring(0, 200),
+      createdAt: new Date(row.created_at),
+      rank: row.rank,
+    }));
+  }
+
+  get embeddingsAvailable(): boolean {
+    return this.embeddingClient !== null && this.d.pg;
+  }
 }

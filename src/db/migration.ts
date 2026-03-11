@@ -722,6 +722,8 @@ export async function ensurePostgresSchema(db: DbClient): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_large_files_conv ON large_files (conversation_id, created_at);
   `);
 
+  // Try to add pgvector embedding columns (optional)
+  await addEmbeddingColumnsIfAvailable(db);
 }
 
 /**
@@ -764,5 +766,45 @@ async function migratePostgresSchema(db: DbClient): Promise<void> {
     await db.run(`ALTER TABLE summaries ADD COLUMN source_message_token_count INTEGER NOT NULL DEFAULT 0`);
   }
 
+  // Add embedding columns if pgvector is available
+  await addEmbeddingColumnsIfAvailable(db);
+}
+
+/**
+ * Attempt to add pgvector embedding columns. Silently skips if pgvector
+ * extension is not installed — embeddings are purely optional.
+ */
+async function addEmbeddingColumnsIfAvailable(db: DbClient): Promise<void> {
+  try {
+    await db.run(`CREATE EXTENSION IF NOT EXISTS vector`);
+  } catch {
+    return; // pgvector not installed — skip
+  }
+
+  const hasMessageEmbedding = await db.queryOne<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'messages' AND column_name = 'embedding'
+     ) AS exists`,
+  );
+  if (!hasMessageEmbedding?.exists) {
+    await db.run(`ALTER TABLE messages ADD COLUMN embedding vector(1536)`);
+    try {
+      await db.run(`CREATE INDEX IF NOT EXISTS idx_messages_embedding ON messages USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)`);
+    } catch { /* HNSW can fail on older pgvector — non-fatal */ }
+  }
+
+  const hasSummaryEmbedding = await db.queryOne<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'summaries' AND column_name = 'embedding'
+     ) AS exists`,
+  );
+  if (!hasSummaryEmbedding?.exists) {
+    await db.run(`ALTER TABLE summaries ADD COLUMN embedding vector(1536)`);
+    try {
+      await db.run(`CREATE INDEX IF NOT EXISTS idx_summaries_embedding ON summaries USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)`);
+    } catch { /* Non-fatal */ }
+  }
 }
 

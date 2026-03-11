@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { DbClient } from "../db/db-interface.js";
 import { SqliteClient } from "../db/sqlite-client.js";
 import { Dialect, type Backend } from "../db/dialect.js";
+import { EmbeddingClient, toVectorLiteral, type EmbeddingConfig } from "../embeddings.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { sanitizeTsQuery } from "./tsquery-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
@@ -68,7 +69,7 @@ export type ContextItemRecord = {
 export type SummarySearchInput = {
   conversationId?: number;
   query: string;
-  mode: "regex" | "full_text";
+  mode: "regex" | "full_text" | "semantic";
   since?: Date;
   before?: Date;
   limit?: number;
@@ -247,6 +248,8 @@ const FILE_COLS = "file_id, conversation_id, file_name, mime_type, byte_size, st
 export class SummaryStore {
   private readonly fullTextAvailable: boolean;
   private readonly d: Dialect;
+  private readonly embeddingClient: EmbeddingClient | null;
+  private readonly embeddingQueue: EmbeddingQueue | null;
   /** Root (non-transactional) database client. */
   private readonly _rootDb: DbClient;
   private readonly _txStore = new AsyncLocalStorage<DbClient>();
@@ -258,11 +261,35 @@ export class SummaryStore {
 
   constructor(
     db: DbClient | DatabaseSync,
-    options?: { fullTextAvailable?: boolean; fts5Available?: boolean; backend?: Backend },
+    options?: { fullTextAvailable?: boolean; fts5Available?: boolean; backend?: Backend; embeddingConfig?: EmbeddingConfig },
   ) {
     this._rootDb = ensureDbClient(db);
     this.fullTextAvailable = options?.fullTextAvailable ?? options?.fts5Available ?? true;
     this.d = new Dialect(options?.backend ?? "sqlite");
+
+    if (this.d.pg && options?.embeddingConfig) {
+      const client = new EmbeddingClient(options.embeddingConfig);
+      this.embeddingClient = client.isConfigured() ? client : null;
+    } else {
+      this.embeddingClient = null;
+    }
+
+    if (this.embeddingClient) {
+      this.embeddingQueue = new EmbeddingQueue(this.embeddingClient, db);
+      this.embeddingQueue.start();
+    } else {
+      this.embeddingQueue = null;
+    }
+  }
+
+  /** Flush all pending embeddings without stopping the queue timer. */
+  async drainEmbeddingQueue(): Promise<void> {
+    if (this.embeddingQueue) await this.embeddingQueue.drain();
+  }
+
+  /** Gracefully stop the embedding queue (drain + stop timer). Call on shutdown. */
+  async stopEmbeddingQueue(): Promise<void> {
+    if (this.embeddingQueue) await this.embeddingQueue.stop();
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -329,6 +356,8 @@ export class SummaryStore {
         ]);
       } catch { /* FTS indexing is best-effort */ }
     }
+
+    this.embedOnInsert(input.summaryId, input.content).catch(() => {});
 
     return toSummaryRecord(row);
   }
@@ -630,6 +659,14 @@ export class SummaryStore {
   async searchSummaries(input: SummarySearchInput): Promise<SummarySearchResult[]> {
     const limit = input.limit ?? 50;
 
+    if (input.mode === "semantic") {
+      try {
+        return await this.searchSemantic(input.query, limit, input.conversationId, input.since, input.before);
+      } catch {
+        return this.searchSummaries({ ...input, mode: "full_text" });
+      }
+    }
+
     if (input.mode === "full_text") {
       if (this.fullTextAvailable) {
         try {
@@ -870,4 +907,60 @@ export class SummaryStore {
     return result.rows.map(toLargeFileRecord);
   }
 
+  // ── Embedding helpers ──────────────────────────────────────────────────
+
+  private async embedOnInsert(summaryId: string, content: string): Promise<void> {
+    if (!this.embeddingClient || !this.d.pg) return;
+    if (!content || content.trim().length === 0) return;
+
+    const embedding = await this.embeddingClient.embedOne(content);
+    await this.db.run(
+      `UPDATE summaries SET embedding = $1 WHERE summary_id = $2`,
+      [toVectorLiteral(embedding), summaryId],
+    );
+  }
+
+  async searchSemantic(
+    query: string, limit: number,
+    conversationId?: number, since?: Date, before?: Date,
+  ): Promise<SummarySearchResult[]> {
+    if (!this.d.pg || !this.embeddingClient) {
+      throw new Error("Semantic search requires PostgreSQL with pgvector and a configured embedding API key");
+    }
+
+    const queryEmbedding = await this.embeddingClient.embedOne(query);
+    const vectorLiteral = toVectorLiteral(queryEmbedding);
+
+    const d = this.d.reset();
+    const where: string[] = ["embedding IS NOT NULL"];
+    const params: unknown[] = [];
+
+    if (conversationId !== undefined) { where.push(`conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`created_at < ${d.p()}`); params.push(before.toISOString()); }
+
+    const result = await this.db.query<SummarySearchRow & { content: string }>(
+      `SELECT summary_id, conversation_id, kind, content, created_at,
+         1 - (embedding <=> '${vectorLiteral}'::vector) AS rank,
+         LEFT(content, 200) AS snippet
+       FROM summaries
+       WHERE ${where.join(" AND ")}
+       ORDER BY embedding <=> '${vectorLiteral}'::vector
+       LIMIT ${limit}`,
+      params,
+    );
+
+    return result.rows.map((row) => ({
+      summaryId: row.summary_id,
+      conversationId: row.conversation_id,
+      kind: row.kind,
+      snippet: row.content.substring(0, 200),
+      createdAt: new Date(row.created_at),
+      rank: row.rank,
+    }));
+  }
+
+  get embeddingsAvailable(): boolean {
+    return this.embeddingClient !== null && this.d.pg;
+  }
 }

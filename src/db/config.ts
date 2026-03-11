@@ -15,6 +15,12 @@ export type LcmConfig = {
   statelessSessionPatterns: string[];
   /** When true, stateless session pattern matching is enforced. */
   skipStatelessSessions: boolean;
+  /** API key for OpenAI-compatible embedding generation. Falls back to OPENAI_API_KEY env var. */
+  embeddingApiKey: string;
+  /** Base URL for embedding API. Defaults to OpenAI. */
+  embeddingBaseUrl: string;
+  /** Embedding model name. Defaults to text-embedding-3-small. */
+  embeddingModel: string;
   contextThreshold: number;
   freshTailCount: number;
   leafMinFanout: number;
@@ -169,6 +175,12 @@ export function resolveLcmConfig(
       env.LCM_SKIP_STATELESS_SESSIONS !== undefined
         ? env.LCM_SKIP_STATELESS_SESSIONS === "true"
         : toBool(pc.skipStatelessSessions) ?? true,
+    embeddingApiKey:
+      env.LCM_EMBEDDING_API_KEY ?? env.OPENAI_API_KEY ?? toStr(pc.embeddingApiKey) ?? "",
+    embeddingBaseUrl:
+      env.LCM_EMBEDDING_BASE_URL ?? toStr(pc.embeddingBaseUrl) ?? "https://api.openai.com/v1",
+    embeddingModel:
+      env.LCM_EMBEDDING_MODEL ?? toStr(pc.embeddingModel) ?? "text-embedding-3-small",
     contextThreshold:
       (env.LCM_CONTEXT_THRESHOLD !== undefined ? parseFloat(env.LCM_CONTEXT_THRESHOLD) : undefined)
         ?? toNumber(pc.contextThreshold) ?? 0.75,
