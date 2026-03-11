@@ -950,13 +950,17 @@ export class ConversationStore {
     if (since) { where.push(`created_at >= ${d.p()}`); params.push(since.toISOString()); }
     if (before) { where.push(`created_at < ${d.p()}`); params.push(before.toISOString()); }
 
+    const vecParam = d.p();
+    const limitParam = d.p();
+    params.push(vectorLiteral, limit);
+
     const result = await this.db.query<MessageRow & { rank: number }>(
       `SELECT message_id, conversation_id, role, content, created_at,
-         1 - (embedding <=> '${vectorLiteral}'::vector) AS rank
+         1 - (embedding <=> ${vecParam}::vector) AS rank
        FROM messages
        WHERE ${where.join(" AND ")}
-       ORDER BY embedding <=> '${vectorLiteral}'::vector
-       LIMIT ${limit}`,
+       ORDER BY embedding <=> ${vecParam}::vector
+       LIMIT ${limitParam}`,
       params,
     );
 
