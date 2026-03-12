@@ -81,6 +81,9 @@ export class EmbeddingQueue {
    * Add an item to the embedding queue. Non-blocking.
    * For messages with empty content (pure tool-call turns), pass empty string —
    * the queue will synthesize embedding text from message_parts at flush time.
+   *
+   * Safe to call multiple times for the same id — duplicates are deduped at
+   * flush time by checking if an embedding already exists.
    */
   enqueue(table: "messages" | "summaries", id: number | string, content: string): void {
     // Summaries should always have content; skip if empty
@@ -205,8 +208,28 @@ export class EmbeddingQueue {
       // Remove ready items from queue, keep the rest
       this.queue = notReady;
 
-      // Resolve empty-content messages from their parts
+      // Deduplicate: skip items that already have embeddings (e.g. re-enqueued
+      // from createMessageParts after the first enqueue already embedded it)
+      const deduped: QueueItem[] = [];
       for (const item of ready) {
+        if (item.retries === 0) {
+          try {
+            const idCol = item.table === "messages" ? "message_id" : "summary_id";
+            const { rows } = await this.db.query<{ has_emb: boolean }>(
+              `SELECT embedding IS NOT NULL AS has_emb FROM ${item.table} WHERE ${idCol} = $1`,
+              [item.id],
+            );
+            if (rows.length > 0 && rows[0].has_emb) continue; // already embedded
+          } catch {
+            // If check fails, proceed with embedding attempt
+          }
+        }
+        deduped.push(item);
+      }
+      if (deduped.length === 0) return;
+
+      // Resolve empty-content messages from their parts
+      for (const item of deduped) {
         if ((!item.content || item.content.trim().length === 0) && item.table === "messages") {
           item.content = await this.synthesizeFromParts(item.id);
           if (item.content) {
@@ -216,8 +239,8 @@ export class EmbeddingQueue {
       }
 
       // Filter out items that are still empty after synthesis (no parts at all)
-      const embeddable = ready.filter(r => r.content && r.content.trim().length > 0);
-      const empty = ready.filter(r => !r.content || r.content.trim().length === 0);
+      const embeddable = deduped.filter(r => r.content && r.content.trim().length > 0);
+      const empty = deduped.filter(r => !r.content || r.content.trim().length === 0);
       if (empty.length > 0) {
         this.log(`Skipped ${empty.length} items with no embeddable content`);
       }

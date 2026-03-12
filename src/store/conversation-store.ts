@@ -582,6 +582,7 @@ export class ConversationStore {
       return;
     }
 
+    let hasToolParts = false;
     for (const input of parts) {
       const partId = randomUUID();
       const d = this.d.reset();
@@ -596,6 +597,15 @@ export class ConversationStore {
           input.textContent, input.toolCallId, input.toolName, input.toolInput, input.toolOutput, input.metadata,
         ],
       );
+      if (input.partType === "tool") hasToolParts = true;
+    }
+
+    // Re-enqueue for embedding if this message has tool parts.
+    // createMessage enqueues immediately but with empty content for tool-only
+    // turns. The queue may flush before parts exist, so re-enqueue now that
+    // parts are persisted and available for synthesis.
+    if (hasToolParts && this.embeddingQueue) {
+      this.embeddingQueue.enqueue("messages", messageId, "");
     }
   }
 

@@ -777,6 +777,9 @@ export class LcmContextEngine implements ContextEngine {
   private readonly ignoreSessionPatterns: RegExp[];
   private readonly statelessSessionPatterns: RegExp[];
   private sessionOperationQueues = new Map<string, Promise<void>>();
+  /** Global mutex for bootstrap operations. Prevents concurrent this.db swaps
+   *  across sessions that share the same store instances. */
+  private bootstrapLock: Promise<void> = Promise.resolve();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
@@ -1420,6 +1423,16 @@ export class LcmContextEngine implements ContextEngine {
     }
     await this.ensureMigrated();
 
+    // Serialize all bootstraps globally to prevent this.db swap races.
+    // The withSharedTransaction/withClient pattern swaps instance-level this.db
+    // on shared store singletons, which is not safe when multiple sessions
+    // bootstrap concurrently (event loop interleaving).
+    const prevLock = this.bootstrapLock;
+    let releaseLock!: () => void;
+    this.bootstrapLock = new Promise<void>((resolve) => { releaseLock = resolve; });
+    await prevLock;
+
+    try {
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () =>
@@ -1548,6 +1561,9 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     return result;
+    } finally {
+      releaseLock();
+    }
   }
 
   private async ingestSingle(params: {
