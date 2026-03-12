@@ -450,6 +450,7 @@ export class ConversationStore {
       const messageId = result.lastInsertId!;
 
       await this.indexMessageForFullText(messageId, input.content);
+      this.embedOnInsert(messageId, input.content).catch(() => {});
 
       d.reset();
       const row = await this.db.queryOne<MessageRow>(
