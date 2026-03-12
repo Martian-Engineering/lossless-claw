@@ -314,7 +314,26 @@ function blockFromPart(part: MessagePartRecord): unknown {
     // OpenAI format so the Responses API gets the {type:"reasoning", id:"rs_…"} it expects.
     const restored = tryRestoreOpenAIReasoning(metadata.raw as Record<string, unknown>);
     if (restored) return restored;
-    return metadata.raw;
+
+    // Don't return raw for tool call/result blocks — they need to go through
+    // toolCallBlockFromPart/toolResultBlockFromPart which properly normalize
+    // arguments (stringify if object) and format for the target provider.
+    // Returning raw here causes arguments to be passed as a JS object instead
+    // of a JSON string, which breaks xAI/OpenAI Chat Completions API (422).
+    const rawType = (metadata.raw as Record<string, unknown>).type as string | undefined;
+    const isToolBlock =
+      rawType === "toolCall" ||
+      rawType === "tool_use" ||
+      rawType === "tool-use" ||
+      rawType === "toolUse" ||
+      rawType === "functionCall" ||
+      rawType === "function_call" ||
+      rawType === "function_call_output" ||
+      rawType === "toolResult" ||
+      rawType === "tool_result";
+    if (!isToolBlock) {
+      return metadata.raw;
+    }
   }
 
   if (part.partType === "reasoning") {
