@@ -21,6 +21,14 @@
       "label": "Ignored Sessions",
       "help": "Glob patterns for session keys to exclude from LCM storage"
     },
+    "statelessSessionPatterns": {
+      "label": "Stateless Sessions",
+      "help": "Glob patterns for session keys that can read from LCM but never write to it"
+    },
+    "skipStatelessSessions": {
+      "label": "Skip Stateless Sessions",
+      "help": "When enabled, matching stateless session keys skip LCM persistence and grant writes"
+    },
     "summaryModel": {
       "label": "Summary Model",
       "help": "Model override for LCM summarization (e.g., 'gpt-5.4' to reuse the session provider, or 'openai-resp/gpt-5.4' for a full cross-provider ref)"
@@ -78,6 +86,15 @@
         "items": {
           "type": "string"
         }
+      },
+      "statelessSessionPatterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "skipStatelessSessions": {
+        "type": "boolean"
       },
       "largeFileThresholdTokens": {
         "type": "integer",

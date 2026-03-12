@@ -24,6 +24,8 @@ function createTestConfig(databasePath: string): LcmConfig {
     enabled: true,
     databasePath,
     ignoreSessionPatterns: [],
+    statelessSessionPatterns: [],
+    skipStatelessSessions: true,
     contextThreshold: 0.75,
     freshTailCount: 8,
     leafMinFanout: 8,
@@ -480,6 +482,221 @@ describe("LcmContextEngine ignored sessions", () => {
         resolveDelegatedExpansionGrantId(ignoredChildSessionKey)!,
       ),
     ).not.toBeNull();
+  });
+});
+
+describe("LcmContextEngine stateless sessions", () => {
+  const statelessSessionKey = "agent:main:ephemeral:preview";
+  const statefulSessionKey = "agent:main:chat:preview";
+  const runtimeSessionId = "runtime-stateless-session";
+  const statefulRuntimeSessionId = "runtime-stateful-session";
+
+  it("matches stateless patterns on sessionKey and can be disabled globally", () => {
+    const enabledEngine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+    });
+    const disabledEngine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      skipStatelessSessions: false,
+    });
+
+    expect(enabledEngine.isStatelessSession(statelessSessionKey)).toBe(true);
+    expect(enabledEngine.isStatelessSession(statefulSessionKey)).toBe(false);
+    expect(disabledEngine.isStatelessSession(statelessSessionKey)).toBe(false);
+  });
+
+  it("skips bootstrap persistence for stateless session keys", async () => {
+    const sessionFile = createSessionFilePath("stateless-bootstrap");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "bootstrap me" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "bootstrap reply" }],
+    } as AgentMessage);
+
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+    });
+
+    const stateless = await engine.bootstrap({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      sessionFile,
+    });
+
+    const stateful = await engine.bootstrap({
+      sessionId: statefulRuntimeSessionId,
+      sessionKey: statefulSessionKey,
+      sessionFile,
+    });
+
+    expect(stateless).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "stateless session",
+    });
+    expect(
+      await engine.getConversationStore().getConversationBySessionId(runtimeSessionId),
+    ).toBeNull();
+    expect(stateful.bootstrapped).toBe(true);
+    expect(stateful.importedMessages).toBe(2);
+  });
+
+  it("skips ingest and ingestBatch writes for stateless session keys", async () => {
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+    });
+
+    const ingested = await engine.ingest({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      message: makeMessage({ role: "user", content: "drop me" }),
+    });
+    const batched = await engine.ingestBatch({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      messages: [
+        makeMessage({ role: "user", content: "drop batch user" }),
+        makeMessage({ role: "assistant", content: "drop batch assistant" }),
+      ],
+    });
+    const included = await engine.ingest({
+      sessionId: runtimeSessionId,
+      sessionKey: statefulSessionKey,
+      message: makeMessage({ role: "user", content: "keep me" }),
+    });
+
+    expect(ingested).toEqual({ ingested: false });
+    expect(batched).toEqual({ ingestedCount: 0 });
+    expect(included).toEqual({ ingested: true });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(runtimeSessionId);
+    expect(conversation).not.toBeNull();
+    expect(
+      await engine.getConversationStore().getMessageCount(conversation!.conversationId),
+    ).toBe(1);
+  });
+
+  it("allows assemble reads for stateless session keys", async () => {
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+    });
+
+    await engine.ingest({
+      sessionId: runtimeSessionId,
+      sessionKey: statefulSessionKey,
+      message: makeMessage({ role: "user", content: "persisted context" }),
+    });
+
+    const assembled = await engine.assemble({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      messages: [],
+      tokenBudget: 500,
+    });
+
+    expect(assembled.messages).toHaveLength(1);
+    expect(assembled.messages[0]?.content).toBe("persisted context");
+  });
+
+  it("skips afterTurn and compact writes for stateless session keys", async () => {
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+    });
+
+    await engine.afterTurn({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      sessionFile: createSessionFilePath("stateless-after-turn"),
+      messages: [makeMessage({ role: "assistant", content: "ignored turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 1000,
+    });
+
+    await engine.ingest({
+      sessionId: runtimeSessionId,
+      sessionKey: statefulSessionKey,
+      message: makeMessage({ role: "user", content: "persisted context" }),
+    });
+
+    const compactResult = await engine.compact({
+      sessionId: runtimeSessionId,
+      sessionKey: statelessSessionKey,
+      sessionFile: createSessionFilePath("stateless-compact"),
+      tokenBudget: 1000,
+    });
+
+    expect(compactResult).toEqual({
+      ok: true,
+      compacted: false,
+      reason: "stateless session",
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(runtimeSessionId);
+    expect(conversation).not.toBeNull();
+    expect(
+      await engine.getConversationStore().getMessageCount(conversation!.conversationId),
+    ).toBe(1);
+  });
+
+  it("skips delegated grant writes for stateless session keys", async () => {
+    const childSessionKey = "agent:main:subagent:worker-123";
+    const engine = createEngineWithDeps(
+      { statelessSessionPatterns: ["agent:*:ephemeral:**"] },
+      {
+        resolveSessionIdFromSessionKey: vi.fn(async (sessionKey: string) =>
+          sessionKey === statefulSessionKey ? runtimeSessionId : undefined,
+        ),
+      },
+    );
+
+    await engine.ingest({
+      sessionId: runtimeSessionId,
+      sessionKey: statefulSessionKey,
+      message: makeMessage({ role: "user", content: "parent context" }),
+    });
+
+    const skipped = await engine.prepareSubagentSpawn({
+      parentSessionKey: statelessSessionKey,
+      childSessionKey,
+    });
+    const included = await engine.prepareSubagentSpawn({
+      parentSessionKey: statefulSessionKey,
+      childSessionKey,
+    });
+
+    expect(skipped).toBeUndefined();
+    expect(resolveDelegatedExpansionGrantId(childSessionKey)).not.toBeNull();
+
+    included?.rollback();
+    expect(resolveDelegatedExpansionGrantId(childSessionKey)).toBeNull();
+  });
+
+  it("skips subagent cleanup for stateless child session keys", async () => {
+    const childSessionKey = statelessSessionKey;
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: childSessionKey,
+      issuerSessionId: "issuer-1",
+      allowedConversationIds: [1],
+    });
+
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+    });
+
+    await engine.onSubagentEnded({
+      childSessionKey,
+      reason: "deleted",
+    });
+
+    expect(resolveDelegatedExpansionGrantId(childSessionKey)).not.toBeNull();
   });
 });
 

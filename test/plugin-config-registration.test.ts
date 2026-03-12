@@ -122,6 +122,8 @@ describe("lcm plugin registration", () => {
       freshTailCount: 7,
       dbPath,
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      skipStatelessSessions: true,
       largeFileThresholdTokens: 12345,
     });
 
@@ -138,6 +140,8 @@ describe("lcm plugin registration", () => {
       freshTailCount: 7,
       databasePath: dbPath,
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      skipStatelessSessions: true,
       largeFileTokenThreshold: 12345,
     });
     expect(infoLog).toHaveBeenCalledWith(
@@ -145,6 +149,9 @@ describe("lcm plugin registration", () => {
     );
     expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:*, agent:main:subagent:**",
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Stateless session patterns: 1 pattern(s): agent:*:ephemeral:**",
     );
     expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: (unconfigured)",

@@ -6,6 +6,10 @@ export type LcmConfig = {
   databasePath: string;
   /** Glob patterns for session keys to exclude from LCM storage entirely. */
   ignoreSessionPatterns: string[];
+  /** Glob patterns for session keys that may read from LCM but never write to it. */
+  statelessSessionPatterns: string[];
+  /** When true, stateless session pattern matching is enforced. */
+  skipStatelessSessions: boolean;
   contextThreshold: number;
   freshTailCount: number;
   leafMinFanout: number;
@@ -114,6 +118,17 @@ export function resolveLcmConfig(
           .map((entry) => entry.trim())
           .filter(Boolean)
         : toStrArray(pc.ignoreSessionPatterns) ?? [],
+    statelessSessionPatterns:
+      env.LCM_STATELESS_SESSION_PATTERNS !== undefined
+        ? env.LCM_STATELESS_SESSION_PATTERNS
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+        : toStrArray(pc.statelessSessionPatterns) ?? [],
+    skipStatelessSessions:
+      env.LCM_SKIP_STATELESS_SESSIONS !== undefined
+        ? env.LCM_SKIP_STATELESS_SESSIONS === "true"
+        : toBool(pc.skipStatelessSessions) ?? true,
     contextThreshold:
       (env.LCM_CONTEXT_THRESHOLD !== undefined ? parseFloat(env.LCM_CONTEXT_THRESHOLD) : undefined)
         ?? toNumber(pc.contextThreshold) ?? 0.75,

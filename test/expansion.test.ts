@@ -7,6 +7,8 @@ const BASE_CONFIG: LcmConfig = {
   enabled: true,
   databasePath: ":memory:",
   ignoreSessionPatterns: [],
+  statelessSessionPatterns: [],
+  skipStatelessSessions: true,
   contextThreshold: 0.75,
   freshTailCount: 8,
   leafMinFanout: 8,

@@ -7,6 +7,8 @@ describe("resolveLcmConfig", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.enabled).toBe(true);
     expect(config.ignoreSessionPatterns).toEqual([]);
+    expect(config.statelessSessionPatterns).toEqual([]);
+    expect(config.skipStatelessSessions).toBe(true);
     expect(config.contextThreshold).toBe(0.75);
     expect(config.freshTailCount).toBe(32);
     expect(config.incrementalMaxDepth).toBe(0);
@@ -25,6 +27,8 @@ describe("resolveLcmConfig", () => {
       freshTailCount: 16,
       incrementalMaxDepth: -1,
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
+      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      skipStatelessSessions: false,
       leafMinFanout: 4,
       condensedMinFanout: 2,
       autocompactDisabled: true,
@@ -36,6 +40,8 @@ describe("resolveLcmConfig", () => {
       "agent:*:cron:*",
       "agent:main:subagent:**",
     ]);
+    expect(config.statelessSessionPatterns).toEqual(["agent:*:ephemeral:**"]);
+    expect(config.skipStatelessSessions).toBe(false);
     expect(config.contextThreshold).toBe(0.5);
     expect(config.freshTailCount).toBe(16);
     expect(config.incrementalMaxDepth).toBe(-1);
@@ -53,12 +59,16 @@ describe("resolveLcmConfig", () => {
       LCM_ENABLED: "false",
       LCM_AUTOCOMPACT_DISABLED: "true",
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
+      LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
+      LCM_SKIP_STATELESS_SESSIONS: "false",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
       freshTailCount: 16,
       incrementalMaxDepth: -1,
       ignoreSessionPatterns: ["agent:*:test:*"],
+      statelessSessionPatterns: ["agent:*:preview:*"],
+      skipStatelessSessions: true,
       enabled: true,
       autocompactDisabled: false,
     };
@@ -68,6 +78,11 @@ describe("resolveLcmConfig", () => {
       "agent:*:cron:*",
       "agent:main:subagent:**",
     ]);
+    expect(config.statelessSessionPatterns).toEqual([
+      "agent:*:ephemeral:**",
+      "agent:main:preview:*",
+    ]);
+    expect(config.skipStatelessSessions).toBe(false);
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
@@ -95,6 +110,8 @@ describe("resolveLcmConfig", () => {
       contextThreshold: "0.6",
       freshTailCount: "24",
       ignoreSessionPatterns: "agent:*:cron:*, agent:main:subagent:**",
+      statelessSessionPatterns: "agent:*:ephemeral:**, agent:main:preview:*",
+      skipStatelessSessions: "false",
     });
     expect(config.contextThreshold).toBe(0.6);
     expect(config.freshTailCount).toBe(24);
@@ -102,6 +119,11 @@ describe("resolveLcmConfig", () => {
       "agent:*:cron:*",
       "agent:main:subagent:**",
     ]);
+    expect(config.statelessSessionPatterns).toEqual([
+      "agent:*:ephemeral:**",
+      "agent:main:preview:*",
+    ]);
+    expect(config.skipStatelessSessions).toBe(false);
   });
 
   it("ignores invalid plugin config values", () => {
@@ -183,6 +205,17 @@ describe("resolveLcmConfig", () => {
     );
 
     expect(config.ignoreSessionPatterns).toEqual(["agent:*:cron:*"]);
+  });
+
+  it("keeps empty stateless session patterns out of resolved config", () => {
+    const config = resolveLcmConfig(
+      { LCM_STATELESS_SESSION_PATTERNS: " agent:*:ephemeral:** , , " } as NodeJS.ProcessEnv,
+      {
+        statelessSessionPatterns: ["agent:*:preview:*"],
+      },
+    );
+
+    expect(config.statelessSessionPatterns).toEqual(["agent:*:ephemeral:**"]);
   });
 
   it("uses summary model overrides from env vars", () => {
