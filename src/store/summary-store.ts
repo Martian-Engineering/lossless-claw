@@ -4,6 +4,7 @@ import type { DbClient } from "../db/db-interface.js";
 import { SqliteClient } from "../db/sqlite-client.js";
 import { Dialect, type Backend } from "../db/dialect.js";
 import { EmbeddingClient, toVectorLiteral, type EmbeddingConfig } from "../embeddings.js";
+import { EmbeddingQueue } from "../embedding-queue.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { sanitizeTsQuery } from "./tsquery-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
@@ -357,7 +358,9 @@ export class SummaryStore {
       } catch { /* FTS indexing is best-effort */ }
     }
 
-    this.embedOnInsert(input.summaryId, input.content).catch(() => {});
+    if (this.embeddingQueue) {
+      this.embeddingQueue.enqueue("summaries", input.summaryId, input.content);
+    }
 
     return toSummaryRecord(row);
   }

@@ -17,8 +17,12 @@ const EMBEDDING_BASE_URL = "https://api.openai.com/v1";
 /** Maximum texts per single API call (OpenAI limit is 2048, we stay conservative) */
 const MAX_BATCH_SIZE = 512;
 
-/** Maximum tokens we'll try to embed in one text. Truncate beyond this. */
-const MAX_INPUT_TOKENS_APPROX = 8000; // ~32k chars, well within 8191 token limit
+/**
+ * Maximum *characters* for embedding input. OpenAI's limit is 8192 tokens;
+ * worst-case token:char ratio is ~1:2 for code-heavy/CJK content.
+ * 12k chars ≈ 6k tokens at worst, leaving headroom.
+ */
+const MAX_INPUT_CHARS = 12000;
 
 export interface EmbeddingConfig {
   apiKey?: string;
@@ -63,8 +67,8 @@ export class EmbeddingClient {
 
     // Truncate overly long texts
     const truncated = texts.map((t) =>
-      t.length > MAX_INPUT_TOKENS_APPROX * 4
-        ? t.slice(0, MAX_INPUT_TOKENS_APPROX * 4)
+      t.length > MAX_INPUT_CHARS
+        ? t.slice(0, MAX_INPUT_CHARS)
         : t,
     );
 

@@ -5,6 +5,7 @@ import type { DbClient } from "../db/db-interface.js";
 import { SqliteClient } from "../db/sqlite-client.js";
 import { Dialect, type Backend } from "../db/dialect.js";
 import { EmbeddingClient, toVectorLiteral, type EmbeddingConfig } from "../embeddings.js";
+import { EmbeddingQueue } from "../embedding-queue.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { sanitizeTsQuery } from "./tsquery-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
@@ -230,6 +231,7 @@ export class ConversationStore {
   private readonly fullTextAvailable: boolean;
   private readonly d: Dialect;
   private readonly embeddingClient: EmbeddingClient | null;
+  private readonly embeddingQueue: EmbeddingQueue | null;
   /**
    * Root (non-transactional) database client.
    * Query methods use the `db` getter which returns the transaction-scoped
@@ -258,6 +260,23 @@ export class ConversationStore {
     } else {
       this.embeddingClient = null;
     }
+
+    // Set up batched embedding queue (replaces fire-and-forget embedOnInsert)
+    if (this.embeddingClient) {
+      this.embeddingQueue = new EmbeddingQueue(this.embeddingClient, db, {
+        log: (msg) => console.error(`[lcm:conv-embedding-queue] ${msg}`),
+      });
+      this.embeddingQueue.start();
+      console.error(`[lcm:conv-store] embedding queue started (batch=2s, retry=5x)`);
+    } else {
+      this.embeddingQueue = null;
+      console.error(`[lcm:conv-store] embedding queue NOT started (no embedding client)`);
+    }
+  }
+
+  /** Gracefully drain pending embeddings. Call on shutdown. */
+  async stopEmbeddingQueue(): Promise<void> {
+    if (this.embeddingQueue) await this.embeddingQueue.stop();
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -423,7 +442,9 @@ export class ConversationStore {
     const messageId = result.lastInsertId!;
 
     await this.indexMessageForFullText(messageId, input.content);
-    this.embedOnInsert(messageId, input.content).catch(() => {});
+    if (this.embeddingQueue) {
+      this.embeddingQueue.enqueue("messages", messageId, input.content);
+    }
 
     d.reset();
     const row = await this.db.queryOne<MessageRow>(
@@ -450,7 +471,9 @@ export class ConversationStore {
       const messageId = result.lastInsertId!;
 
       await this.indexMessageForFullText(messageId, input.content);
-      this.embedOnInsert(messageId, input.content).catch(() => {});
+      if (this.embeddingQueue) {
+        this.embeddingQueue.enqueue("messages", messageId, input.content);
+      }
 
       d.reset();
       const row = await this.db.queryOne<MessageRow>(
