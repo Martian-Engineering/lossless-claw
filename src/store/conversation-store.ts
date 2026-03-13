@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { DbClient } from "../db/db-interface.js";
 import { Dialect, type Backend } from "../db/dialect.js";
@@ -218,19 +219,24 @@ export class ConversationStore {
   private readonly fullTextAvailable: boolean;
   private readonly d: Dialect;
   /**
-   * The active database client. During a transaction, this is temporarily
-   * swapped to the transaction-scoped client so all queries run on the
-   * same connection. Outside transactions, this is the pool/connection.
+   * Root (non-transactional) database client.
+   * Query methods use the `db` getter which returns the transaction-scoped
+   * client from AsyncLocalStorage when inside a transaction, falling back
+   * to this root client otherwise.
    */
-  private db: DbClient;
-  private readonly rootDb: DbClient;
+  private readonly _rootDb: DbClient;
+  private readonly _txStore = new AsyncLocalStorage<DbClient>();
+
+  /** Active DB client — transaction-scoped if inside withTransaction/withClient, else root. */
+  private get db(): DbClient {
+    return this._txStore.getStore() ?? this._rootDb;
+  }
 
   constructor(
     db: DbClient,
     options?: { fullTextAvailable?: boolean; backend?: Backend },
   ) {
-    this.db = db;
-    this.rootDb = db;
+    this._rootDb = db;
     this.fullTextAvailable = options?.fullTextAvailable ?? true;
     this.d = new Dialect(options?.backend ?? "sqlite");
   }
@@ -240,21 +246,17 @@ export class ConversationStore {
   /**
    * Execute an operation within a database transaction.
    *
-   * For the duration of the callback, `this.db` is swapped to the
-   * transaction-scoped client so all queries run on the same connection.
-   * This is critical for Postgres where the pool hands out different
-   * connections per query — without the swap, BEGIN/COMMIT would land
-   * on different connections than the actual queries.
+   * Uses AsyncLocalStorage to scope the transaction client to this async
+   * call chain. All queries within the callback automatically use the
+   * transaction-scoped client via the `db` getter — no instance field swap,
+   * so concurrent sessions sharing this store singleton are safe.
    */
   async withTransaction<T>(operation: () => Promise<T> | T): Promise<T> {
-    const outerDb = this.db;
-    return outerDb.transaction(async (txClient) => {
-      this.db = txClient;
-      try {
-        return await operation();
-      } finally {
-        this.db = outerDb;
-      }
+    if (this._txStore.getStore()) {
+      return operation();
+    }
+    return this._rootDb.transaction(async (txClient) => {
+      return this._txStore.run(txClient, operation);
     });
   }
 

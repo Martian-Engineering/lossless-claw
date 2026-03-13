@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { DbClient } from "../db/db-interface.js";
 import { Dialect, type Backend } from "../db/dialect.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
@@ -236,16 +237,20 @@ const FILE_COLS = "file_id, conversation_id, file_name, mime_type, byte_size, st
 export class SummaryStore {
   private readonly fullTextAvailable: boolean;
   private readonly d: Dialect;
-  /** Active DB client. Swapped to txn client inside withTransaction. */
-  private db: DbClient;
-  private readonly rootDb: DbClient;
+  /** Root (non-transactional) database client. */
+  private readonly _rootDb: DbClient;
+  private readonly _txStore = new AsyncLocalStorage<DbClient>();
+
+  /** Active DB client — transaction-scoped if inside withTransaction/withClient, else root. */
+  private get db(): DbClient {
+    return this._txStore.getStore() ?? this._rootDb;
+  }
 
   constructor(
     db: DbClient,
     options?: { fullTextAvailable?: boolean; backend?: Backend },
   ) {
-    this.db = db;
-    this.rootDb = db;
+    this._rootDb = db;
     this.fullTextAvailable = options?.fullTextAvailable ?? true;
     this.d = new Dialect(options?.backend ?? "sqlite");
   }
@@ -253,14 +258,11 @@ export class SummaryStore {
   // ── Transaction helpers ──────────────────────────────────────────────────
 
   async withTransaction<T>(operation: () => Promise<T> | T): Promise<T> {
-    const outerDb = this.db;
-    return outerDb.transaction(async (txClient) => {
-      this.db = txClient;
-      try {
-        return await operation();
-      } finally {
-        this.db = outerDb;
-      }
+    if (this._txStore.getStore()) {
+      return operation();
+    }
+    return this._rootDb.transaction(async (txClient) => {
+      return this._txStore.run(txClient, operation);
     });
   }
 

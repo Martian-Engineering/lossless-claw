@@ -788,7 +788,12 @@ export class LcmContextEngine implements ContextEngine {
     this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
 
     const db = createLcmConnection(this.config);
-    const features = getLcmDbFeatures(this.config.backend);
+    // Pass the underlying SQLite handle for FTS5 probing when backend is sqlite.
+    // Without this, getLcmDbFeatures returns fullTextAvailable=false and FTS5
+    // silently degrades to LIKE-based search on every SQLite install.
+    const features = this.config.backend === "sqlite"
+      ? getLcmDbFeatures("sqlite", getLcmConnection(this.config.databasePath))
+      : getLcmDbFeatures(this.config.backend);
     this.fullTextAvailable = features.fullTextAvailable;
 
     // Run migrations eagerly at construction time so the schema exists
@@ -935,12 +940,10 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
     if (this.config.backend === 'postgres') {
-      try {
-        const db = createLcmConnection(this.config);
-        await ensurePostgresSchema(db);
-      } catch (err: any) {
-        this.deps.log.warn(`[lcm] Postgres schema migration failed: ${err.message}`);
-      }
+      // Let migration errors propagate — if schema setup fails, the engine
+      // must not mark itself as migrated. Subsequent calls will retry.
+      const db = createLcmConnection(this.config);
+      await ensurePostgresSchema(db);
       this.migrated = true;
       return;
     }
