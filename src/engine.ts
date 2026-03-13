@@ -777,8 +777,9 @@ export class LcmContextEngine implements ContextEngine {
   private readonly ignoreSessionPatterns: RegExp[];
   private readonly statelessSessionPatterns: RegExp[];
   private sessionOperationQueues = new Map<string, Promise<void>>();
-  /** Global mutex for bootstrap operations. Prevents concurrent this.db swaps
-   *  across sessions that share the same store instances. */
+  /** Global mutex for bootstrap operations. With AsyncLocalStorage handling
+   *  per-session DB scoping, this primarily prevents concurrent bootstraps
+   *  from racing on conversation creation and context_items population. */
   private bootstrapLock: Promise<void> = Promise.resolve();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
@@ -2260,11 +2261,16 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   async dispose(): Promise<void> {
-    // No-op for plugin singleton — the connection is shared across runs.
-    // OpenClaw's runner calls dispose() after every run, but the plugin
-    // registers a single engine instance reused by the factory. Closing
-    // the DB here would break subsequent runs with "database is not open".
-    // The shared connection is managed for the lifetime of the plugin process.
+    // The engine is a plugin singleton reused across runs — don't close
+    // the DB connection (that happens on process exit via closeLcmConnection).
+    // But do drain any pending embedding work so nothing is silently lost
+    // between runs.
+    try {
+      await this.conversationStore.drainEmbeddingQueue();
+    } catch { /* best-effort */ }
+    try {
+      await this.summaryStore.drainEmbeddingQueue();
+    } catch { /* best-effort */ }
   }
 
   // ── Public accessors for retrieval (used by subagent expansion) ─────────

@@ -274,7 +274,12 @@ export class ConversationStore {
     }
   }
 
-  /** Gracefully drain pending embeddings. Call on shutdown. */
+  /** Flush all pending embeddings without stopping the queue timer. */
+  async drainEmbeddingQueue(): Promise<void> {
+    if (this.embeddingQueue) await this.embeddingQueue.drain();
+  }
+
+  /** Gracefully stop the embedding queue (drain + stop timer). Call on shutdown. */
   async stopEmbeddingQueue(): Promise<void> {
     if (this.embeddingQueue) await this.embeddingQueue.stop();
   }

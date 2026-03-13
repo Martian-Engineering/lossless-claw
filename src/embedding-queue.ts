@@ -108,15 +108,33 @@ export class EmbeddingQueue {
     }
   }
 
-  /** Stop the timer and drain remaining items (best effort). */
+  /**
+   * Flush all pending items without stopping the timer.
+   * Clears retry delays so backoff-delayed items are processed immediately.
+   */
+  async drain(): Promise<void> {
+    // Clear retry delays so all items are eligible for processing
+    for (const item of this.queue) {
+      item.nextRetryAt = 0;
+    }
+    // Loop until the queue is empty or we hit a safety cap
+    const maxRounds = Math.ceil(this.queue.length / this.batchSize) + 1;
+    for (let i = 0; i < maxRounds && this.queue.length > 0; i++) {
+      await this.flush();
+    }
+  }
+
+  /** Stop the timer and drain all remaining items. */
   async stop(): Promise<void> {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
-    // Final flush attempt
     if (this.queue.length > 0) {
-      await this.flush();
+      await this.drain();
+    }
+    if (this.queue.length > 0) {
+      this.log(`shutdown: ${this.queue.length} items could not be drained`);
     }
   }
 
