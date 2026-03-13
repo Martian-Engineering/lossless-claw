@@ -11,7 +11,12 @@
 
 import pg from "pg";
 
-const DB_URL = process.env.LCM_DB_URL || "postgres://lcm_phil:pheon.lcm4@10.4.20.16:5432/phil_memory";
+const DB_URL = process.env.LCM_DB_URL;
+if (!DB_URL) {
+  console.error("Error: LCM_DB_URL environment variable is required.");
+  console.error("  Example: LCM_DB_URL=postgres://user:pass@host:5432/dbname node backfill-embeddings.mjs");
+  process.exit(1);
+}
 const API_KEY = process.env.LCM_EMBEDDING_API_KEY || process.env.OPENAI_API_KEY;
 const MODEL = "text-embedding-3-small";
 const DIMENSIONS = 1536;

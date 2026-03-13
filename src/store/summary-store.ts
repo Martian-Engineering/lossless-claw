@@ -665,7 +665,10 @@ export class SummaryStore {
     if (input.mode === "semantic") {
       try {
         return await this.searchSemantic(input.query, limit, input.conversationId, input.since, input.before);
-      } catch {
+      } catch (err) {
+        console.warn(
+          `[lcm:sum-store] semantic search failed, falling back to full_text: ${err instanceof Error ? err.message : String(err)}`,
+        );
         return this.searchSummaries({ ...input, mode: "full_text" });
       }
     }

@@ -692,7 +692,10 @@ export class ConversationStore {
         return await this.searchSemantic(
           input.query, limit, input.conversationId, input.since, input.before,
         );
-      } catch {
+      } catch (err) {
+        console.warn(
+          `[lcm:conv-store] semantic search failed, falling back to full_text: ${err instanceof Error ? err.message : String(err)}`,
+        );
         return this.searchMessages({ ...input, mode: "full_text" });
       }
     }

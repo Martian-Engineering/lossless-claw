@@ -6,7 +6,12 @@
 import pg from "pg";
 import https from "https";
 
-const DB = "postgres://lcm_phil:pheon.lcm4@10.4.20.16:5432/phil_memory";
+const DB = process.env.LCM_DB_URL;
+if (!DB) {
+  console.error("Error: LCM_DB_URL environment variable is required.");
+  console.error("  Example: LCM_DB_URL=postgres://user:pass@host:5432/dbname node backfill-tool-embeddings.mjs");
+  process.exit(1);
+}
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const MODEL = "text-embedding-3-small";
 const BATCH_SIZE = 50;

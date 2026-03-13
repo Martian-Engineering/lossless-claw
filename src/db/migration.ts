@@ -790,6 +790,10 @@ async function addEmbeddingColumnsIfAvailable(db: DbClient): Promise<void> {
   if (!hasMessageEmbedding?.exists) {
     await db.run(`ALTER TABLE messages ADD COLUMN embedding vector(1536)`);
     try {
+      // HNSW index tuning: m=16 (connections per node), ef_construction=64 (build-time quality).
+      // For larger deployments (>100k messages), consider increasing ef_construction to 128-200
+      // for better recall, or switching to IVFFlat with appropriate list count for faster builds.
+      // Query-time ef_search defaults to 40 — increase via SET hnsw.ef_search for higher recall.
       await db.run(`CREATE INDEX IF NOT EXISTS idx_messages_embedding ON messages USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)`);
     } catch { /* HNSW can fail on older pgvector — non-fatal */ }
   }
