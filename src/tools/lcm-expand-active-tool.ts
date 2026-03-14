@@ -93,6 +93,10 @@ export function createLcmExpandActiveTool(input: {
         });
       }
 
+      input.deps.log.info(
+        `[lcm:expand] Expanding ${pointerId}: ${restoredItems.length} item(s), ~${tokensRestored} tokens (source: ${pointer.sourceType}, label: "${pointer.label}")`,
+      );
+
       // Replace the pointer context item with the original items
       await summaryStore.replacePointerWithContextItems({
         conversationId,

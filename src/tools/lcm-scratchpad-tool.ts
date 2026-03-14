@@ -99,6 +99,9 @@ export function createLcmScratchpadTool(input: {
           }
 
           const tokenCount = estimateTokens(content);
+          input.deps.log.info(
+            `[lcm:scratchpad] Write: ${tokenCount} tokens (max: ${maxTokens})`,
+          );
           if (tokenCount > maxTokens) {
             return jsonResult({
               error: `Content exceeds scratchpad limit: ${tokenCount} tokens > ${maxTokens} max. Trim content or increase scratchpadMaxTokens.`,
@@ -155,6 +158,9 @@ export function createLcmScratchpadTool(input: {
         }
 
         case "replace_section": {
+          input.deps.log.info(
+            `[lcm:scratchpad] Replace section: "${section}"`,
+          );
           if (!section) {
             return jsonResult({ error: "section is required for replace_section action." });
           }

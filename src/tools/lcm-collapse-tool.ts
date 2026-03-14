@@ -209,6 +209,9 @@ export function createLcmCollapseTool(input: {
 
       // Create the pointer
       const pointerId = `ptr_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      input.deps.log.info(
+        `[lcm:collapse] Collapsing ${sourceIds.length} item(s) (${sourceType}) → ${pointerId}, saving ~${tokensSaved} tokens: "${label}"`,
+      );
 
       await summaryStore.insertPointer({
         pointerId,
@@ -227,6 +230,10 @@ export function createLcmCollapseTool(input: {
         endOrdinal,
         pointerId,
       });
+
+      input.deps.log.info(
+        `[lcm:collapse] Done: ${pointerId} replaced ordinals ${startOrdinal}-${endOrdinal}`,
+      );
 
       return jsonResult({
         pointerId,
