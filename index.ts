@@ -12,6 +12,7 @@ import { LcmContextEngine } from "./src/engine.js";
 import { createLcmDescribeTool } from "./src/tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "./src/tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "./src/tools/lcm-expand-tool.js";
+import { createLcmExportTool } from "./src/tools/lcm-export-tool.js";
 import { createLcmGrepTool } from "./src/tools/lcm-grep-tool.js";
 import type { LcmDependencies } from "./src/types.js";
 
@@ -1313,6 +1314,11 @@ const lcmPlugin = {
         lcm,
         sessionKey: ctx.sessionKey,
         requesterSessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmExportTool({
+        deps,
       }),
     );
 
