@@ -139,7 +139,7 @@ describe("lcm plugin registration", () => {
       enabled: true,
       contextThreshold: 0.33,
       incrementalMaxDepth: -1,
-      freshTailCount: 64,
+      freshTailCount: 7,
       databasePath: dbPath,
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
