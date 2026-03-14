@@ -9,10 +9,13 @@ import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig } from "./src/db/config.js";
 import { LcmContextEngine } from "./src/engine.js";
+import { createLcmCollapseTool } from "./src/tools/lcm-collapse-tool.js";
 import { createLcmDescribeTool } from "./src/tools/lcm-describe-tool.js";
+import { createLcmExpandActiveTool } from "./src/tools/lcm-expand-active-tool.js";
 import { createLcmExpandQueryTool } from "./src/tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "./src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "./src/tools/lcm-grep-tool.js";
+import { createLcmScratchpadTool } from "./src/tools/lcm-scratchpad-tool.js";
 import type { LcmDependencies } from "./src/types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -1315,6 +1318,33 @@ const lcmPlugin = {
         requesterSessionKey: ctx.sessionKey,
       }),
     );
+
+    // Active memory tools
+    if (deps.config.collapseEnabled) {
+      api.registerTool((ctx) =>
+        createLcmCollapseTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      );
+      api.registerTool((ctx) =>
+        createLcmExpandActiveTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      );
+    }
+    if (deps.config.scratchpadEnabled) {
+      api.registerTool((ctx) =>
+        createLcmScratchpadTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      );
+    }
 
     api.logger.info(
       `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,

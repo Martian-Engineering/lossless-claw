@@ -24,6 +24,14 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+  /** Enable the scratchpad system (default true). */
+  scratchpadEnabled: boolean;
+  /** Max tokens for the scratchpad document (default 2000). */
+  scratchpadMaxTokens: number;
+  /** Enable collapse/expand tools (default true). */
+  collapseEnabled: boolean;
+  /** Token threshold for middle zone compression (default 50000). */
+  middleCompressionThreshold: number;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -123,5 +131,19 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+    scratchpadEnabled:
+      env.LCM_SCRATCHPAD_ENABLED !== undefined
+        ? env.LCM_SCRATCHPAD_ENABLED !== "false"
+        : toBool(pc.scratchpadEnabled) ?? true,
+    scratchpadMaxTokens:
+      (env.LCM_SCRATCHPAD_MAX_TOKENS !== undefined ? parseInt(env.LCM_SCRATCHPAD_MAX_TOKENS, 10) : undefined)
+        ?? toNumber(pc.scratchpadMaxTokens) ?? 2000,
+    collapseEnabled:
+      env.LCM_COLLAPSE_ENABLED !== undefined
+        ? env.LCM_COLLAPSE_ENABLED !== "false"
+        : toBool(pc.collapseEnabled) ?? true,
+    middleCompressionThreshold:
+      (env.LCM_MIDDLE_COMPRESSION_THRESHOLD !== undefined ? parseInt(env.LCM_MIDDLE_COMPRESSION_THRESHOLD, 10) : undefined)
+        ?? toNumber(pc.middleCompressionThreshold) ?? 50000,
   };
 }

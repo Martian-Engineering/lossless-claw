@@ -355,6 +355,58 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
   }
 }
 
+/**
+ * Ensure context_items supports pointer/scratchpad item types.
+ *
+ * SQLite doesn't support ALTER TABLE to modify CHECK constraints, so for
+ * existing DBs we check whether the table schema already includes the new
+ * item types. If not, we recreate the table preserving existing data.
+ */
+function ensureContextItemsActiveMemory(db: DatabaseSync): void {
+  // Check if pointer_id column exists (proxy for whether migration already ran)
+  const columns = db.prepare(`PRAGMA table_info(context_items)`).all() as Array<{ name?: string }>;
+  const hasPointerId = columns.some((col) => col.name === "pointer_id");
+  if (hasPointerId) {
+    return; // Already migrated
+  }
+
+  // Recreate context_items table with updated schema
+  db.exec("BEGIN");
+  try {
+    db.exec(`
+      CREATE TABLE context_items_new (
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL,
+        item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary', 'pointer', 'scratchpad')),
+        message_id INTEGER REFERENCES messages(message_id) ON DELETE RESTRICT,
+        summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+        pointer_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (conversation_id, ordinal),
+        CHECK (
+          (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL AND pointer_id IS NULL) OR
+          (item_type = 'summary' AND summary_id IS NOT NULL AND message_id IS NULL AND pointer_id IS NULL) OR
+          (item_type = 'pointer' AND pointer_id IS NOT NULL AND message_id IS NULL AND summary_id IS NULL) OR
+          (item_type = 'scratchpad' AND message_id IS NULL AND summary_id IS NULL AND pointer_id IS NULL)
+        )
+      );
+
+      INSERT INTO context_items_new (conversation_id, ordinal, item_type, message_id, summary_id, created_at)
+      SELECT conversation_id, ordinal, item_type, message_id, summary_id, created_at
+      FROM context_items;
+
+      DROP TABLE context_items;
+      ALTER TABLE context_items_new RENAME TO context_items;
+
+      CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal);
+    `);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
 export function runLcmMigrations(
   db: DatabaseSync,
   options?: { fts5Available?: boolean },
@@ -451,14 +503,17 @@ export function runLcmMigrations(
     CREATE TABLE IF NOT EXISTS context_items (
       conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
       ordinal INTEGER NOT NULL,
-      item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary')),
+      item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary', 'pointer', 'scratchpad')),
       message_id INTEGER REFERENCES messages(message_id) ON DELETE RESTRICT,
       summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+      pointer_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       PRIMARY KEY (conversation_id, ordinal),
       CHECK (
-        (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL) OR
-        (item_type = 'summary' AND summary_id IS NOT NULL AND message_id IS NULL)
+        (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL AND pointer_id IS NULL) OR
+        (item_type = 'summary' AND summary_id IS NOT NULL AND message_id IS NULL AND pointer_id IS NULL) OR
+        (item_type = 'pointer' AND pointer_id IS NOT NULL AND message_id IS NULL AND summary_id IS NULL) OR
+        (item_type = 'scratchpad' AND message_id IS NULL AND summary_id IS NULL AND pointer_id IS NULL)
       )
     );
 
@@ -495,6 +550,32 @@ export function runLcmMigrations(
   ensureSummaryMetadataColumns(db);
   backfillSummaryDepths(db);
   backfillSummaryMetadata(db);
+
+  // ── Active memory tables ────────────────────────────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pointers (
+      pointer_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL,
+      label TEXT NOT NULL,
+      reason TEXT,
+      source_type TEXT NOT NULL,
+      source_ids TEXT NOT NULL,
+      tokens_saved INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS scratchpads (
+      conversation_id INTEGER PRIMARY KEY,
+      content TEXT NOT NULL DEFAULT '',
+      token_count INTEGER DEFAULT 0,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+    );
+  `);
+
+  // Migrate existing context_items table if it lacks the pointer/scratchpad columns.
+  ensureContextItemsActiveMemory(db);
 
   const fts5Available = options?.fts5Available ?? getLcmDbFeatures(db).fts5Available;
   if (!fts5Available) {
