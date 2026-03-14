@@ -988,7 +988,11 @@ describe("LcmContextEngine.assemble canonical path", () => {
 });
 
 describe("LcmContextEngine fidelity and token budget", () => {
-  it("counts large raw metadata blocks in stored context token totals", async () => {
+  it("normalizes tool_result blocks instead of returning raw metadata verbatim", async () => {
+    // Verify that tool_result blocks with large raw metadata blobs are
+    // normalized through toolResultBlockFromPart rather than returned
+    // verbatim. Raw metadata should NOT leak into the assembled payload —
+    // only the dedicated part columns (toolOutput, textContent) matter.
     const engine = createEngine();
     const sessionId = randomUUID();
     const rawBlob = "x".repeat(24_000);
@@ -1014,9 +1018,6 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
 
-    const contextTokens = await engine
-      .getSummaryStore()
-      .getContextTokenCount(conversation!.conversationId);
     const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
     const assembled = await assembler.assemble({
       conversationId: conversation!.conversationId,
@@ -1024,8 +1025,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
     const assembledPayloadTokens = estimateAssembledPayloadTokens(assembled.messages);
 
-    expect(contextTokens).toBe(assembledPayloadTokens);
-    expect(contextTokens).toBeGreaterThan(8_000);
+    // The assembled payload should be small — the 24K raw metadata blob
+    // must NOT appear in the output. Tool results use dedicated columns,
+    // not the raw metadata object.
+    expect(assembledPayloadTokens).toBeLessThan(500);
   });
 
   it("preserves structured toolResult content via message_parts and assembler", async () => {

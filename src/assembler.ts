@@ -211,7 +211,8 @@ function tryRestoreOpenAIReasoning(raw: Record<string, unknown>): Record<string,
   return null;
 }
 
-function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
+/** @internal Exported for testing only. */
+export function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
   const type =
     rawType === "function_call" ||
     rawType === "functionCall" ||
@@ -245,7 +246,10 @@ function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string): unkno
   }
 
   if (input !== undefined) {
-    if (type === "functionCall") {
+    // toolCall and functionCall use "arguments" (consumed by OpenAI/xAI Chat
+    // Completions extractToolCalls and Responses API paths in OpenClaw).
+    // tool_use and variants use "input" (Anthropic native format).
+    if (type === "functionCall" || type === "toolCall") {
       block.arguments = input;
     } else {
       block.input = input;
@@ -254,7 +258,8 @@ function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string): unkno
   return block;
 }
 
-function toolResultBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
+/** @internal Exported for testing only. */
+export function toolResultBlockFromPart(part: MessagePartRecord, rawType?: string): unknown {
   const type =
     rawType === "function_call_output" || rawType === "toolResult" || rawType === "tool_result"
       ? rawType
@@ -307,7 +312,8 @@ function toRuntimeRole(
   return "user"; // user | system
 }
 
-function blockFromPart(part: MessagePartRecord): unknown {
+/** @internal Exported for testing only. */
+export function blockFromPart(part: MessagePartRecord): unknown {
   const metadata = getPartMetadata(part);
   if (metadata.raw && typeof metadata.raw === "object") {
     // If this is an OpenClaw-normalised OpenAI reasoning block, restore the original
