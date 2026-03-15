@@ -1,7 +1,7 @@
-FROM node:22-alpine
+FROM node:22-bullseye
 
-# Install git, python3, make, and build-base (g++) to build native extensions
-RUN apk add --no-cache git python3 make build-base cmake
+# Install git and build tools
+RUN apt-get update && apt-get install -y git python3 make g++ cmake linux-libc-dev
 
 # Install openclaw globally
 RUN npm install -g openclaw@latest
