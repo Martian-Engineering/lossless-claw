@@ -3,6 +3,8 @@ import crypto from "node:crypto";
 import type { LcmContextEngine } from "../engine.js";
 import {
   createDelegatedExpansionGrant,
+  getRuntimeExpansionAuthManager,
+  resolveDelegatedExpansionGrantId,
   revokeDelegatedExpansionGrantForSession,
 } from "../expansion-auth.js";
 import type { LcmDependencies } from "../types.js";
@@ -254,13 +256,37 @@ async function resolveSummaryCandidates(params: {
   explicitSummaryIds: string[];
   query?: string;
   conversationId?: number;
+  conversationIds?: number[];
+  grantContext?: {
+    isSubagent: boolean;
+    allowedConversationIds?: number[];
+  };
 }): Promise<SummaryCandidate[]> {
   const retrieval = params.lcm.getRetrieval();
   const candidates = new Map<string, SummaryCandidate>();
 
+  const allowedConversationIds = params.grantContext?.allowedConversationIds;
+  const isSubagent = params.grantContext?.isSubagent === true;
+  const enforceGrantScope =
+    isSubagent &&
+    Array.isArray(allowedConversationIds) &&
+    allowedConversationIds.length > 0;
+
+  // For grantless subagents, restrict to session's own conversation
+  const sessionConversationId = params.conversationId;
+
   for (const summaryId of params.explicitSummaryIds) {
     const described = await retrieval.describe(summaryId);
     if (!described || described.type !== "summary" || !described.summary) {
+      throw new Error(`Summary not found: ${summaryId}`);
+    }
+    const summaryConvId = described.summary.conversationId;
+    if (enforceGrantScope && !allowedConversationIds.includes(summaryConvId)) {
+      // Uniform error — don't leak existence
+      throw new Error(`Summary not found: ${summaryId}`);
+    }
+    if (isSubagent && !enforceGrantScope && sessionConversationId != null && summaryConvId !== sessionConversationId) {
+      // Grantless subagent: restrict to own conversation
       throw new Error(`Summary not found: ${summaryId}`);
     }
     candidates.set(summaryId, {
@@ -270,17 +296,36 @@ async function resolveSummaryCandidates(params: {
   }
 
   if (params.query) {
-    const grepResult = await retrieval.grep({
-      query: params.query,
-      mode: "full_text",
-      scope: "summaries",
-      conversationId: params.conversationId,
-    });
-    for (const summary of grepResult.summaries) {
-      candidates.set(summary.summaryId, {
-        summaryId: summary.summaryId,
-        conversationId: summary.conversationId,
-      });
+    const scopedConversationIds =
+      Array.isArray(params.conversationIds) && params.conversationIds.length > 0
+        ? params.conversationIds
+        : null;
+    const grepResults = scopedConversationIds
+      ? await Promise.all(
+          scopedConversationIds.map((conversationId) =>
+            retrieval.grep({
+              query: params.query as string,
+              mode: "full_text",
+              scope: "summaries",
+              conversationId,
+            }),
+          ),
+        )
+      : [
+          await retrieval.grep({
+            query: params.query,
+            mode: "full_text",
+            scope: "summaries",
+            conversationId: params.conversationId,
+          }),
+        ];
+    for (const grepResult of grepResults) {
+      for (const summary of grepResult.summaries) {
+        candidates.set(summary.summaryId, {
+          summaryId: summary.summaryId,
+          conversationId: summary.conversationId,
+        });
+      }
     }
   }
 
@@ -374,17 +419,42 @@ export function createLcmExpandQueryTool(input: {
         });
       }
 
-      const conversationScope = await resolveLcmConversationScope({
-        lcm: input.lcm,
-        deps: input.deps,
-        sessionId: input.sessionId,
-        sessionKey: input.sessionKey,
-        params: p,
-      });
+      const sessionKey = (input.sessionKey ?? input.sessionId ?? "").trim();
+      const isSubagent = input.deps.isSubagentSessionKey(sessionKey);
+      const grantId = isSubagent ? resolveDelegatedExpansionGrantId(sessionKey) : null;
+      const grant = grantId ? getRuntimeExpansionAuthManager().getGrant(grantId) : null;
+      const grantContext = {
+        isSubagent,
+        allowedConversationIds: grant?.allowedConversationIds,
+      };
+
+      let conversationScope: Awaited<ReturnType<typeof resolveLcmConversationScope>>;
+      try {
+        conversationScope = await resolveLcmConversationScope({
+          lcm: input.lcm,
+          deps: input.deps,
+          sessionId: input.sessionId,
+          sessionKey: input.sessionKey,
+          params: p,
+          grantContext,
+        });
+      } catch (scopeError) {
+        return jsonResult({
+          error: "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
+        });
+      }
       let scopedConversationId = conversationScope.conversationId;
+      if (
+        scopedConversationId == null &&
+        conversationScope.conversationIds &&
+        conversationScope.conversationIds.length === 1
+      ) {
+        scopedConversationId = conversationScope.conversationIds[0];
+      }
       if (
         !conversationScope.allConversations &&
         scopedConversationId == null &&
+        (!conversationScope.conversationIds || conversationScope.conversationIds.length === 0) &&
         callerSessionKey
       ) {
         scopedConversationId = await resolveRequesterConversationScopeId({
@@ -394,7 +464,11 @@ export function createLcmExpandQueryTool(input: {
         });
       }
 
-      if (!conversationScope.allConversations && scopedConversationId == null) {
+      if (
+        !conversationScope.allConversations &&
+        scopedConversationId == null &&
+        (!conversationScope.conversationIds || conversationScope.conversationIds.length === 0)
+      ) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
@@ -410,6 +484,8 @@ export function createLcmExpandQueryTool(input: {
           explicitSummaryIds,
           query: query || undefined,
           conversationId: scopedConversationId,
+          conversationIds: conversationScope.conversationIds,
+          grantContext,
         });
 
         if (candidates.length === 0) {

@@ -1,5 +1,9 @@
 import { Type } from "@sinclair/typebox";
 import type { LcmContextEngine } from "../engine.js";
+import {
+  getRuntimeExpansionAuthManager,
+  resolveDelegatedExpansionGrantId,
+} from "../expansion-auth.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
@@ -106,29 +110,93 @@ export function createLcmGrepTool(input: {
           error: "`since` must be earlier than `before`.",
         });
       }
-      const conversationScope = await resolveLcmConversationScope({
-        lcm: input.lcm,
-        deps: input.deps,
-        sessionId: input.sessionId,
-        sessionKey: input.sessionKey,
-        params: p,
-      });
-      if (!conversationScope.allConversations && conversationScope.conversationId == null) {
+      const sessionKey = (input.sessionKey ?? input.sessionId ?? "").trim();
+      const isSubagent = input.deps.isSubagentSessionKey(sessionKey);
+      const grantId = isSubagent ? resolveDelegatedExpansionGrantId(sessionKey) : null;
+      const grant = grantId ? getRuntimeExpansionAuthManager().getGrant(grantId) : null;
+      const grantContext = {
+        isSubagent,
+        allowedConversationIds: grant?.allowedConversationIds,
+      };
+
+      let conversationScope: Awaited<ReturnType<typeof resolveLcmConversationScope>>;
+      try {
+        conversationScope = await resolveLcmConversationScope({
+          lcm: input.lcm,
+          deps: input.deps,
+          sessionId: input.sessionId,
+          sessionKey: input.sessionKey,
+          params: p,
+          grantContext,
+        });
+      } catch (scopeError) {
+        return jsonResult({
+          error: "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
+        });
+      }
+      if (
+        !conversationScope.allConversations &&
+        conversationScope.conversationId == null &&
+        (!conversationScope.conversationIds || conversationScope.conversationIds.length === 0)
+      ) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
         });
       }
 
-      const result = await retrieval.grep({
-        query: pattern,
-        mode,
-        scope,
-        conversationId: conversationScope.conversationId,
-        limit,
-        since,
-        before,
-      });
+      const scopedConversationIds =
+        Array.isArray(conversationScope.conversationIds) && conversationScope.conversationIds.length > 0
+          ? conversationScope.conversationIds
+          : null;
+
+      let result: { messages: any[]; summaries: any[]; totalMatches: number };
+      try {
+        result = scopedConversationIds
+          ? {
+              messages: [],
+              summaries: [],
+              totalMatches: 0,
+            }
+          : await retrieval.grep({
+              query: pattern,
+              mode,
+              scope,
+              conversationId: conversationScope.conversationId,
+              limit,
+              since,
+              before,
+            });
+
+        if (scopedConversationIds) {
+          for (const scopedConversationId of scopedConversationIds) {
+            const scopedResult = await retrieval.grep({
+              query: pattern,
+              mode,
+              scope,
+              conversationId: scopedConversationId,
+              limit,
+              since,
+              before,
+            });
+            result.messages.push(...scopedResult.messages);
+            result.summaries.push(...scopedResult.summaries);
+          }
+          result.messages.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+          result.summaries.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+          if (result.messages.length > limit) {
+            result.messages = result.messages.slice(0, limit);
+          }
+          if (result.summaries.length > limit) {
+            result.summaries = result.summaries.slice(0, limit);
+          }
+          result.totalMatches = result.messages.length + result.summaries.length;
+        }
+      } catch (grepError) {
+        return jsonResult({
+          error: grepError instanceof Error ? grepError.message : "Search failed.",
+        });
+      }
 
       const lines: string[] = [];
       lines.push("## LCM Grep Results");
@@ -138,6 +206,8 @@ export function createLcmGrepTool(input: {
         lines.push("**Conversation scope:** all conversations");
       } else if (conversationScope.conversationId != null) {
         lines.push(`**Conversation scope:** ${conversationScope.conversationId}`);
+      } else if (conversationScope.conversationIds && conversationScope.conversationIds.length > 0) {
+        lines.push(`**Conversation scope:** ${conversationScope.conversationIds.join(", ")}`);
       }
       if (since || before) {
         lines.push(

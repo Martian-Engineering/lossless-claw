@@ -69,14 +69,36 @@ export function createLcmDescribeTool(input: {
       const timezone = input.lcm.timezone;
       const p = params as Record<string, unknown>;
       const id = (p.id as string).trim();
-      const conversationScope = await resolveLcmConversationScope({
-        lcm: input.lcm,
-        deps: input.deps,
-        sessionId: input.sessionId,
-        sessionKey: input.sessionKey,
-        params: p,
-      });
-      if (!conversationScope.allConversations && conversationScope.conversationId == null) {
+      const sessionKey = (input.sessionKey ?? input.sessionId ?? "").trim();
+      const isSubagent = input.deps.isSubagentSessionKey(sessionKey);
+      const grantId = isSubagent ? resolveDelegatedExpansionGrantId(sessionKey) : null;
+      const grant = grantId ? getRuntimeExpansionAuthManager().getGrant(grantId) : null;
+      const grantContext = {
+        isSubagent,
+        allowedConversationIds: grant?.allowedConversationIds,
+      };
+
+      let conversationScope: Awaited<ReturnType<typeof resolveLcmConversationScope>>;
+      try {
+        conversationScope = await resolveLcmConversationScope({
+          lcm: input.lcm,
+          deps: input.deps,
+          sessionId: input.sessionId,
+          sessionKey: input.sessionKey,
+          params: p,
+          grantContext,
+        });
+      } catch (scopeError) {
+        return jsonResult({
+          error: `Not found: ${id}`,
+          hint: "Check the ID format (sum_xxx for summaries, file_xxx for files).",
+        });
+      }
+      if (
+        !conversationScope.allConversations &&
+        conversationScope.conversationId == null &&
+        (!conversationScope.conversationIds || conversationScope.conversationIds.length === 0)
+      ) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
@@ -91,13 +113,23 @@ export function createLcmDescribeTool(input: {
           hint: "Check the ID format (sum_xxx for summaries, file_xxx for files).",
         });
       }
+      const itemConversationId =
+        result.type === "summary" ? result.summary?.conversationId : result.file?.conversationId;
       if (conversationScope.conversationId != null) {
-        const itemConversationId =
-          result.type === "summary" ? result.summary?.conversationId : result.file?.conversationId;
         if (itemConversationId != null && itemConversationId !== conversationScope.conversationId) {
           return jsonResult({
-            error: `Not found in conversation ${conversationScope.conversationId}: ${id}`,
-            hint: "Use allConversations=true for cross-conversation lookup.",
+            error: `Not found: ${id}`,
+            hint: "Check the ID format (sum_xxx for summaries, file_xxx for files).",
+          });
+        }
+      } else if (conversationScope.conversationIds && conversationScope.conversationIds.length > 0) {
+        if (
+          itemConversationId != null &&
+          !conversationScope.conversationIds.includes(itemConversationId)
+        ) {
+          return jsonResult({
+            error: `Not found: ${id}`,
+            hint: "Check the ID format (sum_xxx for summaries, file_xxx for files).",
           });
         }
       }

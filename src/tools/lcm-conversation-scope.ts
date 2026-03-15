@@ -3,6 +3,7 @@ import type { LcmDependencies } from "../types.js";
 
 export type LcmConversationScope = {
   conversationId?: number;
+  conversationIds?: number[];
   allConversations: boolean;
 };
 
@@ -44,33 +45,81 @@ export async function resolveLcmConversationScope(input: {
   sessionId?: string;
   sessionKey?: string;
   deps?: Pick<LcmDependencies, "resolveSessionIdFromSessionKey">;
+  grantContext?: {
+    isSubagent: boolean;
+    allowedConversationIds?: number[];
+  };
 }): Promise<LcmConversationScope> {
   const { lcm, params } = input;
+  const allowedConversationIds = input.grantContext?.allowedConversationIds;
+  const isSubagent = input.grantContext?.isSubagent === true;
+  const hasDelegatedGrant =
+    isSubagent && Array.isArray(allowedConversationIds) && allowedConversationIds.length > 0;
+
+  let cachedSessionConversationId: number | undefined;
+  let resolvedSessionConversationId = false;
+
+  const resolveSessionConversationId = async (): Promise<number | undefined> => {
+    if (resolvedSessionConversationId) {
+      return cachedSessionConversationId;
+    }
+
+    let normalizedSessionId = input.sessionId?.trim();
+    if (!normalizedSessionId && input.sessionKey && input.deps) {
+      normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(input.sessionKey.trim());
+    }
+    if (!normalizedSessionId) {
+      resolvedSessionConversationId = true;
+      return undefined;
+    }
+
+    const conversation = await lcm.getConversationStore().getConversationBySessionId(normalizedSessionId);
+    cachedSessionConversationId = conversation?.conversationId;
+    resolvedSessionConversationId = true;
+    return cachedSessionConversationId;
+  };
+
+  const enforceConversationAccess = async (conversationId: number): Promise<void> => {
+    if (hasDelegatedGrant) {
+      if (!allowedConversationIds.includes(conversationId)) {
+        throw new Error(`Conversation ${conversationId} is not in delegated grant scope.`);
+      }
+      return;
+    }
+
+    if (isSubagent) {
+      const sessionConversationId = await resolveSessionConversationId();
+      if (sessionConversationId == null || sessionConversationId !== conversationId) {
+        throw new Error(`Conversation ${conversationId} is not available in this session.`);
+      }
+    }
+  };
 
   const explicitConversationId =
     typeof params.conversationId === "number" && Number.isFinite(params.conversationId)
       ? Math.trunc(params.conversationId)
       : undefined;
   if (explicitConversationId != null) {
+    await enforceConversationAccess(explicitConversationId);
     return { conversationId: explicitConversationId, allConversations: false };
   }
 
   if (params.allConversations === true) {
+    if (hasDelegatedGrant) {
+      return { conversationIds: [...allowedConversationIds], allConversations: false };
+    }
+    if (isSubagent) {
+      const sessionConversationId = await resolveSessionConversationId();
+      return { conversationId: sessionConversationId, allConversations: false };
+    }
     return { conversationId: undefined, allConversations: true };
   }
 
-  let normalizedSessionId = input.sessionId?.trim();
-  if (!normalizedSessionId && input.sessionKey && input.deps) {
-    normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(input.sessionKey.trim());
-  }
-  if (!normalizedSessionId) {
+  const conversationId = await resolveSessionConversationId();
+  if (conversationId == null) {
     return { conversationId: undefined, allConversations: false };
   }
 
-  const conversation = await lcm.getConversationStore().getConversationBySessionId(normalizedSessionId);
-  if (!conversation) {
-    return { conversationId: undefined, allConversations: false };
-  }
-
-  return { conversationId: conversation.conversationId, allConversations: false };
+  await enforceConversationAccess(conversationId);
+  return { conversationId, allConversations: false };
 }

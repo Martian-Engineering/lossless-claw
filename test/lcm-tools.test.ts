@@ -4,6 +4,7 @@ import {
   resetDelegatedExpansionGrantsForTests,
 } from "../src/expansion-auth.js";
 import { createLcmDescribeTool } from "../src/tools/lcm-describe-tool.js";
+import { createLcmExpandQueryTool } from "../src/tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
 import type { LcmDependencies } from "../src/types.js";
@@ -241,7 +242,7 @@ describe("LCM tools session scoping", () => {
       sessionId: "session-1",
     });
     const scoped = await tool.execute("call-3", { id: "sum_foreign" });
-    expect((scoped.details as { error?: string }).error).toContain("Not found in conversation 42");
+    expect((scoped.details as { error?: string }).error).toContain("Not found: sum_foreign");
 
     const cross = await tool.execute("call-4", {
       id: "sum_foreign",
@@ -249,5 +250,138 @@ describe("LCM tools session scoping", () => {
     });
     expect((cross.content[0] as { text: string }).text).toContain("meta conv=99");
     expect((cross.content[0] as { text: string }).text).toContain("manifest");
+  });
+
+  it("lcm_grep scopes delegated allConversations to allowed grant conversations", async () => {
+    const retrieval = {
+      grep: vi.fn(async (input: { conversationId?: number }) => ({
+        messages: [],
+        summaries: [
+          {
+            summaryId: `sum_${input.conversationId}`,
+            conversationId: input.conversationId ?? 0,
+            kind: "leaf",
+            snippet: "match",
+            createdAt: new Date("2026-01-01T00:00:00.000Z"),
+            rank: 0,
+          },
+        ],
+        totalMatches: 1,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const delegatedSessionKey = "agent:main:subagent:scope-test";
+    createDelegatedExpansionGrant({
+      delegatedSessionKey,
+      issuerSessionId: "main",
+      allowedConversationIds: [7, 8],
+      tokenCap: 120,
+    });
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: delegatedSessionKey,
+      sessionKey: delegatedSessionKey,
+    });
+    const result = await tool.execute("call-5", {
+      pattern: "match",
+      allConversations: true,
+      scope: "summaries",
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledTimes(2);
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: 7 }),
+    );
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: 8 }),
+    );
+    expect((result.content[0] as { text: string }).text).toContain("**Conversation scope:** 7, 8");
+  });
+
+  it("lcm_describe rejects delegated access outside allowed conversation scope", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const delegatedSessionKey = "agent:main:subagent:describe-scope-test";
+    createDelegatedExpansionGrant({
+      delegatedSessionKey,
+      issuerSessionId: "main",
+      allowedConversationIds: [42],
+      tokenCap: 120,
+    });
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: delegatedSessionKey,
+      sessionKey: delegatedSessionKey,
+    });
+
+    const scoped = await tool.execute("call-6", {
+      id: "sum_any",
+      conversationId: 99,
+    });
+
+    expect((scoped.details as { error?: string }).error).toContain(
+      "Not found: sum_any",
+    );
+    expect(retrieval.describe).not.toHaveBeenCalled();
+  });
+
+  it("lcm_expand_query rejects explicit summaryIds outside scoped conversation", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "sum_foreign",
+        type: "summary",
+        summary: {
+          conversationId: 99,
+          kind: "leaf",
+          content: "foreign content",
+          depth: 0,
+          tokenCount: 10,
+          descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: 10,
+          fileIds: [],
+          parentIds: [],
+          childIds: [],
+          messageIds: [],
+          earliestAt: new Date("2026-01-01T00:00:00.000Z"),
+          latestAt: new Date("2026-01-01T00:00:00.000Z"),
+          subtree: [],
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      })),
+    };
+
+    // Use a main session (not subagent) with explicit conversationId=42
+    // The summary lives in conversation 99, so it should be rejected
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+      sessionKey: "session-1",
+      requesterSessionKey: "session-1",
+    });
+
+    const result = await tool.execute("call-7", {
+      summaryIds: ["sum_foreign"],
+      prompt: "test",
+      conversationId: 42,
+    });
+
+    // Summary is in conversation 99 but scope is 42 — should be rejected
+    expect((result.details as { error?: string }).error).toContain(
+      "outside conversation 42",
+    );
   });
 });

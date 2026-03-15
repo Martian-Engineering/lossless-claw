@@ -195,6 +195,14 @@ export class ExpansionAuthManager {
       }
     }
 
+    // 6. Depth must not exceed grant maxDepth
+    if (request.depth > grant.maxDepth) {
+      return {
+        valid: false,
+        reason: `Requested depth ${request.depth} exceeds grant maximum ${grant.maxDepth}`,
+      };
+    }
+
     return { valid: true };
   }
 

@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
+import { UnsafeRegexError, validateRegexSafety } from "./regex-safety.js";
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -238,6 +239,8 @@ function toLargeFileRecord(row: LargeFileRow): LargeFileRecord {
 }
 
 // ── SummaryStore ──────────────────────────────────────────────────────────────
+
+const MAX_REGEX_SCAN_ROWS = 10_000;
 
 export class SummaryStore {
   private readonly fts5Available: boolean;
@@ -818,7 +821,17 @@ export class SummaryStore {
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
-    const re = new RegExp(pattern);
+    const validation = validateRegexSafety(pattern);
+    if (!validation.safe) {
+      throw new UnsafeRegexError(`Invalid/unsafe regex: ${validation.reason ?? "Pattern not allowed"}`);
+    }
+
+    let re: RegExp;
+    try {
+      re = new RegExp(pattern);
+    } catch {
+      throw new UnsafeRegexError("Invalid/unsafe regex: Invalid regular expression");
+    }
 
     const where: string[] = [];
     const args: Array<string | number> = [];
@@ -842,7 +855,8 @@ export class SummaryStore {
                 source_message_token_count, created_at
          FROM summaries
          ${whereClause}
-         ORDER BY created_at DESC`,
+         ORDER BY created_at DESC
+         LIMIT ${MAX_REGEX_SCAN_ROWS}`,
       )
       .all(...args) as unknown as SummaryRow[];
 

@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
+import { UnsafeRegexError, validateRegexSafety } from "./regex-safety.js";
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -202,6 +203,8 @@ function toMessagePartRecord(row: MessagePartRow): MessagePartRecord {
 }
 
 // ── ConversationStore ─────────────────────────────────────────────────────────
+
+const MAX_REGEX_SCAN_ROWS = 10_000;
 
 export class ConversationStore {
   private readonly fts5Available: boolean;
@@ -700,7 +703,17 @@ export class ConversationStore {
     before?: Date,
   ): MessageSearchResult[] {
     // SQLite has no native POSIX regex; fetch candidates and filter in JS
-    const re = new RegExp(pattern);
+    const validation = validateRegexSafety(pattern);
+    if (!validation.safe) {
+      throw new UnsafeRegexError(`Invalid/unsafe regex: ${validation.reason ?? "Pattern not allowed"}`);
+    }
+
+    let re: RegExp;
+    try {
+      re = new RegExp(pattern);
+    } catch {
+      throw new UnsafeRegexError("Invalid/unsafe regex: Invalid regular expression");
+    }
 
     const where: string[] = [];
     const args: Array<string | number> = [];
@@ -722,7 +735,8 @@ export class ConversationStore {
         `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
          FROM messages
          ${whereClause}
-         ORDER BY created_at DESC`,
+         ORDER BY created_at DESC
+         LIMIT ${MAX_REGEX_SCAN_ROWS}`,
       )
       .all(...args) as unknown as MessageRow[];
 
