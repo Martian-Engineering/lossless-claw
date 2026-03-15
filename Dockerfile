@@ -1,6 +1,6 @@
-FROM node:22-bullseye
+FROM node:22-bookworm
 
-# Install git and build tools
+# Install git and build tools. Bookworm has newer cmake (3.25+)
 RUN apt-get update && apt-get install -y git python3 make g++ cmake linux-libc-dev
 
 # Install openclaw globally
