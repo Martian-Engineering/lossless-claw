@@ -18,6 +18,6 @@ WORKDIR /root/.openclaw
 RUN openclaw wizard init --non-interactive || true
 
 # Install our local plugin into the docker openclaw instance
-RUN openclaw plugin install /plugin
+RUN openclaw plugins install /plugin
 
 ENTRYPOINT ["openclaw", "gateway", "start", "--foreground"]
