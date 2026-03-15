@@ -1320,8 +1320,13 @@ export class LcmContextEngine implements ContextEngine {
         messages: ingestBatch,
         isHeartbeat: params.isHeartbeat === true,
       });
-    } catch {
-      // Continue with proactive compaction even if ingest fails.
+    } catch (err) {
+      // Never compact a stale or partially ingested frontier.
+      console.error(
+        `[lcm] afterTurn: ingest failed, skipping compaction:`,
+        err instanceof Error ? err.message : err,
+      );
+      return;
     }
 
     const tokenBudget =

@@ -426,6 +426,9 @@ export class SummaryStore {
     return rows.map(toSummaryRecord);
   }
 
+  // NOTE: historical naming is confusing here.
+  // getSummaryParents(summaryId) returns the source summaries compacted into
+  // `summaryId`. Expansion should use this direction for replay.
   async getSummaryParents(summaryId: string): Promise<SummaryRecord[]> {
     const rows = this.db
       .prepare(

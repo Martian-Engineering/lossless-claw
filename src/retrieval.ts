@@ -297,7 +297,11 @@ export class RetrievalEngine {
     }
 
     if (summary.kind === "condensed") {
-      const children = await this.summaryStore.getSummaryChildren(summaryId);
+      // IMPORTANT: a condensed summary is linked to the summaries that were
+      // compacted into it via summary_parents(summary_id, parent_summary_id).
+      // For expansion/replay we need to walk those source summaries, not newer
+      // summaries that may later derive from this node.
+      const children = await this.summaryStore.getSummaryParents(summaryId);
 
       for (const child of children) {
         if (result.truncated) {
