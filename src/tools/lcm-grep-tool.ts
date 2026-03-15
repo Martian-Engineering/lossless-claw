@@ -17,8 +17,8 @@ const LcmGrepSchema = Type.Object({
   mode: Type.Optional(
     Type.String({
       description:
-        'Search mode: "regex" for regular expression matching, "full_text" for text search, "semantic" for embedding-based similarity search. Default: "regex".',
-      enum: ["regex", "full_text", "semantic"],
+        'Search mode: "regex" for regular expression matching, "full_text" for text search, "semantic" for embedding-based similarity search, "recency_boosted" for semantic search weighted toward recent results. Default: "regex".',
+      enum: ["regex", "full_text", "semantic", "recency_boosted"],
     }),
   ),
   scope: Type.Optional(
@@ -89,7 +89,7 @@ export function createLcmGrepTool(input: {
       const timezone = input.lcm.timezone;
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
-      const mode = (p.mode as "regex" | "full_text" | "semantic") ?? "regex";
+      const mode = (p.mode as "regex" | "full_text" | "semantic" | "recency_boosted") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
       let since: Date | undefined;

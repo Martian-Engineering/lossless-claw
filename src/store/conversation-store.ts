@@ -99,10 +99,16 @@ export type ConversationRecord = {
 export type MessageSearchInput = {
   conversationId?: ConversationId;
   query: string;
-  mode: "regex" | "full_text" | "semantic";
+  mode: "regex" | "full_text" | "semantic" | "recency_boosted";
   since?: Date;
   before?: Date;
   limit?: number;
+  /** Weight for semantic similarity (0-1). Default 0.7. Only used in recency_boosted mode. */
+  semanticWeight?: number;
+  /** Weight for recency (0-1). Default 0.3. Only used in recency_boosted mode. */
+  recencyWeight?: number;
+  /** Half-life in days for recency decay. Default 7. Only used in recency_boosted mode. */
+  recencyHalfLifeDays?: number;
 };
 
 export type MessageSearchResult = {
@@ -687,6 +693,20 @@ export class ConversationStore {
   async searchMessages(input: MessageSearchInput): Promise<MessageSearchResult[]> {
     const limit = input.limit ?? 50;
 
+    if (input.mode === "recency_boosted") {
+      try {
+        return await this.searchRecencyBoosted(
+          input.query, limit, input.conversationId, input.since, input.before,
+          input.semanticWeight, input.recencyWeight, input.recencyHalfLifeDays,
+        );
+      } catch (err) {
+        console.warn(
+          `[lcm:conv-store] recency_boosted search failed, falling back to semantic: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return this.searchMessages({ ...input, mode: "semantic" });
+      }
+    }
+
     if (input.mode === "semantic") {
       try {
         return await this.searchSemantic(
@@ -998,6 +1018,73 @@ export class ConversationStore {
        FROM messages
        WHERE ${where.join(" AND ")}
        ORDER BY embedding <=> ${vecParam}::vector
+       LIMIT ${limitParam}`,
+      params,
+    );
+
+    return result.rows.map((row) => ({
+      messageId: row.message_id,
+      conversationId: row.conversation_id,
+      role: row.role,
+      snippet: row.content.substring(0, 200),
+      createdAt: new Date(row.created_at),
+      rank: row.rank,
+    }));
+  }
+
+  /**
+   * Recency-boosted semantic search.
+   *
+   * Blends cosine similarity with an exponential time-decay factor:
+   *   score = semanticWeight * similarity + recencyWeight * exp(-ln(2) * age_days / halfLife)
+   *
+   * Recent messages get a natural lift. The half-life controls how fast
+   * the recency bonus decays (default 7 days = score halves every week).
+   */
+  async searchRecencyBoosted(
+    query: string, limit: number,
+    conversationId?: ConversationId, since?: Date, before?: Date,
+    semanticWeight = 0.7, recencyWeight = 0.3, halfLifeDays = 7,
+  ): Promise<MessageSearchResult[]> {
+    if (!this.d.pg || !this.embeddingClient) {
+      throw new Error("Recency-boosted search requires PostgreSQL with pgvector and a configured embedding API key");
+    }
+
+    const queryEmbedding = await this.embeddingClient.embedOne(query);
+    const vectorLiteral = toVectorLiteral(queryEmbedding);
+
+    const d = this.d.reset();
+    const where: string[] = ["embedding IS NOT NULL"];
+    const params: unknown[] = [];
+
+    if (conversationId !== undefined) { where.push(`conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`created_at < ${d.p()}`); params.push(before.toISOString()); }
+
+    const vecParam = d.p();
+    const swParam = d.p();
+    const rwParam = d.p();
+    const hlParam = d.p();
+    const limitParam = d.p();
+    params.push(vectorLiteral, semanticWeight, recencyWeight, halfLifeDays, limit);
+
+    // Use HNSW index for initial candidate retrieval (ORDER BY distance),
+    // then re-rank with blended score. Fetch 3x limit candidates to ensure
+    // good recall after re-ranking.
+    const result = await this.db.query<MessageRow & { rank: number }>(
+      `WITH candidates AS (
+         SELECT message_id, conversation_id, role, content, created_at,
+           1 - (embedding <=> ${vecParam}::vector) AS similarity,
+           EXP(-LN(2) * EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0 / ${hlParam}) AS recency
+         FROM messages
+         WHERE ${where.join(" AND ")}
+         ORDER BY embedding <=> ${vecParam}::vector
+         LIMIT ${limitParam} * 3
+       )
+       SELECT message_id, conversation_id, role, content, created_at,
+         (${swParam} * similarity + ${rwParam} * recency) AS rank
+       FROM candidates
+       ORDER BY rank DESC
        LIMIT ${limitParam}`,
       params,
     );

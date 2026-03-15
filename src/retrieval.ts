@@ -62,7 +62,7 @@ export interface DescribeResult {
 
 export interface GrepInput {
   query: string;
-  mode: "regex" | "full_text" | "semantic";
+  mode: "regex" | "full_text" | "semantic" | "recency_boosted";
   scope: "messages" | "summaries" | "both";
   conversationId?: number;
   since?: Date;

@@ -70,10 +70,13 @@ export type ContextItemRecord = {
 export type SummarySearchInput = {
   conversationId?: number;
   query: string;
-  mode: "regex" | "full_text" | "semantic";
+  mode: "regex" | "full_text" | "semantic" | "recency_boosted";
   since?: Date;
   before?: Date;
   limit?: number;
+  semanticWeight?: number;
+  recencyWeight?: number;
+  recencyHalfLifeDays?: number;
 };
 
 export type SummarySearchResult = {
@@ -662,6 +665,20 @@ export class SummaryStore {
   async searchSummaries(input: SummarySearchInput): Promise<SummarySearchResult[]> {
     const limit = input.limit ?? 50;
 
+    if (input.mode === "recency_boosted") {
+      try {
+        return await this.searchRecencyBoosted(
+          input.query, limit, input.conversationId, input.since, input.before,
+          input.semanticWeight, input.recencyWeight, input.recencyHalfLifeDays,
+        );
+      } catch (err) {
+        console.warn(
+          `[lcm:sum-store] recency_boosted search failed, falling back to semantic: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return this.searchSummaries({ ...input, mode: "semantic" });
+      }
+    }
+
     if (input.mode === "semantic") {
       try {
         return await this.searchSemantic(input.query, limit, input.conversationId, input.since, input.before);
@@ -956,6 +973,66 @@ export class SummaryStore {
        FROM summaries
        WHERE ${where.join(" AND ")}
        ORDER BY embedding <=> ${vecParam}::vector
+       LIMIT ${limitParam}`,
+      params,
+    );
+
+    return result.rows.map((row) => ({
+      summaryId: row.summary_id,
+      conversationId: row.conversation_id,
+      kind: row.kind,
+      snippet: row.content.substring(0, 200),
+      createdAt: new Date(row.created_at),
+      rank: row.rank,
+    }));
+  }
+
+  /**
+   * Recency-boosted semantic search for summaries.
+   * Blends cosine similarity with exponential time decay.
+   * Uses latest_at (summary time range end) for recency calculation.
+   */
+  async searchRecencyBoosted(
+    query: string, limit: number,
+    conversationId?: number, since?: Date, before?: Date,
+    semanticWeight = 0.7, recencyWeight = 0.3, halfLifeDays = 7,
+  ): Promise<SummarySearchResult[]> {
+    if (!this.d.pg || !this.embeddingClient) {
+      throw new Error("Recency-boosted search requires PostgreSQL with pgvector and a configured embedding API key");
+    }
+
+    const queryEmbedding = await this.embeddingClient.embedOne(query);
+    const vectorLiteral = toVectorLiteral(queryEmbedding);
+
+    const d = this.d.reset();
+    const where: string[] = ["embedding IS NOT NULL"];
+    const params: unknown[] = [];
+
+    if (conversationId !== undefined) { where.push(`conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`created_at < ${d.p()}`); params.push(before.toISOString()); }
+
+    const vecParam = d.p();
+    const swParam = d.p();
+    const rwParam = d.p();
+    const hlParam = d.p();
+    const limitParam = d.p();
+    params.push(vectorLiteral, semanticWeight, recencyWeight, halfLifeDays, limit);
+
+    const result = await this.db.query<SummarySearchRow & { content: string }>(
+      `WITH candidates AS (
+         SELECT summary_id, conversation_id, kind, content, created_at,
+           1 - (embedding <=> ${vecParam}::vector) AS similarity,
+           EXP(-LN(2) * EXTRACT(EPOCH FROM (NOW() - COALESCE(latest_at, created_at))) / 86400.0 / ${hlParam}) AS recency
+         FROM summaries
+         WHERE ${where.join(" AND ")}
+         ORDER BY embedding <=> ${vecParam}::vector
+         LIMIT ${limitParam} * 3
+       )
+       SELECT summary_id, conversation_id, kind, content, created_at,
+         (${swParam} * similarity + ${rwParam} * recency) AS rank
+       FROM candidates
+       ORDER BY rank DESC
        LIMIT ${limitParam}`,
       params,
     );
