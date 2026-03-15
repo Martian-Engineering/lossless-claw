@@ -642,15 +642,38 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   legacyParams: LcmSummarizerLegacyParams;
   customInstructions?: string;
 }): Promise<LcmSummarizeFn | undefined> {
+  const runtimeConfig =
+    params.legacyParams.config && typeof params.legacyParams.config === "object"
+      ? (params.legacyParams.config as {
+          summaryModel?: unknown;
+          plugins?: {
+            entries?: {
+              [key: string]: {
+                config?: { summaryModel?: unknown };
+              };
+            };
+          };
+        })
+      : undefined;
+  const nestedPluginSummaryModel =
+    typeof runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config?.summaryModel ===
+    "string"
+      ? runtimeConfig.plugins.entries["lossless-claw"].config.summaryModel.trim()
+      : "";
+  const summaryModelOverride =
+    (typeof runtimeConfig?.summaryModel === "string" ? runtimeConfig.summaryModel.trim() : "") ||
+    nestedPluginSummaryModel;
   const providerHint =
     typeof params.legacyParams.provider === "string" ? params.legacyParams.provider.trim() : "";
   const modelHint =
     typeof params.legacyParams.model === "string" ? params.legacyParams.model.trim() : "";
-  const modelRef = modelHint || undefined;
+  const modelRef = summaryModelOverride || modelHint || undefined;
+
+  const resolveProviderHint = summaryModelOverride ? undefined : providerHint || undefined;
 
   let resolved: { provider: string; model: string };
   try {
-    resolved = params.deps.resolveModel(modelRef, providerHint || undefined);
+    resolved = params.deps.resolveModel(modelRef, resolveProviderHint);
   } catch (err) {
     console.error(`[lcm] createLcmSummarize: resolveModel FAILED:`, err instanceof Error ? err.message : err);
     return undefined;
@@ -672,8 +695,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       : undefined;
   const providerApi = resolveProviderApiFromLegacyConfig(params.legacyParams.config, provider);
 
-  const apiKey = params.deps.getApiKey(provider, model);
-
   const condensedTargetTokens =
     Number.isFinite(params.deps.config.condensedTargetTokens) &&
     params.deps.config.condensedTargetTokens > 0
@@ -691,6 +712,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
     const mode: SummaryMode = aggressive ? "aggressive" : "normal";
     const isCondensed = options?.isCondensed === true;
+    const apiKey = await params.deps.getApiKey(provider, model, {
+      profileId: authProfileId,
+    });
     const targetTokens = resolveTargetTokens({
       inputTokens: estimateTokens(text),
       mode,
