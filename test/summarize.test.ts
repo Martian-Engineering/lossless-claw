@@ -152,6 +152,96 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(completeMock.mock.calls[0]?.[0]?.apiKey).toBe("resolved-api-key");
   });
 
+  it("adapts native Ollama provider config for pi-ai with normalized /v1 baseUrl", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "ollama",
+        model: "llama3.2",
+      })),
+      getApiKey: vi.fn(async () => undefined),
+    });
+
+    const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "ollama",
+        model: "llama3.2",
+        config: {
+          models: {
+            providers: {
+              ollama: {
+                api: "ollama",
+                baseUrl: "http://127.0.0.1:11434/",
+              },
+            },
+          },
+        },
+      },
+    });
+
+    await summarize!("Summary input");
+
+    const request = vi.mocked(deps.complete).mock.calls[0]?.[0];
+    expect(request?.providerApi).toBe("openai-completions");
+    expect(request?.apiKey).toBe("ollama-local");
+    expect(request?.runtimeConfig).toMatchObject({
+      models: {
+        providers: {
+          ollama: {
+            api: "openai-completions",
+            baseUrl: "http://127.0.0.1:11434/v1",
+          },
+        },
+      },
+    });
+  });
+
+  it("uses config-backed apiKey for native Ollama when runtime auth lookup returns nothing", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "ollama",
+        model: "llama3.2",
+      })),
+      getApiKey: vi.fn(async () => undefined),
+    });
+
+    const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "ollama",
+        model: "llama3.2",
+        config: {
+          models: {
+            providers: {
+              Ollama: {
+                api: "ollama",
+                baseUrl: "http://127.0.0.1:11434/v1",
+                apiKey: "config-ollama-key",
+              },
+            },
+          },
+        },
+      },
+    });
+
+    await summarize!("Summary input");
+
+    const request = vi.mocked(deps.complete).mock.calls[0]?.[0];
+    expect(request?.providerApi).toBe("openai-completions");
+    expect(request?.apiKey).toBe("config-ollama-key");
+    expect(request?.runtimeConfig).toMatchObject({
+      models: {
+        providers: {
+          Ollama: {
+            api: "openai-completions",
+            baseUrl: "http://127.0.0.1:11434/v1",
+            apiKey: "config-ollama-key",
+          },
+        },
+      },
+    });
+  });
+
   it("falls back deterministically when model returns empty summary output after retry", async () => {
     const deps = makeDeps({
       complete: vi.fn(async () => ({
