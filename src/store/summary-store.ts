@@ -3,7 +3,7 @@ import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
 
 export type SummaryKind = "leaf" | "condensed";
-export type ContextItemType = "message" | "summary";
+export type ContextItemType = "message" | "summary" | "pointer" | "scratchpad";
 
 export type CreateSummaryInput = {
   summaryId: string;
@@ -49,7 +49,26 @@ export type ContextItemRecord = {
   itemType: ContextItemType;
   messageId: number | null;
   summaryId: string | null;
+  pointerId: string | null;
   createdAt: Date;
+};
+
+export type PointerRecord = {
+  pointerId: string;
+  conversationId: number;
+  label: string;
+  reason: string | null;
+  sourceType: string;
+  sourceIds: string[];
+  tokensSaved: number;
+  createdAt: Date;
+};
+
+export type ScratchpadRecord = {
+  conversationId: number;
+  content: string;
+  tokenCount: number;
+  updatedAt: Date;
 };
 
 export type SummarySearchInput = {
@@ -122,7 +141,26 @@ interface ContextItemRow {
   item_type: ContextItemType;
   message_id: number | null;
   summary_id: string | null;
+  pointer_id: string | null;
   created_at: string;
+}
+
+interface PointerRow {
+  pointer_id: string;
+  conversation_id: number;
+  label: string;
+  reason: string | null;
+  source_type: string;
+  source_ids: string;
+  tokens_saved: number;
+  created_at: string;
+}
+
+interface ScratchpadRow {
+  conversation_id: number;
+  content: string;
+  token_count: number;
+  updated_at: string;
 }
 
 interface SummarySearchRow {
@@ -209,7 +247,36 @@ function toContextItemRecord(row: ContextItemRow): ContextItemRecord {
     itemType: row.item_type,
     messageId: row.message_id,
     summaryId: row.summary_id,
+    pointerId: row.pointer_id ?? null,
     createdAt: new Date(row.created_at),
+  };
+}
+
+function toPointerRecord(row: PointerRow): PointerRecord {
+  let sourceIds: string[] = [];
+  try {
+    sourceIds = JSON.parse(row.source_ids);
+  } catch {
+    // ignore malformed JSON
+  }
+  return {
+    pointerId: row.pointer_id,
+    conversationId: row.conversation_id,
+    label: row.label,
+    reason: row.reason,
+    sourceType: row.source_type,
+    sourceIds,
+    tokensSaved: row.tokens_saved ?? 0,
+    createdAt: new Date(row.created_at),
+  };
+}
+
+function toScratchpadRecord(row: ScratchpadRow): ScratchpadRecord {
+  return {
+    conversationId: row.conversation_id,
+    content: row.content,
+    tokenCount: row.token_count ?? 0,
+    updatedAt: new Date(row.updated_at),
   };
 }
 
@@ -511,7 +578,7 @@ export class SummaryStore {
   async getContextItems(conversationId: number): Promise<ContextItemRecord[]> {
     const rows = this.db
       .prepare(
-        `SELECT conversation_id, ordinal, item_type, message_id, summary_id, created_at
+        `SELECT conversation_id, ordinal, item_type, message_id, summary_id, pointer_id, created_at
        FROM context_items
        WHERE conversation_id = ?
        ORDER BY ordinal`,
@@ -914,5 +981,262 @@ export class SummaryStore {
       )
       .all(conversationId) as unknown as LargeFileRow[];
     return rows.map(toLargeFileRecord);
+  }
+
+  // ── Pointers ────────────────────────────────────────────────────────────
+
+  async insertPointer(input: {
+    pointerId: string;
+    conversationId: number;
+    label: string;
+    reason?: string;
+    sourceType: string;
+    sourceIds: string[];
+    tokensSaved: number;
+  }): Promise<PointerRecord> {
+    this.db
+      .prepare(
+        `INSERT INTO pointers (pointer_id, conversation_id, label, reason, source_type, source_ids, tokens_saved)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.pointerId,
+        input.conversationId,
+        input.label,
+        input.reason ?? null,
+        input.sourceType,
+        JSON.stringify(input.sourceIds),
+        input.tokensSaved,
+      );
+
+    const row = this.db
+      .prepare(
+        `SELECT pointer_id, conversation_id, label, reason, source_type, source_ids, tokens_saved, created_at
+       FROM pointers WHERE pointer_id = ?`,
+      )
+      .get(input.pointerId) as unknown as PointerRow;
+
+    return toPointerRecord(row);
+  }
+
+  async getPointer(pointerId: string): Promise<PointerRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT pointer_id, conversation_id, label, reason, source_type, source_ids, tokens_saved, created_at
+       FROM pointers WHERE pointer_id = ?`,
+      )
+      .get(pointerId) as unknown as PointerRow | undefined;
+    return row ? toPointerRecord(row) : null;
+  }
+
+  async getPointersByConversation(conversationId: number): Promise<PointerRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT pointer_id, conversation_id, label, reason, source_type, source_ids, tokens_saved, created_at
+       FROM pointers
+       WHERE conversation_id = ?
+       ORDER BY created_at`,
+      )
+      .all(conversationId) as unknown as PointerRow[];
+    return rows.map(toPointerRecord);
+  }
+
+  async deletePointer(pointerId: string): Promise<void> {
+    this.db.prepare(`DELETE FROM pointers WHERE pointer_id = ?`).run(pointerId);
+  }
+
+  async appendContextPointer(conversationId: number, pointerId: string): Promise<void> {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(ordinal), -1) AS max_ordinal
+       FROM context_items WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as MaxOrdinalRow;
+
+    this.db
+      .prepare(
+        `INSERT INTO context_items (conversation_id, ordinal, item_type, pointer_id)
+       VALUES (?, ?, 'pointer', ?)`,
+      )
+      .run(conversationId, row.max_ordinal + 1, pointerId);
+  }
+
+  async replaceContextRangeWithPointer(input: {
+    conversationId: number;
+    startOrdinal: number;
+    endOrdinal: number;
+    pointerId: string;
+  }): Promise<void> {
+    const { conversationId, startOrdinal, endOrdinal, pointerId } = input;
+
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(
+          `DELETE FROM context_items
+         WHERE conversation_id = ?
+           AND ordinal >= ?
+           AND ordinal <= ?`,
+        )
+        .run(conversationId, startOrdinal, endOrdinal);
+
+      this.db
+        .prepare(
+          `INSERT INTO context_items (conversation_id, ordinal, item_type, pointer_id)
+         VALUES (?, ?, 'pointer', ?)`,
+        )
+        .run(conversationId, startOrdinal, pointerId);
+
+      // Resequence ordinals
+      const items = this.db
+        .prepare(
+          `SELECT ordinal FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
+        )
+        .all(conversationId) as unknown as { ordinal: number }[];
+
+      const updateStmt = this.db.prepare(
+        `UPDATE context_items
+         SET ordinal = ?
+         WHERE conversation_id = ? AND ordinal = ?`,
+      );
+
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(-(i + 1), conversationId, items[i].ordinal);
+      }
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(i, conversationId, -(i + 1));
+      }
+
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  async replacePointerWithContextItems(input: {
+    conversationId: number;
+    pointerOrdinal: number;
+    items: Array<{ itemType: "message" | "summary"; messageId?: number; summaryId?: string }>;
+  }): Promise<void> {
+    const { conversationId, pointerOrdinal, items } = input;
+
+    this.db.exec("BEGIN");
+    try {
+      // Delete the pointer context item
+      this.db
+        .prepare(
+          `DELETE FROM context_items
+         WHERE conversation_id = ? AND ordinal = ?`,
+        )
+        .run(conversationId, pointerOrdinal);
+
+      // Insert replacement items at sequential ordinals starting from a high temp base
+      const tempBase = 100000;
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.itemType === "message" && item.messageId != null) {
+          this.db
+            .prepare(
+              `INSERT INTO context_items (conversation_id, ordinal, item_type, message_id)
+             VALUES (?, ?, 'message', ?)`,
+            )
+            .run(conversationId, tempBase + i, item.messageId);
+        } else if (item.itemType === "summary" && item.summaryId != null) {
+          this.db
+            .prepare(
+              `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
+             VALUES (?, ?, 'summary', ?)`,
+            )
+            .run(conversationId, tempBase + i, item.summaryId);
+        }
+      }
+
+      // Resequence all ordinals
+      const allItems = this.db
+        .prepare(
+          `SELECT ordinal FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
+        )
+        .all(conversationId) as unknown as { ordinal: number }[];
+
+      const updateStmt = this.db.prepare(
+        `UPDATE context_items SET ordinal = ? WHERE conversation_id = ? AND ordinal = ?`,
+      );
+
+      for (let i = 0; i < allItems.length; i++) {
+        updateStmt.run(-(i + 1), conversationId, allItems[i].ordinal);
+      }
+      for (let i = 0; i < allItems.length; i++) {
+        updateStmt.run(i, conversationId, -(i + 1));
+      }
+
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  // ── Scratchpad ──────────────────────────────────────────────────────────
+
+  async getScratchpad(conversationId: number): Promise<ScratchpadRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT conversation_id, content, token_count, updated_at
+       FROM scratchpads WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as ScratchpadRow | undefined;
+    return row ? toScratchpadRecord(row) : null;
+  }
+
+  async upsertScratchpad(input: {
+    conversationId: number;
+    content: string;
+    tokenCount: number;
+  }): Promise<ScratchpadRecord> {
+    this.db
+      .prepare(
+        `INSERT INTO scratchpads (conversation_id, content, token_count, updated_at)
+       VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT (conversation_id) DO UPDATE SET
+         content = excluded.content,
+         token_count = excluded.token_count,
+         updated_at = datetime('now')`,
+      )
+      .run(input.conversationId, input.content, input.tokenCount);
+
+    return (await this.getScratchpad(input.conversationId))!;
+  }
+
+  async ensureScratchpadContextItem(conversationId: number): Promise<void> {
+    // Check if a scratchpad context item already exists
+    const existing = this.db
+      .prepare(
+        `SELECT ordinal FROM context_items
+       WHERE conversation_id = ? AND item_type = 'scratchpad'`,
+      )
+      .get(conversationId) as unknown as { ordinal: number } | undefined;
+
+    if (existing) {
+      return;
+    }
+
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(ordinal), -1) AS max_ordinal
+       FROM context_items WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as MaxOrdinalRow;
+
+    this.db
+      .prepare(
+        `INSERT INTO context_items (conversation_id, ordinal, item_type)
+       VALUES (?, ?, 'scratchpad')`,
+      )
+      .run(conversationId, row.max_ordinal + 1);
   }
 }

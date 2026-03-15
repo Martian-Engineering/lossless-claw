@@ -5,7 +5,7 @@ import type {
   MessagePartRecord,
   MessageRole,
 } from "./store/conversation-store.js";
-import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
+import type { SummaryStore, ContextItemRecord, SummaryRecord, PointerRecord, ScratchpadRecord } from "./store/summary-store.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 
@@ -528,6 +528,31 @@ async function formatSummaryContent(
   return lines.join("\n");
 }
 
+/**
+ * Format a pointer record into the XML payload string the model sees.
+ */
+function formatPointerContent(pointer: PointerRecord, timezone?: string): string {
+  const created = formatDateForAttribute(pointer.createdAt, timezone);
+  const lines: string[] = [];
+  lines.push(`<collapsed id="${pointer.pointerId}" tokens_saved="${pointer.tokensSaved}" created="${created}">`);
+  lines.push(`  ${pointer.label}${pointer.reason ? ` (collapsed: ${pointer.reason})` : ""}`);
+  lines.push(`  → lcm_expand_active(pointerId: "${pointer.pointerId}") to restore`);
+  lines.push(`</collapsed>`);
+  return lines.join("\n");
+}
+
+/**
+ * Format a scratchpad record into the XML payload string the model sees.
+ */
+function formatScratchpadContent(scratchpad: ScratchpadRecord, timezone?: string): string {
+  const updated = formatDateForAttribute(scratchpad.updatedAt, timezone);
+  const lines: string[] = [];
+  lines.push(`<scratchpad updated="${updated}">`);
+  lines.push(scratchpad.content);
+  lines.push(`</scratchpad>`);
+  return lines.join("\n");
+}
+
 // ── Resolved context item (after fetching underlying message/summary) ────────
 
 interface ResolvedItem {
@@ -597,10 +622,24 @@ export class ContextAssembler {
 
     const systemPromptAddition = buildSystemPromptAddition(summarySignals);
 
-    // Step 3: Split into evictable prefix and protected fresh tail
-    const tailStart = Math.max(0, resolved.length - freshTailCount);
-    const freshTail = resolved.slice(tailStart);
-    const evictable = resolved.slice(0, tailStart);
+    // Step 3: Extract scratchpad items — they go just before the fresh tail
+    // regardless of their original position.
+    const scratchpadItems: ResolvedItem[] = [];
+    const nonScratchpad: ResolvedItem[] = [];
+    for (const item of resolved) {
+      // Identify scratchpad items by checking the context item type
+      const contextItem = contextItems.find((ci) => ci.ordinal === item.ordinal);
+      if (contextItem?.itemType === "scratchpad") {
+        scratchpadItems.push(item);
+      } else {
+        nonScratchpad.push(item);
+      }
+    }
+
+    // Split into evictable prefix and protected fresh tail
+    const tailStart = Math.max(0, nonScratchpad.length - freshTailCount);
+    const freshTail = nonScratchpad.slice(tailStart);
+    const evictable = nonScratchpad.slice(0, tailStart);
 
     // Step 4: Budget-aware selection
     // First, compute the token cost of the fresh tail (always included).
@@ -647,7 +686,10 @@ export class ContextAssembler {
       evictableTokens = accum;
     }
 
-    // Append fresh tail after the evictable prefix
+    // Append scratchpad items just before fresh tail (high-attention zone)
+    selected.push(...scratchpadItems);
+
+    // Append fresh tail after the scratchpad
     selected.push(...freshTail);
 
     const estimatedTokens = evictableTokens + tailTokens;
@@ -708,6 +750,14 @@ export class ContextAssembler {
 
     if (item.itemType === "summary" && item.summaryId != null) {
       return this.resolveSummaryItem(item);
+    }
+
+    if (item.itemType === "pointer" && item.pointerId != null) {
+      return this.resolvePointerItem(item);
+    }
+
+    if (item.itemType === "scratchpad") {
+      return this.resolveScratchpadItem(item);
     }
 
     // Malformed item — skip
@@ -799,6 +849,48 @@ export class ContextAssembler {
         depth: summary.depth,
         descendantCount: summary.descendantCount,
       },
+    };
+  }
+
+  /**
+   * Resolve a context item that references a collapsed pointer.
+   * Pointers render as minimal user messages.
+   */
+  private async resolvePointerItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
+    const pointer = await this.summaryStore.getPointer(item.pointerId!);
+    if (!pointer) {
+      return null;
+    }
+
+    const content = formatPointerContent(pointer, this.timezone);
+    const tokens = estimateTokens(content);
+
+    return {
+      ordinal: item.ordinal,
+      message: { role: "user" as const, content } as AgentMessage,
+      tokens,
+      isMessage: false,
+    };
+  }
+
+  /**
+   * Resolve a scratchpad context item.
+   * The scratchpad renders as a user message with clear boundaries.
+   */
+  private async resolveScratchpadItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
+    const scratchpad = await this.summaryStore.getScratchpad(item.conversationId);
+    if (!scratchpad || !scratchpad.content.trim()) {
+      return null;
+    }
+
+    const content = formatScratchpadContent(scratchpad, this.timezone);
+    const tokens = estimateTokens(content);
+
+    return {
+      ordinal: item.ordinal,
+      message: { role: "user" as const, content } as AgentMessage,
+      tokens,
+      isMessage: false,
     };
   }
 }
