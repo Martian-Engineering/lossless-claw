@@ -15,9 +15,9 @@ RUN npm run build || true # Just in case
 
 # Set up openclaw workspace
 WORKDIR /root/.openclaw
-RUN openclaw wizard init --non-interactive || true
 
 # Install our local plugin into the docker openclaw instance
 RUN openclaw plugins install /plugin
 
-ENTRYPOINT ["openclaw", "gateway", "run"]
+# Run openclaw gateway in the foreground, creating a dev config
+ENTRYPOINT ["openclaw", "gateway", "run", "--dev", "--bind", "auto"]
