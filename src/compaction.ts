@@ -156,6 +156,15 @@ function dedupeOrderedIds(ids: Iterable<string>): string[] {
   return ordered;
 }
 
+/** Regex patterns for preserve tags */
+const PRESERVE_START = /<!--\s*preserve(?:\s*:.*?)?\s*-->/i;
+const PRESERVE_END = /<!--\s*\/preserve\s*-->/i;
+
+/** Check if content has preserve tags (should not be compacted). */
+function hasPreserveTags(content: string): boolean {
+  return PRESERVE_START.test(content) && PRESERVE_END.test(content);
+}
+
 // ── CompactionEngine ─────────────────────────────────────────────────────────
 
 export class CompactionEngine {
@@ -665,6 +674,11 @@ export class CompactionEngine {
         if (item.itemType !== "message" || item.messageId == null) {
           continue;
         }
+        // Skip preserve-tagged messages - they should never be compacted
+        const msg = await this.conversationStore.getMessageById(item.messageId);
+        if (msg && hasPreserveTags(msg.content)) {
+          continue;
+        }
         started = true;
       } else if (item.itemType !== "message" || item.messageId == null) {
         break;
@@ -673,6 +687,13 @@ export class CompactionEngine {
       if (item.messageId == null) {
         continue;
       }
+
+      // Skip preserve-tagged messages - they should never be compacted
+      const msg = await this.conversationStore.getMessageById(item.messageId);
+      if (msg && hasPreserveTags(msg.content)) {
+        continue;
+      }
+
       const messageTokens = await this.getMessageTokenCount(item.messageId);
       if (chunk.length > 0 && chunkTokens + messageTokens > threshold) {
         break;
@@ -897,6 +918,12 @@ export class CompactionEngine {
         }
         continue;
       }
+
+      // Skip summaries containing preserve-tagged content
+      if (hasPreserveTags(summary.content)) {
+        continue;
+      }
+
       const tokenCount = this.resolveSummaryTokenCount(summary);
 
       if (chunk.length > 0 && summaryTokens + tokenCount > chunkTokenBudget) {

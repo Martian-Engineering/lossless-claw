@@ -1898,4 +1898,133 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
       }),
     );
   });
+
+  // ── Preserve tag tests ─────────────────────────────────────────────────────
+
+  it("skips preserve-tagged content in ingest", async () => {
+    const engine = createEngine();
+    const sessionId = "preserve-ingest-test";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: `<!-- preserve -->
+# SOUL.md
+
+This is identity content that should never be compacted.
+<!-- /preserve -->`,
+      },
+    });
+
+    const conversation =
+      await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).toBeNull();
+  });
+
+  it("skips preserve-tagged content with optional type suffix", async () => {
+    const engine = createEngine();
+    const sessionId = "preserve-suffix-test";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: `<!-- preserve:soul -->
+# SOUL.md
+
+Identity content with type suffix.
+<!-- /preserve -->`,
+      },
+    });
+
+    const conversation =
+      await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).toBeNull();
+  });
+
+  it("ingests content without preserve tags normally", async () => {
+    const engine = createEngine();
+    const sessionId = "no-preserve-test";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: "This is regular content without preserve tags.",
+      },
+    });
+
+    const conversation =
+      await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(
+      conversation!.conversationId,
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toBe("This is regular content without preserve tags.");
+  });
+
+  it("does not compact messages with preserve tags", async () => {
+    const engine = createEngine();
+    const sessionId = "preserve-compact-test";
+
+    // Ingest regular messages
+    for (let i = 0; i < 5; i++) {
+      await engine.ingest({
+        sessionId,
+        message: { role: "user", content: `Regular message ${i}` },
+      });
+      await engine.ingest({
+        sessionId,
+        message: { role: "assistant", content: `Response ${i}` },
+      });
+    }
+
+    // Ingest a preserve-tagged message (simulating old data that was ingested before the feature)
+    const conversation =
+      await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    // Directly insert a preserve-tagged message into the database
+    // Get current max seq first
+    const messagesBeforeInsert = await engine.getConversationStore().getMessages(
+      conversation!.conversationId,
+    );
+    const maxSeq = Math.max(...messagesBeforeInsert.map((m) => m.seq ?? 0), 0);
+    await engine.getConversationStore().createMessage({
+      conversationId: conversation!.conversationId,
+      seq: maxSeq + 1,
+      role: "user",
+      content: `<!-- preserve -->
+# SOUL.md
+Identity content that should not be compacted.
+<!-- /preserve -->`,
+      tokenCount: 100,
+    });
+
+    // Get messages before compaction
+    const messagesBefore = await engine.getConversationStore().getMessages(
+      conversation!.conversationId,
+    );
+    expect(messagesBefore.length).toBeGreaterThan(10);
+
+    // Try to compact - the preserve-tagged message should be skipped
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: "/tmp/test-session.jsonl",
+      tokenBudget: 1000, // Low budget to trigger compaction
+      force: true,
+    });
+
+    // Verify the preserve-tagged message is still in the database
+    const messagesAfter = await engine.getConversationStore().getMessages(
+      conversation!.conversationId,
+    );
+    const preserveMessages = messagesAfter.filter((m) =>
+      m.content.includes("<!-- preserve -->"),
+    );
+    expect(preserveMessages.length).toBe(1);
+    expect(preserveMessages[0].content).toContain("Identity content that should not be compacted");
+  });
 });
