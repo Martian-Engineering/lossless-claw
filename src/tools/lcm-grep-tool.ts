@@ -80,7 +80,7 @@ export function createLcmGrepTool(input: {
       "Searches across messages and/or summaries stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
       "active context. Returns matching snippets with their summary/message IDs " +
-      "for follow-up with lcm_expand or lcm_describe. " +
+      "for follow-up with lcm_expand or lcm_describe.",
 
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
