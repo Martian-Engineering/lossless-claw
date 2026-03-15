@@ -16,6 +16,13 @@ import { createLcmExpandQueryTool } from "./src/tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "./src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "./src/tools/lcm-grep-tool.js";
 import { createLcmScratchpadTool } from "./src/tools/lcm-scratchpad-tool.js";
+import { createLcmUndoTool } from "./src/tools/lcm-undo-tool.js";
+import { createLcmBudgetTool } from "./src/tools/lcm-budget-tool.js";
+import { createLcmCheckpointTool } from "./src/tools/lcm-checkpoint-tool.js";
+import { createLcmTemplatesTool } from "./src/tools/lcm-templates-tool.js";
+import { createLcmTidyTool } from "./src/tools/lcm-tidy-tool.js";
+import { createLcmPromoteTool } from "./src/tools/lcm-promote-tool.js";
+import { createLcmTagTool } from "./src/tools/lcm-tag-tool.js";
 import type { LcmDependencies } from "./src/types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -1345,6 +1352,57 @@ const lcmPlugin = {
         }),
       );
     }
+
+    // Undo & budget tools
+    api.registerTool((ctx) =>
+      createLcmUndoTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmBudgetTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmCheckpointTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmTemplatesTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmTidyTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmPromoteTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmTagTool({
+        deps,
+        lcm,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
 
     api.logger.info(
       `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,

@@ -32,6 +32,8 @@ export type LcmConfig = {
   collapseEnabled: boolean;
   /** Token threshold for middle zone compression (default 50000). */
   middleCompressionThreshold: number;
+  /** Fraction of token budget above which a warning is injected (0.0-1.0, default 0.7). */
+  budgetWarningThreshold: number;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -145,5 +147,6 @@ export function resolveLcmConfig(
     middleCompressionThreshold:
       (env.LCM_MIDDLE_COMPRESSION_THRESHOLD !== undefined ? parseInt(env.LCM_MIDDLE_COMPRESSION_THRESHOLD, 10) : undefined)
         ?? toNumber(pc.middleCompressionThreshold) ?? 50000,
+    budgetWarningThreshold: toNumber(pc.budgetWarningThreshold) ?? 0.55,
   };
 }

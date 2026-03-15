@@ -546,6 +546,13 @@ export function runLcmMigrations(
     db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
   }
 
+  // Track whether LCM has actively managed this conversation (collapse/expand/scratchpad).
+  // Once set, the assembler must trust the DB and never fall back to live messages.
+  const hasManagedAt = conversationColumns.some((col) => col.name === "managed_at");
+  if (!hasManagedAt) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN managed_at TEXT`);
+  }
+
   ensureSummaryDepthColumn(db);
   ensureSummaryMetadataColumns(db);
   backfillSummaryDepths(db);
@@ -561,6 +568,7 @@ export function runLcmMigrations(
       source_type TEXT NOT NULL,
       source_ids TEXT NOT NULL,
       tokens_saved INTEGER DEFAULT 0,
+      data TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
     );
@@ -576,6 +584,81 @@ export function runLcmMigrations(
 
   // Migrate existing context_items table if it lacks the pointer/scratchpad columns.
   ensureContextItemsActiveMemory(db);
+
+  // Add data column to pointers if it doesn't exist (for computation state).
+  try {
+    db.exec(`ALTER TABLE pointers ADD COLUMN data TEXT`);
+  } catch {
+    // Column already exists
+  }
+
+  // Add accessed_at column to pointers for access tracking.
+  try {
+    db.exec(`ALTER TABLE pointers ADD COLUMN accessed_at TEXT`);
+  } catch {
+    // Column already exists
+  }
+
+  // Add tags column to pointers (JSON array for categorization).
+  try {
+    db.exec(`ALTER TABLE pointers ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`);
+  } catch {
+    // Column already exists
+  }
+
+  // Add status column to pointers (active/reference/stale lifecycle).
+  try {
+    db.exec(`ALTER TABLE pointers ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
+  } catch {
+    // Column already exists
+  }
+
+  // ── Restore points table (for lcm_undo) ──────────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS restore_points (
+      id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL,
+      operation TEXT NOT NULL,
+      target TEXT NOT NULL,
+      items_affected INTEGER NOT NULL DEFAULT 0,
+      tokens_affected INTEGER NOT NULL DEFAULT 0,
+      snapshot_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS restore_points_conv_idx ON restore_points (conversation_id, created_at);
+  `);
+
+  // ── Checkpoints table (for lcm_checkpoint) ──────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS checkpoints (
+      checkpoint_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT,
+      context_snapshot TEXT NOT NULL,
+      scratchpad_snapshot TEXT,
+      token_count INTEGER DEFAULT 0,
+      item_count INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS checkpoints_conv_idx ON checkpoints (conversation_id, created_at);
+  `);
+
+  // ── Templates table (for lcm_templates) ──────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS templates (
+      template_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      content TEXT NOT NULL,
+      language TEXT DEFAULT 'python',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS templates_conv_name_idx ON templates (conversation_id, name);
+  `);
 
   const fts5Available = options?.fts5Available ?? getLcmDbFeatures(db).fts5Available;
   if (!fts5Available) {

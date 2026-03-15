@@ -995,3 +995,271 @@ describe("Active Memory: End-to-End Flows", () => {
     expect(collapsedMsgs).toHaveLength(2);
   });
 });
+
+// ── Tags & Status tests ────────────────────────────────────────────────────
+
+describe("Pointer tags and status", () => {
+  let db: DatabaseSync;
+  let conversationStore: ConversationStore;
+  let summaryStore: SummaryStore;
+  let assembler: ContextAssembler;
+
+  beforeEach(() => {
+    db = createInMemoryDb();
+    ({ conversationStore, summaryStore, assembler } = createStores(db));
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("should store and retrieve tags on a pointer", async () => {
+    const { conversationId, messageIds } = await seedConversation(
+      conversationStore, summaryStore, 4,
+    );
+
+    const pointer = await summaryStore.insertPointer({
+      pointerId: "ptr_test_tags_1",
+      conversationId,
+      label: "test pointer with tags",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[0])],
+      tokensSaved: 100,
+      tags: ["research", "path-a"],
+      status: "active",
+    });
+
+    expect(pointer.tags).toEqual(["research", "path-a"]);
+    expect(pointer.status).toBe("active");
+
+    const retrieved = await summaryStore.getPointer("ptr_test_tags_1");
+    expect(retrieved).not.toBeNull();
+    expect(retrieved!.tags).toEqual(["research", "path-a"]);
+    expect(retrieved!.status).toBe("active");
+  });
+
+  it("should default tags to empty array and status to active", async () => {
+    const { conversationId, messageIds } = await seedConversation(
+      conversationStore, summaryStore, 4,
+    );
+
+    const pointer = await summaryStore.insertPointer({
+      pointerId: "ptr_test_defaults",
+      conversationId,
+      label: "test pointer defaults",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[0])],
+      tokensSaved: 50,
+    });
+
+    expect(pointer.tags).toEqual([]);
+    expect(pointer.status).toBe("active");
+  });
+
+  it("should update tags on a pointer", async () => {
+    const { conversationId, messageIds } = await seedConversation(
+      conversationStore, summaryStore, 4,
+    );
+
+    await summaryStore.insertPointer({
+      pointerId: "ptr_update_tags",
+      conversationId,
+      label: "test update tags",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[0])],
+      tokensSaved: 50,
+      tags: ["old-tag"],
+    });
+
+    await summaryStore.updatePointerTags("ptr_update_tags", ["new-tag", "another"]);
+    const updated = await summaryStore.getPointer("ptr_update_tags");
+    expect(updated!.tags).toEqual(["new-tag", "another"]);
+  });
+
+  it("should update status on a pointer", async () => {
+    const { conversationId, messageIds } = await seedConversation(
+      conversationStore, summaryStore, 4,
+    );
+
+    await summaryStore.insertPointer({
+      pointerId: "ptr_update_status",
+      conversationId,
+      label: "test update status",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[0])],
+      tokensSaved: 50,
+    });
+
+    expect((await summaryStore.getPointer("ptr_update_status"))!.status).toBe("active");
+
+    await summaryStore.updatePointerStatus("ptr_update_status", "stale");
+    const updated = await summaryStore.getPointer("ptr_update_status");
+    expect(updated!.status).toBe("stale");
+  });
+
+  it("should find pointers by tags", async () => {
+    const { conversationId, messageIds } = await seedConversation(
+      conversationStore, summaryStore, 6,
+    );
+
+    await summaryStore.insertPointer({
+      pointerId: "ptr_tag_search_1",
+      conversationId,
+      label: "pointer A",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[0])],
+      tokensSaved: 50,
+      tags: ["research", "math"],
+    });
+
+    await summaryStore.insertPointer({
+      pointerId: "ptr_tag_search_2",
+      conversationId,
+      label: "pointer B",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[1])],
+      tokensSaved: 50,
+      tags: ["research", "coding"],
+    });
+
+    await summaryStore.insertPointer({
+      pointerId: "ptr_tag_search_3",
+      conversationId,
+      label: "pointer C",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[2])],
+      tokensSaved: 50,
+      tags: ["coding"],
+    });
+
+    const mathPointers = await summaryStore.getPointersByTags(conversationId, ["math"]);
+    expect(mathPointers).toHaveLength(1);
+    expect(mathPointers[0].pointerId).toBe("ptr_tag_search_1");
+
+    const researchPointers = await summaryStore.getPointersByTags(conversationId, ["research"]);
+    expect(researchPointers).toHaveLength(2);
+
+    const codingOrMath = await summaryStore.getPointersByTags(conversationId, ["coding", "math"]);
+    expect(codingOrMath).toHaveLength(3);
+  });
+
+  it("should find related pointers via shared tags", async () => {
+    const { conversationId, messageIds } = await seedConversation(
+      conversationStore, summaryStore, 6,
+    );
+
+    await summaryStore.insertPointer({
+      pointerId: "ptr_related_1",
+      conversationId,
+      label: "pointer A",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[0])],
+      tokensSaved: 50,
+      tags: ["research", "path-a"],
+    });
+
+    await summaryStore.insertPointer({
+      pointerId: "ptr_related_2",
+      conversationId,
+      label: "pointer B",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[1])],
+      tokensSaved: 50,
+      tags: ["research", "path-b"],
+    });
+
+    await summaryStore.insertPointer({
+      pointerId: "ptr_related_3",
+      conversationId,
+      label: "pointer C - unrelated",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[2])],
+      tokensSaved: 50,
+      tags: ["coding"],
+    });
+
+    const related = await summaryStore.getRelatedPointers("ptr_related_1", conversationId);
+    expect(related).toHaveLength(1);
+    expect(related[0].pointerId).toBe("ptr_related_2");
+  });
+
+  it("should render tags and status in assembled pointer XML", async () => {
+    const { conversationId, messageIds } = await seedConversation(
+      conversationStore, summaryStore, 4,
+    );
+
+    const pointer = await summaryStore.insertPointer({
+      pointerId: "ptr_render_tags",
+      conversationId,
+      label: "tagged pointer",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[0])],
+      tokensSaved: 50,
+      tags: ["research", "math"],
+      status: "reference",
+    });
+
+    await summaryStore.replaceContextRangeWithPointer({
+      conversationId,
+      startOrdinal: 0,
+      endOrdinal: 0,
+      pointerId: "ptr_render_tags",
+    });
+
+    await conversationStore.markConversationManaged(conversationId);
+
+    const assembled = await assembler.assemble({
+      conversationId,
+      tokenBudget: 100000,
+      freshTailCount: 0,
+    });
+
+    const collapsedMsg = assembled.messages.find(
+      (m) => typeof m.content === "string" && m.content.includes("ptr_render_tags"),
+    );
+    expect(collapsedMsg).toBeDefined();
+    const content = collapsedMsg!.content as string;
+    expect(content).toContain('tags="research,math"');
+    expect(content).toContain('status="reference"');
+  });
+
+  it("should not render status attribute when active (default)", async () => {
+    const { conversationId, messageIds } = await seedConversation(
+      conversationStore, summaryStore, 4,
+    );
+
+    await summaryStore.insertPointer({
+      pointerId: "ptr_active_default",
+      conversationId,
+      label: "active pointer",
+      sourceType: "tool_output",
+      sourceIds: [String(messageIds[0])],
+      tokensSaved: 50,
+      tags: [],
+      status: "active",
+    });
+
+    await summaryStore.replaceContextRangeWithPointer({
+      conversationId,
+      startOrdinal: 0,
+      endOrdinal: 0,
+      pointerId: "ptr_active_default",
+    });
+
+    await conversationStore.markConversationManaged(conversationId);
+
+    const assembled = await assembler.assemble({
+      conversationId,
+      tokenBudget: 100000,
+      freshTailCount: 0,
+    });
+
+    const collapsedMsg = assembled.messages.find(
+      (m) => typeof m.content === "string" && m.content.includes("ptr_active_default"),
+    );
+    expect(collapsedMsg).toBeDefined();
+    const content = collapsedMsg!.content as string;
+    expect(content).not.toContain('status=');
+    expect(content).not.toContain('tags=');
+  });
+});

@@ -862,7 +862,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[2]?.role).toBe("user");
   });
 
-  it("omits dynamic LCM system prompt guidance when no summaries exist", async () => {
+  it("omits LCM recall guidance but includes context ref map when no summaries exist", async () => {
     const engine = createEngine();
     const sessionId = "session-no-summary-guidance";
 
@@ -882,7 +882,11 @@ describe("LcmContextEngine.assemble canonical path", () => {
     });
 
     const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
-    expect(promptAddition).toBeUndefined();
+    // Context ref map is always present when there are context items
+    expect(promptAddition).toBeDefined();
+    expect(promptAddition).toContain("## Context Refs");
+    // But no LCM Recall guidance without summaries
+    expect(promptAddition).not.toContain("## LCM Recall");
   });
 
   it("adds recall workflow guidance when summaries are present", async () => {

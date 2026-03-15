@@ -107,12 +107,22 @@ export function createLcmExpandActiveTool(input: {
       // Delete the pointer record
       await summaryStore.deletePointer(pointerId);
 
-      return jsonResult({
+      // Mark the conversation as actively managed (expand is an LCM operation)
+      await conversationStore.markConversationManaged(conversationId);
+
+      const result: Record<string, unknown> = {
         expanded: true,
         tokensRestored,
         itemCount: restoredItems.length,
         message: `Expanded ${restoredItems.length} item(s), restoring ~${tokensRestored} tokens to context.`,
-      });
+      };
+
+      if (pointer.data) {
+        result.data = pointer.data;
+        result.message = `${result.message} Includes structured data payload.`;
+      }
+
+      return jsonResult(result);
     },
   };
 }

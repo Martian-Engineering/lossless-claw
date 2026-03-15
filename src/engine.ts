@@ -594,6 +594,8 @@ export class LcmContextEngine implements ContextEngine {
   private migrated = false;
   private readonly fts5Available: boolean;
   private sessionOperationQueues = new Map<string, Promise<void>>();
+  private _lastSessionFile: string | undefined;
+  private _lastSessionId: string | undefined;
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
@@ -1006,6 +1008,8 @@ export class LcmContextEngine implements ContextEngine {
 
   async bootstrap(params: { sessionId: string; sessionFile: string }): Promise<BootstrapResult> {
     this.ensureMigrated();
+    this._lastSessionFile = params.sessionFile;
+    this._lastSessionId = params.sessionId;
 
     const result = await this.withSessionQueue(params.sessionId, async () =>
       this.conversationStore.withTransaction(async () => {
@@ -1122,6 +1126,46 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
+    // Cross-session scratchpad seeding: if scratchpad is empty, seed from WORKSPACE_STATE.md
+    if (this.config.scratchpadEnabled) {
+      try {
+        const conversation = await this.conversationStore.getConversationBySessionId(
+          params.sessionId,
+        );
+        if (conversation) {
+          const scratchpad = await this.summaryStore.getScratchpad(conversation.conversationId);
+          if (!scratchpad || !scratchpad.content.trim()) {
+            try {
+              const wsPath = join(process.cwd(), "WORKSPACE_STATE.md");
+              const wsContent = readFileSync(wsPath, "utf-8");
+              if (wsContent.trim()) {
+                const header = `<!-- auto-seeded from WORKSPACE_STATE.md at ${new Date().toISOString()} -->`;
+                const seededContent = `${header}\n${wsContent}`;
+                const tokenCount = estimateTokens(seededContent);
+                await this.summaryStore.upsertScratchpad({
+                  conversationId: conversation.conversationId,
+                  content: seededContent,
+                  tokenCount,
+                });
+                await this.summaryStore.ensureScratchpadContextItem(conversation.conversationId);
+                await this.conversationStore.markConversationManaged(conversation.conversationId);
+                console.error(
+                  `[lcm] bootstrap: seeded scratchpad from WORKSPACE_STATE.md (${tokenCount} tokens)`,
+                );
+              }
+            } catch {
+              // WORKSPACE_STATE.md doesn't exist or can't be read — that's fine
+            }
+          }
+        }
+      } catch (err) {
+        console.error(
+          `[lcm] bootstrap: scratchpad seeding failed:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+
     return result;
   }
 
@@ -1219,6 +1263,115 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
+  /**
+   * Flush pending messages from the session file into the DB.
+   *
+   * During a turn, tool results are written to the session JSONL in real time
+   * but only ingested into the LCM database in afterTurn(). This method reads
+   * the session file and ingests any messages not already in the DB, so that
+   * mid-turn tools (like lcm_collapse) can find current-turn content.
+   */
+  async flushPendingMessages(): Promise<{ flushed: number }> {
+    if (!this._lastSessionFile || !this._lastSessionId) {
+      return { flushed: 0 };
+    }
+
+    this.ensureMigrated();
+
+    const sessionId = this._lastSessionId;
+    const sessionFile = this._lastSessionFile;
+
+    return this.withSessionQueue(sessionId, async () => {
+      const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
+      if (!conversation) {
+        return { flushed: 0 };
+      }
+
+      const historicalMessages = readLeafPathMessages(sessionFile);
+      if (historicalMessages.length === 0) {
+        return { flushed: 0 };
+      }
+
+      // Strip incomplete tool call/result pairs from the tail.
+      // During mid-turn flush, the JSONL may contain an assistant message
+      // with tool_use blocks whose results haven't been written yet (because
+      // those tools are currently executing, including this flush call itself).
+      // Ingesting those incomplete pairs triggers transcript repair's
+      // "missing tool result" synthetic errors. Instead, trim them off.
+      const trimmed = this.trimIncompleteToolPairs(historicalMessages);
+
+      if (trimmed.length === 0) {
+        return { flushed: 0 };
+      }
+
+      const result = await this.reconcileSessionTail({
+        sessionId,
+        conversationId: conversation.conversationId,
+        historicalMessages: trimmed,
+      });
+
+      return { flushed: result.importedMessages };
+    });
+  }
+
+  /**
+   * Remove trailing messages that form incomplete tool call/result pairs.
+   * If the last assistant message has tool_use blocks, check that each
+   * has a corresponding tool result after it. Drop the assistant message
+   * and any orphaned tool results if not all calls are satisfied.
+   */
+  private trimIncompleteToolPairs(messages: AgentMessage[]): AgentMessage[] {
+    if (messages.length === 0) return messages;
+
+    // Find the last assistant message
+    let lastAssistantIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") {
+        lastAssistantIdx = i;
+        break;
+      }
+    }
+
+    if (lastAssistantIdx === -1) return messages;
+
+    const assistantMsg = messages[lastAssistantIdx];
+
+    // Extract tool_use IDs from the assistant message
+    const toolCallIds = new Set<string>();
+    const content = assistantMsg.content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block && typeof block === "object" && "type" in block) {
+          if (block.type === "tool_use" && "id" in block && typeof block.id === "string") {
+            toolCallIds.add(block.id);
+          }
+        }
+      }
+    }
+
+    // No tool calls in the last assistant message — nothing to trim
+    if (toolCallIds.size === 0) return messages;
+
+    // Check which tool calls have results after the assistant message
+    const satisfiedIds = new Set<string>();
+    for (let i = lastAssistantIdx + 1; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role === "tool" || msg.role === "toolResult") {
+        const callId = (msg as Record<string, unknown>).toolCallId as string | undefined
+          ?? (msg as Record<string, unknown>).toolUseId as string | undefined;
+        if (callId && toolCallIds.has(callId)) {
+          satisfiedIds.add(callId);
+        }
+      }
+    }
+
+    // All tool calls have results — safe to ingest everything
+    if (satisfiedIds.size === toolCallIds.size) return messages;
+
+    // Some tool calls are missing results — trim from the assistant message onward
+    return messages.slice(0, lastAssistantIdx);
+  }
+
   async afterTurn(params: {
     sessionId: string;
     sessionFile: string;
@@ -1230,6 +1383,8 @@ export class LcmContextEngine implements ContextEngine {
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
     this.ensureMigrated();
+    this._lastSessionFile = params.sessionFile;
+    this._lastSessionId = params.sessionId;
 
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
@@ -1303,6 +1458,7 @@ export class LcmContextEngine implements ContextEngine {
     messages: AgentMessage[];
     tokenBudget?: number;
   }): Promise<AssembleResult> {
+    let isManaged = false;
     try {
       this.ensureMigrated();
 
@@ -1316,8 +1472,10 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
+      isManaged = conversation.managedAt != null;
+
       const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
-      if (contextItems.length === 0) {
+      if (contextItems.length === 0 && !isManaged) {
         return {
           messages: params.messages,
           estimatedTokens: 0,
@@ -1327,8 +1485,11 @@ export class LcmContextEngine implements ContextEngine {
       // Guard against incomplete bootstrap/coverage: if the DB only has
       // raw context items and clearly trails the current live history, keep
       // the live path to avoid dropping prompt context.
-      const hasSummaryItems = contextItems.some((item) => item.itemType === "summary");
-      if (!hasSummaryItems && contextItems.length < params.messages.length) {
+      // However, if LCM has ever actively managed this conversation
+      // (collapse/expand/scratchpad), the DB is authoritative — falling back
+      // to live messages would re-inject content that was deliberately
+      // collapsed or compacted.
+      if (!isManaged && contextItems.length < params.messages.length) {
         return {
           messages: params.messages,
           estimatedTokens: 0,
@@ -1346,11 +1507,13 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: conversation.conversationId,
         tokenBudget,
         freshTailCount: this.config.freshTailCount,
+        budgetWarningThreshold: this.config.budgetWarningThreshold,
       });
 
       // If assembly produced no messages for a non-empty live session,
-      // fail safe to the live context.
-      if (assembled.messages.length === 0 && params.messages.length > 0) {
+      // fail safe to the live context — but only if the conversation hasn't
+      // been actively managed, to avoid re-injecting collapsed content.
+      if (assembled.messages.length === 0 && params.messages.length > 0 && !isManaged) {
         return {
           messages: params.messages,
           estimatedTokens: 0,
@@ -1365,7 +1528,17 @@ export class LcmContextEngine implements ContextEngine {
           : {}),
       };
       return result;
-    } catch {
+    } catch (err) {
+      // If the conversation has been actively managed, do NOT fall back to
+      // live messages — that would re-inject collapsed content. Return an
+      // empty context instead and let the caller handle it.
+      if (isManaged) {
+        this.deps.log.error(`[lcm:assemble] Error in managed conversation, returning empty context to avoid re-injection: ${err}`);
+        return {
+          messages: [],
+          estimatedTokens: 0,
+        };
+      }
       return {
         messages: params.messages,
         estimatedTokens: 0,
@@ -1697,6 +1870,10 @@ export class LcmContextEngine implements ContextEngine {
 
   getSummaryStore(): SummaryStore {
     return this.summaryStore;
+  }
+
+  getAssembler(): ContextAssembler {
+    return this.assembler;
   }
 
   // ── Heartbeat pruning ──────────────────────────────────────────────────

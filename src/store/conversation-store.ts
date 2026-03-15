@@ -75,6 +75,7 @@ export type ConversationRecord = {
   sessionId: string;
   title: string | null;
   bootstrappedAt: Date | null;
+  managedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -104,6 +105,7 @@ interface ConversationRow {
   session_id: string;
   title: string | null;
   bootstrapped_at: string | null;
+  managed_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -157,6 +159,7 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
     sessionId: row.session_id,
     title: row.title,
     bootstrappedAt: row.bootstrapped_at ? new Date(row.bootstrapped_at) : null,
+    managedAt: row.managed_at ? new Date(row.managed_at) : null,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
   };
@@ -236,7 +239,7 @@ export class ConversationStore {
 
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, title, bootstrapped_at, managed_at, created_at, updated_at
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(Number(result.lastInsertRowid)) as unknown as ConversationRow;
@@ -247,7 +250,7 @@ export class ConversationStore {
   async getConversation(conversationId: ConversationId): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, title, bootstrapped_at, managed_at, created_at, updated_at
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(conversationId) as unknown as ConversationRow | undefined;
@@ -258,7 +261,7 @@ export class ConversationStore {
   async getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, title, bootstrapped_at, managed_at, created_at, updated_at
        FROM conversations
        WHERE session_id = ?
        ORDER BY created_at DESC
@@ -282,6 +285,17 @@ export class ConversationStore {
       .prepare(
         `UPDATE conversations
        SET bootstrapped_at = COALESCE(bootstrapped_at, datetime('now')),
+           updated_at = datetime('now')
+       WHERE conversation_id = ?`,
+      )
+      .run(conversationId);
+  }
+
+  async markConversationManaged(conversationId: ConversationId): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE conversations
+       SET managed_at = COALESCE(managed_at, datetime('now')),
            updated_at = datetime('now')
        WHERE conversation_id = ?`,
       )

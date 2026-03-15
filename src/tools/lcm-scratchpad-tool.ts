@@ -9,6 +9,55 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+/** Default staleness threshold in minutes */
+const STALE_THRESHOLD_MINUTES = 30;
+
+/** Parse timestamp comments from scratchpad content */
+function parseSectionTimestamps(content: string): Array<{ section: string; timestamp: Date; line: number }> {
+  const lines = content.split("\n");
+  const results: Array<{ section: string; timestamp: Date; line: number }> = [];
+  let currentSection = "";
+
+  for (let i = 0; i < lines.length; i++) {
+    const headingMatch = lines[i].trim().match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      currentSection = headingMatch[2].trim();
+    }
+    const tsMatch = lines[i].match(/<!-- (?:updated|written|appended): (\d{4}-\d{2}-\d{2}T[\d:.]+Z?) -->/);
+    if (tsMatch && currentSection) {
+      const date = new Date(tsMatch[1]);
+      if (!isNaN(date.getTime())) {
+        results.push({ section: currentSection, timestamp: date, line: i });
+      }
+    }
+  }
+  return results;
+}
+
+/** Check for stale sections and return warnings */
+function getStalenessWarnings(content: string, thresholdMinutes: number = STALE_THRESHOLD_MINUTES): string[] {
+  const now = new Date();
+  const sectionTimestamps = parseSectionTimestamps(content);
+  const warnings: string[] = [];
+
+  // Group by section, take the latest timestamp per section
+  const latestBySection = new Map<string, Date>();
+  for (const entry of sectionTimestamps) {
+    const existing = latestBySection.get(entry.section);
+    if (!existing || entry.timestamp > existing) {
+      latestBySection.set(entry.section, entry.timestamp);
+    }
+  }
+
+  for (const [section, timestamp] of latestBySection) {
+    const ageMinutes = Math.round((now.getTime() - timestamp.getTime()) / 60000);
+    if (ageMinutes > thresholdMinutes) {
+      warnings.push(`⚠️ Section '${section}' last updated ${ageMinutes}min ago — may be stale`);
+    }
+  }
+  return warnings;
+}
+
 const LcmScratchpadSchema = Type.Object({
   action: Type.String({
     description:
@@ -86,11 +135,16 @@ export function createLcmScratchpadTool(input: {
               message: "Scratchpad is empty. Use action: \"write\" to initialize it.",
             });
           }
-          return jsonResult({
+          const warnings = getStalenessWarnings(scratchpad.content);
+          const result: Record<string, unknown> = {
             content: scratchpad.content,
             tokenCount: scratchpad.tokenCount,
             updatedAt: scratchpad.updatedAt.toISOString(),
-          });
+          };
+          if (warnings.length > 0) {
+            result.stalenessWarnings = warnings;
+          }
+          return jsonResult(result);
         }
 
         case "write": {
@@ -98,7 +152,8 @@ export function createLcmScratchpadTool(input: {
             return jsonResult({ error: "content is required for write action." });
           }
 
-          const tokenCount = estimateTokens(content);
+          const timestampedContent = content + `\n<!-- written: ${new Date().toISOString()} -->`;
+          const tokenCount = estimateTokens(timestampedContent);
           input.deps.log.info(
             `[lcm:scratchpad] Write: ${tokenCount} tokens (max: ${maxTokens})`,
           );
@@ -110,12 +165,15 @@ export function createLcmScratchpadTool(input: {
 
           const scratchpad = await summaryStore.upsertScratchpad({
             conversationId,
-            content,
+            content: timestampedContent,
             tokenCount,
           });
 
           // Ensure there's a scratchpad context item
           await summaryStore.ensureScratchpadContextItem(conversationId);
+
+          // Mark conversation as actively managed
+          await conversationStore.markConversationManaged(conversationId);
 
           return jsonResult({
             action: "write",
@@ -131,9 +189,10 @@ export function createLcmScratchpadTool(input: {
 
           const existing = await summaryStore.getScratchpad(conversationId);
           const currentContent = existing?.content ?? "";
+          const appendedContent = content + `\n<!-- appended: ${new Date().toISOString()} -->`;
           const newContent = currentContent
-            ? `${currentContent}\n${content}`
-            : content;
+            ? `${currentContent}\n${appendedContent}`
+            : appendedContent;
 
           const tokenCount = estimateTokens(newContent);
           if (tokenCount > maxTokens) {
@@ -149,6 +208,9 @@ export function createLcmScratchpadTool(input: {
           });
 
           await summaryStore.ensureScratchpadContextItem(conversationId);
+
+          // Mark conversation as actively managed
+          await conversationStore.markConversationManaged(conversationId);
 
           return jsonResult({
             action: "append",
@@ -220,7 +282,8 @@ export function createLcmScratchpadTool(input: {
           const header = lines[sectionStart];
           const before = lines.slice(0, sectionStart);
           const after = lines.slice(sectionEnd);
-          const newContent = [...before, header, content, ...after].join("\n");
+          const timestampedSectionContent = content + `\n<!-- updated: ${new Date().toISOString()} -->`;
+          const newContent = [...before, header, timestampedSectionContent, ...after].join("\n");
 
           const tokenCount = estimateTokens(newContent);
           if (tokenCount > maxTokens) {
@@ -234,6 +297,9 @@ export function createLcmScratchpadTool(input: {
             content: newContent,
             tokenCount,
           });
+
+          // Mark conversation as actively managed
+          await conversationStore.markConversationManaged(conversationId);
 
           return jsonResult({
             action: "replace_section",
