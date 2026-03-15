@@ -3,7 +3,7 @@
   "uiHints": {
     "contextThreshold": {
       "label": "Context Threshold",
-      "help": "Fraction of context window that triggers compaction (0.0–1.0)"
+      "help": "Fraction of context window that triggers compaction (0.0\u20131.0)"
     },
     "incrementalMaxDepth": {
       "label": "Incremental Max Depth",
@@ -70,6 +70,26 @@
       },
       "summaryProvider": {
         "type": "string"
+      },
+      "scratchpadEnabled": {
+        "type": "boolean"
+      },
+      "scratchpadMaxTokens": {
+        "type": "integer",
+        "minimum": 100
+      },
+      "collapseEnabled": {
+        "type": "boolean"
+      },
+      "middleCompressionThreshold": {
+        "type": "integer",
+        "minimum": 1000
+      },
+      "undoEnabled": {
+        "type": "boolean"
+      },
+      "budgetEnabled": {
+        "type": "boolean"
       }
     }
   }

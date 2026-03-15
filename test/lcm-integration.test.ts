@@ -235,7 +235,7 @@ function createMockSummaryStore() {
           ordinal: maxOrdinal + 1,
           itemType: "message",
           messageId,
-          summaryId: null,
+          summaryId: null, pointerId: null,
           createdAt: new Date(),
         });
       },
@@ -249,7 +249,7 @@ function createMockSummaryStore() {
           conversationId,
           ordinal: maxOrdinal + 1,
           itemType: "summary",
-          messageId: null,
+          messageId: null, pointerId: null,
           summaryId,
           createdAt: new Date(),
         });
@@ -287,7 +287,7 @@ function createMockSummaryStore() {
           conversationId,
           ordinal: startOrdinal,
           itemType: "summary",
-          messageId: null,
+          messageId: null, pointerId: null,
           summaryId,
           createdAt: new Date(),
         });

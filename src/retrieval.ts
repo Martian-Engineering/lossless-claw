@@ -14,7 +14,7 @@ import type {
 
 export interface DescribeResult {
   id: string;
-  type: "summary" | "file";
+  type: "summary" | "file" | "pointer";
   /** Summary-specific fields */
   summary?: {
     conversationId: number;
@@ -57,6 +57,25 @@ export interface DescribeResult {
     storageUri: string;
     explorationSummary: string | null;
     createdAt: Date;
+  };
+  /** Pointer-specific fields */
+  pointer?: {
+    conversationId: number;
+    label: string;
+    reason: string | null;
+    sourceType: string;
+    sourceIds: string[];
+    tokensSaved: number;
+    data: string | null;
+    tags: string[];
+    status: string;
+    createdAt: Date;
+    sourceMessages: Array<{
+      messageId: number;
+      role: string;
+      content: string;
+      tokenCount: number;
+    }>;
   };
 }
 
@@ -138,6 +157,9 @@ export class RetrievalEngine {
     if (id.startsWith("file_")) {
       return this.describeFile(id);
     }
+    if (id.startsWith("ptr_")) {
+      return this.describePointer(id);
+    }
     return null;
   }
 
@@ -210,6 +232,53 @@ export class RetrievalEngine {
         storageUri: file.storageUri,
         explorationSummary: file.explorationSummary,
         createdAt: file.createdAt,
+      },
+    };
+  }
+
+  private async describePointer(id: string): Promise<DescribeResult | null> {
+    const pointer = await this.summaryStore.getPointer(id);
+    if (!pointer) {
+      return null;
+    }
+
+    // Fetch source messages by their IDs (stored as number[] in sourceIds)
+    const sourceMessages: Array<{
+      messageId: number;
+      role: string;
+      content: string;
+      tokenCount: number;
+    }> = [];
+
+    for (const sourceId of pointer.sourceIds) {
+      const msgId = typeof sourceId === "number" ? sourceId : Number(sourceId);
+      if (Number.isNaN(msgId)) continue;
+      const msg = await this.conversationStore.getMessageById(msgId);
+      if (msg) {
+        sourceMessages.push({
+          messageId: msg.messageId,
+          role: msg.role,
+          content: msg.content,
+          tokenCount: msg.tokenCount,
+        });
+      }
+    }
+
+    return {
+      id,
+      type: "pointer",
+      pointer: {
+        conversationId: pointer.conversationId,
+        label: pointer.label,
+        reason: pointer.reason,
+        sourceType: pointer.sourceType,
+        sourceIds: pointer.sourceIds,
+        tokensSaved: pointer.tokensSaved,
+        data: pointer.data,
+        tags: pointer.tags,
+        status: pointer.status,
+        createdAt: pointer.createdAt,
+        sourceMessages,
       },
     };
   }

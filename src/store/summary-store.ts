@@ -3,7 +3,7 @@ import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
 
 export type SummaryKind = "leaf" | "condensed";
-export type ContextItemType = "message" | "summary";
+export type ContextItemType = "message" | "summary" | "pointer" | "scratchpad";
 
 export type CreateSummaryInput = {
   summaryId: string;
@@ -49,6 +49,63 @@ export type ContextItemRecord = {
   itemType: ContextItemType;
   messageId: number | null;
   summaryId: string | null;
+  pointerId: string | null;
+  createdAt: Date;
+};
+
+export type PointerStatus = "active" | "reference" | "stale";
+
+export type PointerRecord = {
+  pointerId: string;
+  conversationId: number;
+  label: string;
+  reason: string | null;
+  sourceType: string;
+  sourceIds: string[];
+  tokensSaved: number;
+  data: string | null;
+  tags: string[];
+  status: PointerStatus;
+  accessedAt: Date | null;
+  createdAt: Date;
+};
+
+export type ScratchpadRecord = {
+  conversationId: number;
+  content: string;
+  tokenCount: number;
+  updatedAt: Date;
+};
+
+export type RestorePointRecord = {
+  id: string;
+  conversationId: number;
+  operation: string;
+  target: string;
+  itemsAffected: number;
+  tokensAffected: number;
+  snapshot: ContextItemRecord[];
+  createdAt: Date;
+};
+
+export type CheckpointRecord = {
+  checkpointId: string;
+  conversationId: number;
+  name: string;
+  description: string | null;
+  contextSnapshot: string;
+  scratchpadSnapshot: string | null;
+  tokenCount: number;
+  itemCount: number;
+  createdAt: Date;
+};
+
+export type TemplateRecord = {
+  templateId: string;
+  conversationId: number;
+  name: string;
+  content: string;
+  language: string;
   createdAt: Date;
 };
 
@@ -122,7 +179,30 @@ interface ContextItemRow {
   item_type: ContextItemType;
   message_id: number | null;
   summary_id: string | null;
+  pointer_id: string | null;
   created_at: string;
+}
+
+interface PointerRow {
+  pointer_id: string;
+  conversation_id: number;
+  label: string;
+  reason: string | null;
+  source_type: string;
+  source_ids: string;
+  tokens_saved: number;
+  data: string | null;
+  tags: string;
+  status: string;
+  accessed_at: string | null;
+  created_at: string;
+}
+
+interface ScratchpadRow {
+  conversation_id: number;
+  content: string;
+  token_count: number;
+  updated_at: string;
 }
 
 interface SummarySearchRow {
@@ -131,6 +211,38 @@ interface SummarySearchRow {
   kind: SummaryKind;
   snippet: string;
   rank: number;
+  created_at: string;
+}
+
+interface RestorePointRow {
+  id: string;
+  conversation_id: number;
+  operation: string;
+  target: string;
+  items_affected: number;
+  tokens_affected: number;
+  snapshot_json: string;
+  created_at: string;
+}
+
+interface CheckpointRow {
+  checkpoint_id: string;
+  conversation_id: number;
+  name: string;
+  description: string | null;
+  context_snapshot: string;
+  scratchpad_snapshot: string | null;
+  token_count: number;
+  item_count: number;
+  created_at: string;
+}
+
+interface TemplateRow {
+  template_id: string;
+  conversation_id: number;
+  name: string;
+  content: string;
+  language: string;
   created_at: string;
 }
 
@@ -209,7 +321,51 @@ function toContextItemRecord(row: ContextItemRow): ContextItemRecord {
     itemType: row.item_type,
     messageId: row.message_id,
     summaryId: row.summary_id,
+    pointerId: row.pointer_id ?? null,
     createdAt: new Date(row.created_at),
+  };
+}
+
+function parsePointerStatus(value: string | null | undefined): PointerStatus {
+  if (value === "reference" || value === "stale") return value;
+  return "active";
+}
+
+function toPointerRecord(row: PointerRow): PointerRecord {
+  let sourceIds: string[] = [];
+  try {
+    sourceIds = JSON.parse(row.source_ids);
+  } catch {
+    // ignore malformed JSON
+  }
+  let tags: string[] = [];
+  try {
+    tags = JSON.parse(row.tags ?? "[]");
+  } catch {
+    // ignore malformed JSON
+  }
+  return {
+    pointerId: row.pointer_id,
+    conversationId: row.conversation_id,
+    label: row.label,
+    reason: row.reason,
+    sourceType: row.source_type,
+    sourceIds,
+    tokensSaved: row.tokens_saved ?? 0,
+    data: row.data ?? null,
+    tags,
+    status: parsePointerStatus(row.status),
+    accessedAt: row.accessed_at ? new Date(row.accessed_at) : null,
+    createdAt: new Date(row.created_at),
+  };
+}
+
+function toScratchpadRecord(row: ScratchpadRow): ScratchpadRecord {
+  return {
+    conversationId: row.conversation_id,
+    content: row.content,
+    tokenCount: row.token_count ?? 0,
+    updatedAt: new Date(row.updated_at),
   };
 }
 
@@ -221,6 +377,63 @@ function toSearchResult(row: SummarySearchRow): SummarySearchResult {
     snippet: row.snippet,
     createdAt: new Date(row.created_at),
     rank: row.rank,
+  };
+}
+
+function toRestorePointRecord(row: RestorePointRow): RestorePointRecord {
+  let snapshot: ContextItemRecord[] = [];
+  try {
+    const parsed = JSON.parse(row.snapshot_json);
+    if (Array.isArray(parsed)) {
+      snapshot = parsed.map((item: Record<string, unknown>) =>
+        toContextItemRecord({
+          conversation_id: item.conversation_id as number,
+          ordinal: item.ordinal as number,
+          item_type: item.item_type as ContextItemType,
+          message_id: (item.message_id as number | null) ?? null,
+          summary_id: (item.summary_id as string | null) ?? null,
+          pointer_id: (item.pointer_id as string | null) ?? null,
+          created_at: (item.created_at as string) ?? "",
+        }),
+      );
+    }
+  } catch {
+    // ignore malformed JSON
+  }
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    operation: row.operation,
+    target: row.target,
+    itemsAffected: row.items_affected,
+    tokensAffected: row.tokens_affected,
+    snapshot,
+    createdAt: new Date(row.created_at),
+  };
+}
+
+function toCheckpointRecord(row: CheckpointRow): CheckpointRecord {
+  return {
+    checkpointId: row.checkpoint_id,
+    conversationId: row.conversation_id,
+    name: row.name,
+    description: row.description,
+    contextSnapshot: row.context_snapshot,
+    scratchpadSnapshot: row.scratchpad_snapshot,
+    tokenCount: row.token_count,
+    itemCount: row.item_count,
+    createdAt: new Date(row.created_at),
+  };
+}
+
+function toTemplateRecord(row: TemplateRow): TemplateRecord {
+  return {
+    templateId: row.template_id,
+    conversationId: row.conversation_id,
+    name: row.name,
+    content: row.content,
+    language: row.language ?? "python",
+    createdAt: new Date(row.created_at),
   };
 }
 
@@ -511,7 +724,7 @@ export class SummaryStore {
   async getContextItems(conversationId: number): Promise<ContextItemRecord[]> {
     const rows = this.db
       .prepare(
-        `SELECT conversation_id, ordinal, item_type, message_id, summary_id, created_at
+        `SELECT conversation_id, ordinal, item_type, message_id, summary_id, pointer_id, created_at
        FROM context_items
        WHERE conversation_id = ?
        ORDER BY ordinal`,
@@ -914,5 +1127,710 @@ export class SummaryStore {
       )
       .all(conversationId) as unknown as LargeFileRow[];
     return rows.map(toLargeFileRecord);
+  }
+
+  // ── Pointers ────────────────────────────────────────────────────────────
+
+  async insertPointer(input: {
+    pointerId: string;
+    conversationId: number;
+    label: string;
+    reason?: string;
+    sourceType: string;
+    sourceIds: string[];
+    tokensSaved: number;
+    data?: string;
+    tags?: string[];
+    status?: PointerStatus;
+  }): Promise<PointerRecord> {
+    this.db
+      .prepare(
+        `INSERT INTO pointers (pointer_id, conversation_id, label, reason, source_type, source_ids, tokens_saved, data, tags, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.pointerId,
+        input.conversationId,
+        input.label,
+        input.reason ?? null,
+        input.sourceType,
+        JSON.stringify(input.sourceIds),
+        input.tokensSaved,
+        input.data ?? null,
+        JSON.stringify(input.tags ?? []),
+        input.status ?? "active",
+      );
+
+    const row = this.db
+      .prepare(
+        `SELECT pointer_id, conversation_id, label, reason, source_type, source_ids, tokens_saved, data, tags, status, accessed_at, created_at
+       FROM pointers WHERE pointer_id = ?`,
+      )
+      .get(input.pointerId) as unknown as PointerRow;
+
+    return toPointerRecord(row);
+  }
+
+  async getPointer(pointerId: string): Promise<PointerRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT pointer_id, conversation_id, label, reason, source_type, source_ids, tokens_saved, data, tags, status, accessed_at, created_at
+       FROM pointers WHERE pointer_id = ?`,
+      )
+      .get(pointerId) as unknown as PointerRow | undefined;
+    if (!row) return null;
+
+    // Track access time
+    this.db
+      .prepare(`UPDATE pointers SET accessed_at = datetime('now') WHERE pointer_id = ?`)
+      .run(pointerId);
+
+    return toPointerRecord(row);
+  }
+
+  async getPointersByConversation(conversationId: number): Promise<PointerRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT pointer_id, conversation_id, label, reason, source_type, source_ids, tokens_saved, data, tags, status, accessed_at, created_at
+       FROM pointers
+       WHERE conversation_id = ?
+       ORDER BY created_at`,
+      )
+      .all(conversationId) as unknown as PointerRow[];
+    return rows.map(toPointerRecord);
+  }
+
+  async deletePointer(pointerId: string): Promise<void> {
+    this.db.prepare(`DELETE FROM pointers WHERE pointer_id = ?`).run(pointerId);
+  }
+
+  async updatePointerTags(pointerId: string, tags: string[]): Promise<void> {
+    this.db
+      .prepare(`UPDATE pointers SET tags = ? WHERE pointer_id = ?`)
+      .run(JSON.stringify(tags), pointerId);
+  }
+
+  async updatePointerStatus(pointerId: string, status: PointerStatus): Promise<void> {
+    this.db
+      .prepare(`UPDATE pointers SET status = ? WHERE pointer_id = ?`)
+      .run(status, pointerId);
+  }
+
+  async getPointersByTags(conversationId: number, tags: string[]): Promise<PointerRecord[]> {
+    // SQLite doesn't have native JSON array containment, so we fetch all and filter in JS.
+    // For the expected volume of pointers per conversation (<100), this is fine.
+    const allPointers = await this.getPointersByConversation(conversationId);
+    return allPointers.filter((ptr) =>
+      tags.some((tag) => ptr.tags.includes(tag)),
+    );
+  }
+
+  async getRelatedPointers(pointerId: string, conversationId: number): Promise<PointerRecord[]> {
+    const pointer = await this.getPointer(pointerId);
+    if (!pointer || pointer.tags.length === 0) return [];
+    const allPointers = await this.getPointersByConversation(conversationId);
+    return allPointers.filter(
+      (ptr) =>
+        ptr.pointerId !== pointerId &&
+        ptr.tags.some((tag) => pointer.tags.includes(tag)),
+    );
+  }
+
+  async getUnusedPointers(conversationId: number, olderThanMinutes: number): Promise<PointerRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT pointer_id, conversation_id, label, reason, source_type, source_ids, tokens_saved, data, tags, status, accessed_at, created_at
+       FROM pointers
+       WHERE conversation_id = ?
+         AND (accessed_at IS NULL OR julianday('now') - julianday(accessed_at) > ? / 1440.0)
+       ORDER BY created_at`,
+      )
+      .all(conversationId, olderThanMinutes) as unknown as PointerRow[];
+    return rows.map(toPointerRecord);
+  }
+
+  async appendContextPointer(conversationId: number, pointerId: string): Promise<void> {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(ordinal), -1) AS max_ordinal
+       FROM context_items WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as MaxOrdinalRow;
+
+    this.db
+      .prepare(
+        `INSERT INTO context_items (conversation_id, ordinal, item_type, pointer_id)
+       VALUES (?, ?, 'pointer', ?)`,
+      )
+      .run(conversationId, row.max_ordinal + 1, pointerId);
+  }
+
+  async replaceContextRangeWithPointer(input: {
+    conversationId: number;
+    startOrdinal: number;
+    endOrdinal: number;
+    pointerId: string;
+  }): Promise<void> {
+    const { conversationId, startOrdinal, endOrdinal, pointerId } = input;
+
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(
+          `DELETE FROM context_items
+         WHERE conversation_id = ?
+           AND ordinal >= ?
+           AND ordinal <= ?`,
+        )
+        .run(conversationId, startOrdinal, endOrdinal);
+
+      this.db
+        .prepare(
+          `INSERT INTO context_items (conversation_id, ordinal, item_type, pointer_id)
+         VALUES (?, ?, 'pointer', ?)`,
+        )
+        .run(conversationId, startOrdinal, pointerId);
+
+      // Resequence ordinals
+      const items = this.db
+        .prepare(
+          `SELECT ordinal FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
+        )
+        .all(conversationId) as unknown as { ordinal: number }[];
+
+      const updateStmt = this.db.prepare(
+        `UPDATE context_items
+         SET ordinal = ?
+         WHERE conversation_id = ? AND ordinal = ?`,
+      );
+
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(-(i + 1), conversationId, items[i].ordinal);
+      }
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(i, conversationId, -(i + 1));
+      }
+
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  async removeContextItemsInRange(
+    conversationId: number,
+    startOrdinal: number,
+    endOrdinal: number,
+  ): Promise<number> {
+    this.db.exec("BEGIN");
+    try {
+      const result = this.db
+        .prepare(
+          `DELETE FROM context_items WHERE conversation_id = ? AND ordinal >= ? AND ordinal <= ?`,
+        )
+        .run(conversationId, startOrdinal, endOrdinal);
+      const changes = result.changes;
+
+      // Resequence ordinals
+      const items = this.db
+        .prepare(
+          `SELECT ordinal FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
+        )
+        .all(conversationId) as unknown as { ordinal: number }[];
+
+      const updateStmt = this.db.prepare(
+        `UPDATE context_items
+         SET ordinal = ?
+         WHERE conversation_id = ? AND ordinal = ?`,
+      );
+
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(-(i + 1), conversationId, items[i].ordinal);
+      }
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(i, conversationId, -(i + 1));
+      }
+
+      this.db.exec("COMMIT");
+      return changes;
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  async replaceContextRangeWithMessage(params: {
+    conversationId: number;
+    startOrdinal: number;
+    endOrdinal: number;
+    messageId: number;
+  }): Promise<void> {
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(
+          `DELETE FROM context_items WHERE conversation_id = ? AND ordinal >= ? AND ordinal <= ?`,
+        )
+        .run(params.conversationId, params.startOrdinal, params.endOrdinal);
+
+      this.db
+        .prepare(
+          `INSERT INTO context_items (conversation_id, ordinal, item_type, message_id) VALUES (?, ?, ?, ?)`,
+        )
+        .run(params.conversationId, params.startOrdinal, "message", params.messageId);
+
+      // Resequence ordinals
+      const items = this.db
+        .prepare(
+          `SELECT ordinal FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
+        )
+        .all(params.conversationId) as unknown as { ordinal: number }[];
+
+      const updateStmt = this.db.prepare(
+        `UPDATE context_items
+         SET ordinal = ?
+         WHERE conversation_id = ? AND ordinal = ?`,
+      );
+
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(-(i + 1), params.conversationId, items[i].ordinal);
+      }
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(i, params.conversationId, -(i + 1));
+      }
+
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  async replacePointerWithContextItems(input: {
+    conversationId: number;
+    pointerOrdinal: number;
+    items: Array<{ itemType: "message" | "summary"; messageId?: number; summaryId?: string }>;
+  }): Promise<void> {
+    const { conversationId, pointerOrdinal, items } = input;
+
+    this.db.exec("BEGIN");
+    try {
+      // Delete the pointer context item
+      this.db
+        .prepare(
+          `DELETE FROM context_items
+         WHERE conversation_id = ? AND ordinal = ?`,
+        )
+        .run(conversationId, pointerOrdinal);
+
+      // Insert replacement items at sequential ordinals starting from a high temp base
+      const tempBase = 100000;
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.itemType === "message" && item.messageId != null) {
+          this.db
+            .prepare(
+              `INSERT INTO context_items (conversation_id, ordinal, item_type, message_id)
+             VALUES (?, ?, 'message', ?)`,
+            )
+            .run(conversationId, tempBase + i, item.messageId);
+        } else if (item.itemType === "summary" && item.summaryId != null) {
+          this.db
+            .prepare(
+              `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
+             VALUES (?, ?, 'summary', ?)`,
+            )
+            .run(conversationId, tempBase + i, item.summaryId);
+        }
+      }
+
+      // Resequence all ordinals
+      const allItems = this.db
+        .prepare(
+          `SELECT ordinal FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
+        )
+        .all(conversationId) as unknown as { ordinal: number }[];
+
+      const updateStmt = this.db.prepare(
+        `UPDATE context_items SET ordinal = ? WHERE conversation_id = ? AND ordinal = ?`,
+      );
+
+      for (let i = 0; i < allItems.length; i++) {
+        updateStmt.run(-(i + 1), conversationId, allItems[i].ordinal);
+      }
+      for (let i = 0; i < allItems.length; i++) {
+        updateStmt.run(i, conversationId, -(i + 1));
+      }
+
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  // ── Scratchpad ──────────────────────────────────────────────────────────
+
+  async getScratchpad(conversationId: number): Promise<ScratchpadRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT conversation_id, content, token_count, updated_at
+       FROM scratchpads WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as ScratchpadRow | undefined;
+    return row ? toScratchpadRecord(row) : null;
+  }
+
+  async upsertScratchpad(input: {
+    conversationId: number;
+    content: string;
+    tokenCount: number;
+  }): Promise<ScratchpadRecord> {
+    this.db
+      .prepare(
+        `INSERT INTO scratchpads (conversation_id, content, token_count, updated_at)
+       VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT (conversation_id) DO UPDATE SET
+         content = excluded.content,
+         token_count = excluded.token_count,
+         updated_at = datetime('now')`,
+      )
+      .run(input.conversationId, input.content, input.tokenCount);
+
+    return (await this.getScratchpad(input.conversationId))!;
+  }
+
+  // ── Restore points ──────────────────────────────────────────────────
+
+  async createRestorePoint(input: {
+    id: string;
+    conversationId: number;
+    operation: string;
+    target: string;
+    itemsAffected: number;
+    tokensAffected: number;
+    snapshotRows: unknown[];
+  }): Promise<void> {
+    const snapshotJson = JSON.stringify(input.snapshotRows);
+
+    this.db
+      .prepare(
+        `INSERT INTO restore_points (id, conversation_id, operation, target, items_affected, tokens_affected, snapshot_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.id,
+        input.conversationId,
+        input.operation,
+        input.target,
+        input.itemsAffected,
+        input.tokensAffected,
+        snapshotJson,
+      );
+
+    // Auto-prune: keep last 10 per conversation
+    this.db
+      .prepare(
+        `DELETE FROM restore_points
+       WHERE conversation_id = ?
+         AND id NOT IN (
+           SELECT id FROM restore_points
+           WHERE conversation_id = ?
+           ORDER BY created_at DESC
+           LIMIT 10
+         )`,
+      )
+      .run(input.conversationId, input.conversationId);
+  }
+
+  async getRestorePoints(conversationId: number): Promise<RestorePointRecord[]> {
+    // Expire points older than 1 hour
+    this.db
+      .prepare(
+        `DELETE FROM restore_points
+       WHERE conversation_id = ?
+         AND julianday('now') - julianday(created_at) > 1.0/24.0`,
+      )
+      .run(conversationId);
+
+    const rows = this.db
+      .prepare(
+        `SELECT id, conversation_id, operation, target, items_affected, tokens_affected, snapshot_json, created_at
+       FROM restore_points
+       WHERE conversation_id = ?
+       ORDER BY created_at DESC`,
+      )
+      .all(conversationId) as unknown as RestorePointRow[];
+    return rows.map(toRestorePointRecord);
+  }
+
+  async getRestorePoint(id: string): Promise<RestorePointRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT id, conversation_id, operation, target, items_affected, tokens_affected, snapshot_json, created_at
+       FROM restore_points WHERE id = ?`,
+      )
+      .get(id) as unknown as RestorePointRow | undefined;
+    return row ? toRestorePointRecord(row) : null;
+  }
+
+  async deleteRestorePoint(id: string): Promise<void> {
+    this.db.prepare(`DELETE FROM restore_points WHERE id = ?`).run(id);
+  }
+
+  /**
+   * Snapshot context_items rows in a range. Returns raw DB rows suitable for
+   * storing in a restore point's snapshot_json.
+   */
+  getContextItemRowsInRange(
+    conversationId: number,
+    startOrdinal: number,
+    endOrdinal: number,
+  ): unknown[] {
+    return this.db
+      .prepare(
+        `SELECT conversation_id, ordinal, item_type, message_id, summary_id, pointer_id, created_at
+       FROM context_items
+       WHERE conversation_id = ? AND ordinal >= ? AND ordinal <= ?
+       ORDER BY ordinal`,
+      )
+      .all(conversationId, startOrdinal, endOrdinal) as unknown as ContextItemRow[];
+  }
+
+  /**
+   * Restore context items from a snapshot: delete current items in the
+   * conversation and re-insert the snapshot rows, then resequence.
+   */
+  restoreContextItemsFromSnapshot(
+    conversationId: number,
+    snapshot: unknown[],
+  ): void {
+    this.db.exec("BEGIN");
+    try {
+      // Delete all current context items for this conversation
+      this.db
+        .prepare(`DELETE FROM context_items WHERE conversation_id = ?`)
+        .run(conversationId);
+
+      // Re-insert snapshot rows
+      const insertStmt = this.db.prepare(
+        `INSERT INTO context_items (conversation_id, ordinal, item_type, message_id, summary_id, pointer_id)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      for (const raw of snapshot) {
+        const row = raw as ContextItemRow;
+        insertStmt.run(
+          conversationId,
+          row.ordinal,
+          row.item_type,
+          row.message_id ?? null,
+          row.summary_id ?? null,
+          row.pointer_id ?? null,
+        );
+      }
+
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /**
+   * Restore context items from a restore point by its ID. Reads the
+   * snapshot_json directly from the restore_points table, deletes current
+   * context items, and re-inserts the snapshot.
+   */
+  restoreContextItemsFromSnapshotById(restorePointId: string): void {
+    const rpRow = this.db
+      .prepare(`SELECT conversation_id, snapshot_json FROM restore_points WHERE id = ?`)
+      .get(restorePointId) as { conversation_id: number; snapshot_json: string } | undefined;
+
+    if (!rpRow) {
+      throw new Error(`Restore point ${restorePointId} not found.`);
+    }
+
+    const snapshot = JSON.parse(rpRow.snapshot_json) as unknown[];
+    this.restoreContextItemsFromSnapshot(rpRow.conversation_id, snapshot);
+  }
+
+  // ── Checkpoints ──────────────────────────────────────────────────────
+
+  async saveCheckpoint(input: {
+    checkpointId: string;
+    conversationId: number;
+    name: string;
+    description?: string;
+    contextSnapshot: string;
+    scratchpadSnapshot?: string;
+    tokenCount: number;
+    itemCount: number;
+  }): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO checkpoints (checkpoint_id, conversation_id, name, description, context_snapshot, scratchpad_snapshot, token_count, item_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.checkpointId,
+        input.conversationId,
+        input.name,
+        input.description ?? null,
+        input.contextSnapshot,
+        input.scratchpadSnapshot ?? null,
+        input.tokenCount,
+        input.itemCount,
+      );
+  }
+
+  async getCheckpoint(checkpointId: string): Promise<CheckpointRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT checkpoint_id, conversation_id, name, description, context_snapshot, scratchpad_snapshot, token_count, item_count, created_at
+       FROM checkpoints WHERE checkpoint_id = ?`,
+      )
+      .get(checkpointId) as unknown as CheckpointRow | undefined;
+    return row ? toCheckpointRecord(row) : null;
+  }
+
+  async listCheckpoints(conversationId: number): Promise<CheckpointRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT checkpoint_id, conversation_id, name, description, context_snapshot, scratchpad_snapshot, token_count, item_count, created_at
+       FROM checkpoints
+       WHERE conversation_id = ?
+       ORDER BY created_at DESC`,
+      )
+      .all(conversationId) as unknown as CheckpointRow[];
+    return rows.map(toCheckpointRecord);
+  }
+
+  async deleteCheckpoint(checkpointId: string): Promise<boolean> {
+    const result = this.db
+      .prepare(`DELETE FROM checkpoints WHERE checkpoint_id = ?`)
+      .run(checkpointId);
+    return (result as unknown as { changes: number }).changes > 0;
+  }
+
+  /**
+   * Get all context_item rows for a conversation as raw DB rows,
+   * suitable for storing in a checkpoint snapshot.
+   */
+  getContextItemRows(conversationId: number): unknown[] {
+    return this.db
+      .prepare(
+        `SELECT conversation_id, ordinal, item_type, message_id, summary_id, pointer_id, created_at
+       FROM context_items
+       WHERE conversation_id = ?
+       ORDER BY ordinal`,
+      )
+      .all(conversationId);
+  }
+
+  async ensureScratchpadContextItem(conversationId: number): Promise<void> {
+    // Check if a scratchpad context item already exists
+    const existing = this.db
+      .prepare(
+        `SELECT ordinal FROM context_items
+       WHERE conversation_id = ? AND item_type = 'scratchpad'`,
+      )
+      .get(conversationId) as unknown as { ordinal: number } | undefined;
+
+    if (existing) {
+      return;
+    }
+
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(ordinal), -1) AS max_ordinal
+       FROM context_items WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as MaxOrdinalRow;
+
+    this.db
+      .prepare(
+        `INSERT INTO context_items (conversation_id, ordinal, item_type)
+       VALUES (?, ?, 'scratchpad')`,
+      )
+      .run(conversationId, row.max_ordinal + 1);
+  }
+
+  // ── Template CRUD ──────────────────────────────────────────────────────────
+
+  async saveTemplate(input: {
+    templateId: string;
+    conversationId: number;
+    name: string;
+    content: string;
+    language?: string;
+  }): Promise<TemplateRecord> {
+    const language = input.language ?? "python";
+    // Upsert by (conversation_id, name)
+    const existing = this.db
+      .prepare(
+        `SELECT template_id FROM templates WHERE conversation_id = ? AND name = ?`,
+      )
+      .get(input.conversationId, input.name) as { template_id: string } | undefined;
+
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE templates SET content = ?, language = ?, template_id = ? WHERE conversation_id = ? AND name = ?`,
+        )
+        .run(input.content, language, input.templateId, input.conversationId, input.name);
+    } else {
+      this.db
+        .prepare(
+          `INSERT INTO templates (template_id, conversation_id, name, content, language)
+         VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(input.templateId, input.conversationId, input.name, input.content, language);
+    }
+
+    const row = this.db
+      .prepare(
+        `SELECT template_id, conversation_id, name, content, language, created_at
+       FROM templates WHERE template_id = ?`,
+      )
+      .get(input.templateId) as unknown as TemplateRow;
+
+    return toTemplateRecord(row);
+  }
+
+  async getTemplate(conversationId: number, name: string): Promise<TemplateRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT template_id, conversation_id, name, content, language, created_at
+       FROM templates WHERE conversation_id = ? AND name = ?`,
+      )
+      .get(conversationId, name) as unknown as TemplateRow | undefined;
+    return row ? toTemplateRecord(row) : null;
+  }
+
+  async listTemplates(conversationId: number): Promise<TemplateRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT template_id, conversation_id, name, content, language, created_at
+       FROM templates WHERE conversation_id = ?
+       ORDER BY name`,
+      )
+      .all(conversationId) as unknown as TemplateRow[];
+    return rows.map(toTemplateRecord);
+  }
+
+  async deleteTemplate(conversationId: number, name: string): Promise<boolean> {
+    const result = this.db
+      .prepare(`DELETE FROM templates WHERE conversation_id = ? AND name = ?`)
+      .run(conversationId, name);
+    return (result as unknown as { changes: number }).changes > 0;
   }
 }

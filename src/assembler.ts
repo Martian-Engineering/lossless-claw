@@ -5,7 +5,7 @@ import type {
   MessagePartRecord,
   MessageRole,
 } from "./store/conversation-store.js";
-import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
+import type { SummaryStore, ContextItemRecord, SummaryRecord, PointerRecord, ScratchpadRecord } from "./store/summary-store.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 
@@ -16,6 +16,8 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
+  /** Fraction of token budget above which a warning is injected (0.0-1.0, default 0.7). */
+  budgetWarningThreshold?: number;
 }
 
 export interface AssembleContextResult {
@@ -495,6 +497,7 @@ async function formatSummaryContent(
 ): Promise<string> {
   const attributes = [
     `id="${summary.summaryId}"`,
+    `tokens="${summary.tokenCount}"`,
     `kind="${summary.kind}"`,
     `depth="${summary.depth}"`,
     `descendant_count="${summary.descendantCount}"`,
@@ -528,6 +531,36 @@ async function formatSummaryContent(
   return lines.join("\n");
 }
 
+/**
+ * Format a pointer record into the XML payload string the model sees.
+ */
+function formatPointerContent(pointer: PointerRecord, timezone?: string): string {
+  const created = formatDateForAttribute(pointer.createdAt, timezone);
+  const tagAttr = pointer.tags && pointer.tags.length > 0 ? ` tags="${pointer.tags.join(",")}"` : "";
+  const statusAttr = pointer.status && pointer.status !== "active" ? ` status="${pointer.status}"` : "";
+  const lines: string[] = [];
+  lines.push(`<collapsed id="${pointer.pointerId}" tokens_saved="${pointer.tokensSaved}" created="${created}"${tagAttr}${statusAttr}>`);
+  lines.push(`  ${pointer.label}${pointer.reason ? ` (collapsed: ${pointer.reason})` : ""}`);
+  if (pointer.data) {
+    lines.push(`  [has stored data — available on expand]`);
+  }
+  lines.push(`  → lcm_expand_active(pointerId: "${pointer.pointerId}") to restore`);
+  lines.push(`</collapsed>`);
+  return lines.join("\n");
+}
+
+/**
+ * Format a scratchpad record into the XML payload string the model sees.
+ */
+function formatScratchpadContent(scratchpad: ScratchpadRecord, timezone?: string): string {
+  const updated = formatDateForAttribute(scratchpad.updatedAt, timezone);
+  const lines: string[] = [];
+  lines.push(`<scratchpad updated="${updated}">`);
+  lines.push(scratchpad.content);
+  lines.push(`</scratchpad>`);
+  return lines.join("\n");
+}
+
 // ── Resolved context item (after fetching underlying message/summary) ────────
 
 interface ResolvedItem {
@@ -541,6 +574,183 @@ interface ResolvedItem {
   isMessage: boolean;
   /** Summary metadata used for dynamic system prompt guidance */
   summarySignal?: SummaryPromptSignal;
+}
+
+// ── Context Ref Map ──────────────────────────────────────────────────────────
+
+/** Format an ordinal as a 3-char zero-padded hex ref: §001, §00a, §03f */
+function ordinalToRef(ordinal: number): string {
+  return "§" + ordinal.toString(16).padStart(3, "0");
+}
+
+/** Parse a §XXX ref back to an ordinal number. Returns NaN on failure. */
+export function parseRef(ref: string): number {
+  const hex = ref.startsWith("§") ? ref.slice(1) : ref;
+  return parseInt(hex, 16);
+}
+
+/**
+ * Determine the type abbreviation and preview for a single context item.
+ */
+function refMapEntry(
+  ordinal: number,
+  contextItem: ContextItemRecord,
+  resolved: ResolvedItem,
+): string {
+  const ref = ordinalToRef(ordinal);
+  const itemType = contextItem.itemType;
+
+  if (itemType === "scratchpad") {
+    return `${ref} pad(${resolved.tokens})`;
+  }
+
+  if (itemType === "pointer") {
+    // Extract label from pointer content
+    const content = typeof resolved.message.content === "string" ? resolved.message.content : "";
+    const labelMatch = content.match(/^\s*<collapsed[^>]*>\s*\n\s*(.+?)(?:\s*\(collapsed:|\s*\n)/);
+    const label = labelMatch ? labelMatch[1].trim() : "collapsed";
+    const preview = label.length > 30 ? label.slice(0, 27) + "..." : label;
+    return `${ref} ptr(${resolved.tokens}) "${preview}"`;
+  }
+
+  if (itemType === "summary") {
+    const content = typeof resolved.message.content === "string" ? resolved.message.content : "";
+    // Extract content between <content> tags
+    const contentMatch = content.match(/<content>\s*([\s\S]*?)\s*<\/content>/);
+    const summaryText = contentMatch ? contentMatch[1].trim() : content;
+    const preview = summaryText.length > 30 ? summaryText.slice(0, 27) + "..." : summaryText;
+    return `${ref} sum(${resolved.tokens}) "${preview}"`;
+  }
+
+  // message type — determine role
+  const role = resolved.message.role;
+
+  if (role === "user") {
+    const content = typeof resolved.message.content === "string"
+      ? resolved.message.content
+      : "";
+    const preview = content.length > 30 ? content.slice(0, 27) + "..." : content;
+    return `${ref} user(${resolved.tokens}) "${preview}"`;
+  }
+
+  if (role === "assistant") {
+    // Check if content contains tool calls
+    const content = resolved.message.content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block && typeof block === "object") {
+          const blockType = (block as { type?: string }).type ?? "";
+          if (
+            blockType === "tool_use" ||
+            blockType === "tool-use" ||
+            blockType === "toolUse" ||
+            blockType === "toolCall" ||
+            blockType === "function_call" ||
+            blockType === "functionCall"
+          ) {
+            const toolName = (block as { name?: string }).name ?? "unknown";
+            return `${ref} asst(${resolved.tokens}) [tool:${toolName}]`;
+          }
+        }
+      }
+    }
+    const text = typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? (content.find((b: unknown) => b && typeof b === "object" && (b as { type?: string }).type === "text") as { text?: string } | undefined)?.text ?? ""
+        : "";
+    const preview = text.length > 30 ? text.slice(0, 27) + "..." : text;
+    return `${ref} asst(${resolved.tokens}) "${preview}"`;
+  }
+
+  // toolResult role — show token count
+  return `${ref} tool(${resolved.tokens})`;
+}
+
+/**
+ * Build a compact context ref map string.
+ * Exported so other modules (e.g. collapse tool) can generate a refreshed map.
+ */
+export function buildContextRefMap(
+  resolvedItems: ResolvedItem[],
+  contextItems: ContextItemRecord[],
+): string {
+  if (resolvedItems.length === 0) {
+    return "";
+  }
+
+  // Build a lookup from ordinal → contextItem
+  const contextByOrdinal = new Map<number, ContextItemRecord>();
+  for (const ci of contextItems) {
+    contextByOrdinal.set(ci.ordinal, ci);
+  }
+
+  // Generate entries
+  const entries: string[] = [];
+
+  const items = resolvedItems.map((ri) => {
+    const ci = contextByOrdinal.get(ri.ordinal);
+    return { resolved: ri, context: ci };
+  }).filter((x) => x.context != null) as { resolved: ResolvedItem; context: ContextItemRecord }[];
+
+  // Adaptive display limits based on context size
+  let headCount: number;
+  let tailCount: number;
+  let showAll: boolean;
+
+  if (items.length <= 25) {
+    showAll = true;
+    headCount = 0;
+    tailCount = 0;
+  } else if (items.length <= 50) {
+    showAll = false;
+    headCount = 18;
+    tailCount = 7;
+  } else if (items.length <= 100) {
+    showAll = false;
+    headCount = 25;
+    tailCount = 10;
+  } else {
+    showAll = false;
+    headCount = 30;
+    tailCount = 12;
+  }
+
+  if (showAll) {
+    for (const { resolved, context } of items) {
+      entries.push(refMapEntry(resolved.ordinal, context, resolved));
+    }
+  } else {
+    // Show first headCount, ellipsis, last tailCount
+    for (let i = 0; i < headCount; i++) {
+      const { resolved, context } = items[i];
+      entries.push(refMapEntry(resolved.ordinal, context, resolved));
+    }
+    entries.push(`... +${items.length - headCount - tailCount} more ...`);
+    for (let i = items.length - tailCount; i < items.length; i++) {
+      const { resolved, context } = items[i];
+      entries.push(refMapEntry(resolved.ordinal, context, resolved));
+    }
+  }
+
+  // Join with " | " and wrap at ~120 chars
+  const lines: string[] = [];
+  let currentLine = "";
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const sep = currentLine.length > 0 ? " | " : "";
+    if (currentLine.length > 0 && currentLine.length + sep.length + entry.length > 120) {
+      lines.push(currentLine);
+      currentLine = entry;
+    } else {
+      currentLine += sep + entry;
+    }
+  }
+  if (currentLine.length > 0) {
+    lines.push(currentLine);
+  }
+
+  return "## Context Refs\n" + lines.join("\n");
 }
 
 // ── ContextAssembler ─────────────────────────────────────────────────────────
@@ -595,12 +805,39 @@ export class ContextAssembler {
       }
     }
 
-    const systemPromptAddition = buildSystemPromptAddition(summarySignals);
+    const summaryGuidance = buildSystemPromptAddition(summarySignals);
 
-    // Step 3: Split into evictable prefix and protected fresh tail
-    const tailStart = Math.max(0, resolved.length - freshTailCount);
-    const freshTail = resolved.slice(tailStart);
-    const evictable = resolved.slice(0, tailStart);
+    // Build context ref map (always generated)
+    const contextRefMap = buildContextRefMap(resolved, contextItems);
+
+    // Combine summary guidance and context ref map
+    let systemPromptAddition: string | undefined;
+    if (summaryGuidance && contextRefMap) {
+      systemPromptAddition = summaryGuidance + "\n\n" + contextRefMap;
+    } else if (summaryGuidance) {
+      systemPromptAddition = summaryGuidance;
+    } else if (contextRefMap) {
+      systemPromptAddition = contextRefMap;
+    }
+
+    // Step 3: Extract scratchpad items — they go just before the fresh tail
+    // regardless of their original position.
+    const scratchpadItems: ResolvedItem[] = [];
+    const nonScratchpad: ResolvedItem[] = [];
+    for (const item of resolved) {
+      // Identify scratchpad items by checking the context item type
+      const contextItem = contextItems.find((ci) => ci.ordinal === item.ordinal);
+      if (contextItem?.itemType === "scratchpad") {
+        scratchpadItems.push(item);
+      } else {
+        nonScratchpad.push(item);
+      }
+    }
+
+    // Split into evictable prefix and protected fresh tail
+    const tailStart = Math.max(0, nonScratchpad.length - freshTailCount);
+    const freshTail = nonScratchpad.slice(tailStart);
+    const evictable = nonScratchpad.slice(0, tailStart);
 
     // Step 4: Budget-aware selection
     // First, compute the token cost of the fresh tail (always included).
@@ -647,10 +884,55 @@ export class ContextAssembler {
       evictableTokens = accum;
     }
 
-    // Append fresh tail after the evictable prefix
+    // Append scratchpad items just before fresh tail (high-attention zone)
+    selected.push(...scratchpadItems);
+
+    // Append fresh tail after the scratchpad
     selected.push(...freshTail);
 
     const estimatedTokens = evictableTokens + tailTokens;
+
+    // Context budget line: always show usage, with warning if over threshold
+    if (tokenBudget > 0) {
+      const usageRatio = estimatedTokens / tokenBudget;
+      const warningThreshold = input.budgetWarningThreshold ?? 0.7;
+      const pct = Math.round(usageRatio * 100);
+      const usedK = (estimatedTokens / 1000).toFixed(1);
+      const totalK = (tokenBudget / 1000).toFixed(1);
+
+      let budgetLine = `\nContext budget: ~${usedK}k/${totalK}k tokens (${pct}%).`;
+      if (usageRatio >= warningThreshold) {
+        // Escalating awareness: every 10% over threshold gets a clearer signal
+        const stepsOver = Math.floor((usageRatio - warningThreshold) / 0.10);
+        if (stepsOver <= 0) {
+          budgetLine += ` ⚠️ Budget pressure — consider collapsing stale items.`;
+        } else if (stepsOver === 1) {
+          budgetLine += ` ⚠️⚠️ Context growing — run lcm_tidy or collapse large items soon.`;
+        } else if (stepsOver === 2) {
+          budgetLine += ` ⚠️⚠️⚠️ High context usage — tidy now to avoid compaction. Run: lcm_tidy(keepRecentTurns: 3)`;
+        } else {
+          budgetLine += ` 🚨 Critical context usage (${pct}%) — auto-compaction imminent. Run lcm_tidy immediately.`;
+        }
+
+        // Find the 5 largest items in selected (non-fresh-tail, non-scratchpad)
+        const evictableWithTokens = selected
+          .filter((_, idx) => idx < selected.length - freshTail.length - scratchpadItems.length)
+          .map(item => ({ ordinal: item.ordinal, tokens: item.tokens, type: item.isMessage ? 'message' : (item.summarySignal ? 'summary' : 'pointer') }))
+          .sort((a, b) => b.tokens - a.tokens)
+          .slice(0, 5);
+
+        if (evictableWithTokens.length > 0) {
+          budgetLine += `\nLargest collapsible:`;
+          for (const item of evictableWithTokens) {
+            budgetLine += `\n- §${item.ordinal.toString(16).padStart(3, '0')} (${item.type}): ~${item.tokens} tokens`;
+          }
+        }
+      }
+
+      systemPromptAddition = systemPromptAddition
+        ? systemPromptAddition + '\n' + budgetLine
+        : budgetLine;
+    }
 
     // Normalize assistant string content to array blocks (some providers return
     // content as a plain string; Anthropic expects content block arrays).
@@ -708,6 +990,14 @@ export class ContextAssembler {
 
     if (item.itemType === "summary" && item.summaryId != null) {
       return this.resolveSummaryItem(item);
+    }
+
+    if (item.itemType === "pointer" && item.pointerId != null) {
+      return this.resolvePointerItem(item);
+    }
+
+    if (item.itemType === "scratchpad") {
+      return this.resolveScratchpadItem(item);
     }
 
     // Malformed item — skip
@@ -800,5 +1090,60 @@ export class ContextAssembler {
         descendantCount: summary.descendantCount,
       },
     };
+  }
+
+  /**
+   * Resolve a context item that references a collapsed pointer.
+   * Pointers render as minimal user messages.
+   */
+  private async resolvePointerItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
+    const pointer = await this.summaryStore.getPointer(item.pointerId!);
+    if (!pointer) {
+      return null;
+    }
+
+    const content = formatPointerContent(pointer, this.timezone);
+    const tokens = estimateTokens(content);
+
+    return {
+      ordinal: item.ordinal,
+      message: { role: "user" as const, content } as AgentMessage,
+      tokens,
+      isMessage: false,
+    };
+  }
+
+  /**
+   * Resolve a scratchpad context item.
+   * The scratchpad renders as a user message with clear boundaries.
+   */
+  private async resolveScratchpadItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
+    const scratchpad = await this.summaryStore.getScratchpad(item.conversationId);
+    if (!scratchpad || !scratchpad.content.trim()) {
+      return null;
+    }
+
+    const content = formatScratchpadContent(scratchpad, this.timezone);
+    const tokens = estimateTokens(content);
+
+    return {
+      ordinal: item.ordinal,
+      message: { role: "user" as const, content } as AgentMessage,
+      tokens,
+      isMessage: false,
+    };
+  }
+
+  /**
+   * Build a context ref map for a conversation's current context items.
+   * Used by tools (e.g. collapse) to show a refreshed map after mutations.
+   */
+  async buildRefMap(conversationId: number): Promise<string> {
+    const contextItems = await this.summaryStore.getContextItems(conversationId);
+    if (contextItems.length === 0) {
+      return "";
+    }
+    const resolved = await this.resolveItems(contextItems);
+    return buildContextRefMap(resolved, contextItems);
   }
 }

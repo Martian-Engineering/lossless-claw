@@ -12,8 +12,15 @@ import { formatTimestamp } from "../compaction.js";
 
 const LcmDescribeSchema = Type.Object({
   id: Type.String({
-    description: "The LCM ID to look up. Use sum_xxx for summaries, file_xxx for files.",
+    description:
+      "The LCM ID to look up. Use sum_xxx for summaries, file_xxx for files, ptr_xxx for collapsed pointers.",
   }),
+  query: Type.Optional(
+    Type.String({
+      description:
+        "Search within a pointer's source messages for this pattern (substring match). Only used with ptr_xxx IDs.",
+    }),
+  ),
   conversationId: Type.Optional(
     Type.Number({
       description:
@@ -60,9 +67,11 @@ export function createLcmDescribeTool(input: {
     label: "LCM Describe",
     description:
       "Look up metadata and content for an LCM item by ID. " +
-      "Use this to inspect summaries (sum_xxx) or stored files (file_xxx) " +
-      "from compacted conversation history. Returns summary content, lineage, " +
-      "token counts, and file exploration results.",
+      "Use this to inspect summaries (sum_xxx), stored files (file_xxx), " +
+      "or collapsed pointers (ptr_xxx) from compacted conversation history. " +
+      "Returns summary content, lineage, token counts, pointer previews, " +
+      "and file exploration results. For pointers, use optional query parameter " +
+      "to search within collapsed content without expanding.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
       const retrieval = input.lcm.getRetrieval();
@@ -88,12 +97,16 @@ export function createLcmDescribeTool(input: {
       if (!result) {
         return jsonResult({
           error: `Not found: ${id}`,
-          hint: "Check the ID format (sum_xxx for summaries, file_xxx for files).",
+          hint: "Check the ID format (sum_xxx for summaries, file_xxx for files, ptr_xxx for pointers).",
         });
       }
       if (conversationScope.conversationId != null) {
         const itemConversationId =
-          result.type === "summary" ? result.summary?.conversationId : result.file?.conversationId;
+          result.type === "summary"
+            ? result.summary?.conversationId
+            : result.type === "pointer"
+              ? result.pointer?.conversationId
+              : result.file?.conversationId;
         if (itemConversationId != null && itemConversationId !== conversationScope.conversationId) {
           return jsonResult({
             error: `Not found in conversation ${conversationScope.conversationId}: ${id}`,
@@ -226,6 +239,104 @@ export function createLcmDescribeTool(input: {
           content: [{ type: "text", text: lines.join("\n") }],
           details: result,
         };
+      }
+
+      if (result.type === "pointer" && result.pointer) {
+        const ptr = result.pointer;
+        const query = typeof p.query === "string" ? p.query.trim() : "";
+
+        // If query is provided, search within source messages
+        if (query) {
+          const matches: Array<{
+            id: number;
+            role: string;
+            snippet: string;
+            tokens: number;
+          }> = [];
+
+          for (const src of ptr.sourceMessages) {
+            const idx = src.content.toLowerCase().indexOf(query.toLowerCase());
+            if (idx >= 0) {
+              const snippetStart = Math.max(0, idx - 40);
+              const snippetEnd = Math.min(src.content.length, idx + query.length + 40);
+              const snippet =
+                (snippetStart > 0 ? "..." : "") +
+                src.content.slice(snippetStart, snippetEnd) +
+                (snippetEnd < src.content.length ? "..." : "");
+              matches.push({
+                id: src.messageId,
+                role: src.role,
+                snippet,
+                tokens: src.tokenCount,
+              });
+            }
+          }
+
+          return jsonResult({
+            id,
+            query,
+            matches,
+            totalSources: ptr.sourceMessages.length,
+            matchCount: matches.length,
+          });
+        }
+
+        // Full pointer describe
+        const totalTokens = ptr.sourceMessages.reduce((sum, m) => sum + m.tokenCount, 0);
+
+        // Build concatenated preview (~500 chars)
+        let previewText = "";
+        for (const src of ptr.sourceMessages) {
+          if (previewText.length >= 500) break;
+          previewText += src.content.slice(0, 500 - previewText.length);
+        }
+        if (previewText.length > 500) {
+          previewText = previewText.slice(0, 497) + "...";
+        }
+
+        const sources = ptr.sourceMessages.map((src) => ({
+          id: src.messageId,
+          role: src.role,
+          tokens: src.tokenCount,
+          preview: src.content.slice(0, 100) + (src.content.length > 100 ? "..." : ""),
+        }));
+
+        let parsedData: unknown = undefined;
+        if (ptr.data) {
+          try {
+            parsedData = JSON.parse(ptr.data);
+          } catch {
+            parsedData = ptr.data;
+          }
+        }
+
+        // Find related pointers (those sharing tags)
+        let relatedPointers: Array<{ id: string; label: string; sharedTags: string[] }> = [];
+        if (ptr.tags && ptr.tags.length > 0) {
+          const summaryStore = input.lcm.getSummaryStore();
+          const related = await summaryStore.getRelatedPointers(id, ptr.conversationId);
+          relatedPointers = related.map((rp) => ({
+            id: rp.pointerId,
+            label: rp.label,
+            sharedTags: rp.tags.filter((t) => ptr.tags.includes(t)),
+          }));
+        }
+
+        return jsonResult({
+          id,
+          type: "pointer",
+          label: ptr.label,
+          tags: ptr.tags ?? [],
+          status: ptr.status ?? "active",
+          data: parsedData ?? null,
+          sourceCount: ptr.sourceMessages.length,
+          totalTokens,
+          tokensSaved: ptr.tokensSaved,
+          created: formatIso(ptr.createdAt, timezone),
+          preview: previewText,
+          sources,
+          ...(relatedPointers.length > 0 ? { relatedPointers } : {}),
+        });
       }
 
       return jsonResult(result);

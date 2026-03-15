@@ -355,6 +355,58 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
   }
 }
 
+/**
+ * Ensure context_items supports pointer/scratchpad item types.
+ *
+ * SQLite doesn't support ALTER TABLE to modify CHECK constraints, so for
+ * existing DBs we check whether the table schema already includes the new
+ * item types. If not, we recreate the table preserving existing data.
+ */
+function ensureContextItemsActiveMemory(db: DatabaseSync): void {
+  // Check if pointer_id column exists (proxy for whether migration already ran)
+  const columns = db.prepare(`PRAGMA table_info(context_items)`).all() as Array<{ name?: string }>;
+  const hasPointerId = columns.some((col) => col.name === "pointer_id");
+  if (hasPointerId) {
+    return; // Already migrated
+  }
+
+  // Recreate context_items table with updated schema
+  db.exec("BEGIN");
+  try {
+    db.exec(`
+      CREATE TABLE context_items_new (
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL,
+        item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary', 'pointer', 'scratchpad')),
+        message_id INTEGER REFERENCES messages(message_id) ON DELETE RESTRICT,
+        summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+        pointer_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (conversation_id, ordinal),
+        CHECK (
+          (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL AND pointer_id IS NULL) OR
+          (item_type = 'summary' AND summary_id IS NOT NULL AND message_id IS NULL AND pointer_id IS NULL) OR
+          (item_type = 'pointer' AND pointer_id IS NOT NULL AND message_id IS NULL AND summary_id IS NULL) OR
+          (item_type = 'scratchpad' AND message_id IS NULL AND summary_id IS NULL AND pointer_id IS NULL)
+        )
+      );
+
+      INSERT INTO context_items_new (conversation_id, ordinal, item_type, message_id, summary_id, created_at)
+      SELECT conversation_id, ordinal, item_type, message_id, summary_id, created_at
+      FROM context_items;
+
+      DROP TABLE context_items;
+      ALTER TABLE context_items_new RENAME TO context_items;
+
+      CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal);
+    `);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
 export function runLcmMigrations(
   db: DatabaseSync,
   options?: { fts5Available?: boolean },
@@ -451,14 +503,17 @@ export function runLcmMigrations(
     CREATE TABLE IF NOT EXISTS context_items (
       conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
       ordinal INTEGER NOT NULL,
-      item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary')),
+      item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary', 'pointer', 'scratchpad')),
       message_id INTEGER REFERENCES messages(message_id) ON DELETE RESTRICT,
       summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+      pointer_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       PRIMARY KEY (conversation_id, ordinal),
       CHECK (
-        (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL) OR
-        (item_type = 'summary' AND summary_id IS NOT NULL AND message_id IS NULL)
+        (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL AND pointer_id IS NULL) OR
+        (item_type = 'summary' AND summary_id IS NOT NULL AND message_id IS NULL AND pointer_id IS NULL) OR
+        (item_type = 'pointer' AND pointer_id IS NOT NULL AND message_id IS NULL AND summary_id IS NULL) OR
+        (item_type = 'scratchpad' AND message_id IS NULL AND summary_id IS NULL AND pointer_id IS NULL)
       )
     );
 
@@ -491,10 +546,119 @@ export function runLcmMigrations(
     db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
   }
 
+  // Track whether LCM has actively managed this conversation (collapse/expand/scratchpad).
+  // Once set, the assembler must trust the DB and never fall back to live messages.
+  const hasManagedAt = conversationColumns.some((col) => col.name === "managed_at");
+  if (!hasManagedAt) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN managed_at TEXT`);
+  }
+
   ensureSummaryDepthColumn(db);
   ensureSummaryMetadataColumns(db);
   backfillSummaryDepths(db);
   backfillSummaryMetadata(db);
+
+  // ── Active memory tables ────────────────────────────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pointers (
+      pointer_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL,
+      label TEXT NOT NULL,
+      reason TEXT,
+      source_type TEXT NOT NULL,
+      source_ids TEXT NOT NULL,
+      tokens_saved INTEGER DEFAULT 0,
+      data TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS scratchpads (
+      conversation_id INTEGER PRIMARY KEY,
+      content TEXT NOT NULL DEFAULT '',
+      token_count INTEGER DEFAULT 0,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+    );
+  `);
+
+  // Migrate existing context_items table if it lacks the pointer/scratchpad columns.
+  ensureContextItemsActiveMemory(db);
+
+  // Add data column to pointers if it doesn't exist (for computation state).
+  try {
+    db.exec(`ALTER TABLE pointers ADD COLUMN data TEXT`);
+  } catch {
+    // Column already exists
+  }
+
+  // Add accessed_at column to pointers for access tracking.
+  try {
+    db.exec(`ALTER TABLE pointers ADD COLUMN accessed_at TEXT`);
+  } catch {
+    // Column already exists
+  }
+
+  // Add tags column to pointers (JSON array for categorization).
+  try {
+    db.exec(`ALTER TABLE pointers ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`);
+  } catch {
+    // Column already exists
+  }
+
+  // Add status column to pointers (active/reference/stale lifecycle).
+  try {
+    db.exec(`ALTER TABLE pointers ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
+  } catch {
+    // Column already exists
+  }
+
+  // ── Restore points table (for lcm_undo) ──────────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS restore_points (
+      id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL,
+      operation TEXT NOT NULL,
+      target TEXT NOT NULL,
+      items_affected INTEGER NOT NULL DEFAULT 0,
+      tokens_affected INTEGER NOT NULL DEFAULT 0,
+      snapshot_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS restore_points_conv_idx ON restore_points (conversation_id, created_at);
+  `);
+
+  // ── Checkpoints table (for lcm_checkpoint) ──────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS checkpoints (
+      checkpoint_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT,
+      context_snapshot TEXT NOT NULL,
+      scratchpad_snapshot TEXT,
+      token_count INTEGER DEFAULT 0,
+      item_count INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS checkpoints_conv_idx ON checkpoints (conversation_id, created_at);
+  `);
+
+  // ── Templates table (for lcm_templates) ──────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS templates (
+      template_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      content TEXT NOT NULL,
+      language TEXT DEFAULT 'python',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS templates_conv_name_idx ON templates (conversation_id, name);
+  `);
 
   const fts5Available = options?.fts5Available ?? getLcmDbFeatures(db).fts5Available;
   if (!fts5Available) {
