@@ -1,7 +1,7 @@
-FROM node:20-alpine
+FROM node:22-alpine
 
-# Install git (required for some npm dependencies)
-RUN apk add --no-cache git
+# Install git, python3, make, and build-base (g++) to build native extensions
+RUN apk add --no-cache git python3 make build-base cmake
 
 # Install openclaw globally
 RUN npm install -g openclaw@latest
