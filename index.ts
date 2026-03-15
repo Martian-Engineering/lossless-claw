@@ -1308,6 +1308,7 @@ const lcmPlugin = {
     const lcm = new LcmContextEngine(deps);
 
     api.registerContextEngine("lossless-claw", () => lcm);
+    api.registerContextEngine("default", () => lcm);
     api.registerTool(
       (ctx) =>
         createLcmGrepTool({
