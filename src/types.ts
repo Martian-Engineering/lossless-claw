@@ -14,7 +14,10 @@ import type { LcmConfig } from "./db/config.js";
 export interface TokenizerService {
   /** Check if tokenizer service is enabled */
   isEnabled(): boolean;
-  
+
+  /** Warm the tokenizer so subsequent countTokens() calls can run synchronously. */
+  initialize?(): Promise<void>;
+
   /** Count tokens in text (synchronous) */
   countTokens(text: string): number;
 }

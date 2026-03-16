@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import lcmPlugin from "../index.js";
 import { closeLcmConnection } from "../src/db/connection.js";
+import { HuggingFaceTokenizer } from "../src/tokenizers/huggingface.js";
 
 type RegisteredEngineFactory = (() => unknown) | undefined;
 
@@ -109,6 +110,7 @@ describe("lcm plugin registration", () => {
       rmSync(dir, { recursive: true, force: true });
     }
     tempDirs.clear();
+    vi.restoreAllMocks();
   });
 
   it("uses api.pluginConfig values during register", { timeout: 20000 }, () => {
@@ -141,6 +143,50 @@ describe("lcm plugin registration", () => {
     expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, useTokenizer=false)`,
     );
+  });
+
+  it("warms the tokenizer on register and redacts proxy credentials in logs", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+
+    const initializeSpy = vi
+      .spyOn(HuggingFaceTokenizer.prototype, "initialize")
+      .mockImplementation(async function mockInitialize(this: HuggingFaceTokenizer) {
+        Object.assign(this as object, {
+          initialized: true,
+          tokenizer: {
+            encode(text: string) {
+              return { ids: new Array(Math.ceil(text.length / 2)).fill(0), length: Math.ceil(text.length / 2) };
+            },
+          },
+        });
+      });
+
+    const { api, getFactory, infoLog, warnLog } = buildApi({
+      enabled: true,
+      useTokenizer: true,
+      proxy: "http://user:pass@proxy.example.test:7890",
+      dbPath,
+    });
+    api.config = defaultModelConfig("zai/glm-5") as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+    await Promise.resolve();
+
+    expect(initializeSpy).toHaveBeenCalledTimes(1);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { deps?: { tokenizer?: { isEnabled(): boolean } } };
+    expect(engine.deps?.tokenizer?.isEnabled()).toBe(true);
+
+    const infoMessages = infoLog.mock.calls.map(([message]) => String(message));
+    expect(infoMessages.some((message) => message.includes("user:pass"))).toBe(false);
+    expect(
+      infoMessages.some((message) => message.includes("proxy=http://***:***@proxy.example.test:7890")),
+    ).toBe(true);
+    expect(warnLog).not.toHaveBeenCalledWith(expect.stringContaining("Tokenizer warmup failed"));
   });
 
   it("inherits OpenClaw's default model for summarization when no LCM model override is set", () => {

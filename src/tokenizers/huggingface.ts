@@ -7,7 +7,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { createRequire } from "node:module";
-import { ProxyAgent, setGlobalDispatcher } from "undici";
+import { ProxyAgent } from "undici";
 
 // ESM-compatible require for synchronous imports
 const require = createRequire(import.meta.url);
@@ -16,6 +16,8 @@ const require = createRequire(import.meta.url);
 type TokenizerType = {
   encode(text: string): { ids: number[]; length: number };
 };
+
+type FetchWithDispatcherInit = RequestInit & { dispatcher?: unknown };
 
 // Model to HuggingFace path mapping
 // Only include models where we know the correct tokenizer path
@@ -104,10 +106,19 @@ export async function verifyTokenizerUrl(hfPath: string): Promise<boolean> {
   }
 }
 
+export function redactUrlCredentials(value?: string): string | undefined {
+  if (!value) {
+    return value;
+  }
+
+  return value.replace(/\/\/(?:[^/@:]+)(?::[^@]*)?@/, "//***:***@");
+}
+
 export class HuggingFaceTokenizer {
   private tokenizer: TokenizerType | null = null;
   private initialized = false;
   private initError: Error | null = null;
+  private initPromise: Promise<void> | null = null;
   private readonly modelId: string;
   private readonly httpProxy?: string;
   private readonly cacheDir: string;
@@ -163,17 +174,24 @@ export class HuggingFaceTokenizer {
   }
 
   async initialize(): Promise<void> {
-    if (this.initialized) return;
-    
-    // Try lazy load first
-    try {
-      await this.lazyLoad();
-      this.initialized = true;
+    if (this.initialized) {
       return;
-    } catch (err) {
-      this.initError = err instanceof Error ? err : new Error(String(err));
-      throw this.initError;
     }
+
+    if (!this.initPromise) {
+      this.initPromise = (async () => {
+        try {
+          await this.lazyLoad();
+          this.initialized = true;
+        } catch (err) {
+          this.initError = err instanceof Error ? err : new Error(String(err));
+          this.initPromise = null;
+          throw this.initError;
+        }
+      })();
+    }
+
+    await this.initPromise;
   }
 
   private async lazyLoad(): Promise<void> {
@@ -194,11 +212,9 @@ export class HuggingFaceTokenizer {
     }
     
     const proxyUrl = this.httpProxy;
-
-    // Set proxy if provided (using undici ProxyAgent for native fetch)
-    if (proxyUrl) {
-      setGlobalDispatcher(new ProxyAgent(proxyUrl));
-    }
+    const fetchOptions: FetchWithDispatcherInit | undefined = proxyUrl
+      ? { dispatcher: new ProxyAgent(proxyUrl) }
+      : undefined;
 
     // Try load from cache
     const cachePathJson = cachePath.replace(/\.json$/, '.tokenizer.json');
@@ -224,8 +240,8 @@ export class HuggingFaceTokenizer {
     const configUrl = `https://huggingface.co/${hfPath}/resolve/main/tokenizer_config.json`;
     
     const [tokenizerResponse, configResponse] = await Promise.all([
-      fetch(tokenizerUrl),
-      fetch(configUrl),
+      fetch(tokenizerUrl, fetchOptions),
+      fetch(configUrl, fetchOptions),
     ]);
     
     if (!tokenizerResponse.ok) {

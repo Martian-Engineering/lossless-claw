@@ -258,6 +258,14 @@ export class RetrievalEngine {
    * - Respects `tokenCap` and sets `truncated` when the cap is exceeded.
    */
   async expand(input: ExpandInput): Promise<ExpandResult> {
+    if (this.useTokenizer && this.tokenizer?.initialize) {
+      try {
+        await this.tokenizer.initialize();
+      } catch {
+        // Fall back to heuristic counting when tokenizer warmup fails.
+      }
+    }
+
     const depth = input.depth ?? 1;
     const includeMessages = input.includeMessages ?? false;
     const tokenCap = input.tokenCap ?? Infinity;

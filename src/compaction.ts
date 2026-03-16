@@ -164,6 +164,18 @@ export class CompactionEngine {
     private tokenizer?: TokenizerService,
   ) {}
 
+  private async ensureTokenizerReady(): Promise<void> {
+    if (!this.useTokenizer || !this.tokenizer?.initialize) {
+      return;
+    }
+
+    try {
+      await this.tokenizer.initialize();
+    } catch {
+      // Fall back to heuristic counting when tokenizer warmup fails.
+    }
+  }
+
   // ── evaluate ─────────────────────────────────────────────────────────────
 
   /** Evaluate whether compaction is needed. */
@@ -172,6 +184,8 @@ export class CompactionEngine {
     tokenBudget: number,
     observedTokenCount?: number,
   ): Promise<CompactionDecision> {
+    await this.ensureTokenizerReady();
+
     const storedTokens = await this.summaryStore.getContextTokenCount(conversationId);
     const liveTokens =
       typeof observedTokenCount === "number" &&
@@ -211,6 +225,8 @@ export class CompactionEngine {
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
+    await this.ensureTokenizerReady();
+
     const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId);
     const threshold = this.resolveLeafChunkTokens();
     return {
@@ -231,6 +247,7 @@ export class CompactionEngine {
     force?: boolean;
     hardTrigger?: boolean;
   }): Promise<CompactionResult> {
+    await this.ensureTokenizerReady();
     return this.compactFullSweep(input);
   }
 
@@ -246,6 +263,8 @@ export class CompactionEngine {
     force?: boolean;
     previousSummaryContent?: string;
   }): Promise<CompactionResult> {
+    await this.ensureTokenizerReady();
+
     const { conversationId, tokenBudget, summarize, force } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
@@ -359,6 +378,8 @@ export class CompactionEngine {
     force?: boolean;
     hardTrigger?: boolean;
   }): Promise<CompactionResult> {
+    await this.ensureTokenizerReady();
+
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
@@ -486,6 +507,8 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
   }): Promise<{ success: boolean; rounds: number; finalTokens: number }> {
+    await this.ensureTokenizerReady();
+
     const { conversationId, tokenBudget, summarize } = input;
     const targetTokens =
       typeof input.targetTokens === "number" &&

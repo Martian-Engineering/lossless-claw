@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -23,6 +23,15 @@ const mockFetch = vi.fn().mockImplementation((url: string) => {
   return Promise.resolve({ ok: false, status: 404 });
 });
 vi.stubGlobal("fetch", mockFetch);
+
+const { setGlobalDispatcher, ProxyAgent } = vi.hoisted(() => ({
+  setGlobalDispatcher: vi.fn(),
+  ProxyAgent: vi.fn().mockImplementation((url: string) => ({ proxyUrl: url })),
+}));
+vi.mock("undici", () => ({
+  ProxyAgent,
+  setGlobalDispatcher,
+}));
 
 // Mock fs module to simulate file system
 vi.mock("fs/promises", () => ({
@@ -66,6 +75,12 @@ vi.mock("@huggingface/tokenizers", () => {
 import { HuggingFaceTokenizer, createTokenizerService } from "../src/tokenizers/huggingface.js";
 
 describe("HuggingFaceTokenizer", () => {
+  beforeEach(() => {
+    mockFetch.mockClear();
+    setGlobalDispatcher.mockClear();
+    ProxyAgent.mockClear();
+  });
+
   describe("constructor", () => {
     it("creates tokenizer with default model glm-5", () => {
       const tokenizer = new HuggingFaceTokenizer();
@@ -89,6 +104,44 @@ describe("HuggingFaceTokenizer", () => {
     it("throws when model does not exist", async () => {
       const tokenizer = new HuggingFaceTokenizer("non-existent-model-xyz-12345");
       await expect(tokenizer.initialize()).rejects.toThrow();
+    });
+
+    it("uses a request-scoped proxy dispatcher instead of mutating the global dispatcher", async () => {
+      mockFetch.mockClear();
+      setGlobalDispatcher.mockClear();
+      ProxyAgent.mockClear();
+
+      const proxyUrl = "http://user:pass@proxy.example.test:7890";
+      const previousCacheDir = process.env.TOKENIZER_CACHE_DIR;
+      process.env.TOKENIZER_CACHE_DIR = path.join(os.tmpdir(), `non_existent_proxy_test_${Date.now()}`);
+
+      try {
+        const tokenizer = new HuggingFaceTokenizer("glm-5", proxyUrl);
+        await tokenizer.initialize();
+
+        expect(ProxyAgent).toHaveBeenCalledWith(proxyUrl);
+        expect(setGlobalDispatcher).not.toHaveBeenCalled();
+        expect(mockFetch).toHaveBeenNthCalledWith(
+          1,
+          expect.stringContaining("/tokenizer.json"),
+          expect.objectContaining({
+            dispatcher: { proxyUrl },
+          }),
+        );
+        expect(mockFetch).toHaveBeenNthCalledWith(
+          2,
+          expect.stringContaining("/tokenizer_config.json"),
+          expect.objectContaining({
+            dispatcher: { proxyUrl },
+          }),
+        );
+      } finally {
+        if (previousCacheDir === undefined) {
+          delete process.env.TOKENIZER_CACHE_DIR;
+        } else {
+          process.env.TOKENIZER_CACHE_DIR = previousCacheDir;
+        }
+      }
     });
   });
 

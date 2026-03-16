@@ -656,6 +656,19 @@ export class LcmContextEngine implements ContextEngine {
     this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore, deps.config.useTokenizer, deps.tokenizer);
   }
 
+  /** Warm the tokenizer before any sync token-count paths run. */
+  private async ensureTokenizerReady(): Promise<void> {
+    if (!this.config.useTokenizer || !this.deps.tokenizer?.initialize) {
+      return;
+    }
+
+    try {
+      await this.deps.tokenizer.initialize();
+    } catch {
+      // Fall back to heuristic counting when tokenizer warmup fails.
+    }
+  }
+
   /** Ensure DB schema is up-to-date. Called lazily on first bootstrap/ingest/assemble/compact. */
   private ensureMigrated(): void {
     if (this.migrated) {
@@ -1020,6 +1033,7 @@ export class LcmContextEngine implements ContextEngine {
 
   async bootstrap(params: { sessionId: string; sessionFile: string }): Promise<BootstrapResult> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
 
     const result = await this.withSessionQueue(params.sessionId, async () =>
       this.conversationStore.withTransaction(async () => {
@@ -1205,6 +1219,7 @@ export class LcmContextEngine implements ContextEngine {
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
     return this.withSessionQueue(params.sessionId, () => this.ingestSingle(params));
   }
 
@@ -1214,6 +1229,7 @@ export class LcmContextEngine implements ContextEngine {
     isHeartbeat?: boolean;
   }): Promise<IngestBatchResult> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
     if (params.messages.length === 0) {
       return { ingestedCount: 0 };
     }
@@ -1244,6 +1260,7 @@ export class LcmContextEngine implements ContextEngine {
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
 
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
@@ -1319,6 +1336,7 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<AssembleResult> {
     try {
       this.ensureMigrated();
+      await this.ensureTokenizerReady();
 
       const conversation = await this.conversationStore.getConversationBySessionId(
         params.sessionId,
@@ -1396,6 +1414,7 @@ export class LcmContextEngine implements ContextEngine {
     threshold: number;
   }> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
     const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
     if (!conversation) {
       const fallbackThreshold =
@@ -1425,6 +1444,7 @@ export class LcmContextEngine implements ContextEngine {
     previousSummaryContent?: string;
   }): Promise<CompactResult> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
     return this.withSessionQueue(params.sessionId, async () => {
       const conversation = await this.conversationStore.getConversationBySessionId(
         params.sessionId,
@@ -1498,6 +1518,7 @@ export class LcmContextEngine implements ContextEngine {
     force?: boolean;
   }): Promise<CompactResult> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
     return this.withSessionQueue(params.sessionId, async () => {
       const { sessionId, force = false } = params;
 

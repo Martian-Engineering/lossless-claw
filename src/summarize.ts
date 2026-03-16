@@ -688,6 +688,13 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     const apiKey = await params.deps.getApiKey(provider, model, {
       profileId: authProfileId,
     });
+    if (params.deps.config.useTokenizer && params.deps.tokenizer?.initialize) {
+      try {
+        await params.deps.tokenizer.initialize();
+      } catch {
+        // Fall back to heuristic counting when tokenizer warmup fails.
+      }
+    }
     const targetTokens = resolveTargetTokens({
       inputTokens: calculateTokens(text, params.deps.config.useTokenizer, params.deps.tokenizer),
       mode,

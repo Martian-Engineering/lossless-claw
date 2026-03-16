@@ -562,6 +562,14 @@ export class ContextAssembler {
    * 5. Return the final ordered messages in chronological order.
    */
   async assemble(input: AssembleContextInput): Promise<AssembleContextResult> {
+    if (input.useTokenizer && input.tokenizer?.initialize) {
+      try {
+        await input.tokenizer.initialize();
+      } catch {
+        // Fall back to heuristic counting when tokenizer warmup fails.
+      }
+    }
+
     const { conversationId, tokenBudget } = input;
     const freshTailCount = input.freshTailCount ?? 8;
     const useTokenizer = input.useTokenizer;
