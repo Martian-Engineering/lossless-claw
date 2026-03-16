@@ -76,6 +76,8 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileSummaryModel: "",
       summaryModel: "",
       summaryProvider: "",
+      expansionProvider: "",
+      expansionModel: "",
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
@@ -259,6 +261,78 @@ describe("createLcmExpandQueryTool", () => {
       error: "prompt is required.",
     });
     expect(callGatewayMock).not.toHaveBeenCalled();
+  });
+
+  it("passes expansion provider and model overrides to delegated agent runs", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        return { runId: "run-overrides" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Handled by override test.",
+                    citedIds: ["sum_a"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 1234,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const deps = makeDeps();
+    const tool = createLcmExpandQueryTool({
+      deps: {
+        ...deps,
+        config: {
+          ...deps.config,
+          expansionProvider: "openrouter",
+          expansionModel: "anthropic/claude-haiku-4-5",
+        },
+      },
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    await tool.execute("call-overrides", {
+      summaryIds: ["sum_a"],
+      prompt: "Answer this",
+      conversationId: 42,
+    });
+
+    const agentCall = callGatewayMock.mock.calls
+      .map(([opts]) => opts as { method?: string; params?: Record<string, unknown> })
+      .find((entry) => entry.method === "agent");
+
+    expect(agentCall?.params).toMatchObject({
+      provider: "openrouter",
+      model: "anthropic/claude-haiku-4-5",
+    });
   });
 
   it("returns timeout when delegated run exceeds 120 seconds", async () => {

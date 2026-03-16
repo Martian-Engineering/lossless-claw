@@ -184,6 +184,49 @@ describe("lcm plugin registration", () => {
     });
   });
 
+  it("forwards explicit provider and model fields to runtime subagent runs", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+
+    const { api, getFactory } = buildApi({
+      enabled: true,
+      dbPath,
+    });
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as {
+      deps?: {
+        callGateway: (params: {
+          method: string;
+          params?: Record<string, unknown>;
+        }) => Promise<unknown>;
+      };
+      config: { databasePath: string };
+    };
+    const run = api.runtime.subagent.run as ReturnType<typeof vi.fn>;
+
+    await engine.deps?.callGateway({
+      method: "agent",
+      params: {
+        sessionKey: "agent:main:subagent:test",
+        message: "Test delegated run",
+        provider: "openrouter",
+        model: "anthropic/claude-haiku-4-5",
+        deliver: false,
+        idempotencyKey: "idem-1",
+      },
+    });
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "openrouter",
+      model: "anthropic/claude-haiku-4-5",
+    }));
+  });
+
   it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {
     const { api, getFactory, warnLog } = buildApi(
       {

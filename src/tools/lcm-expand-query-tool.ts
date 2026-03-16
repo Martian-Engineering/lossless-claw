@@ -481,6 +481,7 @@ export function createLcmExpandQueryTool(input: {
         });
 
         const childIdem = crypto.randomUUID();
+        const expansionProvider = input.deps.config.expansionProvider || undefined;
         const expansionModel = input.deps.config.expansionModel || undefined;
         const response = (await input.deps.callGateway({
           method: "agent",
@@ -490,6 +491,7 @@ export function createLcmExpandQueryTool(input: {
             deliver: false,
             lane: input.deps.agentLaneSubagent,
             idempotencyKey: childIdem,
+            ...(expansionProvider ? { provider: expansionProvider } : {}),
             ...(expansionModel ? { model: expansionModel } : {}),
             extraSystemPrompt: input.deps.buildSubagentSystemPrompt({
               depth: 1,
