@@ -847,7 +847,7 @@ func buildLeafSummaryPrompt(text, previousContext string, targetTokens int) stri
 	if prev == "" {
 		prev = "(none)"
 	}
-	return fmt.Sprintf(`You summarize a SEGMENT of an OpenClaw conversation for future model turns.
+	return fmt.Sprintf(`You summarize a SEGMENT of a Claude Code conversation for future model turns.
 Treat this as incremental memory compaction input, not a full-conversation summary.
 
 Normal summary policy:
@@ -880,7 +880,7 @@ func buildCondensedSummaryPrompt(text, previousContext string, targetTokens int)
 	if prev == "" {
 		prev = "(none)"
 	}
-	return fmt.Sprintf(`You produce a Pi-inspired condensed OpenClaw memory summary for long-context handoff.
+	return fmt.Sprintf(`You produce a condensed Claude Code memory summary for long-context handoff.
 Capture only durable facts that matter for future execution and safe continuation.
 
 Operator instructions: (none)
@@ -1278,14 +1278,14 @@ func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) 
 		}
 	}
 
-	// Check ~/.openclaw/secrets.json for setup-token fallback.
+	// Check ~/.claude/secrets.json for setup-token fallback.
 	if normalizedProvider == "anthropic" {
-		if key, err := readSetupTokenFromSecrets(paths.openclawDir); err == nil && key != "" {
+		if key, err := readSetupTokenFromSecrets(paths.claudeDir); err == nil && key != "" {
 			return key, nil
 		}
 	}
 
-	mode, err := readProviderProfileMode(paths.openclawConfig, normalizedProvider)
+	mode, err := readProviderProfileMode(paths.claudeConfig, normalizedProvider)
 	if err != nil {
 		return "", err
 	}
@@ -1293,7 +1293,7 @@ func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) 
 		return "", fmt.Errorf("%s profile mode is %q; set %s explicitly", normalizedProvider, mode, envCandidates[0])
 	}
 
-	if key, err := readKeyFromEnvFileCandidates(paths.openclawEnv, envCandidates); err == nil && key != "" {
+	if key, err := readKeyFromEnvFileCandidates(paths.claudeEnv, envCandidates); err == nil && key != "" {
 		return key, nil
 	}
 
@@ -1303,10 +1303,10 @@ func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) 
 	}
 
 	candidates := []string{
-		filepath.Join(paths.openclawDir, "auth-tokens.json"),
-		filepath.Join(paths.openclawCredsDir, "auth-tokens.json"),
-		filepath.Join(paths.openclawCredsDir, normalizedProvider+".json"),
-		filepath.Join(paths.openclawCredsDir, "providers", normalizedProvider+".json"),
+		filepath.Join(paths.claudeDir, "auth-tokens.json"),
+		filepath.Join(paths.claudeCredsDir, "auth-tokens.json"),
+		filepath.Join(paths.claudeCredsDir, normalizedProvider+".json"),
+		filepath.Join(paths.claudeCredsDir, "providers", normalizedProvider+".json"),
 	}
 	for _, path := range candidates {
 		if key, err := readLikelyProviderKey(path, normalizedProvider, envCandidates); err == nil && key != "" {
@@ -1321,9 +1321,9 @@ func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) 
 	)
 }
 
-// readSetupTokenFromSecrets reads an Anthropic setup-token from ~/.openclaw/secrets.json.
-func readSetupTokenFromSecrets(openclawDir string) (string, error) {
-	secretsPath := filepath.Join(openclawDir, "secrets.json")
+// readSetupTokenFromSecrets reads an Anthropic setup-token from ~/.claude/secrets.json.
+func readSetupTokenFromSecrets(claudeDir string) (string, error) {
+	secretsPath := filepath.Join(claudeDir, "secrets.json")
 	data, err := os.ReadFile(secretsPath)
 	if err != nil {
 		return "", err
@@ -1367,7 +1367,7 @@ func readAnthropicProfileMode(configPath string) (string, error) {
 		return "", err
 	}
 	if mode == "" {
-		return "", errors.New("OpenClaw config does not define anthropic:default or anthropic:manual profile")
+		return "", errors.New("Claude Code config does not define anthropic:default or anthropic:manual profile")
 	}
 	return mode, nil
 }
@@ -1375,7 +1375,7 @@ func readAnthropicProfileMode(configPath string) (string, error) {
 func readProviderProfileMode(configPath, provider string) (string, error) {
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
-		return "", fmt.Errorf("read OpenClaw config %q: %w", configPath, err)
+		return "", fmt.Errorf("read Claude Code config %q: %w", configPath, err)
 	}
 
 	var parsed struct {
@@ -1387,7 +1387,7 @@ func readProviderProfileMode(configPath, provider string) (string, error) {
 		} `json:"auth"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return "", fmt.Errorf("parse OpenClaw config %q: %w", configPath, err)
+		return "", fmt.Errorf("parse Claude Code config %q: %w", configPath, err)
 	}
 
 	normalizedProvider := normalizeProviderID(provider)

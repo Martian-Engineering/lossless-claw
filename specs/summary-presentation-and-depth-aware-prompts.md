@@ -199,7 +199,7 @@ Timezone is derived from the operator's configured timezone (available via
 **Leaf prompt** (depth 0):
 
 ```
-You summarize a SEGMENT of an OpenClaw conversation for future model turns.
+You summarize a SEGMENT of a Claude Code conversation for future model turns.
 Treat this as incremental memory compaction, not a full-conversation summary.
 
 Summary policy:

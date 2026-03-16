@@ -1,12 +1,12 @@
 # TUI Reference
 
-The Lossless Claw TUI (`lcm-tui`) is an interactive terminal application for inspecting, debugging, and maintaining the LCM database. It provides direct visibility into what the model sees (context assembly), how summaries are structured (DAG hierarchy), and tools for surgical repairs when things go wrong.
+The Lossless Claude TUI (`lcm-tui`) is an interactive terminal application for inspecting, debugging, and maintaining the LCM database. It provides direct visibility into what the model sees (context assembly), how summaries are structured (DAG hierarchy), and tools for surgical repairs when things go wrong.
 
 ## Installation
 
 **From GitHub releases:**
 
-Download the latest binary for your platform from [Releases](https://github.com/Martian-Engineering/lossless-claw/releases).
+Download the latest binary for your platform from [Releases](https://github.com/ipedro/lossless-claude/releases).
 
 **Build from source:**
 
@@ -14,7 +14,7 @@ Download the latest binary for your platform from [Releases](https://github.com/
 cd tui
 go build -o lcm-tui .
 # or: make build
-# or: go install github.com/Martian-Engineering/lossless-claw/tui@latest
+# or: go install github.com/ipedro/lossless-claude/tui@latest
 ```
 
 Requires Go 1.24+.
@@ -22,11 +22,11 @@ Requires Go 1.24+.
 ## Quick Start
 
 ```bash
-lcm-tui                              # default: ~/.openclaw/lcm.db
+lcm-tui                              # default: ~/.claude/lcm.db
 lcm-tui --db /path/to/lcm.db        # custom database path
 ```
 
-The TUI auto-discovers agent session directories from `~/.openclaw/agents/`.
+The TUI auto-discovers agent session directories from `~/.claude/agents/`.
 
 ## Navigation Model
 
@@ -38,7 +38,7 @@ Agents → Sessions → Conversation → [Summary DAG | Context View | Large Fil
 
 ### Screen 1: Agent List
 
-Lists all agents discovered under `~/.openclaw/agents/`. Select an agent to see its sessions.
+Lists all agents discovered under `~/.claude/agents/`. Select an agent to see its sessions.
 
 | Key | Action |
 |-----|--------|
@@ -469,10 +469,10 @@ The TUI resolves API keys by provider for rewrite, repair, and backfill compacti
 
 Resolution order:
 1. Provider API key environment variable
-2. OpenClaw config (`~/.openclaw/openclaw.json`) — checks matching provider auth profile mode
-3. OpenClaw env file
+2. Claude Code config (`~/.claude/claude.json`) — checks matching provider auth profile mode
+3. Claude Code env file
 4. `~/.zshrc` export
-5. Credential file candidates under `~/.openclaw/`
+5. Credential file candidates under `~/.claude/`
 
 If the provider auth profile mode is `oauth` (not `api_key`), set the provider API key environment variable explicitly.
 
@@ -485,12 +485,12 @@ It also honors `LCM_SUMMARY_PROVIDER` / `LCM_SUMMARY_MODEL` as fallback.
 
 ## Database
 
-The TUI operates directly on the SQLite database at `~/.openclaw/lcm.db`. All write operations (rewrite, dissolve, repair, transplant, backfill) use transactions. Changes take effect on the next conversation turn — the running OpenClaw instance picks up database changes automatically.
+The TUI operates directly on the SQLite database at `~/.claude/lcm.db`. All write operations (rewrite, dissolve, repair, transplant, backfill) use transactions. Changes take effect on the next conversation turn — the running Claude Code instance picks up database changes automatically.
 
 **Backup recommendation:** Before batch operations (repair `--all`, rewrite `--all`, transplant, backfill), copy the database:
 
 ```bash
-cp ~/.openclaw/lcm.db ~/.openclaw/lcm.db.bak-$(date +%Y%m%d)
+cp ~/.claude/lcm.db ~/.claude/lcm.db.bak-$(date +%Y%m%d)
 ```
 
 ## Troubleshooting

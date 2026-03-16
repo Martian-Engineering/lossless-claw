@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { ClaudePluginApi } from "../src/claude-bridge.js";
 import lcmPlugin from "../index.js";
 import { closeLcmConnection } from "../src/db/connection.js";
 
@@ -12,7 +12,7 @@ function buildApi(
   pluginConfig: Record<string, unknown>,
   options?: { includeModelAuth?: boolean; agentDir?: string },
 ): {
-  api: OpenClawPluginApi;
+  api: ClaudePluginApi;
   getFactory: () => RegisteredEngineFactory;
   infoLog: ReturnType<typeof vi.fn>;
   warnLog: ReturnType<typeof vi.fn>;
@@ -23,9 +23,9 @@ function buildApi(
   const agentDir = options?.agentDir ?? "/tmp/fake-agent";
 
   const api = {
-    id: "lossless-claw",
+    id: "lossless-claude",
     name: "Lossless Context Management",
-    source: "/tmp/lossless-claw",
+    source: "/tmp/lossless-claude",
     config: {},
     pluginConfig,
     runtime: {
@@ -73,7 +73,7 @@ function buildApi(
     registerCommand: vi.fn(),
     resolvePath: vi.fn(() => agentDir),
     on: vi.fn(),
-  } as unknown as OpenClawPluginApi;
+  } as unknown as ClaudePluginApi;
 
   return {
     api,
@@ -112,7 +112,7 @@ describe("lcm plugin registration", () => {
   });
 
   it("uses api.pluginConfig values during register", { timeout: 20000 }, () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    const dbPath = join(tmpdir(), `lossless-claude-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
 
     const { api, getFactory, infoLog } = buildApi({
@@ -143,11 +143,11 @@ describe("lcm plugin registration", () => {
     );
   });
 
-  it("inherits OpenClaw's default model for summarization when no LCM model override is set", () => {
+  it("inherits Claude Code's default model for summarization when no LCM model override is set", () => {
     const { api, getFactory } = buildApi({
       enabled: true,
     });
-    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as ClaudePluginApi["config"];
 
     lcmPlugin.register(api);
 
@@ -171,7 +171,7 @@ describe("lcm plugin registration", () => {
       summaryModel: "gpt-5.4",
       summaryProvider: "openai-resp",
     });
-    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as ClaudePluginApi["config"];
 
     lcmPlugin.register(api);
 
@@ -194,7 +194,7 @@ describe("lcm plugin registration", () => {
       enabled: true,
       summaryModel: "openai-resp/gpt-5.4",
     });
-    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as ClaudePluginApi["config"];
 
     lcmPlugin.register(api);
 
@@ -218,7 +218,7 @@ describe("lcm plugin registration", () => {
       summaryModel: "gpt-5.4",
       summaryProvider: "openai-resp",
     });
-    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as ClaudePluginApi["config"];
 
     lcmPlugin.register(api);
 
@@ -236,14 +236,14 @@ describe("lcm plugin registration", () => {
     });
   });
 
-  it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {
+  it("registers without runtime.modelAuth on older Claude Code runtimes", () => {
     const { api, getFactory, warnLog } = buildApi(
       {
         enabled: true,
       },
       { includeModelAuth: false },
     );
-    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as ClaudePluginApi["config"];
 
     expect(() => lcmPlugin.register(api)).not.toThrow();
     expect(getFactory()).toBeTypeOf("function");
@@ -256,9 +256,9 @@ describe("lcm plugin registration", () => {
     const { api, getFactory } = buildApi({
       enabled: true,
     });
-    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
+    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as ClaudePluginApi["config"];
     const modelAuth = (
-      api.runtime as OpenClawPluginApi["runtime"] & {
+      api.runtime as ClaudePluginApi["runtime"] & {
         modelAuth: {
           getApiKeyForModel: ReturnType<typeof vi.fn>;
         };
@@ -283,7 +283,7 @@ describe("lcm plugin registration", () => {
 
   it("falls back to auth-profiles.json when runtime.modelAuth is unavailable", { timeout: 20000 }, async () => {
     const provider = "lossless-test-provider";
-    const agentDir = mkdtempSync(join(tmpdir(), "lossless-claw-auth-"));
+    const agentDir = mkdtempSync(join(tmpdir(), "lossless-claude-auth-"));
     tempDirs.add(agentDir);
     writeFileSync(
       join(agentDir, "auth-profiles.json"),
@@ -313,7 +313,7 @@ describe("lcm plugin registration", () => {
       },
       { includeModelAuth: false, agentDir },
     );
-    api.config = defaultModelConfig(`${provider}/claude-sonnet-4-6`) as OpenClawPluginApi["config"];
+    api.config = defaultModelConfig(`${provider}/claude-sonnet-4-6`) as ClaudePluginApi["config"];
 
     lcmPlugin.register(api);
 

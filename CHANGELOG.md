@@ -1,4 +1,4 @@
-# @martian-engineering/lossless-claw
+# @ipedro/lossless-claude
 
 ## 0.3.0
 

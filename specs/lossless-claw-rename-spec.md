@@ -1,5 +1,7 @@
 # Rename Spec: `openclaw-lcm` -> `lossless-claw`
 
+> **Note:** This project has been further renamed from `lossless-claw` to `lossless-claude` (a Claude Code plugin).
+
 ## Scope and naming decisions
 
 - Package name: `@martian-engineering/lossless-claw`

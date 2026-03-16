@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { ClaudePluginApi } from "../src/claude-bridge.js";
 import lcmPlugin from "../index.js";
 import { closeLcmConnection } from "../src/db/connection.js";
 
@@ -21,18 +21,18 @@ function buildApi(params?: {
   config?: Record<string, unknown>;
   pluginConfig?: Record<string, unknown>;
 }): {
-  api: OpenClawPluginApi;
+  api: ClaudePluginApi;
   getFactory: () => RegisteredEngineFactory;
   dbPath: string;
 } {
   let factory: RegisteredEngineFactory;
-  const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+  const dbPath = join(tmpdir(), `lossless-claude-${Date.now()}-${Math.random().toString(16)}.db`);
 
   const api = {
-    id: "lossless-claw",
+    id: "lossless-claude",
     name: "Lossless Context Management",
-    source: "/tmp/lossless-claw",
-    config: (params?.config ?? {}) as OpenClawPluginApi["config"],
+    source: "/tmp/lossless-claude",
+    config: (params?.config ?? {}) as ClaudePluginApi["config"],
     pluginConfig: {
       enabled: true,
       dbPath,
@@ -75,7 +75,7 @@ function buildApi(params?: {
     registerCommand: vi.fn(),
     resolvePath: vi.fn(() => "/tmp/fake-agent"),
     on: vi.fn(),
-  } as unknown as OpenClawPluginApi;
+  } as unknown as ClaudePluginApi;
 
   return {
     api,
@@ -147,7 +147,7 @@ describe("auth-profile SecretRef resolution in complete()", () => {
   });
 
   it("resolves env-backed tokenRef values from auth-profiles.json", async () => {
-    const agentDir = mkdtempSync(join(tmpdir(), "lossless-claw-auth-"));
+    const agentDir = mkdtempSync(join(tmpdir(), "lossless-claude-auth-"));
     tempDirs.add(agentDir);
 
     writeFileSync(
@@ -192,7 +192,7 @@ describe("auth-profile SecretRef resolution in complete()", () => {
   });
 
   it("resolves file-backed keyRef values through configured secret providers", async () => {
-    const rootDir = mkdtempSync(join(tmpdir(), "lossless-claw-secret-provider-"));
+    const rootDir = mkdtempSync(join(tmpdir(), "lossless-claude-secret-provider-"));
     tempDirs.add(rootDir);
 
     const agentDir = join(rootDir, "agent");

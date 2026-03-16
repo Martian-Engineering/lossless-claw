@@ -2,25 +2,25 @@
 
 ## Quick start
 
-Install the plugin with OpenClaw's plugin installer:
+Install the plugin with Claude Code's plugin installer:
 
 ```bash
-openclaw plugins install @martian-engineering/lossless-claw
+claude plugins install @ipedro/lossless-claude
 ```
 
-If you're running from a local OpenClaw checkout:
+If you're running from a local Claude Code checkout:
 
 ```bash
-pnpm openclaw plugins install @martian-engineering/lossless-claw
+pnpm claude plugins install @ipedro/lossless-claude
 ```
 
 For local development of this plugin, link your working copy:
 
 ```bash
-openclaw plugins install --link /path/to/lossless-claw
+claude plugins install --link /path/to/lossless-claude
 ```
 
-`openclaw plugins install` handles plugin registration/enabling and slot selection automatically.
+`claude plugins install` handles plugin registration/enabling and slot selection automatically.
 
 Set recommended environment variables:
 
@@ -29,7 +29,7 @@ export LCM_FRESH_TAIL_COUNT=32
 export LCM_INCREMENTAL_MAX_DEPTH=-1
 ```
 
-Restart OpenClaw.
+Restart Claude Code.
 
 ## Tuning guide
 
@@ -93,7 +93,7 @@ The actual summary size depends on the LLM's output; these values are guidelines
 
 ## Model selection
 
-LCM uses the same model as the parent OpenClaw session for summarization by default. You can override this:
+LCM uses the same model as the parent Claude Code session for summarization by default. You can override this:
 
 ```bash
 # Use a specific model for summarization
@@ -112,12 +112,12 @@ Using a cheaper/faster model for summarization can reduce costs, but quality mat
 
 ## Database management
 
-The SQLite database lives at `LCM_DATABASE_PATH` (default `~/.openclaw/lcm.db`). 
+The SQLite database lives at `LCM_DATABASE_PATH` (default `~/.claude/lcm.db`). 
 
 ### Inspecting the database
 
 ```bash
-sqlite3 ~/.openclaw/lcm.db
+sqlite3 ~/.claude/lcm.db
 
 # Count conversations
 SELECT COUNT(*) FROM conversations;
@@ -137,22 +137,22 @@ SELECT summary_id, depth, token_count FROM summaries ORDER BY token_count DESC L
 The database is a single file. Back it up with:
 
 ```bash
-cp ~/.openclaw/lcm.db ~/.openclaw/lcm.db.backup
+cp ~/.claude/lcm.db ~/.claude/lcm.db.backup
 ```
 
 Or use SQLite's online backup:
 
 ```bash
-sqlite3 ~/.openclaw/lcm.db ".backup ~/.openclaw/lcm.db.backup"
+sqlite3 ~/.claude/lcm.db ".backup ~/.claude/lcm.db.backup"
 ```
 
 ## Per-agent configuration
 
-In multi-agent OpenClaw setups, each agent uses the same LCM database but has its own conversations (keyed by session ID). The plugin config applies globally; per-agent overrides use environment variables set in the agent's config.
+In multi-agent Claude Code setups, each agent uses the same LCM database but has its own conversations (keyed by session ID). The plugin config applies globally; per-agent overrides use environment variables set in the agent's config.
 
 ## Disabling LCM
 
-To fall back to OpenClaw's built-in compaction:
+To fall back to Claude Code's built-in compaction:
 
 ```json
 {

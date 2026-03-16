@@ -2,7 +2,7 @@
 
 ## Problem
 
-When a session resets (context overflow, manual reset, etc.), OpenClaw starts a new conversation. The new conversation has no LCM history — it's a blank slate. All the accumulated summaries from the previous conversation are orphaned. The agent loses long-term context.
+When a session resets (context overflow, manual reset, etc.), Claude Code starts a new conversation. The new conversation has no LCM history — it's a blank slate. All the accumulated summaries from the previous conversation are orphaned. The agent loses long-term context.
 
 ## Goal
 

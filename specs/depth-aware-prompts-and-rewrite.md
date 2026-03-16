@@ -12,7 +12,7 @@ LCM's condensed summaries are low-quality for two reasons:
 
 2. **One-size-fits-all prompt.** `buildCondensedSummaryPrompt` uses a rigid Pi-style template (Goals & Context, Key Decisions, Progress, Constraints, Critical Details, Files) regardless of depth. A d1 node compressing 8 leaf summaries covering 2 hours of activity gets the same prompt as a d3 node compressing months of work. The result: status reports that repeat the same project context verbatim across every node, with no sense of temporal progression or information hierarchy.
 
-Additionally, the prompts are biased toward software development (the domain of all test content to date), but OpenClaw is a general-purpose personal agent used for research, business, content creation, personal tasks, and more. Prompts must be domain-agnostic.
+Additionally, the prompts are biased toward software development (the domain of all test content to date), but Claude Code is a general-purpose personal agent used for research, business, content creation, personal tasks, and more. Prompts must be domain-agnostic.
 
 ## Changes
 
@@ -248,7 +248,7 @@ Retroactively rewrite summaries in-place using new or custom prompts. Use cases:
 
 1. **Test prompt improvements** on live conversation data without re-running the entire conversation
 2. **Upgrade existing summaries** when prompts are improved (like this change)
-3. **Operator customization** — allow individual OpenClaw operators to tune their summary style
+3. **Operator customization** — allow individual operators to tune their summary style
 
 ### Design
 
@@ -330,7 +330,7 @@ For each summary:
 
 OLD (1523 tokens):
   Goals & Context
-  Working on OpenClaw's LCM system...
+  Working on the LCM system...
   [truncated preview]
 
 NEW (1401 tokens):
@@ -407,7 +407,7 @@ const (
 
   OLD (1523 tokens):
     Goals & Context
-    Working on OpenClaw's LCM system...
+    Working on the LCM system...
     [scrollable with Shift+J/K]
 
   NEW (1401 tokens):
@@ -656,7 +656,7 @@ so you can see exactly what will be sent — including which template source was
 
 #### Relationship to lossless-claw plugin (TypeScript)
 
-The lossless-claw plugin (TypeScript, runs inside OpenClaw) and lcm-tui (Go, standalone binary)
+The lossless-claw plugin (TypeScript, runs inside Claude Code) and lcm-tui (Go, standalone binary)
 need the same prompt logic. Two approaches:
 
 **Option A: Duplicate prompts in both codebases.** Simple, no cross-language dependency.

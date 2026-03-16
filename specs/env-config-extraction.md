@@ -2,7 +2,7 @@
 
 ## Problem
 
-OpenClaw's security scanner flags `engine.ts` with a critical "env-harvesting" warning:
+The security scanner flags `engine.ts` with a critical "env-harvesting" warning:
 
 ```
 Environment variable access combined with network send — possible credential harvesting
@@ -31,11 +31,11 @@ const model = process.env.LCM_LARGE_FILE_SUMMARY_MODEL?.trim() ?? "";
 ### `index.ts` (8 reads)
 ```ts
 // line 62 — resolveApiKey(): process.env[key] (dynamic API key lookup)
-// line 265 — resolveAuthStorePaths(): OPENCLAW_AGENT_DIR, PI_CODING_AGENT_DIR
+// line 265 — resolveAuthStorePaths(): CLAUDE_AGENT_DIR, PI_CODING_AGENT_DIR
 // line 270 — resolveAuthStorePaths(): HOME
 // line 529 — createLcmDependencies(): resolveLcmConfig(process.env)
 // line 676 — resolveModel lambda: LCM_SUMMARY_MODEL
-// line 691-692 — resolveModel lambda: LCM_SUMMARY_PROVIDER, OPENCLAW_PROVIDER
+// line 691-692 — resolveModel lambda: LCM_SUMMARY_PROVIDER, CLAUDE_PROVIDER
 // line 759 — configSchema.parse(): resolveLcmConfig(process.env)
 ```
 
@@ -88,7 +88,7 @@ Create a helper that captures all env-derived values at plugin load time:
 type PluginEnvSnapshot = {
   lcmSummaryModel: string;
   lcmSummaryProvider: string;
-  openclawProvider: string;
+  claudeProvider: string;
   agentDir: string;
   home: string;
 };
@@ -97,8 +97,8 @@ function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnaps
   return {
     lcmSummaryModel: env.LCM_SUMMARY_MODEL?.trim() ?? "",
     lcmSummaryProvider: env.LCM_SUMMARY_PROVIDER?.trim() ?? "",
-    openclawProvider: env.OPENCLAW_PROVIDER?.trim() ?? "",
-    agentDir: env.OPENCLAW_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
+    claudeProvider: env.CLAUDE_PROVIDER?.trim() ?? "",
+    agentDir: env.CLAUDE_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
     home: env.HOME?.trim() ?? "",
   };
 }
@@ -134,11 +134,11 @@ grep -rn 'process\.env' src/engine.ts src/assembler.ts src/compaction.ts src/exp
 ## Testing
 
 - Existing 378 tests should pass unchanged (they mock `LcmConfig` and `LcmDependencies`)
-- Manually verify: `npm pack` + install on a clean OpenClaw instance → no scanner warning
+- Manually verify: `npm pack` + install on a clean Claude Code instance → no scanner warning
 - Verify large-file summarizer still works when env vars are set
 
 ## Non-Goals
 
-- Changing the scanner heuristic (that's upstream OpenClaw's concern, and the heuristic is reasonable in general — "post" matching is a minor flaw but the principle is sound)
+- Changing the scanner heuristic (that's upstream concern, and the heuristic is reasonable in general — "post" matching is a minor flaw but the principle is sound)
 - Moving `resolveLcmConfig` out of `src/db/config.ts` (it's already the right place)
 - Eliminating `process.env` from `index.ts` entirely (it's the plugin entry point, env wiring belongs there)

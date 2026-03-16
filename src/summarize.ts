@@ -38,7 +38,7 @@ function normalizeProviderId(provider: string): string {
 }
 
 /**
- * Resolve provider API override from legacy OpenClaw config.
+ * Resolve provider API override from legacy Claude Code config.
  *
  * When model ids are custom/forward-compat, this hint allows deps.complete to
  * construct a valid pi-ai Model object even if getModel(provider, model) misses.
@@ -453,7 +453,7 @@ function buildLeafSummaryPrompt(params: {
     : "Operator instructions: (none)";
 
   return [
-    "You summarize a SEGMENT of an OpenClaw conversation for future model turns.",
+    "You summarize a SEGMENT of a Claude Code conversation for future model turns.",
     "Treat this as incremental memory compaction input, not a full-conversation summary.",
     policy,
     instructionBlock,

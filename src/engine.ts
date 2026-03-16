@@ -13,7 +13,7 @@ import type {
   IngestResult,
   SubagentEndReason,
   SubagentSpawnPreparation,
-} from "openclaw/plugin-sdk";
+} from "./claude-bridge.js";
 import { ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
@@ -798,14 +798,14 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
-  /** Persist intercepted large-file text payloads to ~/.openclaw/lcm-files. */
+  /** Persist intercepted large-file text payloads to ~/.claude/lcm-files. */
   private async storeLargeFileContent(params: {
     conversationId: number;
     fileId: string;
     extension: string;
     content: string;
   }): Promise<string> {
-    const dir = join(homedir(), ".openclaw", "lcm-files", String(params.conversationId));
+    const dir = join(homedir(), ".claude", "lcm-files", String(params.conversationId));
     await mkdir(dir, { recursive: true });
 
     const normalizedExtension = params.extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "txt";
@@ -1679,7 +1679,7 @@ export class LcmContextEngine implements ContextEngine {
 
   async dispose(): Promise<void> {
     // No-op for plugin singleton — the connection is shared across runs.
-    // OpenClaw's runner calls dispose() after every run, but the plugin
+    // Claude Code's runner calls dispose() after every run, but the plugin
     // registers a single engine instance reused by the factory. Closing
     // the DB here would break subsequent runs with "database is not open".
     // The connection is cleaned up on process exit via closeLcmConnection().
@@ -1709,7 +1709,7 @@ export class LcmContextEngine implements ContextEngine {
    * heartbeat ack. The entire sequence has no durable information value for LCM.
    *
    * Detection: assistant content (trimmed, lowercased) starts with "heartbeat_ok"
-   * and any text after is not alphanumeric (matches OpenClaw core's ack detection).
+   * and any text after is not alphanumeric (matches Claude Code core's ack detection).
    * This catches both exact "HEARTBEAT_OK" and chatty variants like
    * "HEARTBEAT_OK — weekend, no market".
    *
@@ -1765,7 +1765,7 @@ const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
 /**
  * Detect whether an assistant message is a heartbeat ack.
  *
- * Matches the same pattern as OpenClaw core's heartbeat-events-filter:
+ * Matches the same pattern as Claude Code core's heartbeat-events-filter:
  * content starts with "heartbeat_ok" (case-insensitive) and any character
  * immediately after is not alphanumeric or underscore.
  *

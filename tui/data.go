@@ -19,15 +19,15 @@ import (
 
 // appDataPaths stores resolved locations for session files and the LCM DB.
 type appDataPaths struct {
-	agentsDir        string
-	lcmDBPath        string
-	openclawDir      string
-	openclawConfig   string
-	openclawEnv      string
-	openclawCredsDir string
+	agentsDir     string
+	lcmDBPath     string
+	claudeDir     string
+	claudeConfig  string
+	claudeEnv     string
+	claudeCredsDir string
 }
 
-// agentEntry describes one agent directory under ~/.openclaw/agents.
+// agentEntry describes one agent directory under ~/.claude/agents.
 type agentEntry struct {
 	name string
 	path string
@@ -170,14 +170,14 @@ func resolveDataPaths() (appDataPaths, error) {
 	if err != nil {
 		return appDataPaths{}, fmt.Errorf("resolve home dir: %w", err)
 	}
-	base := filepath.Join(home, ".openclaw")
+	base := filepath.Join(home, ".claude")
 	return appDataPaths{
-		agentsDir:        filepath.Join(base, "agents"),
-		lcmDBPath:        filepath.Join(base, "lcm.db"),
-		openclawDir:      base,
-		openclawConfig:   filepath.Join(base, "openclaw.json"),
-		openclawEnv:      filepath.Join(base, ".env"),
-		openclawCredsDir: filepath.Join(base, "credentials"),
+		agentsDir:      filepath.Join(base, "agents"),
+		lcmDBPath:      filepath.Join(base, "lcm.db"),
+		claudeDir:      base,
+		claudeConfig:   filepath.Join(base, "claude.json"),
+		claudeEnv:      filepath.Join(base, ".env"),
+		claudeCredsDir: filepath.Join(base, "credentials"),
 	}, nil
 }
 

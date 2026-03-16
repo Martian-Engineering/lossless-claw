@@ -1,7 +1,7 @@
 /**
  * Tool use/result pairing repair for assembled context.
  *
- * Copied from openclaw core (src/agents/session-transcript-repair.ts +
+ * Copied from upstream core (src/agents/session-transcript-repair.ts +
  * src/agents/tool-call-id.ts) to avoid depending on unexported internals.
  * When the plugin SDK exports sanitizeToolUseResultPairing, this file can
  * be removed in favor of the SDK import.
@@ -151,7 +151,7 @@ function makeMissingToolResult(params: {
     content: [
       {
         type: "text",
-        text: "[lossless-claw] missing tool result in session history; inserted synthetic error result for transcript repair.",
+        text: "[lossless-claude] missing tool result in session history; inserted synthetic error result for transcript repair.",
       },
     ],
     isError: true,

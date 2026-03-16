@@ -89,7 +89,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
     normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
     buildSubagentSystemPrompt: () => "subagent prompt",
     readLatestAssistantReply,
-    resolveAgentDir: () => "/tmp/openclaw-agent",
+    resolveAgentDir: () => "/tmp/claude-agent",
     resolveSessionIdFromSessionKey: async () => undefined,
     agentLaneSubagent: "subagent",
     log: {

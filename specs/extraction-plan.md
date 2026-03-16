@@ -2,13 +2,13 @@
 
 ## Overview
 
-Extract LCM from OpenClaw's in-tree `src/plugins/lcm/` into this standalone plugin package `@martian-engineering/lossless-claw`. The source code has already been copied into `src/` and `test/` directories but all imports still reference OpenClaw core internals. The main task is to refactor imports using dependency injection.
+Extract LCM from the upstream `src/plugins/lcm/` into this standalone plugin package `lossless-claude`. The source code has already been copied into `src/` and `test/` directories but all imports still reference upstream core internals. The main task is to refactor imports using dependency injection.
 
 ## Architecture
 
 ### Dependency Injection
 
-Instead of importing from OpenClaw core directly, the LCM engine receives its dependencies via `LcmDependencies` (defined in `src/types.ts`). The plugin entry point (`index.ts`) constructs these from the `OpenClawPluginApi`.
+Instead of importing from upstream core directly, the LCM engine receives its dependencies via `LcmDependencies` (defined in `src/types.ts`). The plugin entry point (`index.ts`) constructs these from the `ClaudePluginApi`.
 
 ### Source Layout
 
@@ -45,40 +45,40 @@ src/
 
 ## Import Rewrite Map
 
-Every import from OpenClaw core must be replaced. Here's the mapping:
+Every import from upstream core must be replaced. Here's the mapping:
 
 ### Context Engine Types
 **From:** `../../context-engine/types.js`
-**To:** `openclaw/plugin-sdk` (these are already exported)
+**To:** `./claude-bridge.js` (these are already exported)
 ```typescript
 // Old:
 import type { ContextEngine, AssembleResult, ... } from "../../context-engine/types.js";
 // New:
-import type { ContextEngine, AssembleResult, ... } from "openclaw/plugin-sdk";
+import type { ContextEngine, AssembleResult, ... } from "./claude-bridge.js";
 ```
 
 ### Context Engine Registry
 **From:** `../../context-engine/registry.js` and `../../context-engine/init.js`
-**To:** `openclaw/plugin-sdk` (registerContextEngine is exported)
+**To:** `./claude-bridge.js` (registerContextEngine is exported)
 ```typescript
 // Old:
 import { registerContextEngine } from "../../context-engine/registry.js";
 import { ensureContextEnginesInitialized } from "../../context-engine/init.js";
 import { resolveContextEngine } from "../../context-engine/registry.js";
 // New:
-import { registerContextEngine } from "openclaw/plugin-sdk";
+import { registerContextEngine } from "./claude-bridge.js";
 // ensureContextEnginesInitialized and resolveContextEngine are used in tools —
 // tools should receive the engine instance via closure from the register function
 ```
 
 ### Config
 **From:** `../../config/config.js`
-**To:** `openclaw/plugin-sdk` (OpenClawConfig is exported)
+**To:** `./claude-bridge.js` (config types are exported)
 ```typescript
 // Old:
 import { loadConfig, type OpenClawConfig } from "../../config/config.js";
 // New:
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import type { ClaudeConfig } from "./claude-bridge.js";
 // loadConfig: receive config via LcmDependencies or api.config
 ```
 
@@ -110,7 +110,7 @@ import { completeSimple } from "@mariozechner/pi-ai";
 ### Session Key Utilities (tools)
 **From:** `../../routing/session-key.js`
 **To:** Inject via `LcmDependencies.parseAgentSessionKey`, `.isSubagentSessionKey`, `.normalizeAgentId`
-Or: import `{ DEFAULT_ACCOUNT_ID, normalizeAccountId }` from `openclaw/plugin-sdk`
+Or: import `{ DEFAULT_ACCOUNT_ID, normalizeAccountId }` from `./claude-bridge.js`
 
 ### Gateway Calls (tools)
 **From:** `../../gateway/call.js`
@@ -130,7 +130,7 @@ Or: import `{ DEFAULT_ACCOUNT_ID, normalizeAccountId }` from `openclaw/plugin-sd
 
 ### Pi Agent Core Types
 **From:** `@mariozechner/pi-agent-core`
-**To:** Keep as direct peer dependency, or re-export from openclaw/plugin-sdk
+**To:** Keep as direct peer dependency, or re-export from claude-bridge
 
 ## Refactoring Strategy
 
@@ -166,7 +166,7 @@ Tests need to mock LcmDependencies instead of core modules.
 
 ## Key Constraints
 
-1. **Message types**: LCM heavily uses `@mariozechner/pi-agent-core` message types. These must remain available — either as a direct dependency or re-exported from openclaw.
+1. **Message types**: LCM heavily uses `@mariozechner/pi-agent-core` message types. These must remain available — either as a direct dependency or re-exported from claude-bridge.
 2. **better-sqlite3**: Native dependency. Plugin install with `--ignore-scripts` may fail. Need to verify prebuild availability.
 3. **Backward compat**: Env vars (LCM_CONTEXT_THRESHOLD etc.) must continue working.
-4. **Database path**: Keep `~/.openclaw/lcm.db` as default.
+4. **Database path**: Keep `~/.claude/lcm.db` as default.

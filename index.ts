@@ -1,12 +1,12 @@
 /**
- * @martian-engineering/lossless-claw — Lossless Context Management plugin for OpenClaw
+ * lossless-claude — Lossless Context Management plugin for Claude Code
  *
  * DAG-based conversation summarization with incremental compaction,
  * full-text search, and sub-agent expansion.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { ClaudePluginApi } from "./src/claude-bridge.js";
 import { resolveLcmConfig } from "./src/db/config.js";
 import { LcmContextEngine } from "./src/engine.js";
 import { createLcmDescribeTool } from "./src/tools/lcm-describe-tool.js";
@@ -44,8 +44,8 @@ type PluginEnvSnapshot = {
   lcmSummaryProvider: string;
   pluginSummaryModel: string;
   pluginSummaryProvider: string;
-  openclawProvider: string;
-  openclawDefaultModel: string;
+  claudeProvider: string;
+  claudeDefaultModel: string;
   agentDir: string;
   home: string;
 };
@@ -83,21 +83,23 @@ type RuntimeModelAuthModel = {
 type RuntimeModelAuth = {
   getApiKeyForModel: (params: {
     model: RuntimeModelAuthModel;
-    cfg?: OpenClawPluginApi["config"];
+    cfg?: ClaudePluginApi["config"];
     profileId?: string;
     preferredProfile?: string;
   }) => Promise<RuntimeModelAuthResult | undefined>;
   resolveApiKeyForProvider: (params: {
     provider: string;
-    cfg?: OpenClawPluginApi["config"];
+    cfg?: ClaudePluginApi["config"];
     profileId?: string;
     preferredProfile?: string;
   }) => Promise<RuntimeModelAuthResult | undefined>;
 };
 
+// Legacy upstream PR reference — the original OpenClaw PR that added runtime.modelAuth.
+// Retained for the auth-profile fallback warning message that fires on older host runtimes.
 const MODEL_AUTH_PR_URL = "https://github.com/openclaw/openclaw/pull/41090";
 const MODEL_AUTH_MERGE_COMMIT = "4790e40";
-const MODEL_AUTH_REQUIRED_RELEASE = "the first OpenClaw release after 2026.3.8";
+const MODEL_AUTH_REQUIRED_RELEASE = "the first host release after 2026.3.8";
 
 /** Capture plugin env values once during initialization. */
 function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnapshot {
@@ -106,14 +108,14 @@ function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnaps
     lcmSummaryProvider: env.LCM_SUMMARY_PROVIDER?.trim() ?? "",
     pluginSummaryModel: "",
     pluginSummaryProvider: "",
-    openclawProvider: env.OPENCLAW_PROVIDER?.trim() ?? "",
-    openclawDefaultModel: "",
-    agentDir: env.OPENCLAW_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
+    claudeProvider: env.CLAUDE_PROVIDER?.trim() ?? "",
+    claudeDefaultModel: "",
+    agentDir: env.CLAUDE_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
     home: env.HOME?.trim() ?? "",
   };
 }
 
-/** Read OpenClaw's configured default model from the validated runtime config. */
+/** Read Claude Code's configured default model from the validated runtime config. */
 function readDefaultModelFromConfig(config: unknown): string {
   if (!config || typeof config !== "object") {
     return "";
@@ -333,8 +335,8 @@ function resolveProviderApiFromRuntimeConfig(
 }
 
 /** Resolve runtime.modelAuth from plugin runtime when available. */
-function getRuntimeModelAuth(api: OpenClawPluginApi): RuntimeModelAuth | undefined {
-  const runtime = api.runtime as OpenClawPluginApi["runtime"] & {
+function getRuntimeModelAuth(api: ClaudePluginApi): RuntimeModelAuth | undefined {
+  const runtime = api.runtime as ClaudePluginApi["runtime"] & {
     modelAuth?: RuntimeModelAuth;
   };
   return runtime.modelAuth;
@@ -372,10 +374,10 @@ function resolveApiKeyFromAuthResult(auth: RuntimeModelAuthResult | undefined): 
 
 function buildLegacyAuthFallbackWarning(): string {
   return [
-    "[lcm] OpenClaw runtime.modelAuth is unavailable; using legacy auth-profiles fallback.",
-    `Stock lossless-claw 0.2.7 expects OpenClaw plugin runtime support from PR #41090 (${MODEL_AUTH_PR_URL}).`,
-    `OpenClaw 2026.3.8 and 2026.3.8-beta.1 do not include merge commit ${MODEL_AUTH_MERGE_COMMIT};`,
-    `${MODEL_AUTH_REQUIRED_RELEASE} is required for stock lossless-claw 0.2.7 without this fallback patch.`,
+    "[lcm] Claude Code runtime.modelAuth is unavailable; using legacy auth-profiles fallback.",
+    `Stock lossless-claude 0.2.7 expects Claude Code plugin runtime support from PR #41090 (${MODEL_AUTH_PR_URL}).`,
+    `Host 2026.3.8 and 2026.3.8-beta.1 do not include merge commit ${MODEL_AUTH_MERGE_COMMIT};`,
+    `${MODEL_AUTH_REQUIRED_RELEASE} is required for stock lossless-claude 0.2.7 without this fallback patch.`,
   ].join(" ");
 }
 
@@ -455,7 +457,7 @@ function resolveAuthStorePaths(params: { agentDir?: string; envSnapshot: PluginE
 
   const home = params.envSnapshot.home;
   if (home) {
-    paths.push(join(home, ".openclaw", "agents", "main", "agent", "auth-profiles.json"));
+    paths.push(join(home, ".claude", "agents", "main", "agent", "auth-profiles.json"));
   }
 
   return [...new Set(paths)];
@@ -516,7 +518,7 @@ function resolveAuthProfileCandidates(params: {
 /**
  * Resolve a SecretRef (tokenRef/keyRef) to a credential string.
  *
- * OpenClaw's auth-profiles support a level of indirection: instead of storing
+ * Claude Code's auth-profiles support a level of indirection: instead of storing
  * the raw API key or token inline, a credential can reference it via a
  * SecretRef. Two resolution strategies are supported:
  *
@@ -528,7 +530,7 @@ function resolveAuthProfileCandidates(params: {
  *    paths, while singleValue providers use the sentinel id `value`.
  *
  * 3. Legacy fallback — when no file provider config is available, fall back to
- *    `~/.openclaw/secrets.json` for backward compatibility.
+ *    `~/.claude/secrets.json` for backward compatibility.
  */
 function resolveSecretRef(params: {
   ref: SecretRef | undefined;
@@ -585,9 +587,9 @@ function resolveSecretRef(params: {
     // Fall through to the legacy secrets.json lookup below.
   }
 
-  // Legacy file fallback (source: "file" or unset) — read from ~/.openclaw/secrets.json
+  // Legacy file fallback (source: "file" or unset) — read from ~/.claude/secrets.json
   try {
-    const secretsPath = join(params.home, ".openclaw", "secrets.json");
+    const secretsPath = join(params.home, ".claude", "secrets.json");
     const raw = readFileSync(secretsPath, "utf8");
     const secrets = JSON.parse(raw) as Record<string, unknown>;
     const parts = ref.id.replace(/^\//, "").split("/");
@@ -828,9 +830,9 @@ function readLatestAssistantReply(messages: unknown[]): string | undefined {
 }
 
 /** Construct LCM dependencies from plugin API/runtime surfaces. */
-function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
+function createLcmDependencies(api: ClaudePluginApi): LcmDependencies {
   const envSnapshot = snapshotPluginEnv();
-  envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(api.config);
+  envSnapshot.claudeDefaultModel = readDefaultModelFromConfig(api.config);
   const modelAuth = getRuntimeModelAuth(api);
   const readEnv: ReadEnvFn = (key) => process.env[key];
   const pluginConfig =
@@ -917,7 +919,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 
         // Resolve provider-level config (baseUrl, headers, etc.) from runtime config.
         // Custom/proxy providers (e.g. bailian, local proxies) store their baseUrl and
-        // apiKey under models.providers.<provider> in openclaw.json.  Without this
+        // apiKey under models.providers.<provider> in host config.  Without this
         // lookup the resolved model object lacks baseUrl, which crashes pi-ai's
         // detectCompat() ("Cannot read properties of undefined (reading 'includes')"),
         // and the apiKey is unresolvable, causing 401 errors.  See #19.
@@ -1127,7 +1129,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         (modelRef?.trim() ||
          envSnapshot.pluginSummaryModel ||
          envSnapshot.lcmSummaryModel ||
-         envSnapshot.openclawDefaultModel).trim();
+         envSnapshot.claudeDefaultModel).trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");
       }
@@ -1144,7 +1146,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         providerHint?.trim() ||
         envSnapshot.pluginSummaryProvider ||
         envSnapshot.lcmSummaryProvider ||
-        envSnapshot.openclawProvider ||
+        envSnapshot.claudeProvider ||
         "openai"
       ).trim();
       return { provider, model: raw };
@@ -1164,7 +1166,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             return modelAuthKey;
           }
         } catch {
-          // Fall through to auth-profile lookup for older OpenClaw runtimes.
+          // Fall through to auth-profile lookup for older Claude Code runtimes.
         }
       }
 
@@ -1200,7 +1202,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
               return modelAuthKey;
             }
           } catch {
-            // Fall through to auth-profile lookup for older OpenClaw runtimes.
+            // Fall through to auth-profile lookup for older Claude Code runtimes.
           }
         }
 
@@ -1266,7 +1268,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 }
 
 const lcmPlugin = {
-  id: "lossless-claw",
+  id: "lossless-claude",
   name: "Lossless Context Management",
   description:
     "DAG-based conversation summarization with incremental compaction, full-text search, and sub-agent expansion",
@@ -1281,11 +1283,11 @@ const lcmPlugin = {
     },
   },
 
-  register(api: OpenClawPluginApi) {
+  register(api: ClaudePluginApi) {
     const deps = createLcmDependencies(api);
     const lcm = new LcmContextEngine(deps);
 
-    api.registerContextEngine("lossless-claw", () => lcm);
+    api.registerContextEngine("lossless-claude", () => lcm);
     api.registerTool(
       (ctx) =>
         createLcmGrepTool({

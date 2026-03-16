@@ -46,7 +46,7 @@ func TestBackfillDryRunMakesNoWrites(t *testing.T) {
 
 	agent := "agent-dryrun"
 	sessionID := "session-dryrun"
-	agentSessions := filepath.Join(home, ".openclaw", "agents", agent, "sessions")
+	agentSessions := filepath.Join(home, ".claude", "agents", agent, "sessions")
 	if err := os.MkdirAll(agentSessions, 0o755); err != nil {
 		t.Fatalf("create sessions dir: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestBackfillDryRunMakesNoWrites(t *testing.T) {
 		t.Fatalf("write session jsonl: %v", err)
 	}
 
-	dbPath := filepath.Join(home, ".openclaw", "lcm.db")
+	dbPath := filepath.Join(home, ".claude", "lcm.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("open db: %v", err)

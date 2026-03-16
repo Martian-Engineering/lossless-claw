@@ -63,7 +63,7 @@ Repair proceeds bottom-up through the DAG — leaves first, then condensed nodes
 
 ### Summarization
 
-Use the Anthropic API directly (not OpenClaw's internal summarizer — this is an external tool).
+Use the Anthropic API directly (not Claude Code's internal summarizer — this is an external tool).
 
 **Leaf prompt:**
 ```
@@ -97,7 +97,7 @@ Target length: ~2000 tokens.
 ```
 
 Model: `claude-sonnet-4-20250514` (fast, cheap, good at summarization).
-API key: Read from `~/.openclaw/openclaw.json` auth profiles (same as lcm-tui already does for DB path resolution — the `anthropic:default` or `anthropic:manual` profile).
+API key: Read from `~/.claude/claude.json` auth profiles (same as lcm-tui already does for DB path resolution — the `anthropic:default` or `anthropic:manual` profile).
 
 ### Output Format
 
@@ -152,9 +152,9 @@ Done. 6 summaries repaired. Changes take effect on next conversation turn.
 
 ### API Key Resolution
 
-Read `~/.openclaw/openclaw.json`, parse the `auth.profiles` section. Look for `anthropic:default` or `anthropic:manual` profile. For `mode: "api_key"`, the key is stored in the OpenClaw credentials file or environment. For simplicity, also support `ANTHROPIC_API_KEY` env var as override.
+Read `~/.claude/claude.json`, parse the `auth.profiles` section. Look for `anthropic:default` or `anthropic:manual` profile. For `mode: "api_key"`, the key is stored in the Claude Code credentials file or environment. For simplicity, also support `ANTHROPIC_API_KEY` env var as override.
 
-The existing `data.go` already resolves `~/.openclaw/` paths — extend `appDataPaths` to also locate the config file.
+The existing `data.go` already resolves `~/.claude/` paths — extend `appDataPaths` to also locate the config file.
 
 ### Message Content Reconstruction
 
@@ -203,6 +203,6 @@ Use the same rough estimator the TUI already uses: `len(content) / 4`. Good enou
 ## Non-Goals
 
 - TUI screen for repair (might add later, but CLI first)
-- Rewriting the summarization prompts to match OpenClaw's internal ones exactly (close enough is fine)
+- Rewriting the summarization prompts to match Claude Code's internal ones exactly (close enough is fine)
 - Repairing DAG structure (only content repair — structure is already correct)
 - Handling conversations where source messages have been deleted (they haven't — LCM never deletes raw messages)

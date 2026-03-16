@@ -1,4 +1,4 @@
-module github.com/Martian-Engineering/lossless-claw/tui
+module github.com/ipedro/lossless-claude/tui
 
 go 1.24.5
 

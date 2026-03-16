@@ -1,5 +1,5 @@
 {
-  "id": "lossless-claw",
+  "id": "lossless-claude",
   "uiHints": {
     "contextThreshold": {
       "label": "Context Threshold",
@@ -15,7 +15,7 @@
     },
     "dbPath": {
       "label": "Database Path",
-      "help": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
+      "help": "Path to LCM SQLite database (default: ~/.claude/lcm.db)"
     },
     "summaryModel": {
       "label": "Summary Model",

@@ -1,7 +1,7 @@
 # Historical Session Backfill + Archive Compaction (TUI)
 
 ## Problem
-Lossless Claw only creates LCM summaries for sessions that were active after LCM was enabled. Older JSONL sessions exist in `~/.openclaw/agents/*/sessions/` but have no LCM conversation rows, no summary DAG, and no way to transplant their history into current conversations.
+Lossless Claw only creates LCM summaries for sessions that were active after LCM was enabled. Older JSONL sessions exist in `~/.claude/agents/*/sessions/` but have no LCM conversation rows, no summary DAG, and no way to transplant their history into current conversations.
 
 ## Goal
 Add a TUI CLI workflow that can:
@@ -49,7 +49,7 @@ Implement standalone command entrypoint analogous to `repair/rewrite/transplant/
 
 #### Core phases
 1. **Resolve source session file**
-   - Path: `~/.openclaw/agents/<agent>/sessions/<session_id>.jsonl`
+   - Path: `~/.claude/agents/<agent>/sessions/<session_id>.jsonl`
    - Validate file exists/readable.
 
 2. **Create conversation row (or reuse by session_id if already exists)**

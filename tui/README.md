@@ -1,18 +1,18 @@
 # lcm-tui
 
-Interactive terminal UI for inspecting, debugging, and maintaining the [Lossless Claw](https://github.com/Martian-Engineering/lossless-claw) database. Browse conversations, navigate the summary DAG, see exactly what the model sees in context, and perform surgical repairs — all from the terminal.
+Interactive terminal UI for inspecting, debugging, and maintaining the [Lossless Claude](https://github.com/ipedro/lossless-claude) database. Browse conversations, navigate the summary DAG, see exactly what the model sees in context, and perform surgical repairs — all from the terminal.
 
 ## Install
 
 **From releases:**
 
-Download the latest binary from [GitHub Releases](https://github.com/Martian-Engineering/lossless-claw/releases).
+Download the latest binary from [GitHub Releases](https://github.com/ipedro/lossless-claude/releases).
 
 **From source:**
 
 ```bash
 go build -o lcm-tui .
-# or: go install github.com/Martian-Engineering/lossless-claw/tui@latest
+# or: go install github.com/ipedro/lossless-claude/tui@latest
 ```
 
 Requires Go 1.24+.
@@ -20,7 +20,7 @@ Requires Go 1.24+.
 ## Usage
 
 ```bash
-lcm-tui                          # default: ~/.openclaw/lcm.db
+lcm-tui                          # default: ~/.claude/lcm.db
 lcm-tui --db /path/to/lcm.db    # custom database path
 ```
 
@@ -65,10 +65,10 @@ Full reference with keybindings, screen descriptions, flag tables, and troublesh
 
 ## Architecture
 
-The TUI reads directly from the LCM SQLite database (`~/.openclaw/lcm.db`) and session JSONL files (`~/.openclaw/agents/`). Write operations (rewrite, repair, dissolve, transplant, backfill) use transactions. Changes take effect on the next conversation turn — no restart needed.
+The TUI reads directly from the LCM SQLite database (`~/.claude/lcm.db`) and session JSONL files (`~/.claude/agents/`). Write operations (rewrite, repair, dissolve, transplant, backfill) use transactions. Changes take effect on the next conversation turn — no restart needed.
 
 Rewrite, repair, and backfill compaction operations call provider APIs directly. By default they use Anthropic (`claude-sonnet-4-20250514`), and rewrite/backfill also support OpenAI (`--provider openai --model gpt-5.3-codex`) with `OPENAI_API_KEY`.
 
 ## License
 
-Part of the [Lossless Claw](https://github.com/Martian-Engineering/lossless-claw) monorepo.
+Part of the [Lossless Claude](https://github.com/ipedro/lossless-claude) monorepo.

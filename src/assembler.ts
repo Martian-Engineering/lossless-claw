@@ -1,4 +1,4 @@
-import type { ContextEngine } from "openclaw/plugin-sdk";
+import type { ContextEngine } from "./claude-bridge.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
   ConversationStore,
@@ -191,8 +191,8 @@ function reasoningBlockFromPart(part: MessagePartRecord, rawType?: string): unkn
 }
 
 /**
- * Detect if a raw block is an OpenClaw-normalised OpenAI reasoning item.
- * OpenClaw converts OpenAI `{type:"reasoning", id:"rs_…", encrypted_content:"…"}`
+ * Detect if a raw block is a host-normalised OpenAI reasoning item.
+ * Claude Code converts OpenAI `{type:"reasoning", id:"rs_…", encrypted_content:"…"}`
  * into `{type:"thinking", thinking:"", thinkingSignature:"{…}"}`.
  * When we reassemble for the OpenAI provider we need the original back.
  */
@@ -310,7 +310,7 @@ function toRuntimeRole(
 function blockFromPart(part: MessagePartRecord): unknown {
   const metadata = getPartMetadata(part);
   if (metadata.raw && typeof metadata.raw === "object") {
-    // If this is an OpenClaw-normalised OpenAI reasoning block, restore the original
+    // If this is a host-normalised OpenAI reasoning block, restore the original
     // OpenAI format so the Responses API gets the {type:"reasoning", id:"rs_…"} it expects.
     const restored = tryRestoreOpenAIReasoning(metadata.raw as Record<string, unknown>);
     if (restored) return restored;

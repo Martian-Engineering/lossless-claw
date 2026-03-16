@@ -56,7 +56,7 @@ function toStr(value: unknown): string | undefined {
 /**
  * Resolve LCM configuration with three-tier precedence:
  *   1. Environment variables (highest — backward compat)
- *   2. Plugin config object (from plugins.entries.lossless-claw.config)
+ *   2. Plugin config object (from plugins.entries.lossless-claude.config)
  *   3. Hardcoded defaults (lowest)
  */
 export function resolveLcmConfig(
@@ -74,7 +74,7 @@ export function resolveLcmConfig(
       env.LCM_DATABASE_PATH
       ?? toStr(pc.dbPath)
       ?? toStr(pc.databasePath)
-      ?? join(homedir(), ".openclaw", "lcm.db"),
+      ?? join(homedir(), ".claude", "lcm.db"),
     contextThreshold:
       (env.LCM_CONTEXT_THRESHOLD !== undefined ? parseFloat(env.LCM_CONTEXT_THRESHOLD) : undefined)
         ?? toNumber(pc.contextThreshold) ?? 0.75,

@@ -203,7 +203,7 @@ func main() {
 	m := newModel()
 	program := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "openclaw-tui failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "lcm-tui failed: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -1466,7 +1466,7 @@ func buildSummaryRows(graph summaryGraph) []summaryRow {
 
 func (m model) View() string {
 	if m.width <= 0 || m.height <= 0 {
-		return "Initializing openclaw-tui..."
+		return "Initializing lcm-tui..."
 	}
 
 	header := m.renderHeader()
@@ -1476,7 +1476,7 @@ func (m model) View() string {
 }
 
 func (m model) renderHeader() string {
-	title := "openclaw-tui"
+	title := "lcm-tui"
 	switch m.screen {
 	case screenAgents:
 		title += " | Agents"
@@ -1585,7 +1585,7 @@ func (m model) renderStatus() string {
 
 func (m model) renderAgents() string {
 	if len(m.agents) == 0 {
-		return "No agents found under ~/.openclaw/agents"
+		return "No agents found under ~/.claude/agents"
 	}
 	visible := max(1, m.height-4)
 	offset := listOffset(m.agentCursor, len(m.agents), visible)

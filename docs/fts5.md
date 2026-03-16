@@ -1,7 +1,7 @@
 # Optional: enable FTS5 for fast full-text search
 
-`lossless-claw` works without FTS5 as of the current release. When FTS5 is unavailable in the
-Node runtime that runs the OpenClaw gateway, the plugin:
+`lossless-claude` works without FTS5 as of the current release. When FTS5 is unavailable in the
+Node runtime that runs the Claude Code gateway, the plugin:
 
 - keeps persisting messages and summaries
 - falls back from `"full_text"` search to a slower `LIKE`-based search
@@ -76,7 +76,7 @@ Build the runtime:
 make -j8 node
 ```
 
-Expose the binary under a Node-compatible basename that OpenClaw recognizes:
+Expose the binary under a Node-compatible basename that Claude Code recognizes:
 
 ```bash
 mkdir -p ~/Projects/node-fts5/bin
@@ -84,7 +84,7 @@ ln -sfn ~/Projects/node-fts5/out/Release/node ~/Projects/node-fts5/bin/node-22.1
 ```
 
 Use a basename like `node-22.15.0`, `node`, or `nodejs`. Names like
-`node-v22.15.0-fts5` may not be recognized correctly by OpenClaw's CLI/runtime parsing.
+`node-v22.15.0-fts5` may not be recognized correctly by Claude Code's CLI/runtime parsing.
 
 Verify the new runtime:
 
@@ -98,30 +98,30 @@ console.log("fts5: ok");
 NODE
 ```
 
-## Point the OpenClaw gateway at that runtime on macOS
+## Point the Claude Code gateway at that runtime on macOS
 
 Back up the existing LaunchAgent plist first:
 
 ```bash
-cp ~/Library/LaunchAgents/ai.openclaw.gateway.plist \
-  ~/Library/LaunchAgents/ai.openclaw.gateway.plist.bak-$(date +%Y%m%d-%H%M%S)
+cp ~/Library/LaunchAgents/ai.claude.gateway.plist \
+  ~/Library/LaunchAgents/ai.claude.gateway.plist.bak-$(date +%Y%m%d-%H%M%S)
 ```
 
 Replace the runtime path, then reload the agent:
 
 ```bash
 /usr/libexec/PlistBuddy -c 'Set :ProgramArguments:0 /Users/youruser/Projects/node-fts5/bin/node-22.15.0' \
-  ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+  ~/Library/LaunchAgents/ai.claude.gateway.plist
 
-launchctl bootout gui/$UID ~/Library/LaunchAgents/ai.openclaw.gateway.plist 2>/dev/null || true
-launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-launchctl kickstart -k gui/$UID/ai.openclaw.gateway
+launchctl bootout gui/$UID ~/Library/LaunchAgents/ai.claude.gateway.plist 2>/dev/null || true
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.claude.gateway.plist
+launchctl kickstart -k gui/$UID/ai.claude.gateway
 ```
 
 Verify the live runtime:
 
 ```bash
-launchctl print gui/$UID/ai.openclaw.gateway | sed -n '1,80p'
+launchctl print gui/$UID/ai.claude.gateway | sed -n '1,80p'
 ```
 
 You should see:
@@ -130,13 +130,13 @@ You should see:
 program = /Users/youruser/Projects/node-fts5/bin/node-22.15.0
 ```
 
-## Verify `lossless-claw`
+## Verify `lossless-claude`
 
 Check the logs:
 
 ```bash
-tail -n 60 ~/.openclaw/logs/gateway.log
-tail -n 60 ~/.openclaw/logs/gateway.err.log
+tail -n 60 ~/.claude/logs/gateway.log
+tail -n 60 ~/.claude/logs/gateway.err.log
 ```
 
 You want:
@@ -148,10 +148,10 @@ Then force one turn through the gateway and verify the DB fills:
 
 ```bash
 /Users/youruser/Projects/node-fts5/bin/node-22.15.0 \
-  /path/to/openclaw/dist/index.js \
+  /path/to/claude/dist/index.js \
   agent --session-id fts5-smoke --message 'Reply with exactly: ok' --timeout 60
 
-sqlite3 ~/.openclaw/lcm.db '
+sqlite3 ~/.claude/lcm.db '
   select count(*) as conversations from conversations;
   select count(*) as messages from messages;
   select count(*) as summaries from summaries;

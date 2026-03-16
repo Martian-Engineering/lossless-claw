@@ -1,12 +1,12 @@
 # Architecture
 
-This document describes how lossless-claw works internally — the data model, compaction lifecycle, context assembly, and expansion system.
+This document describes how lossless-claude works internally — the data model, compaction lifecycle, context assembly, and expansion system.
 
 ## Data model
 
 ### Conversations and messages
 
-Every OpenClaw session maps to a **conversation**. The first time a session ingests a message, LCM creates a conversation record keyed by the runtime session ID.
+Every Claude Code session maps to a **conversation**. The first time a session ingests a message, LCM creates a conversation record keyed by the runtime session ID.
 
 Messages are stored with:
 - **seq** — Monotonically increasing sequence number within the conversation
@@ -52,7 +52,7 @@ When compaction creates a summary from a range of messages (or summaries), the s
 
 ### Ingestion
 
-When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
+When Claude Code processes a turn, it calls the context engine's lifecycle hooks:
 
 1. **bootstrap** — On session start, reconciles the JSONL session file with the LCM database. Imports any messages that exist in the file but not in LCM (crash recovery).
 2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
@@ -190,7 +190,7 @@ Files embedded in user messages (typically via `<file>` blocks from tool output)
 1. Parse file blocks from message content.
 2. For each block exceeding `largeFileTokenThreshold` (default 25k tokens):
    - Generate a unique file ID (`file_` prefix)
-   - Store the content to `~/.openclaw/lcm-files/<conversation_id>/<file_id>.<ext>`
+   - Store the content to `~/.claude/lcm-files/<conversation_id>/<file_id>.<ext>`
    - Generate a ~200 token exploration summary (structural analysis, key sections, etc.)
    - Insert a `large_files` record with metadata
    - Replace the file block in the message with a compact reference
@@ -202,12 +202,12 @@ This prevents a single large file paste from consuming the entire context window
 
 LCM handles crash recovery through **bootstrap reconciliation**:
 
-1. On session start, read the JSONL session file (OpenClaw's ground truth).
+1. On session start, read the JSONL session file (Claude Code's ground truth).
 2. Compare against the LCM database.
 3. Find the most recent message that exists in both (the "anchor").
 4. Import any messages after the anchor that are in JSONL but not in LCM.
 
-This handles the case where OpenClaw wrote messages to the session file but crashed before LCM could persist them.
+This handles the case where Claude Code wrote messages to the session file but crashed before LCM could persist them.
 
 ## Operation serialization
 
@@ -217,7 +217,7 @@ All mutating operations (ingest, compact) are serialized per-session using a pro
 
 LCM needs to call an LLM for summarization. It resolves credentials through a three-tier cascade:
 
-1. **Auth profiles** — OpenClaw's OAuth/token/API-key profile system (`auth-profiles.json`), checked in priority order
+1. **Auth profiles** — Claude Code's OAuth/token/API-key profile system (`auth-profiles.json`), checked in priority order
 2. **Environment variables** — Standard provider env vars (`ANTHROPIC_API_KEY`, etc.)
 3. **Custom provider key** — From models config (e.g., `models.json`)
 

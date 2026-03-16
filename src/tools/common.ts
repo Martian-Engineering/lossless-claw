@@ -1,6 +1,6 @@
-import type { AnyAgentTool as OpenClawAnyAgentTool } from "openclaw/plugin-sdk";
+import type { AnyAgentTool as BridgeAnyAgentTool } from "../claude-bridge.js";
 
-export type AnyAgentTool = OpenClawAnyAgentTool;
+export type AnyAgentTool = BridgeAnyAgentTool;
 
 /** Render structured payloads as deterministic text tool results. */
 export function jsonResult(payload: unknown): {

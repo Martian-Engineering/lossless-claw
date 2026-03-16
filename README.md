@@ -1,6 +1,6 @@
-# lossless-claw
+# lossless-claude
 
-Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://papers.voltropy.com/LCM) from [Voltropy](https://x.com/Voltropy). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
+Lossless Context Management plugin for [Claude Code](https://github.com/anthropics/claude-code), based on the [LCM paper](https://papers.voltropy.com/LCM) from [Voltropy](https://x.com/Voltropy). Replaces Claude Code's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
 
 ## Table of contents
 
@@ -15,7 +15,7 @@ Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/op
 
 Two ways to learn: read the below, or [check out this super cool animated visualization](https://losslesscontext.ai).
 
-When a conversation grows beyond the model's context window, OpenClaw (just like all of the other agents) normally truncates older messages. LCM instead:
+When a conversation grows beyond the model's context window, Claude Code (just like all of the other agents) normally truncates older messages. LCM instead:
 
 1. **Persists every message** in a SQLite database, organized by conversation
 2. **Summarizes chunks** of older messages into summaries using your configured LLM
@@ -31,51 +31,51 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 ### Prerequisites
 
-- OpenClaw with plugin context engine support
+- Claude Code with plugin context engine support
 - Node.js 22+
-- An LLM provider configured in OpenClaw (used for summarization)
+- An LLM provider configured in Claude Code (used for summarization)
 
 ### Install the plugin
 
-Use OpenClaw's plugin installer (recommended):
+Use Claude Code's plugin installer (recommended):
 
 ```bash
-openclaw plugins install @martian-engineering/lossless-claw
+claude plugins install @ipedro/lossless-claude
 ```
 
-If you're running from a local OpenClaw checkout, use:
+If you're running from a local Claude Code checkout, use:
 
 ```bash
-pnpm openclaw plugins install @martian-engineering/lossless-claw
+pnpm claude plugins install @ipedro/lossless-claude
 ```
 
 For local plugin development, link your working copy instead of copying files:
 
 ```bash
-openclaw plugins install --link /path/to/lossless-claw
-# or from a local OpenClaw checkout:
-# pnpm openclaw plugins install --link /path/to/lossless-claw
+claude plugins install --link /path/to/lossless-claude
+# or from a local Claude Code checkout:
+# pnpm claude plugins install --link /path/to/lossless-claude
 ```
 
 The install command records the plugin, enables it, and applies compatible slot selection (including `contextEngine` when applicable).
 
-### Configure OpenClaw
+### Configure Claude Code
 
-In most cases, no manual JSON edits are needed after `openclaw plugins install`.
+In most cases, no manual JSON edits are needed after `claude plugins install`.
 
-If you need to set it manually, ensure the context engine slot points at lossless-claw:
+If you need to set it manually, ensure the context engine slot points at lossless-claude:
 
 ```json
 {
   "plugins": {
     "slots": {
-      "contextEngine": "lossless-claw"
+      "contextEngine": "lossless-claude"
     }
   }
 }
 ```
 
-Restart OpenClaw after configuration changes.
+Restart Claude Code after configuration changes.
 
 ## Configuration
 
@@ -83,13 +83,13 @@ LCM is configured through a combination of plugin config and environment variabl
 
 ### Plugin config
 
-Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
+Add a `lossless-claude` entry under `plugins.entries` in your Claude Code config:
 
 ```json
 {
   "plugins": {
     "entries": {
-      "lossless-claw": {
+      "lossless-claude": {
         "enabled": true,
         "config": {
           "freshTailCount": 32,
@@ -107,7 +107,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LCM_ENABLED` | `true` | Enable/disable the plugin |
-| `LCM_DATABASE_PATH` | `~/.openclaw/lcm.db` | Path to the SQLite database |
+| `LCM_DATABASE_PATH` | `~/.claude/lcm.db` | Path to the SQLite database |
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window that triggers compaction (0.0–1.0) |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Number of recent messages protected from compaction |
 | `LCM_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |
@@ -121,8 +121,8 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File blocks above this size are intercepted and stored separately |
 | `LCM_LARGE_FILE_SUMMARY_PROVIDER` | `""` | Provider override for large-file summarization |
 | `LCM_LARGE_FILE_SUMMARY_MODEL` | `""` | Model override for large-file summarization |
-| `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514`) |
-| `LCM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider override for summarization |
+| `LCM_SUMMARY_MODEL` | *(from Claude Code)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514`) |
+| `LCM_SUMMARY_PROVIDER` | *(from Claude Code)* | Provider override for summarization |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
 
@@ -138,9 +138,9 @@ LCM_CONTEXT_THRESHOLD=0.75
 - **incrementalMaxDepth=-1** enables unlimited automatic condensation after each compaction pass — the DAG cascades as deep as needed. Set to `0` (default) for leaf-only, or a positive integer for a specific depth cap.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
 
-### OpenClaw session reset settings
+### Claude Code session reset settings
 
-LCM preserves history through compaction, but it does **not** change OpenClaw's core session reset policy. If sessions are resetting sooner than you want, increase OpenClaw's `session.reset.idleMinutes` or use a channel/type-specific override.
+LCM preserves history through compaction, but it does **not** change Claude Code's core session reset policy. If sessions are resetting sooner than you want, increase Claude Code's `session.reset.idleMinutes` or use a channel/type-specific override.
 
 ```json
 {
@@ -155,9 +155,9 @@ LCM preserves history through compaction, but it does **not** change OpenClaw's 
 
 - `session.reset.mode: "idle"` keeps a session alive until the idle window expires.
 - `session.reset.idleMinutes` is the actual reset interval in minutes.
-- OpenClaw does **not** currently enforce a maximum `idleMinutes`; in source it is validated only as a positive integer.
+- Claude Code does **not** currently enforce a maximum `idleMinutes`; in source it is validated only as a positive integer.
 - If you also use daily reset mode, `idleMinutes` acts as a secondary guard and the session resets when **either** the daily boundary or the idle window is reached first.
-- Legacy `session.idleMinutes` still works, but OpenClaw prefers `session.reset.idleMinutes`.
+- Legacy `session.idleMinutes` still works, but Claude Code prefers `session.reset.idleMinutes`.
 
 Useful values:
 
@@ -218,7 +218,7 @@ src/
   integrity.ts              # DAG integrity checks and repair utilities
   transcript-repair.ts      # Tool-use/result pairing sanitization
   types.ts                  # Core type definitions (dependency injection contracts)
-  openclaw-bridge.ts        # Bridge utilities
+  claude-bridge.ts        # Bridge utilities
   db/
     config.ts               # LcmConfig resolution from env vars
     connection.ts           # SQLite connection management
@@ -236,7 +236,7 @@ src/
     common.ts               # Shared tool utilities
 test/                       # Vitest test suite
 specs/                      # Design specifications
-openclaw.plugin.json        # Plugin manifest with config schema and UI hints
+claude.plugin.json        # Plugin manifest with config schema and UI hints
 tui/                        # Interactive terminal UI (Go)
   main.go                   # Entry point and bubbletea app
   data.go                   # Data loading and SQLite queries

@@ -90,7 +90,7 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
 }
 
 function createEngine(): LcmContextEngine {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-engine-"));
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
   return new LcmContextEngine(createTestDeps(config));
@@ -102,13 +102,13 @@ function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
 }
 
 function createSessionFilePath(name: string): string {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-session-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-session-"));
   tempDirs.push(tempDir);
   return join(tempDir, `${name}.jsonl`);
 }
 
 function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-engine-"));
   tempDirs.push(tempDir);
   const config = {
     ...createTestConfig(join(tempDir, "lcm.db")),
@@ -119,7 +119,7 @@ function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine
 
 async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
   const originalHome = process.env.HOME;
-  const tempHome = mkdtempSync(join(tmpdir(), "lossless-claw-home-"));
+  const tempHome = mkdtempSync(join(tmpdir(), "lossless-claude-home-"));
   tempDirs.push(tempHome);
   process.env.HOME = tempHome;
 
@@ -321,7 +321,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(storedFile!.fileName).toBe("lcm-paper.md");
       expect(storedFile!.mimeType).toBe("text/markdown");
       expect(storedFile!.storageUri).toContain(
-        `.openclaw/lcm-files/${conversation!.conversationId}/`,
+        `.claude/lcm-files/${conversation!.conversationId}/`,
       );
       expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(fileText);
 
@@ -364,7 +364,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
 
 describe("LcmContextEngine connection lifecycle", () => {
   it("keeps shared sqlite handle open while another engine instance is active", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-shared-db-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claude-shared-db-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "lcm.db");
 

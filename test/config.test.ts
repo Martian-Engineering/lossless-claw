@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import manifest from "../openclaw.plugin.json" with { type: "json" };
+import manifest from "../claude.plugin.json" with { type: "json" };
 import { resolveLcmConfig } from "../src/db/config.js";
 
 describe("resolveLcmConfig", () => {

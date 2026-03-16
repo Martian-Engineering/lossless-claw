@@ -39,7 +39,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
     normalizeAgentId: vi.fn(() => "main"),
     buildSubagentSystemPrompt: vi.fn(() => ""),
     readLatestAssistantReply: vi.fn(() => undefined),
-    resolveAgentDir: vi.fn(() => "/tmp/openclaw-agent"),
+    resolveAgentDir: vi.fn(() => "/tmp/claude-agent"),
     resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
     agentLaneSubagent: "subagent",
     log: {

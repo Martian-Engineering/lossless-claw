@@ -37,5 +37,5 @@ changelog:
 
 release:
   github:
-    owner: Martian-Engineering
-    name: lossless-claw
+    owner: ipedro
+    name: lossless-claude

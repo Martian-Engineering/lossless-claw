@@ -1,14 +1,14 @@
 {
-  "name": "@martian-engineering/lossless-claw",
+  "name": "@ipedro/lossless-claude",
   "version": "0.3.0",
-  "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with incremental compaction",
+  "description": "Lossless Context Management plugin for Claude Code — DAG-based conversation summarization with incremental compaction",
   "type": "module",
   "main": "index.ts",
   "license": "MIT",
   "author": "Josh Lehman <josh@martian.engineering>",
   "keywords": [
-    "openclaw",
-    "openclaw-plugin",
+    "claude-code",
+    "claude-code-plugin",
     "context-management",
     "llm",
     "summarization",
@@ -18,7 +18,7 @@
   "files": [
     "index.ts",
     "src/**/*.ts",
-    "openclaw.plugin.json",
+    "claude.plugin.json",
     "docs/",
     "README.md",
     "LICENSE"
@@ -39,23 +39,15 @@
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
-  "peerDependencies": {
-    "openclaw": "*"
-  },
   "publishConfig": {
     "access": "public"
   },
-  "openclaw": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Martian-Engineering/lossless-claw.git"
+    "url": "git+https://github.com/ipedro/lossless-claude.git"
   },
-  "homepage": "https://github.com/Martian-Engineering/lossless-claw#readme",
+  "homepage": "https://github.com/ipedro/lossless-claude#readme",
   "bugs": {
-    "url": "https://github.com/Martian-Engineering/lossless-claw/issues"
+    "url": "https://github.com/ipedro/lossless-claude/issues"
   }
 }

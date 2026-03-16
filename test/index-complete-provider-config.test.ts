@@ -1,7 +1,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { ClaudePluginApi } from "../src/claude-bridge.js";
 import lcmPlugin from "../index.js";
 import { closeLcmConnection } from "../src/db/connection.js";
 
@@ -17,18 +17,18 @@ vi.mock("@mariozechner/pi-ai", () => piAiMock);
 type RegisteredEngineFactory = (() => unknown) | undefined;
 
 function buildApi(loadConfigResult: Record<string, unknown>): {
-  api: OpenClawPluginApi;
+  api: ClaudePluginApi;
   getFactory: () => RegisteredEngineFactory;
   loadConfig: ReturnType<typeof vi.fn>;
 } {
   let factory: RegisteredEngineFactory;
   const loadConfig = vi.fn(() => loadConfigResult);
-  const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+  const dbPath = join(tmpdir(), `lossless-claude-${Date.now()}-${Math.random().toString(16)}.db`);
 
   const api = {
-    id: "lossless-claw",
+    id: "lossless-claude",
     name: "Lossless Context Management",
-    source: "/tmp/lossless-claw",
+    source: "/tmp/lossless-claude",
     config: {},
     pluginConfig: {
       enabled: true,
@@ -71,7 +71,7 @@ function buildApi(loadConfigResult: Record<string, unknown>): {
     registerCommand: vi.fn(),
     resolvePath: vi.fn(() => "/tmp/fake-agent"),
     on: vi.fn(),
-  } as unknown as OpenClawPluginApi;
+  } as unknown as ClaudePluginApi;
 
   return {
     api,
