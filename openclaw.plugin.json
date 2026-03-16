@@ -24,6 +24,14 @@
     "summaryProvider": {
       "label": "Summary Provider",
       "help": "Provider override for LCM summarization (e.g., 'openai-resp')"
+    },
+    "useTokenizer": {
+      "label": "Use Precise Tokenizer",
+      "help": "Use HuggingFace tokenizer service instead of chars/4 heuristic"
+    },
+    "proxy": {
+      "label": "Proxy URL",
+      "help": "HTTP(S) proxy for tokenizer downloads from HuggingFace"
     }
   },
   "configSchema": {
@@ -31,20 +39,24 @@
     "additionalProperties": false,
     "properties": {
       "enabled": {
-        "type": "boolean"
+        "type": "boolean",
+        "description": "Enable or disable the plugin"
       },
       "contextThreshold": {
         "type": "number",
         "minimum": 0,
-        "maximum": 1
+        "maximum": 1,
+        "description": "Fraction of context window that triggers compaction (0.0–1.0)"
       },
       "incrementalMaxDepth": {
         "type": "integer",
-        "minimum": -1
+        "minimum": -1,
+        "description": "How deep incremental compaction goes (0 = leaf only, -1 = unlimited)"
       },
       "freshTailCount": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "description": "Number of recent messages protected from compaction"
       },
       "leafMinFanout": {
         "type": "integer",
@@ -59,17 +71,47 @@
         "minimum": 2
       },
       "dbPath": {
-        "type": "string"
+        "type": "string",
+        "description": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
       },
       "largeFileThresholdTokens": {
         "type": "integer",
-        "minimum": 1000
+        "minimum": 1000,
+        "description": "Token threshold for treating files as 'large'"
       },
       "summaryModel": {
         "type": "string"
       },
       "summaryProvider": {
         "type": "string"
+      },
+      "useTokenizer": {
+        "type": "boolean",
+        "description": "Use precise tokenizer service instead of chars/4 heuristic"
+      },
+      "proxy": {
+        "type": "string",
+        "description": "HTTP(S) proxy URL for tokenizer downloads from HuggingFace"
+      },
+      "timezone": {
+        "type": "string",
+        "description": "IANA timezone for timestamps in summaries"
+      },
+      "pruneHeartbeatOk": {
+        "type": "boolean",
+        "description": "Delete HEARTBEAT_OK turn cycles from LCM storage"
+      },
+      "autocompactDisabled": {
+        "type": "boolean",
+        "description": "Disable automatic compaction"
+      },
+      "largeFileSummaryProvider": {
+        "type": "string",
+        "description": "Provider override for large-file summarization"
+      },
+      "largeFileSummaryModel": {
+        "type": "string",
+        "description": "Model override for large-file summarization"
       }
     }
   }

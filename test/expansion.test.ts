@@ -22,6 +22,7 @@ const BASE_CONFIG: LcmConfig = {
   autocompactDisabled: false,
   timezone: "UTC",
   pruneHeartbeatOk: false,
+  useTokenizer: false,
 };
 
 function makeExpansionResult() {

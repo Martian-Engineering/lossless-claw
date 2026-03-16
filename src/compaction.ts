@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import type { ConversationStore, CreateMessagePartInput } from "./store/conversation-store.js";
 import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
 import { extractFileIdsFromContent } from "./large-files.js";
+import type { TokenizerService } from "./types.js";
+import { calculateTokens } from "./token-utils.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -79,11 +81,6 @@ type CondensedPhaseCandidate = {
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Estimate token count from character length (~4 chars per token). */
-function estimateTokens(content: string): number {
-  return Math.ceil(content.length / 4);
-}
 
 /** Format a timestamp as `YYYY-MM-DD HH:mm TZ` for prompt source text. */
 export function formatTimestamp(value: Date, timezone: string = "UTC"): string {
@@ -163,7 +160,21 @@ export class CompactionEngine {
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
     private config: CompactionConfig,
+    private useTokenizer?: boolean,
+    private tokenizer?: TokenizerService,
   ) {}
+
+  private async ensureTokenizerReady(): Promise<void> {
+    if (!this.useTokenizer || !this.tokenizer?.initialize) {
+      return;
+    }
+
+    try {
+      await this.tokenizer.initialize();
+    } catch {
+      // Fall back to heuristic counting when tokenizer warmup fails.
+    }
+  }
 
   // ── evaluate ─────────────────────────────────────────────────────────────
 
@@ -173,6 +184,8 @@ export class CompactionEngine {
     tokenBudget: number,
     observedTokenCount?: number,
   ): Promise<CompactionDecision> {
+    await this.ensureTokenizerReady();
+
     const storedTokens = await this.summaryStore.getContextTokenCount(conversationId);
     const liveTokens =
       typeof observedTokenCount === "number" &&
@@ -212,6 +225,8 @@ export class CompactionEngine {
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
+    await this.ensureTokenizerReady();
+
     const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId);
     const threshold = this.resolveLeafChunkTokens();
     return {
@@ -232,6 +247,7 @@ export class CompactionEngine {
     force?: boolean;
     hardTrigger?: boolean;
   }): Promise<CompactionResult> {
+    await this.ensureTokenizerReady();
     return this.compactFullSweep(input);
   }
 
@@ -247,6 +263,8 @@ export class CompactionEngine {
     force?: boolean;
     previousSummaryContent?: string;
   }): Promise<CompactionResult> {
+    await this.ensureTokenizerReady();
+
     const { conversationId, tokenBudget, summarize, force } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
@@ -360,6 +378,8 @@ export class CompactionEngine {
     force?: boolean;
     hardTrigger?: boolean;
   }): Promise<CompactionResult> {
+    await this.ensureTokenizerReady();
+
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
@@ -487,6 +507,8 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
   }): Promise<{ success: boolean; rounds: number; finalTokens: number }> {
+    await this.ensureTokenizerReady();
+
     const { conversationId, tokenBudget, summarize } = input;
     const targetTokens =
       typeof input.targetTokens === "number" &&
@@ -609,7 +631,11 @@ export class CompactionEngine {
     ) {
       return message.tokenCount;
     }
-    return estimateTokens(message.content);
+    return calculateTokens(
+      message.content,
+      this.useTokenizer,
+      this.tokenizer
+    );
   }
 
   /** Sum raw message tokens outside the protected fresh tail. */
@@ -744,7 +770,8 @@ export class CompactionEngine {
     ) {
       return summary.tokenCount;
     }
-    return estimateTokens(summary.content);
+    // Synchronous fallback - use heuristic only (can't await in sync function)
+    return Math.ceil(summary.content.length / 4);
   }
 
   /** Resolve message token count with content-length fallback. */
@@ -756,7 +783,8 @@ export class CompactionEngine {
     ) {
       return message.tokenCount;
     }
-    return estimateTokens(message.content);
+    // Synchronous fallback - use heuristic only (can't await in sync function)
+    return Math.ceil(message.content.length / 4);
   }
 
   private resolveLeafMinFanout(): number {
@@ -972,16 +1000,16 @@ export class CompactionEngine {
         level: "fallback",
       };
     }
-    const inputTokens = Math.max(1, estimateTokens(sourceText));
+    const inputTokens = Math.max(1, calculateTokens(sourceText, this.useTokenizer, this.tokenizer));
 
     let summaryText = await params.summarize(sourceText, false, params.options);
     let level: CompactionLevel = "normal";
 
-    if (estimateTokens(summaryText) >= inputTokens) {
+    if (calculateTokens(summaryText, this.useTokenizer, this.tokenizer) >= inputTokens) {
       summaryText = await params.summarize(sourceText, true, params.options);
       level = "aggressive";
 
-      if (estimateTokens(summaryText) >= inputTokens) {
+      if (calculateTokens(summaryText, this.useTokenizer, this.tokenizer) >= inputTokens) {
         const truncated =
           sourceText.length > FALLBACK_MAX_CHARS
             ? sourceText.slice(0, FALLBACK_MAX_CHARS)
@@ -1040,7 +1068,11 @@ export class CompactionEngine {
 
     // Persist the leaf summary
     const summaryId = generateSummaryId(summary.content);
-    const tokenCount = estimateTokens(summary.content);
+    const tokenCount = calculateTokens(
+      summary.content,
+      this.useTokenizer,
+      this.tokenizer
+    );
 
     await this.summaryStore.insertSummary({
       summaryId,
@@ -1139,7 +1171,11 @@ export class CompactionEngine {
 
     // Persist the condensed summary
     const summaryId = generateSummaryId(condensed.content);
-    const tokenCount = estimateTokens(condensed.content);
+    const tokenCount = calculateTokens(
+      condensed.content,
+      this.useTokenizer,
+      this.tokenizer
+    );
 
     await this.summaryStore.insertSummary({
       summaryId,
@@ -1308,7 +1344,8 @@ export class CompactionEngine {
         seq,
         role: "system",
         content,
-        tokenCount: estimateTokens(content),
+        // Use heuristic for system events (not critical path)
+        tokenCount: Math.ceil(content.length / 4),
       });
 
       const parts: CreateMessagePartInput[] = [

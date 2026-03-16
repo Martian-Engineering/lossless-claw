@@ -6,6 +6,8 @@ import type {
   MessageRole,
 } from "./store/conversation-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
+import type { TokenizerService } from "./types.js";
+import { calculateTokens } from "./token-utils.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 
@@ -16,6 +18,10 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
+  /** Whether to use tokenizer for token counting (optional) */
+  useTokenizer?: boolean;
+  /** Tokenizer service for precise token counting (optional) */
+  tokenizer?: TokenizerService;
 }
 
 export interface AssembleContextResult {
@@ -31,13 +37,6 @@ export interface AssembleContextResult {
     summaryCount: number;
     totalContextItems: number;
   };
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Simple token estimate: ~4 chars per token, same as VoltCode's Token.estimate */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
 }
 
 type SummaryPromptSignal = Pick<SummaryRecord, "kind" | "depth" | "descendantCount">;
@@ -563,10 +562,19 @@ export class ContextAssembler {
    * 5. Return the final ordered messages in chronological order.
    */
   async assemble(input: AssembleContextInput): Promise<AssembleContextResult> {
+    if (input.useTokenizer && input.tokenizer?.initialize) {
+      try {
+        await input.tokenizer.initialize();
+      } catch {
+        // Fall back to heuristic counting when tokenizer warmup fails.
+      }
+    }
+
     const { conversationId, tokenBudget } = input;
     const freshTailCount = input.freshTailCount ?? 8;
+    const useTokenizer = input.useTokenizer;
+    const tokenizer = input.tokenizer;
 
-    // Step 1: Get all context items ordered by ordinal
     const contextItems = await this.summaryStore.getContextItems(conversationId);
 
     if (contextItems.length === 0) {
@@ -577,8 +585,7 @@ export class ContextAssembler {
       };
     }
 
-    // Step 2: Resolve each context item into a ResolvedItem
-    const resolved = await this.resolveItems(contextItems);
+    const resolved = await this.resolveItems(contextItems, useTokenizer, tokenizer);
 
     // Count stats from the full (pre-truncation) set
     let rawMessageCount = 0;
@@ -685,11 +692,15 @@ export class ContextAssembler {
    *
    * Items that cannot be resolved (e.g. deleted message) are silently skipped.
    */
-  private async resolveItems(contextItems: ContextItemRecord[]): Promise<ResolvedItem[]> {
+  private async resolveItems(
+    contextItems: ContextItemRecord[],
+    useTokenizer?: boolean,
+    tokenizer?: TokenizerService
+  ): Promise<ResolvedItem[]> {
     const resolved: ResolvedItem[] = [];
 
     for (const item of contextItems) {
-      const result = await this.resolveItem(item);
+      const result = await this.resolveItem(item, useTokenizer, tokenizer);
       if (result) {
         resolved.push(result);
       }
@@ -701,23 +712,27 @@ export class ContextAssembler {
   /**
    * Resolve a single context item.
    */
-  private async resolveItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
+  private async resolveItem(
+    item: ContextItemRecord,
+    useTokenizer?: boolean,
+    tokenizer?: TokenizerService
+  ): Promise<ResolvedItem | null> {
     if (item.itemType === "message" && item.messageId != null) {
-      return this.resolveMessageItem(item);
+      return this.resolveMessageItem(item, useTokenizer, tokenizer);
     }
 
     if (item.itemType === "summary" && item.summaryId != null) {
-      return this.resolveSummaryItem(item);
+      return this.resolveSummaryItem(item, useTokenizer, tokenizer);
     }
 
-    // Malformed item — skip
     return null;
   }
 
-  /**
-   * Resolve a context item that references a raw message.
-   */
-  private async resolveMessageItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
+  private async resolveMessageItem(
+    item: ContextItemRecord,
+    useTokenizer?: boolean,
+    tokenizer?: TokenizerService
+  ): Promise<ResolvedItem | null> {
     const msg = await this.conversationStore.getMessageById(item.messageId!);
     if (!msg) {
       return null;
@@ -737,7 +752,10 @@ export class ContextAssembler {
     const content = contentFromParts(parts, role, msg.content);
     const contentText =
       typeof content === "string" ? content : (JSON.stringify(content) ?? msg.content);
-    const tokenCount = msg.tokenCount > 0 ? msg.tokenCount : estimateTokens(contentText);
+    // Preserve short-circuit optimization: use stored tokenCount if available
+    const tokenCount = msg.tokenCount > 0
+      ? msg.tokenCount
+      : calculateTokens(contentText, useTokenizer, tokenizer);
 
     // Cast: these are reconstructed from DB storage, not live agent messages,
     // so they won't carry the full AgentMessage metadata (timestamp, usage, etc.)
@@ -775,18 +793,18 @@ export class ContextAssembler {
     };
   }
 
-  /**
-   * Resolve a context item that references a summary.
-   * Summaries are presented as user messages with a structured XML wrapper.
-   */
-  private async resolveSummaryItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
+  private async resolveSummaryItem(
+    item: ContextItemRecord,
+    useTokenizer?: boolean,
+    tokenizer?: TokenizerService
+  ): Promise<ResolvedItem | null> {
     const summary = await this.summaryStore.getSummary(item.summaryId!);
     if (!summary) {
       return null;
     }
 
     const content = await formatSummaryContent(summary, this.summaryStore, this.timezone);
-    const tokens = estimateTokens(content);
+    const tokens = calculateTokens(content, useTokenizer, tokenizer);
 
     // Cast: summaries are synthetic user messages without full AgentMessage metadata
     return {

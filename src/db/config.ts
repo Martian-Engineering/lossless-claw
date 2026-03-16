@@ -24,6 +24,10 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+  /** When true, use precise tokenizer service instead of chars/4 heuristic (default: false). */
+  useTokenizer: boolean;
+  /** HTTP(S) proxy URL for tokenizer downloads from HuggingFace. */
+  proxy?: string;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -123,5 +127,14 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+    useTokenizer:
+      env.LCM_USE_PRECISE_TOKENIZER !== undefined
+        ? env.LCM_USE_PRECISE_TOKENIZER === "true"
+        : toBool(pc.useTokenizer) ?? false,
+    proxy:
+      env.LCM_PROXY
+      ?? env.HTTP_PROXY
+      ?? env.HTTPS_PROXY
+      ?? toStr(pc.proxy),
   };
 }

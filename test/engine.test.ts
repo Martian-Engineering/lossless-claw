@@ -33,6 +33,7 @@ function createTestConfig(databasePath: string): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    useTokenizer: false,
   };
 }
 

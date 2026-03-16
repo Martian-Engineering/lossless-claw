@@ -40,16 +40,12 @@ import {
 import { SummaryStore } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
+import { calculateTokens } from "./token-utils.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Rough token estimate: ~4 chars per token. */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
 
 function toJson(value: unknown): string {
   const encoded = JSON.stringify(value);
@@ -221,36 +217,38 @@ function estimateContentTokensForRole(params: {
   role: "user" | "assistant" | "toolResult";
   content: unknown;
   fallbackContent: string;
+  useTokenizer?: boolean;
+  tokenizer?: typeof import("./types.js").TokenizerService.prototype;
 }): number {
-  const { role, content, fallbackContent } = params;
+  const { role, content, fallbackContent, useTokenizer, tokenizer } = params;
 
   if (typeof content === "string") {
-    return estimateTokens(content);
+    return calculateTokens(content, useTokenizer, tokenizer);
   }
 
   if (Array.isArray(content)) {
     if (content.length === 0) {
-      return estimateTokens(fallbackContent);
+      return calculateTokens(fallbackContent, useTokenizer, tokenizer);
     }
 
     if (role === "user" && content.length === 1 && isTextBlock(content[0])) {
-      return estimateTokens(content[0].text);
+      return calculateTokens(content[0].text, useTokenizer, tokenizer);
     }
 
     const serialized = JSON.stringify(content);
-    return estimateTokens(typeof serialized === "string" ? serialized : "");
+    return calculateTokens(typeof serialized === "string" ? serialized : "", useTokenizer, tokenizer);
   }
 
   if (content && typeof content === "object") {
     if (role === "user" && isTextBlock(content)) {
-      return estimateTokens(content.text);
+      return calculateTokens(content.text, useTokenizer, tokenizer);
     }
 
     const serialized = JSON.stringify([content]);
-    return estimateTokens(typeof serialized === "string" ? serialized : "");
+    return calculateTokens(typeof serialized === "string" ? serialized : "", useTokenizer, tokenizer);
   }
 
-  return estimateTokens(fallbackContent);
+  return calculateTokens(fallbackContent, useTokenizer, tokenizer);
 }
 
 function buildMessageParts(params: {
@@ -429,7 +427,11 @@ type StoredMessage = {
 /**
  * Normalize AgentMessage variants into the storage shape used by LCM.
  */
-function toStoredMessage(message: AgentMessage): StoredMessage {
+function toStoredMessage(
+  message: AgentMessage,
+  useTokenizer?: boolean,
+  tokenizer?: typeof import("./types.js").TokenizerService.prototype,
+): StoredMessage {
   const content =
     "content" in message
       ? extractMessageContent(message.content)
@@ -443,8 +445,10 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
           role: runtimeRole,
           content: message.content,
           fallbackContent: content,
+          useTokenizer,
+          tokenizer,
         })
-      : estimateTokens(content);
+      : calculateTokens(content, useTokenizer, tokenizer);
 
   return {
     role: toDbRole(message.role),
@@ -453,9 +457,13 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
   };
 }
 
-function estimateMessageContentTokensForAfterTurn(content: unknown): number {
+function estimateMessageContentTokensForAfterTurn(
+  content: unknown,
+  useTokenizer?: boolean,
+  tokenizer?: typeof import("./types.js").TokenizerService.prototype,
+): number {
   if (typeof content === "string") {
-    return estimateTokens(content);
+    return calculateTokens(content, useTokenizer, tokenizer);
   }
   if (Array.isArray(content)) {
     let total = 0;
@@ -471,7 +479,7 @@ function estimateMessageContentTokensForAfterTurn(content: unknown): number {
             ? record.thinking
             : "";
       if (text) {
-        total += estimateTokens(text);
+        total += calculateTokens(text, useTokenizer, tokenizer);
       }
     }
     return total;
@@ -480,14 +488,18 @@ function estimateMessageContentTokensForAfterTurn(content: unknown): number {
     return 0;
   }
   const serialized = JSON.stringify(content);
-  return estimateTokens(typeof serialized === "string" ? serialized : "");
+  return calculateTokens(typeof serialized === "string" ? serialized : "", useTokenizer, tokenizer);
 }
 
-function estimateSessionTokenCountForAfterTurn(messages: AgentMessage[]): number {
+function estimateSessionTokenCountForAfterTurn(
+  messages: AgentMessage[],
+  useTokenizer?: boolean,
+  tokenizer?: typeof import("./types.js").TokenizerService.prototype,
+): number {
   let total = 0;
   for (const message of messages) {
     if ("content" in message) {
-      total += estimateMessageContentTokensForAfterTurn(message.content);
+      total += estimateMessageContentTokensForAfterTurn(message.content, useTokenizer, tokenizer);
       continue;
     }
     if ("command" in message || "output" in message) {
@@ -499,7 +511,7 @@ function estimateSessionTokenCountForAfterTurn(messages: AgentMessage[]): number
         typeof (message as { output?: unknown }).output === "string"
           ? (message as { output?: string }).output
           : "";
-      total += estimateTokens(`${commandText}\n${outputText}`);
+      total += calculateTokens(`${commandText}\n${outputText}`, useTokenizer, tokenizer);
     }
   }
   return total;
@@ -637,9 +649,24 @@ export class LcmContextEngine implements ContextEngine {
       this.conversationStore,
       this.summaryStore,
       compactionConfig,
+      deps.config.useTokenizer,
+      deps.tokenizer,
     );
 
-    this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore);
+    this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore, deps.config.useTokenizer, deps.tokenizer);
+  }
+
+  /** Warm the tokenizer before any sync token-count paths run. */
+  private async ensureTokenizerReady(): Promise<void> {
+    if (!this.config.useTokenizer || !this.deps.tokenizer?.initialize) {
+      return;
+    }
+
+    try {
+      await this.deps.tokenizer.initialize();
+    } catch {
+      // Fall back to heuristic counting when tokenizer warmup fails.
+    }
   }
 
   /** Ensure DB schema is up-to-date. Called lazily on first bootstrap/ingest/assemble/compact. */
@@ -835,7 +862,7 @@ export class LcmContextEngine implements ContextEngine {
     let interceptedAny = false;
 
     for (const block of blocks) {
-      const blockTokens = estimateTokens(block.text);
+      const blockTokens = calculateTokens(block.text, this.config.useTokenizer, this.deps.tokenizer);
       if (blockTokens < threshold) {
         continue;
       }
@@ -916,7 +943,7 @@ export class LcmContextEngine implements ContextEngine {
       return { importedMessages: 0, hasOverlap: false };
     }
 
-    const storedHistoricalMessages = historicalMessages.map((message) => toStoredMessage(message));
+    const storedHistoricalMessages = historicalMessages.map((message) => toStoredMessage(message, this.config.useTokenizer, this.deps.tokenizer));
 
     // Fast path: one tail comparison for the common in-sync case.
     const latestHistorical = storedHistoricalMessages[storedHistoricalMessages.length - 1];
@@ -1006,6 +1033,7 @@ export class LcmContextEngine implements ContextEngine {
 
   async bootstrap(params: { sessionId: string; sessionFile: string }): Promise<BootstrapResult> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
 
     const result = await this.withSessionQueue(params.sessionId, async () =>
       this.conversationStore.withTransaction(async () => {
@@ -1028,7 +1056,7 @@ export class LcmContextEngine implements ContextEngine {
 
           const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
           const bulkInput = historicalMessages.map((message, index) => {
-            const stored = toStoredMessage(message);
+            const stored = toStoredMessage(message, this.config.useTokenizer, this.deps.tokenizer);
             return {
               conversationId,
               seq: nextSeq + index,
@@ -1134,7 +1162,7 @@ export class LcmContextEngine implements ContextEngine {
     if (isHeartbeat) {
       return { ingested: false };
     }
-    const stored = toStoredMessage(message);
+    const stored = toStoredMessage(message, this.config.useTokenizer, this.deps.tokenizer);
 
     // Get or create conversation for this session
     const conversation = await this.conversationStore.getOrCreateConversation(sessionId);
@@ -1148,7 +1176,7 @@ export class LcmContextEngine implements ContextEngine {
       });
       if (intercepted) {
         stored.content = intercepted.rewrittenContent;
-        stored.tokenCount = estimateTokens(stored.content);
+        stored.tokenCount = calculateTokens(stored.content, this.config.useTokenizer, this.deps.tokenizer);
         if ("content" in message) {
           messageForParts = {
             ...message,
@@ -1191,6 +1219,7 @@ export class LcmContextEngine implements ContextEngine {
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
     return this.withSessionQueue(params.sessionId, () => this.ingestSingle(params));
   }
 
@@ -1200,6 +1229,7 @@ export class LcmContextEngine implements ContextEngine {
     isHeartbeat?: boolean;
   }): Promise<IngestBatchResult> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
     if (params.messages.length === 0) {
       return { ingestedCount: 0 };
     }
@@ -1230,6 +1260,7 @@ export class LcmContextEngine implements ContextEngine {
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
 
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
@@ -1265,7 +1296,7 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
-    const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
+    const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages, this.config.useTokenizer, this.deps.tokenizer);
 
     try {
       const leafTrigger = await this.evaluateLeafTrigger(params.sessionId);
@@ -1305,6 +1336,7 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<AssembleResult> {
     try {
       this.ensureMigrated();
+      await this.ensureTokenizerReady();
 
       const conversation = await this.conversationStore.getConversationBySessionId(
         params.sessionId,
@@ -1346,6 +1378,8 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: conversation.conversationId,
         tokenBudget,
         freshTailCount: this.config.freshTailCount,
+        useTokenizer: this.config.useTokenizer,
+        tokenizer: this.deps.tokenizer,
       });
 
       // If assembly produced no messages for a non-empty live session,
@@ -1380,6 +1414,7 @@ export class LcmContextEngine implements ContextEngine {
     threshold: number;
   }> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
     const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
     if (!conversation) {
       const fallbackThreshold =
@@ -1409,6 +1444,7 @@ export class LcmContextEngine implements ContextEngine {
     previousSummaryContent?: string;
   }): Promise<CompactResult> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
     return this.withSessionQueue(params.sessionId, async () => {
       const conversation = await this.conversationStore.getConversationBySessionId(
         params.sessionId,
@@ -1482,6 +1518,7 @@ export class LcmContextEngine implements ContextEngine {
     force?: boolean;
   }): Promise<CompactResult> {
     this.ensureMigrated();
+    await this.ensureTokenizerReady();
     return this.withSessionQueue(params.sessionId, async () => {
       const { sessionId, force = false } = params;
 

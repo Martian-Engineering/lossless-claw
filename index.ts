@@ -13,7 +13,8 @@ import { createLcmDescribeTool } from "./src/tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "./src/tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "./src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "./src/tools/lcm-grep-tool.js";
-import type { LcmDependencies } from "./src/types.js";
+import type { LcmDependencies, TokenizerService } from "./src/types.js";
+import { HuggingFaceTokenizer, redactUrlCredentials } from "./src/tokenizers/huggingface.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
@@ -855,6 +856,8 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     api.logger.warn(buildLegacyAuthFallbackWarning());
   }
 
+  const redactedProxy = redactUrlCredentials(config.proxy) ?? "none";
+
   return {
     config,
     complete: async ({
@@ -1262,6 +1265,20 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       error: (msg) => api.logger.error(msg),
       debug: (msg) => api.logger.debug?.(msg),
     },
+    tokenizer: config.useTokenizer
+      ? (() => {
+          const t = new HuggingFaceTokenizer(envSnapshot.openclawDefaultModel || "glm-5", config.proxy);
+          void t.initialize().catch((error) => {
+            api.logger.warn(
+              `[lcm] Tokenizer warmup failed (model=${envSnapshot.openclawDefaultModel || "glm-5"}): ${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
+          api.logger.info(
+            `[lcm] Tokenizer created (model=${envSnapshot.openclawDefaultModel || "glm-5"}, proxy=${redactedProxy})`,
+          );
+          return t;
+        })()
+      : undefined,
   };
 }
 
@@ -1325,7 +1342,7 @@ const lcmPlugin = {
     );
 
     api.logger.info(
-      `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
+      `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold}, useTokenizer=${deps.config.useTokenizer}${deps.config.proxy ? `, proxy=${redactUrlCredentials(deps.config.proxy)}` : ""})`,
     );
   },
 };

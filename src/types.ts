@@ -8,6 +8,21 @@
 import type { LcmConfig } from "./db/config.js";
 
 /**
+ * Minimal tokenizer service interface for accurate token counting.
+ * Implemented by the tokenizer plugin.
+ */
+export interface TokenizerService {
+  /** Check if tokenizer service is enabled */
+  isEnabled(): boolean;
+
+  /** Warm the tokenizer so subsequent countTokens() calls can run synchronously. */
+  initialize?(): Promise<void>;
+
+  /** Count tokens in text (synchronous) */
+  countTokens(text: string): number;
+}
+
+/**
  * Minimal LLM completion interface needed by LCM for summarization.
  * Matches the signature of completeSimple from @mariozechner/pi-ai.
  */
@@ -146,4 +161,7 @@ export interface LcmDependencies {
     error: (msg: string) => void;
     debug: (msg: string) => void;
   };
+
+  /** Optional tokenizer service for accurate token counting (opt-in) */
+  tokenizer?: TokenizerService;
 }
