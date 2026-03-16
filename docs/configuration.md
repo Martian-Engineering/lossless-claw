@@ -91,6 +91,26 @@ The actual summary size depends on the LLM's output; these values are guidelines
 - Smaller chunks create summaries more frequently from less material.
 - This also affects the condensed minimum input threshold (10% of this value).
 
+### Idle compaction
+
+`LCM_IDLE_COMPACT_MINUTES` (default `0`, disabled) triggers compaction when a session has been idle longer than the specified duration. When enabled, the first `assemble()` call after the idle threshold is exceeded runs a lightweight leaf pass (one ~20k-token chunk, one LLM call), followed by a forced full compaction cascade in `afterTurn()`.
+
+- **Recommended:** 180 (3 hours) for most workloads
+- **ML/autoresearch workloads:** 120-180 minutes (inter-experiment gaps are typically 5-60 min; values below 120 risk compacting actively-relevant context)
+- **Hard minimum:** 60 minutes. Values below this are likely to compact context needed for in-progress background jobs.
+
+**Latency impact:** The first message after idle may take 5-15 seconds longer than normal due to the leaf pass. A 15-second timeout protects against API hangs.
+
+**Idle timer policy:**
+- User messages and model responses reset the idle timer
+- Heartbeats do NOT reset the idle timer (they are never ingested)
+- SystemEvents (cron, watchdog) DO reset the timer (they represent genuine new information)
+- Sub-agent completion messages DO reset the timer
+
+**Interaction with context threshold:** Idle compaction and the `contextThreshold` trigger are independent. Both can fire in the same turn. The idle trigger in `afterTurn()` forces compaction even if context is below the threshold.
+
+**Multi-session note:** When multiple sessions trigger idle compaction simultaneously (e.g., after overnight quiet), a random jitter (0-60 seconds) is applied to stagger API calls.
+
 ## Model selection
 
 LCM uses the same model as the parent OpenClaw session for summarization by default. You can override this:

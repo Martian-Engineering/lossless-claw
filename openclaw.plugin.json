@@ -24,6 +24,10 @@
     "summaryProvider": {
       "label": "Summary Provider",
       "help": "Provider override for LCM summarization (e.g., 'openai-resp')"
+    },
+    "idleCompactMinutes": {
+      "label": "Idle Compaction Minutes",
+      "help": "Minutes of inactivity before triggering compaction on next turn (0 = disabled, recommended: 180)"
     }
   },
   "configSchema": {
@@ -70,6 +74,11 @@
       },
       "summaryProvider": {
         "type": "string"
+      },
+      "idleCompactMinutes": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Minutes of session inactivity before triggering compaction on next assemble (0 = disabled)"
       }
     }
   }

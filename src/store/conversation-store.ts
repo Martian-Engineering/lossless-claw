@@ -389,6 +389,25 @@ export class ConversationStore {
     return row ? toMessageRecord(row) : null;
   }
 
+  /**
+   * Get the timestamp of the last real conversational message (user or assistant).
+   * Excludes system/tool messages and LCM internal artifacts.
+   * Returns null if no matching messages exist.
+   */
+  async getLastActivityTimestamp(conversationId: ConversationId): Promise<Date | null> {
+    const row = this.db
+      .prepare(
+        `SELECT MAX(created_at) AS created_at
+       FROM messages
+       WHERE conversation_id = ?
+       AND role IN ('user', 'assistant')`,
+      )
+      .get(conversationId) as unknown as { created_at: string | null } | undefined;
+
+    if (!row?.created_at) return null;
+    return new Date(row.created_at);
+  }
+
   async hasMessage(
     conversationId: ConversationId,
     role: MessageRole,
