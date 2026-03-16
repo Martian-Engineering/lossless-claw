@@ -92,7 +92,7 @@ Three levels of pointer inspection without expanding:
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
 
-### Install the plugin
+### 1. Install the plugin
 
 Use OpenClaw's plugin installer (recommended):
 
@@ -116,7 +116,7 @@ openclaw plugins install --link /path/to/lossless-claw
 
 The install command records the plugin, enables it, and applies compatible slot selection (including `contextEngine` when applicable).
 
-### Configure OpenClaw
+### 2. Configure OpenClaw
 
 In most cases, no manual JSON edits are needed after `openclaw plugins install`.
 
@@ -133,6 +133,61 @@ If you need to set it manually, ensure the context engine slot points at lossles
 ```
 
 Restart OpenClaw after configuration changes.
+
+### 3. Teach your agent to use active context management
+
+The plugin gives your agent 15 new tools, but tools alone aren't enough — your agent needs behavioral instructions to know *when* and *how* to use them. Without guidance, agents won't collapse stale content, won't use the scratchpad, and will still hit compaction like before.
+
+**Copy the ready-made instructions** from [`docs/suggested-agents-instructions.md`](docs/suggested-agents-instructions.md) into your workspace's `AGENTS.md` file:
+
+```bash
+# Append the LCM instructions to your existing AGENTS.md
+cat /path/to/lossless-claw/docs/suggested-agents-instructions.md >> ~/.openclaw/workspace/AGENTS.md
+```
+
+Or selectively copy the sections you want. At minimum, include:
+
+- **Context Management — LCM Tools** (the tools quick reference + behavioral rules)
+- **Post-Compaction Recovery** (how to reorient after compaction)
+
+**What changes for your agent:**
+
+| Before (vanilla OpenClaw) | After (with LCM active memory) |
+|---|---|
+| Context fills up → nuclear compaction → agent loses detail | Agent collapses stale content as it goes → stays under budget |
+| After compaction, agent starts from scratch | Scratchpad survives compaction with pointer IDs as breadcrumbs |
+| Large files flood the context window | Read-collapse-repeat workflow keeps usage flat |
+| No way to revisit compacted history | `lcm_grep` and `lcm_expand_query` recover any detail on demand |
+| Agent forgets what it learned 20 turns ago | Checkpoints, tags, and scratchpad preserve key results indefinitely |
+
+### 4. Verify it's working
+
+After restarting OpenClaw, check that the LCM tools are available:
+
+```
+# In your agent conversation, try:
+lcm_budget    → should show context composition breakdown
+lcm_scratchpad(action: "read")  → should return empty or existing scratchpad
+```
+
+If your agent can call these tools, active context management is live. The agent will start receiving summaries (instead of truncated messages) when conversations grow long, and it can now collapse, expand, and organize its own context.
+
+### 5. Recommended OpenClaw session settings
+
+LCM preserves history through compaction, so you'll want longer sessions to take full advantage:
+
+```json
+{
+  "session": {
+    "reset": {
+      "mode": "idle",
+      "idleMinutes": 10080
+    }
+  }
+}
+```
+
+This keeps sessions alive for 7 days of inactivity. LCM handles the context window; you don't need short sessions as a memory management crutch anymore.
 
 ## Configuration
 
