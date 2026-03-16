@@ -40,13 +40,13 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 Use Claude Code's plugin installer (recommended):
 
 ```bash
-claude plugins install lossless-claude
+claude plugins install @ipedro/lossless-claude
 ```
 
 If you're running from a local Claude Code checkout, use:
 
 ```bash
-pnpm claude plugins install lossless-claude
+pnpm claude plugins install @ipedro/lossless-claude
 ```
 
 For local plugin development, link your working copy instead of copying files:

@@ -1,5 +1,5 @@
 ---
-"lossless-claude": patch
+"@ipedro/lossless-claude": patch
 ---
 
 Declare explicit Claude Code tool names for the LCM factory-registered tools so

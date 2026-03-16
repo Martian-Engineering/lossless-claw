@@ -1,5 +1,5 @@
 {
-  "name": "lossless-claude",
+  "name": "@ipedro/lossless-claude",
   "version": "0.3.0",
   "description": "Lossless Context Management plugin for Claude Code — DAG-based conversation summarization with incremental compaction",
   "type": "module",

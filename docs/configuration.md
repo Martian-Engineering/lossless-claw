@@ -5,13 +5,13 @@
 Install the plugin with Claude Code's plugin installer:
 
 ```bash
-claude plugins install lossless-claude
+claude plugins install @ipedro/lossless-claude
 ```
 
 If you're running from a local Claude Code checkout:
 
 ```bash
-pnpm claude plugins install lossless-claude
+pnpm claude plugins install @ipedro/lossless-claude
 ```
 
 For local development of this plugin, link your working copy:
