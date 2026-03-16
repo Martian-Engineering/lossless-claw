@@ -221,6 +221,32 @@ export class CompactionEngine {
     };
   }
 
+  /**
+   * Evaluate whether idle-triggered compaction should run.
+   *
+   * Checks the last real conversational activity (user/assistant messages)
+   * against the configured idle threshold. Heartbeats are excluded (they are
+   * never ingested); system events and sub-agent completions count as activity
+   * because they represent genuine new information entering the session.
+   */
+  async evaluateIdleTrigger(
+    conversationId: number,
+    idleMinutes: number,
+  ): Promise<{ shouldCompact: boolean; idleMs: number; thresholdMs: number }> {
+    const lastActivity =
+      await this.conversationStore.getLastActivityTimestamp(conversationId);
+    if (!lastActivity) {
+      return { shouldCompact: false, idleMs: 0, thresholdMs: idleMinutes * 60_000 };
+    }
+    const idleMs = Date.now() - lastActivity.getTime();
+    const thresholdMs = idleMinutes * 60_000;
+    return {
+      shouldCompact: idleMs >= thresholdMs,
+      idleMs,
+      thresholdMs,
+    };
+  }
+
   // ── compact ──────────────────────────────────────────────────────────────
 
   /** Run a full compaction sweep for a conversation. */

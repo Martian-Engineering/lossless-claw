@@ -594,6 +594,8 @@ export class LcmContextEngine implements ContextEngine {
   private migrated = false;
   private readonly fts5Available: boolean;
   private sessionOperationQueues = new Map<string, Promise<void>>();
+  /** Tracks sessions where idle compaction triggered in assemble(), so afterTurn() can force a full cascade. */
+  private idleCompactionTriggered = new Map<string, boolean>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
@@ -1296,6 +1298,31 @@ export class LcmContextEngine implements ContextEngine {
     } catch {
       // Proactive compaction is best-effort in the post-turn lifecycle.
     }
+
+    // ── Idle-triggered full cascade ───────────────────────────────────────
+    // If idle compaction triggered in assemble(), force a full compaction
+    // cascade regardless of context threshold. This prevents the leaf pass
+    // from reducing context just below threshold and skipping the full pass.
+    const idleTriggered = this.idleCompactionTriggered.get(params.sessionId);
+    if (idleTriggered) {
+      this.idleCompactionTriggered.delete(params.sessionId);
+      try {
+        await this.compact({
+          sessionId: params.sessionId,
+          sessionFile: params.sessionFile,
+          tokenBudget,
+          currentTokenCount: liveContextTokens,
+          compactionTarget: "threshold",
+          legacyParams: params.legacyCompactionParams,
+          force: true,
+        });
+        console.error(
+          `[lcm] idle-compact-cascade: session=${params.sessionId} forced full compaction after idle trigger`,
+        );
+      } catch {
+        // Idle cascade is best-effort.
+      }
+    }
   }
 
   async assemble(params: {
@@ -1341,6 +1368,51 @@ export class LcmContextEngine implements ContextEngine {
         params.tokenBudget > 0
           ? Math.floor(params.tokenBudget)
           : 128_000;
+
+      // ── Idle compaction: lightweight leaf pass before assembly ─────────
+      if (this.config.idleCompactMinutes > 0) {
+        try {
+          const idleTrigger = await this.compaction.evaluateIdleTrigger(
+            conversation.conversationId,
+            this.config.idleCompactMinutes,
+          );
+          if (idleTrigger.shouldCompact) {
+            const idleStart = Date.now();
+            const IDLE_LEAF_TIMEOUT_MS = 15_000;
+            try {
+              const summarize = await this.resolveSummarize({});
+              await Promise.race([
+                this.compaction.compactLeaf({
+                  conversationId: conversation.conversationId,
+                  tokenBudget,
+                  summarize,
+                  force: true,
+                }),
+                new Promise<never>((_, reject) =>
+                  setTimeout(
+                    () => reject(new Error("idle leaf pass timeout")),
+                    IDLE_LEAF_TIMEOUT_MS,
+                  ),
+                ),
+              ]);
+              console.error(
+                `[lcm] idle-compact-leaf: session=${params.sessionId} idleMs=${idleTrigger.idleMs} durationMs=${Date.now() - idleStart}`,
+              );
+            } catch (err) {
+              // Timeout or API error — skip leaf pass, assemble with raw context.
+              // afterTurn() will handle full compaction.
+              console.error(
+                `[lcm] idle-compact-leaf-skipped: session=${params.sessionId} reason=${err instanceof Error ? err.message : String(err)} idleMs=${idleTrigger.idleMs}`,
+              );
+            }
+            // Flag for afterTurn: force full cascade regardless of threshold
+            this.idleCompactionTriggered.set(params.sessionId, true);
+          }
+        } catch {
+          // Idle evaluation failure is non-fatal — proceed with normal assembly
+        }
+      }
+      // ── End idle compaction ────────────────────────────────────────────
 
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,

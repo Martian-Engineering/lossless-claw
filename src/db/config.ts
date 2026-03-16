@@ -24,6 +24,8 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+  /** Minutes of inactivity before triggering compaction on next assemble (0 = disabled). */
+  idleCompactMinutes: number;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -123,5 +125,8 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+    idleCompactMinutes:
+      (env.LCM_IDLE_COMPACT_MINUTES !== undefined ? parseInt(env.LCM_IDLE_COMPACT_MINUTES, 10) : undefined)
+        ?? toNumber(pc.idleCompactMinutes) ?? 0,
   };
 }
