@@ -84,12 +84,14 @@ export type CreateConversationInput = {
   sessionId: string;
   sessionKey?: string;
   title?: string;
+  agentId?: string;
 };
 
 export type ConversationRecord = {
   conversationId: ConversationId;
   sessionId: string;
   sessionKey: string | null;
+  agentId: string | null;
   title: string | null;
   bootstrappedAt: Date | null;
   createdAt: Date;
@@ -109,6 +111,8 @@ export type MessageSearchInput = {
   recencyWeight?: number;
   /** Half-life in days for recency decay. Default 7. Only used in recency_boosted mode. */
   recencyHalfLifeDays?: number;
+  /** Agent ID of the caller. Results from this agent's conversations get a ranking boost. */
+  callerAgentId?: string;
 };
 
 export type MessageSearchResult = {
@@ -126,6 +130,7 @@ interface ConversationRow {
   conversation_id: number;
   session_id: string;
   session_key: string | null;
+  agent_id: string | null;
   title: string | null;
   bootstrapped_at: string | null;
   created_at: string;
@@ -180,6 +185,7 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
     conversationId: row.conversation_id,
     sessionId: row.session_id,
     sessionKey: row.session_key ?? null,
+    agentId: row.agent_id ?? null,
     title: row.title,
     bootstrappedAt: row.bootstrapped_at ? new Date(row.bootstrapped_at) : null,
     createdAt: new Date(row.created_at),
@@ -227,7 +233,7 @@ function toMessagePartRecord(row: MessagePartRow): MessagePartRecord {
 }
 
 // Column list constants to avoid repetition
-const CONV_COLS = "conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at";
+const CONV_COLS = "conversation_id, session_id, session_key, agent_id, title, bootstrapped_at, created_at, updated_at";
 const MSG_COLS = "message_id, conversation_id, seq, role, content, token_count, created_at";
 const PART_COLS = "part_id, message_id, session_id, part_type, ordinal, text_content, tool_call_id, tool_name, tool_input, tool_output, metadata";
 
@@ -325,9 +331,9 @@ export class ConversationStore {
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
     const d = this.d.reset();
     const result = await this.db.run(
-      `INSERT INTO conversations (session_id, session_key, title)
-       VALUES (${d.p()}, ${d.p()}, ${d.p()}) RETURNING conversation_id`,
-      [input.sessionId, input.sessionKey ?? null, input.title ?? null],
+      `INSERT INTO conversations (session_id, session_key, agent_id, title)
+       VALUES (${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}) RETURNING conversation_id`,
+      [input.sessionId, input.sessionKey ?? null, input.agentId ?? null, input.title ?? null],
     );
     const conversationId = result.lastInsertId!;
 
@@ -396,7 +402,7 @@ export class ConversationStore {
 
   async getOrCreateConversation(
     sessionId: string,
-    titleOrOpts?: string | { title?: string; sessionKey?: string },
+    titleOrOpts?: string | { title?: string; sessionKey?: string; agentId?: string },
   ): Promise<ConversationRecord> {
     const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
     if (opts.sessionKey) {
@@ -424,10 +430,19 @@ export class ConversationStore {
         );
         existing.sessionKey = opts.sessionKey;
       }
+      // Backfill agent_id if it was missing and we now know it
+      if (!existing.agentId && opts.agentId) {
+        const d = this.d.reset();
+        await this.db.run(
+          `UPDATE conversations SET agent_id = ${d.p()}, updated_at = ${d.now()} WHERE conversation_id = ${d.p()}`,
+          [opts.agentId, existing.conversationId],
+        );
+        existing.agentId = opts.agentId;
+      }
       return existing;
     }
 
-    return this.createConversation({ sessionId, title: opts.title, sessionKey: opts.sessionKey });
+    return this.createConversation({ sessionId, title: opts.title, sessionKey: opts.sessionKey, agentId: opts.agentId });
   }
 
   async markConversationBootstrapped(conversationId: ConversationId): Promise<void> {
@@ -698,6 +713,7 @@ export class ConversationStore {
         return await this.searchRecencyBoosted(
           input.query, limit, input.conversationId, input.since, input.before,
           input.semanticWeight, input.recencyWeight, input.recencyHalfLifeDays,
+          input.callerAgentId,
         );
       } catch (err) {
         console.warn(
@@ -711,6 +727,7 @@ export class ConversationStore {
       try {
         return await this.searchSemantic(
           input.query, limit, input.conversationId, input.since, input.before,
+          input.callerAgentId,
         );
       } catch (err) {
         console.warn(
@@ -992,6 +1009,7 @@ export class ConversationStore {
   async searchSemantic(
     query: string, limit: number,
     conversationId?: ConversationId, since?: Date, before?: Date,
+    callerAgentId?: string,
   ): Promise<MessageSearchResult[]> {
     if (!this.d.pg || !this.embeddingClient) {
       throw new Error("Semantic search requires PostgreSQL with pgvector and a configured embedding API key");
@@ -1001,24 +1019,41 @@ export class ConversationStore {
     const vectorLiteral = toVectorLiteral(queryEmbedding);
 
     const d = this.d.reset();
-    const where: string[] = ["embedding IS NOT NULL"];
+    const where: string[] = ["m.embedding IS NOT NULL"];
     const params: unknown[] = [];
 
-    if (conversationId !== undefined) { where.push(`conversation_id = ${d.p()}`); params.push(conversationId); }
-    if (since) { where.push(`created_at >= ${d.p()}`); params.push(since.toISOString()); }
-    if (before) { where.push(`created_at < ${d.p()}`); params.push(before.toISOString()); }
+    if (conversationId !== undefined) { where.push(`m.conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`m.created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`m.created_at < ${d.p()}`); params.push(before.toISOString()); }
 
     const vecParam = d.p();
-    const limitParam = d.p();
-    params.push(vectorLiteral, limit);
+    const candidateLimit = d.p();
+    const finalLimit = d.p();
+    params.push(vectorLiteral, limit * 3, limit);
+
+    // Agent affinity: boost results from caller's own conversations by 1.3x
+    let agentBoostExpr = "1.0";
+    if (callerAgentId) {
+      const agentParam = d.p();
+      params.push(callerAgentId);
+      agentBoostExpr = `CASE WHEN c.agent_id = ${agentParam} THEN 1.3 ELSE 1.0 END`;
+    }
 
     const result = await this.db.query<MessageRow & { rank: number }>(
-      `SELECT message_id, conversation_id, role, content, created_at,
-         1 - (embedding <=> ${vecParam}::vector) AS rank
-       FROM messages
-       WHERE ${where.join(" AND ")}
-       ORDER BY embedding <=> ${vecParam}::vector
-       LIMIT ${limitParam}`,
+      `WITH candidates AS (
+         SELECT m.message_id, m.conversation_id, m.role, m.content, m.created_at,
+           1 - (m.embedding <=> ${vecParam}::vector) AS similarity
+         FROM messages m
+         WHERE ${where.join(" AND ")}
+         ORDER BY m.embedding <=> ${vecParam}::vector
+         LIMIT ${candidateLimit}
+       )
+       SELECT cd.message_id, cd.conversation_id, cd.role, cd.content, cd.created_at,
+         cd.similarity * ${agentBoostExpr} AS rank
+       FROM candidates cd
+       JOIN conversations c ON c.conversation_id = cd.conversation_id
+       ORDER BY rank DESC
+       LIMIT ${finalLimit}`,
       params,
     );
 
@@ -1045,6 +1080,7 @@ export class ConversationStore {
     query: string, limit: number,
     conversationId?: ConversationId, since?: Date, before?: Date,
     semanticWeight = 0.7, recencyWeight = 0.3, halfLifeDays = 7,
+    callerAgentId?: string,
   ): Promise<MessageSearchResult[]> {
     if (!this.d.pg || !this.embeddingClient) {
       throw new Error("Recency-boosted search requires PostgreSQL with pgvector and a configured embedding API key");
@@ -1054,38 +1090,47 @@ export class ConversationStore {
     const vectorLiteral = toVectorLiteral(queryEmbedding);
 
     const d = this.d.reset();
-    const where: string[] = ["embedding IS NOT NULL"];
+    const where: string[] = ["m.embedding IS NOT NULL"];
     const params: unknown[] = [];
 
-    if (conversationId !== undefined) { where.push(`conversation_id = ${d.p()}`); params.push(conversationId); }
-    if (since) { where.push(`created_at >= ${d.p()}`); params.push(since.toISOString()); }
-    if (before) { where.push(`created_at < ${d.p()}`); params.push(before.toISOString()); }
+    if (conversationId !== undefined) { where.push(`m.conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`m.created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`m.created_at < ${d.p()}`); params.push(before.toISOString()); }
 
     const vecParam = d.p();
     const swParam = d.p();
     const rwParam = d.p();
     const hlParam = d.p();
-    const limitParam = d.p();
-    params.push(vectorLiteral, semanticWeight, recencyWeight, halfLifeDays, limit);
+    const candidateLimit = d.p();
+    const finalLimit = d.p();
+    params.push(vectorLiteral, semanticWeight, recencyWeight, halfLifeDays, limit * 3, limit);
+
+    // Agent affinity: boost results from caller's own conversations by 1.3x
+    let agentBoostExpr = "1.0";
+    if (callerAgentId) {
+      const agentParam = d.p();
+      params.push(callerAgentId);
+      agentBoostExpr = `CASE WHEN c.agent_id = ${agentParam} THEN 1.3 ELSE 1.0 END`;
+    }
 
     // Use HNSW index for initial candidate retrieval (ORDER BY distance),
-    // then re-rank with blended score. Fetch 3x limit candidates to ensure
-    // good recall after re-ranking.
+    // then re-rank with blended score + agent affinity.
     const result = await this.db.query<MessageRow & { rank: number }>(
       `WITH candidates AS (
-         SELECT message_id, conversation_id, role, content, created_at,
-           1 - (embedding <=> ${vecParam}::vector) AS similarity,
-           EXP(-LN(2) * EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0 / ${hlParam}) AS recency
-         FROM messages
+         SELECT m.message_id, m.conversation_id, m.role, m.content, m.created_at,
+           1 - (m.embedding <=> ${vecParam}::vector) AS similarity,
+           EXP(-LN(2) * EXTRACT(EPOCH FROM (NOW() - m.created_at)) / 86400.0 / ${hlParam}) AS recency
+         FROM messages m
          WHERE ${where.join(" AND ")}
-         ORDER BY embedding <=> ${vecParam}::vector
-         LIMIT ${limitParam} * 3
+         ORDER BY m.embedding <=> ${vecParam}::vector
+         LIMIT ${candidateLimit}
        )
-       SELECT message_id, conversation_id, role, content, created_at,
-         (${swParam} * similarity + ${rwParam} * recency) AS rank
-       FROM candidates
+       SELECT cd.message_id, cd.conversation_id, cd.role, cd.content, cd.created_at,
+         (${swParam} * cd.similarity + ${rwParam} * cd.recency) * ${agentBoostExpr} AS rank
+       FROM candidates cd
+       JOIN conversations c ON c.conversation_id = cd.conversation_id
        ORDER BY rank DESC
-       LIMIT ${limitParam}`,
+       LIMIT ${finalLimit}`,
       params,
     );
 

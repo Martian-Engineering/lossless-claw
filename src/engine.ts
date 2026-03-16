@@ -955,12 +955,54 @@ export class LcmContextEngine implements ContextEngine {
       const db = createLcmConnection(this.config);
       await ensurePostgresSchema(db);
       this.migrated = true;
+      // Register agent identity after schema is ready (fire-and-forget)
+      this.registerAgent().catch(() => {});
       return;
     }
 
     const sqliteDb = getLcmConnection(this.config.databasePath);
     runLcmMigrations(sqliteDb, { fts5Available: this.fullTextAvailable });
     this.migrated = true;
+  }
+
+  /**
+   * Get the agent identity for this instance.
+   * Priority: LCM_INSTANCE_ID config > parsed from sessionKey > undefined.
+   */
+  private getAgentId(sessionKey?: string): string | undefined {
+    if (this.config.instanceId) return this.config.instanceId;
+    if (!sessionKey) return undefined;
+    return this.deps.parseAgentSessionKey(sessionKey)?.agentId;
+  }
+
+  /**
+   * Register this agent instance in the agents table.
+   * Upserts on boot, bumping last_seen_at and updating model/host info.
+   */
+  private async registerAgent(): Promise<void> {
+    if (this.config.backend !== "postgres") return;
+    const agentId = this.config.instanceId;
+    if (!agentId) return;
+
+    const db = createLcmConnection(this.config);
+    const displayName = this.config.instanceDisplayName || null;
+    const role = this.config.instanceRole || null;
+    const host = (await import("node:os")).hostname();
+    try {
+      await db.run(
+        `INSERT INTO agents (agent_id, display_name, host, role, metadata)
+         VALUES ($1, $2, $3, $4, '{}')
+         ON CONFLICT (agent_id) DO UPDATE SET
+           display_name = COALESCE(EXCLUDED.display_name, agents.display_name),
+           host = COALESCE(EXCLUDED.host, agents.host),
+           role = COALESCE(EXCLUDED.role, agents.role),
+           last_seen_at = NOW()`,
+        [agentId, displayName, host, role],
+      );
+      console.log(`[lcm:engine] registered agent: ${agentId} (${displayName ?? "no display name"}, role=${role ?? "unset"}, host=${host})`);
+    } catch (err) {
+      console.warn(`[lcm:engine] failed to register agent: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
@@ -1433,6 +1475,8 @@ export class LcmContextEngine implements ContextEngine {
     this.bootstrapLock = new Promise<void>((resolve) => { releaseLock = resolve; });
     await prevLock;
 
+    const agentId = this.getAgentId(params.sessionKey);
+
     try {
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
@@ -1441,6 +1485,7 @@ export class LcmContextEngine implements ContextEngine {
           this.summaryStore.withClient(txClient, async () => {
             const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
               sessionKey: params.sessionKey,
+              agentId,
             });
             const conversationId = conversation.conversationId;
             const historicalMessages = readLeafPathMessages(params.sessionFile);
@@ -1580,8 +1625,10 @@ export class LcmContextEngine implements ContextEngine {
     const stored = toStoredMessage(message);
 
     // Get or create conversation for this session
+    const agentId = this.getAgentId(params.sessionKey);
     const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
       sessionKey,
+      agentId,
     });
     const conversationId = conversation.conversationId;
 
@@ -2277,6 +2324,11 @@ export class LcmContextEngine implements ContextEngine {
 
   getRetrieval(): RetrievalEngine {
     return this.retrieval;
+  }
+
+  /** Get the configured instance identity (from LCM_INSTANCE_ID), if any. */
+  getInstanceId(): string | undefined {
+    return this.config.instanceId || undefined;
   }
 
   getConversationStore(): ConversationStore {

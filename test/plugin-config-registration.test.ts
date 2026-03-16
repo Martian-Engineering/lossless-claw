@@ -161,6 +161,9 @@ describe("lcm plugin registration", () => {
       autocompactDisabled: false,
       timezone: 'UTC',
       pruneHeartbeatOk: false,
+    instanceId: "",
+    instanceDisplayName: "",
+    instanceRole: "",
     });
     expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,

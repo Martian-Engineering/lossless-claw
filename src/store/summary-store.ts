@@ -77,6 +77,8 @@ export type SummarySearchInput = {
   semanticWeight?: number;
   recencyWeight?: number;
   recencyHalfLifeDays?: number;
+  /** Agent ID of the caller. Results from this agent's conversations get a ranking boost. */
+  callerAgentId?: string;
 };
 
 export type SummarySearchResult = {
@@ -670,6 +672,7 @@ export class SummaryStore {
         return await this.searchRecencyBoosted(
           input.query, limit, input.conversationId, input.since, input.before,
           input.semanticWeight, input.recencyWeight, input.recencyHalfLifeDays,
+          input.callerAgentId,
         );
       } catch (err) {
         console.warn(
@@ -681,7 +684,7 @@ export class SummaryStore {
 
     if (input.mode === "semantic") {
       try {
-        return await this.searchSemantic(input.query, limit, input.conversationId, input.since, input.before);
+        return await this.searchSemantic(input.query, limit, input.conversationId, input.since, input.before, input.callerAgentId);
       } catch (err) {
         console.warn(
           `[lcm:sum-store] semantic search failed, falling back to full_text: ${err instanceof Error ? err.message : String(err)}`,
@@ -946,6 +949,7 @@ export class SummaryStore {
   async searchSemantic(
     query: string, limit: number,
     conversationId?: number, since?: Date, before?: Date,
+    callerAgentId?: string,
   ): Promise<SummarySearchResult[]> {
     if (!this.d.pg || !this.embeddingClient) {
       throw new Error("Semantic search requires PostgreSQL with pgvector and a configured embedding API key");
@@ -955,25 +959,41 @@ export class SummaryStore {
     const vectorLiteral = toVectorLiteral(queryEmbedding);
 
     const d = this.d.reset();
-    const where: string[] = ["embedding IS NOT NULL"];
+    const where: string[] = ["s.embedding IS NOT NULL"];
     const params: unknown[] = [];
 
-    if (conversationId !== undefined) { where.push(`conversation_id = ${d.p()}`); params.push(conversationId); }
-    if (since) { where.push(`created_at >= ${d.p()}`); params.push(since.toISOString()); }
-    if (before) { where.push(`created_at < ${d.p()}`); params.push(before.toISOString()); }
+    if (conversationId !== undefined) { where.push(`s.conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`s.created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`s.created_at < ${d.p()}`); params.push(before.toISOString()); }
 
     const vecParam = d.p();
-    const limitParam = d.p();
-    params.push(vectorLiteral, limit);
+    const candidateLimit = d.p();
+    const finalLimit = d.p();
+    params.push(vectorLiteral, limit * 3, limit);
+
+    // Agent affinity: boost results from caller's own conversations by 1.3x
+    let agentBoostExpr = "1.0";
+    if (callerAgentId) {
+      const agentParam = d.p();
+      params.push(callerAgentId);
+      agentBoostExpr = `CASE WHEN c.agent_id = ${agentParam} THEN 1.3 ELSE 1.0 END`;
+    }
 
     const result = await this.db.query<SummarySearchRow & { content: string }>(
-      `SELECT summary_id, conversation_id, kind, content, created_at,
-         1 - (embedding <=> ${vecParam}::vector) AS rank,
-         LEFT(content, 200) AS snippet
-       FROM summaries
-       WHERE ${where.join(" AND ")}
-       ORDER BY embedding <=> ${vecParam}::vector
-       LIMIT ${limitParam}`,
+      `WITH candidates AS (
+         SELECT s.summary_id, s.conversation_id, s.kind, s.content, s.created_at,
+           1 - (s.embedding <=> ${vecParam}::vector) AS similarity
+         FROM summaries s
+         WHERE ${where.join(" AND ")}
+         ORDER BY s.embedding <=> ${vecParam}::vector
+         LIMIT ${candidateLimit}
+       )
+       SELECT cd.summary_id, cd.conversation_id, cd.kind, cd.content, cd.created_at,
+         cd.similarity * ${agentBoostExpr} AS rank
+       FROM candidates cd
+       JOIN conversations c ON c.conversation_id = cd.conversation_id
+       ORDER BY rank DESC
+       LIMIT ${finalLimit}`,
       params,
     );
 
@@ -996,6 +1016,7 @@ export class SummaryStore {
     query: string, limit: number,
     conversationId?: number, since?: Date, before?: Date,
     semanticWeight = 0.7, recencyWeight = 0.3, halfLifeDays = 7,
+    callerAgentId?: string,
   ): Promise<SummarySearchResult[]> {
     if (!this.d.pg || !this.embeddingClient) {
       throw new Error("Recency-boosted search requires PostgreSQL with pgvector and a configured embedding API key");
@@ -1005,35 +1026,45 @@ export class SummaryStore {
     const vectorLiteral = toVectorLiteral(queryEmbedding);
 
     const d = this.d.reset();
-    const where: string[] = ["embedding IS NOT NULL"];
+    const where: string[] = ["s.embedding IS NOT NULL"];
     const params: unknown[] = [];
 
-    if (conversationId !== undefined) { where.push(`conversation_id = ${d.p()}`); params.push(conversationId); }
-    if (since) { where.push(`created_at >= ${d.p()}`); params.push(since.toISOString()); }
-    if (before) { where.push(`created_at < ${d.p()}`); params.push(before.toISOString()); }
+    if (conversationId !== undefined) { where.push(`s.conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`s.created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`s.created_at < ${d.p()}`); params.push(before.toISOString()); }
 
     const vecParam = d.p();
     const swParam = d.p();
     const rwParam = d.p();
     const hlParam = d.p();
-    const limitParam = d.p();
-    params.push(vectorLiteral, semanticWeight, recencyWeight, halfLifeDays, limit);
+    const candidateLimit = d.p();
+    const finalLimit = d.p();
+    params.push(vectorLiteral, semanticWeight, recencyWeight, halfLifeDays, limit * 3, limit);
+
+    // Agent affinity: boost results from caller's own conversations by 1.3x
+    let agentBoostExpr = "1.0";
+    if (callerAgentId) {
+      const agentParam = d.p();
+      params.push(callerAgentId);
+      agentBoostExpr = `CASE WHEN c.agent_id = ${agentParam} THEN 1.3 ELSE 1.0 END`;
+    }
 
     const result = await this.db.query<SummarySearchRow & { content: string }>(
       `WITH candidates AS (
-         SELECT summary_id, conversation_id, kind, content, created_at,
-           1 - (embedding <=> ${vecParam}::vector) AS similarity,
-           EXP(-LN(2) * EXTRACT(EPOCH FROM (NOW() - COALESCE(latest_at, created_at))) / 86400.0 / ${hlParam}) AS recency
-         FROM summaries
+         SELECT s.summary_id, s.conversation_id, s.kind, s.content, s.created_at,
+           1 - (s.embedding <=> ${vecParam}::vector) AS similarity,
+           EXP(-LN(2) * EXTRACT(EPOCH FROM (NOW() - COALESCE(s.latest_at, s.created_at))) / 86400.0 / ${hlParam}) AS recency
+         FROM summaries s
          WHERE ${where.join(" AND ")}
-         ORDER BY embedding <=> ${vecParam}::vector
-         LIMIT ${limitParam} * 3
+         ORDER BY s.embedding <=> ${vecParam}::vector
+         LIMIT ${candidateLimit}
        )
-       SELECT summary_id, conversation_id, kind, content, created_at,
-         (${swParam} * similarity + ${rwParam} * recency) AS rank
-       FROM candidates
+       SELECT cd.summary_id, cd.conversation_id, cd.kind, cd.content, cd.created_at,
+         (${swParam} * cd.similarity + ${rwParam} * cd.recency) * ${agentBoostExpr} AS rank
+       FROM candidates cd
+       JOIN conversations c ON c.conversation_id = cd.conversation_id
        ORDER BY rank DESC
-       LIMIT ${limitParam}`,
+       LIMIT ${finalLimit}`,
       params,
     );
 

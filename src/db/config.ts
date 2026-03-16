@@ -49,6 +49,14 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+
+  // ── Agent identity ────────────────────────────────────────────────────────
+  /** Unique identifier for this agent instance (e.g. "opus", "grok", "gemini"). */
+  instanceId: string;
+  /** Human-readable name (e.g. "Rivet Opus"). */
+  instanceDisplayName: string;
+  /** Role classification (e.g. "reasoning", "fast", "research", "local"). */
+  instanceRole: string;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -237,5 +245,10 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+
+    // Agent identity — set via env vars in systemd drop-in
+    instanceId: env.LCM_INSTANCE_ID ?? toStr(pc.instanceId) ?? "",
+    instanceDisplayName: env.LCM_INSTANCE_DISPLAY_NAME ?? toStr(pc.instanceDisplayName) ?? "",
+    instanceRole: env.LCM_INSTANCE_ROLE ?? toStr(pc.instanceRole) ?? "",
   };
 }

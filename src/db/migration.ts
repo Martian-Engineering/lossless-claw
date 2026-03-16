@@ -365,6 +365,7 @@ export function runLcmMigrations(
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
       session_key TEXT,
+      agent_id TEXT,
       title TEXT,
       bootstrapped_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -491,6 +492,10 @@ export function runLcmMigrations(
   const hasBootstrappedAt = conversationColumns.some((col) => col.name === "bootstrapped_at");
   if (!hasBootstrappedAt) {
     db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
+  }
+  const hasAgentIdSqlite = conversationColumns.some((col) => col.name === "agent_id");
+  if (!hasAgentIdSqlite) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN agent_id TEXT`);
   }
 
   const hasSessionKey = conversationColumns.some((col) => col.name === "session_key");
@@ -709,9 +714,22 @@ export async function ensurePostgresSchema(db: DbClient): Promise<void> {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    -- Agent registry: tracks all brains (OpenClaw instances, local models, etc.)
+    CREATE TABLE IF NOT EXISTS agents (
+      agent_id       TEXT PRIMARY KEY,
+      display_name   TEXT,
+      model          TEXT,
+      host           TEXT,
+      role           TEXT,
+      registered_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      metadata       JSONB NOT NULL DEFAULT '{}'
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations (session_id);
     CREATE UNIQUE INDEX IF NOT EXISTS conversations_session_key_idx ON conversations (session_key) WHERE session_key IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_conversations_agent ON conversations (agent_id);
     CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS idx_messages_tsv ON messages USING GIN (content_tsv);
     CREATE INDEX IF NOT EXISTS idx_summaries_conv_created ON summaries (conversation_id, created_at);
@@ -753,6 +771,32 @@ async function migratePostgresSchema(db: DbClient): Promise<void> {
   if (!hasAgentId?.exists) {
     await db.run(`ALTER TABLE conversations ADD COLUMN agent_id TEXT`);
   }
+
+  // Create agents registry table if missing
+  const hasAgentsTable = await db.queryOne<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.tables WHERE table_name = 'agents'
+     ) AS exists`,
+  );
+  if (!hasAgentsTable?.exists) {
+    await db.run(`
+      CREATE TABLE agents (
+        agent_id       TEXT PRIMARY KEY,
+        display_name   TEXT,
+        model          TEXT,
+        host           TEXT,
+        role           TEXT,
+        registered_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        metadata       JSONB NOT NULL DEFAULT '{}'
+      )
+    `);
+  }
+
+  // Add conversations.agent_id index if missing
+  try {
+    await db.run(`CREATE INDEX IF NOT EXISTS idx_conversations_agent ON conversations (agent_id)`);
+  } catch { /* Non-fatal */ }
 
   // Add metadata columns to summaries if missing
   const hasDescendantTokenCount = await db.queryOne<{ exists: boolean }>(

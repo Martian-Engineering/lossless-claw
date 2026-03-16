@@ -50,6 +50,9 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
+    instanceId: "",
+    instanceDisplayName: "",
+    instanceRole: "",
     },
     complete: vi.fn(),
     callGateway: vi.fn(async () => ({})),
@@ -88,6 +91,7 @@ function buildLcmEngine(params: {
     info: { id: "lcm", name: "LCM", version: "0.0.0" },
     timezone: params.timezone ?? "UTC",
     getRetrieval: () => params.retrieval,
+    getInstanceId: () => undefined,
     getConversationStore: () => ({
       getConversationBySessionId: vi.fn(async () =>
         params.conversationId == null

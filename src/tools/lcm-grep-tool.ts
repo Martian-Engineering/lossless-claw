@@ -121,6 +121,10 @@ export function createLcmGrepTool(input: {
         });
       }
 
+      // Pass the caller's agent identity so search results
+      // from this agent's conversations get a ranking boost.
+      const callerAgentId = input.lcm.getInstanceId();
+
       const result = await retrieval.grep({
         query: pattern,
         mode,
@@ -129,6 +133,7 @@ export function createLcmGrepTool(input: {
         limit,
         since,
         before,
+        callerAgentId,
       });
 
       const lines: string[] = [];
