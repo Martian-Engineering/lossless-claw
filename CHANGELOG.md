@@ -6,7 +6,15 @@ This is a fork of [Martian-Engineering/lossless-claw](https://github.com/Martian
 
 ## [Unreleased] — Active Context Management
 
+### Changed
+
+- **lcm_checkpoint restore v2** — Restore is now smart about what to keep. Summaries are restored (accumulated knowledge), but stale pointers and messages are dropped (conversation-scoped, likely expired). Scratchpad is merged (checkpoint's content appended as a "Restored" section, never overwrites current). Includes time-gap reporting and an orientation message with restore statistics.
+- **lcm_budget** — Now uses configurable `contextWindow` setting instead of hardcoded 200k assumption.
+- **Plugin config** — Added `contextWindow` setting (integer, minimum 10000) to `openclaw.plugin.json` schema and UI hints.
+
 ### Added
+
+- **Suggested AGENTS.md instructions** (`docs/suggested-agents-instructions.md`) — Battle-tested behavioral rules for teaching agents to manage their own context window. Covers hygiene workflows, progressive discovery, post-compaction recovery, reading desk pattern for large documents, pointer lifecycle, and checkpoint strategy.
 
 **10 new tools:**
 

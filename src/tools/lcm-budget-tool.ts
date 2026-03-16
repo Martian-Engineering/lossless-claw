@@ -128,8 +128,7 @@ export function createLcmBudgetTool(input: {
 
       // Get context limit from config
       const contextThreshold = input.deps.config.contextThreshold ?? 0.75;
-      // Estimate a rough limit — the actual limit depends on the model
-      const limit = 200000; // default assumption
+      const limit = input.deps.config.contextWindow ?? 200000;
 
       const usagePercent = Math.round((total / limit) * 100);
 

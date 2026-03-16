@@ -241,6 +241,7 @@ For most long-lived LCM setups, a good starting point is:
 - [Configuration guide](docs/configuration.md)
 - [Architecture](docs/architecture.md)
 - [Agent tools](docs/agent-tools.md)
+- [**Suggested AGENTS.md instructions**](docs/suggested-agents-instructions.md) — battle-tested behavioral rules for teaching agents to manage their own context
 - [TUI Reference](docs/tui.md)
 - [lcm-tui](tui/README.md)
 - [Optional: enable FTS5 for fast full-text search](docs/fts5.md)

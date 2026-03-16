@@ -35,7 +35,8 @@ const LcmCheckpointSchema = Type.Object({
   restoreScratchpad: Type.Optional(
     Type.Boolean({
       description:
-        "Whether to restore scratchpad content from the checkpoint (default: false).",
+        "Whether to merge checkpoint scratchpad into current scratchpad (default: false). " +
+        "When true, appends checkpoint's scratchpad as a 'Restored' section — never overwrites current.",
     }),
   ),
   conversationId: Type.Optional(
@@ -218,26 +219,67 @@ export function createLcmCheckpointTool(input: {
             snapshotRows: currentRows,
           });
 
-          // Restore context items from checkpoint snapshot
-          const snapshot = JSON.parse(checkpoint.contextSnapshot) as unknown[];
-          summaryStore.restoreContextItemsFromSnapshot(conversationId, snapshot);
+          // ── v2 Restore: summaries only, drop pointers, merge scratchpad ──
 
-          // Optionally restore scratchpad
-          const restoreScratchpad = p.restoreScratchpad === true;
+          // Parse checkpoint snapshot and filter: keep summaries and scratchpad,
+          // drop pointers and messages (stale conversation-scoped content)
+          const snapshot = JSON.parse(checkpoint.contextSnapshot) as ContextItemRow[];
+          const summaryItems = snapshot.filter(
+            (row) => row.item_type === "summary" || row.item_type === "scratchpad",
+          );
+          const droppedPointers = snapshot.filter((row) => row.item_type === "pointer").length;
+          const droppedMessages = snapshot.filter((row) => row.item_type === "message").length;
+
+          // Re-ordinal the kept items sequentially
+          const reorderedItems = summaryItems.map((row, idx) => ({
+            ...row,
+            ordinal: idx,
+          }));
+
+          summaryStore.restoreContextItemsFromSnapshot(conversationId, reorderedItems);
+
+          // Compute time gap
+          const savedAt = checkpoint.createdAt;
+          const now = new Date();
+          const gapMs = now.getTime() - savedAt.getTime();
+          const gapDays = Math.floor(gapMs / (1000 * 60 * 60 * 24));
+          const gapHours = Math.floor(gapMs / (1000 * 60 * 60));
+          const gapLabel =
+            gapDays > 0
+              ? `${gapDays} day${gapDays !== 1 ? "s" : ""}`
+              : `${gapHours} hour${gapHours !== 1 ? "s" : ""}`;
+
+          // Merge scratchpad: keep current, append checkpoint's as reference
+          const restoreScratchpad = p.restoreScratchpad !== false; // default true in v2
+          let scratchpadMerged = false;
           if (restoreScratchpad && checkpoint.scratchpadSnapshot != null) {
-            const tokenCount = estimateTokens(checkpoint.scratchpadSnapshot);
+            const currentScratchpad = await summaryStore.getScratchpad(conversationId);
+            const currentContent = currentScratchpad?.content ?? "";
+            const savedDate = savedAt.toISOString().slice(0, 10);
+
+            const mergedContent = currentContent
+              ? `${currentContent}\n\n---\n## Restored: ${checkpoint.name} (saved ${savedDate}, ${gapLabel} ago)\n${checkpoint.scratchpadSnapshot}`
+              : `## Restored: ${checkpoint.name} (saved ${savedDate}, ${gapLabel} ago)\n${checkpoint.scratchpadSnapshot}`;
+
+            const tokenCount = estimateTokens(mergedContent);
             await summaryStore.upsertScratchpad({
               conversationId,
-              content: checkpoint.scratchpadSnapshot,
+              content: mergedContent,
               tokenCount,
             });
+            scratchpadMerged = true;
           }
+
+          // Ensure scratchpad context item exists
+          await summaryStore.ensureScratchpadContextItem(conversationId);
 
           // Mark conversation as managed
           await conversationStore.markConversationManaged(conversationId);
 
           input.deps.log.info(
-            `[lcm:checkpoint] Restored "${checkpoint.name}" (${checkpointId}): ${checkpoint.itemCount} items, ~${checkpoint.tokenCount} tokens`,
+            `[lcm:checkpoint] Restored "${checkpoint.name}" (${checkpointId}): ` +
+              `${summaryItems.length} summaries loaded, ${droppedPointers} pointers dropped, ` +
+              `${droppedMessages} messages dropped, scratchpad ${scratchpadMerged ? "merged" : "skipped"}`,
           );
 
           // Build refreshed context ref map
@@ -249,15 +291,36 @@ export function createLcmCheckpointTool(input: {
             // Non-critical
           }
 
+          // Build orientation message
+          const orientation = [
+            `[Checkpoint restored: ${checkpoint.name}]`,
+            `Saved: ${savedAt.toISOString()} | Restored: ${now.toISOString()} | Gap: ${gapLabel}`,
+            ``,
+            `Summaries restored: ${summaryItems.length} (knowledge intact)`,
+            `Pointers dropped: ${droppedPointers} (stale — use current pointers)`,
+            `Messages dropped: ${droppedMessages} (conversation-scoped, expired)`,
+            `Scratchpad: ${scratchpadMerged ? "old content merged into current" : "unchanged"}`,
+            ``,
+            `Read WORKSPACE_STATE.md to reorient.`,
+          ].join("\n");
+
           return jsonResult({
             restored: true,
             checkpointId,
             name: checkpoint.name,
-            itemCount: checkpoint.itemCount,
-            estimatedContextTokens: checkpoint.tokenCount,
+            gapLabel,
+            gapDays,
+            summariesRestored: summaryItems.length,
+            pointersDropped: droppedPointers,
+            messagesDropped: droppedMessages,
+            scratchpadMerged,
             restorePointId: rpId,
-            scratchpadRestored: restoreScratchpad && checkpoint.scratchpadSnapshot != null,
-            message: `Restored checkpoint "${checkpoint.name}" with ${checkpoint.itemCount} items (~${checkpoint.tokenCount} tokens). Restore point ${rpId} created for undo.`,
+            orientation,
+            message:
+              `Restored checkpoint "${checkpoint.name}". ` +
+              `${summaryItems.length} summaries loaded, ${droppedPointers} stale pointers dropped, ` +
+              `scratchpad ${scratchpadMerged ? "merged" : "unchanged"}. ` +
+              `Restore point ${rpId} created for undo.`,
             ...(contextMap ? { contextMap } : {}),
           });
         }

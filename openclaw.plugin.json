@@ -24,6 +24,10 @@
     "summaryProvider": {
       "label": "Summary Provider",
       "help": "Provider override for LCM summarization (e.g., 'openai-resp')"
+    },
+    "contextWindow": {
+      "label": "Context Window",
+      "help": "Model context window size in tokens (default: 200000). Used by budget tool for accurate reporting."
     }
   },
   "configSchema": {
@@ -90,6 +94,10 @@
       },
       "budgetEnabled": {
         "type": "boolean"
+      },
+      "contextWindow": {
+        "type": "integer",
+        "minimum": 10000
       }
     }
   }

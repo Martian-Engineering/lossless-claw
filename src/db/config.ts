@@ -34,6 +34,8 @@ export type LcmConfig = {
   middleCompressionThreshold: number;
   /** Fraction of token budget above which a warning is injected (0.0-1.0, default 0.7). */
   budgetWarningThreshold: number;
+  /** Model context window size in tokens (default 200000). */
+  contextWindow: number;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -148,5 +150,8 @@ export function resolveLcmConfig(
       (env.LCM_MIDDLE_COMPRESSION_THRESHOLD !== undefined ? parseInt(env.LCM_MIDDLE_COMPRESSION_THRESHOLD, 10) : undefined)
         ?? toNumber(pc.middleCompressionThreshold) ?? 50000,
     budgetWarningThreshold: toNumber(pc.budgetWarningThreshold) ?? 0.55,
+    contextWindow:
+      (env.LCM_CONTEXT_WINDOW !== undefined ? parseInt(env.LCM_CONTEXT_WINDOW, 10) : undefined)
+        ?? toNumber(pc.contextWindow) ?? 200000,
   };
 }
