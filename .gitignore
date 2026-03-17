@@ -3,6 +3,8 @@ dist/
 *.tsbuildinfo
 .DS_Store
 .worktrees
+.claude/
+data/
 
 # TUI
 tui/lcm-tui
