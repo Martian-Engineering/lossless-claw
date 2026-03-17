@@ -23,8 +23,7 @@
   ],
   "files": [
     "dist/",
-    "claude.plugin.json",
-    "docs/",
+"docs/",
     "README.md",
     "LICENSE"
   ],

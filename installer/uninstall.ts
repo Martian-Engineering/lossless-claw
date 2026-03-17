@@ -10,7 +10,9 @@ export function removeClaudeSettings(existing: any): any {
 
   const LC_COMMANDS = new Set(["lossless-claude compact", "lossless-claude restore"]);
   for (const event of Object.keys(settings.hooks)) {
-    settings.hooks[event] = settings.hooks[event].filter((h: any) => !LC_COMMANDS.has(h.command));
+    settings.hooks[event] = settings.hooks[event].filter(
+      (entry: any) => !(Array.isArray(entry.hooks) && entry.hooks.some((h: any) => LC_COMMANDS.has(h.command)))
+    );
   }
   delete settings.mcpServers["lossless-claude"];
   return settings;
@@ -76,7 +78,9 @@ export async function uninstall(): Promise<void> {
       const existing = JSON.parse(readFileSync(settingsPath, "utf-8"));
       writeFileSync(settingsPath, JSON.stringify(removeClaudeSettings(existing), null, 2));
       console.log(`Removed lossless-claude from ${settingsPath}`);
-    } catch {}
+    } catch (err) {
+      console.warn(`Warning: could not update ${settingsPath}: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   console.log("lossless-claude uninstalled.");

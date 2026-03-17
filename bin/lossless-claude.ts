@@ -31,8 +31,13 @@ async function main() {
     case "compact": {
       const { handlePreCompact } = await import("../src/hooks/compact.js");
       const { DaemonClient } = await import("../src/daemon/client.js");
+      const { loadDaemonConfig } = await import("../src/daemon/config.js");
+      const { join } = await import("node:path");
+      const { homedir } = await import("node:os");
+      const config = loadDaemonConfig(join(homedir(), ".lossless-claude", "config.json"));
+      const port = config.daemon?.port ?? 3737;
       const input = await readStdin();
-      const r = await handlePreCompact(input, new DaemonClient("http://127.0.0.1:3737"));
+      const r = await handlePreCompact(input, new DaemonClient(`http://127.0.0.1:${port}`));
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
       break;
@@ -40,8 +45,13 @@ async function main() {
     case "restore": {
       const { handleSessionStart } = await import("../src/hooks/restore.js");
       const { DaemonClient } = await import("../src/daemon/client.js");
+      const { loadDaemonConfig } = await import("../src/daemon/config.js");
+      const { join } = await import("node:path");
+      const { homedir } = await import("node:os");
+      const config = loadDaemonConfig(join(homedir(), ".lossless-claude", "config.json"));
+      const port = config.daemon?.port ?? 3737;
       const input = await readStdin();
-      const r = await handleSessionStart(input, new DaemonClient("http://127.0.0.1:3737"));
+      const r = await handleSessionStart(input, new DaemonClient(`http://127.0.0.1:${port}`));
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
       break;

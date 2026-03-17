@@ -52,7 +52,7 @@ export interface ServiceDeps {
 const defaultDeps: ServiceDeps = { spawnSync: spawnSync as any, readFileSync, writeFileSync, mkdirSync, existsSync };
 
 export function resolveBinaryPath(deps: Pick<ServiceDeps, "spawnSync" | "existsSync"> = defaultDeps): string {
-  const result = deps.spawnSync("which", ["lossless-claude"], { encoding: "utf-8" });
+  const result = deps.spawnSync("sh", ["-c", "command -v lossless-claude"], { encoding: "utf-8" });
   if (result.status === 0 && typeof result.stdout === "string" && result.stdout.trim()) {
     return result.stdout.trim();
   }
@@ -178,8 +178,7 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
 
   // 2. Check ANTHROPIC_API_KEY
   if (!process.env.ANTHROPIC_API_KEY) {
-    console.error(`ERROR: ANTHROPIC_API_KEY environment variable is not set.`);
-    process.exit(1);
+    console.warn("Warning: ANTHROPIC_API_KEY is not set. The daemon will need it at runtime — export it in your shell profile.");
   }
 
   // 3. Create config.json if not present
@@ -187,6 +186,8 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   if (!deps.existsSync(configPath)) {
     const { loadDaemonConfig } = await import("../src/daemon/config.js");
     const defaults = loadDaemonConfig("/nonexistent");
+    // Never persist the API key to disk — the daemon reads it from env at runtime
+    defaults.llm.apiKey = "";
     deps.writeFileSync(configPath, JSON.stringify(defaults, null, 2));
     console.log(`Created ${configPath}`);
   }

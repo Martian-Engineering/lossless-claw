@@ -28,16 +28,39 @@ describe("removeClaudeSettings", () => {
   it("removes lossless-claude hooks and mcpServer", () => {
     const r = removeClaudeSettings({
       hooks: {
-        PreCompact: [{ type: "command", command: "other" }, { type: "command", command: "lossless-claude compact" }],
-        SessionStart: [{ type: "command", command: "lossless-claude restore" }],
+        PreCompact: [
+          { matcher: "", hooks: [{ type: "command", command: "other" }] },
+          { matcher: "", hooks: [{ type: "command", command: "lossless-claude compact" }] },
+        ],
+        SessionStart: [
+          { matcher: "", hooks: [{ type: "command", command: "lossless-claude restore" }] },
+        ],
       },
       mcpServers: { "lossless-claude": {}, "other": {} },
     });
     expect(r.hooks.PreCompact).toHaveLength(1);
-    expect(r.hooks.PreCompact[0].command).toBe("other");
+    expect(r.hooks.PreCompact[0].hooks[0].command).toBe("other");
     expect(r.hooks.SessionStart).toHaveLength(0);
     expect(r.mcpServers["lossless-claude"]).toBeUndefined();
     expect(r.mcpServers["other"]).toBeDefined();
+  });
+
+  it("removes entry when any sub-hook matches a lossless-claude command", () => {
+    const r = removeClaudeSettings({
+      hooks: {
+        PreCompact: [
+          {
+            matcher: "",
+            hooks: [
+              { type: "command", command: "something-else" },
+              { type: "command", command: "lossless-claude compact" },
+            ],
+          },
+        ],
+      },
+      mcpServers: {},
+    });
+    expect(r.hooks.PreCompact).toHaveLength(0);
   });
 });
 

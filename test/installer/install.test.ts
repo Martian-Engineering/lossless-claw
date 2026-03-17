@@ -60,11 +60,13 @@ describe("mergeClaudeSettings", () => {
 
 describe("resolveBinaryPath", () => {
   it("returns path from which when available", () => {
+    const spawnMock = makeSpawn(0, "/usr/local/bin/lossless-claude\n");
     const deps = {
-      spawnSync: makeSpawn(0, "/usr/local/bin/lossless-claude\n"),
+      spawnSync: spawnMock,
       existsSync: vi.fn().mockReturnValue(false),
     };
     expect(resolveBinaryPath(deps)).toBe("/usr/local/bin/lossless-claude");
+    expect(spawnMock).toHaveBeenCalledWith("sh", ["-c", "command -v lossless-claude"], expect.anything());
   });
 
   it("falls back to ~/.npm-global/bin when which fails", () => {
@@ -179,6 +181,33 @@ describe("install", () => {
     await expect(install(deps)).resolves.not.toThrow();
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("cipher.yml"));
     warnSpy.mockRestore();
+    process.env.ANTHROPIC_API_KEY = originalApiKey;
+  });
+
+  it("warns (does not exit) when ANTHROPIC_API_KEY is missing", async () => {
+    const originalApiKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    const deps = makeDeps({ existsSync: vi.fn().mockReturnValue(false) });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(install(deps)).resolves.not.toThrow();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("ANTHROPIC_API_KEY"));
+    warnSpy.mockRestore();
+    process.env.ANTHROPIC_API_KEY = originalApiKey;
+  });
+
+  it("writes config.json with llm.apiKey set to empty string", async () => {
+    const originalApiKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    const writeFileMock = vi.fn();
+    const deps = makeDeps({ existsSync: vi.fn().mockReturnValue(false), writeFileSync: writeFileMock });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await install(deps);
+    warnSpy.mockRestore();
+    // Find the config.json write call
+    const configWriteCall = writeFileMock.mock.calls.find((c: any[]) => c[0].endsWith("config.json"));
+    expect(configWriteCall).toBeDefined();
+    const written = JSON.parse(configWriteCall![1]);
+    expect(written.llm.apiKey).toBe("");
     process.env.ANTHROPIC_API_KEY = originalApiKey;
   });
 

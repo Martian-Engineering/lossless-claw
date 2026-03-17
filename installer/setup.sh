@@ -97,6 +97,11 @@ if [ "$XGH_BACKEND" = "remote" ] && [ "$XGH_DRY_RUN" -eq 0 ]; then
     error "XGH_REMOTE_URL must start with http:// or https://"
     exit 1
   fi
+  # Reject URLs with characters that could corrupt YAML or enable injection
+  if [[ "$XGH_REMOTE_URL" =~ [^a-zA-Z0-9:/._@~%-] ]]; then
+    error "XGH_REMOTE_URL contains invalid characters — only alphanumerics, :, /, ., _, @, ~, - and % are allowed"
+    exit 1
+  fi
   if curl -sf --max-time 5 "${XGH_REMOTE_URL}/v1/models" >/dev/null 2>&1; then
     info "Remote server reachable ✓"
   else
@@ -160,39 +165,26 @@ if [ "$XGH_DRY_RUN" -eq 0 ]; then
     _QDRANT_STORAGE="${HOME}/.qdrant/storage"
     mkdir -p "${_QDRANT_STORAGE}"
     if [ -f "$_QDRANT_PLIST" ]; then
-      # Inject MALLOC_CONF if not already present
-      if ! grep -q "MALLOC_CONF" "$_QDRANT_PLIST" 2>/dev/null; then
-        if command -v python3 &>/dev/null; then
-          python3 - "$_QDRANT_PLIST" <<'PYEOF'
-import sys, re
-path = sys.argv[1]
-content = open(path).read()
-if '<key>MALLOC_CONF</key>' not in content:
-    inject = '''    <key>EnvironmentVariables</key>
-    <dict>
-        <key>MALLOC_CONF</key>
-        <string>background_thread:false</string>
-    </dict>
-'''
-    content = content.replace('</dict>\n</plist>', inject + '</dict>\n</plist>')
-    open(path, 'w').write(content)
-    print('Patched MALLOC_CONF into', path)
-PYEOF
-          info "Qdrant plist: injected MALLOC_CONF=background_thread:false"
-        else
-          warn "python3 not found — skipping Qdrant plist MALLOC_CONF patch (memory performance may be affected)"
-        fi
+      # Inject MALLOC_CONF if not already present (using PlistBuddy for safe XML manipulation)
+      if ! /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:MALLOC_CONF" "$_QDRANT_PLIST" &>/dev/null; then
+        /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$_QDRANT_PLIST" 2>/dev/null || true
+        /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:MALLOC_CONF string background_thread:false" "$_QDRANT_PLIST" \
+          && info "Qdrant plist: injected MALLOC_CONF=background_thread:false" \
+          || warn "Could not patch Qdrant plist — add MALLOC_CONF=background_thread:false manually"
       fi
     fi
-
-    # Clear stale WAL locks before starting (harmless if clean)
-    find "${_QDRANT_STORAGE}" -path "*/wal/open-*" -delete 2>/dev/null || true
 
     # Start Qdrant as a background service if not already running
     if ! curl -sf http://localhost:6333/healthz >/dev/null 2>&1; then
       info "Starting Qdrant background service..."
+      # Stop any lingering Qdrant process before cleaning WAL locks
       if [ -f "$_QDRANT_PLIST" ]; then
         launchctl unload "$_QDRANT_PLIST" 2>/dev/null || true
+      fi
+      # Clear stale WAL locks after service is stopped (harmless if clean)
+      find "${_QDRANT_STORAGE}" -path "*/wal/open-*" -delete 2>/dev/null || true
+      # Now start fresh
+      if [ -f "$_QDRANT_PLIST" ]; then
         launchctl load "$_QDRANT_PLIST" 2>/dev/null \
           || warn "Could not load Qdrant plist — start manually: launchctl load ${_QDRANT_PLIST}"
       else
@@ -244,6 +236,7 @@ PYEOF
       # Install Ollama if not present
       if ! command -v ollama &>/dev/null; then
         info "Installing Ollama..."
+        # Trust: official Ollama install script — https://github.com/ollama/ollama#install
         curl -fsSL https://ollama.com/install.sh | sh
       fi
 
@@ -405,7 +398,13 @@ print('yes' if '${1}' in ids else 'no')
     LLM_MODELS=("${OLLAMA_LLM_MODELS[@]}")
     EMBED_MODELS=("${OLLAMA_EMBED_MODELS[@]}")
     CUSTOM_LABEL="Ollama model name (e.g. llama3.2:3b)"
-    _model_available() { ollama list 2>/dev/null | grep -q "^${1}[[:space:]]"; }
+    _model_available() {
+      # Ensure Ollama service is reachable before listing models
+      if ! curl -sf --max-time 2 http://localhost:11434 >/dev/null 2>&1; then
+        return 1
+      fi
+      ollama list 2>/dev/null | grep -q "^${1}[[:space:]]"
+    }
   fi
 
   # Reorder model lists: installed models first, suggestions after
