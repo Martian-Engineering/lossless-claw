@@ -62,17 +62,33 @@ async function main() {
       break;
     }
     case "install": {
+      const dryRun = argv.includes("--dry-run");
       const { install } = await import("../installer/install.js");
-      await install();
+      if (dryRun) {
+        const { DryRunServiceDeps } = await import("../installer/dry-run-deps.js");
+        console.log("\n  lossless-claude install --dry-run\n");
+        await install(new DryRunServiceDeps());
+        console.log("\n  No changes written.");
+      } else {
+        await install();
+      }
       break;
     }
     case "uninstall": {
+      const dryRun = argv.includes("--dry-run");
       const { uninstall } = await import("../installer/uninstall.js");
-      await uninstall();
+      if (dryRun) {
+        const { DryRunServiceDeps } = await import("../installer/dry-run-deps.js");
+        console.log("\n  lossless-claude uninstall --dry-run\n");
+        await uninstall(new DryRunServiceDeps());
+        console.log("\n  No changes written.");
+      } else {
+        await uninstall();
+      }
       break;
     }
     default:
-      console.error("Usage: lossless-claude <daemon|compact|restore|mcp|install|uninstall>");
+      console.error("Usage: lossless-claude <daemon|compact|restore|mcp|install|uninstall> [--dry-run]");
       exit(1);
   }
 }
