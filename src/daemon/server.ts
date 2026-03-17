@@ -1,6 +1,14 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { DaemonConfig } from "./config.js";
+import { createCompactHandler } from "./routes/compact.js";
+import { createRestoreHandler } from "./routes/restore.js";
+import { createGrepHandler } from "./routes/grep.js";
+import { createSearchHandler } from "./routes/search.js";
+import { createExpandHandler } from "./routes/expand.js";
+import { createDescribeHandler } from "./routes/describe.js";
+import { createStoreHandler } from "./routes/store.js";
+import { createRecentHandler } from "./routes/recent.js";
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
 export type DaemonInstance = { address: () => AddressInfo; stop: () => Promise<void>; registerRoute: (method: string, path: string, handler: RouteHandler) => void };
@@ -23,6 +31,14 @@ export async function createDaemon(config: DaemonConfig): Promise<DaemonInstance
 
   routes.set("GET /health", async (_req, res) =>
     sendJson(res, 200, { status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) }));
+  routes.set("POST /compact", createCompactHandler(config));
+  routes.set("POST /restore", createRestoreHandler(config));
+  routes.set("POST /grep", createGrepHandler(config));
+  routes.set("POST /search", createSearchHandler(config));
+  routes.set("POST /expand", createExpandHandler(config));
+  routes.set("POST /describe", createDescribeHandler(config));
+  routes.set("POST /store", createStoreHandler(config));
+  routes.set("POST /recent", createRecentHandler(config));
 
   const server: Server = createServer(async (req, res) => {
     const key = `${req.method} ${req.url?.split("?")[0]}`;
