@@ -1,6 +1,8 @@
 # lossless-claude
 
-Lossless Context Management plugin for [Claude Code](https://github.com/anthropics/claude-code), based on the [LCM paper](https://papers.voltropy.com/LCM) from [Voltropy](https://x.com/Voltropy). Replaces Claude Code's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
+A fork and reinterpretation of [lossless-claw](https://github.com/Martian-Engineering/lossless-claude) by [Martian Engineering](https://martian.engineering), adapted specifically for [Claude Code](https://github.com/anthropics/claude-code). The core ideas — DAG-based summarization, lossless message retention, and the LCM model from [Voltropy](https://x.com/Voltropy) — are theirs. This fork rewires the integration layer for Claude Code's plugin API, replaces the provider abstraction with the Anthropic SDK directly, and ships as a native Claude Code plugin.
+
+Replaces Claude Code's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
 
 ## Table of contents
 
@@ -247,6 +249,12 @@ tui/                        # Interactive terminal UI (Go)
   prompts/                  # Depth-aware prompt templates
 .goreleaser.yml             # GoReleaser config for TUI binary releases
 ```
+
+## Acknowledgments
+
+lossless-claude stands on the shoulders of [lossless-claw](https://github.com/Martian-Engineering/lossless-claude), the original implementation by [Martian Engineering](https://martian.engineering). The DAG-based compaction architecture, the LCM memory model, and the foundational design decisions all originate there. This fork would not exist without their work — we're grateful for it and for making it open source.
+
+The underlying theory comes from the [LCM paper](https://papers.voltropy.com/LCM) by [Voltropy](https://x.com/Voltropy).
 
 ## License
 
