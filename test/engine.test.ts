@@ -862,6 +862,74 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[2]?.role).toBe("user");
   });
 
+  it("rebuilds raw function_call blocks from stored columns when raw arguments are objects", async () => {
+    const engine = createEngine();
+    const sessionId = "session-openai-function-call-raw-arguments-object";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "function_call",
+            call_id: "fc_raw",
+            name: "bash",
+            arguments: '{"cmd":"pwd"}',
+          },
+        ],
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(1);
+
+    const parts = await engine.getConversationStore().getMessageParts(storedMessages[0].messageId);
+    expect(parts).toHaveLength(1);
+
+    const db = (engine.getConversationStore() as unknown as {
+      db: { prepare: (sql: string) => { run: (metadata: string, partId: string) => void } };
+    }).db;
+
+    const metadata = JSON.parse(parts[0].metadata ?? "{}") as {
+      raw?: Record<string, unknown>;
+    };
+    expect(metadata.raw?.arguments).toBe('{"cmd":"pwd"}');
+    metadata.raw = {
+      ...(metadata.raw ?? {}),
+      arguments: { cmd: "pwd" },
+    };
+    db.prepare("UPDATE message_parts SET metadata = ? WHERE part_id = ?").run(
+      JSON.stringify(metadata),
+      parts[0].partId,
+    );
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const assistant = assembled.messages[0] as {
+      role: string;
+      content?: Array<{ type?: string; call_id?: string; arguments?: unknown }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content).toEqual([
+      {
+        type: "function_call",
+        call_id: "fc_raw",
+        name: "bash",
+        arguments: '{"cmd":"pwd"}',
+      },
+    ]);
+  });
+
   it("omits dynamic LCM system prompt guidance when no summaries exist", async () => {
     const engine = createEngine();
     const sessionId = "session-no-summary-guidance";
@@ -988,7 +1056,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
 });
 
 describe("LcmContextEngine fidelity and token budget", () => {
-  it("normalizes tool_result blocks instead of returning raw metadata verbatim", async () => {
+  it("normalizes tool_result blocks without inflating stored token accounting", async () => {
     // Verify that tool_result blocks with large raw metadata blobs are
     // normalized through toolResultBlockFromPart rather than returned
     // verbatim. Raw metadata should NOT leak into the assembled payload —
@@ -999,10 +1067,20 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
     await engine.ingest({
       sessionId,
-      message: makeMessage({
+      message: {
         role: "assistant",
         content: [
-          { type: "text", text: "small visible text" },
+          { type: "toolCall", id: "call_large_raw", name: "read", input: { path: "foo.txt" } },
+        ],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_large_raw",
+        content: [
           {
             type: "tool_result",
             tool_use_id: "call_large_raw",
@@ -1012,12 +1090,15 @@ describe("LcmContextEngine fidelity and token budget", () => {
             },
           },
         ],
-      }),
+      } as AgentMessage,
     });
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
 
+    const contextTokens = await engine
+      .getSummaryStore()
+      .getContextTokenCount(conversation!.conversationId);
     const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
     const assembled = await assembler.assemble({
       conversationId: conversation!.conversationId,
@@ -1028,6 +1109,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     // The assembled payload should be small — the 24K raw metadata blob
     // must NOT appear in the output. Tool results use dedicated columns,
     // not the raw metadata object.
+    expect(contextTokens).toBe(assembledPayloadTokens);
     expect(assembledPayloadTokens).toBeLessThan(500);
   });
 
@@ -1091,6 +1173,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(assembledMessage.toolCallId).toBe("call_123");
     expect(Array.isArray(assembledMessage.content)).toBe(true);
     expect((assembledMessage.content as Array<{ type?: string }>)[0]?.type).toBe("tool_result");
+    expect(
+      (assembledMessage.content as Array<{ content?: unknown }>)[0]?.content,
+    ).toEqual([{ type: "text", text: "command output" }]);
   });
 
   it("preserves toolName through ingest-assemble round-trip for Gemini compatibility", async () => {

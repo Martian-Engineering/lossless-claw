@@ -216,6 +216,25 @@ describe("toolResultBlockFromPart", () => {
 
     expect(block.output).toBe("");
   });
+
+  it("preserves raw content when no normalized output columns are present", () => {
+    const part = makePart({
+      toolCallId: "toolu_content",
+      toolName: "read",
+      textContent: null,
+      toolOutput: null,
+    });
+    const block = toolResultBlockFromPart(part, "tool_result", {
+      type: "tool_result",
+      tool_use_id: "toolu_content",
+      content: [{ type: "text", text: "command output" }],
+    }) as Record<string, unknown>;
+
+    expect(block.type).toBe("tool_result");
+    expect(block.tool_use_id).toBe("toolu_content");
+    expect(block.content).toEqual([{ type: "text", text: "command output" }]);
+    expect(block).not.toHaveProperty("output");
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -351,6 +370,32 @@ describe("blockFromPart", () => {
     expect(block.type).toBe("function_call_output");
     expect(block.call_id).toBe("call-1");
     expect(block.output).toBe("file contents");
+  });
+
+  it("preserves raw tool_result content when dedicated output columns are empty", () => {
+    const part = makePart({
+      partType: "tool",
+      toolCallId: "call-content",
+      toolName: "read",
+      toolOutput: null,
+      textContent: null,
+      metadata: JSON.stringify({
+        rawType: "tool_result",
+        originalRole: "toolResult",
+        raw: {
+          type: "tool_result",
+          tool_use_id: "call-content",
+          content: [{ type: "text", text: "command output" }],
+          metadata: { raw: "ignored" },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.type).toBe("tool_result");
+    expect(block.tool_use_id).toBe("call-content");
+    expect(block.content).toEqual([{ type: "text", text: "command output" }]);
+    expect(block).not.toHaveProperty("metadata");
   });
 
   it("falls back to text block for text parts without metadata", () => {

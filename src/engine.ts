@@ -14,7 +14,7 @@ import type {
   SubagentEndReason,
   SubagentSpawnPreparation,
 } from "openclaw/plugin-sdk";
-import { ContextAssembler } from "./assembler.js";
+import { blockFromPart, ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
@@ -35,6 +35,7 @@ import { RetrievalEngine } from "./retrieval.js";
 import {
   ConversationStore,
   type CreateMessagePartInput,
+  type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
@@ -208,6 +209,58 @@ function isTextBlock(value: unknown): value is { type: "text"; text: string } {
   }
   const record = value as Record<string, unknown>;
   return record.type === "text" && typeof record.text === "string";
+}
+
+function toSyntheticMessagePartRecord(
+  part: CreateMessagePartInput,
+  messageId: number,
+): MessagePartRecord {
+  return {
+    partId: `estimate-part-${part.ordinal}`,
+    messageId,
+    sessionId: part.sessionId,
+    partType: part.partType,
+    ordinal: part.ordinal,
+    textContent: part.textContent ?? null,
+    toolCallId: part.toolCallId ?? null,
+    toolName: part.toolName ?? null,
+    toolInput: part.toolInput ?? null,
+    toolOutput: part.toolOutput ?? null,
+    metadata: part.metadata ?? null,
+  };
+}
+
+function normalizeMessageContentForStorage(params: {
+  message: AgentMessage;
+  fallbackContent: string;
+}): unknown {
+  const { message, fallbackContent } = params;
+  if (!("content" in message)) {
+    return fallbackContent;
+  }
+
+  const role = toRuntimeRoleForTokenEstimate(message.role);
+  const parts = buildMessageParts({
+    sessionId: "storage-estimate",
+    message,
+    fallbackContent,
+  }).map((part) => toSyntheticMessagePartRecord(part, 0));
+
+  if (parts.length === 0) {
+    if (role === "assistant") {
+      return fallbackContent ? [{ type: "text", text: fallbackContent }] : [];
+    }
+    if (role === "toolResult") {
+      return [{ type: "text", text: fallbackContent }];
+    }
+    return fallbackContent;
+  }
+
+  const blocks = parts.map(blockFromPart);
+  if (role === "user" && blocks.length === 1 && isTextBlock(blocks[0])) {
+    return blocks[0].text;
+  }
+  return blocks;
 }
 
 /**
@@ -437,11 +490,18 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
         ? `$ ${(message as { command: string; output: string }).command}\n${(message as { command: string; output: string }).output}`
         : "";
   const runtimeRole = toRuntimeRoleForTokenEstimate(message.role);
+  const normalizedContent =
+    "content" in message
+      ? normalizeMessageContentForStorage({
+          message,
+          fallbackContent: content,
+        })
+      : content;
   const tokenCount =
     "content" in message
       ? estimateContentTokensForRole({
           role: runtimeRole,
-          content: message.content,
+          content: normalizedContent,
           fallbackContent: content,
         })
       : estimateTokens(content);
