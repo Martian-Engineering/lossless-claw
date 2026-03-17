@@ -5,6 +5,7 @@ import {
   buildLaunchdPlist,
   buildSystemdUnit,
   setupDaemonService,
+  install,
   type ServiceDeps,
 } from "../../installer/install.js";
 import { homedir } from "node:os";
@@ -18,12 +19,14 @@ function makeSpawn(status = 0, stdout = "") {
 
 function makeDeps(overrides: Partial<ServiceDeps> = {}): ServiceDeps & {
   spawnSync: ReturnType<typeof vi.fn>;
+  readFileSync: ReturnType<typeof vi.fn>;
   writeFileSync: ReturnType<typeof vi.fn>;
   mkdirSync: ReturnType<typeof vi.fn>;
   existsSync: ReturnType<typeof vi.fn>;
 } {
   return {
     spawnSync: makeSpawn(),
+    readFileSync: vi.fn().mockReturnValue("{}"),
     writeFileSync: vi.fn(),
     mkdirSync: vi.fn(),
     existsSync: vi.fn().mockReturnValue(false),
@@ -162,5 +165,48 @@ describe("setupDaemonService", () => {
     );
     expect(serviceCmds).toHaveLength(0);
     warnSpy.mockRestore();
+  });
+});
+
+// ─── install ────────────────────────────────────────────────────────────────
+
+describe("install", () => {
+  it("accepts deps parameter and warns when cipher.yml is missing", async () => {
+    const originalApiKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    const deps = makeDeps({ existsSync: vi.fn().mockReturnValue(false) });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(install(deps)).resolves.not.toThrow();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("cipher.yml"));
+    warnSpy.mockRestore();
+    process.env.ANTHROPIC_API_KEY = originalApiKey;
+  });
+
+  it("invokes setup.sh as step 0 before other steps", async () => {
+    const originalApiKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    const spawnMock = makeSpawn(0);
+    const deps = makeDeps({ spawnSync: spawnMock, existsSync: vi.fn().mockReturnValue(false) });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await install(deps);
+    const firstCall = spawnMock.mock.calls[0];
+    expect(firstCall[0]).toBe("bash");
+    expect(firstCall[1][0]).toContain("setup.sh");
+    warnSpy.mockRestore();
+    process.env.ANTHROPIC_API_KEY = originalApiKey;
+  });
+
+  it("continues when setup.sh exits non-zero", async () => {
+    const originalApiKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    const deps = makeDeps({
+      spawnSync: makeSpawn(1),
+      existsSync: vi.fn().mockReturnValue(false),
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(install(deps)).resolves.not.toThrow();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("setup.sh"));
+    warnSpy.mockRestore();
+    process.env.ANTHROPIC_API_KEY = originalApiKey;
   });
 });
