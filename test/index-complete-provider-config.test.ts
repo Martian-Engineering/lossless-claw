@@ -156,7 +156,7 @@ describe("createLcmDependencies.complete provider config resolution", () => {
       model: "unit-model",
     });
 
-    expect(loadConfig).toHaveBeenCalledTimes(1);
+    expect(loadConfig).toHaveBeenCalled();
     expect(piAiMock.completeSimple).toHaveBeenCalledTimes(1);
     expect(piAiMock.completeSimple).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -257,6 +257,93 @@ describe("createLcmDependencies.complete provider config resolution", () => {
       }),
       expect.any(Object),
       expect.any(Object),
+    );
+  });
+
+  it("adapts native ollama known models onto the openai-compatible local /v1 lane", async () => {
+    piAiMock.getModel.mockReturnValue({
+      id: "qwen2.5:14b",
+      provider: "ollama",
+      api: "ollama",
+      name: "Qwen 2.5 14B",
+    });
+
+    await callComplete({
+      loadConfigResult: {
+        models: {
+          providers: {
+            ollama: {
+              api: "ollama",
+              baseUrl: "http://127.0.0.1:11434",
+            },
+          },
+        },
+      },
+      provider: "ollama",
+      model: "qwen2.5:14b",
+      runtimeConfig: {
+        models: {
+          providers: {
+            ollama: {
+              api: "ollama",
+              baseUrl: "http://127.0.0.1:11434",
+            },
+          },
+        },
+      },
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "qwen2.5:14b",
+        provider: "ollama",
+        api: "openai-completions",
+        baseUrl: "http://127.0.0.1:11434/v1",
+      }),
+      expect.any(Object),
+      expect.objectContaining({
+        apiKey: "ollama-local",
+        maxTokens: 256,
+      }),
+    );
+  });
+
+  it("falls back to api.config provider details when runtimeConfig omits them", async () => {
+    piAiMock.getModel.mockReturnValue({
+      id: "qwen2.5:14b",
+      provider: "ollama",
+      api: "ollama",
+      name: "Qwen 2.5 14B",
+    });
+
+    await callComplete({
+      loadConfigResult: {
+        models: {
+          providers: {
+            ollama: {
+              api: "ollama",
+              baseUrl: "http://127.0.0.1:11434",
+              apiKey: "ollama-local",
+            },
+          },
+        },
+      },
+      provider: "ollama",
+      model: "qwen2.5:14b",
+      runtimeConfig: {},
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "qwen2.5:14b",
+        provider: "ollama",
+        api: "openai-completions",
+        baseUrl: "http://127.0.0.1:11434/v1",
+      }),
+      expect.any(Object),
+      expect.objectContaining({
+        apiKey: "ollama-local",
+      }),
     );
   });
 });

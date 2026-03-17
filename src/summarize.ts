@@ -37,16 +37,23 @@ function normalizeProviderId(provider: string): string {
   return provider.trim().toLowerCase();
 }
 
-/**
- * Resolve provider API override from legacy OpenClaw config.
- *
- * When model ids are custom/forward-compat, this hint allows deps.complete to
- * construct a valid pi-ai Model object even if getModel(provider, model) misses.
- */
-function resolveProviderApiFromLegacyConfig(
+type LegacyProviderConfig = Record<string, unknown> & {
+  api?: unknown;
+  baseUrl?: unknown;
+  apiKey?: unknown;
+};
+
+type SummarizerRuntimeProviderAdaptation = {
+  providerApi?: string;
+  runtimeConfig: unknown;
+  apiKey?: string;
+};
+
+/** Resolve full provider config from legacy OpenClaw runtime config. */
+function resolveProviderConfigFromLegacyConfig(
   config: unknown,
   provider: string,
-): string | undefined {
+): LegacyProviderConfig | undefined {
   if (!config || typeof config !== "object") {
     return undefined;
   }
@@ -58,10 +65,7 @@ function resolveProviderApiFromLegacyConfig(
 
   const direct = providers[provider];
   if (direct && typeof direct === "object") {
-    const api = (direct as { api?: unknown }).api;
-    if (typeof api === "string" && api.trim()) {
-      return api.trim();
-    }
+    return direct as LegacyProviderConfig;
   }
 
   const normalizedProvider = normalizeProviderId(provider);
@@ -72,12 +76,101 @@ function resolveProviderApiFromLegacyConfig(
     if (!value || typeof value !== "object") {
       continue;
     }
-    const api = (value as { api?: unknown }).api;
-    if (typeof api === "string" && api.trim()) {
-      return api.trim();
-    }
+    return value as LegacyProviderConfig;
   }
   return undefined;
+}
+
+/** Copy legacy runtime config while overriding a single provider entry. */
+function overrideLegacyProviderConfig(
+  runtimeConfig: unknown,
+  provider: string,
+  override: LegacyProviderConfig,
+): unknown {
+  if (!isRecord(runtimeConfig)) {
+    return runtimeConfig;
+  }
+
+  const models = isRecord(runtimeConfig.models) ? runtimeConfig.models : {};
+  const providers = isRecord(models.providers) ? models.providers : {};
+  const nextProviders: Record<string, unknown> = { ...providers };
+
+  let providerKey = provider;
+  const normalizedProvider = normalizeProviderId(provider);
+  for (const key of Object.keys(providers)) {
+    if (normalizeProviderId(key) === normalizedProvider) {
+      providerKey = key;
+      break;
+    }
+  }
+
+  nextProviders[providerKey] = override;
+
+  return {
+    ...runtimeConfig,
+    models: {
+      ...models,
+      providers: nextProviders,
+    },
+  };
+}
+
+/** Pi-ai expects Ollama through the OpenAI-compatible `/v1` surface. */
+function normalizeOllamaBaseUrl(baseUrl: string | undefined): string | undefined {
+  const trimmed = baseUrl?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const withoutTrailingSlash = trimmed.replace(/\/+$/, "");
+  if (/\/v1$/i.test(withoutTrailingSlash)) {
+    return withoutTrailingSlash;
+  }
+  return `${withoutTrailingSlash}/v1`;
+}
+
+/** Adapt native OpenClaw Ollama provider config into pi-ai compatible inputs. */
+function adaptSummarizerRuntimeProvider(params: {
+  runtimeConfig: unknown;
+  provider: string;
+  apiKey?: string;
+}): SummarizerRuntimeProviderAdaptation {
+  const providerConfig = resolveProviderConfigFromLegacyConfig(params.runtimeConfig, params.provider);
+  const providerApi =
+    typeof providerConfig?.api === "string" && providerConfig.api.trim()
+      ? providerConfig.api.trim()
+      : undefined;
+
+  if (!providerApi || normalizeProviderId(providerApi) !== "ollama") {
+    return {
+      providerApi,
+      runtimeConfig: params.runtimeConfig,
+      apiKey: params.apiKey,
+    };
+  }
+
+  const normalizedBaseUrl = normalizeOllamaBaseUrl(
+    typeof providerConfig.baseUrl === "string" ? providerConfig.baseUrl : undefined,
+  );
+  const adaptedProviderConfig: LegacyProviderConfig = {
+    ...providerConfig,
+    api: "openai-completions",
+    ...(normalizedBaseUrl ? { baseUrl: normalizedBaseUrl } : {}),
+  };
+  const configApiKey =
+    typeof providerConfig.apiKey === "string" && providerConfig.apiKey.trim()
+      ? providerConfig.apiKey.trim()
+      : undefined;
+
+  return {
+    providerApi: "openai-completions",
+    runtimeConfig: overrideLegacyProviderConfig(
+      params.runtimeConfig,
+      params.provider,
+      adaptedProviderConfig,
+    ),
+    apiKey: params.apiKey ?? configApiKey ?? "ollama-local",
+  };
 }
 
 /** Approximate token estimate used for target-sizing prompts. */
@@ -670,7 +763,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     typeof params.legacyParams.agentDir === "string" && params.legacyParams.agentDir.trim()
       ? params.legacyParams.agentDir.trim()
       : undefined;
-  const providerApi = resolveProviderApiFromLegacyConfig(params.legacyParams.config, provider);
 
   const condensedTargetTokens =
     Number.isFinite(params.deps.config.condensedTargetTokens) &&
@@ -689,8 +781,13 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
     const mode: SummaryMode = aggressive ? "aggressive" : "normal";
     const isCondensed = options?.isCondensed === true;
-    const apiKey = await params.deps.getApiKey(provider, model, {
+    const resolvedApiKey = await params.deps.getApiKey(provider, model, {
       profileId: authProfileId,
+    });
+    const runtimeProvider = adaptSummarizerRuntimeProvider({
+      runtimeConfig: params.legacyParams.config,
+      provider,
+      apiKey: resolvedApiKey,
     });
     const targetTokens = resolveTargetTokens({
       inputTokens: estimateTokens(text),
@@ -720,11 +817,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     const result = await params.deps.complete({
       provider,
       model,
-      apiKey,
-      providerApi,
+      apiKey: runtimeProvider.apiKey,
+      providerApi: runtimeProvider.providerApi,
       authProfileId,
       agentDir,
-      runtimeConfig: params.legacyParams.config,
+      runtimeConfig: runtimeProvider.runtimeConfig,
       system: LCM_SUMMARIZER_SYSTEM_PROMPT,
       messages: [
         {
@@ -778,11 +875,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         const retryResult = await params.deps.complete({
           provider,
           model,
-          apiKey,
-          providerApi,
+          apiKey: runtimeProvider.apiKey,
+          providerApi: runtimeProvider.providerApi,
           authProfileId,
           agentDir,
-          runtimeConfig: params.legacyParams.config,
+          runtimeConfig: runtimeProvider.runtimeConfig,
           system: LCM_SUMMARIZER_SYSTEM_PROMPT,
           messages: [
             {

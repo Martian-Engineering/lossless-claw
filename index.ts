@@ -332,6 +332,37 @@ function resolveProviderApiFromRuntimeConfig(
   return typeof api === "string" && api.trim() ? api.trim() : undefined;
 }
 
+/** Resolve full provider config from runtime config if available. */
+function resolveProviderConfigFromRuntimeConfig(
+  runtimeConfig: unknown,
+  provider: string,
+): Record<string, unknown> | undefined {
+  if (!isRecord(runtimeConfig)) {
+    return undefined;
+  }
+  const providers = (runtimeConfig as { models?: { providers?: Record<string, unknown> } }).models
+    ?.providers;
+  if (!providers || !isRecord(providers)) {
+    return undefined;
+  }
+  const value = findProviderConfigValue(providers, provider);
+  return isRecord(value) ? value : undefined;
+}
+
+/** Pi-ai expects Ollama through the OpenAI-compatible /v1 surface. */
+function normalizeOllamaBaseUrl(baseUrl: string | undefined): string | undefined {
+  const trimmed = baseUrl?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const withoutTrailingSlash = trimmed.replace(/\/+$/, "");
+  if (/\/v1$/i.test(withoutTrailingSlash)) {
+    return withoutTrailingSlash;
+  }
+  return `${withoutTrailingSlash}/v1`;
+}
+
 /** Resolve runtime.modelAuth from plugin runtime when available. */
 function getRuntimeModelAuth(api: OpenClawPluginApi): RuntimeModelAuth | undefined {
   const runtime = api.runtime as OpenClawPluginApi["runtime"] & {
@@ -897,11 +928,54 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           }
         }
 
+        const loadedRuntimeConfig = (() => {
+          try {
+            return api.runtime.config.loadConfig();
+          } catch {
+            return undefined;
+          }
+        })();
+
+        const providerConfig =
+          resolveProviderConfigFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
+          resolveProviderConfigFromRuntimeConfig(api.config, providerId) ||
+          resolveProviderConfigFromRuntimeConfig(loadedRuntimeConfig, providerId);
+        let effectiveProviderApi =
+          providerApi?.trim() ||
+          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
+          resolveProviderApiFromRuntimeConfig(api.config, providerId) ||
+          resolveProviderApiFromRuntimeConfig(loadedRuntimeConfig, providerId);
+        let providerLevelConfig: Record<string, unknown> = providerConfig ? { ...providerConfig } : {};
+        let preferredApiKey = apiKey?.trim();
+
+        if (
+          normalizeProviderId(providerId) === "ollama" &&
+          normalizeProviderId(effectiveProviderApi ?? "ollama") === "ollama"
+        ) {
+          effectiveProviderApi = "openai-completions";
+          const normalizedBaseUrl = normalizeOllamaBaseUrl(
+            typeof providerLevelConfig.baseUrl === "string" ? providerLevelConfig.baseUrl : undefined,
+          );
+          providerLevelConfig = {
+            ...providerLevelConfig,
+            api: "openai-completions",
+            ...(normalizedBaseUrl ? { baseUrl: normalizedBaseUrl } : {}),
+          };
+          if (!preferredApiKey && typeof providerConfig?.apiKey === "string" && providerConfig.apiKey.trim()) {
+            preferredApiKey = providerConfig.apiKey.trim();
+          }
+          if (!preferredApiKey) {
+            preferredApiKey = "ollama-local";
+          }
+        }
+
         const knownModel =
           typeof mod.getModel === "function" ? mod.getModel(providerId, modelId) : undefined;
         const fallbackApi =
-          providerApi?.trim() ||
-          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
+          effectiveProviderApi?.trim() ||
+          (typeof providerLevelConfig.api === "string" && providerLevelConfig.api.trim()
+            ? providerLevelConfig.api.trim()
+            : undefined) ||
           (() => {
             if (typeof mod.getModels !== "function") {
               return undefined;
@@ -915,20 +989,12 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           })() ||
           inferApiFromProvider(providerId);
 
-        // Resolve provider-level config (baseUrl, headers, etc.) from runtime config.
-        // Custom/proxy providers (e.g. bailian, local proxies) store their baseUrl and
-        // apiKey under models.providers.<provider> in openclaw.json.  Without this
-        // lookup the resolved model object lacks baseUrl, which crashes pi-ai's
-        // detectCompat() ("Cannot read properties of undefined (reading 'includes')"),
-        // and the apiKey is unresolvable, causing 401 errors.  See #19.
-        const providerLevelConfig: Record<string, unknown> = (() => {
-          if (!isRecord(effectiveRuntimeConfig)) return {};
-          const providers = (effectiveRuntimeConfig as { models?: { providers?: Record<string, unknown> } })
-            .models?.providers;
-          if (!providers) return {};
-          const cfg = findProviderConfigValue(providers, providerId);
-          return isRecord(cfg) ? cfg : {};
-        })();
+        const resolvedKnownModelApi =
+          effectiveProviderApi?.trim() ||
+          (typeof providerLevelConfig.api === "string" && providerLevelConfig.api.trim()
+            ? providerLevelConfig.api.trim()
+            : undefined) ||
+          knownModel.api;
 
         const resolvedModel =
           isRecord(knownModel) &&
@@ -939,7 +1005,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 ...knownModel,
                 id: knownModel.id,
                 provider: knownModel.provider,
-                api: knownModel.api,
+                api: resolvedKnownModelApi,
                 // Merge baseUrl/headers from provider config if not already on the model.
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
@@ -978,7 +1044,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                   : {}),
               };
 
-        let resolvedApiKey = apiKey?.trim();
+        let resolvedApiKey = preferredApiKey;
         if (!resolvedApiKey && modelAuth) {
           try {
             resolvedApiKey = resolveApiKeyFromAuthResult(
