@@ -88,10 +88,14 @@ if [ "$XGH_BACKEND" = "remote" ] && [ "$XGH_DRY_RUN" -eq 0 ]; then
       read -r -p "  Remote server URL [http://192.168.1.x:11434]: " XGH_REMOTE_URL
     fi
     XGH_REMOTE_URL="${XGH_REMOTE_URL:-}"
-    if [[ ! "$XGH_REMOTE_URL" =~ ^https?:// ]]; then
-      echo -e "  ${RED}▸${NC} URL must start with http:// or https://" >&2
+    if [ -z "$XGH_REMOTE_URL" ]; then
+      error "XGH_REMOTE_URL is required for the remote backend — set it via environment variable or rerun interactively"
       exit 1
     fi
+  fi
+  if [[ ! "$XGH_REMOTE_URL" =~ ^https?:// ]]; then
+    error "XGH_REMOTE_URL must start with http:// or https://"
+    exit 1
   fi
   if curl -sf --max-time 5 "${XGH_REMOTE_URL}/v1/models" >/dev/null 2>&1; then
     info "Remote server reachable ✓"
@@ -101,21 +105,28 @@ if [ "$XGH_BACKEND" = "remote" ] && [ "$XGH_DRY_RUN" -eq 0 ]; then
 fi
 
 # ── 1. Backend-specific dependencies ──────────────────────────────────────────
+
+# Ensure Homebrew is available on macOS; no-op on other platforms.
+# Installs brew interactively if missing and stdin is a TTY; aborts otherwise.
+_ensure_brew() {
+  if [[ "$(uname)" != "Darwin" ]]; then return; fi
+  if command -v brew &>/dev/null; then return; fi
+  if [ -t 0 ]; then
+    info "Homebrew not found — installing (official installer)"
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  else
+    error "Homebrew is required but not installed, and no interactive terminal is available — install it first: https://brew.sh"
+    exit 1
+  fi
+}
+
 if [ "$XGH_DRY_RUN" -eq 0 ]; then
   lane "Installing backend dependencies"
-
-  if ! command -v brew &>/dev/null; then
-    if [ -t 0 ]; then
-      info "Homebrew not found — installing (official installer)"
-      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    else
-      warn "Homebrew not found and no interactive terminal available — install manually: https://brew.sh"
-    fi
-  fi
 
   # ── Backend-specific dependencies ───────────────────────
   if [ "$XGH_BACKEND" = "vllm-mlx" ]; then
     # ── Apple Silicon: vllm-mlx + Qdrant via Homebrew ────
+    _ensure_brew
 
     # Install uv (Python package installer) if not present
     if ! command -v uv &>/dev/null; then
@@ -193,7 +204,8 @@ PYEOF
 
   elif [ "$XGH_BACKEND" = "ollama" ]; then
     if [[ "$(uname)" == "Darwin" ]]; then
-      # ── macOS Intel: Ollama + Qdrant via Homebrew ────────
+      # ── macOS: Ollama + Qdrant via Homebrew ────────
+      _ensure_brew
       if ! command -v ollama &>/dev/null; then
         info "Installing Ollama via Homebrew..."
         brew install ollama 2>/dev/null || warn "Could not install Ollama via brew — install manually: brew install ollama"
@@ -209,6 +221,12 @@ PYEOF
         info "Installing Qdrant via Homebrew..."
         brew install qdrant 2>/dev/null || warn "Could not install Qdrant via brew — install manually: brew install qdrant"
       fi
+
+      if ! command -v qdrant &>/dev/null && ! [ -x "${HOME}/.qdrant/bin/qdrant" ]; then
+        warn "Qdrant not found after install attempt — install manually via Homebrew (brew install qdrant) or place the binary at ${HOME}/.qdrant/bin/qdrant"
+        exit 1
+      fi
+      info "Qdrant: $(command -v qdrant 2>/dev/null || echo "${HOME}/.qdrant/bin/qdrant")"
 
       # Start services via brew
       if ! curl -sf http://localhost:11434 >/dev/null 2>&1; then
@@ -285,6 +303,7 @@ QDRANTSVCEOF
     # Install Qdrant locally (arch-aware, same as Ollama path)
     if ! command -v qdrant &>/dev/null && ! [ -x "${HOME}/.qdrant/bin/qdrant" ]; then
       if [[ "$(uname)" == "Darwin" ]]; then
+        _ensure_brew
         info "Installing Qdrant via Homebrew..."
         brew install qdrant 2>/dev/null || warn "Could not install Qdrant via brew — install manually"
       else
@@ -342,6 +361,7 @@ QDRANTSVCEOF
 
   # Helper: fetch model IDs from a remote OpenAI-compat server
   _fetch_remote_models() {
+    if ! command -v python3 &>/dev/null; then return 0; fi
     curl -sf "${XGH_REMOTE_URL}/v1/models" 2>/dev/null \
       | python3 -c "import json,sys; [print(m['id'] + '|' + m['id']) for m in json.load(sys.stdin).get('data',[])]" \
       2>/dev/null || true
@@ -357,6 +377,7 @@ QDRANTSVCEOF
     # Try to auto-populate from remote server
     CUSTOM_LABEL="Model ID (as reported by remote server)"
     _model_available() {
+      command -v python3 &>/dev/null || return 1
       curl -sf "${XGH_REMOTE_URL}/v1/models" 2>/dev/null \
         | python3 -c "
 import json,sys
