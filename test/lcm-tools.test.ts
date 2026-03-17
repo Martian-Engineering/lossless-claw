@@ -41,6 +41,8 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileTokenThreshold: 25_000,
       largeFileSummaryProvider: "",
       largeFileSummaryModel: "",
+      summaryModel: "",
+      summaryProvider: "",
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,

@@ -20,6 +20,8 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileTokenThreshold: 25_000,
       largeFileSummaryProvider: "",
       largeFileSummaryModel: "",
+      summaryModel: "",
+      summaryProvider: "",
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
@@ -73,6 +75,98 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         },
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it("prefers summaryProvider from runtime config when present", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: { summaryProvider: "openai-resp" },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith(
+      "claude-opus-4-5",
+      "openai-resp",
+    );
+  });
+
+  it("prefers plugin summaryProvider over top-level config", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          summaryProvider: "openai-resp",
+          plugins: {
+            entries: {
+              "lossless-claw": { config: { summaryProvider: "qiniu" } },
+            },
+          },
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("claude-opus-4-5", "qiniu");
+  });
+
+  it("passes summaryProvider override even when summaryModel override exists", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          summaryModel: "gpt-4o-mini",
+          summaryProvider: "openai-resp",
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith(
+      "gpt-4o-mini",
+      "openai-resp",
+    );
+  });
+
+  it("omits providerHint when only summaryModel override exists", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          summaryModel: "gpt-4o-mini",
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4o-mini", undefined);
+  });
+
+  it("falls back to legacy providerHint when no summary overrides exist", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("claude-opus-4-5", "anthropic");
   });
 
   it("builds distinct normal vs aggressive prompts", async () => {

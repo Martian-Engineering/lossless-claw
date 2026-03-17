@@ -646,30 +646,44 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     params.legacyParams.config && typeof params.legacyParams.config === "object"
       ? (params.legacyParams.config as {
           summaryModel?: unknown;
+          summaryProvider?: unknown;
           plugins?: {
             entries?: {
               [key: string]: {
-                config?: { summaryModel?: unknown };
+                config?: { summaryModel?: unknown; summaryProvider?: unknown };
               };
             };
           };
         })
       : undefined;
+
+  const nestedPluginConfig = runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config;
+
   const nestedPluginSummaryModel =
-    typeof runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config?.summaryModel ===
-    "string"
-      ? runtimeConfig.plugins.entries["lossless-claw"].config.summaryModel.trim()
+    typeof nestedPluginConfig?.summaryModel === "string" ? nestedPluginConfig.summaryModel.trim() : "";
+
+  const nestedPluginSummaryProvider =
+    typeof nestedPluginConfig?.summaryProvider === "string"
+      ? nestedPluginConfig.summaryProvider.trim()
       : "";
+
   const summaryModelOverride =
     (typeof runtimeConfig?.summaryModel === "string" ? runtimeConfig.summaryModel.trim() : "") ||
     nestedPluginSummaryModel;
+
+  const summaryProviderOverride =
+    nestedPluginSummaryProvider ||
+    (typeof runtimeConfig?.summaryProvider === "string" ? runtimeConfig.summaryProvider.trim() : "");
+
   const providerHint =
     typeof params.legacyParams.provider === "string" ? params.legacyParams.provider.trim() : "";
   const modelHint =
     typeof params.legacyParams.model === "string" ? params.legacyParams.model.trim() : "";
   const modelRef = summaryModelOverride || modelHint || undefined;
 
-  const resolveProviderHint = summaryModelOverride ? undefined : providerHint || undefined;
+  const resolveProviderHint =
+    summaryProviderOverride ||
+    (summaryModelOverride ? undefined : providerHint || undefined);
 
   let resolved: { provider: string; model: string };
   try {
