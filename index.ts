@@ -554,6 +554,99 @@ async function resolveApiKeyFromAuthProfiles(params: {
   return undefined;
 }
 
+function resolveApiKeyFromAuthProfilesSync(params: {
+  provider: string;
+  authProfileId?: string;
+  envSnapshot: PluginEnvSnapshot;
+}): string | undefined {
+  const entries = resolveAuthStorePaths({
+    envSnapshot: params.envSnapshot,
+  })
+    .map((path) => {
+      try {
+        const store = parseAuthProfileStore(readFileSync(path, "utf8"));
+        return store ? { store } : undefined;
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((entry): entry is { store: AuthProfileStore } => !!entry);
+
+  const mergedStore = mergeAuthProfileStores(entries.map((entry) => entry.store));
+  if (!mergedStore) {
+    return undefined;
+  }
+
+  const candidates = resolveAuthProfileCandidates({
+    provider: params.provider,
+    store: mergedStore,
+    authProfileId: params.authProfileId,
+    runtimeConfig: undefined,
+  });
+
+  for (const profileId of candidates) {
+    const credential = mergedStore.profiles[profileId];
+    if (!credential) {
+      continue;
+    }
+    if (normalizeProviderId(credential.provider) !== normalizeProviderId(params.provider)) {
+      continue;
+    }
+
+    if (credential.type === "api_key") {
+      const key = credential.key?.trim();
+      if (key) {
+        return key;
+      }
+      continue;
+    }
+
+    if (credential.type === "token") {
+      const token = credential.token?.trim();
+      if (!token) {
+        continue;
+      }
+      const expires = credential.expires;
+      if (
+        typeof expires === "number" &&
+        Number.isFinite(expires) &&
+        expires > 0 &&
+        Date.now() >= expires
+      ) {
+        continue;
+      }
+      return token;
+    }
+
+    const access = credential.access?.trim();
+    if (!access) {
+      continue;
+    }
+    const expires = credential.expires;
+    const isExpired =
+      typeof expires === "number" &&
+      Number.isFinite(expires) &&
+      expires > 0 &&
+      Date.now() >= expires;
+    if (!isExpired) {
+      if (
+        (credential.provider === "google-gemini-cli" ||
+          credential.provider === "google-antigravity") &&
+        typeof credential.projectId === "string" &&
+        credential.projectId.trim()
+      ) {
+        return JSON.stringify({
+          token: access,
+          projectId: credential.projectId.trim(),
+        });
+      }
+      return access;
+    }
+  }
+
+  return undefined;
+}
+
 /** Build a minimal but useful sub-agent prompt. */
 function buildSubagentSystemPrompt(params: {
   depth: number;
@@ -829,7 +922,21 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       ).trim();
       return { provider, model: raw };
     },
-    getApiKey: (provider) => resolveApiKey(provider, readEnv),
+    getApiKey: (provider, _model, options) => {
+      const trimmedProvider = provider.trim();
+      const profileId =
+        typeof options?.profileId === "string" && options.profileId.trim()
+          ? options.profileId.trim()
+          : undefined;
+      const fromProfiles = profileId
+        ? resolveApiKeyFromAuthProfilesSync({
+            provider: trimmedProvider,
+            authProfileId: profileId,
+            envSnapshot,
+          })
+        : undefined;
+      return fromProfiles || resolveApiKey(trimmedProvider, readEnv);
+    },
     requireApiKey: (provider) => {
       const key = resolveApiKey(provider, readEnv);
       if (!key) {

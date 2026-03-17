@@ -58,7 +58,11 @@ export type ResolveModelFn = (modelRef?: string, providerHint?: string) => {
 /**
  * API key resolution function.
  */
-export type GetApiKeyFn = (provider: string, model: string) => string | undefined;
+export type GetApiKeyFn = (
+  provider: string,
+  model: string,
+  options?: { profileId?: string },
+) => string | undefined;
 export type RequireApiKeyFn = (provider: string, model: string) => string;
 
 /**

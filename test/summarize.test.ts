@@ -246,6 +246,27 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(completeMock.mock.calls[0]?.[0]?.apiKey).toBe("resolved-api-key");
   });
 
+  it("passes authProfileId through to getApiKey", async () => {
+    const deps = makeDeps({
+      getApiKey: vi.fn(() => "resolved-api-key"),
+    });
+
+    const summarize = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        authProfileId: "profile-123",
+      },
+    });
+
+    await summarize!("Summary input");
+
+    expect(vi.mocked(deps.getApiKey)).toHaveBeenCalledWith("anthropic", "claude-opus-4-5", {
+      profileId: "profile-123",
+    });
+  });
+
   it("falls back deterministically when model returns empty summary output after retry", async () => {
     const deps = makeDeps({
       complete: vi.fn(async () => ({
