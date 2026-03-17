@@ -23,7 +23,7 @@ export type LcmSummarizerLegacyParams = {
 type SummaryMode = "normal" | "aggressive";
 
 const DEFAULT_CONDENSED_TARGET_TOKENS = 2000;
-const LCM_SUMMARIZER_SYSTEM_PROMPT =
+export const LCM_SUMMARIZER_SYSTEM_PROMPT =
   "You are a context-compaction summarization engine. Follow user instructions exactly and return plain text summary content only.";
 const DIAGNOSTIC_MAX_DEPTH = 4;
 const DIAGNOSTIC_MAX_ARRAY_ITEMS = 8;
@@ -400,7 +400,7 @@ function extractResponseDiagnostics(result: unknown): string {
  * Resolve a practical target token count for leaf and condensed summaries.
  * Aggressive leaf mode intentionally aims lower so compaction converges faster.
  */
-function resolveTargetTokens(params: {
+export function resolveTargetTokens(params: {
   inputTokens: number;
   mode: SummaryMode;
   isCondensed: boolean;
@@ -423,7 +423,7 @@ function resolveTargetTokens(params: {
  * Normal leaf mode preserves details; aggressive leaf mode keeps only the
  * highest-value facts needed for follow-up turns.
  */
-function buildLeafSummaryPrompt(params: {
+export function buildLeafSummaryPrompt(params: {
   text: string;
   mode: SummaryMode;
   targetTokens: number;
@@ -595,7 +595,7 @@ function buildD3PlusPrompt(params: {
 }
 
 /** Build a condensed prompt variant based on the output node depth. */
-function buildCondensedSummaryPrompt(params: {
+export function buildCondensedSummaryPrompt(params: {
   text: string;
   targetTokens: number;
   depth: number;
