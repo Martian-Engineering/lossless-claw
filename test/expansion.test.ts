@@ -24,6 +24,10 @@ const BASE_CONFIG: LcmConfig = {
   autocompactDisabled: false,
   timezone: "UTC",
   pruneHeartbeatOk: false,
+  crossSession: {
+    enabled: false,
+    totalBudget: 6000,
+  },
 };
 
 function makeExpansionResult() {

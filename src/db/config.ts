@@ -28,6 +28,11 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+  /** Cross-session ambient beacon assembly config. */
+  crossSession: {
+    enabled: boolean;
+    totalBudget: number;
+  };
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -68,6 +73,21 @@ export function resolveLcmConfig(
   pluginConfig?: Record<string, unknown>,
 ): LcmConfig {
   const pc = pluginConfig ?? {};
+  const crossSessionConfig =
+    pc.crossSession && typeof pc.crossSession === "object" && !Array.isArray(pc.crossSession)
+      ? (pc.crossSession as Record<string, unknown>)
+      : {};
+  const crossSessionEnabled =
+    env.LCM_CROSS_SESSION_ENABLED !== undefined
+      ? env.LCM_CROSS_SESSION_ENABLED === "true"
+      : toBool(crossSessionConfig.enabled) ?? false;
+  const crossSessionTotalBudgetRaw =
+    (env.LCM_CROSS_SESSION_TOTAL_BUDGET !== undefined
+      ? parseInt(env.LCM_CROSS_SESSION_TOTAL_BUDGET, 10)
+      : undefined) ??
+    toNumber(crossSessionConfig.totalBudget) ??
+    6000;
+  const crossSessionTotalBudget = Math.max(0, Math.floor(crossSessionTotalBudgetRaw));
 
   return {
     enabled:
@@ -131,5 +151,9 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+    crossSession: {
+      enabled: crossSessionEnabled,
+      totalBudget: crossSessionTotalBudget,
+    },
   };
 }

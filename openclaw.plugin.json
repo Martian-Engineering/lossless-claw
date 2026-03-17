@@ -24,6 +24,10 @@
     "summaryProvider": {
       "label": "Summary Provider",
       "help": "Provider override used only when summaryModel is a bare model name (e.g., 'openai-resp')"
+    },
+    "crossSession": {
+      "label": "Cross Session",
+      "help": "Ambient cross-session beacons (disabled by default)"
     }
   },
   "configSchema": {
@@ -70,6 +74,19 @@
       },
       "summaryProvider": {
         "type": "string"
+      },
+      "crossSession": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "totalBudget": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
       }
     }
   }

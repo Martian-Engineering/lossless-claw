@@ -34,6 +34,7 @@ import {
 import { RetrievalEngine } from "./retrieval.js";
 import {
   ConversationStore,
+  type ConversationDigestRecord,
   type CreateMessagePartInput,
   type MessagePartRecord,
   type MessagePartType,
@@ -59,6 +60,21 @@ const BEACON_SUMMARIZER_INSTRUCTIONS = [
 /** Rough token estimate: ~4 chars per token. */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+function formatAmbientTimestamp(date: Date | null): string {
+  return date ? date.toISOString() : "unknown";
+}
+
+function formatAmbientBeaconBlock(digest: ConversationDigestRecord): string {
+  const provider = digest.provider ?? "unknown";
+  const sourceLabel = digest.sourceLabel ?? "unknown";
+  const latestAt = formatAmbientTimestamp(digest.latestAt);
+  return [
+    `<ambient_beacon provider="${provider}" source_label="${sourceLabel}" latest_at="${latestAt}">`,
+    digest.digestText,
+    "</ambient_beacon>",
+  ].join("\n");
 }
 
 function toJson(value: unknown): string {
@@ -1560,9 +1576,23 @@ export class LcmContextEngine implements ContextEngine {
           ? Math.floor(params.tokenBudget)
           : 128_000;
 
+      const ambientBudget =
+        this.config.crossSession.enabled === true
+          ? Math.max(
+              0,
+              Math.min(
+                tokenBudget,
+                Number.isFinite(this.config.crossSession.totalBudget)
+                  ? Math.floor(this.config.crossSession.totalBudget)
+                  : 0,
+              ),
+            )
+          : 0;
+      const sameSessionBudget = Math.max(0, tokenBudget - ambientBudget);
+
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,
-        tokenBudget,
+        tokenBudget: sameSessionBudget,
         freshTailCount: this.config.freshTailCount,
       });
 
@@ -1575,9 +1605,26 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
+      let outputMessages = assembled.messages;
+      let outputTokens = assembled.estimatedTokens;
+
+      if (ambientBudget > 0) {
+        const parsed = this.deps.parseAgentSessionKey(params.sessionId);
+        const agentScope = this.deps.normalizeAgentId(conversation.agentScope ?? parsed?.agentId);
+        const ambient = await this.assembleAmbientContext(
+          agentScope,
+          conversation.conversationId,
+          ambientBudget,
+        );
+        if (ambient.messages.length > 0) {
+          outputMessages = [...assembled.messages, ...ambient.messages];
+          outputTokens += ambient.estimatedTokens;
+        }
+      }
+
       const result: AssembleResultWithSystemPrompt = {
-        messages: assembled.messages,
-        estimatedTokens: assembled.estimatedTokens,
+        messages: outputMessages,
+        estimatedTokens: outputTokens,
         ...(assembled.systemPromptAddition
           ? { systemPromptAddition: assembled.systemPromptAddition }
           : {}),
@@ -1589,6 +1636,42 @@ export class LcmContextEngine implements ContextEngine {
         estimatedTokens: 0,
       };
     }
+  }
+
+  private async assembleAmbientContext(
+    agentScope: string,
+    excludeConversationId: number,
+    tokenBudget: number,
+  ): Promise<{ messages: AgentMessage[]; estimatedTokens: number }> {
+    if (tokenBudget <= 0) {
+      return { messages: [], estimatedTokens: 0 };
+    }
+
+    const candidates = await this.conversationStore.getConversationDigestsForAgentScope({
+      agentScope,
+      excludeConversationId,
+    });
+
+    const selected: AgentMessage[] = [];
+    let estimatedTokens = 0;
+
+    for (const digest of candidates) {
+      const block = formatAmbientBeaconBlock(digest);
+      const blockTokens = estimateTokens(block);
+      if (estimatedTokens + blockTokens > tokenBudget) {
+        break;
+      }
+      estimatedTokens += blockTokens;
+      selected.push({
+        role: "user",
+        content: block,
+      } as AgentMessage);
+    }
+
+    return {
+      messages: selected,
+      estimatedTokens,
+    };
   }
 
   /** Evaluate whether incremental leaf compaction should run for a session. */

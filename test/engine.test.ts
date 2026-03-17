@@ -35,6 +35,10 @@ function createTestConfig(databasePath: string): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    crossSession: {
+      enabled: false,
+      totalBudget: 6000,
+    },
   };
 }
 
@@ -1067,6 +1071,187 @@ describe("LcmContextEngine.assemble canonical path", () => {
     // Refusal-to-guess
     expect(promptAddition).toContain("Do not guess");
     expect(promptAddition).toContain("Expand first or state that you need to expand");
+  });
+
+  it("injects ambient beacons in recency order with budget cutoff and agent isolation", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 220,
+      },
+    });
+    const scopeA = "agent-a";
+    const scopeB = "agent-b";
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-a:current",
+      sessionFile: createSessionFilePath("ambient-current"),
+      messages: [makeMessage({ role: "assistant", content: "current thread content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "slack", sourceLabel: "#current" },
+    });
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-a:recent-1",
+      sessionFile: createSessionFilePath("ambient-r1"),
+      messages: [makeMessage({ role: "assistant", content: "recent one content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "discord", sourceLabel: "#recent-1" },
+    });
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-a:recent-2",
+      sessionFile: createSessionFilePath("ambient-r2"),
+      messages: [makeMessage({ role: "assistant", content: "recent two content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "telegram", sourceLabel: "DM: Two" },
+    });
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-a:oldest",
+      sessionFile: createSessionFilePath("ambient-oldest"),
+      messages: [makeMessage({ role: "assistant", content: "oldest content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "email", sourceLabel: "old-mailbox" },
+    });
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-b:foreign",
+      sessionFile: createSessionFilePath("ambient-foreign"),
+      messages: [makeMessage({ role: "assistant", content: "foreign content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeB, provider: "slack", sourceLabel: "#foreign" },
+    });
+
+    const store = engine.getConversationStore();
+    const current = await store.getConversationBySessionId("agent:agent-a:current");
+    const recent1 = await store.getConversationBySessionId("agent:agent-a:recent-1");
+    const recent2 = await store.getConversationBySessionId("agent:agent-a:recent-2");
+    const oldest = await store.getConversationBySessionId("agent:agent-a:oldest");
+    const foreign = await store.getConversationBySessionId("agent:agent-b:foreign");
+    expect(current).not.toBeNull();
+    expect(recent1).not.toBeNull();
+    expect(recent2).not.toBeNull();
+    expect(oldest).not.toBeNull();
+    expect(foreign).not.toBeNull();
+
+    await store.upsertConversationDigest({
+      conversationId: recent1!.conversationId,
+      agentScope: scopeA,
+      provider: "discord",
+      sourceLabel: "#recent-1",
+      digestText: "recent-one ".repeat(15).trim(),
+      tokenCount: 15,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-15T09:00:00.000Z"),
+      latestAt: new Date("2026-03-16T09:00:00.000Z"),
+    });
+    await store.upsertConversationDigest({
+      conversationId: recent2!.conversationId,
+      agentScope: scopeA,
+      provider: "telegram",
+      sourceLabel: "DM: Two",
+      digestText: "recent-two ".repeat(15).trim(),
+      tokenCount: 15,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-15T10:00:00.000Z"),
+      latestAt: new Date("2026-03-17T09:00:00.000Z"),
+    });
+    await store.upsertConversationDigest({
+      conversationId: oldest!.conversationId,
+      agentScope: scopeA,
+      provider: "email",
+      sourceLabel: "old-mailbox",
+      digestText: "oldest ".repeat(60).trim(),
+      tokenCount: 60,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-14T09:00:00.000Z"),
+      latestAt: new Date("2026-03-14T09:30:00.000Z"),
+    });
+    await store.upsertConversationDigest({
+      conversationId: foreign!.conversationId,
+      agentScope: scopeB,
+      provider: "slack",
+      sourceLabel: "#foreign",
+      digestText: "foreign ".repeat(60).trim(),
+      tokenCount: 60,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-17T08:00:00.000Z"),
+      latestAt: new Date("2026-03-17T10:00:00.000Z"),
+    });
+
+    const result = await engine.assemble({
+      sessionId: "agent:agent-a:current",
+      messages: [],
+      tokenBudget: 2_000,
+    });
+
+    const ambient = result.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(ambient).toHaveLength(2);
+    expect(ambient[0]).toContain('provider="telegram"');
+    expect(ambient[0]).toContain('source_label="DM: Two"');
+    expect(ambient[1]).toContain('provider="discord"');
+    expect(ambient[1]).toContain('source_label="#recent-1"');
+    expect(ambient[0]).toContain('latest_at="2026-03-17T09:00:00.000Z"');
+    expect(ambient[1]).toContain('latest_at="2026-03-16T09:00:00.000Z"');
+    expect(ambient.join("\n")).not.toContain("old-mailbox");
+    expect(ambient.join("\n")).not.toContain("#foreign");
+    expect(ambient.join("\n")).toContain("recent-two recent-two");
+
+    const firstAmbientIndex = result.messages.findIndex(
+      (message: AgentMessage) =>
+        message.role === "user" &&
+        typeof message.content === "string" &&
+        message.content.startsWith("<ambient_beacon "),
+    );
+    expect(firstAmbientIndex).toBeGreaterThan(0);
+  });
+
+  it("keeps assembly byte-equivalent to same-session output when ambient budget is zero", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 0,
+      },
+    });
+    const sessionId = "ambient-zero-budget";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "alpha" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "beta" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const expected = await new ContextAssembler(
+      engine.getConversationStore(),
+      engine.getSummaryStore(),
+    ).assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 600,
+      freshTailCount: 8,
+    });
+    const actual = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 600,
+    });
+
+    expect(JSON.stringify(actual.messages)).toBe(JSON.stringify(expected.messages));
+    expect(actual.estimatedTokens).toBe(expected.estimatedTokens);
+    expect((actual as { systemPromptAddition?: string }).systemPromptAddition).toBe(
+      expected.systemPromptAddition,
+    );
   });
 });
 

@@ -489,6 +489,22 @@ export class ConversationStore {
     return toConversationDigestRecord(row);
   }
 
+  async getConversationDigestsForAgentScope(params: {
+    agentScope: string;
+    excludeConversationId: ConversationId;
+  }): Promise<ConversationDigestRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT conversation_id, agent_scope, provider, source_label, digest_text,
+                token_count, last_context_ord, earliest_at, latest_at, updated_at
+       FROM conversation_digests
+       WHERE agent_scope = ? AND conversation_id != ?
+       ORDER BY latest_at DESC, updated_at DESC`,
+      )
+      .all(params.agentScope, params.excludeConversationId) as unknown as ConversationDigestRow[];
+    return rows.map(toConversationDigestRecord);
+  }
+
   private hasMetadataUpdates(input: UpdateConversationMetadataInput): boolean {
     return (
       input.agentScope !== undefined ||

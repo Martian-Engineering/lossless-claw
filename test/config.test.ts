@@ -14,6 +14,8 @@ describe("resolveLcmConfig", () => {
     expect(config.condensedMinFanoutHard).toBe(2);
     expect(config.autocompactDisabled).toBe(false);
     expect(config.pruneHeartbeatOk).toBe(false);
+    expect(config.crossSession.enabled).toBe(false);
+    expect(config.crossSession.totalBudget).toBe(6000);
   });
 
   it("reads values from plugin config", () => {
@@ -25,6 +27,10 @@ describe("resolveLcmConfig", () => {
       condensedMinFanout: 2,
       autocompactDisabled: true,
       pruneHeartbeatOk: true,
+      crossSession: {
+        enabled: true,
+        totalBudget: 1234,
+      },
       enabled: false,
     });
     expect(config.enabled).toBe(false);
@@ -35,6 +41,8 @@ describe("resolveLcmConfig", () => {
     expect(config.condensedMinFanout).toBe(2);
     expect(config.autocompactDisabled).toBe(true);
     expect(config.pruneHeartbeatOk).toBe(true);
+    expect(config.crossSession.enabled).toBe(true);
+    expect(config.crossSession.totalBudget).toBe(1234);
   });
 
   it("env vars override plugin config", () => {
@@ -44,6 +52,8 @@ describe("resolveLcmConfig", () => {
       LCM_INCREMENTAL_MAX_DEPTH: "3",
       LCM_ENABLED: "false",
       LCM_AUTOCOMPACT_DISABLED: "true",
+      LCM_CROSS_SESSION_ENABLED: "true",
+      LCM_CROSS_SESSION_TOTAL_BUDGET: "2222",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
@@ -51,6 +61,10 @@ describe("resolveLcmConfig", () => {
       incrementalMaxDepth: -1,
       enabled: true,
       autocompactDisabled: false,
+      crossSession: {
+        enabled: false,
+        totalBudget: 3333,
+      },
     };
     const config = resolveLcmConfig(env, pluginConfig);
     expect(config.enabled).toBe(false); // env wins
@@ -58,6 +72,8 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
     expect(config.autocompactDisabled).toBe(true); // env wins
+    expect(config.crossSession.enabled).toBe(true); // env wins
+    expect(config.crossSession.totalBudget).toBe(2222); // env wins
   });
 
   it("plugin config fills gaps when env vars are absent", () => {

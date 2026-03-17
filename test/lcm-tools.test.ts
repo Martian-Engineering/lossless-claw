@@ -46,6 +46,10 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
+      crossSession: {
+        enabled: false,
+        totalBudget: 6000,
+      },
     },
     complete: vi.fn(),
     callGateway: vi.fn(async () => ({})),
