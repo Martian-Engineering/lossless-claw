@@ -360,9 +360,17 @@ export function runLcmMigrations(
   options?: { fts5Available?: boolean },
 ): void {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS contacts (
+      peer_id TEXT PRIMARY KEY,
+      peer_name TEXT,
+      chat_type TEXT CHECK (chat_type IN ('dm', 'group'))
+    );
+
     CREATE TABLE IF NOT EXISTS conversations (
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
+      peer_id TEXT REFERENCES contacts(peer_id) ON DELETE SET NULL,
+      channel TEXT,
       title TEXT,
       bootstrapped_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -489,6 +497,30 @@ export function runLcmMigrations(
   const hasBootstrappedAt = conversationColumns.some((col) => col.name === "bootstrapped_at");
   if (!hasBootstrappedAt) {
     db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
+  }
+
+  // Add peer_id and channel columns to conversations for existing DBs
+  const hasPeerId = conversationColumns.some((col) => col.name === "peer_id");
+  const hasChannel = conversationColumns.some((col) => col.name === "channel");
+  if (!hasPeerId) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN peer_id TEXT REFERENCES contacts(peer_id) ON DELETE SET NULL`);
+  }
+  if (!hasChannel) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN channel TEXT`);
+  }
+
+  // Ensure contacts table exists for existing DBs
+  const contactsTable = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='contacts'")
+    .get();
+  if (!contactsTable) {
+    db.exec(`
+      CREATE TABLE contacts (
+        peer_id TEXT PRIMARY KEY,
+        peer_name TEXT,
+        chat_type TEXT CHECK (chat_type IN ('dm', 'group'))
+      )
+    `);
   }
 
   ensureSummaryDepthColumn(db);

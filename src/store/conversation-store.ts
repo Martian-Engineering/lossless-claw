@@ -67,12 +67,16 @@ export type MessagePartRecord = {
 
 export type CreateConversationInput = {
   sessionId: string;
+  peerId?: string;
+  channel?: string;
   title?: string;
 };
 
 export type ConversationRecord = {
   conversationId: ConversationId;
   sessionId: string;
+  peerId: string | null;
+  channel: string | null;
   title: string | null;
   bootstrappedAt: Date | null;
   createdAt: Date;
@@ -83,6 +87,9 @@ export type MessageSearchInput = {
   conversationId?: ConversationId;
   query: string;
   mode: "regex" | "full_text";
+  peerId?: string;
+  channel?: string;
+  chatType?: "dm" | "group";
   since?: Date;
   before?: Date;
   limit?: number;
@@ -102,6 +109,8 @@ export type MessageSearchResult = {
 interface ConversationRow {
   conversation_id: number;
   session_id: string;
+  peer_id: string | null;
+  channel: string | null;
   title: string | null;
   bootstrapped_at: string | null;
   created_at: string;
@@ -155,6 +164,8 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
   return {
     conversationId: row.conversation_id,
     sessionId: row.session_id,
+    peerId: row.peer_id,
+    channel: row.channel,
     title: row.title,
     bootstrappedAt: row.bootstrapped_at ? new Date(row.bootstrapped_at) : null,
     createdAt: new Date(row.created_at),
@@ -231,12 +242,12 @@ export class ConversationStore {
 
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
     const result = this.db
-      .prepare(`INSERT INTO conversations (session_id, title) VALUES (?, ?)`)
-      .run(input.sessionId, input.title ?? null);
+      .prepare(`INSERT INTO conversations (session_id, peer_id, channel, title) VALUES (?, ?, ?, ?)`)
+      .run(input.sessionId, input.peerId ?? null, input.channel ?? null, input.title ?? null);
 
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, peer_id, channel, title, bootstrapped_at, created_at, updated_at
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(Number(result.lastInsertRowid)) as unknown as ConversationRow;
@@ -247,7 +258,7 @@ export class ConversationStore {
   async getConversation(conversationId: ConversationId): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, peer_id, channel, title, bootstrapped_at, created_at, updated_at
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(conversationId) as unknown as ConversationRow | undefined;
@@ -258,7 +269,7 @@ export class ConversationStore {
   async getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, peer_id, channel, title, bootstrapped_at, created_at, updated_at
        FROM conversations
        WHERE session_id = ?
        ORDER BY created_at DESC
@@ -269,12 +280,12 @@ export class ConversationStore {
     return row ? toConversationRecord(row) : null;
   }
 
-  async getOrCreateConversation(sessionId: string, title?: string): Promise<ConversationRecord> {
+  async getOrCreateConversation(sessionId: string, title?: string, peerId?: string, channel?: string): Promise<ConversationRecord> {
     const existing = await this.getConversationBySessionId(sessionId);
     if (existing) {
       return existing;
     }
-    return this.createConversation({ sessionId, title });
+    return this.createConversation({ sessionId, peerId, channel, title });
   }
 
   async markConversationBootstrapped(conversationId: ConversationId): Promise<void> {
@@ -562,6 +573,9 @@ export class ConversationStore {
             input.query,
             limit,
             input.conversationId,
+            input.peerId,
+            input.channel,
+            input.chatType,
             input.since,
             input.before,
           );
@@ -570,14 +584,17 @@ export class ConversationStore {
             input.query,
             limit,
             input.conversationId,
+            input.peerId,
+            input.channel,
+            input.chatType,
             input.since,
             input.before,
           );
         }
       }
-      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before);
+      return this.searchLike(input.query, limit, input.conversationId, input.peerId, input.channel, input.chatType, input.since, input.before);
     }
-    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
+    return this.searchRegex(input.query, limit, input.conversationId, input.peerId, input.channel, input.chatType, input.since, input.before);
   }
 
   private indexMessageForFullText(messageId: MessageId, content: string): void {
@@ -608,6 +625,9 @@ export class ConversationStore {
     query: string,
     limit: number,
     conversationId?: ConversationId,
+    peerId?: string,
+    channel?: string,
+    chatType?: "dm" | "group",
     since?: Date,
     before?: Date,
   ): MessageSearchResult[] {
@@ -616,6 +636,18 @@ export class ConversationStore {
     if (conversationId != null) {
       where.push("m.conversation_id = ?");
       args.push(conversationId);
+    }
+    if (peerId != null) {
+      where.push("c.peer_id = ?");
+      args.push(peerId);
+    }
+    if (channel != null) {
+      where.push("c.channel = ?");
+      args.push(channel);
+    }
+    if (chatType != null) {
+      where.push("ct.chat_type = ?");
+      args.push(chatType);
     }
     if (since) {
       where.push("julianday(m.created_at) >= julianday(?)");
@@ -636,6 +668,8 @@ export class ConversationStore {
          m.created_at
        FROM messages_fts
        JOIN messages m ON m.message_id = messages_fts.rowid
+       JOIN conversations c ON c.conversation_id = m.conversation_id
+       LEFT JOIN contacts ct ON ct.peer_id = c.peer_id
        WHERE ${where.join(" AND ")}
        ORDER BY m.created_at DESC
        LIMIT ?`;
@@ -647,6 +681,9 @@ export class ConversationStore {
     query: string,
     limit: number,
     conversationId?: ConversationId,
+    peerId?: string,
+    channel?: string,
+    chatType?: "dm" | "group",
     since?: Date,
     before?: Date,
   ): MessageSearchResult[] {
@@ -658,15 +695,27 @@ export class ConversationStore {
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
     if (conversationId != null) {
-      where.push("conversation_id = ?");
+      where.push("m.conversation_id = ?");
       args.push(conversationId);
     }
+    if (peerId != null) {
+      where.push("c.peer_id = ?");
+      args.push(peerId);
+    }
+    if (channel != null) {
+      where.push("c.channel = ?");
+      args.push(channel);
+    }
+    if (chatType != null) {
+      where.push("ct.chat_type = ?");
+      args.push(chatType);
+    }
     if (since) {
-      where.push("julianday(created_at) >= julianday(?)");
+      where.push("julianday(m.created_at) >= julianday(?)");
       args.push(since.toISOString());
     }
     if (before) {
-      where.push("julianday(created_at) < julianday(?)");
+      where.push("julianday(m.created_at) < julianday(?)");
       args.push(before.toISOString());
     }
     args.push(limit);
@@ -674,10 +723,12 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
-         FROM messages
+        `SELECT m.message_id, m.conversation_id, m.seq, m.role, m.content, m.token_count, m.created_at
+         FROM messages m
+         JOIN conversations c ON c.conversation_id = m.conversation_id
+         LEFT JOIN contacts ct ON ct.peer_id = c.peer_id
          ${whereClause}
-         ORDER BY created_at DESC
+         ORDER BY m.created_at DESC
          LIMIT ?`,
       )
       .all(...args) as unknown as MessageRow[];
@@ -696,6 +747,9 @@ export class ConversationStore {
     pattern: string,
     limit: number,
     conversationId?: ConversationId,
+    peerId?: string,
+    channel?: string,
+    chatType?: "dm" | "group",
     since?: Date,
     before?: Date,
   ): MessageSearchResult[] {
@@ -705,24 +759,38 @@ export class ConversationStore {
     const where: string[] = [];
     const args: Array<string | number> = [];
     if (conversationId != null) {
-      where.push("conversation_id = ?");
+      where.push("m.conversation_id = ?");
       args.push(conversationId);
     }
+    if (peerId != null) {
+      where.push("c.peer_id = ?");
+      args.push(peerId);
+    }
+    if (channel != null) {
+      where.push("c.channel = ?");
+      args.push(channel);
+    }
+    if (chatType != null) {
+      where.push("ct.chat_type = ?");
+      args.push(chatType);
+    }
     if (since) {
-      where.push("julianday(created_at) >= julianday(?)");
+      where.push("julianday(m.created_at) >= julianday(?)");
       args.push(since.toISOString());
     }
     if (before) {
-      where.push("julianday(created_at) < julianday(?)");
+      where.push("julianday(m.created_at) < julianday(?)");
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
-         FROM messages
+        `SELECT m.message_id, m.conversation_id, m.seq, m.role, m.content, m.token_count, m.created_at
+         FROM messages m
+         JOIN conversations c ON c.conversation_id = m.conversation_id
+         LEFT JOIN contacts ct ON ct.peer_id = c.peer_id
          ${whereClause}
-         ORDER BY created_at DESC`,
+         ORDER BY m.created_at DESC`,
       )
       .all(...args) as unknown as MessageRow[];
 

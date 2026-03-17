@@ -39,6 +39,7 @@ import {
   type MessagePartType,
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
+import { ContactStore, type CreateContactInput } from "./store/contact-store.js";
 import { createLcmSummarizeFromLegacyParams } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 
@@ -648,6 +649,7 @@ export class LcmContextEngine implements ContextEngine {
 
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
+  private contactStore: ContactStore;
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
@@ -667,6 +669,7 @@ export class LcmContextEngine implements ContextEngine {
 
     this.conversationStore = new ConversationStore(db, { fts5Available: this.fts5Available });
     this.summaryStore = new SummaryStore(db, { fts5Available: this.fts5Available });
+    this.contactStore = new ContactStore(db);
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -1277,6 +1280,57 @@ export class LcmContextEngine implements ContextEngine {
       }
       return { ingestedCount };
     });
+  }
+
+  /**
+   * Update conversation with peer information.
+   * Creates or updates the contact and associates it with the conversation.
+   * 
+   * @param sessionId - The session ID
+   * @param peerInfo - Peer information (peerId, peerName, channel, chatType)
+   */
+  async updateConversationPeer(params: {
+    sessionId: string;
+    peerId: string;
+    peerName?: string;
+    channel?: string;
+    chatType?: "dm" | "group";
+  }): Promise<void> {
+    this.ensureMigrated();
+    
+    const { sessionId, peerId, peerName, channel, chatType } = params;
+    
+    // Create or update contact
+    this.contactStore.create({
+      peerId,
+      peerName,
+      chatType,
+    });
+    
+    // Update conversation with peer info
+    const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
+    if (conversation) {
+      // Only update if not already set
+      if (!conversation.peerId || !conversation.channel) {
+        const db = getLcmConnection(this.config.databasePath);
+        const updates: string[] = [];
+        const values: (string | null)[] = [];
+        
+        if (!conversation.peerId) {
+          updates.push("peer_id = ?");
+          values.push(peerId);
+        }
+        if (!conversation.channel && channel) {
+          updates.push("channel = ?");
+          values.push(channel);
+        }
+        
+        if (updates.length > 0) {
+          values.push(String(conversation.conversationId));
+          db.prepare(`UPDATE conversations SET ${updates.join(", ")} WHERE conversation_id = ?`).run(...values);
+        }
+      }
+    }
   }
 
   async afterTurn(params: {

@@ -12,7 +12,9 @@ import { LcmContextEngine } from "./src/engine.js";
 import { createLcmDescribeTool } from "./src/tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "./src/tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "./src/tools/lcm-expand-tool.js";
+import { createLcmExportTool } from "./src/tools/lcm-export-tool.js";
 import { createLcmGrepTool } from "./src/tools/lcm-grep-tool.js";
+import { createLcmUpdatePeerTool } from "./src/tools/lcm-update-peer-tool.js";
 import type { LcmDependencies } from "./src/types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -1323,6 +1325,62 @@ const lcmPlugin = {
         }),
       { name: "lcm_expand_query" },
     );
+    api.registerTool((ctx) =>
+      createLcmExportTool({
+        deps,
+      }),
+    );
+    api.registerTool((ctx) =>
+      createLcmUpdatePeerTool({
+        deps,
+        lcm,
+        sessionId: ctx.sessionId,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+
+    // Register hook to auto-extract peer info from inbound messages
+    api.registerHook(["message_received"], async (event) => {
+      const meta = event.context?.inboundMeta;
+      if (!meta) return;
+
+      const sessionId = event.sessionId;
+      if (!sessionId) return;
+
+      // Extract peer info from inbound metadata
+      const chatId = meta.chat_id;
+      const channel = meta.channel;
+      const chatType = meta.chat_type;
+
+      // For DMs, the peer is the sender
+      // For groups, the peer is the chat/group
+      let peerId: string | undefined;
+      let peerName: string | undefined;
+
+      if (chatType === "dm" && meta.sender_id) {
+        peerId = `user:${meta.sender_id}`;
+        peerName = meta.sender_name || meta.sender;
+      } else if (chatType === "group" && chatId) {
+        peerId = chatId;
+        peerName = meta.chat_name || meta.group_name;
+      }
+
+      if (!peerId) return;
+
+      // Update conversation with peer info
+      try {
+        await lcm.updateConversationPeer({
+          sessionId,
+          peerId,
+          peerName,
+          channel,
+          chatType,
+        });
+        deps.log.info(`[lcm] Auto-extracted peer: ${peerId} (${peerName || "unknown"}) for session ${sessionId}`);
+      } catch (error) {
+        deps.log.warn(`[lcm] Failed to update peer info: ${error}`);
+      }
+    });
 
     api.logger.info(
       `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,

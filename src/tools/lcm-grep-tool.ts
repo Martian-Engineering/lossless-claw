@@ -39,6 +39,22 @@ const LcmGrepSchema = Type.Object({
         "Set true to explicitly search across all conversations. Ignored when conversationId is provided.",
     }),
   ),
+  peerId: Type.Optional(
+    Type.String({
+      description: "Filter by peer ID (e.g., user:ou_xxx, chat:xxx).",
+    })
+  ),
+  channel: Type.Optional(
+    Type.String({
+      description: "Filter by channel (e.g., feishu, telegram).",
+    })
+  ),
+  chatType: Type.Optional(
+    Type.String({
+      description: "Filter by chat type: dm or group.",
+      enum: ["dm", "group"],
+    })
+  ),
   since: Type.Optional(
     Type.String({
       description: "Only return matches created at or after this ISO timestamp.",
@@ -91,6 +107,9 @@ export function createLcmGrepTool(input: {
       const mode = (p.mode as "regex" | "full_text") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
+      const peerId = p.peerId as string | undefined;
+      const channel = p.channel as string | undefined;
+      const chatType = p.chatType as "dm" | "group" | undefined;
       let since: Date | undefined;
       let before: Date | undefined;
       try {
@@ -125,6 +144,9 @@ export function createLcmGrepTool(input: {
         mode,
         scope,
         conversationId: conversationScope.conversationId,
+        peerId,
+        channel,
+        chatType,
         limit,
         since,
         before,
@@ -138,6 +160,13 @@ export function createLcmGrepTool(input: {
         lines.push("**Conversation scope:** all conversations");
       } else if (conversationScope.conversationId != null) {
         lines.push(`**Conversation scope:** ${conversationScope.conversationId}`);
+      }
+      if (peerId || channel || chatType) {
+        const filters: string[] = [];
+        if (peerId) filters.push(`peer: ${peerId}`);
+        if (channel) filters.push(`channel: ${channel}`);
+        if (chatType) filters.push(`type: ${chatType}`);
+        lines.push(`**Peer filter:** ${filters.join(" | ")}`);
       }
       if (since || before) {
         lines.push(

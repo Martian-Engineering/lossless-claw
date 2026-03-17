@@ -27,3 +27,9 @@ export type {
   CreateLargeFileInput,
   LargeFileRecord,
 } from "./summary-store.js";
+
+export { ContactStore } from "./contact-store.js";
+export type {
+  ContactRecord,
+  CreateContactInput,
+} from "./contact-store.js";
