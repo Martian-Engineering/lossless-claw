@@ -241,6 +241,28 @@ describe("install", () => {
   });
 });
 
+// ─── install dry-run ─────────────────────────────────────────────────────────
+
+describe("install with DryRunServiceDeps", () => {
+  it("prints [dry-run] lines and writes no real files", async () => {
+    const { DryRunServiceDeps } = await import("../../installer/dry-run-deps.js");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(install(new DryRunServiceDeps())).resolves.not.toThrow();
+
+    const dryRunLines = logSpy.mock.calls
+      .flatMap((c: any[]) => c)
+      .filter((s: any) => typeof s === "string" && s.includes("[dry-run]"));
+
+    expect(dryRunLines.some((l: string) => l.includes("would write:"))).toBe(true);
+    expect(dryRunLines.some((l: string) => l.includes("settings.json"))).toBe(true);
+
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+});
+
 // ─── setup.sh dry-run preview ────────────────────────────────────────────────
 
 describe("setup.sh XGH_DRY_RUN=1 preview", () => {

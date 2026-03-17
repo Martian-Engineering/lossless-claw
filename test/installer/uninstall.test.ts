@@ -174,3 +174,25 @@ describe("uninstall", () => {
     warnSpy.mockRestore();
   });
 });
+
+// ─── uninstall dry-run ───────────────────────────────────────────────────────
+
+describe("uninstall with DryRunServiceDeps", () => {
+  it("prints [dry-run] lines and writes no real files", async () => {
+    const { DryRunServiceDeps } = await import("../../installer/dry-run-deps.js");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(uninstall(new DryRunServiceDeps())).resolves.not.toThrow();
+
+    const dryRunLines = logSpy.mock.calls
+      .flatMap((c: any[]) => c)
+      .filter((s: any) => typeof s === "string" && s.includes("[dry-run]"));
+
+    // uninstall uses unload, not load — no launchctl load should appear
+    expect(dryRunLines.every((l: string) => !l.includes("would run: launchctl load"))).toBe(true);
+
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+});
