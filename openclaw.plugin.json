@@ -19,11 +19,11 @@
     },
     "summaryModel": {
       "label": "Summary Model",
-      "help": "Model override for LCM summarization (e.g., 'gpt-5.4' or 'openai-resp/gpt-5.4')"
+      "help": "Model override for LCM summarization (e.g., 'gpt-5.4' to reuse the session provider, or 'openai-resp/gpt-5.4' for a full cross-provider ref)"
     },
     "summaryProvider": {
       "label": "Summary Provider",
-      "help": "Provider override for LCM summarization (e.g., 'openai-resp')"
+      "help": "Provider override used only when summaryModel is a bare model name (e.g., 'openai-resp')"
     }
   },
   "configSchema": {

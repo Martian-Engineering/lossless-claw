@@ -121,8 +121,8 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File blocks above this size are intercepted and stored separately |
 | `LCM_LARGE_FILE_SUMMARY_PROVIDER` | `""` | Provider override for large-file summarization |
 | `LCM_LARGE_FILE_SUMMARY_MODEL` | `""` | Model override for large-file summarization |
-| `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514`) |
-| `LCM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider override for summarization |
+| `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514` or `claude-sonnet-4-20250514`) |
+| `LCM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider used with a bare `LCM_SUMMARY_MODEL` value when you want to override the session provider |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
 
@@ -136,7 +136,7 @@ When choosing which model to use for summarization, lossless-claw follows this p
 4. Current session model (inherited from the active conversation)
 5. OpenClaw's `agents.defaults.model.primary` (system default)
 
-The same priority applies to `summaryProvider`, with plugin config taking precedence over `LCM_SUMMARY_PROVIDER`, then falling back to the provider hint from the session or OpenClaw defaults.
+`summaryProvider` is not an independent selector. It is only used when the chosen `summaryModel` is a bare model name without a provider prefix. If no explicit `summaryProvider` is configured for that level, lossless-claw falls back to the active session provider hint and emits a warning.
 
 This allows you to:
 - Set a global summarization model via plugin config or environment variable
