@@ -520,11 +520,6 @@ export class ConversationStore {
     return row ? toMessageRecord(row) : null;
   }
 
-  /** Alias for getMessage — matches upstream API naming convention. */
-  async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
-    return this.getMessage(messageId);
-  }
-
   async getMessages(
     conversationId: ConversationId,
     options?: { limit?: number; before?: number; after?: number },
@@ -632,13 +627,6 @@ export class ConversationStore {
     // parts are persisted and available for synthesis.
     if (hasToolParts && this.embeddingQueue) {
       this.embeddingQueue.enqueue("messages", messageId, "");
-    }
-  }
-
-  /** Batch insert multiple message parts. Matches upstream API. */
-  async createMessageParts(messageId: MessageId, parts: CreateMessagePartInput[]): Promise<void> {
-    for (const part of parts) {
-      await this.createMessagePart(messageId, part);
     }
   }
 
