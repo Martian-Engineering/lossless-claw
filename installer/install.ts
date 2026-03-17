@@ -4,9 +4,19 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 
-const LC_HOOK_COMPACT = { type: "command", command: "lossless-claude compact" };
-const LC_HOOK_RESTORE = { type: "command", command: "lossless-claude restore" };
+const LC_HOOK_COMPACT_CMD = "lossless-claude compact";
+const LC_HOOK_RESTORE_CMD = "lossless-claude restore";
 const LC_MCP = { command: "lossless-claude", args: ["mcp"] };
+
+function makeHookEntry(command: string): { matcher: string; hooks: { type: string; command: string }[] } {
+  return { matcher: "", hooks: [{ type: "command", command }] };
+}
+
+function hasHookCommand(entries: any[], command: string): boolean {
+  return entries.some((entry: any) =>
+    Array.isArray(entry.hooks) && entry.hooks.some((h: any) => h.command === command)
+  );
+}
 
 export function mergeClaudeSettings(existing: any): any {
   const settings = JSON.parse(JSON.stringify(existing));
@@ -15,14 +25,14 @@ export function mergeClaudeSettings(existing: any): any {
 
   // Merge PreCompact
   settings.hooks.PreCompact = settings.hooks.PreCompact ?? [];
-  if (!settings.hooks.PreCompact.some((h: any) => h.command === LC_HOOK_COMPACT.command)) {
-    settings.hooks.PreCompact.push(LC_HOOK_COMPACT);
+  if (!hasHookCommand(settings.hooks.PreCompact, LC_HOOK_COMPACT_CMD)) {
+    settings.hooks.PreCompact.push(makeHookEntry(LC_HOOK_COMPACT_CMD));
   }
 
   // Merge SessionStart
   settings.hooks.SessionStart = settings.hooks.SessionStart ?? [];
-  if (!settings.hooks.SessionStart.some((h: any) => h.command === LC_HOOK_RESTORE.command)) {
-    settings.hooks.SessionStart.push(LC_HOOK_RESTORE);
+  if (!hasHookCommand(settings.hooks.SessionStart, LC_HOOK_RESTORE_CMD)) {
+    settings.hooks.SessionStart.push(makeHookEntry(LC_HOOK_RESTORE_CMD));
   }
 
   // Add MCP server
