@@ -1,9 +1,15 @@
 {
   "name": "@ipedro/lossless-claude",
   "version": "0.3.0",
-  "description": "Lossless Context Management plugin for Claude Code — DAG-based conversation summarization with incremental compaction",
+  "description": "Lossless context management for Claude Code — DAG-based conversation compaction with semantic memory promotion",
   "type": "module",
-  "main": "index.ts",
+  "main": "src/memory/index.ts",
+  "exports": {
+    ".": "./src/memory/index.ts"
+  },
+  "bin": {
+    "lossless-claude": "./bin/lossless-claude.ts"
+  },
   "license": "MIT",
   "author": "Josh Lehman <josh@martian.engineering>",
   "keywords": [
@@ -16,7 +22,7 @@
     "dag"
   ],
   "files": [
-    "index.ts",
+    "bin/",
     "src/**/*.ts",
     "claude.plugin.json",
     "docs/",
@@ -30,8 +36,8 @@
     "version-packages": "changeset version"
   },
   "dependencies": {
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-ai": "*",
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
     "@sinclair/typebox": "0.34.48"
   },
   "devDependencies": {
