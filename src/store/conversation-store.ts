@@ -1,10 +1,20 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import type { DbClient } from "../db/db-interface.js";
+import { SqliteClient } from "../db/sqlite-client.js";
 import { Dialect, type Backend } from "../db/dialect.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { sanitizeTsQuery } from "./tsquery-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
+
+/** Accept either a DbClient or raw DatabaseSync (auto-wraps the latter). */
+function ensureDbClient(db: DbClient | DatabaseSync): DbClient {
+  if ('run' in db && typeof (db as DbClient).run === 'function') {
+    return db as DbClient;
+  }
+  return new SqliteClient(db as DatabaseSync);
+}
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -233,11 +243,11 @@ export class ConversationStore {
   }
 
   constructor(
-    db: DbClient,
-    options?: { fullTextAvailable?: boolean; backend?: Backend },
+    db: DbClient | DatabaseSync,
+    options?: { fullTextAvailable?: boolean; fts5Available?: boolean; backend?: Backend },
   ) {
-    this._rootDb = db;
-    this.fullTextAvailable = options?.fullTextAvailable ?? true;
+    this._rootDb = ensureDbClient(db);
+    this.fullTextAvailable = options?.fullTextAvailable ?? options?.fts5Available ?? true;
     this.d = new Dialect(options?.backend ?? "sqlite");
   }
 
@@ -439,6 +449,11 @@ export class ConversationStore {
     return row ? toMessageRecord(row) : null;
   }
 
+  /** Alias for getMessage — matches upstream API naming convention. */
+  async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
+    return this.getMessage(messageId);
+  }
+
   async getMessages(
     conversationId: ConversationId,
     options?: { limit?: number; before?: number; after?: number },
@@ -541,6 +556,13 @@ export class ConversationStore {
       throw new Error(`Failed to retrieve created message part with ID ${partId}`);
     }
     return toMessagePartRecord(row);
+  }
+
+  /** Batch insert multiple message parts. Matches upstream API. */
+  async createMessageParts(messageId: MessageId, parts: CreateMessagePartInput[]): Promise<void> {
+    for (const part of parts) {
+      await this.createMessagePart(messageId, part);
+    }
   }
 
   async getMessageParts(messageId: MessageId): Promise<MessagePartRecord[]> {

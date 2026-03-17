@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { formatTimestamp } from "../compaction.js";
 import type { LcmContextEngine } from "../engine.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
@@ -85,6 +86,7 @@ export function createLcmGrepTool(input: {
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
       const retrieval = input.lcm.getRetrieval();
+      const timezone = input.lcm.timezone;
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
       const mode = (p.mode as "regex" | "full_text") ?? "regex";
@@ -140,8 +142,8 @@ export function createLcmGrepTool(input: {
       }
       if (since || before) {
         lines.push(
-          `**Time filter:** ${since ? `since ${since.toISOString()}` : "since -∞"} | ${
-            before ? `before ${before.toISOString()}` : "before +∞"
+          `**Time filter:** ${since ? `since ${formatTimestamp(since, timezone)}` : "since -∞"} | ${
+            before ? `before ${formatTimestamp(before, timezone)}` : "before +∞"
           }`,
         );
       }
@@ -155,7 +157,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const msg of result.messages) {
           const snippet = truncateSnippet(msg.snippet);
-          const line = `- [msg#${msg.messageId}] (${msg.role}, ${msg.createdAt.toISOString()}): ${snippet}`;
+          const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatTimestamp(msg.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
@@ -171,7 +173,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const sum of result.summaries) {
           const snippet = truncateSnippet(sum.snippet);
-          const line = `- [${sum.summaryId}] (${sum.kind}, ${sum.createdAt.toISOString()}): ${snippet}`;
+          const line = `- [${sum.summaryId}] (${sum.kind}, ${formatTimestamp(sum.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;

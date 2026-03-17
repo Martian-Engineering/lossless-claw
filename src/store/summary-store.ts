@@ -1,9 +1,19 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { DatabaseSync } from "node:sqlite";
 import type { DbClient } from "../db/db-interface.js";
+import { SqliteClient } from "../db/sqlite-client.js";
 import { Dialect, type Backend } from "../db/dialect.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { sanitizeTsQuery } from "./tsquery-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
+
+/** Accept either a DbClient or raw DatabaseSync (auto-wraps the latter). */
+function ensureDbClient(db: DbClient | DatabaseSync): DbClient {
+  if ('run' in db && typeof (db as DbClient).run === 'function') {
+    return db as DbClient;
+  }
+  return new SqliteClient(db as DatabaseSync);
+}
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -247,11 +257,11 @@ export class SummaryStore {
   }
 
   constructor(
-    db: DbClient,
-    options?: { fullTextAvailable?: boolean; backend?: Backend },
+    db: DbClient | DatabaseSync,
+    options?: { fullTextAvailable?: boolean; fts5Available?: boolean; backend?: Backend },
   ) {
-    this._rootDb = db;
-    this.fullTextAvailable = options?.fullTextAvailable ?? true;
+    this._rootDb = ensureDbClient(db);
+    this.fullTextAvailable = options?.fullTextAvailable ?? options?.fts5Available ?? true;
     this.d = new Dialect(options?.backend ?? "sqlite");
   }
 
