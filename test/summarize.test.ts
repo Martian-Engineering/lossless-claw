@@ -117,6 +117,28 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("claude-opus-4-5", "qiniu");
   });
 
+  it("prefers plugin summaryModel over top-level config", async () => {
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          summaryModel: "gpt-4o-mini",
+          plugins: {
+            entries: {
+              "lossless-claw": { config: { summaryModel: "openai-resp/gpt-4.1-mini" } },
+            },
+          },
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("openai-resp/gpt-4.1-mini", undefined);
+  });
+
   it("passes summaryProvider override even when summaryModel override exists", async () => {
     const deps = makeDeps();
 

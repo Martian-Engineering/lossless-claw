@@ -557,9 +557,12 @@ async function resolveApiKeyFromAuthProfiles(params: {
 function resolveApiKeyFromAuthProfilesSync(params: {
   provider: string;
   authProfileId?: string;
+  agentDir?: string;
+  runtimeConfig?: unknown;
   envSnapshot: PluginEnvSnapshot;
 }): string | undefined {
   const entries = resolveAuthStorePaths({
+    agentDir: params.agentDir,
     envSnapshot: params.envSnapshot,
   })
     .map((path) => {
@@ -581,7 +584,7 @@ function resolveApiKeyFromAuthProfilesSync(params: {
     provider: params.provider,
     store: mergedStore,
     authProfileId: params.authProfileId,
-    runtimeConfig: undefined,
+    runtimeConfig: params.runtimeConfig,
   });
 
   for (const profileId of candidates) {
@@ -932,6 +935,8 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         ? resolveApiKeyFromAuthProfilesSync({
             provider: trimmedProvider,
             authProfileId: profileId,
+            agentDir: typeof options?.agentDir === "string" ? options.agentDir : undefined,
+            runtimeConfig: options?.runtimeConfig,
             envSnapshot,
           })
         : undefined;

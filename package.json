@@ -15,6 +15,9 @@
     "conversation-memory",
     "dag"
   ],
+  "scripts": {
+    "test": "vitest run"
+  },
   "files": [
     "index.ts",
     "src/**/*.ts",

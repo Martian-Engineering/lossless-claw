@@ -61,7 +61,7 @@ export type ResolveModelFn = (modelRef?: string, providerHint?: string) => {
 export type GetApiKeyFn = (
   provider: string,
   model: string,
-  options?: { profileId?: string },
+  options?: { profileId?: string; agentDir?: string; runtimeConfig?: unknown },
 ) => string | undefined;
 export type RequireApiKeyFn = (provider: string, model: string) => string;
 

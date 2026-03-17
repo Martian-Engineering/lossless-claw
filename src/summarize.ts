@@ -668,8 +668,8 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       : "";
 
   const summaryModelOverride =
-    (typeof runtimeConfig?.summaryModel === "string" ? runtimeConfig.summaryModel.trim() : "") ||
-    nestedPluginSummaryModel;
+    nestedPluginSummaryModel ||
+    (typeof runtimeConfig?.summaryModel === "string" ? runtimeConfig.summaryModel.trim() : "");
 
   const summaryProviderOverride =
     nestedPluginSummaryProvider ||
@@ -728,6 +728,8 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     const isCondensed = options?.isCondensed === true;
     const apiKey = await params.deps.getApiKey(provider, model, {
       profileId: authProfileId,
+      agentDir,
+      runtimeConfig: params.legacyParams.config,
     });
     const targetTokens = resolveTargetTokens({
       inputTokens: estimateTokens(text),
