@@ -1,6 +1,6 @@
 {
   "name": "@martian-engineering/lossless-claw",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with incremental compaction",
   "type": "module",
   "main": "index.ts",
@@ -16,7 +16,10 @@
     "dag"
   ],
   "scripts": {
-    "test": "vitest run"
+    "changeset": "changeset",
+    "release:verify": "npm test && npm pack --dry-run",
+    "test": "vitest run --dir test",
+    "version-packages": "changeset version"
   },
   "files": [
     "index.ts",
@@ -26,12 +29,6 @@
     "README.md",
     "LICENSE"
   ],
-  "scripts": {
-    "changeset": "changeset",
-    "release:verify": "npm test && npm pack --dry-run",
-    "test": "vitest run --dir test",
-    "version-packages": "changeset version"
-  },
   "dependencies": {
     "@mariozechner/pi-agent-core": "*",
     "@mariozechner/pi-ai": "*",
