@@ -2208,17 +2208,8 @@ describe("LCM integration: retrieval", () => {
     expect(result.messages[0]?.createdAt.toISOString()).toBe(t2.toISOString());
   });
 
-  it("expand returns children of a condensed parent summary", async () => {
-    // Create a condensed parent summary
-    await sumStore.insertSummary({
-      summaryId: "sum_parent",
-      conversationId: CONV_ID,
-      kind: "condensed",
-      content: "High-level condensed summary.",
-      tokenCount: 10,
-    });
-
-    // Create child leaf summaries that point to the parent
+  it("expand returns source summaries of a condensed summary", async () => {
+    // Create source leaf summaries that will be compacted into sum_parent
     await sumStore.insertSummary({
       summaryId: "sum_child_1",
       conversationId: CONV_ID,
@@ -2234,9 +2225,16 @@ describe("LCM integration: retrieval", () => {
       tokenCount: 15,
     });
 
-    // Link children to parent: each child has sum_parent as its parent
-    await sumStore.linkSummaryToParents("sum_child_1", ["sum_parent"]);
-    await sumStore.linkSummaryToParents("sum_child_2", ["sum_parent"]);
+    await sumStore.insertSummary({
+      summaryId: "sum_parent",
+      conversationId: CONV_ID,
+      kind: "condensed",
+      content: "High-level condensed summary.",
+      tokenCount: 10,
+    });
+
+    // Condensed summaries link to the source summaries they were built from.
+    await sumStore.linkSummaryToParents("sum_parent", ["sum_child_1", "sum_child_2"]);
 
     const result = await retrieval.expand({
       summaryId: "sum_parent",
@@ -2251,16 +2249,7 @@ describe("LCM integration: retrieval", () => {
   });
 
   it("expand respects tokenCap", async () => {
-    // Create parent
-    await sumStore.insertSummary({
-      summaryId: "sum_big_parent",
-      conversationId: CONV_ID,
-      kind: "condensed",
-      content: "Parent summary.",
-      tokenCount: 5,
-    });
-
-    // Create children with large token counts
+    // Create source summaries with large token counts
     await sumStore.insertSummary({
       summaryId: "sum_big_child_1",
       conversationId: CONV_ID,
@@ -2283,9 +2272,19 @@ describe("LCM integration: retrieval", () => {
       tokenCount: 100,
     });
 
-    await sumStore.linkSummaryToParents("sum_big_child_1", ["sum_big_parent"]);
-    await sumStore.linkSummaryToParents("sum_big_child_2", ["sum_big_parent"]);
-    await sumStore.linkSummaryToParents("sum_big_child_3", ["sum_big_parent"]);
+    await sumStore.insertSummary({
+      summaryId: "sum_big_parent",
+      conversationId: CONV_ID,
+      kind: "condensed",
+      content: "Parent summary.",
+      tokenCount: 5,
+    });
+
+    await sumStore.linkSummaryToParents("sum_big_parent", [
+      "sum_big_child_1",
+      "sum_big_child_2",
+      "sum_big_child_3",
+    ]);
 
     // Expand with a cap of 150 tokens — should fit child 1 (100) but not child 2
     const result = await retrieval.expand({
@@ -2332,12 +2331,12 @@ describe("LCM integration: retrieval", () => {
   });
 
   it("expand recurses through multiple depth levels", async () => {
-    // Build a 3-level hierarchy: grandparent -> parent -> leaf children
+    // Build a 3-level lineage chain: grandparent -> mid_parent -> deep_leaf
     await sumStore.insertSummary({
-      summaryId: "sum_grandparent",
+      summaryId: "sum_deep_leaf",
       conversationId: CONV_ID,
-      kind: "condensed",
-      content: "Grandparent condensed.",
+      kind: "leaf",
+      content: "Deep leaf summary.",
       tokenCount: 10,
     });
 
@@ -2348,18 +2347,16 @@ describe("LCM integration: retrieval", () => {
       content: "Mid-level condensed parent.",
       tokenCount: 10,
     });
-    // mid_parent is a child of grandparent
-    await sumStore.linkSummaryToParents("sum_mid_parent", ["sum_grandparent"]);
+    await sumStore.linkSummaryToParents("sum_mid_parent", ["sum_deep_leaf"]);
 
     await sumStore.insertSummary({
-      summaryId: "sum_deep_leaf",
+      summaryId: "sum_grandparent",
       conversationId: CONV_ID,
-      kind: "leaf",
-      content: "Deep leaf summary.",
+      kind: "condensed",
+      content: "Grandparent condensed.",
       tokenCount: 10,
     });
-    // deep_leaf is a child of mid_parent
-    await sumStore.linkSummaryToParents("sum_deep_leaf", ["sum_mid_parent"]);
+    await sumStore.linkSummaryToParents("sum_grandparent", ["sum_mid_parent"]);
 
     // Expand grandparent with depth=2 to reach deep_leaf
     const result = await retrieval.expand({

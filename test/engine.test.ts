@@ -1741,6 +1741,38 @@ describe("LcmContextEngine fidelity and token budget", () => {
       runtimeContext,
     );
   });
+
+  it("afterTurn skips compaction when ingest fails", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-ingest-failure";
+
+    const ingestBatchSpy = vi
+      .spyOn(engine, "ingestBatch")
+      .mockRejectedValue(new Error("ingest exploded"));
+    const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
+    const compactSpy = vi.spyOn(engine, "compact");
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-ingest-failure"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(ingestBatchSpy).toHaveBeenCalled();
+    expect(evaluateLeafTriggerSpy).not.toHaveBeenCalled();
+    expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
+    expect(compactSpy).not.toHaveBeenCalled();
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      "[lcm] afterTurn: ingest failed, skipping compaction:",
+      "ingest exploded",
+    );
+
+    consoleErrorSpy.mockRestore();
+  });
 });
 
 // ── Compact token budget plumbing ───────────────────────────────────────────
