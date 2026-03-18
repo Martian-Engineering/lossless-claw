@@ -808,7 +808,7 @@ export class LcmContextEngine implements ContextEngine {
         );
       } else {
         migrationOk = true;
-        this.deps.log.info(
+        this.deps.log.debug(
           `[lcm] Migration successful — ${tables.length} tables: ${tables.map((t) => t.name).join(", ")}`,
         );
       }
