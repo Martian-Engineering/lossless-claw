@@ -282,6 +282,14 @@ export class CompactionEngine {
       summarize,
       previousSummaryContent,
     );
+    if (!leafResult) {
+      return {
+        actionTaken: false,
+        tokensBefore,
+        tokensAfter: tokensBefore,
+        condensed: false,
+      };
+    }
     const tokensAfterLeaf = await this.summaryStore.getContextTokenCount(conversationId);
 
     await this.persistCompactionEvents({
@@ -315,6 +323,9 @@ export class CompactionEngine {
           targetDepth,
           summarize,
         );
+        if (!condenseResult) {
+          break;
+        }
         const passTokensAfter = await this.summaryStore.getContextTokenCount(conversationId);
         await this.persistCompactionEvents({
           conversationId,
@@ -406,6 +417,9 @@ export class CompactionEngine {
         summarize,
         previousSummaryContent,
       );
+      if (!leafResult) {
+        break;
+      }
       const passTokensAfter = await this.summaryStore.getContextTokenCount(conversationId);
       await this.persistCompactionEvents({
         conversationId,
@@ -421,6 +435,10 @@ export class CompactionEngine {
       level = leafResult.level;
       previousSummaryContent = leafResult.content;
 
+      if (!force && passTokensAfter <= threshold) {
+        previousTokens = passTokensAfter;
+        break;
+      }
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
         break;
       }
@@ -428,7 +446,7 @@ export class CompactionEngine {
     }
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.
-    while (true) {
+    while (force || previousTokens > threshold) {
       const candidate = await this.selectShallowestCondensationCandidate({
         conversationId,
         hardTrigger: hardTrigger === true,
@@ -444,6 +462,9 @@ export class CompactionEngine {
         candidate.targetDepth,
         summarize,
       );
+      if (!condenseResult) {
+        break;
+      }
       const passTokensAfter = await this.summaryStore.getContextTokenCount(conversationId);
       await this.persistCompactionEvents({
         conversationId,
@@ -459,6 +480,10 @@ export class CompactionEngine {
       createdSummaryId = condenseResult.summaryId;
       level = condenseResult.level;
 
+      if (!force && passTokensAfter <= threshold) {
+        previousTokens = passTokensAfter;
+        break;
+      }
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
         break;
       }
@@ -964,7 +989,7 @@ export class CompactionEngine {
     sourceText: string;
     summarize: CompactionSummarizeFn;
     options?: CompactionSummarizeOptions;
-  }): Promise<{ content: string; level: CompactionLevel }> {
+  }): Promise<{ content: string; level: CompactionLevel } | null> {
     const sourceText = params.sourceText.trim();
     if (!sourceText) {
       return {
@@ -974,11 +999,25 @@ export class CompactionEngine {
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
 
-    let summaryText = await params.summarize(sourceText, false, params.options);
+    const runSummarizer = async (aggressiveMode: boolean): Promise<string | null> => {
+      const output = await params.summarize(sourceText, aggressiveMode, params.options);
+      const trimmed = output.trim();
+      return trimmed || null;
+    };
+
+    const initialSummary = await runSummarizer(false);
+    if (initialSummary === null) {
+      return null;
+    }
+    let summaryText = initialSummary;
     let level: CompactionLevel = "normal";
 
     if (estimateTokens(summaryText) >= inputTokens) {
-      summaryText = await params.summarize(sourceText, true, params.options);
+      const aggressiveSummary = await runSummarizer(true);
+      if (aggressiveSummary === null) {
+        return null;
+      }
+      summaryText = aggressiveSummary;
       level = "aggressive";
 
       if (estimateTokens(summaryText) >= inputTokens) {
@@ -986,7 +1025,8 @@ export class CompactionEngine {
           sourceText.length > FALLBACK_MAX_CHARS
             ? sourceText.slice(0, FALLBACK_MAX_CHARS)
             : sourceText;
-        summaryText = `${truncated}\n[Truncated from ${inputTokens} tokens]`;
+        summaryText = `${truncated}
+[Truncated from ${inputTokens} tokens]`;
         level = "fallback";
       }
     }
@@ -1004,7 +1044,7 @@ export class CompactionEngine {
     messageItems: ContextItemRecord[],
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string }> {
+  ): Promise<{ summaryId: string; level: CompactionLevel; content: string } | null> {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
       [];
@@ -1037,6 +1077,12 @@ export class CompactionEngine {
         isCondensed: false,
       },
     });
+    if (!summary) {
+      console.warn(
+        `[lcm] leaf summarizer returned empty content; conversationId=${conversationId}; chunkMessages=${messageContents.length}; skipping leaf chunk`,
+      );
+      return null;
+    }
 
     // Persist the leaf summary
     const summaryId = generateSummaryId(summary.content);
@@ -1095,7 +1141,7 @@ export class CompactionEngine {
     summaryItems: ContextItemRecord[],
     targetDepth: number,
     summarize: CompactionSummarizeFn,
-  ): Promise<PassResult> {
+  ): Promise<PassResult | null> {
     // Fetch full summary records
     const summaryRecords: SummaryRecord[] = [];
     for (const item of summaryItems) {
@@ -1136,6 +1182,12 @@ export class CompactionEngine {
         depth: targetDepth + 1,
       },
     });
+    if (!condensed) {
+      console.warn(
+        `[lcm] condensed summarizer returned empty content; conversationId=${conversationId}; depth=${targetDepth}; chunkSummaries=${summaryRecords.length}; skipping condensed chunk`,
+      );
+      return null;
+    }
 
     // Persist the condensed summary
     const summaryId = generateSummaryId(condensed.content);

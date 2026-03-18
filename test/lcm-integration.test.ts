@@ -735,7 +735,7 @@ describe("LCM integration: ingest -> assemble", () => {
     // So we should see items from index 5..9 (fresh tail) + maybe index 5 from evictable
     const result = await assembler.assemble({
       conversationId: CONV_ID,
-      tokenBudget: 500,
+      tokenBudget: 150,
       freshTailCount: 4,
     });
 
@@ -1383,7 +1383,7 @@ describe("LCM integration: compaction", () => {
     const summarize = vi.fn(async () => "Depth two merged summary");
     const result = await depthAwareEngine.compact({
       conversationId: CONV_ID,
-      tokenBudget: 500,
+      tokenBudget: 200,
       summarize,
       force: true,
     });
@@ -1444,7 +1444,7 @@ describe("LCM integration: compaction", () => {
     const summarize = vi.fn(async () => "Depth-aware merged summary");
     const result = await depthAwareEngine.compact({
       conversationId: CONV_ID,
-      tokenBudget: 500,
+      tokenBudget: 200,
       summarize,
       force: true,
     });
@@ -1507,7 +1507,7 @@ describe("LCM integration: compaction", () => {
     const summarize = vi.fn(async () => "Depth-aware summary output");
     const result = await depthAwareEngine.compact({
       conversationId: CONV_ID,
-      tokenBudget: 500,
+      tokenBudget: 140,
       summarize,
       force: true,
     });
@@ -1695,7 +1695,7 @@ describe("LCM integration: compaction", () => {
     const summarize = vi.fn(async () => "Fanout relaxed summary");
     const normalResult = await depthAwareEngine.compact({
       conversationId: CONV_ID,
-      tokenBudget: 500,
+      tokenBudget: 140,
       summarize,
       force: true,
     });

@@ -793,24 +793,32 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           customInstructions: params.customInstructions,
         });
 
-    const result = await params.deps.complete({
-      provider,
-      model,
-      apiKey,
-      providerApi,
-      authProfileId,
-      agentDir,
-      runtimeConfig: params.legacyParams.config,
-      system: LCM_SUMMARIZER_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      maxTokens: targetTokens,
-      temperature: aggressive ? 0.1 : 0.2,
-    });
+    let result: Awaited<ReturnType<typeof params.deps.complete>>;
+    try {
+      result = await params.deps.complete({
+        provider,
+        model,
+        apiKey,
+        providerApi,
+        authProfileId,
+        agentDir,
+        runtimeConfig: params.legacyParams.config,
+        system: LCM_SUMMARIZER_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        maxTokens: targetTokens,
+        temperature: aggressive ? 0.1 : 0.2,
+      });
+    } catch (err) {
+      console.error(
+        `[lcm] summarizer call failed; provider=${provider}; model=${model}; error=${err instanceof Error ? err.message : String(err)}`,
+      );
+      return "";
+    }
 
     const normalized = normalizeCompletionSummary(result.content);
     let summary = normalized.summary;

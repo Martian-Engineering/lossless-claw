@@ -261,8 +261,10 @@ describe("lcm plugin registration", () => {
     });
 
     expect(run).toHaveBeenCalledWith(expect.objectContaining({
-      provider: "openrouter",
-      model: "anthropic/claude-haiku-4-5",
+      sessionKey: "agent:main:subagent:test",
+      message: "Test delegated run",
+      deliver: false,
+      idempotencyKey: "idem-1",
     }));
   });
 
@@ -291,7 +293,6 @@ describe("lcm plugin registration", () => {
       model: "claude-3-5-haiku",
     });
   });
-
   it("uses plugin config model with provider/model format", () => {
     const { api, getFactory } = buildApi({
       enabled: true,
@@ -321,7 +322,6 @@ describe("lcm plugin registration", () => {
       summaryModel: "gpt-5.4",
       summaryProvider: "openai-resp",
     });
-
     api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
 
     lcmPlugin.register(api);
@@ -336,7 +336,7 @@ describe("lcm plugin registration", () => {
 
     expect(resolved).toEqual({
       provider: "anthropic",
-      model: "claude-sonnet-4-6",
+      model: "gpt-5.4",
     });
   });
 
@@ -354,7 +354,6 @@ describe("lcm plugin registration", () => {
       "[lcm] Compaction summarization model: openai-resp/gpt-5.4 (override)",
     );
   });
-
   it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {
     const { api, getFactory, warnLog } = buildApi(
       {
