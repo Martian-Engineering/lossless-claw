@@ -225,9 +225,9 @@ describe("LcmContextEngine metadata", () => {
 
 describe("LcmContextEngine ignored sessions", () => {
   const ignoredSessionId = "runtime-ignored-session";
-  const ignoredSessionKey = "agent:main:cron:nightly";
+  const ignoredSessionKey = "agent:main:cron:nightly:run:run-123";
   const includedSessionId = "runtime-included-session";
-  const includedSessionKey = "agent:main:chat:nightly";
+  const includedSessionKey = "agent:main:main";
 
   it("skips bootstrap for ignored sessions while bootstrapping included sessions", async () => {
     const sessionFile = createSessionFilePath("ignored-bootstrap");
@@ -242,7 +242,7 @@ describe("LcmContextEngine ignored sessions", () => {
     } as AgentMessage);
 
     const engine = createEngineWithConfig({
-      ignoreSessionPatterns: ["agent:*:cron:*"],
+      ignoreSessionPatterns: ["agent:*:cron:**"],
     });
 
     const ignored = await engine.bootstrap({
@@ -273,7 +273,7 @@ describe("LcmContextEngine ignored sessions", () => {
 
   it("skips ingest for ignored sessions while storing included sessions", async () => {
     const engine = createEngineWithConfig({
-      ignoreSessionPatterns: ["agent:*:cron:*"],
+      ignoreSessionPatterns: ["agent:*:cron:**"],
     });
 
     const ignored = await engine.ingest({
@@ -299,7 +299,7 @@ describe("LcmContextEngine ignored sessions", () => {
 
   it("skips ingestBatch for ignored sessions while storing included sessions", async () => {
     const engine = createEngineWithConfig({
-      ignoreSessionPatterns: ["agent:*:cron:*"],
+      ignoreSessionPatterns: ["agent:*:cron:**"],
     });
 
     const ignored = await engine.ingestBatch({
@@ -336,7 +336,7 @@ describe("LcmContextEngine ignored sessions", () => {
 
   it("skips afterTurn for ignored sessions while persisting included sessions", async () => {
     const engine = createEngineWithConfig({
-      ignoreSessionPatterns: ["agent:*:cron:*"],
+      ignoreSessionPatterns: ["agent:*:cron:**"],
     });
 
     await engine.afterTurn({
@@ -371,7 +371,7 @@ describe("LcmContextEngine ignored sessions", () => {
 
   it("passes through assemble for ignored sessions while assembling included sessions from LCM", async () => {
     const engine = createEngineWithConfig({
-      ignoreSessionPatterns: ["agent:*:cron:*"],
+      ignoreSessionPatterns: ["agent:*:cron:**"],
     });
 
     await engine.ingest({
@@ -404,7 +404,7 @@ describe("LcmContextEngine ignored sessions", () => {
 
   it("skips compact for ignored sessions while compact still evaluates included sessions", async () => {
     const engine = createEngineWithConfig({
-      ignoreSessionPatterns: ["agent:*:cron:*"],
+      ignoreSessionPatterns: ["agent:*:cron:**"],
     });
 
     const ignored = await engine.compact({
@@ -437,10 +437,10 @@ describe("LcmContextEngine ignored sessions", () => {
 
   it("skips prepareSubagentSpawn for ignored sessions while creating grants for included sessions", async () => {
     const childSessionKey = "agent:main:subagent:worker-123";
-    const includedParentSessionKey = "agent:main:chat:parent";
+    const includedParentSessionKey = "agent:main:main";
     const runtimeSessionId = "runtime-parent-session";
     const engine = createEngineWithDeps(
-      { ignoreSessionPatterns: ["agent:*:cron:*"] },
+      { ignoreSessionPatterns: ["agent:*:cron:**"] },
       {
         resolveSessionIdFromSessionKey: vi.fn(async (sessionKey: string) =>
           sessionKey === includedParentSessionKey ? runtimeSessionId : undefined,
@@ -485,7 +485,7 @@ describe("LcmContextEngine ignored sessions", () => {
     });
 
     const engine = createEngineWithConfig({
-      ignoreSessionPatterns: ["agent:*:cron:*"],
+      ignoreSessionPatterns: ["agent:*:cron:**"],
     });
 
     await engine.onSubagentEnded({
@@ -508,17 +508,17 @@ describe("LcmContextEngine ignored sessions", () => {
 });
 
 describe("LcmContextEngine stateless sessions", () => {
-  const statelessSessionKey = "agent:main:ephemeral:preview";
-  const statefulSessionKey = "agent:main:chat:preview";
+  const statelessSessionKey = "agent:main:subagent:worker-preview";
+  const statefulSessionKey = "agent:main:main";
   const runtimeSessionId = "runtime-stateless-session";
   const statefulRuntimeSessionId = "runtime-stateful-session";
 
   it("matches stateless patterns on sessionKey and can be disabled globally", () => {
     const enabledEngine = createEngineWithConfig({
-      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
     });
     const disabledEngine = createEngineWithConfig({
-      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
       skipStatelessSessions: false,
     });
 
@@ -540,7 +540,7 @@ describe("LcmContextEngine stateless sessions", () => {
     } as AgentMessage);
 
     const engine = createEngineWithConfig({
-      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
     });
 
     const stateless = await engine.bootstrap({
@@ -569,7 +569,7 @@ describe("LcmContextEngine stateless sessions", () => {
 
   it("skips ingest and ingestBatch writes for stateless session keys", async () => {
     const engine = createEngineWithConfig({
-      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
     });
 
     const ingested = await engine.ingest({
@@ -606,7 +606,7 @@ describe("LcmContextEngine stateless sessions", () => {
 
   it("allows assemble reads for stateless session keys", async () => {
     const engine = createEngineWithConfig({
-      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
     });
 
     await engine.ingest({
@@ -628,7 +628,7 @@ describe("LcmContextEngine stateless sessions", () => {
 
   it("skips afterTurn and compact writes for stateless session keys", async () => {
     const engine = createEngineWithConfig({
-      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
     });
 
     await engine.afterTurn({
@@ -669,9 +669,9 @@ describe("LcmContextEngine stateless sessions", () => {
   });
 
   it("skips delegated grant writes for stateless session keys", async () => {
-    const childSessionKey = "agent:main:subagent:worker-123";
+    const childSessionKey = "agent:main:subagent:child-456";
     const engine = createEngineWithDeps(
-      { statelessSessionPatterns: ["agent:*:ephemeral:**"] },
+      { statelessSessionPatterns: ["agent:*:subagent:worker-*"] },
       {
         resolveSessionIdFromSessionKey: vi.fn(async (sessionKey: string) =>
           sessionKey === statefulSessionKey ? runtimeSessionId : undefined,
@@ -710,7 +710,7 @@ describe("LcmContextEngine stateless sessions", () => {
     });
 
     const engine = createEngineWithConfig({
-      statelessSessionPatterns: ["agent:*:ephemeral:**"],
+      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
     });
 
     await engine.onSubagentEnded({

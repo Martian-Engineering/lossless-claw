@@ -96,7 +96,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
           "contextThreshold": 0.75,
           "incrementalMaxDepth": -1,
           "ignoreSessionPatterns": [
-            "agent:*:cron:*"
+            "agent:*:cron:**"
           ],
           "summaryProvider": "anthropic",
           "summaryModel": "claude-3-5-haiku"

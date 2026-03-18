@@ -125,12 +125,12 @@ Use `ignoreSessionPatterns` or `LCM_IGNORE_SESSION_PATTERNS` to keep low-value s
 Example:
 
 ```bash
-export LCM_IGNORE_SESSION_PATTERNS=agent:*:cron:*,agent:main:subagent:batch-**
+export LCM_IGNORE_SESSION_PATTERNS=agent:*:cron:**,agent:main:subagent:**
 ```
 
 ### Stateless sessions
 
-Use `statelessSessionPatterns` or `LCM_STATELESS_SESSION_PATTERNS` for sessions that should be able to read from LCM without writing to it. This is useful for ephemeral or delegated sessions that should reuse existing context but avoid generating new LCM state.
+Use `statelessSessionPatterns` or `LCM_STATELESS_SESSION_PATTERNS` for sessions that should be able to read from LCM without writing to it. This is especially useful for sub-agent sessions, which use real OpenClaw keys like `agent:<agentId>:subagent:<uuid>`.
 
 Enable enforcement with `skipStatelessSessions` or `LCM_SKIP_STATELESS_SESSIONS=true`.
 
@@ -145,7 +145,7 @@ When a session key matches a stateless pattern and enforcement is enabled, LCM w
 Example:
 
 ```bash
-export LCM_STATELESS_SESSION_PATTERNS=agent:*:ephemeral:**,agent:main:subagent:batch-**
+export LCM_STATELESS_SESSION_PATTERNS=agent:*:subagent:**,agent:ops:subagent:**
 export LCM_SKIP_STATELESS_SESSIONS=true
 ```
 
@@ -158,11 +158,11 @@ Plugin config example:
       "lossless-claw": {
         "config": {
           "ignoreSessionPatterns": [
-            "agent:*:cron:*"
+            "agent:*:cron:**"
           ],
           "statelessSessionPatterns": [
-            "agent:*:ephemeral:**",
-            "agent:main:subagent:batch-**"
+            "agent:*:subagent:**",
+            "agent:ops:subagent:**"
           ],
           "skipStatelessSessions": true
         }
