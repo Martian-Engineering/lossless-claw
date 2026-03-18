@@ -35,6 +35,7 @@ import {
 } from "./large-files.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
+import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
   ConversationStore,
   type CreateMessagePartInput,
@@ -804,14 +805,18 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
     if (this.config.ignoreSessionPatterns.length > 0) {
-      this.deps.log.info(
-        `[lcm] Ignoring sessions matching ${this.config.ignoreSessionPatterns.length} pattern(s): ${this.config.ignoreSessionPatterns.join(", ")}`,
-      );
+      logStartupBannerOnce({
+        key: "ignore-session-patterns",
+        log: (message) => this.deps.log.info(message),
+        message: `[lcm] Ignoring sessions matching ${this.config.ignoreSessionPatterns.length} pattern(s): ${this.config.ignoreSessionPatterns.join(", ")}`,
+      });
     }
     if (this.config.skipStatelessSessions && this.config.statelessSessionPatterns.length > 0) {
-      this.deps.log.info(
-        `[lcm] Stateless session patterns: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
-      );
+      logStartupBannerOnce({
+        key: "stateless-session-patterns",
+        log: (message) => this.deps.log.info(message),
+        message: `[lcm] Stateless session patterns: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
+      });
     }
 
     this.assembler = new ContextAssembler(

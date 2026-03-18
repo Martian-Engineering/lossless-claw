@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import lcmPlugin from "../index.js";
 import { closeLcmConnection } from "../src/db/connection.js";
+import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
 
 type RegisteredEngineFactory = (() => unknown) | undefined;
 
@@ -104,6 +105,7 @@ describe("lcm plugin registration", () => {
       closeLcmConnection(dbPath);
     }
     dbPaths.clear();
+    resetStartupBannerLogsForTests();
     vi.unstubAllEnvs();
     for (const dir of tempDirs) {
       rmSync(dir, { recursive: true, force: true });
@@ -353,6 +355,46 @@ describe("lcm plugin registration", () => {
     expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: openai-resp/gpt-5.4 (override)",
     );
+  });
+
+  it("dedupes startup banner logs across repeated registration and engine construction", () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+
+    const pluginConfig = {
+      enabled: true,
+      contextThreshold: 0.33,
+      dbPath,
+      ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
+      statelessSessionPatterns: ["agent:*:subagent:**"],
+      skipStatelessSessions: true,
+    };
+    const first = buildApi(pluginConfig);
+    const second = buildApi(pluginConfig);
+
+    lcmPlugin.register(first.api);
+    lcmPlugin.register(second.api);
+
+    const firstFactory = first.getFactory();
+    const secondFactory = second.getFactory();
+
+    expect(firstFactory).toBeTypeOf("function");
+    expect(secondFactory).toBeTypeOf("function");
+
+    firstFactory!();
+    secondFactory!();
+
+    const firstMessages = first.infoLog.mock.calls.map(([message]) => message);
+    const secondMessages = second.infoLog.mock.calls.map(([message]) => message);
+
+    expect(firstMessages).toHaveLength(4);
+    expect([...firstMessages].sort()).toEqual([
+      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
+      "[lcm] Compaction summarization model: (unconfigured)",
+      "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
+      "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
+    ].sort());
+    expect(secondMessages).toEqual([]);
   });
   it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {
     const { api, getFactory, warnLog } = buildApi(

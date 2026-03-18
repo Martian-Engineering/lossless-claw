@@ -10,6 +10,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig } from "../db/config.js";
 import { createLcmDatabaseConnection } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
+import { logStartupBannerOnce } from "../startup-banner-log.js";
 import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
@@ -1354,16 +1355,20 @@ const lcmPlugin = {
       }),
     );
 
-    api.logger.info(
-      `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
-    );
-    api.logger.info(
-      buildCompactionModelLog({
+    logStartupBannerOnce({
+      key: "plugin-loaded",
+      log: (message) => api.logger.info(message),
+      message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
+    });
+    logStartupBannerOnce({
+      key: "compaction-model",
+      log: (message) => api.logger.info(message),
+      message: buildCompactionModelLog({
         config: deps.config,
         defaultModelRef: readDefaultModelFromConfig(api.config),
         defaultProvider: process.env.OPENCLAW_PROVIDER?.trim() ?? "",
       }),
-    );
+    });
   },
 };
 
