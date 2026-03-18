@@ -742,7 +742,16 @@ export class ConversationStore {
     before?: Date,
   ): MessageSearchResult[] {
     // SQLite has no native POSIX regex; fetch candidates and filter in JS
-    const re = new RegExp(pattern);
+    // Guard against ReDoS: reject patterns with nested quantifiers or excessive length
+    if (pattern.length > 500 || /(\+|\*|\?)\)(\+|\*|\?|\{\d)/.test(pattern)) {
+      return [];
+    }
+    let re: RegExp;
+    try {
+      re = new RegExp(pattern);
+    } catch {
+      return [];
+    }
 
     const where: string[] = [];
     const args: Array<string | number> = [];
@@ -768,11 +777,14 @@ export class ConversationStore {
       )
       .all(...args) as unknown as MessageRow[];
 
+    const MAX_ROW_SCAN = 10_000;
     const results: MessageSearchResult[] = [];
+    let scanned = 0;
     for (const row of rows) {
-      if (results.length >= limit) {
+      if (results.length >= limit || scanned >= MAX_ROW_SCAN) {
         break;
       }
+      scanned++;
       const match = re.exec(row.content);
       if (match) {
         results.push({
