@@ -67,14 +67,14 @@ export type MessagePartRecord = {
 
 export type CreateConversationInput = {
   sessionId: string;
-  title?: string;
   sessionKey?: string;
+  title?: string;
 };
 
 export type ConversationRecord = {
   conversationId: ConversationId;
   sessionId: string;
-  sessionKey?: string;
+  sessionKey: string | null;
   title: string | null;
   bootstrappedAt: Date | null;
   createdAt: Date;
@@ -158,7 +158,7 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
   return {
     conversationId: row.conversation_id,
     sessionId: row.session_id,
-    sessionKey: row.session_key ?? undefined,
+    sessionKey: row.session_key ?? null,
     title: row.title,
     bootstrappedAt: row.bootstrapped_at ? new Date(row.bootstrapped_at) : null,
     createdAt: new Date(row.created_at),
@@ -277,11 +277,34 @@ export class ConversationStore {
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at
-       FROM conversations WHERE session_key = ? LIMIT 1`,
+       FROM conversations
+       WHERE session_key = ?
+       LIMIT 1`,
       )
       .get(sessionKey) as unknown as ConversationRow | undefined;
 
     return row ? toConversationRecord(row) : null;
+  }
+
+  /** Resolve a conversation by stable session identity. */
+  async getConversationForSession(input: {
+    sessionId?: string;
+    sessionKey?: string;
+  }): Promise<ConversationRecord | null> {
+    const normalizedSessionKey = input.sessionKey?.trim();
+    if (normalizedSessionKey) {
+      const byKey = await this.getConversationBySessionKey(normalizedSessionKey);
+      if (byKey) {
+        return byKey;
+      }
+    }
+
+    const normalizedSessionId = input.sessionId?.trim();
+    if (!normalizedSessionId) {
+      return null;
+    }
+
+    return this.getConversationBySessionId(normalizedSessionId);
   }
 
   async getOrCreateConversation(
@@ -289,7 +312,6 @@ export class ConversationStore {
     titleOrOpts?: string | { title?: string; sessionKey?: string },
   ): Promise<ConversationRecord> {
     const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
-
     if (opts.sessionKey) {
       const byKey = await this.getConversationBySessionKey(opts.sessionKey);
       if (byKey) {
@@ -299,6 +321,7 @@ export class ConversationStore {
               `UPDATE conversations SET session_id = ?, updated_at = datetime('now') WHERE conversation_id = ?`,
             )
             .run(sessionId, byKey.conversationId);
+          byKey.sessionId = sessionId;
         }
         return byKey;
       }
@@ -312,6 +335,7 @@ export class ConversationStore {
             `UPDATE conversations SET session_key = ?, updated_at = datetime('now') WHERE conversation_id = ?`,
           )
           .run(opts.sessionKey, existing.conversationId);
+        existing.sessionKey = opts.sessionKey;
       }
       return existing;
     }

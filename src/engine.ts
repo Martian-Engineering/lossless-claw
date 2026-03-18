@@ -927,16 +927,17 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
-   * Serialize mutating operations per session to prevent ingest/compaction races.
+   * Serialize mutating operations per stable session identity to prevent
+   * ingest/compaction races across runtime UUID recycling.
    */
-  private async withSessionQueue<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.sessionOperationQueues.get(sessionId) ?? Promise.resolve();
+  private async withSessionQueue<T>(queueKey: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.sessionOperationQueues.get(queueKey) ?? Promise.resolve();
     let releaseQueue: () => void = () => {};
     const current = new Promise<void>((resolve) => {
       releaseQueue = resolve;
     });
     const next = previous.catch(() => {}).then(() => current);
-    this.sessionOperationQueues.set(sessionId, next);
+    this.sessionOperationQueues.set(queueKey, next);
 
     await previous.catch(() => {});
     try {
@@ -944,11 +945,17 @@ export class LcmContextEngine implements ContextEngine {
     } finally {
       releaseQueue();
       void next.finally(() => {
-        if (this.sessionOperationQueues.get(sessionId) === next) {
-          this.sessionOperationQueues.delete(sessionId);
+        if (this.sessionOperationQueues.get(queueKey) === next) {
+          this.sessionOperationQueues.delete(queueKey);
         }
       });
     }
+  }
+
+  /** Prefer stable session keys for queue serialization when available. */
+  private resolveSessionQueueKey(sessionId: string, sessionKey?: string): string {
+    const normalizedSessionKey = sessionKey?.trim();
+    return normalizedSessionKey || sessionId;
   }
 
   /** Normalize optional live token estimates supplied by runtime callers. */
@@ -992,7 +999,9 @@ export class LcmContextEngine implements ContextEngine {
       return undefined;
     }
     try {
-      const bySessionKey = await this.conversationStore.getConversationBySessionKey(trimmedKey);
+      const bySessionKey = await this.conversationStore.getConversationForSession({
+        sessionKey: trimmedKey,
+      });
       if (bySessionKey) {
         return bySessionKey.conversationId;
       }
@@ -1001,8 +1010,9 @@ export class LcmContextEngine implements ContextEngine {
       if (!runtimeSessionId) {
         return undefined;
       }
-      const conversation =
-        await this.conversationStore.getConversationBySessionId(runtimeSessionId);
+      const conversation = await this.conversationStore.getConversationForSession({
+        sessionId: runtimeSessionId,
+      });
       return conversation?.conversationId;
     } catch {
       return undefined;
@@ -1306,13 +1316,15 @@ export class LcmContextEngine implements ContextEngine {
     }
     this.ensureMigrated();
 
-    const result = await this.withSessionQueue(params.sessionId, async () =>
-      this.conversationStore.withTransaction(async () => {
-        const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
-          sessionKey: params.sessionKey,
-        });
-        const conversationId = conversation.conversationId;
-        const historicalMessages = readLeafPathMessages(params.sessionFile);
+    const result = await this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () =>
+        this.conversationStore.withTransaction(async () => {
+          const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
+            sessionKey: params.sessionKey,
+          });
+          const conversationId = conversation.conversationId;
+          const historicalMessages = readLeafPathMessages(params.sessionFile);
 
         // First-time import path: no LCM rows yet, so seed directly from the
         // active leaf context snapshot.
@@ -1391,23 +1403,24 @@ export class LcmContextEngine implements ContextEngine {
           };
         }
 
-        return {
-          bootstrapped: false,
-          importedMessages: 0,
-          reason: reconcile.hasOverlap
-            ? "conversation already up to date"
-            : "conversation already has messages",
-        };
-      }),
+          return {
+            bootstrapped: false,
+            importedMessages: 0,
+            reason: reconcile.hasOverlap
+              ? "conversation already up to date"
+              : "conversation already has messages",
+          };
+        }),
     );
 
     // Post-bootstrap pruning: clean HEARTBEAT_OK turns that were already
     // in the DB from prior bootstrap cycles (before pruning was enabled).
     if (this.config.pruneHeartbeatOk && result.bootstrapped === false) {
       try {
-        const conversation = await this.conversationStore.getConversationBySessionId(
-          params.sessionId,
-        );
+        const conversation = await this.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
         if (conversation) {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
@@ -1503,7 +1516,10 @@ export class LcmContextEngine implements ContextEngine {
       return { ingested: false };
     }
     this.ensureMigrated();
-    return this.withSessionQueue(params.sessionId, () => this.ingestSingle(params));
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      () => this.ingestSingle(params),
+    );
   }
 
   async ingestBatch(params: {
@@ -1522,21 +1538,24 @@ export class LcmContextEngine implements ContextEngine {
     if (params.messages.length === 0) {
       return { ingestedCount: 0 };
     }
-    return this.withSessionQueue(params.sessionId, async () => {
-      let ingestedCount = 0;
-      for (const message of params.messages) {
-        const result = await this.ingestSingle({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          message,
-          isHeartbeat: params.isHeartbeat,
-        });
-        if (result.ingested) {
-          ingestedCount += 1;
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () => {
+        let ingestedCount = 0;
+        for (const message of params.messages) {
+          const result = await this.ingestSingle({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            message,
+            isHeartbeat: params.isHeartbeat,
+          });
+          if (result.ingested) {
+            ingestedCount += 1;
+          }
         }
-      }
-      return { ingestedCount };
-    });
+        return { ingestedCount };
+      },
+    );
   }
 
   async afterTurn(params: {
@@ -1606,10 +1625,11 @@ export class LcmContextEngine implements ContextEngine {
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
 
     try {
-      const leafTrigger = await this.evaluateLeafTrigger(params.sessionId);
+      const leafTrigger = await this.evaluateLeafTrigger(params.sessionId, params.sessionKey);
       if (leafTrigger.shouldCompact) {
         this.compactLeafAsync({
           sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
           sessionFile: params.sessionFile,
           tokenBudget,
           currentTokenCount: liveContextTokens,
@@ -1625,6 +1645,7 @@ export class LcmContextEngine implements ContextEngine {
     try {
       await this.compact({
         sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
         sessionFile: params.sessionFile,
         tokenBudget,
         currentTokenCount: liveContextTokens,
@@ -1651,9 +1672,10 @@ export class LcmContextEngine implements ContextEngine {
     try {
       this.ensureMigrated();
 
-      const conversation = await this.conversationStore.getConversationBySessionId(
-        params.sessionId,
-      );
+      const conversation = await this.conversationStore.getConversationForSession({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+      });
       if (!conversation) {
         return {
           messages: params.messages,
@@ -1719,13 +1741,16 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /** Evaluate whether incremental leaf compaction should run for a session. */
-  async evaluateLeafTrigger(sessionId: string): Promise<{
+  async evaluateLeafTrigger(sessionId: string, sessionKey?: string): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
     this.ensureMigrated();
-    const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
     if (!conversation) {
       const fallbackThreshold =
         typeof this.config.leafChunkTokens === "number" &&
@@ -1765,70 +1790,74 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     this.ensureMigrated();
-    return this.withSessionQueue(params.sessionId, async () => {
-      const conversation = await this.conversationStore.getConversationBySessionId(
-        params.sessionId,
-      );
-      if (!conversation) {
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () => {
+        const conversation = await this.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+        if (!conversation) {
+          return {
+            ok: true,
+            compacted: false,
+            reason: "no conversation found for session",
+          };
+        }
+
+        const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
+        const tokenBudget = this.resolveTokenBudget({
+          tokenBudget: params.tokenBudget,
+          runtimeContext: params.runtimeContext,
+          legacyParams,
+        });
+        if (!tokenBudget) {
+          return {
+            ok: false,
+            compacted: false,
+            reason: "missing token budget in compact params",
+          };
+        }
+
+        const lp = legacyParams ?? {};
+        const observedTokens = this.normalizeObservedTokenCount(
+          params.currentTokenCount ??
+            (
+              lp as {
+                currentTokenCount?: unknown;
+              }
+            ).currentTokenCount,
+        );
+        const summarize = await this.resolveSummarize({
+          legacyParams,
+          customInstructions: params.customInstructions,
+        });
+
+        const leafResult = await this.compaction.compactLeaf({
+          conversationId: conversation.conversationId,
+          tokenBudget,
+          summarize,
+          force: params.force,
+          previousSummaryContent: params.previousSummaryContent,
+        });
+        const tokensBefore = observedTokens ?? leafResult.tokensBefore;
+
         return {
           ok: true,
-          compacted: false,
-          reason: "no conversation found for session",
-        };
-      }
-
-      const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
-      const tokenBudget = this.resolveTokenBudget({
-        tokenBudget: params.tokenBudget,
-        runtimeContext: params.runtimeContext,
-        legacyParams,
-      });
-      if (!tokenBudget) {
-        return {
-          ok: false,
-          compacted: false,
-          reason: "missing token budget in compact params",
-        };
-      }
-
-      const lp = legacyParams ?? {};
-      const observedTokens = this.normalizeObservedTokenCount(
-        params.currentTokenCount ??
-          (
-            lp as {
-              currentTokenCount?: unknown;
-            }
-          ).currentTokenCount,
-      );
-      const summarize = await this.resolveSummarize({
-        legacyParams,
-        customInstructions: params.customInstructions,
-      });
-
-      const leafResult = await this.compaction.compactLeaf({
-        conversationId: conversation.conversationId,
-        tokenBudget,
-        summarize,
-        force: params.force,
-        previousSummaryContent: params.previousSummaryContent,
-      });
-      const tokensBefore = observedTokens ?? leafResult.tokensBefore;
-
-      return {
-        ok: true,
-        compacted: leafResult.actionTaken,
-        reason: leafResult.actionTaken ? "compacted" : "below threshold",
-        result: {
-          tokensBefore,
-          tokensAfter: leafResult.tokensAfter,
-          details: {
-            rounds: leafResult.actionTaken ? 1 : 0,
-            targetTokens: tokenBudget,
-            mode: "leaf",
+          compacted: leafResult.actionTaken,
+          reason: leafResult.actionTaken ? "compacted" : "below threshold",
+          result: {
+            tokensBefore,
+            tokensAfter: leafResult.tokensAfter,
+            details: {
+              rounds: leafResult.actionTaken ? 1 : 0,
+              targetTokens: tokenBudget,
+              mode: "leaf",
+            },
           },
-        },
-      };
-    });
+        };
+      },
+    );
   }
 
   async compact(params: {
@@ -1861,20 +1890,25 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     this.ensureMigrated();
-    return this.withSessionQueue(params.sessionId, async () => {
-      const { sessionId, force = false } = params;
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () => {
+        const { sessionId, force = false } = params;
 
-      // Look up conversation
-      const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
-      if (!conversation) {
-        return {
-          ok: true,
-          compacted: false,
-          reason: "no conversation found for session",
-        };
-      }
+        // Look up conversation
+        const conversation = await this.conversationStore.getConversationForSession({
+          sessionId,
+          sessionKey: params.sessionKey,
+        });
+        if (!conversation) {
+          return {
+            ok: true,
+            compacted: false,
+            reason: "no conversation found for session",
+          };
+        }
 
-      const conversationId = conversation.conversationId;
+        const conversationId = conversation.conversationId;
 
       const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
       const lp = legacyParams ?? {};
@@ -1997,7 +2031,8 @@ export class LcmContextEngine implements ContextEngine {
           },
         },
       };
-    });
+      },
+    );
   }
 
   async prepareSubagentSpawn(params: {

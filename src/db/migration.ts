@@ -498,7 +498,6 @@ export function runLcmMigrations(
   }
 
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS conversations_session_key_idx ON conversations (session_key)`);
-
   ensureSummaryDepthColumn(db);
   ensureSummaryMetadataColumns(db);
   backfillSummaryDepths(db);
