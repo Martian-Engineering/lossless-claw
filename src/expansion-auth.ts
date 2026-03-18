@@ -195,17 +195,9 @@ export class ExpansionAuthManager {
       }
     }
 
-    // 6. Requested depth must not exceed grant maxDepth
-    if (request.depth > grant.maxDepth) {
-      return {
-        valid: false,
-        reason: `Requested depth ${request.depth} exceeds grant maxDepth ${grant.maxDepth}`,
-      };
-    }
-
-    // 7. tokenCap is enforced via clamping in wrapWithAuth, not rejected here.
-    // This allows callers to request more than remaining budget — it will be
-    // clamped to the actual remaining amount at execution time.
+    // 6. Depth and tokenCap are enforced via clamping in wrapWithAuth, not
+    // rejected here. This allows callers to request more than the grant
+    // permits — the values will be clamped to the grant limits at execution time.
 
     return { valid: true };
   }
@@ -347,6 +339,15 @@ export function wrapWithAuth(
         throw new Error("Expansion authorization failed: Grant token budget exhausted");
       }
 
+      // Clamp depth to grant maxDepth
+      const grant = authManager.getGrant(grantId);
+      const grantMaxDepth = grant?.maxDepth ?? DEFAULT_MAX_DEPTH;
+      const requestedDepth =
+        typeof request.maxDepth === "number" && Number.isFinite(request.maxDepth)
+          ? Math.max(1, Math.trunc(request.maxDepth))
+          : grantMaxDepth;
+      const effectiveDepth = Math.min(requestedDepth, grantMaxDepth);
+
       const requestedTokenCap =
         typeof request.tokenCap === "number" && Number.isFinite(request.tokenCap)
           ? Math.max(1, Math.trunc(request.tokenCap))
@@ -354,6 +355,7 @@ export function wrapWithAuth(
       const effectiveTokenCap = Math.max(1, Math.min(requestedTokenCap, remainingBudget));
       const result = await orchestrator.expand({
         ...request,
+        maxDepth: effectiveDepth,
         tokenCap: effectiveTokenCap,
       });
       authManager.consumeTokenBudget(grantId, result.totalTokens);
