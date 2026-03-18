@@ -103,6 +103,75 @@ export LCM_SUMMARY_PROVIDER=anthropic
 
 Using a cheaper/faster model for summarization can reduce costs, but quality matters — poor summaries compound as they're condensed into higher-level nodes.
 
+When more than one source is present, compaction summarization resolves in this order:
+
+1. `LCM_SUMMARY_MODEL` / `LCM_SUMMARY_PROVIDER`
+2. Plugin config `summaryModel` / `summaryProvider`
+3. OpenClaw's default compaction model/provider
+4. Legacy per-call model/provider hints
+
+If `summaryModel` already includes a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that choice.
+
+## Session controls
+
+### Excluding sessions entirely
+
+Use `ignoreSessionPatterns` or `LCM_IGNORE_SESSION_PATTERNS` to keep low-value sessions completely out of LCM. Matching sessions do not create conversations, do not store messages, and do not participate in compaction or delegated expansion grants.
+
+- Matching uses the full session key.
+- `*` matches any characters except `:`.
+- `**` matches anything, including `:`.
+
+Example:
+
+```bash
+export LCM_IGNORE_SESSION_PATTERNS=agent:*:cron:*,agent:main:subagent:batch-**
+```
+
+### Stateless sessions
+
+Use `statelessSessionPatterns` or `LCM_STATELESS_SESSION_PATTERNS` for sessions that should be able to read from LCM without writing to it. This is useful for ephemeral or delegated sessions that should reuse existing context but avoid generating new LCM state.
+
+Enable enforcement with `skipStatelessSessions` or `LCM_SKIP_STATELESS_SESSIONS=true`.
+
+When a session key matches a stateless pattern and enforcement is enabled, LCM will:
+
+- skip bootstrap imports
+- skip ingest and after-turn persistence
+- skip compaction writes
+- skip delegated expansion grant writes
+- still allow read-side assembly from existing persisted context
+
+Example:
+
+```bash
+export LCM_STATELESS_SESSION_PATTERNS=agent:*:ephemeral:**,agent:main:subagent:batch-**
+export LCM_SKIP_STATELESS_SESSIONS=true
+```
+
+Plugin config example:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "config": {
+          "ignoreSessionPatterns": [
+            "agent:*:cron:*"
+          ],
+          "statelessSessionPatterns": [
+            "agent:*:ephemeral:**",
+            "agent:main:subagent:batch-**"
+          ],
+          "skipStatelessSessions": true
+        }
+      }
+    }
+  }
+}
+```
+
 ## TUI conversation window size
 
 `LCM_TUI_CONVERSATION_WINDOW_SIZE` (default `200`) controls how many messages `lcm-tui` loads per keyset-paged conversation window when a session has an LCM `conversation_id`.
