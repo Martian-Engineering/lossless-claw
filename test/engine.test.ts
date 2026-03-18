@@ -370,6 +370,7 @@ describe("LcmContextEngine ignored sessions", () => {
       sessionFile: createSessionFilePath("included-after-turn"),
       messages: [makeMessage({ role: "assistant", content: "included turn" })],
       prePromptMessageCount: 0,
+      tokenBudget: 4096,
     });
 
     expect(
@@ -2297,6 +2298,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       ],
       prePromptMessageCount: 1,
       autoCompactionSummary: "[summary] compacted older history",
+      tokenBudget: 4096,
     });
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
@@ -2347,10 +2349,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
     );
   });
 
-  it("afterTurn accepts runtimeContext and forwards it as legacyParams", async () => {
+  it("afterTurn resolves tokenBudget from runtimeContext and forwards it as legacyParams", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-runtime-context";
-    const runtimeContext = { provider: "anthropic", model: "claude-opus-4-5" };
+    const runtimeContext = { provider: "anthropic", model: "claude-opus-4-5", tokenBudget: 2048 };
 
     vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
       shouldCompact: true,
@@ -2373,18 +2375,56 @@ describe("LcmContextEngine fidelity and token budget", () => {
       sessionFile: createSessionFilePath("after-turn-runtime-context"),
       messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
       prePromptMessageCount: 0,
-      tokenBudget: 4096,
       runtimeContext,
     });
 
     expect(compactLeafAsyncSpy).toHaveBeenCalled();
+    expect((compactLeafAsyncSpy.mock.calls[0]?.[0] as { tokenBudget?: unknown }).tokenBudget).toBe(2048);
     expect((compactLeafAsyncSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
       runtimeContext,
     );
     expect(compactSpy).toHaveBeenCalled();
+    expect((compactSpy.mock.calls[0]?.[0] as { tokenBudget?: unknown }).tokenBudget).toBe(2048);
     expect((compactSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
       runtimeContext,
     );
+  });
+
+  it("afterTurn falls back to the default token budget when no budget is provided", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-default-token-budget";
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    vi.spyOn(engine, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-default-token-budget"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+    });
+
+    expect(compactSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        tokenBudget: 128_000,
+        compactionTarget: "threshold",
+      }),
+    );
+    expect(consoleWarnSpy).toHaveBeenCalledWith(
+      "[lcm] afterTurn: tokenBudget not provided; using default 128000",
+    );
+
+    consoleWarnSpy.mockRestore();
   });
 
   it("afterTurn falls back to legacyCompactionParams when runtimeContext is missing", async () => {

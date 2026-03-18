@@ -1610,20 +1610,19 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
+    const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
     const DEFAULT_AFTER_TURN_TOKEN_BUDGET = 128_000;
-    const tokenBudget =
-      typeof params.tokenBudget === "number" &&
-      Number.isFinite(params.tokenBudget) &&
-      params.tokenBudget > 0
-        ? Math.floor(params.tokenBudget)
-        : DEFAULT_AFTER_TURN_TOKEN_BUDGET;
-    if (params.tokenBudget == null) {
-      console.error(
-        `[lcm] afterTurn: tokenBudget not provided by runtime; using default ${DEFAULT_AFTER_TURN_TOKEN_BUDGET}`,
+    const resolvedTokenBudget = this.resolveTokenBudget({
+      tokenBudget: params.tokenBudget,
+      runtimeContext: params.runtimeContext,
+      legacyParams,
+    });
+    const tokenBudget = resolvedTokenBudget ?? DEFAULT_AFTER_TURN_TOKEN_BUDGET;
+    if (resolvedTokenBudget === undefined) {
+      console.warn(
+        `[lcm] afterTurn: tokenBudget not provided; using default ${DEFAULT_AFTER_TURN_TOKEN_BUDGET}`,
       );
     }
-
-    const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
 
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
 
