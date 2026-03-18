@@ -112,6 +112,16 @@ function createEngine(): LcmContextEngine {
   return new LcmContextEngine(createTestDeps(config), db);
 }
 
+function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies>): LcmContextEngine {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = createTestConfig(join(tempDir, "lcm.db"));
+  return new LcmContextEngine({
+    ...createTestDeps(config),
+    ...overrides,
+  });
+}
+
 function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
   const config = createTestConfig(databasePath);
   const db = createLcmDatabaseConnection(config.databasePath);
@@ -932,6 +942,73 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(largeFiles).toHaveLength(0);
     });
   });
+
+  it("serializes recycled session writes by stable sessionKey", async () => {
+    const engine = createEngine();
+    const sessionKey = "agent:main:main";
+
+    await engine.ingest({
+      sessionId: "runtime-seed",
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "seed" }),
+    });
+
+    const store = engine.getConversationStore();
+    const originalCreateMessage = store.createMessage.bind(store);
+    let releaseFirstCreate: () => void = () => {};
+    let unblockFirstCreate!: () => void;
+    const firstCreateBlocked = new Promise<void>((resolve) => {
+      unblockFirstCreate = resolve;
+    });
+    let heldFirstCreate = false;
+
+    const createMessageSpy = vi
+      .spyOn(store, "createMessage")
+      .mockImplementation(async (input) => {
+        if (!heldFirstCreate) {
+          heldFirstCreate = true;
+          unblockFirstCreate();
+          await new Promise<void>((resolve) => {
+            releaseFirstCreate = resolve;
+          });
+        }
+        return originalCreateMessage(input);
+      });
+
+    const firstIngest = engine.ingest({
+      sessionId: "runtime-a",
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "first recycled reply" }),
+    });
+    await firstCreateBlocked;
+
+    const secondIngest = engine.ingest({
+      sessionId: "runtime-b",
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "second recycled reply" }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(createMessageSpy).toHaveBeenCalledTimes(1);
+
+    releaseFirstCreate();
+
+    await expect(Promise.all([firstIngest, secondIngest])).resolves.toEqual([
+      { ingested: true },
+      { ingested: true },
+    ]);
+
+    const conversation = await store.getConversationBySessionKey(sessionKey);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.sessionId).toBe("runtime-b");
+
+    const stored = await store.getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed",
+      "first recycled reply",
+      "second recycled reply",
+    ]);
+  });
 });
 
 describe("LcmContextEngine connection lifecycle", () => {
@@ -1200,6 +1277,27 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(result.bootstrapped).toBe(true);
     expect(bulkSpy).toHaveBeenCalledTimes(1);
     expect(singleSpy).not.toHaveBeenCalled();
+  });
+
+  it("prepareSubagentSpawn resolves parent conversation by sessionKey before UUID backfill", async () => {
+    const sessionKey = "agent:main:main";
+    const engine = createEngineWithDepsOverrides({
+      resolveSessionIdFromSessionKey: async () => "runtime-fresh",
+    });
+
+    await engine.ingest({
+      sessionId: "runtime-stale",
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "parent context" }),
+    });
+
+    const preparation = await engine.prepareSubagentSpawn({
+      parentSessionKey: sessionKey,
+      childSessionKey: "agent:main:subagent:test-child",
+    });
+
+    expect(preparation).toBeDefined();
+    preparation?.rollback();
   });
 });
 
@@ -2234,7 +2332,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       tokenBudget: 4096,
     });
 
-    expect(evaluateLeafTriggerSpy).toHaveBeenCalledWith(sessionId);
+    expect(evaluateLeafTriggerSpy).toHaveBeenCalledWith(sessionId, undefined);
     expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
     expect(compactSpy).toHaveBeenCalledWith(
       expect.objectContaining({

@@ -232,13 +232,37 @@ export async function resolveRequesterConversationScopeId(params: {
   }
 
   try {
+    const store = params.lcm.getConversationStore() as ReturnType<
+      LcmContextEngine["getConversationStore"]
+    > & {
+      getConversationForSession?: (input: {
+        sessionId?: string;
+        sessionKey?: string;
+      }) => Promise<{ conversationId: number } | null>;
+      getConversationBySessionKey?: (
+        sessionKey: string,
+      ) => Promise<{ conversationId: number } | null>;
+    };
+
+    if (typeof store.getConversationForSession === "function") {
+      const conversation = await store.getConversationForSession({
+        sessionKey: requesterSessionKey,
+      });
+      if (conversation) {
+        return conversation.conversationId;
+      }
+    } else if (typeof store.getConversationBySessionKey === "function") {
+      const byKey = await store.getConversationBySessionKey(requesterSessionKey);
+      if (byKey) {
+        return byKey.conversationId;
+      }
+    }
+
     const runtimeSessionId = await params.deps.resolveSessionIdFromSessionKey(requesterSessionKey);
     if (!runtimeSessionId) {
       return undefined;
     }
-    const conversation = await params.lcm
-      .getConversationStore()
-      .getConversationBySessionId(runtimeSessionId);
+    const conversation = await store.getConversationBySessionId(runtimeSessionId);
     return conversation?.conversationId;
   } catch {
     return undefined;

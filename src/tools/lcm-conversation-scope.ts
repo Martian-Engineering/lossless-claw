@@ -6,6 +6,44 @@ export type LcmConversationScope = {
   allConversations: boolean;
 };
 
+type ConversationScopeStore = ReturnType<LcmContextEngine["getConversationStore"]> & {
+  getConversationForSession?: (input: {
+    sessionId?: string;
+    sessionKey?: string;
+  }) => Promise<{ conversationId: number } | null>;
+  getConversationBySessionKey?: (sessionKey: string) => Promise<{ conversationId: number } | null>;
+};
+
+async function lookupConversationForSession(input: {
+  lcm: LcmContextEngine;
+  sessionId?: string;
+  sessionKey?: string;
+}): Promise<{ conversationId: number } | null> {
+  const store = input.lcm.getConversationStore() as ConversationScopeStore;
+
+  if (typeof store.getConversationForSession === "function") {
+    return store.getConversationForSession({
+      sessionId: input.sessionId,
+      sessionKey: input.sessionKey,
+    });
+  }
+
+  const normalizedSessionKey = input.sessionKey?.trim();
+  if (normalizedSessionKey && typeof store.getConversationBySessionKey === "function") {
+    const byKey = await store.getConversationBySessionKey(normalizedSessionKey);
+    if (byKey) {
+      return byKey;
+    }
+  }
+
+  const normalizedSessionId = input.sessionId?.trim();
+  if (!normalizedSessionId) {
+    return null;
+  }
+
+  return store.getConversationBySessionId(normalizedSessionId);
+}
+
 /**
  * Parse an ISO-8601 timestamp tool parameter into a Date.
  *
@@ -72,11 +110,15 @@ export async function resolveLcmConversationScope(input: {
   if (!normalizedSessionId && normalizedSessionKey && input.deps) {
     normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(normalizedSessionKey);
   }
-  if (!normalizedSessionId) {
+  if (!normalizedSessionId && !input.sessionKey?.trim()) {
     return { conversationId: undefined, allConversations: false };
   }
 
-  const conversation = await lcm.getConversationStore().getConversationBySessionId(normalizedSessionId);
+  const conversation = await lookupConversationForSession({
+    lcm,
+    sessionId: normalizedSessionId,
+    sessionKey: input.sessionKey,
+  });
   if (!conversation) {
     return { conversationId: undefined, allConversations: false };
   }
