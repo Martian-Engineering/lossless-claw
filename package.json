@@ -42,6 +42,9 @@
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
+  "optionalDependencies": {
+    "pg": "^8.13.0"
+  },
   "peerDependencies": {
     "openclaw": "*"
   },

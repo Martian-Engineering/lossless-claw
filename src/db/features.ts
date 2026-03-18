@@ -1,7 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
+import type { Backend } from "./dialect.js";
 
 export type LcmDbFeatures = {
-  fts5Available: boolean;
+  fullTextAvailable: boolean;
+  backend: Backend;
 };
 
 const featureCache = new WeakMap<DatabaseSync, LcmDbFeatures>();
@@ -23,20 +25,34 @@ function probeFts5(db: DatabaseSync): boolean {
 }
 
 /**
- * Detect SQLite features exposed by the current Node runtime.
+ * Detect database features for the configured backend.
  *
- * The result is cached per DatabaseSync handle because the probe is runtime-
- * specific, not database-file-specific.
+ * PostgreSQL: full-text search always available (tsvector is built-in).
+ * SQLite: probe for FTS5 at runtime.
+ *
+ * @param backend  - "sqlite" or "postgres"
+ * @param sqliteDb - raw DatabaseSync handle (only needed for SQLite FTS5 probe)
  */
-export function getLcmDbFeatures(db: DatabaseSync): LcmDbFeatures {
-  const cached = featureCache.get(db);
-  if (cached) {
-    return cached;
+export function getLcmDbFeatures(
+  backend: Backend,
+  sqliteDb?: DatabaseSync,
+): LcmDbFeatures {
+  if (backend === "postgres") {
+    return { fullTextAvailable: true, backend: "postgres" };
   }
 
-  const detected: LcmDbFeatures = {
-    fts5Available: probeFts5(db),
-  };
-  featureCache.set(db, detected);
-  return detected;
+  // SQLite — probe for FTS5 if we have a handle
+  if (sqliteDb) {
+    const cached = featureCache.get(sqliteDb);
+    if (cached) return cached;
+
+    const detected: LcmDbFeatures = {
+      fullTextAvailable: probeFts5(sqliteDb),
+      backend: "sqlite",
+    };
+    featureCache.set(sqliteDb, detected);
+    return detected;
+  }
+
+  return { fullTextAvailable: false, backend: "sqlite" };
 }
