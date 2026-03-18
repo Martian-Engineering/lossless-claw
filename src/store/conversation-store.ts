@@ -262,11 +262,22 @@ export class ConversationStore {
    * so concurrent sessions sharing this store singleton are safe.
    */
   async withTransaction<T>(operation: () => Promise<T> | T): Promise<T> {
+    return this.withTransactionClient(() => operation());
+  }
+
+  /**
+   * Execute an operation within this store's transaction scope and expose the
+   * underlying transaction client so other stores can join the same database
+   * transaction.
+   */
+  async withTransactionClient<T>(
+    operation: (client: DbClient) => Promise<T> | T,
+  ): Promise<T> {
     if (this._txStore.getStore()) {
-      return operation();
+      return operation(this._txStore.getStore()!);
     }
     return this._rootDb.transaction(async (txClient) => {
-      return this._txStore.run(txClient, operation);
+      return this._txStore.run(txClient, () => operation(txClient));
     });
   }
 

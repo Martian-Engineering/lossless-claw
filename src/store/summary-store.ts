@@ -276,6 +276,16 @@ export class SummaryStore {
     });
   }
 
+  /**
+   * Run an operation against an explicit database client.
+   *
+   * This lets engine-level flows share a transaction-scoped client across
+   * multiple stores when one store opens the transaction.
+   */
+  async withClient<T>(client: DbClient, operation: () => Promise<T> | T): Promise<T> {
+    return this._txStore.run(client, operation);
+  }
+
   // ── Summary CRUD ──────────────────────────────────────────────────────────
 
   async insertSummary(input: CreateSummaryInput): Promise<SummaryRecord> {
