@@ -1123,7 +1123,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
     },
     resolveModel: (modelRef, providerHint) => {
-      const raw = (modelRef?.trim() || envSnapshot.openclawDefaultModel).trim();
+      const raw = (envSnapshot.pluginSummaryModel || envSnapshot.lcmSummaryModel || modelRef?.trim() || envSnapshot.openclawDefaultModel).trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");
       }
@@ -1136,7 +1136,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         }
       }
 
-      const provider = (providerHint?.trim() || envSnapshot.openclawProvider || "openai").trim();
+      const provider = (envSnapshot.pluginSummaryProvider || envSnapshot.lcmSummaryProvider || providerHint?.trim() || envSnapshot.openclawProvider || "openai").trim();
       return { provider, model: raw };
     },
     getApiKey: async (provider, model, options) => {
