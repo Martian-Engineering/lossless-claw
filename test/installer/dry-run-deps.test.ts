@@ -90,6 +90,17 @@ describe("DryRunServiceDeps", () => {
     rmSync(scriptPath);
   });
 
+  // ── promptUser ───────────────────────────────────────────────────────────
+
+  it("promptUser logs [dry-run] would prompt and returns empty string", async () => {
+    const deps = new DryRunServiceDeps();
+    const result = await deps.promptUser("Pick [1]: ");
+    expect(result).toBe("");
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[dry-run] would prompt: Pick [1]: ")
+    );
+  });
+
   // ── readFileSync / existsSync — pass-through ─────────────────────────────
 
   it("readFileSync delegates to real fs", () => {
