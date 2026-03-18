@@ -674,14 +674,14 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
   const summaryLevels = [
     {
-      levelName: "plugin config (lossless-claw)",
-      model: readModelRef(nestedPluginConfig?.summaryModel),
-      provider: typeof nestedPluginConfig?.summaryProvider === "string" ? nestedPluginConfig.summaryProvider.trim() : "",
-    },
-    {
       levelName: "environment variables",
       model: process.env.LCM_SUMMARY_MODEL?.trim() ?? "",
       provider: process.env.LCM_SUMMARY_PROVIDER?.trim() ?? "",
+    },
+    {
+      levelName: "plugin config (lossless-claw)",
+      model: readModelRef(nestedPluginConfig?.summaryModel),
+      provider: typeof nestedPluginConfig?.summaryProvider === "string" ? nestedPluginConfig.summaryProvider.trim() : "",
     },
     {
       levelName: "OpenClaw agents.defaults.compaction.model",

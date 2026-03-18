@@ -102,9 +102,37 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("claude-opus-4-5", "anthropic");
   });
 
-  it("prefers plugin summaryModel over env and compaction model", async () => {
+  it("prefers env summaryModel over plugin config and compaction model", async () => {
     vi.stubEnv("LCM_SUMMARY_MODEL", "gpt-4o-mini");
     vi.stubEnv("LCM_SUMMARY_PROVIDER", "openai-resp");
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        config: {
+          agents: {
+            defaults: {
+              compaction: {
+                model: "openai-resp/gpt-4.1-mini",
+              },
+            },
+          },
+          plugins: {
+            entries: {
+              "lossless-claw": { config: { summaryModel: "gpt-4.1", summaryProvider: "qiniu" } },
+            },
+          },
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4o-mini", "openai-resp");
+  });
+
+  it("prefers plugin summaryModel over compaction model when env vars are absent", async () => {
     const deps = makeDeps();
 
     await createLcmSummarizeFromLegacyParams({

@@ -224,8 +224,10 @@ describe("LcmContextEngine metadata", () => {
 });
 
 describe("LcmContextEngine ignored sessions", () => {
-  const ignoredSessionId = "agent:main:cron:nightly";
-  const includedSessionId = "agent:main:chat:nightly";
+  const ignoredSessionId = "runtime-ignored-session";
+  const ignoredSessionKey = "agent:main:cron:nightly";
+  const includedSessionId = "runtime-included-session";
+  const includedSessionKey = "agent:main:chat:nightly";
 
   it("skips bootstrap for ignored sessions while bootstrapping included sessions", async () => {
     const sessionFile = createSessionFilePath("ignored-bootstrap");
@@ -243,8 +245,16 @@ describe("LcmContextEngine ignored sessions", () => {
       ignoreSessionPatterns: ["agent:*:cron:*"],
     });
 
-    const ignored = await engine.bootstrap({ sessionId: ignoredSessionId, sessionFile });
-    const included = await engine.bootstrap({ sessionId: includedSessionId, sessionFile });
+    const ignored = await engine.bootstrap({
+      sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
+      sessionFile,
+    });
+    const included = await engine.bootstrap({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      sessionFile,
+    });
 
     expect(ignored).toEqual({
       bootstrapped: false,
@@ -268,10 +278,12 @@ describe("LcmContextEngine ignored sessions", () => {
 
     const ignored = await engine.ingest({
       sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
       message: makeMessage({ role: "user", content: "drop me" }),
     });
     const included = await engine.ingest({
       sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
       message: makeMessage({ role: "user", content: "keep me" }),
     });
 
@@ -292,6 +304,7 @@ describe("LcmContextEngine ignored sessions", () => {
 
     const ignored = await engine.ingestBatch({
       sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
       messages: [
         makeMessage({ role: "user", content: "drop batch user" }),
         makeMessage({ role: "assistant", content: "drop batch assistant" }),
@@ -299,6 +312,7 @@ describe("LcmContextEngine ignored sessions", () => {
     });
     const included = await engine.ingestBatch({
       sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
       messages: [
         makeMessage({ role: "user", content: "keep batch user" }),
         makeMessage({ role: "assistant", content: "keep batch assistant" }),
@@ -327,12 +341,14 @@ describe("LcmContextEngine ignored sessions", () => {
 
     await engine.afterTurn({
       sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
       sessionFile: createSessionFilePath("ignored-after-turn"),
       messages: [makeMessage({ role: "assistant", content: "ignored turn" })],
       prePromptMessageCount: 0,
     });
     await engine.afterTurn({
       sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
       sessionFile: createSessionFilePath("included-after-turn"),
       messages: [makeMessage({ role: "assistant", content: "included turn" })],
       prePromptMessageCount: 0,
@@ -360,17 +376,20 @@ describe("LcmContextEngine ignored sessions", () => {
 
     await engine.ingest({
       sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
       message: makeMessage({ role: "user", content: "persisted context" }),
     });
 
     const liveMessages = [makeMessage({ role: "user", content: "live ignored turn" })];
     const ignored = await engine.assemble({
       sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
       messages: liveMessages,
       tokenBudget: 500,
     });
     const included = await engine.assemble({
       sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
       messages: [],
       tokenBudget: 500,
     });
@@ -390,16 +409,19 @@ describe("LcmContextEngine ignored sessions", () => {
 
     const ignored = await engine.compact({
       sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
       sessionFile: createSessionFilePath("ignored-compact"),
       tokenBudget: 1000,
     });
 
     await engine.ingest({
       sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
       message: makeMessage({ role: "user", content: "compact me maybe" }),
     });
     const included = await engine.compact({
       sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
       sessionFile: createSessionFilePath("included-compact"),
       tokenBudget: 1000,
     });

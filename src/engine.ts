@@ -723,12 +723,27 @@ export class LcmContextEngine implements ContextEngine {
     this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore);
   }
 
-  /** Check whether a session key should be excluded from LCM processing. */
-  private shouldIgnoreSession(sessionId: string): boolean {
-    if (!sessionId.trim() || this.ignoreSessionPatterns.length === 0) {
+  /**
+   * Check whether a session should be excluded from LCM processing.
+   *
+   * We prefer sessionKey matching because the configured glob patterns are
+   * documented in terms of session keys, but we fall back to sessionId for
+   * older call sites that may not provide the key yet.
+   */
+  private shouldIgnoreSession(params: { sessionId?: string; sessionKey?: string }): boolean {
+    if (this.ignoreSessionPatterns.length === 0) {
       return false;
     }
-    return matchesSessionPattern(sessionId, this.ignoreSessionPatterns);
+
+    const candidate =
+      typeof params.sessionKey === "string" && params.sessionKey.trim()
+        ? params.sessionKey.trim()
+        : (params.sessionId?.trim() ?? "");
+    if (!candidate) {
+      return false;
+    }
+
+    return matchesSessionPattern(candidate, this.ignoreSessionPatterns);
   }
 
   /** Check whether a session key should skip all LCM writes while remaining readable. */
@@ -1111,7 +1126,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionFile: string;
     sessionKey?: string;
   }): Promise<BootstrapResult> {
-    if (this.shouldIgnoreSession(params.sessionId)) {
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       return {
         bootstrapped: false,
         importedMessages: 0,
@@ -1311,7 +1326,7 @@ export class LcmContextEngine implements ContextEngine {
     message: AgentMessage;
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
-    if (this.shouldIgnoreSession(params.sessionId)) {
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       return { ingested: false };
     }
     if (this.isStatelessSession(params.sessionKey)) {
@@ -1327,7 +1342,7 @@ export class LcmContextEngine implements ContextEngine {
     messages: AgentMessage[];
     isHeartbeat?: boolean;
   }): Promise<IngestBatchResult> {
-    if (this.shouldIgnoreSession(params.sessionId)) {
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       return { ingestedCount: 0 };
     }
     if (this.isStatelessSession(params.sessionKey)) {
@@ -1367,7 +1382,7 @@ export class LcmContextEngine implements ContextEngine {
     /** Back-compat param name. */
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
-    if (this.shouldIgnoreSession(params.sessionId)) {
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       return;
     }
     if (this.isStatelessSession(params.sessionKey)) {
@@ -1455,7 +1470,7 @@ export class LcmContextEngine implements ContextEngine {
     messages: AgentMessage[];
     tokenBudget?: number;
   }): Promise<AssembleResult> {
-    if (this.shouldIgnoreSession(params.sessionId)) {
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       return {
         messages: params.messages,
         estimatedTokens: 0,
@@ -1659,7 +1674,7 @@ export class LcmContextEngine implements ContextEngine {
     /** Force compaction even if below threshold */
     force?: boolean;
   }): Promise<CompactResult> {
-    if (this.shouldIgnoreSession(params.sessionId)) {
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       return {
         ok: true,
         compacted: false,
@@ -1818,8 +1833,8 @@ export class LcmContextEngine implements ContextEngine {
     ttlMs?: number;
   }): Promise<SubagentSpawnPreparation | undefined> {
     if (
-      this.shouldIgnoreSession(params.parentSessionKey)
-      || this.shouldIgnoreSession(params.childSessionKey)
+      this.shouldIgnoreSession({ sessionKey: params.parentSessionKey })
+      || this.shouldIgnoreSession({ sessionKey: params.childSessionKey })
       || this.isStatelessSession(params.parentSessionKey)
       || this.isStatelessSession(params.childSessionKey)
     ) {
@@ -1863,7 +1878,7 @@ export class LcmContextEngine implements ContextEngine {
     reason: SubagentEndReason;
   }): Promise<void> {
     if (
-      this.shouldIgnoreSession(params.childSessionKey)
+      this.shouldIgnoreSession({ sessionKey: params.childSessionKey })
       || this.isStatelessSession(params.childSessionKey)
     ) {
       return;
