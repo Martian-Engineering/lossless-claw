@@ -2619,3 +2619,124 @@ describe("LCM integration: full round-trip", () => {
     expect(grepResult.totalMatches).toBeGreaterThanOrEqual(1);
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Test Suite: Media Message Annotation
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("LCM integration: media message annotation in compaction", () => {
+  let convStore: ReturnType<typeof createMockConversationStore>;
+  let sumStore: ReturnType<typeof createMockSummaryStore>;
+  let compactionEngine: CompactionEngine;
+
+  beforeEach(() => {
+    convStore = createMockConversationStore();
+    sumStore = createMockSummaryStore();
+    wireStores(convStore, sumStore);
+    compactionEngine = new CompactionEngine(
+      convStore,
+      sumStore,
+      defaultCompactionConfig,
+    );
+  });
+
+  it("annotates media-only messages with [Media attachment] instead of raw file path", async () => {
+    // Ingest messages; one is media-only (just a file path)
+    const msgs = await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) =>
+        i === 3 ? "MEDIA:/tmp/uploads/photo_2026.png" : `Discussion point ${i}: ${"x".repeat(200)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    // Add a "file" part to the media-only message
+    await convStore.createMessageParts(msgs[3].messageId, [
+      {
+        sessionId: "test-session",
+        partType: "file",
+        ordinal: 0,
+        textContent: null,
+        metadata: JSON.stringify({ filename: "photo_2026.png" }),
+      },
+    ]);
+
+    let summarizedText = "";
+    const summarize = vi.fn(async (text: string) => {
+      summarizedText = text;
+      return `Summary: ${text.substring(0, 100)}`;
+    });
+
+    await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    // The summarizer should have received "[Media attachment]" not the raw MEDIA:/ path
+    expect(summarizedText).toContain("[Media attachment]");
+    expect(summarizedText).not.toContain("MEDIA:/tmp/uploads/photo_2026.png");
+  });
+
+  it("annotates media-mostly messages with text + [with media attachment]", async () => {
+    const msgs = await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) =>
+        i === 2 ? "Look at this chart, really interesting pattern here" : `Analysis ${i}: ${"y".repeat(200)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    // Add a "file" part to the media-mostly message
+    await convStore.createMessageParts(msgs[2].messageId, [
+      {
+        sessionId: "test-session",
+        partType: "file",
+        ordinal: 0,
+        textContent: null,
+        metadata: JSON.stringify({ filename: "chart.png" }),
+      },
+    ]);
+
+    let summarizedText = "";
+    const summarize = vi.fn(async (text: string) => {
+      summarizedText = text;
+      return `Summary: ${text.substring(0, 100)}`;
+    });
+
+    await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    // The summarizer should see the text with annotation, not just raw content
+    expect(summarizedText).toContain("Look at this chart, really interesting pattern here");
+    expect(summarizedText).toContain("[with media attachment]");
+  });
+
+  it("leaves text-only messages unchanged even with many tokens", async () => {
+    const msgs = await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) => `Pure text message ${i}: ${"z".repeat(200)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    // No file parts added — all text-only
+
+    let summarizedText = "";
+    const summarize = vi.fn(async (text: string) => {
+      summarizedText = text;
+      return `Summary: ${text.substring(0, 100)}`;
+    });
+
+    await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    // No media annotations should appear
+    expect(summarizedText).not.toContain("[Media attachment]");
+    expect(summarizedText).not.toContain("[with media attachment]");
+    expect(summarizedText).toContain("Pure text message");
+  });
+});
