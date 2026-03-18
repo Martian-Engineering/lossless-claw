@@ -128,6 +128,39 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
 
+### Expansion model override requirements
+
+If you want `lcm_expand_query` to run on a dedicated model via `expansionModel` or `LCM_EXPANSION_MODEL`, OpenClaw must explicitly trust the plugin to request sub-agent model overrides.
+
+Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the canonical `provider/model` target you want the plugin to use:
+
+```json
+{
+  "models": {
+    "openai/gpt-4.1-mini": {}
+  },
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "enabled": true,
+        "subagent": {
+          "allowModelOverride": true,
+          "allowedModels": ["openai/gpt-4.1-mini"]
+        },
+        "config": {
+          "expansionModel": "openai/gpt-4.1-mini"
+        }
+      }
+    }
+  }
+}
+```
+
+- `subagent.allowModelOverride` is required for OpenClaw to honor plugin-requested per-run `provider`/`model` overrides.
+- `subagent.allowedModels` is optional but recommended. Use `"*"` only if you intentionally want to trust any target model.
+- The chosen expansion target must also be available in OpenClaw's normal model catalog. If it is not already configured elsewhere, add it under the top-level `models` map as shown above.
+- If you prefer splitting provider and model, set `config.expansionProvider` and use a bare `config.expansionModel`.
+
 ### Summary model priority
 
 When choosing which model to use for summarization, lossless-claw follows this priority order (highest to lowest):
