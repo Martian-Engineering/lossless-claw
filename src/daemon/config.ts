@@ -10,7 +10,7 @@ export type DaemonConfig = {
     promotionThresholds: { minDepth: number; compressionRatio: number; keywords: Record<string, string[]>; architecturePatterns: string[] };
   };
   restoration: { recentSummaries: number; semanticTopK: number; semanticThreshold: number };
-  llm: { model: string; apiKey: string };
+  llm: { provider: "anthropic" | "openai"; model: string; apiKey: string; baseURL: string };
   cipher: { configPath: string; collection: string };
 };
 
@@ -26,7 +26,7 @@ const DEFAULTS: DaemonConfig = {
     },
   },
   restoration: { recentSummaries: 3, semanticTopK: 5, semanticThreshold: 0.35 },
-  llm: { model: "claude-haiku-4-5-20251001", apiKey: "" },
+  llm: { provider: "anthropic", model: "claude-haiku-4-5-20251001", apiKey: "", baseURL: "" },
   cipher: { configPath: join(homedir(), ".cipher", "cipher.yml"), collection: "lossless_memory" },
 };
 
@@ -46,8 +46,10 @@ export function loadDaemonConfig(configPath: string, overrides?: any, env?: Reco
   const e = env ?? process.env;
   let fileConfig: any = {};
   try { fileConfig = JSON.parse(readFileSync(configPath, "utf-8")); } catch {}
-  const merged = deepMerge(DEFAULTS, deepMerge(fileConfig, overrides));
+  const merged = deepMerge(structuredClone(DEFAULTS), deepMerge(fileConfig, overrides));
   if (merged.llm.apiKey) merged.llm.apiKey = merged.llm.apiKey.replace(/\$\{(\w+)\}/g, (_: string, k: string) => e[k] ?? "");
-  if (!merged.llm.apiKey && e.ANTHROPIC_API_KEY) merged.llm.apiKey = e.ANTHROPIC_API_KEY;
+  if (!merged.llm.apiKey && merged.llm.provider === "anthropic" && e.ANTHROPIC_API_KEY) {
+    merged.llm.apiKey = e.ANTHROPIC_API_KEY;
+  }
   return merged;
 }

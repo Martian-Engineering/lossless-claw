@@ -28,4 +28,29 @@ describe("loadDaemonConfig", () => {
     const c = loadDaemonConfig("/nonexistent", undefined, { ANTHROPIC_API_KEY: "sk-env" });
     expect(c.llm.apiKey).toBe("sk-env");
   });
+
+  it("defaults provider to 'anthropic' and baseURL to empty string", () => {
+    const c = loadDaemonConfig("/nonexistent/config.json");
+    expect(c.llm.provider).toBe("anthropic");
+    expect(c.llm.baseURL).toBe("");
+  });
+
+  it("merges provider and baseURL from file config", () => {
+    const c = loadDaemonConfig("/nonexistent/config.json", {
+      llm: { provider: "openai", baseURL: "http://localhost:11435/v1", model: "qwen2.5:14b" }
+    });
+    expect(c.llm.provider).toBe("openai");
+    expect(c.llm.baseURL).toBe("http://localhost:11435/v1");
+    expect(c.llm.model).toBe("qwen2.5:14b");
+  });
+
+  it("does NOT inject ANTHROPIC_API_KEY when provider is openai", () => {
+    const c = loadDaemonConfig("/nonexistent", { llm: { provider: "openai" } }, { ANTHROPIC_API_KEY: "sk-leaked" });
+    expect(c.llm.apiKey).toBe("");
+  });
+
+  it("still injects ANTHROPIC_API_KEY when provider is anthropic", () => {
+    const c = loadDaemonConfig("/nonexistent", { llm: { provider: "anthropic" } }, { ANTHROPIC_API_KEY: "sk-env" });
+    expect(c.llm.apiKey).toBe("sk-env");
+  });
 });
