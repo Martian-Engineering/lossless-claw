@@ -99,7 +99,7 @@ async function migrateSqlite(pool) {
         `INSERT INTO summaries (summary_id, conversation_id, kind, depth, content, token_count,
          earliest_at, latest_at, descendant_count, descendant_token_count, source_message_token_count,
          file_ids, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
         [s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
          s.earliest_at, s.latest_at, s.descendant_count, s.descendant_token_count,
          s.source_message_token_count, s.file_ids || '[]', s.created_at]
