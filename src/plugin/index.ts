@@ -129,6 +129,41 @@ function readDefaultModelFromConfig(config: unknown): string {
   return typeof primary === "string" ? primary.trim() : "";
 }
 
+/** Format a provider/model pair for logs. */
+function formatProviderModel(params: { provider: string; model: string }): string {
+  return `${params.provider}/${params.model}`;
+}
+
+/** Build a startup log showing which compaction model LCM will use. */
+function buildCompactionModelLog(params: {
+  config: LcmConfig;
+  defaultModelRef: string;
+  defaultProvider: string;
+}): string {
+  const usingOverride = Boolean(params.config.summaryModel || params.config.summaryProvider);
+  const raw = (params.config.summaryModel || params.defaultModelRef).trim();
+  if (!raw) {
+    return "[lcm] Compaction summarization model: (unconfigured)";
+  }
+
+  if (raw.includes("/")) {
+    const [provider, ...rest] = raw.split("/");
+    const model = rest.join("/").trim();
+    if (provider && model) {
+      return `[lcm] Compaction summarization model: ${formatProviderModel({
+        provider: provider.trim(),
+        model,
+      })} (${usingOverride ? "override" : "default"})`;
+    }
+  }
+
+  const provider = (params.config.summaryProvider || params.defaultProvider || "openai").trim();
+  return `[lcm] Compaction summarization model: ${formatProviderModel({
+    provider,
+    model: raw,
+  })} (${usingOverride ? "override" : "default"})`;
+}
+
 /** Resolve common provider API keys from environment. */
 function resolveApiKey(provider: string, readEnv: ReadEnvFn): string | undefined {
   const keyMap: Record<string, string[]> = {
@@ -1125,8 +1160,8 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     },
     resolveModel: (modelRef, providerHint) => {
       const raw =
-        (envSnapshot.pluginSummaryModel ||
-         envSnapshot.lcmSummaryModel ||
+        (envSnapshot.lcmSummaryModel ||
+         config.summaryModel ||
          modelRef?.trim() ||
          envSnapshot.openclawDefaultModel).trim();
       if (!raw) {
@@ -1143,8 +1178,8 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 
       const provider = (
         providerHint?.trim() ||
-        envSnapshot.pluginSummaryProvider ||
         envSnapshot.lcmSummaryProvider ||
+        config.summaryProvider ||
         envSnapshot.openclawProvider ||
         "openai"
       ).trim();
@@ -1321,6 +1356,13 @@ const lcmPlugin = {
 
     api.logger.info(
       `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
+    );
+    api.logger.info(
+      buildCompactionModelLog({
+        config: deps.config,
+        defaultModelRef: readDefaultModelFromConfig(api.config),
+        defaultProvider: process.env.OPENCLAW_PROVIDER?.trim() ?? "",
+      }),
     );
   },
 };

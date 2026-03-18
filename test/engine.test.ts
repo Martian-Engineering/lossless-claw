@@ -145,7 +145,8 @@ function createEngineWithDeps(
     ...createTestConfig(join(tempDir, "lcm.db")),
     ...configOverrides,
   };
-  return new LcmContextEngine(createTestDeps(config, depOverrides));
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return new LcmContextEngine(createTestDeps(config, depOverrides), db);
 }
 
 async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
