@@ -14,6 +14,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -29,6 +30,12 @@ const (
 	openAIResponsesModel   = "gpt-5.3-codex"
 	condensedTargetTokens  = 2000
 	defaultHTTPTimeout     = 180 * time.Second
+)
+
+var (
+	lookupCLIPath       = exec.LookPath
+	execCLICommand      = exec.CommandContext
+	cliOutputTokenSlack = 64
 )
 
 type repairOptions struct {
@@ -944,16 +951,21 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 		return "", fmt.Errorf("marshal Anthropic request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(payload))
+	// OAuth/setup-tokens (sk-ant-oat01-...) cannot authenticate directly against
+	// api.anthropic.com — they require OpenClaw's internal OAuth exchange. When one
+	// is detected, delegate to the `claude` CLI which already holds valid Max OAuth
+	// credentials and handles the exchange transparently.
+	if isOAuthToken(c.apiKey) {
+		return summarizeViaCLI(ctx, model, prompt, targetTokens)
+	}
+
+	endpoint := "https://api.anthropic.com/v1/messages"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return "", fmt.Errorf("build Anthropic request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if isOAuthToken(c.apiKey) {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	} else {
-		req.Header.Set("x-api-key", c.apiKey)
-	}
+	req.Header.Set("x-api-key", c.apiKey)
 	req.Header.Set("anthropic-version", anthropicVersion)
 
 	resp, err := c.http.Do(req)
@@ -984,6 +996,51 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 			"empty summary after normalization (provider=anthropic model=%s block_types=%s)",
 			model,
 			formatBlockTypes(blockTypes),
+		)
+	}
+	return result, nil
+}
+
+// summarizeViaCLI delegates to the `claude` CLI binary when an OAuth/setup-token
+// is in use. The CLI handles Max OAuth exchange internally, so no raw API key is needed.
+func summarizeViaCLI(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
+	claudePath, err := lookupCLIPath("claude")
+	if err != nil {
+		return "", fmt.Errorf("oauth token detected but `claude` CLI not found in PATH: install Claude Code or set --provider openai as a workaround")
+	}
+	cmd := execCLICommand(ctx, claudePath,
+		"--print",
+		"--output-format", "text",
+		"--model", model,
+		"-p", prompt,
+	)
+	// Unset ANTHROPIC_API_KEY so the CLI uses its own stored OAuth credentials.
+	env := os.Environ()
+	filtered := env[:0]
+	for _, e := range env {
+		if !strings.HasPrefix(e, "ANTHROPIC_API_KEY=") {
+			filtered = append(filtered, e)
+		}
+	}
+	cmd.Env = filtered
+	out, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", fmt.Errorf("claude CLI exited %d: %s", exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return "", fmt.Errorf("claude CLI: %w", err)
+	}
+	result := strings.TrimSpace(string(out))
+	if result == "" {
+		return "", fmt.Errorf("claude CLI returned empty output")
+	}
+	estimatedTokens := estimateTokenCount(result)
+	if estimatedTokens > targetTokens+cliOutputTokenSlack {
+		return "", fmt.Errorf(
+			"claude CLI output exceeded target token budget: got %d tokens for target %d",
+			estimatedTokens,
+			targetTokens,
 		)
 	}
 	return result, nil
@@ -1342,6 +1399,48 @@ func readSetupTokenFromSecrets(openclawDir string) (string, error) {
 // isOAuthToken returns true if the token uses the OAuth setup-token prefix.
 func isOAuthToken(token string) bool {
 	return strings.HasPrefix(token, "sk-ant-oat")
+}
+
+// resolveGatewayURL reads ~/.openclaw/openclaw.json and returns the local
+// gateway base URL (e.g. "http://127.0.0.1:3030"). Returns "" if the config
+// file is missing or the port field is absent.
+func resolveGatewayURL() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".openclaw", "openclaw.json"))
+	if err != nil {
+		return ""
+	}
+	var cfg map[string]interface{}
+	if json.Unmarshal(data, &cfg) != nil {
+		return ""
+	}
+	// Port may be at top-level "port" or nested under "gateway.port"
+	var portVal interface{}
+	var ok bool
+	portVal, ok = cfg["port"]
+	if !ok {
+		if gw, gwOk := cfg["gateway"].(map[string]interface{}); gwOk {
+			portVal, ok = gw["port"]
+		}
+	}
+	if !ok {
+		return ""
+	}
+	switch v := portVal.(type) {
+	case float64:
+		return fmt.Sprintf("http://127.0.0.1:%d", int(v))
+	case string:
+		p, err := strconv.Atoi(v)
+		if err != nil {
+			return ""
+		}
+		return fmt.Sprintf("http://127.0.0.1:%d", p)
+	default:
+		return ""
+	}
 }
 
 func providerAPIEnvCandidates(provider string) []string {

@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -120,4 +125,249 @@ func TestSummarizeOpenAIEmptyNormalizationIncludesDiagnostics(t *testing.T) {
 	if !strings.Contains(msg, "block_types=reasoning") {
 		t.Fatalf("expected block_types diagnostics, got %q", msg)
 	}
+}
+
+func TestIsOAuthToken(t *testing.T) {
+	tests := []struct {
+		token string
+		want  bool
+	}{
+		{"sk-ant-oat01-abc123", true},
+		{"sk-ant-oat02-xyz", true},
+		{"sk-ant-api03-abc123", false},
+		{"some-random-key", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isOAuthToken(tt.token); got != tt.want {
+			t.Errorf("isOAuthToken(%q) = %v, want %v", tt.token, got, tt.want)
+		}
+	}
+}
+
+func TestResolveGatewayURL(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  map[string]interface{}
+		want string
+	}{
+		{
+			name: "top-level port",
+			cfg:  map[string]interface{}{"port": float64(8080)},
+			want: "http://127.0.0.1:8080",
+		},
+		{
+			name: "nested gateway port",
+			cfg:  map[string]interface{}{"gateway": map[string]interface{}{"port": float64(3030)}},
+			want: "http://127.0.0.1:3030",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpHome := t.TempDir()
+			ocDir := filepath.Join(tmpHome, ".openclaw")
+			if err := os.MkdirAll(ocDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			data, _ := json.Marshal(tt.cfg)
+			if err := os.WriteFile(filepath.Join(ocDir, "openclaw.json"), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			t.Setenv("HOME", tmpHome)
+
+			got := resolveGatewayURL()
+			if got != tt.want {
+				t.Fatalf("resolveGatewayURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveGatewayURLMissingFile(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	got := resolveGatewayURL()
+	if got != "" {
+		t.Fatalf("resolveGatewayURL() = %q, want empty string", got)
+	}
+}
+
+func TestSummarizeAnthropicOAuthDelegatesToCLI(t *testing.T) {
+	stubClaudeCLI(t)
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("LCM_HELPER_STDOUT", "CLI summary")
+	t.Setenv("LCM_EXPECT_MODEL", anthropicModel)
+	t.Setenv("LCM_EXPECT_PROMPT", "say hello")
+	t.Setenv("ANTHROPIC_API_KEY", "should-be-filtered")
+
+	httpCalled := false
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "sk-ant-oat01-test-token",
+		model:    anthropicModel,
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			httpCalled = true
+			return jsonResponse(500, `{"error":"should not be called"}`), nil
+		})},
+	}
+
+	summary, err := client.summarize(context.Background(), "say hello", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
+	if httpCalled {
+		t.Fatal("HTTP transport was called for OAuth token; expected delegation to claude CLI")
+	}
+	if summary != "CLI summary" {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
+func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
+	stubClaudeCLI(t)
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("LCM_HELPER_STDOUT", strings.Repeat("word ", 200))
+	t.Setenv("LCM_EXPECT_MODEL", anthropicModel)
+	t.Setenv("LCM_EXPECT_PROMPT", "oversized")
+
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "sk-ant-oat01-test-token",
+		model:    anthropicModel,
+		http:     &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) { return nil, nil })},
+	}
+
+	_, err := client.summarize(context.Background(), "oversized", 32)
+	if err == nil {
+		t.Fatal("expected summarize to reject oversized CLI output")
+	}
+	if !strings.Contains(err.Error(), "exceeded target token budget") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSummarizeAnthropicRegularKeyHitsDirectAPI(t *testing.T) {
+	var capturedURL string
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "sk-ant-api03-regular-key",
+		model:    anthropicModel,
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			capturedURL = req.URL.String()
+			if got := req.Header.Get("x-api-key"); got != "sk-ant-api03-regular-key" {
+				t.Fatalf("expected x-api-key header, got %q", got)
+			}
+			return jsonResponse(200, `{
+				"content":[{"type":"text","text":"Direct API response."}]
+			}`), nil
+		})},
+	}
+
+	summary, err := client.summarize(context.Background(), "prompt", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
+	if capturedURL != "https://api.anthropic.com/v1/messages" {
+		t.Fatalf("expected direct API URL, got %q", capturedURL)
+	}
+	if summary != "Direct API response." {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
+func stubClaudeCLI(t *testing.T) {
+	t.Helper()
+
+	originalLookup := lookupCLIPath
+	originalExec := execCLICommand
+	lookupCLIPath = func(file string) (string, error) {
+		if file != "claude" {
+			t.Fatalf("unexpected lookup path: %q", file)
+		}
+		return "/tmp/fake-claude", nil
+	}
+	execCLICommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		cmdArgs := append([]string{"-test.run=TestHelperProcessClaudeCLI", "--", name}, args...)
+		return exec.CommandContext(ctx, os.Args[0], cmdArgs...)
+	}
+	t.Cleanup(func() {
+		lookupCLIPath = originalLookup
+		execCLICommand = originalExec
+	})
+}
+
+func TestHelperProcessClaudeCLI(t *testing.T) {
+	t.Helper()
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	args := os.Args
+	separator := -1
+	for i, arg := range args {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator == -1 || separator+1 >= len(args) {
+		_, _ = os.Stderr.WriteString("missing helper args")
+		os.Exit(2)
+	}
+
+	cliArgs := args[separator+2:]
+	expectedModel := os.Getenv("LCM_EXPECT_MODEL")
+	expectedPrompt := os.Getenv("LCM_EXPECT_PROMPT")
+
+	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		_, _ = os.Stderr.WriteString("ANTHROPIC_API_KEY should be filtered")
+		os.Exit(3)
+	}
+	if !containsArgs(cliArgs, "--print") {
+		_, _ = os.Stderr.WriteString("missing --print")
+		os.Exit(4)
+	}
+	if !containsArgPair(cliArgs, "--output-format", "text") {
+		_, _ = os.Stderr.WriteString("missing output format")
+		os.Exit(5)
+	}
+	if expectedModel != "" && !containsArgPair(cliArgs, "--model", expectedModel) {
+		_, _ = os.Stderr.WriteString("missing model")
+		os.Exit(6)
+	}
+	if expectedPrompt != "" && !containsArgPair(cliArgs, "-p", expectedPrompt) {
+		_, _ = os.Stderr.WriteString("missing prompt")
+		os.Exit(7)
+	}
+
+	_, _ = os.Stdout.WriteString(os.Getenv("LCM_HELPER_STDOUT"))
+	if codeText := strings.TrimSpace(os.Getenv("LCM_HELPER_EXIT_CODE")); codeText != "" {
+		code, err := strconv.Atoi(codeText)
+		if err != nil {
+			_, _ = os.Stderr.WriteString("bad exit code")
+			os.Exit(8)
+		}
+		os.Exit(code)
+	}
+	os.Exit(0)
+}
+
+func containsArgs(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsArgPair(args []string, flag, want string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == want {
+			return true
+		}
+	}
+	return false
 }
