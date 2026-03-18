@@ -1,6 +1,6 @@
-# lossless-claude
+# 🧠🤖 lossless-claude
 
-A fork and reinterpretation of [lossless-claw](https://github.com/Martian-Engineering/lossless-claude) by [Martian Engineering](https://martian.engineering), adapted specifically for [Claude Code](https://github.com/anthropics/claude-code). The core ideas — DAG-based summarization, lossless message retention, and the LCM model from [Voltropy](https://x.com/Voltropy) — are theirs. This fork rewires the integration layer for Claude Code's plugin API, replaces the provider abstraction with the Anthropic SDK directly, and ships as a native Claude Code plugin.
+A fork and reinterpretation of [lossless-claw](https://github.com/Martian-Engineering/lossless-claude) by [Martian Engineering](https://martian.engineering), adapted specifically for [Claude Code](https://github.com/anthropics/claude-code). The core ideas — DAG-based summarization, lossless message retention, and the LCM model from [Voltropy](https://x.com/Voltropy) — are theirs. This fork rewires the integration layer for Claude Code's plugin API, replaces the provider abstraction with the Anthropic SDK directly, and ships as a native Claude Code plugin. 🧠🤖
 
 Replaces Claude Code's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
 
@@ -26,6 +26,20 @@ When a conversation grows beyond the model's context window, Claude Code (just l
 5. **Provides tools** (`lcm_grep`, `lcm_describe`, `lcm_expand`) so agents can search and recall details from compacted history
 
 Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.
+
+### How compaction is triggered
+
+Compaction is **incremental and post-turn** — not a bulk dump when the window fills up.
+
+After every turn, the engine checks whether there's enough material to compact:
+
+- **Leaf pass:** once `LCM_LEAF_MIN_FANOUT` (default: 8) raw messages accumulate without a summary, they're grouped into a leaf summary
+- **Condensation:** once `LCM_CONDENSED_MIN_FANOUT` (default: 4) leaf summaries accumulate, they condense into a higher-level DAG node — and so on up the tree
+- **Depth:** `LCM_INCREMENTAL_MAX_DEPTH=-1` lets condensation cascade as deep as needed after each pass
+
+The context delivered to the model each turn is **assembled fresh** from summaries + recent raw messages (`LCM_FRESH_TAIL_COUNT`, default: 32) + Cipher recall. The raw history never accumulates in the context window — it lives in SQLite and is represented by summaries instead.
+
+The result: the context window never "fills up and dumps". It stays within `LCM_CONTEXT_THRESHOLD` (default: 75%) at all times.
 
 **It feels like talking to an agent that never forgets. Because it doesn't. In normal operation, you'll never need to think about compaction again.**
 
