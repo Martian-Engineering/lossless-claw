@@ -22,7 +22,9 @@ import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
 import {
   createDelegatedExpansionGrant,
+  getRuntimeExpansionAuthManager,
   removeDelegatedExpansionGrantForSession,
+  resolveDelegatedExpansionGrantId,
   revokeDelegatedExpansionGrantForSession,
 } from "./expansion-auth.js";
 import {
@@ -90,6 +92,104 @@ function appendTextValue(value: unknown, out: string[]): void {
   const record = value as Record<string, unknown>;
   appendTextValue(record.text, out);
   appendTextValue(record.value, out);
+}
+
+const STRUCTURED_TEXT_FIELD_KEYS = ["text", "transcript", "transcription", "message", "summary"];
+const STRUCTURED_ARRAY_FIELD_KEYS = [
+  "segments",
+  "utterances",
+  "paragraphs",
+  "alternatives",
+  "words",
+  "items",
+  "results",
+];
+const STRUCTURED_NESTED_FIELD_KEYS = ["content", "output", "result", "payload", "data", "value"];
+const MAX_STRUCTURED_TEXT_DEPTH = 6;
+
+function looksLikeJsonPayload(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  );
+}
+
+function extractStructuredText(value: unknown, depth: number = 0): string | undefined {
+  if (value == null || depth > MAX_STRUCTURED_TEXT_DEPTH) {
+    return undefined;
+  }
+  if (typeof value === "string") {
+    if (looksLikeJsonPayload(value)) {
+      try {
+        const parsed = JSON.parse(value.trim());
+        const parsedText = extractStructuredText(parsed, depth + 1);
+        if (typeof parsedText === "string" && parsedText.length > 0) {
+          return parsedText;
+        }
+      } catch {
+        // Fall through to returning the original string when parsing fails.
+      }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const texts: string[] = [];
+    for (const entry of value) {
+      const text = extractStructuredText(entry, depth + 1);
+      if (typeof text === "string" && text.trim().length > 0) {
+        texts.push(text);
+      }
+    }
+    return texts.length > 0 ? texts.join("\n") : undefined;
+  }
+  if (typeof value !== "object") {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+
+  // Skip tool call/result objects — their structured data belongs in the parts table, not content
+  if (record.type === "toolCall" || record.type === "tool_call" || record.type === "toolResult" ||
+      record.type === "tool_result" || record.type === "tool_use" || record.type === "tool_use_result") {
+    return undefined;
+  }
+
+  for (const key of STRUCTURED_TEXT_FIELD_KEYS) {
+    const candidate = record[key];
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate;
+    }
+  }
+
+  for (const key of STRUCTURED_ARRAY_FIELD_KEYS) {
+    const candidate = record[key];
+    if (Array.isArray(candidate)) {
+      const texts: string[] = [];
+      for (const entry of candidate) {
+        const text = extractStructuredText(entry, depth + 1);
+        if (typeof text === "string" && text.trim().length > 0) {
+          texts.push(text);
+        }
+      }
+      if (texts.length > 0) {
+        return texts.join("\n");
+      }
+    }
+  }
+
+  for (const key of STRUCTURED_NESTED_FIELD_KEYS) {
+    const nested = record[key];
+    const nestedText = extractStructuredText(nested, depth + 1);
+    if (typeof nestedText === "string" && nestedText.trim().length > 0) {
+      return nestedText;
+    }
+  }
+
+  return undefined;
 }
 
 function extractReasoningText(record: Record<string, unknown>): string | undefined {
@@ -182,18 +282,23 @@ function toPartType(type: string): MessagePartType {
  * JSON syntax that can later pollute assembled model context.
  */
 function extractMessageContent(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
+  const extracted = extractStructuredText(content);
+  if (typeof extracted === "string") {
+    return extracted;
   }
-
-  if (Array.isArray(content)) {
-    return content
-      .filter((block): block is { type?: unknown; text?: unknown } => {
-        return !!block && typeof block === "object";
-      })
-      .filter((block) => block.type === "text" && typeof block.text === "string")
-      .map((block) => block.text as string)
-      .join("\n");
+  if (content == null) {
+    return "";
+  }
+  if (Array.isArray(content) && content.length === 0) {
+    return "";
+  }
+  // If content is an array of only tool call/result objects, store as empty
+  // (structured data is preserved in the message parts table)
+  if (Array.isArray(content) && content.length > 0 && content.every(
+    (item) => typeof item === "object" && item !== null && !Array.isArray(item) &&
+      ["toolCall", "tool_call", "toolResult", "tool_result", "tool_use", "tool_use_result"].includes((item as Record<string, unknown>).type as string)
+  )) {
+    return "";
   }
 
   const serialized = JSON.stringify(content);
@@ -1968,18 +2073,30 @@ export class LcmContextEngine implements ContextEngine {
         continue;
       }
 
-      // Found a HEARTBEAT_OK reply. Walk backward to find the turn start
+      // Found an exact HEARTBEAT_OK reply. Walk backward to find the turn start
       // (the preceding user message).
-      const turnMessageIds: number[] = [msg.messageId];
+      const turnMessages = [msg];
       for (let j = i - 1; j >= 0; j--) {
         const prev = allMessages[j];
-        turnMessageIds.push(prev.messageId);
+        turnMessages.push(prev);
         if (prev.role === "user") {
           break; // Found turn start
         }
       }
 
-      toDelete.push(...turnMessageIds);
+      if (!turnMessages.some((record) => record.role === "user")) {
+        continue;
+      }
+      if (turnMessages.some((record) => record.role === "tool")) {
+        continue;
+      }
+
+      const messageIds = turnMessages.map((record) => record.messageId);
+      const hasToolParts = await this.turnHasToolInteractions(messageIds);
+      if (hasToolParts) {
+        continue;
+      }
+      toDelete.push(...messageIds);
     }
 
     if (toDelete.length === 0) {
@@ -1990,6 +2107,16 @@ export class LcmContextEngine implements ContextEngine {
     const uniqueIds = [...new Set(toDelete)];
     return this.conversationStore.deleteMessages(uniqueIds);
   }
+
+  private async turnHasToolInteractions(messageIds: number[]): Promise<boolean> {
+    for (const messageId of messageIds) {
+      const parts = await this.conversationStore.getMessageParts(messageId);
+      if (parts.some(messagePartIndicatesToolUsage)) {
+        return true;
+      }
+    }
+    return false;
+  }
 }
 
 // ── Heartbeat detection ─────────────────────────────────────────────────────
@@ -1999,40 +2126,11 @@ const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
 /**
  * Detect whether an assistant message is a heartbeat ack.
  *
- * Matches the same pattern as OpenClaw core's heartbeat-events-filter:
- * content starts with "heartbeat_ok" (case-insensitive) and any character
- * immediately after is not alphanumeric or underscore.
- *
- * This catches:
- *   - "HEARTBEAT_OK"
- *   - "  HEARTBEAT_OK  "
- *   - "HEARTBEAT_OK — weekend, no market."
- *   - "Saturday 10:48 AM PT — weekend, no market. HEARTBEAT_OK"
- *
- * But not:
- *   - "HEARTBEAT_OK_EXTENDED" (alphanumeric continuation)
+ * Only exact (case-insensitive) "HEARTBEAT_OK" acknowledgements are pruned.
+ * Any additional text indicates the heartbeat carried real content and should remain.
  */
 function isHeartbeatOkContent(content: string): boolean {
-  const trimmed = content.trim().toLowerCase();
-  if (!trimmed) {
-    return false;
-  }
-
-  // Check if it starts with the token
-  if (trimmed.startsWith(HEARTBEAT_OK_TOKEN)) {
-    const suffix = trimmed.slice(HEARTBEAT_OK_TOKEN.length);
-    if (suffix.length === 0) {
-      return true;
-    }
-    return !/[a-z0-9_]/.test(suffix[0]);
-  }
-
-  // Also check if it ends with the token (chatty prefix + HEARTBEAT_OK)
-  if (trimmed.endsWith(HEARTBEAT_OK_TOKEN)) {
-    return true;
-  }
-
-  return false;
+  return content.trim().toLowerCase() === HEARTBEAT_OK_TOKEN;
 }
 
 // ── Emergency fallback summarization ────────────────────────────────────────

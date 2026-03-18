@@ -4,9 +4,23 @@ import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
-import { formatTimestamp } from "../compaction.js";
 
 const MAX_RESULT_CHARS = 40_000; // ~10k tokens
+
+function formatLocalTime(value: Date | string | number | null | undefined): string {
+  if (value == null) {
+    return "-";
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "-";
+  }
+  try {
+    return date.toLocaleString(undefined, { timeZoneName: "short" });
+  } catch {
+    return date.toISOString();
+  }
+}
 
 const LcmGrepSchema = Type.Object({
   pattern: Type.String({
@@ -84,7 +98,6 @@ export function createLcmGrepTool(input: {
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
       const retrieval = input.lcm.getRetrieval();
-      const timezone = input.lcm.timezone;
 
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
@@ -141,8 +154,8 @@ export function createLcmGrepTool(input: {
       }
       if (since || before) {
         lines.push(
-          `**Time filter:** ${since ? `since ${formatTimestamp(since, timezone)}` : "since -∞"} | ${
-            before ? `before ${formatTimestamp(before, timezone)}` : "before +∞"
+          `**Time filter:** ${since ? `since ${formatLocalTime(since)}` : "since -∞"} | ${
+            before ? `before ${formatLocalTime(before)}` : "before +∞"
           }`,
         );
       }
@@ -156,7 +169,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const msg of result.messages) {
           const snippet = truncateSnippet(msg.snippet);
-          const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatTimestamp(msg.createdAt, timezone)}): ${snippet}`;
+          const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatLocalTime(msg.createdAt)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
@@ -172,7 +185,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const sum of result.summaries) {
           const snippet = truncateSnippet(sum.snippet);
-          const line = `- [${sum.summaryId}] (${sum.kind}, ${formatTimestamp(sum.createdAt, timezone)}): ${snippet}`;
+          const line = `- [${sum.summaryId}] (${sum.kind}, ${formatLocalTime(sum.createdAt)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
