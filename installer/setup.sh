@@ -4,7 +4,6 @@ set -euo pipefail
 # ── Colors / helpers ──────────────────────────────────────────────────────────
 XGH_LLM_MODEL="${XGH_LLM_MODEL:-}"
 XGH_EMBED_MODEL="${XGH_EMBED_MODEL:-}"
-XGH_MODEL_PORT="${XGH_MODEL_PORT:-11434}"
 _ORIGINAL_XGH_BACKEND="${XGH_BACKEND:-}"   # capture before auto-detection
 XGH_BACKEND="${XGH_BACKEND:-}"
 XGH_REMOTE_URL="${XGH_REMOTE_URL:-}"
@@ -85,7 +84,6 @@ if [ "$XGH_DRY_RUN" -eq 0 ] && [ -z "${_ORIGINAL_XGH_BACKEND}" ]; then
     else
       echo "    1) Local — vllm-mlx (macOS Apple Silicon)"
     fi
-    echo -e "       ${DIM}(will stop Ollama if running — port 11434 conflict)${NC}"
     if [ "$XGH_BACKEND" = "ollama" ]; then
       echo -e "    ${GREEN}2)${NC} Local — Ollama (Linux / Intel Mac)          ${DIM}[auto-detected]${NC}"
     else
@@ -110,6 +108,13 @@ if [ "$XGH_DRY_RUN" -eq 0 ] && [ -z "${_ORIGINAL_XGH_BACKEND}" ]; then
     esac
     _XGH_BACKEND_PICKED=1
   fi
+fi
+
+# Set default port based on backend: vllm-mlx uses 11435 to avoid conflicting with Ollama on 11434
+if [ "$XGH_BACKEND" = "vllm-mlx" ]; then
+  XGH_MODEL_PORT="${XGH_MODEL_PORT:-11435}"
+else
+  XGH_MODEL_PORT="${XGH_MODEL_PORT:-11434}"
 fi
 
 # ── Remote URL prompt and validation ─────────────────────────────────────────
@@ -175,14 +180,6 @@ if [ "$XGH_DRY_RUN" -eq 0 ]; then
     if ! command -v vllm-mlx &>/dev/null; then
       info "vllm-mlx (local model server for Apple Silicon)"
       uv tool install "git+https://github.com/waybarrios/vllm-mlx.git"
-    fi
-
-    # Kill any Ollama process squatting on port 11434
-    if pgrep -x ollama >/dev/null 2>&1 || pgrep -x "Ollama" >/dev/null 2>&1; then
-      warn "Ollama is running and will conflict with vllm-mlx on port 11434 — stopping it"
-      osascript -e 'quit app "Ollama"' 2>/dev/null || true
-      pkill -f "[Oo]llama" 2>/dev/null || true
-      sleep 1
     fi
 
     # Only install Qdrant for presets that need it
@@ -253,7 +250,7 @@ if [ "$XGH_DRY_RUN" -eq 0 ]; then
       info "Qdrant: $(command -v qdrant 2>/dev/null || echo "${HOME}/.qdrant/bin/qdrant")"
 
       # Start services via brew
-      if ! curl -sf http://localhost:11434 >/dev/null 2>&1; then
+      if ! curl -sf "http://localhost:${XGH_MODEL_PORT}" >/dev/null 2>&1; then
         brew services start ollama 2>/dev/null || warn "Could not start Ollama service — start manually: brew services start ollama"
       fi
       if ! curl -sf http://localhost:6333/healthz >/dev/null 2>&1; then
@@ -432,7 +429,7 @@ print('yes' if '${1}' in ids else 'no')
     CUSTOM_LABEL="Ollama model name (e.g. llama3.2:3b)"
     _model_available() {
       # Ensure Ollama service is reachable before listing models
-      if ! curl -sf --max-time 2 http://localhost:11434 >/dev/null 2>&1; then
+      if ! curl -sf --max-time 2 "http://localhost:${XGH_MODEL_PORT}" >/dev/null 2>&1; then
         return 1
       fi
       ollama list 2>/dev/null | grep -q "^${1}[[:space:]]"
