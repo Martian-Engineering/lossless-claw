@@ -32,6 +32,12 @@ const (
 	defaultHTTPTimeout     = 180 * time.Second
 )
 
+var (
+	lookupCLIPath       = exec.LookPath
+	execCLICommand      = exec.CommandContext
+	cliOutputTokenSlack = 64
+)
+
 type repairOptions struct {
 	apply     bool
 	dryRun    bool
@@ -950,7 +956,7 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 	// is detected, delegate to the `claude` CLI which already holds valid Max OAuth
 	// credentials and handles the exchange transparently.
 	if isOAuthToken(c.apiKey) {
-		return summarizeViaCLI(ctx, prompt, targetTokens)
+		return summarizeViaCLI(ctx, model, prompt, targetTokens)
 	}
 
 	endpoint := "https://api.anthropic.com/v1/messages"
@@ -997,13 +1003,15 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 
 // summarizeViaCLI delegates to the `claude` CLI binary when an OAuth/setup-token
 // is in use. The CLI handles Max OAuth exchange internally, so no raw API key is needed.
-func summarizeViaCLI(ctx context.Context, prompt string, targetTokens int) (string, error) {
-	claudePath, err := exec.LookPath("claude")
+func summarizeViaCLI(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
+	claudePath, err := lookupCLIPath("claude")
 	if err != nil {
 		return "", fmt.Errorf("oauth token detected but `claude` CLI not found in PATH: install Claude Code or set --provider openai as a workaround")
 	}
-	cmd := exec.CommandContext(ctx, claudePath,
+	cmd := execCLICommand(ctx, claudePath,
 		"--print",
+		"--output-format", "text",
+		"--model", model,
 		"-p", prompt,
 	)
 	// Unset ANTHROPIC_API_KEY so the CLI uses its own stored OAuth credentials.
@@ -1026,6 +1034,14 @@ func summarizeViaCLI(ctx context.Context, prompt string, targetTokens int) (stri
 	result := strings.TrimSpace(string(out))
 	if result == "" {
 		return "", fmt.Errorf("claude CLI returned empty output")
+	}
+	estimatedTokens := estimateTokenCount(result)
+	if estimatedTokens > targetTokens+cliOutputTokenSlack {
+		return "", fmt.Errorf(
+			"claude CLI output exceeded target token budget: got %d tokens for target %d",
+			estimatedTokens,
+			targetTokens,
+		)
 	}
 	return result, nil
 }

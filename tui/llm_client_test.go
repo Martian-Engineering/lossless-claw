@@ -6,10 +6,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -145,26 +146,42 @@ func TestIsOAuthToken(t *testing.T) {
 }
 
 func TestResolveGatewayURL(t *testing.T) {
-	// Create a temp dir to act as HOME with .openclaw/openclaw.json
-	tmpHome := t.TempDir()
-	ocDir := filepath.Join(tmpHome, ".openclaw")
-	if err := os.MkdirAll(ocDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cfg := map[string]interface{}{"port": float64(8080)}
-	data, _ := json.Marshal(cfg)
-	if err := os.WriteFile(filepath.Join(ocDir, "openclaw.json"), data, 0o644); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name string
+		cfg  map[string]interface{}
+		want string
+	}{
+		{
+			name: "top-level port",
+			cfg:  map[string]interface{}{"port": float64(8080)},
+			want: "http://127.0.0.1:8080",
+		},
+		{
+			name: "nested gateway port",
+			cfg:  map[string]interface{}{"gateway": map[string]interface{}{"port": float64(3030)}},
+			want: "http://127.0.0.1:3030",
+		},
 	}
 
-	// Override HOME so resolveGatewayURL reads our temp config
-	orig := os.Getenv("HOME")
-	t.Setenv("HOME", tmpHome)
-	defer os.Setenv("HOME", orig)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpHome := t.TempDir()
+			ocDir := filepath.Join(tmpHome, ".openclaw")
+			if err := os.MkdirAll(ocDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			data, _ := json.Marshal(tt.cfg)
+			if err := os.WriteFile(filepath.Join(ocDir, "openclaw.json"), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
 
-	got := resolveGatewayURL()
-	if got != "http://127.0.0.1:8080" {
-		t.Fatalf("resolveGatewayURL() = %q, want %q", got, "http://127.0.0.1:8080")
+			t.Setenv("HOME", tmpHome)
+
+			got := resolveGatewayURL()
+			if got != tt.want {
+				t.Fatalf("resolveGatewayURL() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -178,10 +195,13 @@ func TestResolveGatewayURLMissingFile(t *testing.T) {
 }
 
 func TestSummarizeAnthropicOAuthDelegatesToCLI(t *testing.T) {
-	// When an OAuth/setup-token is detected, summarizeAnthropic should NOT
-	// make an HTTP request to api.anthropic.com. Instead it delegates to
-	// summarizeViaCLI (the `claude` CLI). We verify the HTTP transport is
-	// never called when an OAuth token is used.
+	stubClaudeCLI(t)
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("LCM_HELPER_STDOUT", "CLI summary")
+	t.Setenv("LCM_EXPECT_MODEL", anthropicModel)
+	t.Setenv("LCM_EXPECT_PROMPT", "say hello")
+	t.Setenv("ANTHROPIC_API_KEY", "should-be-filtered")
+
 	httpCalled := false
 	client := &anthropicClient{
 		provider: "anthropic",
@@ -193,13 +213,38 @@ func TestSummarizeAnthropicOAuthDelegatesToCLI(t *testing.T) {
 		})},
 	}
 
-	// Use a very short timeout context so the CLI call doesn't block tests.
-	// The key assertion is that the HTTP transport is NOT called.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_, _ = client.summarize(ctx, "say hello", 200)
+	summary, err := client.summarize(context.Background(), "say hello", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
 	if httpCalled {
 		t.Fatal("HTTP transport was called for OAuth token; expected delegation to claude CLI")
+	}
+	if summary != "CLI summary" {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
+func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
+	stubClaudeCLI(t)
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("LCM_HELPER_STDOUT", strings.Repeat("word ", 200))
+	t.Setenv("LCM_EXPECT_MODEL", anthropicModel)
+	t.Setenv("LCM_EXPECT_PROMPT", "oversized")
+
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "sk-ant-oat01-test-token",
+		model:    anthropicModel,
+		http:     &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) { return nil, nil })},
+	}
+
+	_, err := client.summarize(context.Background(), "oversized", 32)
+	if err == nil {
+		t.Fatal("expected summarize to reject oversized CLI output")
+	}
+	if !strings.Contains(err.Error(), "exceeded target token budget") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -230,4 +275,99 @@ func TestSummarizeAnthropicRegularKeyHitsDirectAPI(t *testing.T) {
 	if summary != "Direct API response." {
 		t.Fatalf("unexpected summary: %q", summary)
 	}
+}
+
+func stubClaudeCLI(t *testing.T) {
+	t.Helper()
+
+	originalLookup := lookupCLIPath
+	originalExec := execCLICommand
+	lookupCLIPath = func(file string) (string, error) {
+		if file != "claude" {
+			t.Fatalf("unexpected lookup path: %q", file)
+		}
+		return "/tmp/fake-claude", nil
+	}
+	execCLICommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		cmdArgs := append([]string{"-test.run=TestHelperProcessClaudeCLI", "--", name}, args...)
+		return exec.CommandContext(ctx, os.Args[0], cmdArgs...)
+	}
+	t.Cleanup(func() {
+		lookupCLIPath = originalLookup
+		execCLICommand = originalExec
+	})
+}
+
+func TestHelperProcessClaudeCLI(t *testing.T) {
+	t.Helper()
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	args := os.Args
+	separator := -1
+	for i, arg := range args {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator == -1 || separator+1 >= len(args) {
+		_, _ = os.Stderr.WriteString("missing helper args")
+		os.Exit(2)
+	}
+
+	cliArgs := args[separator+2:]
+	expectedModel := os.Getenv("LCM_EXPECT_MODEL")
+	expectedPrompt := os.Getenv("LCM_EXPECT_PROMPT")
+
+	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		_, _ = os.Stderr.WriteString("ANTHROPIC_API_KEY should be filtered")
+		os.Exit(3)
+	}
+	if !containsArgs(cliArgs, "--print") {
+		_, _ = os.Stderr.WriteString("missing --print")
+		os.Exit(4)
+	}
+	if !containsArgPair(cliArgs, "--output-format", "text") {
+		_, _ = os.Stderr.WriteString("missing output format")
+		os.Exit(5)
+	}
+	if expectedModel != "" && !containsArgPair(cliArgs, "--model", expectedModel) {
+		_, _ = os.Stderr.WriteString("missing model")
+		os.Exit(6)
+	}
+	if expectedPrompt != "" && !containsArgPair(cliArgs, "-p", expectedPrompt) {
+		_, _ = os.Stderr.WriteString("missing prompt")
+		os.Exit(7)
+	}
+
+	_, _ = os.Stdout.WriteString(os.Getenv("LCM_HELPER_STDOUT"))
+	if codeText := strings.TrimSpace(os.Getenv("LCM_HELPER_EXIT_CODE")); codeText != "" {
+		code, err := strconv.Atoi(codeText)
+		if err != nil {
+			_, _ = os.Stderr.WriteString("bad exit code")
+			os.Exit(8)
+		}
+		os.Exit(code)
+	}
+	os.Exit(0)
+}
+
+func containsArgs(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsArgPair(args []string, flag, want string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == want {
+			return true
+		}
+	}
+	return false
 }
