@@ -2309,6 +2309,41 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(conversation!.sourceLabel).toBe("#alerts");
   });
 
+  it("afterTurn refreshes fallback conversation metadata when runtimeContext appears later", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 6000,
+      },
+    });
+    const sessionId = "plain-session-metadata-refresh";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("plain-session-metadata-refresh-seed"),
+      messages: [makeMessage({ role: "assistant", content: "first turn without runtime metadata" })],
+      prePromptMessageCount: 0,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("plain-session-metadata-refresh-followup"),
+      messages: [makeMessage({ role: "assistant", content: "follow-up with runtime metadata" })],
+      prePromptMessageCount: 0,
+      runtimeContext: {
+        agentScope: "agent-runtime",
+        provider: "discord",
+        sourceLabel: "#ops-alerts",
+      },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.agentScope).toBe("agent-runtime");
+    expect(conversation!.provider).toBe("discord");
+    expect(conversation!.sourceLabel).toBe("#ops-alerts");
+  });
+
   it("escapes ambient beacon attribute values", async () => {
     const engine = createEngineWithConfig({
       crossSession: {

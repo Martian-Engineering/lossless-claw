@@ -940,24 +940,24 @@ export class LcmContextEngine implements ContextEngine {
     const parsed = this.deps.parseAgentSessionKey(params.sessionId);
 
     const agentScope =
-      params.conversationAgentScope ??
       safeString(lp.agentScope) ??
       safeString(lp.agent_scope) ??
       safeString(lp.agentId) ??
       safeString(lp.agent_id) ??
+      params.conversationAgentScope ??
       (parsed ? this.deps.normalizeAgentId(parsed.agentId) : this.deps.normalizeAgentId(undefined));
     const provider =
-      params.conversationProvider ??
       safeString(lp.provider) ??
       safeString(lp.sessionProvider) ??
       safeString(lp.session_provider) ??
+      params.conversationProvider ??
       null;
     const sourceLabel =
-      params.conversationSourceLabel ??
       safeString(lp.sourceLabel) ??
       safeString(lp.source_label) ??
       safeString(lp.channelLabel) ??
       safeString(lp.channel_label) ??
+      params.conversationSourceLabel ??
       (parsed ? parsed.suffix : null);
 
     return {
