@@ -990,7 +990,10 @@ describe("LcmContextEngine.assemble canonical path", () => {
     // Core recall section
     expect(promptAddition).toContain("## LCM Recall");
     expect(promptAddition).toContain("maps to details, not the details themselves");
-    expect(promptAddition).toContain("**Recall priority:** LCM tools first");
+    expect(promptAddition).toContain("Use LCM tools first for compacted conversation history");
+    expect(promptAddition).toContain("prefer any available memory/recall tool");
+    expect(promptAddition).not.toContain("qmd");
+    expect(promptAddition).not.toContain("memory_search as last resort");
     // Tool escalation
     expect(promptAddition).toContain("1. `lcm_grep`");
     expect(promptAddition).toContain("2. `lcm_describe`");
