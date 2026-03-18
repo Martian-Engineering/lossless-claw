@@ -63,7 +63,7 @@ describe("Session key continuity", () => {
 
     // Create without sessionKey (legacy path)
     const conv1 = await convStore.getOrCreateConversation("uuid-1");
-    expect(conv1.sessionKey).toBeUndefined();
+    expect(conv1.sessionKey).toBeNull();
 
     // Re-fetch with sessionKey — should backfill
     const conv2 = await convStore.getOrCreateConversation("uuid-1", { sessionKey: "agent:main:main" });

@@ -116,10 +116,14 @@ function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies>): Lcm
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
-  return new LcmContextEngine({
-    ...createTestDeps(config),
-    ...overrides,
-  });
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return new LcmContextEngine(
+    {
+      ...createTestDeps(config),
+      ...overrides,
+    },
+    db,
+  );
 }
 
 function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
