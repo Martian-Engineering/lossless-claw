@@ -106,6 +106,19 @@ const STRUCTURED_ARRAY_FIELD_KEYS = [
 ];
 const STRUCTURED_NESTED_FIELD_KEYS = ["content", "output", "result", "payload", "data", "value"];
 const MAX_STRUCTURED_TEXT_DEPTH = 6;
+const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
+  "tool_use",
+  "toolUse",
+  "tool-use",
+  "toolCall",
+  "tool_call",
+  "functionCall",
+  "function_call",
+  "function_call_output",
+  "tool_result",
+  "toolResult",
+  "tool_use_result",
+]);
 
 function looksLikeJsonPayload(value: string): boolean {
   const trimmed = value.trim();
@@ -153,8 +166,7 @@ function extractStructuredText(value: unknown, depth: number = 0): string | unde
   const record = value as Record<string, unknown>;
 
   // Skip tool call/result objects — their structured data belongs in the parts table, not content
-  if (record.type === "toolCall" || record.type === "tool_call" || record.type === "toolResult" ||
-      record.type === "tool_result" || record.type === "tool_use" || record.type === "tool_use_result") {
+  if (typeof record.type === "string" && TOOL_RAW_TYPES.has(record.type)) {
     return undefined;
   }
 
@@ -296,7 +308,8 @@ function extractMessageContent(content: unknown): string {
   // (structured data is preserved in the message parts table)
   if (Array.isArray(content) && content.length > 0 && content.every(
     (item) => typeof item === "object" && item !== null && !Array.isArray(item) &&
-      ["toolCall", "tool_call", "toolResult", "tool_result", "tool_use", "tool_use_result"].includes((item as Record<string, unknown>).type as string)
+      typeof (item as Record<string, unknown>).type === "string" &&
+      TOOL_RAW_TYPES.has((item as Record<string, unknown>).type as string)
   )) {
     return "";
   }
@@ -939,6 +952,11 @@ export class LcmContextEngine implements ContextEngine {
       return undefined;
     }
     try {
+      const bySessionKey = await this.conversationStore.getConversationBySessionKey(trimmedKey);
+      if (bySessionKey) {
+        return bySessionKey.conversationId;
+      }
+
       const runtimeSessionId = await this.deps.resolveSessionIdFromSessionKey(trimmedKey);
       if (!runtimeSessionId) {
         return undefined;
@@ -2145,17 +2163,6 @@ export class LcmContextEngine implements ContextEngine {
 // ── Tool-part detection ──────────────────────────────────────────────────────
 
 const TOOL_PART_TYPES: ReadonlySet<string> = new Set(["tool"]);
-const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
-  "tool_use",
-  "toolUse",
-  "tool-use",
-  "toolCall",
-  "functionCall",
-  "function_call",
-  "function_call_output",
-  "tool_result",
-  "toolResult",
-]);
 
 function messagePartIndicatesToolUsage(part: MessagePartRecord): boolean {
   if (TOOL_PART_TYPES.has(part.partType)) {

@@ -3,6 +3,7 @@ import {
   createDelegatedExpansionGrant,
   resetDelegatedExpansionGrantsForTests,
 } from "../src/expansion-auth.js";
+import { formatTimestamp } from "../src/compaction.js";
 import { createLcmDescribeTool } from "../src/tools/lcm-describe-tool.js";
 import { createLcmExpandTool } from "../src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
@@ -80,9 +81,12 @@ function buildLcmEngine(params: {
     describe: ReturnType<typeof vi.fn>;
   };
   conversationId?: number;
+  conversationIdBySessionKey?: number;
+  timezone?: string;
 }) {
   return {
     info: { id: "lcm", name: "LCM", version: "0.0.0" },
+    timezone: params.timezone ?? "UTC",
     getRetrieval: () => params.retrieval,
     getConversationStore: () => ({
       getConversationBySessionId: vi.fn(async () =>
@@ -91,6 +95,19 @@ function buildLcmEngine(params: {
           : {
               conversationId: params.conversationId,
               sessionId: "session-1",
+              title: null,
+              bootstrappedAt: null,
+              createdAt: new Date("2026-01-01T00:00:00.000Z"),
+              updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+            },
+      ),
+      getConversationBySessionKey: vi.fn(async () =>
+        params.conversationIdBySessionKey == null
+          ? null
+          : {
+              conversationId: params.conversationIdBySessionKey,
+              sessionId: "legacy-session",
+              sessionKey: "agent:main:main",
               title: null,
               bootstrappedAt: null,
               createdAt: new Date("2026-01-01T00:00:00.000Z"),
@@ -150,10 +167,9 @@ describe("LCM tools session scoping", () => {
     expect((result.details as { expansionCount?: number }).expansionCount).toBe(1);
   });
 
-  it("lcm_grep forwards since/before and includes local timestamps in text output", async () => {
+  it("lcm_grep forwards since/before and uses the configured timezone in text output", async () => {
     const createdAt = new Date("2026-01-03T00:00:00.000Z");
-    // Timestamps are now displayed in local time via toLocaleString()
-    // We verify the output contains the date and the message content
+    const timezone = "America/Los_Angeles";
     const retrieval = {
       grep: vi.fn(async () => ({
         messages: [
@@ -175,7 +191,7 @@ describe("LCM tools session scoping", () => {
 
     const tool = createLcmGrepTool({
       deps: makeDeps(),
-      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      lcm: buildLcmEngine({ retrieval, conversationId: 42, timezone }) as never,
       sessionId: "session-1",
     });
     const result = await tool.execute("call-2", {
@@ -192,11 +208,41 @@ describe("LCM tools session scoping", () => {
       }),
     );
     const text = (result.content[0] as { text: string }).text;
-    expect(text).toContain("2026");
+    expect(text).toContain(formatTimestamp(createdAt, timezone));
+    expect(text).toContain(formatTimestamp(new Date("2026-01-01T00:00:00.000Z"), timezone));
+    expect(text).toContain(formatTimestamp(new Date("2026-01-04T00:00:00.000Z"), timezone));
     expect(text).toContain("deployment timeline");
   });
 
+  it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps({
+        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
+      }),
+      lcm: buildLcmEngine({ retrieval, conversationIdBySessionKey: 42 }) as never,
+      sessionKey: "agent:main:main",
+    });
+    await tool.execute("call-2b", { pattern: "deployment" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+      }),
+    );
+  });
+
   it("lcm_describe blocks cross-conversation lookup unless allConversations=true", async () => {
+    const timezone = "America/Los_Angeles";
     const retrieval = {
       grep: vi.fn(),
       expand: vi.fn(),
@@ -242,7 +288,7 @@ describe("LCM tools session scoping", () => {
 
     const tool = createLcmDescribeTool({
       deps: makeDeps(),
-      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      lcm: buildLcmEngine({ retrieval, conversationId: 42, timezone }) as never,
       sessionId: "session-1",
     });
     const scoped = await tool.execute("call-3", { id: "sum_foreign" });
@@ -254,5 +300,8 @@ describe("LCM tools session scoping", () => {
     });
     expect((cross.content[0] as { text: string }).text).toContain("meta conv=99");
     expect((cross.content[0] as { text: string }).text).toContain("manifest");
+    expect((cross.content[0] as { text: string }).text).toContain(
+      formatTimestamp(new Date("2026-01-01T00:00:00.000Z"), timezone),
+    );
   });
 });

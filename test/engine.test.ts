@@ -741,6 +741,30 @@ describe("ConversationStore session reuse", () => {
   });
 });
 
+describe("LcmContextEngine delegated session continuity", () => {
+  it("prepares subagent spawn from an existing conversation found by sessionKey", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const config = createTestConfig(join(tempDir, "lcm.db"));
+    const db = createLcmDatabaseConnection(config.databasePath);
+    const deps = createTestDeps(config);
+    deps.resolveSessionIdFromSessionKey = vi.fn(async () => "uuid-after-reset");
+    const engine = new LcmContextEngine(deps, db);
+
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    await engine
+      .getConversationStore()
+      .getOrCreateConversation("uuid-before-reset", { sessionKey: "agent:main:main" });
+
+    const prepared = await engine.prepareSubagentSpawn({
+      parentSessionKey: "agent:main:main",
+      childSessionKey: "agent:main:subagent:child",
+    });
+
+    expect(prepared).toBeDefined();
+  });
+});
+
 // ── Ingest content extraction ───────────────────────────────────────────────
 
 describe("LcmContextEngine.ingest content extraction", () => {
@@ -1726,6 +1750,52 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(
       (assembledMessage.content as Array<{ content?: unknown }>)[0]?.content,
     ).toEqual([{ type: "text", text: "command output" }]);
+  });
+
+  it("does not leak OpenAI function tool payloads into stored message content fallbacks", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "function_call", call_id: "fc_only", name: "bash", arguments: '{"cmd":"pwd"}' },
+        ],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "fc_only",
+        toolName: "bash",
+        content: [{ type: "function_call_output", call_id: "fc_only", output: "/tmp" }],
+        isError: false,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(2);
+    expect(storedMessages[0]?.content).toBe("");
+    expect(storedMessages[1]?.content).toBe("");
+
+    const assembled = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    const assistant = assembled.messages[0] as { content?: Array<{ type?: string }> };
+    const toolResult = assembled.messages[1] as { content?: Array<{ type?: string }> };
+    expect(assistant.content?.[0]?.type).toBe("function_call");
+    expect(toolResult.content?.[0]?.type).toBe("function_call_output");
   });
 
   it("preserves toolName through ingest-assemble round-trip for Gemini compatibility", async () => {

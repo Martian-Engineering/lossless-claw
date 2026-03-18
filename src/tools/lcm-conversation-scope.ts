@@ -59,9 +59,18 @@ export async function resolveLcmConversationScope(input: {
     return { conversationId: undefined, allConversations: true };
   }
 
+  const normalizedSessionKey = input.sessionKey?.trim();
+  if (normalizedSessionKey) {
+    const bySessionKey =
+      await lcm.getConversationStore().getConversationBySessionKey(normalizedSessionKey);
+    if (bySessionKey) {
+      return { conversationId: bySessionKey.conversationId, allConversations: false };
+    }
+  }
+
   let normalizedSessionId = input.sessionId?.trim();
-  if (!normalizedSessionId && input.sessionKey && input.deps) {
-    normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(input.sessionKey.trim());
+  if (!normalizedSessionId && normalizedSessionKey && input.deps) {
+    normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(normalizedSessionKey);
   }
   if (!normalizedSessionId) {
     return { conversationId: undefined, allConversations: false };
