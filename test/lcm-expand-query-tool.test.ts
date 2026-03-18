@@ -79,8 +79,6 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       summaryModel: "",
       largeFileSummaryProvider: "",
       largeFileSummaryModel: "",
-      summaryModel: "",
-      summaryProvider: "",
       expansionProvider: "",
       expansionModel: "",
       autocompactDisabled: false,

@@ -48,8 +48,6 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       summaryModel: "",
       largeFileSummaryProvider: "",
       largeFileSummaryModel: "",
-      summaryModel: "",
-      summaryProvider: "",
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
