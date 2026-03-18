@@ -4,7 +4,7 @@ import type { DbClient } from "../db/db-interface.js";
 import { SqliteClient } from "../db/sqlite-client.js";
 import { Dialect, type Backend } from "../db/dialect.js";
 import { EmbeddingClient, toVectorLiteral, type EmbeddingConfig } from "../embeddings.js";
-import { EmbeddingQueue } from "../embedding-queue.js";
+import { EmbeddingQueue, type QueueableDb } from "../embedding-queue.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { sanitizeTsQuery } from "./tsquery-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
@@ -281,7 +281,7 @@ export class SummaryStore {
     }
 
     if (this.embeddingClient) {
-      this.embeddingQueue = new EmbeddingQueue(this.embeddingClient, db);
+      this.embeddingQueue = new EmbeddingQueue(this.embeddingClient, db as QueueableDb);
       this.embeddingQueue.start();
     } else {
       this.embeddingQueue = null;
