@@ -7,7 +7,7 @@ import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ContextAssembler } from "../src/assembler.js";
 import type { LcmConfig } from "../src/db/config.js";
-import { closeLcmConnection } from "../src/db/connection.js";
+import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import {
   createDelegatedExpansionGrant,
@@ -108,12 +108,14 @@ function createEngine(): LcmContextEngine {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
-  return new LcmContextEngine(createTestDeps(config));
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return new LcmContextEngine(createTestDeps(config), db);
 }
 
 function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
   const config = createTestConfig(databasePath);
-  return new LcmContextEngine(createTestDeps(config));
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return new LcmContextEngine(createTestDeps(config), db);
 }
 
 function createSessionFilePath(name: string): string {
@@ -129,7 +131,8 @@ function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine
     ...createTestConfig(join(tempDir, "lcm.db")),
     ...overrides,
   };
-  return new LcmContextEngine(createTestDeps(config));
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return new LcmContextEngine(createTestDeps(config), db);
 }
 
 function createEngineWithDeps(
@@ -719,6 +722,22 @@ describe("LcmContextEngine stateless sessions", () => {
     });
 
     expect(resolveDelegatedExpansionGrantId(childSessionKey)).not.toBeNull();
+  });
+});
+
+describe("ConversationStore session reuse", () => {
+  it("reuses conversation across session resets when sessionKey matches", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const conv1 = await store.getOrCreateConversation("uuid-1", { sessionKey: "agent:main:main" });
+    const conv2 = await store.getOrCreateConversation("uuid-2", { sessionKey: "agent:main:main" });
+
+    expect(conv2.conversationId).toBe(conv1.conversationId);
+
+    const refreshed = await store.getConversation(conv1.conversationId);
+    expect(refreshed?.sessionId).toBe("uuid-2");
   });
 });
 

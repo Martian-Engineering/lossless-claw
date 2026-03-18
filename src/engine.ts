@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import type {
   ContextEngine,
   ContextEngineInfo,
@@ -17,7 +18,6 @@ import type {
 import { blockFromPart, ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
-import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
 import {
@@ -658,6 +658,7 @@ export class LcmContextEngine implements ContextEngine {
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
+  private readonly db: DatabaseSync;
   private migrated = false;
   private readonly fts5Available: boolean;
   private readonly ignoreSessionPatterns: RegExp[];
@@ -667,17 +668,17 @@ export class LcmContextEngine implements ContextEngine {
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
 
-  constructor(deps: LcmDependencies) {
+  constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
     this.config = deps.config;
     this.ignoreSessionPatterns = compileSessionPatterns(this.config.ignoreSessionPatterns);
     this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
+    this.db = database;
 
-    const db = getLcmConnection(this.config.databasePath);
-    this.fts5Available = getLcmDbFeatures(db).fts5Available;
+    this.fts5Available = getLcmDbFeatures(this.db).fts5Available;
 
-    this.conversationStore = new ConversationStore(db, { fts5Available: this.fts5Available });
-    this.summaryStore = new SummaryStore(db, { fts5Available: this.fts5Available });
+    this.conversationStore = new ConversationStore(this.db, { fts5Available: this.fts5Available });
+    this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -764,8 +765,7 @@ export class LcmContextEngine implements ContextEngine {
     if (this.migrated) {
       return;
     }
-    const db = getLcmConnection(this.config.databasePath);
-    runLcmMigrations(db, { fts5Available: this.fts5Available });
+    runLcmMigrations(this.db, { fts5Available: this.fts5Available });
     this.migrated = true;
   }
 
@@ -1017,6 +1017,7 @@ export class LcmContextEngine implements ContextEngine {
    */
   private async reconcileSessionTail(params: {
     sessionId: string;
+    sessionKey?: string;
     conversationId: number;
     historicalMessages: AgentMessage[];
   }): Promise<{
@@ -1112,7 +1113,7 @@ export class LcmContextEngine implements ContextEngine {
     const missingTail = historicalMessages.slice(anchorIndex + 1);
     let importedMessages = 0;
     for (const message of missingTail) {
-      const result = await this.ingestSingle({ sessionId, message });
+      const result = await this.ingestSingle({ sessionId, sessionKey: params.sessionKey, message });
       if (result.ingested) {
         importedMessages += 1;
       }
@@ -1144,7 +1145,9 @@ export class LcmContextEngine implements ContextEngine {
 
     const result = await this.withSessionQueue(params.sessionId, async () =>
       this.conversationStore.withTransaction(async () => {
-        const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId);
+        const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
+          sessionKey: params.sessionKey,
+        });
         const conversationId = conversation.conversationId;
         const historicalMessages = readLeafPathMessages(params.sessionFile);
 
@@ -1200,6 +1203,7 @@ export class LcmContextEngine implements ContextEngine {
         // messages that were never persisted to LCM.
         const reconcile = await this.reconcileSessionTail({
           sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
           conversationId,
           historicalMessages,
         });
@@ -1262,17 +1266,20 @@ export class LcmContextEngine implements ContextEngine {
 
   private async ingestSingle(params: {
     sessionId: string;
+    sessionKey?: string;
     message: AgentMessage;
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
-    const { sessionId, message, isHeartbeat } = params;
+    const { sessionId, sessionKey, message, isHeartbeat } = params;
     if (isHeartbeat) {
       return { ingested: false };
     }
     const stored = toStoredMessage(message);
 
     // Get or create conversation for this session
-    const conversation = await this.conversationStore.getOrCreateConversation(sessionId);
+    const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
+      sessionKey,
+    });
     const conversationId = conversation.conversationId;
 
     let messageForParts = message;
@@ -1357,6 +1364,7 @@ export class LcmContextEngine implements ContextEngine {
       for (const message of params.messages) {
         const result = await this.ingestSingle({
           sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
           message,
           isHeartbeat: params.isHeartbeat,
         });
@@ -1407,6 +1415,7 @@ export class LcmContextEngine implements ContextEngine {
     try {
       await this.ingestBatch({
         sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
         messages: ingestBatch,
         isHeartbeat: params.isHeartbeat === true,
       });
@@ -1907,7 +1916,7 @@ export class LcmContextEngine implements ContextEngine {
     // OpenClaw's runner calls dispose() after every run, but the plugin
     // registers a single engine instance reused by the factory. Closing
     // the DB here would break subsequent runs with "database is not open".
-    // The connection is cleaned up on process exit via closeLcmConnection().
+    // The shared connection is managed for the lifetime of the plugin process.
   }
 
   // ── Public accessors for retrieval (used by subagent expansion) ─────────

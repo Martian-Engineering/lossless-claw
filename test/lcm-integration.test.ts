@@ -24,10 +24,11 @@ function createMockConversationStore() {
     withTransaction: vi.fn(async <T>(operation: () => Promise<T> | T): Promise<T> => {
       return await operation();
     }),
-    createConversation: vi.fn(async (input: { sessionId: string; title?: string }) => {
+    createConversation: vi.fn(async (input: { sessionId: string; title?: string; sessionKey?: string }) => {
       const conv = {
         conversationId: nextConvId++,
         sessionId: input.sessionId,
+        sessionKey: input.sessionKey,
         title: input.title ?? null,
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -41,21 +42,37 @@ function createMockConversationStore() {
     getConversationBySessionId: vi.fn(
       async (sid: string) => conversations.find((c) => c.sessionId === sid) ?? null,
     ),
-    getOrCreateConversation: vi.fn(async (sid: string, title?: string) => {
-      const existing = conversations.find((c) => c.sessionId === sid);
-      if (existing) {
-        return existing;
-      }
-      const conv = {
-        conversationId: nextConvId++,
-        sessionId: sid,
-        title: title ?? null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-      conversations.push(conv);
-      return conv;
-    }),
+    getOrCreateConversation: vi.fn(
+      async (sid: string, titleOrOpts?: string | { title?: string; sessionKey?: string }) => {
+        const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
+        if (opts.sessionKey) {
+          const byKey = conversations.find((c) => c.sessionKey === opts.sessionKey);
+          if (byKey) {
+            if (byKey.sessionId !== sid) {
+              byKey.sessionId = sid;
+            }
+            return byKey;
+          }
+        }
+        const existing = conversations.find((c) => c.sessionId === sid);
+        if (existing) {
+          if (opts.sessionKey && !existing.sessionKey) {
+            existing.sessionKey = opts.sessionKey;
+          }
+          return existing;
+        }
+        const conv = {
+          conversationId: nextConvId++,
+          sessionId: sid,
+          sessionKey: opts.sessionKey,
+          title: opts.title ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        conversations.push(conv);
+        return conv;
+      },
+    ),
     createMessage: vi.fn(
       async (input: {
         conversationId: number;

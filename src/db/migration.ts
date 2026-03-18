@@ -363,6 +363,7 @@ export function runLcmMigrations(
     CREATE TABLE IF NOT EXISTS conversations (
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
+      session_key TEXT,
       title TEXT,
       bootstrapped_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -490,6 +491,13 @@ export function runLcmMigrations(
   if (!hasBootstrappedAt) {
     db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
   }
+
+  const hasSessionKey = conversationColumns.some((col) => col.name === "session_key");
+  if (!hasSessionKey) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN session_key TEXT`);
+  }
+
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS conversations_session_key_idx ON conversations (session_key)`);
 
   ensureSummaryDepthColumn(db);
   ensureSummaryMetadataColumns(db);

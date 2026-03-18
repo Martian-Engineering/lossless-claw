@@ -68,11 +68,13 @@ export type MessagePartRecord = {
 export type CreateConversationInput = {
   sessionId: string;
   title?: string;
+  sessionKey?: string;
 };
 
 export type ConversationRecord = {
   conversationId: ConversationId;
   sessionId: string;
+  sessionKey?: string;
   title: string | null;
   bootstrappedAt: Date | null;
   createdAt: Date;
@@ -102,6 +104,7 @@ export type MessageSearchResult = {
 interface ConversationRow {
   conversation_id: number;
   session_id: string;
+  session_key: string | null;
   title: string | null;
   bootstrapped_at: string | null;
   created_at: string;
@@ -155,6 +158,7 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
   return {
     conversationId: row.conversation_id,
     sessionId: row.session_id,
+    sessionKey: row.session_key ?? undefined,
     title: row.title,
     bootstrappedAt: row.bootstrapped_at ? new Date(row.bootstrapped_at) : null,
     createdAt: new Date(row.created_at),
@@ -231,12 +235,12 @@ export class ConversationStore {
 
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
     const result = this.db
-      .prepare(`INSERT INTO conversations (session_id, title) VALUES (?, ?)`)
-      .run(input.sessionId, input.title ?? null);
+      .prepare(`INSERT INTO conversations (session_id, session_key, title) VALUES (?, ?, ?)`)
+      .run(input.sessionId, input.sessionKey ?? null, input.title ?? null);
 
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(Number(result.lastInsertRowid)) as unknown as ConversationRow;
@@ -247,7 +251,7 @@ export class ConversationStore {
   async getConversation(conversationId: ConversationId): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(conversationId) as unknown as ConversationRow | undefined;
@@ -258,7 +262,7 @@ export class ConversationStore {
   async getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at
        FROM conversations
        WHERE session_id = ?
        ORDER BY created_at DESC
@@ -269,12 +273,50 @@ export class ConversationStore {
     return row ? toConversationRecord(row) : null;
   }
 
-  async getOrCreateConversation(sessionId: string, title?: string): Promise<ConversationRecord> {
+  async getConversationBySessionKey(sessionKey: string): Promise<ConversationRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at
+       FROM conversations WHERE session_key = ? LIMIT 1`,
+      )
+      .get(sessionKey) as unknown as ConversationRow | undefined;
+
+    return row ? toConversationRecord(row) : null;
+  }
+
+  async getOrCreateConversation(
+    sessionId: string,
+    titleOrOpts?: string | { title?: string; sessionKey?: string },
+  ): Promise<ConversationRecord> {
+    const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
+
+    if (opts.sessionKey) {
+      const byKey = await this.getConversationBySessionKey(opts.sessionKey);
+      if (byKey) {
+        if (byKey.sessionId !== sessionId) {
+          this.db
+            .prepare(
+              `UPDATE conversations SET session_id = ?, updated_at = datetime('now') WHERE conversation_id = ?`,
+            )
+            .run(sessionId, byKey.conversationId);
+        }
+        return byKey;
+      }
+    }
+
     const existing = await this.getConversationBySessionId(sessionId);
     if (existing) {
+      if (opts.sessionKey && !existing.sessionKey) {
+        this.db
+          .prepare(
+            `UPDATE conversations SET session_key = ?, updated_at = datetime('now') WHERE conversation_id = ?`,
+          )
+          .run(opts.sessionKey, existing.conversationId);
+      }
       return existing;
     }
-    return this.createConversation({ sessionId, title });
+
+    return this.createConversation({ sessionId, title: opts.title, sessionKey: opts.sessionKey });
   }
 
   async markConversationBootstrapped(conversationId: ConversationId): Promise<void> {
