@@ -15,7 +15,7 @@ import type {
   SubagentEndReason,
   SubagentSpawnPreparation,
 } from "openclaw/plugin-sdk";
-import { ContextAssembler } from "./assembler.js";
+import { blockFromPart, ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
@@ -39,6 +39,7 @@ import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
   ConversationStore,
   type CreateMessagePartInput,
+  type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
@@ -62,6 +63,12 @@ function toJson(value: unknown): string {
 
 function safeString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 function safeBoolean(value: unknown): boolean | undefined {
@@ -330,6 +337,58 @@ function isTextBlock(value: unknown): value is { type: "text"; text: string } {
   return record.type === "text" && typeof record.text === "string";
 }
 
+function toSyntheticMessagePartRecord(
+  part: CreateMessagePartInput,
+  messageId: number,
+): MessagePartRecord {
+  return {
+    partId: `estimate-part-${part.ordinal}`,
+    messageId,
+    sessionId: part.sessionId,
+    partType: part.partType,
+    ordinal: part.ordinal,
+    textContent: part.textContent ?? null,
+    toolCallId: part.toolCallId ?? null,
+    toolName: part.toolName ?? null,
+    toolInput: part.toolInput ?? null,
+    toolOutput: part.toolOutput ?? null,
+    metadata: part.metadata ?? null,
+  };
+}
+
+function normalizeMessageContentForStorage(params: {
+  message: AgentMessage;
+  fallbackContent: string;
+}): unknown {
+  const { message, fallbackContent } = params;
+  if (!("content" in message)) {
+    return fallbackContent;
+  }
+
+  const role = toRuntimeRoleForTokenEstimate(message.role);
+  const parts = buildMessageParts({
+    sessionId: "storage-estimate",
+    message,
+    fallbackContent,
+  }).map((part) => toSyntheticMessagePartRecord(part, 0));
+
+  if (parts.length === 0) {
+    if (role === "assistant") {
+      return fallbackContent ? [{ type: "text", text: fallbackContent }] : [];
+    }
+    if (role === "toolResult") {
+      return [{ type: "text", text: fallbackContent }];
+    }
+    return fallbackContent;
+  }
+
+  const blocks = parts.map(blockFromPart);
+  if (role === "user" && blocks.length === 1 && isTextBlock(blocks[0])) {
+    return blocks[0].text;
+  }
+  return blocks;
+}
+
 /**
  * Estimate token usage for the content shape that the assembler will emit.
  *
@@ -557,11 +616,18 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
         ? `$ ${(message as { command: string; output: string }).command}\n${(message as { command: string; output: string }).output}`
         : "";
   const runtimeRole = toRuntimeRoleForTokenEstimate(message.role);
+  const normalizedContent =
+    "content" in message
+      ? normalizeMessageContentForStorage({
+          message,
+          fallbackContent: content,
+        })
+      : content;
   const tokenCount =
     "content" in message
       ? estimateContentTokensForRole({
           role: runtimeRole,
-          content: message.content,
+          content: normalizedContent,
           fallbackContent: content,
         })
       : estimateTokens(content);
@@ -896,9 +962,10 @@ export class LcmContextEngine implements ContextEngine {
   /** Resolve token budget from direct params or legacy fallback input. */
   private resolveTokenBudget(params: {
     tokenBudget?: number;
+    runtimeContext?: Record<string, unknown>;
     legacyParams?: Record<string, unknown>;
   }): number | undefined {
-    const lp = params.legacyParams ?? {};
+    const lp = asRecord(params.runtimeContext) ?? params.legacyParams ?? {};
     if (
       typeof params.tokenBudget === "number" &&
       Number.isFinite(params.tokenBudget) &&
@@ -1481,6 +1548,9 @@ export class LcmContextEngine implements ContextEngine {
     autoCompactionSummary?: string;
     isHeartbeat?: boolean;
     tokenBudget?: number;
+    /** OpenClaw runtime param name (preferred). */
+    runtimeContext?: Record<string, unknown>;
+    /** Back-compat param name. */
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
@@ -1531,6 +1601,8 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
+    const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
+
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
 
     try {
@@ -1541,7 +1613,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionFile: params.sessionFile,
           tokenBudget,
           currentTokenCount: liveContextTokens,
-          legacyParams: params.legacyCompactionParams,
+          legacyParams,
         }).catch(() => {
           // Leaf compaction is best-effort and should not fail the caller.
         });
@@ -1557,7 +1629,7 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget,
         currentTokenCount: liveContextTokens,
         compactionTarget: "threshold",
-        legacyParams: params.legacyCompactionParams,
+        legacyParams,
       });
     } catch {
       // Proactive compaction is best-effort in the post-turn lifecycle.
@@ -1678,6 +1750,9 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget?: number;
     currentTokenCount?: number;
     customInstructions?: string;
+    /** OpenClaw runtime param name (preferred). */
+    runtimeContext?: Record<string, unknown>;
+    /** Back-compat param name. */
     legacyParams?: Record<string, unknown>;
     force?: boolean;
     previousSummaryContent?: string;
@@ -1702,7 +1777,12 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
-      const tokenBudget = this.resolveTokenBudget(params);
+      const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
+      const tokenBudget = this.resolveTokenBudget({
+        tokenBudget: params.tokenBudget,
+        runtimeContext: params.runtimeContext,
+        legacyParams,
+      });
       if (!tokenBudget) {
         return {
           ok: false,
@@ -1711,7 +1791,7 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
-      const lp = params.legacyParams ?? {};
+      const lp = legacyParams ?? {};
       const observedTokens = this.normalizeObservedTokenCount(
         params.currentTokenCount ??
           (
@@ -1721,7 +1801,7 @@ export class LcmContextEngine implements ContextEngine {
           ).currentTokenCount,
       );
       const summarize = await this.resolveSummarize({
-        legacyParams: params.legacyParams,
+        legacyParams,
         customInstructions: params.customInstructions,
       });
 
@@ -1759,6 +1839,9 @@ export class LcmContextEngine implements ContextEngine {
     currentTokenCount?: number;
     compactionTarget?: "budget" | "threshold";
     customInstructions?: string;
+    /** OpenClaw runtime param name (preferred). */
+    runtimeContext?: Record<string, unknown>;
+    /** Back-compat param name. */
     legacyParams?: Record<string, unknown>;
     /** Force compaction even if below threshold */
     force?: boolean;
@@ -1793,7 +1876,8 @@ export class LcmContextEngine implements ContextEngine {
 
       const conversationId = conversation.conversationId;
 
-      const lp = params.legacyParams ?? {};
+      const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
+      const lp = legacyParams ?? {};
       const manualCompactionRequested =
         (
           lp as {
@@ -1801,7 +1885,11 @@ export class LcmContextEngine implements ContextEngine {
           }
         ).manualCompaction === true;
       const forceCompaction = force || manualCompactionRequested;
-      const tokenBudget = this.resolveTokenBudget(params);
+      const tokenBudget = this.resolveTokenBudget({
+        tokenBudget: params.tokenBudget,
+        runtimeContext: params.runtimeContext,
+        legacyParams,
+      });
       if (!tokenBudget) {
         return {
           ok: false,
@@ -1811,7 +1899,7 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const summarize = await this.resolveSummarize({
-        legacyParams: params.legacyParams,
+        legacyParams,
         customInstructions: params.customInstructions,
       });
 
