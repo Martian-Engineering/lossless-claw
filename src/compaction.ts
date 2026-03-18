@@ -140,7 +140,6 @@ function generateSummaryId(content: string): string {
 }
 
 /** Maximum characters for the deterministic fallback truncation (512 tokens * 4 chars). */
-const FALLBACK_MAX_CHARS = 512 * 4;
 const DEFAULT_LEAF_CHUNK_TOKENS = 20_000;
 const CONDENSED_MIN_INPUT_RATIO = 0.1;
 
@@ -982,8 +981,13 @@ export class CompactionEngine {
   }
 
   /**
-   * Run three-level summarization escalation:
-   * normal -> aggressive -> deterministic fallback.
+   * Run two-level summarization escalation with explicit error handling:
+   * normal -> aggressive -> fail (do NOT truncate to garbage).
+   *
+   * If both normal and aggressive summarization fail (return result >= input tokens),
+   * returns null. The caller MUST NOT persist these failed attempts.
+   * This forces the compaction engine to bail and retry on the next turn, instead
+   * of creating useless garbage "fallback" summaries that pollute the DAG.
    */
   private async summarizeWithEscalation(params: {
     sourceText: string;
@@ -992,17 +996,18 @@ export class CompactionEngine {
   }): Promise<{ content: string; level: CompactionLevel } | null> {
     const sourceText = params.sourceText.trim();
     if (!sourceText) {
-      return {
-        content: "[Truncated from 0 tokens]",
-        level: "fallback",
-      };
+      return null;
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
 
     const runSummarizer = async (aggressiveMode: boolean): Promise<string | null> => {
-      const output = await params.summarize(sourceText, aggressiveMode, params.options);
-      const trimmed = output.trim();
-      return trimmed || null;
+      try {
+        const output = await params.summarize(sourceText, aggressiveMode, params.options);
+        const trimmed = output.trim();
+        return trimmed || null;
+      } catch {
+        return null;
+      }
     };
 
     const initialSummary = await runSummarizer(false);
@@ -1021,13 +1026,13 @@ export class CompactionEngine {
       level = "aggressive";
 
       if (estimateTokens(summaryText) >= inputTokens) {
-        const truncated =
-          sourceText.length > FALLBACK_MAX_CHARS
-            ? sourceText.slice(0, FALLBACK_MAX_CHARS)
-            : sourceText;
-        summaryText = `${truncated}
-[Truncated from ${inputTokens} tokens]`;
-        level = "fallback";
+        // Both normal and aggressive modes failed to compress.
+        // Return null instead of truncating — the caller will skip
+        // this compaction and retry on the next turn.
+        console.warn(
+          `[lcm] summarization failed to compress (input=${inputTokens}, aggressive=${estimateTokens(summaryText)}); skipping`,
+        );
+        return null;
       }
     }
 
