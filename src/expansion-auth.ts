@@ -195,6 +195,18 @@ export class ExpansionAuthManager {
       }
     }
 
+    // 6. Requested depth must not exceed grant maxDepth
+    if (request.depth > grant.maxDepth) {
+      return {
+        valid: false,
+        reason: `Requested depth ${request.depth} exceeds grant maxDepth ${grant.maxDepth}`,
+      };
+    }
+
+    // 7. tokenCap is enforced via clamping in wrapWithAuth, not rejected here.
+    // This allows callers to request more than remaining budget — it will be
+    // clamped to the actual remaining amount at execution time.
+
     return { valid: true };
   }
 

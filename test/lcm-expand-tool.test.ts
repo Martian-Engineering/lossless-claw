@@ -457,6 +457,7 @@ describe("createLcmExpandTool expansion limits", () => {
       issuerSessionId: "main",
       allowedConversationIds: [7],
       tokenCap: 120,
+      maxDepth: 10,
     });
 
     const tool = createLcmExpandTool({

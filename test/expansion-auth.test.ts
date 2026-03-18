@@ -307,18 +307,18 @@ describe("ExpansionAuthManager", () => {
       expect(result.valid).toBe(true);
     });
 
-    it("does not enforce maxDepth against grant limits", () => {
+    it("rejects requests exceeding grant maxDepth", () => {
       const result = manager.validateExpansion(grantId, {
         conversationId: 1,
         summaryIds: ["sum_a"],
         depth: 5,
         tokenCap: 1000,
       });
-      expect(result.valid).toBe(true);
-      expect(result.reason).toBeUndefined();
+      expect(result.valid).toBe(false);
+      expect(result.reason).toContain("maxDepth");
     });
 
-    it("does not enforce tokenCap against grant limits", () => {
+    it("allows oversized tokenCap (clamped at execution by wrapWithAuth)", () => {
       const result = manager.validateExpansion(grantId, {
         conversationId: 1,
         summaryIds: ["sum_a"],
@@ -326,7 +326,6 @@ describe("ExpansionAuthManager", () => {
         tokenCap: 5000,
       });
       expect(result.valid).toBe(true);
-      expect(result.reason).toBeUndefined();
     });
 
     it("checks validation in priority order: existence > revocation > expiry > scope", () => {

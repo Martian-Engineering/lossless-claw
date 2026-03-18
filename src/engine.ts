@@ -1972,11 +1972,34 @@ export class LcmContextEngine implements ContextEngine {
         ? Math.floor(params.ttlMs)
         : undefined;
 
+    // Inherit scope from parent grant if one exists (prevents privilege escalation)
+    const parentGrantId = resolveDelegatedExpansionGrantId(parentSessionKey);
+    const parentGrant = parentGrantId
+      ? getRuntimeExpansionAuthManager().getGrant(parentGrantId)
+      : null;
+
+    const childTokenCap = parentGrant
+      ? Math.min(
+          getRuntimeExpansionAuthManager().getRemainingTokenBudget(parentGrantId!) ?? this.config.maxExpandTokens,
+          this.config.maxExpandTokens,
+        )
+      : this.config.maxExpandTokens;
+
+    const childMaxDepth = parentGrant
+      ? Math.max(0, parentGrant.maxDepth - 1)
+      : undefined;
+
+    const childAllowedSummaryIds = parentGrant?.allowedSummaryIds.length
+      ? parentGrant.allowedSummaryIds
+      : undefined;
+
     createDelegatedExpansionGrant({
       delegatedSessionKey: childSessionKey,
       issuerSessionId: parentSessionKey,
       allowedConversationIds: [conversationId],
-      tokenCap: this.config.maxExpandTokens,
+      allowedSummaryIds: childAllowedSummaryIds,
+      tokenCap: childTokenCap,
+      maxDepth: childMaxDepth,
       ttlMs,
     });
 
@@ -2117,6 +2140,41 @@ export class LcmContextEngine implements ContextEngine {
     }
     return false;
   }
+}
+
+// ── Tool-part detection ──────────────────────────────────────────────────────
+
+const TOOL_PART_TYPES: ReadonlySet<string> = new Set(["tool"]);
+const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
+  "tool_use",
+  "toolUse",
+  "tool-use",
+  "toolCall",
+  "functionCall",
+  "function_call",
+  "function_call_output",
+  "tool_result",
+  "toolResult",
+]);
+
+function messagePartIndicatesToolUsage(part: MessagePartRecord): boolean {
+  if (TOOL_PART_TYPES.has(part.partType)) {
+    return true;
+  }
+  if (part.toolCallId || part.toolName || part.toolInput || part.toolOutput) {
+    return true;
+  }
+  if (typeof part.metadata === "string" && part.metadata.length > 0) {
+    try {
+      const meta = JSON.parse(part.metadata) as Record<string, unknown>;
+      if (typeof meta.rawType === "string" && TOOL_RAW_TYPES.has(meta.rawType)) {
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return false;
 }
 
 // ── Heartbeat detection ─────────────────────────────────────────────────────
