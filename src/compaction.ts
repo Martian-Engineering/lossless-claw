@@ -231,6 +231,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
+    summaryModel?: string;
   }): Promise<CompactionResult> {
     return this.compactFullSweep(input);
   }
@@ -246,6 +247,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     previousSummaryContent?: string;
+    summaryModel?: string;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force } = input;
 
@@ -281,6 +283,7 @@ export class CompactionEngine {
       leafChunk.items,
       summarize,
       previousSummaryContent,
+      input.summaryModel,
     );
     if (!leafResult) {
       return {
@@ -322,6 +325,7 @@ export class CompactionEngine {
           chunk.items,
           targetDepth,
           summarize,
+          input.summaryModel,
         );
         if (!condenseResult) {
           break;
@@ -370,6 +374,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
+    summaryModel?: string;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
@@ -416,6 +421,7 @@ export class CompactionEngine {
         leafChunk.items,
         summarize,
         previousSummaryContent,
+        input.summaryModel,
       );
       if (!leafResult) {
         break;
@@ -461,6 +467,7 @@ export class CompactionEngine {
         candidate.chunk.items,
         candidate.targetDepth,
         summarize,
+        input.summaryModel,
       );
       if (!condenseResult) {
         break;
@@ -511,6 +518,7 @@ export class CompactionEngine {
     targetTokens?: number;
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
+    summaryModel?: string;
   }): Promise<{ success: boolean; rounds: number; finalTokens: number }> {
     const { conversationId, tokenBudget, summarize } = input;
     const targetTokens =
@@ -542,6 +550,7 @@ export class CompactionEngine {
         tokenBudget,
         summarize,
         force: true,
+        summaryModel: input.summaryModel,
       });
 
       if (result.tokensAfter <= targetTokens) {
@@ -1044,6 +1053,7 @@ export class CompactionEngine {
     messageItems: ContextItemRecord[],
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
+    summaryModel?: string,
   ): Promise<{ summaryId: string; level: CompactionLevel; content: string } | null> {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
@@ -1110,6 +1120,7 @@ export class CompactionEngine {
         (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
         0,
       ),
+      model: summaryModel,
     });
 
     // Link to source messages
@@ -1141,6 +1152,7 @@ export class CompactionEngine {
     summaryItems: ContextItemRecord[],
     targetDepth: number,
     summarize: CompactionSummarizeFn,
+    summaryModel?: string,
   ): Promise<PassResult | null> {
     // Fetch full summary records
     const summaryRecords: SummaryRecord[] = [];
@@ -1242,6 +1254,7 @@ export class CompactionEngine {
             : 0;
         return count + sourceTokens;
       }, 0),
+      model: summaryModel,
     });
 
     // Link to parent summaries

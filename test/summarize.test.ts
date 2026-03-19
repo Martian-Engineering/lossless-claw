@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createLcmSummarizeFromLegacyParams } from "../src/summarize.js";
+import { createLcmSummarizeFromLegacyParams, type LcmSummarizeFn } from "../src/summarize.js";
 import type { LcmDependencies } from "../src/types.js";
+
+async function createSummarizeFn(
+  params: Parameters<typeof createLcmSummarizeFromLegacyParams>[0],
+): Promise<LcmSummarizeFn | undefined> {
+  const result = await createLcmSummarizeFromLegacyParams(params);
+  return result?.fn;
+}
 
 function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
   return {
@@ -286,7 +293,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
   it("builds distinct normal vs aggressive prompts", async () => {
     const deps = makeDeps();
 
-    const summarize = await createLcmSummarizeFromLegacyParams({
+    const summarize = await createSummarizeFn({
       deps,
       legacyParams: {
         provider: "anthropic",
@@ -320,7 +327,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
   it("uses condensed prompt mode for condensed summaries", async () => {
     const deps = makeDeps();
-    const summarize = await createLcmSummarizeFromLegacyParams({
+    const summarize = await createSummarizeFn({
       deps,
       legacyParams: {
         provider: "anthropic",
@@ -346,7 +353,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       getApiKey: vi.fn(async () => "resolved-api-key"),
     });
 
-    const summarize = await createLcmSummarizeFromLegacyParams({
+    const summarize = await createSummarizeFn({
       deps,
       legacyParams: {
         provider: "anthropic",
@@ -365,7 +372,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       getApiKey: vi.fn(() => "resolved-api-key"),
     });
 
-    const summarize = await createLcmSummarizeFromLegacyParams({
+    const summarize = await createSummarizeFn({
       deps,
       legacyParams: {
         provider: "anthropic",
@@ -388,7 +395,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       })),
     });
 
-    const summarize = await createLcmSummarizeFromLegacyParams({
+    const summarize = await createSummarizeFn({
       deps,
       legacyParams: {
         provider: "anthropic",
@@ -428,7 +435,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       })),
     });
 
-    const summarize = await createLcmSummarizeFromLegacyParams({
+    const summarize = await createSummarizeFn({
       deps,
       legacyParams: {
         provider: "openai",
@@ -455,7 +462,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         })),
       });
 
-      const summarize = await createLcmSummarizeFromLegacyParams({
+      const summarize = await createSummarizeFn({
         deps,
         legacyParams: {
           provider: "openai",
@@ -501,7 +508,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           }),
         });
 
-        const summarize = await createLcmSummarizeFromLegacyParams({
+        const summarize = await createSummarizeFn({
           deps,
           legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
         });
@@ -543,7 +550,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           })),
         });
 
-        const summarize = await createLcmSummarizeFromLegacyParams({
+        const summarize = await createSummarizeFn({
           deps,
           legacyParams: { provider: "openai", model: "openai-codex" },
         });
@@ -586,7 +593,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           }),
         });
 
-        const summarize = await createLcmSummarizeFromLegacyParams({
+        const summarize = await createSummarizeFn({
           deps,
           legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
         });
@@ -641,7 +648,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           })),
         });
 
-        const summarize = await createLcmSummarizeFromLegacyParams({
+        const summarize = await createSummarizeFn({
           deps,
           legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
         });
@@ -689,7 +696,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           })),
         });
 
-        const summarize = await createLcmSummarizeFromLegacyParams({
+        const summarize = await createSummarizeFn({
           deps,
           legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
         });
@@ -713,7 +720,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         // Default makeDeps uses anthropic + returns valid text — no retry expected.
       });
 
-      const summarize = await createLcmSummarizeFromLegacyParams({
+      const summarize = await createSummarizeFn({
         deps,
         legacyParams: { provider: "anthropic", model: "claude-opus-4-5" },
       });
@@ -745,7 +752,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           })),
         });
 
-        const summarize = await createLcmSummarizeFromLegacyParams({
+        const summarize = await createSummarizeFn({
           deps,
           legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
         });
@@ -792,7 +799,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           })),
         });
 
-        const summarize = await createLcmSummarizeFromLegacyParams({
+        const summarize = await createSummarizeFn({
           deps,
           legacyParams: { provider: "openai", model: "openai-codex" },
         });
@@ -836,7 +843,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           })),
         });
 
-        const summarize = await createLcmSummarizeFromLegacyParams({
+        const summarize = await createSummarizeFn({
           deps,
           legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
         });
@@ -874,7 +881,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           })),
         });
 
-        const summarize = await createLcmSummarizeFromLegacyParams({
+        const summarize = await createSummarizeFn({
           deps,
           legacyParams: { provider: "openai", model: "openai-codex" },
         });
@@ -926,7 +933,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         })),
       });
 
-      const summarize = await createLcmSummarizeFromLegacyParams({
+      const summarize = await createSummarizeFn({
         deps,
         legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
       });

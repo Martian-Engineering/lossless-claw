@@ -80,6 +80,14 @@ function isoStringOrNull(value: Date | null): string | null {
   return value ? value.toISOString() : null;
 }
 
+function ensureSummaryModelColumn(db: DatabaseSync): void {
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const hasModel = summaryColumns.some((col) => col.name === "model");
+  if (!hasModel) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`);
+  }
+}
+
 function backfillSummaryDepths(db: DatabaseSync): void {
   // Leaves are always depth 0, even if legacy rows had malformed values.
   db.exec(`UPDATE summaries SET depth = 0 WHERE kind = 'leaf'`);
@@ -500,6 +508,7 @@ export function runLcmMigrations(
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS conversations_session_key_idx ON conversations (session_key)`);
   ensureSummaryDepthColumn(db);
   ensureSummaryMetadataColumns(db);
+  ensureSummaryModelColumn(db);
   backfillSummaryDepths(db);
   backfillSummaryMetadata(db);
 

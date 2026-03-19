@@ -641,7 +641,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   deps: LcmDependencies;
   legacyParams: LcmSummarizerLegacyParams;
   customInstructions?: string;
-}): Promise<LcmSummarizeFn | undefined> {
+}): Promise<{ fn: LcmSummarizeFn; model: string } | undefined> {
   const readModelRef = (value: unknown): string => {
     if (typeof value === "string") {
       return value.trim();
@@ -752,7 +752,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       ? params.deps.config.condensedTargetTokens
       : DEFAULT_CONDENSED_TARGET_TOKENS;
 
-  return async (
+  const fn: LcmSummarizeFn = async (
     text: string,
     aggressive?: boolean,
     options?: LcmSummarizeOptions,
@@ -928,4 +928,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
     return summary;
   };
+
+  return { fn, model };
 }

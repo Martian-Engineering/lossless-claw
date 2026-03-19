@@ -1023,10 +1023,13 @@ export class LcmContextEngine implements ContextEngine {
   private async resolveSummarize(params: {
     legacyParams?: Record<string, unknown>;
     customInstructions?: string;
-  }): Promise<(text: string, aggressive?: boolean) => Promise<string>> {
+  }): Promise<{ summarize: (text: string, aggressive?: boolean) => Promise<string>; summaryModel: string }> {
     const lp = params.legacyParams ?? {};
     if (typeof lp.summarize === "function") {
-      return lp.summarize as (text: string, aggressive?: boolean) => Promise<string>;
+      return {
+        summarize: lp.summarize as (text: string, aggressive?: boolean) => Promise<string>,
+        summaryModel: "unknown",
+      };
     }
     try {
       const runtimeSummarizer = await createLcmSummarizeFromLegacyParams({
@@ -1035,14 +1038,14 @@ export class LcmContextEngine implements ContextEngine {
         customInstructions: params.customInstructions,
       });
       if (runtimeSummarizer) {
-        return runtimeSummarizer;
+        return { summarize: runtimeSummarizer.fn, summaryModel: runtimeSummarizer.model };
       }
       console.error(`[lcm] resolveSummarize: createLcmSummarizeFromLegacyParams returned undefined`);
     } catch (err) {
       console.error(`[lcm] resolveSummarize failed, using emergency fallback:`, err instanceof Error ? err.message : err);
     }
     console.error(`[lcm] resolveSummarize: FALLING BACK TO EMERGENCY TRUNCATION`);
-    return createEmergencyFallbackSummarize();
+    return { summarize: createEmergencyFallbackSummarize(), summaryModel: "unknown" };
   }
 
   /**
@@ -1066,16 +1069,16 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
-      const summarize = await createLcmSummarizeFromLegacyParams({
+      const result = await createLcmSummarizeFromLegacyParams({
         deps: this.deps,
         legacyParams: { provider, model },
       });
-      if (!summarize) {
+      if (!result) {
         return undefined;
       }
 
       this.largeFileTextSummarizer = async (prompt: string): Promise<string | null> => {
-        const summary = await summarize(prompt, false);
+        const summary = await result.fn(prompt, false);
         if (typeof summary !== "string") {
           return null;
         }
@@ -1830,7 +1833,7 @@ export class LcmContextEngine implements ContextEngine {
               }
             ).currentTokenCount,
         );
-        const summarize = await this.resolveSummarize({
+        const { summarize, summaryModel } = await this.resolveSummarize({
           legacyParams,
           customInstructions: params.customInstructions,
         });
@@ -1841,6 +1844,7 @@ export class LcmContextEngine implements ContextEngine {
           summarize,
           force: params.force,
           previousSummaryContent: params.previousSummaryContent,
+          summaryModel,
         });
         const tokensBefore = observedTokens ?? leafResult.tokensBefore;
 
@@ -1934,7 +1938,7 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
-      const summarize = await this.resolveSummarize({
+      const { summarize, summaryModel } = await this.resolveSummarize({
         legacyParams,
         customInstructions: params.customInstructions,
       });
@@ -1977,6 +1981,7 @@ export class LcmContextEngine implements ContextEngine {
           summarize,
           force: forceCompaction,
           hardTrigger: false,
+          summaryModel,
         });
 
         return {
@@ -2013,6 +2018,7 @@ export class LcmContextEngine implements ContextEngine {
         targetTokens: convergenceTargetTokens,
         ...(observedTokens !== undefined ? { currentTokens: observedTokens } : {}),
         summarize,
+        summaryModel,
       });
       const didCompact = compactResult.rounds > 0;
 
