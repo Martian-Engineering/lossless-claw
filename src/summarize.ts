@@ -32,6 +32,26 @@ const DIAGNOSTIC_MAX_CHARS = 1200;
 const DIAGNOSTIC_SENSITIVE_KEY_PATTERN =
   /(api[-_]?key|authorization|token|secret|password|cookie|set-cookie|private[-_]?key|bearer)/i;
 
+/**
+ * Default timeout for a single summarizer LLM call.  Long enough for large
+ * context windows on slower providers, short enough to prevent the gateway
+ * event loop from starving when a provider hangs.
+ */
+const SUMMARIZER_TIMEOUT_MS = 60_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`[lcm] summarizer timeout after ${ms}ms (${label})`)),
+      ms,
+    );
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 /** Normalize provider ids for stable config/profile lookup. */
 function normalizeProviderId(provider: string): string {
   return provider.trim().toLowerCase();
@@ -795,7 +815,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
     let result: Awaited<ReturnType<typeof params.deps.complete>>;
     try {
-      result = await params.deps.complete({
+      result = await withTimeout(params.deps.complete({
         provider,
         model,
         apiKey,
@@ -812,7 +832,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         ],
         maxTokens: targetTokens,
         temperature: aggressive ? 0.1 : 0.2,
-      });
+      }), SUMMARIZER_TIMEOUT_MS, "initial");
     } catch (err) {
       console.error(
         `[lcm] summarizer call failed; provider=${provider}; model=${model}; error=${err instanceof Error ? err.message : String(err)}`,
@@ -859,7 +879,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       // reasoning budget to coax a textual response from providers that
       // sometimes return reasoning-only or empty blocks on the first pass.
       try {
-        const retryResult = await params.deps.complete({
+        const retryResult = await withTimeout(params.deps.complete({
           provider,
           model,
           apiKey,
@@ -877,7 +897,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           maxTokens: targetTokens,
           temperature: 0.05,
           reasoning: "low",
-        });
+        }), SUMMARIZER_TIMEOUT_MS, "retry");
 
         const retryNormalized = normalizeCompletionSummary(retryResult.content);
         summary = retryNormalized.summary;
