@@ -3,7 +3,6 @@ import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
 import type {
   ContextEngine,
   ContextEngineInfo,
@@ -18,8 +17,9 @@ import type {
 import { blockFromPart, ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
+import { createLcmConnection, closeLcmConnection, getLcmConnection } from "./db/connection.js";
 import { getLcmDbFeatures } from "./db/features.js";
-import { runLcmMigrations } from "./db/migration.js";
+import { runLcmMigrations, ensurePostgresSchema } from "./db/migration.js";
 import {
   createDelegatedExpansionGrant,
   getRuntimeExpansionAuthManager,
@@ -772,46 +772,63 @@ export class LcmContextEngine implements ContextEngine {
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
-  private readonly db: DatabaseSync;
   private migrated = false;
-  private readonly fts5Available: boolean;
+  private readonly fullTextAvailable: boolean;
   private readonly ignoreSessionPatterns: RegExp[];
   private readonly statelessSessionPatterns: RegExp[];
   private sessionOperationQueues = new Map<string, Promise<void>>();
+  /** Global mutex for bootstrap operations. With AsyncLocalStorage handling
+   *  per-session DB scoping, this primarily prevents concurrent bootstraps
+   *  from racing on conversation creation and context_items population. */
+  private bootstrapLock: Promise<void> = Promise.resolve();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
 
-  constructor(deps: LcmDependencies, database: DatabaseSync) {
+  constructor(deps: LcmDependencies) {
     this.deps = deps;
     this.config = deps.config;
     this.ignoreSessionPatterns = compileSessionPatterns(this.config.ignoreSessionPatterns);
     this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
-    this.db = database;
 
-    this.fts5Available = getLcmDbFeatures(this.db).fts5Available;
+    const db = createLcmConnection(this.config);
+    // Pass the underlying SQLite handle for FTS5 probing when backend is sqlite.
+    // Without this, getLcmDbFeatures returns fullTextAvailable=false and FTS5
+    // silently degrades to LIKE-based search on every SQLite install.
+    const features = this.config.backend === "sqlite"
+      ? getLcmDbFeatures("sqlite", getLcmConnection(this.config.databasePath))
+      : getLcmDbFeatures(this.config.backend);
+    this.fullTextAvailable = features.fullTextAvailable;
 
     // Run migrations eagerly at construction time so the schema exists
     // before any lifecycle hook fires.
     let migrationOk = false;
     try {
-      runLcmMigrations(this.db, { fts5Available: this.fts5Available });
-      this.migrated = true;
+      if (this.config.backend === 'sqlite') {
+        // For SQLite, get the raw connection for sync migrations
+        const sqliteDb = getLcmConnection(this.config.databasePath);
+        runLcmMigrations(sqliteDb, { fts5Available: this.fullTextAvailable });
 
-      // Verify tables were actually created
-      const tables = this.db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .all() as Array<{ name: string }>;
-      if (tables.length === 0) {
-        this.deps.log.warn(
-          "[lcm] Migration completed but database has zero tables — DB may be non-functional",
-        );
+        // Verify tables were actually created
+        const tables = sqliteDb
+          .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+          .all() as Array<{ name: string }>;
+        if (tables.length === 0) {
+          this.deps.log.warn(
+            "[lcm] Migration completed but database has zero tables — DB may be non-functional",
+          );
+        } else {
+          migrationOk = true;
+          this.deps.log.debug(
+            `[lcm] Migration successful — ${tables.length} tables: ${tables.map((t) => t.name).join(", ")}`,
+          );
+        }
       } else {
+        // For Postgres, schema is ensured asynchronously; assume OK for now.
+        // The ensureMigrated() call will run ensurePostgresSchema on first use.
         migrationOk = true;
-        this.deps.log.debug(
-          `[lcm] Migration successful — ${tables.length} tables: ${tables.map((t) => t.name).join(", ")}`,
-        );
       }
+      this.migrated = migrationOk;
     } catch (err) {
       this.deps.log.error(
         `[lcm] Migration failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -828,12 +845,22 @@ export class LcmContextEngine implements ContextEngine {
       ownsCompaction: migrationOk,
     };
 
-    this.conversationStore = new ConversationStore(this.db, {
-      fts5Available: this.fts5Available,
-    });
-    this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    const embeddingConfig = this.config.embeddingApiKey
+      ? { apiKey: this.config.embeddingApiKey, baseUrl: this.config.embeddingBaseUrl, model: this.config.embeddingModel }
+      : undefined;
 
-    if (!this.fts5Available) {
+    this.conversationStore = new ConversationStore(db, {
+      fullTextAvailable: this.fullTextAvailable,
+      backend: features.backend,
+      embeddingConfig,
+    });
+    this.summaryStore = new SummaryStore(db, {
+      fullTextAvailable: this.fullTextAvailable,
+      backend: features.backend,
+      embeddingConfig,
+    });
+
+    if (!this.fullTextAvailable) {
       this.deps.log.warn(
         "[lcm] FTS5 unavailable in the current Node runtime; full_text search will fall back to LIKE and indexing is disabled",
       );
@@ -918,12 +945,64 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /** Ensure DB schema is up-to-date. Called lazily on first bootstrap/ingest/assemble/compact. */
-  private ensureMigrated(): void {
+  private async ensureMigrated(): Promise<void> {
     if (this.migrated) {
       return;
     }
-    runLcmMigrations(this.db, { fts5Available: this.fts5Available });
+    if (this.config.backend === 'postgres') {
+      // Let migration errors propagate — if schema setup fails, the engine
+      // must not mark itself as migrated. Subsequent calls will retry.
+      const db = createLcmConnection(this.config);
+      await ensurePostgresSchema(db);
+      this.migrated = true;
+      // Register agent identity after schema is ready (fire-and-forget)
+      this.registerAgent().catch(() => {});
+      return;
+    }
+
+    const sqliteDb = getLcmConnection(this.config.databasePath);
+    runLcmMigrations(sqliteDb, { fts5Available: this.fullTextAvailable });
     this.migrated = true;
+  }
+
+  /**
+   * Get the agent identity for this instance.
+   * Priority: LCM_INSTANCE_ID config > parsed from sessionKey > undefined.
+   */
+  private getAgentId(sessionKey?: string): string | undefined {
+    if (this.config.instanceId) return this.config.instanceId;
+    if (!sessionKey) return undefined;
+    return this.deps.parseAgentSessionKey(sessionKey)?.agentId;
+  }
+
+  /**
+   * Register this agent instance in the agents table.
+   * Upserts on boot, bumping last_seen_at and updating model/host info.
+   */
+  private async registerAgent(): Promise<void> {
+    if (this.config.backend !== "postgres") return;
+    const agentId = this.config.instanceId;
+    if (!agentId) return;
+
+    const db = createLcmConnection(this.config);
+    const displayName = this.config.instanceDisplayName || null;
+    const role = this.config.instanceRole || null;
+    const host = (await import("node:os")).hostname();
+    try {
+      await db.run(
+        `INSERT INTO agents (agent_id, display_name, host, role, metadata)
+         VALUES ($1, $2, $3, $4, '{}')
+         ON CONFLICT (agent_id) DO UPDATE SET
+           display_name = COALESCE(EXCLUDED.display_name, agents.display_name),
+           host = COALESCE(EXCLUDED.host, agents.host),
+           role = COALESCE(EXCLUDED.role, agents.role),
+           last_seen_at = NOW()`,
+        [agentId, displayName, host, role],
+      );
+      console.log(`[lcm:engine] registered agent: ${agentId} (${displayName ?? "no display name"}, role=${role ?? "unset"}, host=${host})`);
+    } catch (err) {
+      console.warn(`[lcm:engine] failed to register agent: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
@@ -1188,6 +1267,59 @@ export class LcmContextEngine implements ContextEngine {
    * Reconcile session-file history with persisted messages and append only the
    * tail that is present in JSONL but missing from LCM.
    */
+  /**
+   * Scan historical messages for any that are missing from the DB and import
+   * them.  Used when the tail matches but a count mismatch reveals mid-history
+   * gaps (e.g. process crash during a turn meant afterTurn never persisted
+   * those messages to LCM).
+   */
+  private async importMissingMessages(params: {
+    sessionId: string;
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+    storedHistoricalMessages: Array<{ role: string; content: string; tokenCount: number }>;
+  }): Promise<number> {
+    const { sessionId, conversationId, historicalMessages, storedHistoricalMessages } = params;
+
+    // Running occurrence counter for each (role, content) identity as we walk
+    // through the historical messages in order.
+    const historicalRunning = new Map<string, number>();
+    // Cache DB counts per identity to avoid repeated queries.
+    const dbCountCache = new Map<string, number>();
+    let imported = 0;
+
+    for (let i = 0; i < storedHistoricalMessages.length; i++) {
+      const stored = storedHistoricalMessages[i];
+      const identity = messageIdentity(stored.role, stored.content);
+      const runCount = (historicalRunning.get(identity) ?? 0) + 1;
+      historicalRunning.set(identity, runCount);
+
+      if (!dbCountCache.has(identity)) {
+        dbCountCache.set(
+          identity,
+          await this.conversationStore.countMessagesByIdentity(
+            conversationId,
+            stored.role,
+            stored.content,
+          ),
+        );
+      }
+
+      if (runCount > dbCountCache.get(identity)!) {
+        const result = await this.ingestSingle({ sessionId, message: historicalMessages[i] });
+        if (result.ingested) {
+          imported++;
+          dbCountCache.set(identity, dbCountCache.get(identity)! + 1);
+        }
+      }
+    }
+
+    if (imported > 0) {
+      console.error(`[lcm] reconcile: imported ${imported} missing mid-history messages`);
+    }
+    return imported;
+  }
+
   private async reconcileSessionTail(params: {
     sessionId: string;
     sessionKey?: string;
@@ -1225,7 +1357,25 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
       if (dbOccurrences === historicalOccurrences) {
-        return { importedMessages: 0, hasOverlap: true };
+        // Guard against mid-history gaps: if the JSONL has more messages than
+        // the DB, a turn's messages were lost (e.g. process crash before
+        // afterTurn could persist them).  The tail matches because a later
+        // turn wrote to both JSONL and DB, but the gap is in the middle.
+        const dbCount = await this.conversationStore.getMessageCount(conversationId);
+        if (historicalMessages.length <= dbCount) {
+          return { importedMessages: 0, hasOverlap: true };
+        }
+        console.error(
+          `[lcm] reconcile: tail matches but mid-history gap detected ` +
+            `(jsonl=${historicalMessages.length}, db=${dbCount}) — scanning for missing messages`,
+        );
+        const imported = await this.importMissingMessages({
+          sessionId,
+          conversationId,
+          historicalMessages,
+          storedHistoricalMessages,
+        });
+        return { importedMessages: imported, hasOverlap: true };
       }
     }
 
@@ -1314,103 +1464,122 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
 
+    // Serialize all bootstraps globally to prevent this.db swap races.
+    // The withSharedTransaction/withClient pattern swaps instance-level this.db
+    // on shared store singletons, which is not safe when multiple sessions
+    // bootstrap concurrently (event loop interleaving).
+    const prevLock = this.bootstrapLock;
+    let releaseLock!: () => void;
+    this.bootstrapLock = new Promise<void>((resolve) => { releaseLock = resolve; });
+    await prevLock;
+
+    const agentId = this.getAgentId(params.sessionKey);
+
+    try {
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () =>
-        this.conversationStore.withTransaction(async () => {
-          const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
-            sessionKey: params.sessionKey,
-          });
-          const conversationId = conversation.conversationId;
-          const historicalMessages = readLeafPathMessages(params.sessionFile);
+        this.conversationStore.withTransactionClient(async (txClient) =>
+          this.summaryStore.withClient(txClient, async () => {
+            const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
+              sessionKey: params.sessionKey,
+              agentId,
+            });
+            const conversationId = conversation.conversationId;
+            const historicalMessages = readLeafPathMessages(params.sessionFile);
 
-        // First-time import path: no LCM rows yet, so seed directly from the
-        // active leaf context snapshot.
-        const existingCount = await this.conversationStore.getMessageCount(conversationId);
-        if (existingCount === 0) {
-          if (historicalMessages.length === 0) {
-            await this.conversationStore.markConversationBootstrapped(conversationId);
+            // First-time import path: no LCM rows yet, so seed directly from the
+            // active leaf context snapshot.
+            const existingCount = await this.conversationStore.getMessageCount(conversationId);
+            if (existingCount === 0) {
+              if (historicalMessages.length === 0) {
+                await this.conversationStore.markConversationBootstrapped(conversationId);
+                return {
+                  bootstrapped: false,
+                  importedMessages: 0,
+                  reason: "no leaf-path messages in session",
+                };
+              }
+
+              const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
+              const bulkInput = historicalMessages.map((message, index) => {
+                const stored = toStoredMessage(message);
+                return {
+                  conversationId,
+                  seq: nextSeq + index,
+                  role: stored.role,
+                  content: stored.content,
+                  tokenCount: stored.tokenCount,
+                };
+              });
+
+              const inserted = await this.conversationStore.createMessagesBulk(bulkInput);
+              await this.summaryStore.appendContextMessages(
+                conversationId,
+                inserted.map((record) => record.messageId),
+              );
+              await this.conversationStore.markConversationBootstrapped(conversationId);
+
+              // Prune HEARTBEAT_OK turns from the freshly imported data
+              if (this.config.pruneHeartbeatOk) {
+                const pruned = await this.pruneHeartbeatOkTurns(conversationId);
+                if (pruned > 0) {
+                  console.error(
+                    `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
+                  );
+                }
+              }
+
+              return {
+                bootstrapped: true,
+                importedMessages: inserted.length,
+              };
+            }
+
+            // Existing conversation path: reconcile crash gaps by appending JSONL
+            // messages that were never persisted to LCM.
+            const reconcile = await this.reconcileSessionTail({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              conversationId,
+              historicalMessages,
+            });
+
+            if (!conversation.bootstrappedAt) {
+              await this.conversationStore.markConversationBootstrapped(conversationId);
+            }
+
+            if (reconcile.importedMessages > 0) {
+              console.error(
+                `[lcm] bootstrap: reconciled ${reconcile.importedMessages} missing messages ` +
+                  `for conversation ${conversationId}`,
+              );
+              return {
+                bootstrapped: true,
+                importedMessages: reconcile.importedMessages,
+                reason: "reconciled missing session messages",
+              };
+            }
+
+            if (conversation.bootstrappedAt) {
+              return {
+                bootstrapped: false,
+                importedMessages: 0,
+                reason: "already bootstrapped",
+              };
+            }
+
             return {
               bootstrapped: false,
               importedMessages: 0,
-              reason: "no leaf-path messages in session",
+              reason: reconcile.hasOverlap
+                ? "conversation already up to date"
+                : "conversation already has messages",
             };
-          }
-
-          const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
-          const bulkInput = historicalMessages.map((message, index) => {
-            const stored = toStoredMessage(message);
-            return {
-              conversationId,
-              seq: nextSeq + index,
-              role: stored.role,
-              content: stored.content,
-              tokenCount: stored.tokenCount,
-            };
-          });
-
-          const inserted = await this.conversationStore.createMessagesBulk(bulkInput);
-          await this.summaryStore.appendContextMessages(
-            conversationId,
-            inserted.map((record) => record.messageId),
-          );
-          await this.conversationStore.markConversationBootstrapped(conversationId);
-
-          // Prune HEARTBEAT_OK turns from the freshly imported data
-          if (this.config.pruneHeartbeatOk) {
-            const pruned = await this.pruneHeartbeatOkTurns(conversationId);
-            if (pruned > 0) {
-              console.error(
-                `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
-              );
-            }
-          }
-
-          return {
-            bootstrapped: true,
-            importedMessages: inserted.length,
-          };
-        }
-
-        // Existing conversation path: reconcile crash gaps by appending JSONL
-        // messages that were never persisted to LCM.
-        const reconcile = await this.reconcileSessionTail({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          conversationId,
-          historicalMessages,
-        });
-
-        if (!conversation.bootstrappedAt) {
-          await this.conversationStore.markConversationBootstrapped(conversationId);
-        }
-
-        if (reconcile.importedMessages > 0) {
-          return {
-            bootstrapped: true,
-            importedMessages: reconcile.importedMessages,
-            reason: "reconciled missing session messages",
-          };
-        }
-
-        if (conversation.bootstrappedAt) {
-          return {
-            bootstrapped: false,
-            importedMessages: 0,
-            reason: "already bootstrapped",
-          };
-        }
-
-          return {
-            bootstrapped: false,
-            importedMessages: 0,
-            reason: reconcile.hasOverlap
-              ? "conversation already up to date"
-              : "conversation already has messages",
-          };
-        }),
+          }),
+        ),
     );
 
     // Post-bootstrap pruning: clean HEARTBEAT_OK turns that were already
@@ -1438,6 +1607,9 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     return result;
+    } finally {
+      releaseLock();
+    }
   }
 
   private async ingestSingle(params: {
@@ -1453,8 +1625,10 @@ export class LcmContextEngine implements ContextEngine {
     const stored = toStoredMessage(message);
 
     // Get or create conversation for this session
+    const agentId = this.getAgentId(params.sessionKey);
     const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
       sessionKey,
+      agentId,
     });
     const conversationId = conversation.conversationId;
 
@@ -1515,7 +1689,7 @@ export class LcmContextEngine implements ContextEngine {
     if (this.isStatelessSession(params.sessionKey)) {
       return { ingested: false };
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       () => this.ingestSingle(params),
@@ -1534,7 +1708,7 @@ export class LcmContextEngine implements ContextEngine {
     if (this.isStatelessSession(params.sessionKey)) {
       return { ingestedCount: 0 };
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
     if (params.messages.length === 0) {
       return { ingestedCount: 0 };
     }
@@ -1578,7 +1752,7 @@ export class LcmContextEngine implements ContextEngine {
     if (this.isStatelessSession(params.sessionKey)) {
       return;
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
 
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
@@ -1672,7 +1846,7 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     try {
-      this.ensureMigrated();
+      await this.ensureMigrated();
 
       const conversation = await this.conversationStore.getConversationForSession({
         sessionId: params.sessionId,
@@ -1748,7 +1922,7 @@ export class LcmContextEngine implements ContextEngine {
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
-    this.ensureMigrated();
+    await this.ensureMigrated();
     const conversation = await this.conversationStore.getConversationForSession({
       sessionId,
       sessionKey,
@@ -1791,7 +1965,7 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
@@ -1891,7 +2065,7 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
@@ -2050,7 +2224,7 @@ export class LcmContextEngine implements ContextEngine {
     ) {
       return undefined;
     }
-    this.ensureMigrated();
+    await this.ensureMigrated();
 
     const childSessionKey = params.childSessionKey.trim();
     const parentSessionKey = params.parentSessionKey.trim();
@@ -2136,17 +2310,27 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   async dispose(): Promise<void> {
-    // No-op for plugin singleton — the connection is shared across runs.
-    // OpenClaw's runner calls dispose() after every run, but the plugin
-    // registers a single engine instance reused by the factory. Closing
-    // the DB here would break subsequent runs with "database is not open".
-    // The shared connection is managed for the lifetime of the plugin process.
+    // The engine is a plugin singleton reused across runs — don't close
+    // the DB connection (that happens on process exit via closeLcmConnection).
+    // But do drain any pending embedding work so nothing is silently lost
+    // between runs.
+    try {
+      await this.conversationStore.drainEmbeddingQueue();
+    } catch { /* best-effort */ }
+    try {
+      await this.summaryStore.drainEmbeddingQueue();
+    } catch { /* best-effort */ }
   }
 
   // ── Public accessors for retrieval (used by subagent expansion) ─────────
 
   getRetrieval(): RetrievalEngine {
     return this.retrieval;
+  }
+
+  /** Get the configured instance identity (from LCM_INSTANCE_ID), if any. */
+  getInstanceId(): string | undefined {
+    return this.config.instanceId || undefined;
   }
 
   getConversationStore(): ConversationStore {

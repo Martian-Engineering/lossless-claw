@@ -7,7 +7,7 @@ import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ContextAssembler } from "../src/assembler.js";
 import type { LcmConfig } from "../src/db/config.js";
-import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
+import { closeLcmConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import {
   createDelegatedExpansionGrant,
@@ -23,6 +23,7 @@ function createTestConfig(databasePath: string): LcmConfig {
   return {
     enabled: true,
     databasePath,
+    backend: 'sqlite',
     ignoreSessionPatterns: [],
     statelessSessionPatterns: [],
     skipStatelessSessions: true,
@@ -41,9 +42,14 @@ function createTestConfig(databasePath: string): LcmConfig {
     summaryModel: "",
     largeFileSummaryProvider: "",
     largeFileSummaryModel: "",
+    expansionProvider: "",
+    expansionModel: "",
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    instanceId: "",
+    instanceDisplayName: "",
+    instanceRole: "",
   };
 }
 
@@ -108,28 +114,22 @@ function createEngine(): LcmContextEngine {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
-  const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new LcmContextEngine(createTestDeps(config));
 }
 
 function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies>): LcmContextEngine {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
-  const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(
-    {
-      ...createTestDeps(config),
-      ...overrides,
-    },
-    db,
-  );
+  return new LcmContextEngine({
+    ...createTestDeps(config),
+    ...overrides,
+  });
 }
 
 function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
   const config = createTestConfig(databasePath);
-  const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new LcmContextEngine(createTestDeps(config));
 }
 
 function createSessionFilePath(name: string): string {
@@ -145,8 +145,7 @@ function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine
     ...createTestConfig(join(tempDir, "lcm.db")),
     ...overrides,
   };
-  const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new LcmContextEngine(createTestDeps(config));
 }
 
 function createEngineWithDeps(
@@ -159,8 +158,7 @@ function createEngineWithDeps(
     ...createTestConfig(join(tempDir, "lcm.db")),
     ...configOverrides,
   };
-  const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config, depOverrides), db);
+  return new LcmContextEngine(createTestDeps(config, depOverrides));
 }
 
 async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
@@ -762,12 +760,11 @@ describe("LcmContextEngine delegated session continuity", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
     tempDirs.push(tempDir);
     const config = createTestConfig(join(tempDir, "lcm.db"));
-    const db = createLcmDatabaseConnection(config.databasePath);
     const deps = createTestDeps(config);
     deps.resolveSessionIdFromSessionKey = vi.fn(async () => "uuid-after-reset");
-    const engine = new LcmContextEngine(deps, db);
+    const engine = new LcmContextEngine(deps);
 
-    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    await (engine as unknown as { ensureMigrated(): Promise<void> }).ensureMigrated();
     await engine
       .getConversationStore()
       .getOrCreateConversation("uuid-before-reset", { sessionKey: "agent:main:main" });

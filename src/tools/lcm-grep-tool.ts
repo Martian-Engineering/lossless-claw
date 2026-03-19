@@ -1,37 +1,24 @@
 import { Type } from "@sinclair/typebox";
+import { formatTimestamp } from "../compaction.js";
 import type { LcmContextEngine } from "../engine.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
-import { formatTimestamp } from "../compaction.js";
+
 
 const MAX_RESULT_CHARS = 40_000; // ~10k tokens
-
-function formatDisplayTime(
-  value: Date | string | number | null | undefined,
-  timezone: string,
-): string {
-  if (value == null) {
-    return "-";
-  }
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "-";
-  }
-  return formatTimestamp(date, timezone);
-}
 
 const LcmGrepSchema = Type.Object({
   pattern: Type.String({
     description:
-      "Search pattern. Interpreted as regex when mode is 'regex', or as a text query for 'full_text' mode.",
+      "Search pattern. Interpreted as regex when mode is 'regex', as a text query for 'full_text' mode, or as a natural language query for 'semantic' mode.",
   }),
   mode: Type.Optional(
     Type.String({
       description:
-        'Search mode: "regex" for regular expression matching, "full_text" for text search. Default: "regex".',
-      enum: ["regex", "full_text"],
+        'Search mode: "regex" for regular expression matching, "full_text" for text search, "semantic" for embedding-based similarity search, "recency_boosted" for semantic search weighted toward recent results. Default: "regex".',
+      enum: ["regex", "full_text", "semantic", "recency_boosted"],
     }),
   ),
   scope: Type.Optional(
@@ -90,19 +77,19 @@ export function createLcmGrepTool(input: {
     name: "lcm_grep",
     label: "LCM Grep",
     description:
-      "Search compacted conversation history using regex or full-text search. " +
+      "Search compacted conversation history using regex, full-text, or semantic search. " +
       "Searches across messages and/or summaries stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
       "active context. Returns matching snippets with their summary/message IDs " +
       "for follow-up with lcm_expand or lcm_describe.",
+
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
       const retrieval = input.lcm.getRetrieval();
       const timezone = input.lcm.timezone;
-
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
-      const mode = (p.mode as "regex" | "full_text") ?? "regex";
+      const mode = (p.mode as "regex" | "full_text" | "semantic" | "recency_boosted") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
       let since: Date | undefined;
@@ -134,6 +121,10 @@ export function createLcmGrepTool(input: {
         });
       }
 
+      // Pass the caller's agent identity so search results
+      // from this agent's conversations get a ranking boost.
+      const callerAgentId = input.lcm.getInstanceId();
+
       const result = await retrieval.grep({
         query: pattern,
         mode,
@@ -142,6 +133,7 @@ export function createLcmGrepTool(input: {
         limit,
         since,
         before,
+        callerAgentId,
       });
 
       const lines: string[] = [];
@@ -155,8 +147,8 @@ export function createLcmGrepTool(input: {
       }
       if (since || before) {
         lines.push(
-          `**Time filter:** ${since ? `since ${formatDisplayTime(since, timezone)}` : "since -∞"} | ${
-            before ? `before ${formatDisplayTime(before, timezone)}` : "before +∞"
+          `**Time filter:** ${since ? `since ${formatTimestamp(since, timezone)}` : "since -∞"} | ${
+            before ? `before ${formatTimestamp(before, timezone)}` : "before +∞"
           }`,
         );
       }
@@ -170,7 +162,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const msg of result.messages) {
           const snippet = truncateSnippet(msg.snippet);
-          const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatDisplayTime(msg.createdAt, timezone)}): ${snippet}`;
+          const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatTimestamp(msg.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
@@ -186,7 +178,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const sum of result.summaries) {
           const snippet = truncateSnippet(sum.snippet);
-          const line = `- [${sum.summaryId}] (${sum.kind}, ${formatDisplayTime(sum.createdAt, timezone)}): ${snippet}`;
+          const line = `- [${sum.summaryId}] (${sum.kind}, ${formatTimestamp(sum.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
