@@ -2713,6 +2713,40 @@ describe("LCM integration: media message annotation in compaction", () => {
     expect(summarizedText).toContain("[with media attachment]");
   });
 
+  it("preserves short captions when a message also has a media attachment", async () => {
+    const msgs = await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) =>
+        i === 2 ? "Look at this!" : `Analysis ${i}: ${"y".repeat(200)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    await convStore.createMessageParts(msgs[2].messageId, [
+      {
+        sessionId: "test-session",
+        partType: "file",
+        ordinal: 0,
+        textContent: null,
+        metadata: JSON.stringify({ filename: "chart.png" }),
+      },
+    ]);
+
+    let summarizedText = "";
+    const summarize = vi.fn(async (text: string) => {
+      summarizedText = text;
+      return `Summary: ${text.substring(0, 100)}`;
+    });
+
+    await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(summarizedText).toContain("Look at this! [with media attachment]");
+    expect(summarizedText).not.toContain("[Media attachment]");
+  });
+
   it("leaves text-only messages unchanged even with many tokens", async () => {
     const msgs = await ingestMessages(convStore, sumStore, 8, {
       contentFn: (i) => `Pure text message ${i}: ${"z".repeat(200)}`,

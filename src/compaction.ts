@@ -150,12 +150,6 @@ const DEFAULT_LEAF_CHUNK_TOKENS = 20_000;
  */
 const MEDIA_PATH_RE = /^MEDIA:\/.+$/;
 
-/**
- * Minimum character count of actual text content (after stripping MEDIA: paths)
- * below which a message is considered "media-only" and its content is replaced
- * with a descriptive annotation rather than the raw file path.
- */
-const MEDIA_ONLY_TEXT_THRESHOLD = 20;
 const CONDENSED_MIN_INPUT_RATIO = 0.1;
 
 function dedupeOrderedIds(ids: Iterable<string>): string[] {
@@ -1057,7 +1051,7 @@ export class CompactionEngine {
    *
    * - Media-only messages (just a file path, no text): content is replaced
    *   with "[Media attachment]" or "[Image attachment]" etc.
-   * - Media-mostly messages (short text + attachment): content is annotated
+   * - Media-mostly messages (any real text + attachment): content is annotated
    *   with " [with media attachment]" suffix.
    * - Text-only messages: returned unchanged.
    */
@@ -1080,7 +1074,7 @@ export class CompactionEngine {
       .join("\n")
       .trim();
 
-    if (textWithoutPaths.length < MEDIA_ONLY_TEXT_THRESHOLD) {
+    if (textWithoutPaths.length === 0) {
       // Media-only: replace with descriptive annotation
       return "[Media attachment]";
     }
