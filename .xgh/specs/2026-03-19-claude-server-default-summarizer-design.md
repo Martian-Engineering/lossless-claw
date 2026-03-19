@@ -61,13 +61,15 @@ interface ProxyManager {
 ```
 
 **Startup sequence:**
-1. Check if the PID file (`~/.claude/lcm-proxy.pid`) exists and the recorded process is alive:
+1. Check if the PID file (`~/.lossless-claude/lcm-proxy.pid`) exists and the recorded process is alive:
    - If alive: skip spawn, reuse existing process
    - If stale PID: delete file, proceed to spawn
+   - If port is occupied by a foreign process (health check returns wrong or no `{"service":"claude-server"}`): treat as startup failure — log port conflict warning, mark unavailable, proceed without summarization
 2. Spawn `claude-server` as child process (`stdio: 'pipe'`), write PID to `~/.claude/lcm-proxy.pid`
 3. Poll `GET /health` every 500ms up to `startupTimeoutMs` — validate response contains `{"service":"claude-server"}` to confirm identity (not just any HTTP server on the port)
 4. If timeout or wrong service: kill child, mark unavailable, log actionable error, proceed without summarization
-5. Register `process.on('SIGTERM')`, `process.on('SIGINT')` to send SIGTERM to child and await graceful shutdown; register `process.on('exit')` as final synchronous kill fallback
+5. Write PID to `~/.lossless-claude/lcm-proxy.pid` (same directory as daemon socket for consistency)
+6. Register `process.on('SIGTERM')`, `process.on('SIGINT')` to send SIGTERM to child and await graceful shutdown; register `process.on('exit')` as final synchronous kill fallback; delete PID file on stop
 
 **Health monitoring (after startup):**
 - Ping `/health` every 30s, validate `{"service":"claude-server"}` identity
@@ -126,7 +128,23 @@ llm: {
 
 ### Env var override
 
-`LCM_SUMMARY_PROVIDER` already maps to `config.llm.provider` in the existing env-var resolution block in `loadDaemonConfig`. Add `"claude-cli"` as a valid value there. When `LCM_SUMMARY_PROVIDER=anthropic`, `claudeCliProxy.enabled` is automatically set to `false` (proxy not started).
+`LCM_SUMMARY_PROVIDER` does **not** exist yet — this is new work. Add env-var resolution to `loadDaemonConfig`:
+
+```typescript
+if (process.env.LCM_SUMMARY_PROVIDER) {
+  config.llm.provider = process.env.LCM_SUMMARY_PROVIDER as LlmProvider;
+}
+```
+
+When `LCM_SUMMARY_PROVIDER=anthropic` (or any non-`claude-cli` value), also set `config.claudeCliProxy.enabled = false` so the proxy is never started.
+
+### Contradictory config (`provider: "claude-cli"` + `claudeCliProxy.enabled: false`)
+
+If a user explicitly sets `provider: "claude-cli"` but `claudeCliProxy.enabled: false`, `loadDaemonConfig` should treat this as summarization disabled: log a warning and set `provider` to `undefined` (or a sentinel that causes `compact.ts` to skip summarization). The proxy is never started, and no localhost baseURL is written.
+
+### `llm.apiKey` optionality
+
+The current `DaemonConfig` type has `apiKey: string` (required). Changing to `apiKey?: string` is a breaking type change — all callsites referencing `config.llm.apiKey` must be updated to use optional chaining (`config.llm.apiKey?.`) or a fallback. This is required work for the implementation.
 
 ---
 
