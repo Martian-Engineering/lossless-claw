@@ -1,4 +1,13 @@
 const RAW_TERM_RE = /"([^"]+)"|(\S+)/g;
+
+/**
+ * Detect whether a query contains CJK characters that FTS5 unicode61
+ * tokenizer cannot index properly.
+ */
+const CJK_RE = /[\u2E80-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\uAC00-\uD7AF\u3040-\u309F\u30A0-\u30FF]/;
+export function containsCjk(text: string): boolean {
+  return CJK_RE.test(text);
+}
 const EDGE_PUNCTUATION_RE = /^[`'"()[\]{}<>.,:;!?*_+=|\\/-]+|[`'"()[\]{}<>.,:;!?*_+=|\\/-]+$/g;
 
 export type LikeSearchPlan = {

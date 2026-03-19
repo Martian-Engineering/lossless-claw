@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
-import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
+import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -624,13 +624,23 @@ export class ConversationStore {
     if (input.mode === "full_text") {
       if (this.fts5Available) {
         try {
-          return this.searchFullText(
+          const results = this.searchFullText(
             input.query,
             limit,
             input.conversationId,
             input.since,
             input.before,
           );
+          if (results.length === 0 && containsCjk(input.query)) {
+            return this.searchLike(
+              input.query,
+              limit,
+              input.conversationId,
+              input.since,
+              input.before,
+            );
+          }
+          return results;
         } catch {
           return this.searchLike(
             input.query,

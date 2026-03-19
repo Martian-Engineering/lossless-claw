@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
-import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
+import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -702,13 +702,23 @@ export class SummaryStore {
     if (input.mode === "full_text") {
       if (this.fts5Available) {
         try {
-          return this.searchFullText(
+          const results = this.searchFullText(
             input.query,
             limit,
             input.conversationId,
             input.since,
             input.before,
           );
+          if (results.length === 0 && containsCjk(input.query)) {
+            return this.searchLike(
+              input.query,
+              limit,
+              input.conversationId,
+              input.since,
+              input.before,
+            );
+          }
+          return results;
         } catch {
           return this.searchLike(
             input.query,
