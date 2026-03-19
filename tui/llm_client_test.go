@@ -82,6 +82,7 @@ func TestSummarizeOpenAISucceedsWithOutputText(t *testing.T) {
 		provider: "openai",
 		apiKey:   "test-openai-key",
 		model:    "gpt-5.3-codex",
+		baseURL:  "https://api.openai.com",
 		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.URL.String() != "https://api.openai.com/v1/responses" {
 				t.Fatalf("unexpected URL: %s", req.URL.String())
@@ -248,19 +249,20 @@ func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
 	}
 }
 
-func TestSummarizeAnthropicRegularKeyHitsDirectAPI(t *testing.T) {
-	var capturedURL string
+func TestSummarizeOpenAICustomBaseURL(t *testing.T) {
+	customBase := "https://proxy.example.com/openai"
 	client := &anthropicClient{
-		provider: "anthropic",
-		apiKey:   "sk-ant-api03-regular-key",
-		model:    anthropicModel,
+		provider: "openai",
+		apiKey:   "test-openai-key",
+		model:    "gpt-5.3-codex",
+		baseURL:  customBase,
 		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			capturedURL = req.URL.String()
-			if got := req.Header.Get("x-api-key"); got != "sk-ant-api03-regular-key" {
-				t.Fatalf("expected x-api-key header, got %q", got)
+			expectedURL := customBase + "/v1/responses"
+			if req.URL.String() != expectedURL {
+				t.Fatalf("expected URL %s, got %s", expectedURL, req.URL.String())
 			}
 			return jsonResponse(200, `{
-				"content":[{"type":"text","text":"Direct API response."}]
+				"output":[{"type":"message","content":[{"type":"output_text","text":"proxied response"}]}]
 			}`), nil
 		})},
 	}
@@ -269,10 +271,7 @@ func TestSummarizeAnthropicRegularKeyHitsDirectAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("summarize returned error: %v", err)
 	}
-	if capturedURL != "https://api.anthropic.com/v1/messages" {
-		t.Fatalf("expected direct API URL, got %q", capturedURL)
-	}
-	if summary != "Direct API response." {
+	if summary != "proxied response" {
 		t.Fatalf("unexpected summary: %q", summary)
 	}
 }
@@ -370,4 +369,60 @@ func containsArgPair(args []string, flag, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestSummarizeAnthropicCustomBaseURL(t *testing.T) {
+	customBase := "https://proxy.example.com/anthropic"
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "test-anthropic-key",
+		model:    "claude-sonnet-4-20250514",
+		baseURL:  customBase,
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			expectedURL := customBase + "/v1/messages"
+			if req.URL.String() != expectedURL {
+				t.Fatalf("expected URL %s, got %s", expectedURL, req.URL.String())
+			}
+			return jsonResponse(200, `{
+				"content":[{"type":"text","text":"proxied anthropic response"}]
+			}`), nil
+		})},
+	}
+
+	summary, err := client.summarize(context.Background(), "prompt", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
+	if summary != "proxied anthropic response" {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
+func TestSummarizeAnthropicRegularKeyHitsDirectAPI(t *testing.T) {
+	var capturedURL string
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "sk-ant-api03-regular-key",
+		model:    anthropicModel,
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			capturedURL = req.URL.String()
+			if got := req.Header.Get("x-api-key"); got != "sk-ant-api03-regular-key" {
+				t.Fatalf("expected x-api-key header, got %q", got)
+			}
+			return jsonResponse(200, `{
+				"content":[{"type":"text","text":"Direct API response."}]
+			}`), nil
+		})},
+	}
+
+	summary, err := client.summarize(context.Background(), "prompt", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
+	if capturedURL != "https://api.anthropic.com/v1/messages" {
+		t.Fatalf("expected direct API URL, got %q", capturedURL)
+	}
+	if summary != "Direct API response." {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
 }

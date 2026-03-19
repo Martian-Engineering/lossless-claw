@@ -37,6 +37,7 @@ type backfillOptions struct {
 	promptDir            string
 	provider             string
 	model                string
+	baseURL              string
 }
 
 type backfillMessage struct {
@@ -186,6 +187,7 @@ func runBackfillCommand(args []string) error {
 		apiKey:   apiKey,
 		http:     &http.Client{Timeout: defaultHTTPTimeout},
 		model:    opts.model,
+		baseURL:  resolveProviderBaseURL(paths, opts.provider, opts.baseURL),
 	}
 
 	result, stats, err := runBackfillWorkflow(ctx, db, opts, input, client.summarize)
@@ -282,6 +284,7 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 	promptDir := fs.String("prompt-dir", "", "custom prompt template directory")
 	provider := fs.String("provider", "", "provider id (e.g. anthropic, openai)")
 	model := fs.String("model", "", "summary model id")
+	baseURL := fs.String("base-url", "", "custom API base URL")
 
 	normalized, err := normalizeBackfillArgs(args)
 	if err != nil {
@@ -314,6 +317,7 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 		promptDir:            strings.TrimSpace(*promptDir),
 		provider:             strings.TrimSpace(*provider),
 		model:                strings.TrimSpace(*model),
+		baseURL:              strings.TrimSpace(*baseURL),
 	}
 	if opts.apply {
 		opts.dryRun = false
@@ -372,6 +376,7 @@ func normalizeBackfillArgs(args []string) ([]string, error) {
 		"--prompt-dir":              true,
 		"--provider":                true,
 		"--model":                   true,
+		"--base-url":                true,
 	}
 
 	for i := 0; i < len(args); i++ {
@@ -419,6 +424,7 @@ Flags:
   --prompt-dir <path>          custom prompt template directory
   --provider <id>              API provider (inferred from model when omitted)
   --model <id>                 API model (default: provider-specific)
+  --base-url <url>             custom API base URL (overrides openclaw.json and env)
 `)
 }
 

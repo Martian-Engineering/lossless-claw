@@ -85,6 +85,7 @@ type rewriteState struct {
 	provider        string
 	apiKey          string
 	model           string
+	baseURL         string
 	err             error
 }
 
@@ -1200,7 +1201,7 @@ func (m *model) advanceSubtreeQueue() {
 		return
 	}
 
-	provider, model := resolveInteractiveRewriteProviderModel()
+	provider, model, baseURL := resolveInteractiveRewriteProviderModel(m.paths)
 	apiKey, err := resolveProviderAPIKey(m.paths, provider)
 	if err != nil {
 		m.status = "Error: " + err.Error()
@@ -1225,6 +1226,7 @@ func (m *model) advanceSubtreeQueue() {
 		provider:        provider,
 		apiKey:          apiKey,
 		model:           model,
+		baseURL:         baseURL,
 	}
 	m.status = fmt.Sprintf("Subtree rewrite [%d/%d]: %s (d%d)", progress, m.subtreeTotal, item.summaryID, item.depth)
 }
@@ -1291,7 +1293,7 @@ func (m *model) startPendingRewrite() {
 		return
 	}
 
-	provider, model := resolveInteractiveRewriteProviderModel()
+	provider, model, baseURL := resolveInteractiveRewriteProviderModel(m.paths)
 	apiKey, err := resolveProviderAPIKey(m.paths, provider)
 	if err != nil {
 		m.status = "Error: " + err.Error()
@@ -1315,6 +1317,7 @@ func (m *model) startPendingRewrite() {
 		provider:        provider,
 		apiKey:          apiKey,
 		model:           model,
+		baseURL:         baseURL,
 	}
 	m.status = fmt.Sprintf("Ready to rewrite %s", summaryID)
 }
@@ -1330,6 +1333,7 @@ func (m model) startPendingRewriteAPI() tea.Cmd {
 			apiKey:   pending.apiKey,
 			http:     &http.Client{Timeout: defaultHTTPTimeout},
 			model:    pending.model,
+			baseURL:  pending.baseURL,
 		}
 		content, err := client.summarize(context.Background(), pending.prompt, pending.targetTokens)
 		if err != nil {
@@ -1343,7 +1347,7 @@ func (m model) startPendingRewriteAPI() tea.Cmd {
 	}
 }
 
-func resolveInteractiveRewriteProviderModel() (string, string) {
+func resolveInteractiveRewriteProviderModel(paths appDataPaths) (string, string, string) {
 	provider := strings.TrimSpace(os.Getenv("LCM_TUI_SUMMARY_PROVIDER"))
 	if provider == "" {
 		provider = strings.TrimSpace(os.Getenv("LCM_SUMMARY_PROVIDER"))
@@ -1353,7 +1357,10 @@ func resolveInteractiveRewriteProviderModel() (string, string) {
 	if model == "" {
 		model = strings.TrimSpace(os.Getenv("LCM_SUMMARY_MODEL"))
 	}
-	return resolveSummaryProviderModel(provider, model)
+	resolvedProvider, resolvedModel := resolveSummaryProviderModel(provider, model)
+	baseURL := strings.TrimSpace(os.Getenv("LCM_TUI_SUMMARY_BASE_URL"))
+	baseURL = resolveProviderBaseURL(paths, resolvedProvider, baseURL)
+	return resolvedProvider, resolvedModel, baseURL
 }
 
 func rewriteSpinnerTickCmd() tea.Cmd {
