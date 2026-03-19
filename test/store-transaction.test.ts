@@ -7,7 +7,7 @@
  * - Concurrent operations on shared store singletons don't cross-contaminate
  * - Nested withTransaction calls reuse the existing transaction
  * - withClient scopes queries to the provided client
- * - withSharedTransaction exposes the txClient for cross-store use
+ * - withTransactionClient exposes the txClient for cross-store use
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -187,8 +187,8 @@ describe("SummaryStore transaction safety", () => {
 
     const conv = await convStore.createConversation({ sessionId: "client-scope" });
 
-    // Use withSharedTransaction to get a txClient, pass to sumStore via withClient
-    await convStore.withSharedTransaction(async (txClient) => {
+    // Use withTransactionClient to get a txClient, pass to sumStore via withClient
+    await convStore.withTransactionClient(async (txClient) => {
       await sumStore.withClient(txClient, async () => {
         await sumStore.insertSummary({
           summaryId: "sum_shared_001",
@@ -206,7 +206,7 @@ describe("SummaryStore transaction safety", () => {
   });
 });
 
-describe("ConversationStore withSharedTransaction", () => {
+describe("ConversationStore withTransactionClient", () => {
   it("exposes txClient to callback for cross-store use", async () => {
     const { db, features } = setupTestDb();
     const convStore = new ConversationStore(db, {
@@ -219,7 +219,7 @@ describe("ConversationStore withSharedTransaction", () => {
     });
 
     // Create conversation + summary in a single shared transaction
-    const conv = await convStore.withSharedTransaction(async (txClient) => {
+    const conv = await convStore.withTransactionClient(async (txClient) => {
       const c = await convStore.createConversation({ sessionId: "shared-txn" });
       await sumStore.withClient(txClient, async () => {
         await sumStore.insertSummary({
@@ -253,7 +253,7 @@ describe("ConversationStore withSharedTransaction", () => {
     const conv = await convStore.createConversation({ sessionId: "rollback-both" });
 
     try {
-      await convStore.withSharedTransaction(async (txClient) => {
+      await convStore.withTransactionClient(async (txClient) => {
         await convStore.createMessage({
           conversationId: conv.conversationId,
           seq: 1,
