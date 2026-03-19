@@ -20,18 +20,26 @@ export const JUST_COMPACTED_TTL_MS = 30_000;
 
 export function createCompactHandler(config: DaemonConfig): RouteHandler {
   const summarize =
-    config.llm.provider === "openai"
-      ? createOpenAISummarizer({
-          model: config.llm.model,
-          baseURL: config.llm.baseURL,
-          apiKey: config.llm.apiKey,
-        })
-      : createAnthropicSummarizer({
-          model: config.llm.model,
-          apiKey: config.llm.apiKey,
-        });
+    config.llm.provider === "disabled"
+      ? null
+      : config.llm.provider === "openai"
+        ? createOpenAISummarizer({
+            model: config.llm.model,
+            baseURL: config.llm.baseURL,
+            apiKey: config.llm.apiKey,
+          })
+        : createAnthropicSummarizer({
+            model: config.llm.model,
+            apiKey: config.llm.apiKey ?? "",
+          });
 
   return async (_req, res, body) => {
+    // When summarization is disabled, return early with informative message
+    if (!summarize) {
+      sendJson(res, 200, { summary: "Summarization disabled — no summarizer configured." });
+      return;
+    }
+
     const input = JSON.parse(body || "{}");
     const { session_id, cwd, transcript_path } = input;
 
