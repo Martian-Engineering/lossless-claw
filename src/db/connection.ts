@@ -1,121 +1,146 @@
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { mkdirSync } from "fs";
+import { dirname } from "path";
+import type { DbClient } from "./db-interface.js";
+import { SqliteClient } from "./sqlite-client.js";
+import { PostgresClient } from "./postgres-client.js";
+import type { LcmConfig } from "./config.js";
 
-type ConnectionKey = string;
+type SqliteConnectionEntry = {
+  db: DatabaseSync;
+  client: SqliteClient;
+  refs: number;
+};
 
-const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
-const connectionIndex = new Map<DatabaseSync, ConnectionKey>();
+type PostgresConnectionEntry = {
+  client: PostgresClient;
+  refs: number;
+};
 
-function isInMemoryPath(dbPath: string): boolean {
-  const normalized = dbPath.trim();
-  return normalized === ":memory:" || normalized.startsWith("file::memory:");
-}
+type ConnectionEntry = SqliteConnectionEntry | PostgresConnectionEntry;
 
-function normalizePath(dbPath: string): ConnectionKey {
-  if (isInMemoryPath(dbPath)) {
-    const trimmed = dbPath.trim();
-    return trimmed.length > 0 ? trimmed : ":memory:";
-  }
-  return resolve(dbPath);
-}
+const _connections = new Map<string, ConnectionEntry>();
 
-function ensureDbDirectory(dbPath: string): void {
-  if (isInMemoryPath(dbPath)) {
-    return;
-  }
-  mkdirSync(dirname(dbPath), { recursive: true });
-}
-
-function configureConnection(db: DatabaseSync): DatabaseSync {
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA foreign_keys = ON");
-  return db;
-}
-
-function trackConnection(dbPath: string, db: DatabaseSync): void {
-  const key = normalizePath(dbPath);
-  let entries = connectionsByPath.get(key);
-  if (!entries) {
-    entries = new Set();
-    connectionsByPath.set(key, entries);
-  }
-  entries.add(db);
-  connectionIndex.set(db, key);
-}
-
-function untrackConnection(db: DatabaseSync): void {
-  const key = connectionIndex.get(db);
-  if (!key) {
-    return;
-  }
-  const entries = connectionsByPath.get(key);
-  if (entries) {
-    entries.delete(db);
-    if (entries.size === 0) {
-      connectionsByPath.delete(key);
-    }
-  }
-  connectionIndex.delete(db);
-}
-
-function closeDatabase(db: DatabaseSync | undefined): void {
-  if (!db) {
-    return;
-  }
+function isConnectionHealthy(entry: ConnectionEntry): boolean {
   try {
-    db.close();
+    if ("db" in entry) {
+      // SQLite connection health check
+      entry.db.prepare("SELECT 1").get();
+      return true;
+    } else {
+      // PostgreSQL connection health is checked by the pool internally
+      return true;
+    }
   } catch {
-    // Ignore close failures; callers are shutting down anyway.
-  } finally {
-    untrackConnection(db);
+    return false;
   }
 }
 
-/**
- * Create a new SQLite connection for the given LCM database path.
- *
- * Connections are tracked so tests can close them by path via closeLcmConnection().
- */
-export function createLcmDatabaseConnection(dbPath: string): DatabaseSync {
-  ensureDbDirectory(dbPath);
-  const db = configureConnection(new DatabaseSync(dbPath));
-  trackConnection(dbPath, db);
-  return db;
+async function forceCloseConnection(entry: ConnectionEntry): Promise<void> {
+  try {
+    if ("db" in entry) {
+      entry.db.close();
+    } else {
+      await entry.client.close();
+    }
+  } catch {
+    // Ignore close failures; caller is already replacing/removing this handle.
+  }
 }
 
-/**
- * Close tracked LCM connections.
- *
- * When a DatabaseSync instance is supplied, only that handle is closed.
- * When a path is supplied, all handles associated with the normalized path
- * are closed. When called with no arguments, all tracked connections are
- * closed. Intended primarily for tests.
- */
-export function closeLcmConnection(target?: string | DatabaseSync): void {
-  if (target && typeof target !== "string") {
-    closeDatabase(target);
+export function createLcmConnection(config: LcmConfig): DbClient {
+  if (config.backend === 'postgres') {
+    if (!config.connectionString) {
+      throw new Error("LCM backend is 'postgres' but connectionString is missing.");
+    }
+    return createPostgresConnection(config.connectionString);
+  }
+  // backend === 'sqlite'
+  return createSqliteConnection(config.databasePath);
+}
+
+function createSqliteConnection(dbPath: string): DbClient {
+  const existing = _connections.get(dbPath);
+  if (existing && "db" in existing) {
+    if (isConnectionHealthy(existing)) {
+      existing.refs += 1;
+      return existing.client;
+    }
+    forceCloseConnection(existing);
+    _connections.delete(dbPath);
+  }
+
+  // Ensure parent directory exists
+  mkdirSync(dirname(dbPath), { recursive: true });
+
+  const db = new DatabaseSync(dbPath);
+
+  // Enable WAL mode for better concurrent read performance
+  db.exec("PRAGMA journal_mode = WAL");
+  // Enable foreign key enforcement
+  db.exec("PRAGMA foreign_keys = ON");
+
+  const client = new SqliteClient(db);
+  _connections.set(dbPath, { db, client, refs: 1 });
+  return client;
+}
+
+function createPostgresConnection(connectionString: string): DbClient {
+  const existing = _connections.get(connectionString);
+  if (existing && !("db" in existing)) {
+    if (isConnectionHealthy(existing)) {
+      existing.refs += 1;
+      return existing.client;
+    }
+    forceCloseConnection(existing);
+    _connections.delete(connectionString);
+  }
+
+  const client = new PostgresClient(connectionString);
+  _connections.set(connectionString, { client, refs: 1 });
+  return client;
+}
+
+export async function closeLcmConnection(key?: string | DatabaseSync): Promise<void> {
+  // Handle raw DatabaseSync instance (used by tests to close standalone handles)
+  if (key && typeof key === "object" && typeof (key as DatabaseSync).close === "function") {
+    try {
+      (key as DatabaseSync).close();
+    } catch {
+      // Already closed or invalid — ignore
+    }
     return;
   }
-
-  if (typeof target === "string") {
-    const key = normalizePath(target);
-    const entries = connectionsByPath.get(key);
-    if (!entries) {
+  if (typeof key === "string" && key.trim()) {
+    const entry = _connections.get(key);
+    if (!entry) {
       return;
     }
-    for (const db of [...entries]) {
-      closeDatabase(db);
+    entry.refs = Math.max(0, entry.refs - 1);
+    if (entry.refs === 0) {
+      await forceCloseConnection(entry);
+      _connections.delete(key);
     }
-    connectionsByPath.delete(key);
     return;
   }
 
-  for (const db of [...connectionIndex.keys()]) {
-    closeDatabase(db);
+  for (const entry of _connections.values()) {
+    await forceCloseConnection(entry);
   }
-  connectionsByPath.clear();
-  connectionIndex.clear();
+  _connections.clear();
 }
 
-export const getLcmConnection = createLcmDatabaseConnection;
+/**
+ * Returns a raw SQLite DatabaseSync handle for migration code and tests.
+ * Creates a FRESH connection not tracked in the pool, so closing it
+ * won't affect the engine's pooled connection.
+ * Only works when backend is sqlite. Throws for postgres.
+ */
+export { getLcmConnection as createLcmDatabaseConnection };
+export function getLcmConnection(dbPath: string): DatabaseSync {
+  mkdirSync(dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA busy_timeout = 5000");
+  return db;
+}
