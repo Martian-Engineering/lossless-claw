@@ -39,12 +39,17 @@ const DIAGNOSTIC_SENSITIVE_KEY_PATTERN =
  */
 const SUMMARIZER_TIMEOUT_MS = 60_000;
 
+/** Error used to distinguish summarizer timeouts from provider failures. */
+class SummarizerTimeoutError extends Error {
+  constructor(ms: number, label: string) {
+    super(`[lcm] summarizer timeout after ${ms}ms (${label})`);
+    this.name = "SummarizerTimeoutError";
+  }
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`[lcm] summarizer timeout after ${ms}ms (${label})`)),
-      ms,
-    );
+    const timer = setTimeout(() => reject(new SummarizerTimeoutError(ms, label)), ms);
     promise.then(
       (val) => { clearTimeout(timer); resolve(val); },
       (err) => { clearTimeout(timer); reject(err); },
@@ -839,6 +844,12 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       console.warn(
         `[lcm] summarizer ${isTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${SUMMARIZER_TIMEOUT_MS}ms; error=${errMsg}`,
       );
+      if (err instanceof SummarizerTimeoutError) {
+        console.error(
+          `[lcm] summarizer timed out; provider=${provider}; model=${model}; source=fallback`,
+        );
+        return buildDeterministicFallbackSummary(text, targetTokens);
+      }
       return "";
     }
 

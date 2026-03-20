@@ -407,6 +407,67 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(summary).toContain("[LCM fallback summary; truncated for context management]");
   });
 
+  it("falls back deterministically when the initial summarizer call times out", async () => {
+    vi.useFakeTimers();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const deps = makeDeps({
+        complete: vi.fn(
+          () =>
+            new Promise(() => {
+              // Intentionally unresolved to exercise the timeout fallback path.
+            }),
+        ),
+      });
+
+      const summarize = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: {
+          provider: "anthropic",
+          model: "claude-opus-4-5",
+        },
+      });
+
+      const summaryPromise = summarize!("A".repeat(12_000), false);
+      await vi.advanceTimersByTimeAsync(60_000);
+      const summary = await summaryPromise;
+
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+      expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+      expect(vi.getTimerCount()).toBe(0);
+
+      const diagnostics = consoleError.mock.calls
+        .flatMap((call) => call.map((entry) => String(entry)))
+        .join(" ");
+      expect(diagnostics).toContain("summarizer timeout after 60000ms (initial)");
+      expect(diagnostics).toContain("source=fallback");
+    } finally {
+      consoleError.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the summarizer timeout timer after a successful completion", async () => {
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps();
+      const summarize = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: {
+          provider: "anthropic",
+          model: "claude-opus-4-5",
+        },
+      });
+
+      const summary = await summarize!("Summary input", false);
+
+      expect(summary).toBe("summary output");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("normalizes OpenAI output_text and reasoning summary blocks", async () => {
     const deps = makeDeps({
       resolveModel: vi.fn(() => ({
