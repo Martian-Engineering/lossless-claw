@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline";
+import { SessionManager } from "@mariozechner/pi-coding-agent";
 import type {
   ContextEngine,
   ContextEngineInfo,
@@ -16,7 +17,14 @@ import type {
   SubagentEndReason,
   SubagentSpawnPreparation,
 } from "openclaw/plugin-sdk";
-import { blockFromPart, ContextAssembler } from "./assembler.js";
+import {
+  blockFromPart,
+  contentFromParts,
+  ContextAssembler,
+  pickToolCallId,
+  pickToolIsError,
+  pickToolName,
+} from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
@@ -54,6 +62,26 @@ type CircuitBreakerState = {
   failures: number;
   openSince: number | null;
 };
+type TranscriptRewriteReplacement = {
+  entryId: string;
+  message: AgentMessage;
+};
+type TranscriptRewriteRequest = {
+  replacements: TranscriptRewriteReplacement[];
+};
+type ContextEngineMaintenanceResult = {
+  changed: boolean;
+  bytesFreed: number;
+  rewrittenEntries: number;
+  reason?: string;
+};
+type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
+  rewriteTranscriptEntries?: (
+    request: TranscriptRewriteRequest,
+  ) => Promise<ContextEngineMaintenanceResult>;
+};
+
+const TRANSCRIPT_GC_BATCH_SIZE = 12;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -79,6 +107,71 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function safeBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+function extractTranscriptToolCallId(message: AgentMessage): string | undefined {
+  const topLevel = message as Record<string, unknown>;
+  const direct =
+    safeString(topLevel.toolCallId) ??
+    safeString(topLevel.tool_call_id) ??
+    safeString(topLevel.toolUseId) ??
+    safeString(topLevel.tool_use_id) ??
+    safeString(topLevel.call_id) ??
+    safeString(topLevel.id);
+  if (direct) {
+    return direct;
+  }
+
+  if (!Array.isArray(topLevel.content)) {
+    return undefined;
+  }
+
+  for (const item of topLevel.content) {
+    const record = asRecord(item);
+    if (!record) {
+      continue;
+    }
+    const nested =
+      safeString(record.toolCallId) ??
+      safeString(record.tool_call_id) ??
+      safeString(record.toolUseId) ??
+      safeString(record.tool_use_id) ??
+      safeString(record.call_id) ??
+      safeString(record.id);
+    if (nested) {
+      return nested;
+    }
+  }
+
+  return undefined;
+}
+
+function listTranscriptToolResultEntryIdsByCallId(sessionFile: string): Map<string, string> {
+  const sessionManager = SessionManager.open(sessionFile);
+  const branch = sessionManager.getBranch();
+  const entryIdsByCallId = new Map<string, string>();
+  const duplicateCallIds = new Set<string>();
+
+  for (const entry of branch) {
+    if (entry.type !== "message" || entry.message.role !== "toolResult") {
+      continue;
+    }
+    const toolCallId = extractTranscriptToolCallId(entry.message as AgentMessage);
+    if (!toolCallId) {
+      continue;
+    }
+    if (entryIdsByCallId.has(toolCallId)) {
+      duplicateCallIds.add(toolCallId);
+      continue;
+    }
+    entryIdsByCallId.set(toolCallId, entry.id);
+  }
+
+  for (const duplicateCallId of duplicateCallIds) {
+    entryIdsByCallId.delete(duplicateCallId);
+  }
+
+  return entryIdsByCallId;
 }
 
 function appendTextValue(value: unknown, out: string[]): void {
@@ -2175,7 +2268,145 @@ export class LcmContextEngine implements ContextEngine {
 
     return batch.slice(storedMessageCount);
   }
+  /**
+   * Rebuild a compact tool-result message from stored message parts.
+   *
+   * The first transcript-GC pass only rewrites tool results that were already
+   * externalized into large_files during ingest, so the stored placeholder is
+   * the canonical replacement content.
+   */
+  private async buildTranscriptGcReplacementMessage(
+    messageId: number,
+  ): Promise<AgentMessage | null> {
+    const message = await this.conversationStore.getMessageById(messageId);
+    if (!message) {
+      return null;
+    }
 
+    const parts = await this.conversationStore.getMessageParts(messageId);
+    const toolCallId = pickToolCallId(parts);
+    if (!toolCallId) {
+      return null;
+    }
+
+    const content = contentFromParts(parts, "toolResult", message.content);
+    const toolName = pickToolName(parts) ?? "unknown";
+    const isError = pickToolIsError(parts);
+
+    return {
+      role: "toolResult",
+      toolCallId,
+      toolName,
+      content,
+      ...(isError !== undefined ? { isError } : {}),
+    } as AgentMessage;
+  }
+
+  /**
+   * Run transcript GC for summarized tool-result messages that already have a
+   * large_files-backed placeholder stored in LCM.
+   */
+  async maintain(params: {
+    sessionId: string;
+    sessionFile: string;
+    sessionKey?: string;
+    runtimeContext?: ContextEngineMaintenanceRuntimeContext;
+  }): Promise<ContextEngineMaintenanceResult> {
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "session excluded by pattern",
+      };
+    }
+    if (this.isStatelessSession(params.sessionKey)) {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "stateless session",
+      };
+    }
+    if (typeof params.runtimeContext?.rewriteTranscriptEntries !== "function") {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "runtime rewrite helper unavailable",
+      };
+    }
+
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () => {
+        const conversation = await this.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+        if (!conversation) {
+          return {
+            changed: false,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: "conversation not found",
+          };
+        }
+
+        const candidates = await this.summaryStore.listTranscriptGcCandidates(
+          conversation.conversationId,
+          { limit: TRANSCRIPT_GC_BATCH_SIZE },
+        );
+        if (candidates.length === 0) {
+          return {
+            changed: false,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: "no transcript GC candidates",
+          };
+        }
+
+        const transcriptEntryIdsByCallId = listTranscriptToolResultEntryIdsByCallId(
+          params.sessionFile,
+        );
+        const replacements: TranscriptRewriteReplacement[] = [];
+        const seenEntryIds = new Set<string>();
+
+        for (const candidate of candidates) {
+          const entryId = transcriptEntryIdsByCallId.get(candidate.toolCallId);
+          if (!entryId || seenEntryIds.has(entryId)) {
+            continue;
+          }
+
+          const replacementMessage = await this.buildTranscriptGcReplacementMessage(
+            candidate.messageId,
+          );
+          if (!replacementMessage) {
+            continue;
+          }
+
+          seenEntryIds.add(entryId);
+          replacements.push({
+            entryId,
+            message: replacementMessage,
+          });
+        }
+
+        if (replacements.length === 0) {
+          return {
+            changed: false,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: "no matching transcript entries",
+          };
+        }
+
+        return params.runtimeContext.rewriteTranscriptEntries({
+          replacements,
+        });
+      },
+    );
+  }
   private async ingestSingle(params: {
     sessionId: string;
     sessionKey?: string;

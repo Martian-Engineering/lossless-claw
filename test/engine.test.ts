@@ -1410,6 +1410,240 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("lists summarized externalized tool results as transcript GC candidates", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const toolOutput = `${"tool output line\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call_gc_candidate",
+              name: "exec",
+              input: { cmd: "pwd" },
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_gc_candidate",
+          toolName: "exec",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_gc_candidate",
+              name: "exec",
+              content: [{ type: "text", text: toolOutput }],
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      const toolMessage = storedMessages[1];
+      expect(toolMessage?.role).toBe("tool");
+
+      const summaryId = `sum_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+      await engine.getSummaryStore().insertSummary({
+        summaryId,
+        conversationId: conversation!.conversationId,
+        kind: "leaf",
+        content: "summarized tool output",
+        tokenCount: 16,
+      });
+      await engine.getSummaryStore().linkSummaryToMessages(summaryId, [toolMessage.messageId]);
+      await engine.getSummaryStore().replaceContextRangeWithSummary({
+        conversationId: conversation!.conversationId,
+        startOrdinal: 1,
+        endOrdinal: 1,
+        summaryId,
+      });
+
+      const candidates = await engine
+        .getSummaryStore()
+        .listTranscriptGcCandidates(conversation!.conversationId);
+
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0]).toMatchObject({
+        messageId: toolMessage.messageId,
+        conversationId: conversation!.conversationId,
+        toolCallId: "call_gc_candidate",
+        toolName: "exec",
+      });
+      expect(candidates[0]?.externalizedFileId).toMatch(/^file_[a-f0-9]{16}$/);
+      expect(candidates[0]?.originalByteSize).toBe(Buffer.byteLength(toolOutput, "utf8"));
+    });
+  });
+
+  it("maintain() requests transcript rewrites for summarized externalized tool results", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const sessionFile = createSessionFilePath("transcript-gc-maintain");
+      const toolOutput = `${"tool output line\n".repeat(160)}done`;
+
+      const sm = SessionManager.open(sessionFile);
+      sm.appendMessage({
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_gc_rewrite",
+            name: "exec",
+            arguments: { cmd: "pwd" },
+          },
+        ],
+      } as AgentMessage);
+      const toolResultEntryId = sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_gc_rewrite",
+        toolName: "exec",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_gc_rewrite",
+            name: "exec",
+            content: [{ type: "text", text: toolOutput }],
+          },
+        ],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "done" }],
+      } as AgentMessage);
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call_gc_rewrite",
+              name: "exec",
+              input: { cmd: "pwd" },
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_gc_rewrite",
+          toolName: "exec",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_gc_rewrite",
+              name: "exec",
+              content: [{ type: "text", text: toolOutput }],
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "done" }],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      const toolMessage = storedMessages[1];
+      expect(toolMessage?.content).toContain("[LCM Tool Output: file_");
+
+      const summaryId = `sum_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+      await engine.getSummaryStore().insertSummary({
+        summaryId,
+        conversationId: conversation!.conversationId,
+        kind: "leaf",
+        content: "summarized tool output",
+        tokenCount: 16,
+      });
+      await engine.getSummaryStore().linkSummaryToMessages(summaryId, [toolMessage.messageId]);
+      await engine.getSummaryStore().replaceContextRangeWithSummary({
+        conversationId: conversation!.conversationId,
+        startOrdinal: 1,
+        endOrdinal: 1,
+        summaryId,
+      });
+
+      const rewriteTranscriptEntries = vi.fn(async (request: { replacements: unknown[] }) => ({
+        changed: true,
+        bytesFreed: 123,
+        rewrittenEntries: request.replacements.length,
+      }));
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile,
+        runtimeContext: {
+          rewriteTranscriptEntries,
+        },
+      });
+
+      expect(result).toEqual({
+        changed: true,
+        bytesFreed: 123,
+        rewrittenEntries: 1,
+      });
+      expect(rewriteTranscriptEntries).toHaveBeenCalledTimes(1);
+      expect(rewriteTranscriptEntries).toHaveBeenCalledWith({
+        replacements: [
+          {
+            entryId: toolResultEntryId,
+            message: expect.objectContaining({
+              role: "toolResult",
+              toolCallId: "call_gc_rewrite",
+              toolName: "exec",
+            }),
+          },
+        ],
+      });
+
+      const replacement = (
+        rewriteTranscriptEntries.mock.calls[0]?.[0] as {
+          replacements?: Array<{ message?: { content?: unknown } }>;
+        }
+      )?.replacements?.[0]?.message;
+      expect(replacement?.content).toEqual([
+        expect.objectContaining({
+          type: "tool_result",
+          tool_use_id: "call_gc_rewrite",
+          name: "exec",
+          output: expect.stringContaining("[LCM Tool Output: file_"),
+        }),
+      ]);
+    });
+  });
+
   it("serializes recycled session writes by stable sessionKey", async () => {
     const engine = createEngine();
     const sessionKey = "agent:main:main";

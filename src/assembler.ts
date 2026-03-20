@@ -473,7 +473,8 @@ export function blockFromPart(part: MessagePartRecord): unknown {
   return { type: "text", text: "" };
 }
 
-function contentFromParts(
+/** @internal Exported for transcript-maintenance reconstruction. */
+export function contentFromParts(
   parts: MessagePartRecord[],
   role: "user" | "assistant" | "toolResult",
   fallbackContent: string,
@@ -502,7 +503,8 @@ function contentFromParts(
   return blocks;
 }
 
-function pickToolCallId(parts: MessagePartRecord[]): string | undefined {
+/** @internal Exported for transcript-maintenance reconstruction. */
+export function pickToolCallId(parts: MessagePartRecord[]): string | undefined {
   for (const part of parts) {
     if (typeof part.toolCallId === "string" && part.toolCallId.length > 0) {
       return part.toolCallId;
@@ -531,7 +533,8 @@ function pickToolCallId(parts: MessagePartRecord[]): string | undefined {
   return undefined;
 }
 
-function pickToolName(parts: MessagePartRecord[]): string | undefined {
+/** @internal Exported for transcript-maintenance reconstruction. */
+export function pickToolName(parts: MessagePartRecord[]): string | undefined {
   for (const part of parts) {
     if (typeof part.toolName === "string" && part.toolName.length > 0) {
       return part.toolName;
@@ -560,7 +563,8 @@ function pickToolName(parts: MessagePartRecord[]): string | undefined {
   return undefined;
 }
 
-function pickToolIsError(parts: MessagePartRecord[]): boolean | undefined {
+/** @internal Exported for transcript-maintenance reconstruction. */
+export function pickToolIsError(parts: MessagePartRecord[]): boolean | undefined {
   for (const part of parts) {
     const decoded = parseJson(part.metadata);
     if (!decoded || typeof decoded !== "object") {
