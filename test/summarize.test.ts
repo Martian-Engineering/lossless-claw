@@ -28,6 +28,9 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
+    instanceId: "",
+    instanceDisplayName: "",
+    instanceRole: "",
     },
     complete: vi.fn(async () => ({
       content: [{ type: "text", text: "summary output" }],

@@ -216,7 +216,7 @@ describe("runLcmMigrations summary depth backfill", () => {
     const dbPath = join(tempDir, "no-fts.db");
     const db = getLcmConnection(dbPath);
 
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(db, { fullTextAvailable: false });
 
     const ftsTables = db
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts%'")

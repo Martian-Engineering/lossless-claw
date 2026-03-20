@@ -12,22 +12,59 @@
 import Database from 'better-sqlite3';
 import pg from 'pg';
 import { readFileSync, readdirSync, existsSync } from 'fs';
-import { join, basename } from 'path';
+import { delimiter, join } from 'path';
 import { homedir } from 'os';
-import { createHash, randomUUID } from 'crypto';
 
 const { Pool } = pg;
-
-// Config
-const SQLITE_PATH = join(homedir(), '.openclaw', 'lcm.db');
-const PG_CONNECTION = 'postgres://lcm_phil:pheon.lcm4@10.4.20.16:5432/phil_memory';
-const AGENTS_DIR = join(homedir(), '.openclaw', 'agents');
-const BACKUP_AGENTS_DIR = join(homedir(), '.openclaw', 'config-backups', '2026-03-07', 'agents');
 
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
 const SQLITE_ONLY = args.includes('--sqlite-only');
 const JSONL_ONLY = args.includes('--jsonl-only');
+
+function readFlagValue(flagName) {
+  const prefix = `${flagName}=`;
+  const match = args.find((arg) => arg.startsWith(prefix));
+  return match ? match.slice(prefix.length).trim() : undefined;
+}
+
+function readFlagValues(flagName) {
+  const prefix = `${flagName}=`;
+  return args
+    .filter((arg) => arg.startsWith(prefix))
+    .map((arg) => arg.slice(prefix.length).trim())
+    .filter(Boolean);
+}
+
+function dedupe(items) {
+  return [...new Set(items.filter(Boolean))];
+}
+
+function resolveMigrationConfig() {
+  const sqlitePath = readFlagValue('--sqlite-path')
+    || process.env.LCM_SQLITE_PATH?.trim()
+    || join(homedir(), '.openclaw', 'lcm.db');
+  const connectionString = readFlagValue('--pg-connection')
+    || process.env.LCM_CONNECTION_STRING?.trim()
+    || process.env.PG_CONNECTION_STRING?.trim()
+    || '';
+  const defaultAgentsDir = join(homedir(), '.openclaw', 'agents');
+  const extraAgentDirs = [
+    ...readFlagValues('--agents-dir'),
+    ...(process.env.LCM_AGENT_DIRS ?? '')
+      .split(delimiter)
+      .map((entry) => entry.trim())
+      .filter(Boolean),
+  ];
+
+  return {
+    sqlitePath,
+    connectionString,
+    agentDirs: dedupe([defaultAgentsDir, ...extraAgentDirs]),
+  };
+}
+
+const MIGRATION_CONFIG = resolveMigrationConfig();
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -38,12 +75,12 @@ function ok(msg) { console.log(`[migrate] ✅ ${msg}`); }
 // ── Phase 1: SQLite → Postgres ───────────────────────────────────
 
 async function migrateSqlite(pool) {
-  if (!existsSync(SQLITE_PATH)) {
+  if (!existsSync(MIGRATION_CONFIG.sqlitePath)) {
     warn('No SQLite database found, skipping Phase 1');
     return;
   }
 
-  const db = new Database(SQLITE_PATH, { readonly: true });
+  const db = new Database(MIGRATION_CONFIG.sqlitePath, { readonly: true });
   const client = await pool.connect();
 
   try {
@@ -99,7 +136,7 @@ async function migrateSqlite(pool) {
         `INSERT INTO summaries (summary_id, conversation_id, kind, depth, content, token_count,
          earliest_at, latest_at, descendant_count, descendant_token_count, source_message_token_count,
          file_ids, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
         [s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
          s.earliest_at, s.latest_at, s.descendant_count, s.descendant_token_count,
          s.source_message_token_count, s.file_ids || '[]', s.created_at]
@@ -218,8 +255,9 @@ function findAllJsonlFiles() {
     }
   }
 
-  scanDir(AGENTS_DIR);
-  scanDir(BACKUP_AGENTS_DIR);
+  for (const dir of MIGRATION_CONFIG.agentDirs) {
+    scanDir(dir);
+  }
   return files;
 }
 
@@ -352,12 +390,19 @@ async function importJsonlSessions(pool) {
 // ── Main ─────────────────────────────────────────────────────────
 
 async function main() {
+  if (!MIGRATION_CONFIG.connectionString) {
+    throw new Error(
+      'Missing PostgreSQL connection string. Set LCM_CONNECTION_STRING/PG_CONNECTION_STRING or pass --pg-connection=<dsn>.',
+    );
+  }
+
   log(`LCM Migration → PostgreSQL`);
-  log(`SQLite: ${SQLITE_PATH}`);
-  log(`Postgres: ${PG_CONNECTION.replace(/:[^@]+@/, ':***@')}`);
+  log(`SQLite: ${MIGRATION_CONFIG.sqlitePath}`);
+  log(`Postgres: ${MIGRATION_CONFIG.connectionString.replace(/:[^@]+@/, ':***@')}`);
+  log(`JSONL dirs: ${MIGRATION_CONFIG.agentDirs.join(', ')}`);
   if (DRY_RUN) log('🔍 DRY RUN — no changes will be made');
 
-  const pool = new Pool({ connectionString: PG_CONNECTION });
+  const pool = new Pool({ connectionString: MIGRATION_CONFIG.connectionString });
 
   try {
     // Verify connection

@@ -3,6 +3,8 @@ import type { DatabaseSync } from "node:sqlite";
 import type { DbClient } from "../db/db-interface.js";
 import { SqliteClient } from "../db/sqlite-client.js";
 import { Dialect, type Backend } from "../db/dialect.js";
+import { EmbeddingClient, toVectorLiteral, type EmbeddingConfig } from "../embeddings.js";
+import { EmbeddingQueue, type QueueableDb } from "../embedding-queue.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { sanitizeTsQuery } from "./tsquery-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
@@ -68,10 +70,15 @@ export type ContextItemRecord = {
 export type SummarySearchInput = {
   conversationId?: number;
   query: string;
-  mode: "regex" | "full_text";
+  mode: "regex" | "full_text" | "semantic" | "recency_boosted";
   since?: Date;
   before?: Date;
   limit?: number;
+  semanticWeight?: number;
+  recencyWeight?: number;
+  recencyHalfLifeDays?: number;
+  /** Agent ID of the caller. Results from this agent's conversations get a ranking boost. */
+  callerAgentId?: string;
 };
 
 export type SummarySearchResult = {
@@ -290,6 +297,8 @@ const FILE_COLS = "file_id, conversation_id, file_name, mime_type, byte_size, st
 export class SummaryStore {
   private readonly fullTextAvailable: boolean;
   private readonly d: Dialect;
+  private readonly embeddingClient: EmbeddingClient | null;
+  private readonly embeddingQueue: EmbeddingQueue | null;
   /** Root (non-transactional) database client. */
   private readonly _rootDb: DbClient;
   private readonly _txStore = new AsyncLocalStorage<DbClient>();
@@ -301,11 +310,35 @@ export class SummaryStore {
 
   constructor(
     db: DbClient | DatabaseSync,
-    options?: { fullTextAvailable?: boolean; fts5Available?: boolean; backend?: Backend },
+    options?: { fullTextAvailable?: boolean; fts5Available?: boolean; backend?: Backend; embeddingConfig?: EmbeddingConfig },
   ) {
     this._rootDb = ensureDbClient(db);
     this.fullTextAvailable = options?.fullTextAvailable ?? options?.fts5Available ?? true;
     this.d = new Dialect(options?.backend ?? "sqlite");
+
+    if (this.d.pg && options?.embeddingConfig) {
+      const client = new EmbeddingClient(options.embeddingConfig);
+      this.embeddingClient = client.isConfigured() ? client : null;
+    } else {
+      this.embeddingClient = null;
+    }
+
+    if (this.embeddingClient) {
+      this.embeddingQueue = new EmbeddingQueue(this.embeddingClient, db as QueueableDb);
+      this.embeddingQueue.start();
+    } else {
+      this.embeddingQueue = null;
+    }
+  }
+
+  /** Flush all pending embeddings without stopping the queue timer. */
+  async drainEmbeddingQueue(): Promise<void> {
+    if (this.embeddingQueue) await this.embeddingQueue.drain();
+  }
+
+  /** Gracefully stop the embedding queue (drain + stop timer). Call on shutdown. */
+  async stopEmbeddingQueue(): Promise<void> {
+    if (this.embeddingQueue) await this.embeddingQueue.stop();
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -317,6 +350,16 @@ export class SummaryStore {
     return this._rootDb.transaction(async (txClient) => {
       return this._txStore.run(txClient, operation);
     });
+  }
+
+  /**
+   * Run an operation against an explicit database client.
+   *
+   * This lets engine-level flows share a transaction-scoped client across
+   * multiple stores when one store opens the transaction.
+   */
+  async withClient<T>(client: DbClient, operation: () => Promise<T> | T): Promise<T> {
+    return this._txStore.run(client, operation);
   }
 
   // ── Summary CRUD ──────────────────────────────────────────────────────────
@@ -361,6 +404,10 @@ export class SummaryStore {
           input.summaryId, input.content,
         ]);
       } catch { /* FTS indexing is best-effort */ }
+    }
+
+    if (this.embeddingQueue) {
+      this.embeddingQueue.enqueue("summaries", input.summaryId, input.content);
     }
 
     return toSummaryRecord(row);
@@ -663,6 +710,32 @@ export class SummaryStore {
   async searchSummaries(input: SummarySearchInput): Promise<SummarySearchResult[]> {
     const limit = input.limit ?? 50;
 
+    if (input.mode === "recency_boosted") {
+      try {
+        return await this.searchRecencyBoosted(
+          input.query, limit, input.conversationId, input.since, input.before,
+          input.semanticWeight, input.recencyWeight, input.recencyHalfLifeDays,
+          input.callerAgentId,
+        );
+      } catch (err) {
+        console.warn(
+          `[lcm:sum-store] recency_boosted search failed, falling back to semantic: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return this.searchSummaries({ ...input, mode: "semantic" });
+      }
+    }
+
+    if (input.mode === "semantic") {
+      try {
+        return await this.searchSemantic(input.query, limit, input.conversationId, input.since, input.before, input.callerAgentId);
+      } catch (err) {
+        console.warn(
+          `[lcm:sum-store] semantic search failed, falling back to full_text: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return this.searchSummaries({ ...input, mode: "full_text" });
+      }
+    }
+
     if (input.mode === "full_text") {
       if (this.fullTextAvailable) {
         try {
@@ -958,5 +1031,152 @@ export class SummaryStore {
     );
 
     return toConversationBootstrapStateRecord(row!);
+  }
+
+  // ── Embedding helpers ──────────────────────────────────────────────────
+
+  private async embedOnInsert(summaryId: string, content: string): Promise<void> {
+    if (!this.embeddingClient || !this.d.pg) return;
+    if (!content || content.trim().length === 0) return;
+
+    const embedding = await this.embeddingClient.embedOne(content);
+    await this.db.run(
+      `UPDATE summaries SET embedding = $1 WHERE summary_id = $2`,
+      [toVectorLiteral(embedding), summaryId],
+    );
+  }
+
+  async searchSemantic(
+    query: string, limit: number,
+    conversationId?: number, since?: Date, before?: Date,
+    callerAgentId?: string,
+  ): Promise<SummarySearchResult[]> {
+    if (!this.d.pg || !this.embeddingClient) {
+      throw new Error("Semantic search requires PostgreSQL with pgvector and a configured embedding API key");
+    }
+
+    const queryEmbedding = await this.embeddingClient.embedOne(query);
+    const vectorLiteral = toVectorLiteral(queryEmbedding);
+
+    const d = this.d.reset();
+    const where: string[] = ["s.embedding IS NOT NULL"];
+    const params: unknown[] = [];
+
+    if (conversationId !== undefined) { where.push(`s.conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`s.created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`s.created_at < ${d.p()}`); params.push(before.toISOString()); }
+
+    const vecParam = d.p();
+    const candidateLimit = d.p();
+    const finalLimit = d.p();
+    params.push(vectorLiteral, limit * 3, limit);
+
+    // Agent affinity: boost results from caller's own conversations by 1.3x
+    let agentBoostExpr = "1.0";
+    if (callerAgentId) {
+      const agentParam = d.p();
+      params.push(callerAgentId);
+      agentBoostExpr = `CASE WHEN c.agent_id = ${agentParam} THEN 1.3 ELSE 1.0 END`;
+    }
+
+    const result = await this.db.query<SummarySearchRow & { content: string }>(
+      `WITH candidates AS (
+         SELECT s.summary_id, s.conversation_id, s.kind, s.content, s.created_at,
+           1 - (s.embedding <=> ${vecParam}::vector) AS similarity
+         FROM summaries s
+         WHERE ${where.join(" AND ")}
+         ORDER BY s.embedding <=> ${vecParam}::vector
+         LIMIT ${candidateLimit}
+       )
+       SELECT cd.summary_id, cd.conversation_id, cd.kind, cd.content, cd.created_at,
+         cd.similarity * ${agentBoostExpr} AS rank
+       FROM candidates cd
+       JOIN conversations c ON c.conversation_id = cd.conversation_id
+       ORDER BY rank DESC
+       LIMIT ${finalLimit}`,
+      params,
+    );
+
+    return result.rows.map((row) => ({
+      summaryId: row.summary_id,
+      conversationId: row.conversation_id,
+      kind: row.kind,
+      snippet: row.content.substring(0, 200),
+      createdAt: new Date(row.created_at),
+      rank: row.rank,
+    }));
+  }
+
+  /**
+   * Recency-boosted semantic search for summaries.
+   * Blends cosine similarity with exponential time decay.
+   */
+  async searchRecencyBoosted(
+    query: string, limit: number,
+    conversationId?: number, since?: Date, before?: Date,
+    semanticWeight = 0.7, recencyWeight = 0.3, halfLifeDays = 7,
+    callerAgentId?: string,
+  ): Promise<SummarySearchResult[]> {
+    if (!this.d.pg || !this.embeddingClient) {
+      throw new Error("Recency-boosted search requires PostgreSQL with pgvector and a configured embedding API key");
+    }
+
+    const queryEmbedding = await this.embeddingClient.embedOne(query);
+    const vectorLiteral = toVectorLiteral(queryEmbedding);
+
+    const d = this.d.reset();
+    const where: string[] = ["s.embedding IS NOT NULL"];
+    const params: unknown[] = [];
+
+    if (conversationId !== undefined) { where.push(`s.conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`s.created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`s.created_at < ${d.p()}`); params.push(before.toISOString()); }
+
+    const vecParam = d.p();
+    const swParam = d.p();
+    const rwParam = d.p();
+    const hlParam = d.p();
+    const candidateLimit = d.p();
+    const finalLimit = d.p();
+    params.push(vectorLiteral, semanticWeight, recencyWeight, halfLifeDays, limit * 3, limit);
+
+    let agentBoostExpr = "1.0";
+    if (callerAgentId) {
+      const agentParam = d.p();
+      params.push(callerAgentId);
+      agentBoostExpr = `CASE WHEN c.agent_id = ${agentParam} THEN 1.3 ELSE 1.0 END`;
+    }
+
+    const result = await this.db.query<SummarySearchRow & { content: string }>(
+      `WITH candidates AS (
+         SELECT s.summary_id, s.conversation_id, s.kind, s.content, s.created_at,
+           1 - (s.embedding <=> ${vecParam}::vector) AS similarity,
+           EXP(-LN(2) * EXTRACT(EPOCH FROM (NOW() - COALESCE(s.latest_at, s.created_at))) / 86400.0 / ${hlParam}) AS recency
+         FROM summaries s
+         WHERE ${where.join(" AND ")}
+         ORDER BY s.embedding <=> ${vecParam}::vector
+         LIMIT ${candidateLimit}
+       )
+       SELECT cd.summary_id, cd.conversation_id, cd.kind, cd.content, cd.created_at,
+         (${swParam} * cd.similarity + ${rwParam} * cd.recency) * ${agentBoostExpr} AS rank
+       FROM candidates cd
+       JOIN conversations c ON c.conversation_id = cd.conversation_id
+       ORDER BY rank DESC
+       LIMIT ${finalLimit}`,
+      params,
+    );
+
+    return result.rows.map((row) => ({
+      summaryId: row.summary_id,
+      conversationId: row.conversation_id,
+      kind: row.kind,
+      snippet: row.content.substring(0, 200),
+      createdAt: new Date(row.created_at),
+      rank: row.rank,
+    }));
+  }
+
+  get embeddingsAvailable(): boolean {
+    return this.embeddingClient !== null && this.d.pg;
   }
 }

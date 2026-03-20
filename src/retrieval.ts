@@ -62,12 +62,14 @@ export interface DescribeResult {
 
 export interface GrepInput {
   query: string;
-  mode: "regex" | "full_text";
+  mode: "regex" | "full_text" | "semantic" | "recency_boosted";
   scope: "messages" | "summaries" | "both";
   conversationId?: number;
   since?: Date;
   before?: Date;
   limit?: number;
+  /** Agent ID of the caller. Results from this agent's conversations get a ranking boost. */
+  callerAgentId?: string;
 }
 
 export interface GrepResult {
@@ -222,9 +224,9 @@ export class RetrievalEngine {
    * Depending on `scope`, searches messages, summaries, or both (in parallel).
    */
   async grep(input: GrepInput): Promise<GrepResult> {
-    const { query, mode, scope, conversationId, since, before, limit } = input;
+    const { query, mode, scope, conversationId, since, before, limit, callerAgentId } = input;
 
-    const searchInput = { query, mode, conversationId, since, before, limit };
+    const searchInput = { query, mode, conversationId, since, before, limit, callerAgentId };
 
     let messages: MessageSearchResult[] = [];
     let summaries: SummarySearchResult[] = [];

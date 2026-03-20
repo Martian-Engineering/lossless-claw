@@ -44,3 +44,7 @@ export { runLcmMigrations, ensurePostgresSchema } from "../db/migration.js";
 export { resolveLcmConfig } from "../db/config.js";
 export type { LcmConfig } from "../db/config.js";
 export type { LcmDbFeatures } from "../db/features.js";
+
+// Embedding exports
+export { EmbeddingClient, toVectorLiteral, fromVectorLiteral } from "../embeddings.js";
+export type { EmbeddingConfig } from "../embeddings.js";
