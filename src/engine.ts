@@ -967,7 +967,10 @@ export class LcmContextEngine implements ContextEngine {
   private readonly fts5Available: boolean;
   private readonly ignoreSessionPatterns: RegExp[];
   private readonly statelessSessionPatterns: RegExp[];
-  private sessionOperationQueues = new Map<string, Promise<void>>();
+  private sessionOperationQueues = new Map<
+    string,
+    { promise: Promise<void>; refCount: number }
+  >();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
@@ -1121,24 +1124,30 @@ export class LcmContextEngine implements ContextEngine {
    * ingest/compaction races across runtime UUID recycling.
    */
   private async withSessionQueue<T>(queueKey: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.sessionOperationQueues.get(queueKey) ?? Promise.resolve();
+    const entry = this.sessionOperationQueues.get(queueKey);
+    const previous = entry?.promise ?? Promise.resolve();
     let releaseQueue: () => void = () => {};
     const current = new Promise<void>((resolve) => {
       releaseQueue = resolve;
     });
     const next = previous.catch(() => {}).then(() => current);
-    this.sessionOperationQueues.set(queueKey, next);
+
+    if (entry) {
+      entry.promise = next;
+      entry.refCount++;
+    } else {
+      this.sessionOperationQueues.set(queueKey, { promise: next, refCount: 1 });
+    }
 
     await previous.catch(() => {});
     try {
       return await operation();
     } finally {
       releaseQueue();
-      void next.finally(() => {
-        if (this.sessionOperationQueues.get(queueKey) === next) {
-          this.sessionOperationQueues.delete(queueKey);
-        }
-      });
+      const cur = this.sessionOperationQueues.get(queueKey);
+      if (cur && --cur.refCount === 0) {
+        this.sessionOperationQueues.delete(queueKey);
+      }
     }
   }
 
