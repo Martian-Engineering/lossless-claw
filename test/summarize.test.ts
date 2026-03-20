@@ -409,6 +409,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
   it("falls back deterministically when the initial summarizer call times out", async () => {
     vi.useFakeTimers();
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const deps = makeDeps({
@@ -436,12 +437,15 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(summary).toContain("[LCM fallback summary; truncated for context management]");
       expect(vi.getTimerCount()).toBe(0);
 
-      const diagnostics = consoleError.mock.calls
-        .flatMap((call) => call.map((entry) => String(entry)))
-        .join(" ");
-      expect(diagnostics).toContain("summarizer timeout after 60000ms (initial)");
+      const diagnostics = [
+        ...consoleWarn.mock.calls.flatMap((call) => call.map((entry) => String(entry))),
+        ...consoleError.mock.calls.flatMap((call) => call.map((entry) => String(entry))),
+      ].join(" ");
+      expect(diagnostics).toContain("summarizer timed out");
+      expect(diagnostics).toContain("timeout=60000ms");
       expect(diagnostics).toContain("source=fallback");
     } finally {
+      consoleWarn.mockRestore();
       consoleError.mockRestore();
       vi.useRealTimers();
     }
@@ -630,7 +634,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     });
 
     it("falls back gracefully when retry throws an exception", async () => {
-      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
         let callCount = 0;
         const deps = makeDeps({
@@ -658,13 +662,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         // Retry threw → deterministic fallback.
         expect(summary).toContain("[LCM fallback summary; truncated for context management]");
 
-        const diagnostics = consoleError.mock.calls
+        const diagnostics = consoleWarn.mock.calls
           .flatMap((c) => c.map(String))
           .join(" ");
         expect(diagnostics).toContain("retry failed");
         expect(diagnostics).toContain("rate limit exceeded");
       } finally {
-        consoleError.mockRestore();
+        consoleWarn.mockRestore();
       }
     });
 
