@@ -408,7 +408,6 @@ describe("createLcmSummarizeFromLegacyParams", () => {
   });
 
   it("falls back deterministically when the initial summarizer call times out", async () => {
-    vi.useFakeTimers();
     const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
@@ -429,6 +428,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         },
       });
 
+      vi.useFakeTimers();
       const summaryPromise = summarize!("A".repeat(12_000), false);
       await vi.advanceTimersByTimeAsync(60_000);
       const summary = await summaryPromise;
@@ -452,7 +452,6 @@ describe("createLcmSummarizeFromLegacyParams", () => {
   });
 
   it("clears the summarizer timeout timer after a successful completion", async () => {
-    vi.useFakeTimers();
     try {
       const deps = makeDeps();
       const summarize = await createLcmSummarizeFromLegacyParams({
@@ -463,6 +462,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         },
       });
 
+      vi.useFakeTimers();
       const summary = await summarize!("Summary input", false);
 
       expect(summary).toBe("summary output");
