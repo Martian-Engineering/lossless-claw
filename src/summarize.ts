@@ -834,8 +834,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         temperature: aggressive ? 0.1 : 0.2,
       }), SUMMARIZER_TIMEOUT_MS, "initial");
     } catch (err) {
-      console.error(
-        `[lcm] summarizer call failed; provider=${provider}; model=${model}; error=${err instanceof Error ? err.message : String(err)}`,
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isTimeout = errMsg.includes("summarizer timeout");
+      console.warn(
+        `[lcm] summarizer ${isTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${SUMMARIZER_TIMEOUT_MS}ms; error=${errMsg}`,
       );
       return "";
     }
@@ -924,10 +926,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         }
       } catch (retryErr) {
         // Retry is best-effort; log and proceed to deterministic fallback.
-        console.error(
-          `[lcm] retry failed; provider=${provider} model=${model}; error=${
-            retryErr instanceof Error ? retryErr.message : String(retryErr)
-          }; falling back to truncation`,
+        const retryErrMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        const isRetryTimeout = retryErrMsg.includes("summarizer timeout");
+        console.warn(
+          `[lcm] retry ${isRetryTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${SUMMARIZER_TIMEOUT_MS}ms; error=${retryErrMsg}; falling back to truncation`,
         );
       }
     }
