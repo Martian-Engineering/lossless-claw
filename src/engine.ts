@@ -824,8 +824,17 @@ export class LcmContextEngine implements ContextEngine {
           );
         }
       } else {
-        // For Postgres, schema is ensured asynchronously; assume OK for now.
-        // The ensureMigrated() call will run ensurePostgresSchema on first use.
+        // For Postgres, run schema setup and agent registration eagerly.
+        // ensureMigrated() short-circuits when this.migrated is already true,
+        // so registerAgent() must be called here — not deferred.
+        const pgDb = createLcmConnection(this.config);
+        ensurePostgresSchema(pgDb)
+          .then(() => this.registerAgent())
+          .catch((err) =>
+            this.deps.log.error(
+              `[lcm] Postgres schema/registration failed: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          );
         migrationOk = true;
       }
       this.migrated = migrationOk;
@@ -999,9 +1008,9 @@ export class LcmContextEngine implements ContextEngine {
            last_seen_at = NOW()`,
         [agentId, displayName, host, role],
       );
-      console.log(`[lcm:engine] registered agent: ${agentId} (${displayName ?? "no display name"}, role=${role ?? "unset"}, host=${host})`);
+      this.deps.log.info(`[lcm:engine] registered agent: ${agentId} (${displayName ?? "no display name"}, role=${role ?? "unset"}, host=${host})`);
     } catch (err) {
-      console.warn(`[lcm:engine] failed to register agent: ${err instanceof Error ? err.message : String(err)}`);
+      this.deps.log.warn(`[lcm:engine] failed to register agent: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
