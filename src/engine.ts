@@ -1,10 +1,8 @@
-import { createHash, randomUUID } from "node:crypto";
-import { closeSync, createReadStream, openSync, readSync, statSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
-import { createInterface } from "node:readline";
 import type {
   ContextEngine,
   ContextEngineInfo,
@@ -16,32 +14,27 @@ import type {
   SubagentEndReason,
   SubagentSpawnPreparation,
 } from "openclaw/plugin-sdk";
-import { blockFromPart, ContextAssembler } from "./assembler.js";
+import { ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
+import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
 import {
   createDelegatedExpansionGrant,
-  getRuntimeExpansionAuthManager,
   removeDelegatedExpansionGrantForSession,
-  resolveDelegatedExpansionGrantId,
   revokeDelegatedExpansionGrantForSession,
 } from "./expansion-auth.js";
 import {
   extensionFromNameOrMime,
   formatFileReference,
-  formatToolOutputReference,
   generateExplorationSummary,
   parseFileBlocks,
 } from "./large-files.js";
 import { RetrievalEngine } from "./retrieval.js";
-import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
-import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
   ConversationStore,
   type CreateMessagePartInput,
-  type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
@@ -67,12 +60,6 @@ function safeString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
 function safeBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
@@ -95,125 +82,6 @@ function appendTextValue(value: unknown, out: string[]): void {
   const record = value as Record<string, unknown>;
   appendTextValue(record.text, out);
   appendTextValue(record.value, out);
-}
-
-const STRUCTURED_TEXT_FIELD_KEYS = ["text", "transcript", "transcription", "message", "summary"];
-const STRUCTURED_ARRAY_FIELD_KEYS = [
-  "segments",
-  "utterances",
-  "paragraphs",
-  "alternatives",
-  "words",
-  "items",
-  "results",
-];
-const STRUCTURED_NESTED_FIELD_KEYS = ["content", "output", "result", "payload", "data", "value"];
-const MAX_STRUCTURED_TEXT_DEPTH = 6;
-const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
-  "tool_use",
-  "toolUse",
-  "tool-use",
-  "toolCall",
-  "tool_call",
-  "functionCall",
-  "function_call",
-  "function_call_output",
-  "tool_result",
-  "toolResult",
-  "tool_use_result",
-]);
-
-function looksLikeJsonPayload(value: string): boolean {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return false;
-  }
-  return (
-    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-    (trimmed.startsWith("[") && trimmed.endsWith("]"))
-  );
-}
-
-function extractStructuredText(value: unknown, depth: number = 0): string | undefined {
-  if (value == null || depth > MAX_STRUCTURED_TEXT_DEPTH) {
-    return undefined;
-  }
-  if (typeof value === "string") {
-    if (looksLikeJsonPayload(value)) {
-      try {
-        const parsed = JSON.parse(value.trim());
-        const parsedText = extractStructuredText(parsed, depth + 1);
-        if (typeof parsedText === "string" && parsedText.length > 0) {
-          return parsedText;
-        }
-      } catch {
-        // Fall through to returning the original string when parsing fails.
-      }
-    }
-    return value;
-  }
-  if (Array.isArray(value)) {
-    const texts: string[] = [];
-    for (const entry of value) {
-      const text = extractStructuredText(entry, depth + 1);
-      if (typeof text === "string" && text.trim().length > 0) {
-        texts.push(text);
-      }
-    }
-    return texts.length > 0 ? texts.join("\n") : undefined;
-  }
-  if (typeof value !== "object") {
-    return undefined;
-  }
-
-  const record = value as Record<string, unknown>;
-
-  // Skip tool call/result objects — their structured data belongs in the parts table, not content
-  if (typeof record.type === "string" && TOOL_RAW_TYPES.has(record.type)) {
-    if (safeBoolean(record.toolOutputExternalized)) {
-      const externalizedText =
-        extractStructuredText(record.output, depth + 1) ??
-        extractStructuredText(record.content, depth + 1) ??
-        extractStructuredText(record.result, depth + 1);
-      if (typeof externalizedText === "string" && externalizedText.trim().length > 0) {
-        return externalizedText;
-      }
-    }
-    return undefined;
-  }
-
-  for (const key of STRUCTURED_TEXT_FIELD_KEYS) {
-    const candidate = record[key];
-    if (typeof candidate === "string" && candidate.trim().length > 0) {
-      return candidate;
-    }
-  }
-
-  for (const key of STRUCTURED_ARRAY_FIELD_KEYS) {
-    const candidate = record[key];
-    if (Array.isArray(candidate)) {
-      const texts: string[] = [];
-      for (const entry of candidate) {
-        const text = extractStructuredText(entry, depth + 1);
-        if (typeof text === "string" && text.trim().length > 0) {
-          texts.push(text);
-        }
-      }
-      if (texts.length > 0) {
-        return texts.join("\n");
-      }
-    }
-  }
-
-  for (const key of STRUCTURED_NESTED_FIELD_KEYS) {
-    const nested = record[key];
-    const nestedText = extractStructuredText(nested, depth + 1);
-    if (typeof nestedText === "string" && nestedText.trim().length > 0) {
-      return nestedText;
-    }
-  }
-
-  return undefined;
 }
 
 function extractReasoningText(record: Record<string, unknown>): string | undefined {
@@ -306,24 +174,18 @@ function toPartType(type: string): MessagePartType {
  * JSON syntax that can later pollute assembled model context.
  */
 function extractMessageContent(content: unknown): string {
-  const extracted = extractStructuredText(content);
-  if (typeof extracted === "string") {
-    return extracted;
+  if (typeof content === "string") {
+    return content;
   }
-  if (content == null) {
-    return "";
-  }
-  if (Array.isArray(content) && content.length === 0) {
-    return "";
-  }
-  // If content is an array of only tool call/result objects, store as empty
-  // (structured data is preserved in the message parts table)
-  if (Array.isArray(content) && content.length > 0 && content.every(
-    (item) => typeof item === "object" && item !== null && !Array.isArray(item) &&
-      typeof (item as Record<string, unknown>).type === "string" &&
-      TOOL_RAW_TYPES.has((item as Record<string, unknown>).type as string)
-  )) {
-    return "";
+
+  if (Array.isArray(content)) {
+    return content
+      .filter((block): block is { type?: unknown; text?: unknown } => {
+        return !!block && typeof block === "object";
+      })
+      .filter((block) => block.type === "text" && typeof block.text === "string")
+      .map((block) => block.text as string)
+      .join("\n");
   }
 
   const serialized = JSON.stringify(content);
@@ -346,58 +208,6 @@ function isTextBlock(value: unknown): value is { type: "text"; text: string } {
   }
   const record = value as Record<string, unknown>;
   return record.type === "text" && typeof record.text === "string";
-}
-
-function toSyntheticMessagePartRecord(
-  part: CreateMessagePartInput,
-  messageId: number,
-): MessagePartRecord {
-  return {
-    partId: `estimate-part-${part.ordinal}`,
-    messageId,
-    sessionId: part.sessionId,
-    partType: part.partType,
-    ordinal: part.ordinal,
-    textContent: part.textContent ?? null,
-    toolCallId: part.toolCallId ?? null,
-    toolName: part.toolName ?? null,
-    toolInput: part.toolInput ?? null,
-    toolOutput: part.toolOutput ?? null,
-    metadata: part.metadata ?? null,
-  };
-}
-
-function normalizeMessageContentForStorage(params: {
-  message: AgentMessage;
-  fallbackContent: string;
-}): unknown {
-  const { message, fallbackContent } = params;
-  if (!("content" in message)) {
-    return fallbackContent;
-  }
-
-  const role = toRuntimeRoleForTokenEstimate(message.role);
-  const parts = buildMessageParts({
-    sessionId: "storage-estimate",
-    message,
-    fallbackContent,
-  }).map((part) => toSyntheticMessagePartRecord(part, 0));
-
-  if (parts.length === 0) {
-    if (role === "assistant") {
-      return fallbackContent ? [{ type: "text", text: fallbackContent }] : [];
-    }
-    if (role === "toolResult") {
-      return [{ type: "text", text: fallbackContent }];
-    }
-    return fallbackContent;
-  }
-
-  const blocks = parts.map(blockFromPart);
-  if (role === "user" && blocks.length === 1 && isTextBlock(blocks[0])) {
-    return blocks[0].text;
-  }
-  return blocks;
 }
 
 /**
@@ -575,13 +385,6 @@ function buildMessageParts(params: {
         toolCallId: topLevelToolCallId,
         toolName: topLevelToolName,
         isError: topLevelIsError,
-        externalizedFileId: safeString(metadataRecord?.externalizedFileId),
-        originalByteSize:
-          typeof metadataRecord?.originalByteSize === "number"
-            ? metadataRecord.originalByteSize
-            : undefined,
-        toolOutputExternalized: safeBoolean(metadataRecord?.toolOutputExternalized),
-        externalizationReason: safeString(metadataRecord?.externalizationReason),
         rawType: block.type,
         raw: metadataRecord ?? message.content[ordinal],
       }),
@@ -634,18 +437,11 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
         ? `$ ${(message as { command: string; output: string }).command}\n${(message as { command: string; output: string }).output}`
         : "";
   const runtimeRole = toRuntimeRoleForTokenEstimate(message.role);
-  const normalizedContent =
-    "content" in message
-      ? normalizeMessageContentForStorage({
-          message,
-          fallbackContent: content,
-        })
-      : content;
   const tokenCount =
     "content" in message
       ? estimateContentTokensForRole({
           role: runtimeRole,
-          content: normalizedContent,
+          content: message.content,
           fallbackContent: content,
         })
       : estimateTokens(content);
@@ -655,15 +451,6 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
     content,
     tokenCount,
   };
-}
-
-function createBootstrapEntryHash(message: StoredMessage | null): string | null {
-  if (!message) {
-    return null;
-  }
-  return createHash("sha256")
-    .update(JSON.stringify({ role: message.role, content: message.content }))
-    .digest("hex");
 }
 
 function estimateMessageContentTokensForAfterTurn(content: unknown): number {
@@ -729,216 +516,53 @@ function isBootstrapMessage(value: unknown): value is AgentMessage {
   return "content" in msg || ("command" in msg && "output" in msg);
 }
 
-function extractBootstrapMessageCandidate(value: unknown): AgentMessage | null {
-  const candidate =
-    value && typeof value === "object" && "message" in value
-      ? (value as { message?: unknown }).message
-      : value;
-  return isBootstrapMessage(candidate) ? candidate : null;
-}
+/** Load recoverable messages from a JSON/JSONL session file. */
+function readLeafPathMessages(sessionFile: string): AgentMessage[] {
+  let raw = "";
+  try {
+    raw = readFileSync(sessionFile, "utf8");
+  } catch {
+    return [];
+  }
 
-function parseBootstrapJsonl(raw: string, options?: {
-  strict?: boolean;
-}): { messages: AgentMessage[]; sawNonWhitespace: boolean; hadMalformedLine: boolean } {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed.filter(isBootstrapMessage);
+    } catch {
+      return [];
+    }
+  }
+
   const messages: AgentMessage[] = [];
   const lines = raw.split(/\r?\n/);
-  let sawNonWhitespace = false;
-  let hadMalformedLine = false;
   for (const line of lines) {
     const item = line.trim();
     if (!item) {
       continue;
     }
-    sawNonWhitespace = true;
     try {
       const parsed = JSON.parse(item);
-      const candidate = extractBootstrapMessageCandidate(parsed);
-      if (candidate) {
+      const candidate =
+        parsed && typeof parsed === "object" && "message" in parsed
+          ? (parsed as { message?: unknown }).message
+          : parsed;
+      if (isBootstrapMessage(candidate)) {
         messages.push(candidate);
-        continue;
-      }
-      if (options?.strict) {
-        hadMalformedLine = true;
       }
     } catch {
-      if (options?.strict) {
-        hadMalformedLine = true;
-      }
+      // Skip malformed lines.
     }
   }
-  return { messages, sawNonWhitespace, hadMalformedLine };
-}
-
-/** Load recoverable messages from a JSON/JSONL session file without full-file reads for JSONL. */
-async function readLeafPathMessages(sessionFile: string): Promise<AgentMessage[]> {
-  try {
-    let sawNonWhitespace = false;
-    let jsonArrayMode = false;
-    let jsonArrayBuffer = "";
-    const messages: AgentMessage[] = [];
-    const stream = createReadStream(sessionFile, { encoding: "utf8" });
-    const lines = createInterface({
-      input: stream,
-      crlfDelay: Infinity,
-    });
-
-    for await (const line of lines) {
-      if (!sawNonWhitespace) {
-        const trimmed = line.trim();
-        if (trimmed) {
-          sawNonWhitespace = true;
-          if (trimmed.startsWith("[")) {
-            jsonArrayMode = true;
-          }
-        }
-      }
-
-      if (jsonArrayMode) {
-        jsonArrayBuffer += `${line}\n`;
-        continue;
-      }
-
-      const parsed = parseBootstrapJsonl(line);
-      if (parsed.messages.length > 0) {
-        messages.push(...parsed.messages);
-      }
-    }
-
-    if (jsonArrayMode) {
-      const trimmed = jsonArrayBuffer.trim();
-      if (!trimmed) {
-        return [];
-      }
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (!Array.isArray(parsed)) {
-          return [];
-        }
-        return parsed.filter(isBootstrapMessage);
-      } catch {
-        return [];
-      }
-    }
-
-    return messages;
-  } catch {
-    return [];
-  }
-}
-
-function readFileSegment(sessionFile: string, offset: number): string | null {
-  let fd: number | null = null;
-  try {
-    fd = openSync(sessionFile, "r");
-    const stats = statSync(sessionFile);
-    const safeOffset = Math.max(0, Math.min(Math.floor(offset), stats.size));
-    const length = stats.size - safeOffset;
-    if (length <= 0) {
-      return "";
-    }
-    const buffer = Buffer.alloc(length);
-    readSync(fd, buffer, 0, length, safeOffset);
-    return buffer.toString("utf8");
-  } catch {
-    return null;
-  } finally {
-    if (fd != null) {
-      closeSync(fd);
-    }
-  }
-}
-
-function readLastJsonlEntryBeforeOffset(sessionFile: string, offset: number): string | null {
-  const chunkSize = 16_384;
-  let fd: number | null = null;
-  try {
-    const safeOffset = Math.max(0, Math.floor(offset));
-    if (safeOffset <= 0) {
-      return null;
-    }
-
-    fd = openSync(sessionFile, "r");
-    let cursor = safeOffset;
-    let carry = "";
-    while (cursor > 0) {
-      const start = Math.max(0, cursor - chunkSize);
-      const length = cursor - start;
-      const buffer = Buffer.alloc(length);
-      readSync(fd, buffer, 0, length, start);
-      carry = buffer.toString("utf8") + carry;
-
-      const trimmedEnd = carry.replace(/\s+$/u, "");
-      if (!trimmedEnd) {
-        cursor = start;
-        carry = "";
-        continue;
-      }
-
-      const newlineIndex = Math.max(trimmedEnd.lastIndexOf("\n"), trimmedEnd.lastIndexOf("\r"));
-      if (newlineIndex >= 0) {
-        const candidate = trimmedEnd.slice(newlineIndex + 1).trim();
-        if (candidate) {
-          return candidate;
-        }
-        carry = trimmedEnd.slice(0, newlineIndex);
-        cursor = start;
-        continue;
-      }
-
-      if (start === 0) {
-        return trimmedEnd.trim() || null;
-      }
-      cursor = start;
-    }
-    return null;
-  } catch {
-    return null;
-  } finally {
-    if (fd != null) {
-      closeSync(fd);
-    }
-  }
-}
-
-function readAppendedLeafPathMessages(params: {
-  sessionFile: string;
-  offset: number;
-}): { messages: AgentMessage[]; canUseAppendOnly: boolean; sawNonWhitespace: boolean } {
-  const raw = readFileSegment(params.sessionFile, params.offset);
-  if (raw == null) {
-    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: false };
-  }
-
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return { messages: [], canUseAppendOnly: true, sawNonWhitespace: false };
-  }
-
-  if (trimmed.startsWith("[")) {
-    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: true };
-  }
-
-  const parsed = parseBootstrapJsonl(raw, { strict: true });
-  if (parsed.hadMalformedLine) {
-    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: parsed.sawNonWhitespace };
-  }
-
-  return {
-    messages: parsed.messages,
-    canUseAppendOnly: true,
-    sawNonWhitespace: parsed.sawNonWhitespace,
-  };
-}
-
-function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | null {
-  if (!line) {
-    return null;
-  }
-  try {
-    return extractBootstrapMessageCandidate(JSON.parse(line));
-  } catch {
-    return null;
-  }
+  return messages;
 }
 
 function messageIdentity(role: string, content: string): string {
@@ -948,7 +572,12 @@ function messageIdentity(role: string, content: string): string {
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
 export class LcmContextEngine implements ContextEngine {
-  readonly info: ContextEngineInfo;
+  readonly info: ContextEngineInfo = {
+    id: "lcm",
+    name: "Lossless Context Management Engine",
+    version: "0.1.0",
+    ownsCompaction: true,
+  };
 
   private config: LcmConfig;
 
@@ -962,85 +591,27 @@ export class LcmContextEngine implements ContextEngine {
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
-  private readonly db: DatabaseSync;
   private migrated = false;
   private readonly fts5Available: boolean;
-  private readonly ignoreSessionPatterns: RegExp[];
-  private readonly statelessSessionPatterns: RegExp[];
-  private sessionOperationQueues = new Map<string, Promise<void>>();
+  private sessionOperationQueues = new Map<string, { promise: Promise<void>; refCount: number }>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
 
-  constructor(deps: LcmDependencies, database: DatabaseSync) {
+  constructor(deps: LcmDependencies) {
     this.deps = deps;
     this.config = deps.config;
-    this.ignoreSessionPatterns = compileSessionPatterns(this.config.ignoreSessionPatterns);
-    this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
-    this.db = database;
 
-    this.fts5Available = getLcmDbFeatures(this.db).fts5Available;
+    const db = getLcmConnection(this.config.databasePath);
+    this.fts5Available = getLcmDbFeatures(db).fts5Available;
 
-    // Run migrations eagerly at construction time so the schema exists
-    // before any lifecycle hook fires.
-    let migrationOk = false;
-    try {
-      runLcmMigrations(this.db, { fts5Available: this.fts5Available });
-      this.migrated = true;
-
-      // Verify tables were actually created
-      const tables = this.db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .all() as Array<{ name: string }>;
-      if (tables.length === 0) {
-        this.deps.log.warn(
-          "[lcm] Migration completed but database has zero tables — DB may be non-functional",
-        );
-      } else {
-        migrationOk = true;
-        this.deps.log.debug(
-          `[lcm] Migration successful — ${tables.length} tables: ${tables.map((t) => t.name).join(", ")}`,
-        );
-      }
-    } catch (err) {
-      this.deps.log.error(
-        `[lcm] Migration failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-
-    // Only claim ownership of compaction when the DB is operational.
-    // Without a working schema, ownsCompaction would disable the runtime's
-    // built-in compaction safeguard and inflate the context budget.
-    this.info = {
-      id: "lcm",
-      name: "Lossless Context Management Engine",
-      version: "0.1.0",
-      ownsCompaction: migrationOk,
-    };
-
-    this.conversationStore = new ConversationStore(this.db, {
-      fts5Available: this.fts5Available,
-    });
-    this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    this.conversationStore = new ConversationStore(db, { fts5Available: this.fts5Available });
+    this.summaryStore = new SummaryStore(db, { fts5Available: this.fts5Available });
 
     if (!this.fts5Available) {
       this.deps.log.warn(
         "[lcm] FTS5 unavailable in the current Node runtime; full_text search will fall back to LIKE and indexing is disabled",
       );
-    }
-    if (this.config.ignoreSessionPatterns.length > 0) {
-      logStartupBannerOnce({
-        key: "ignore-session-patterns",
-        log: (message) => this.deps.log.info(message),
-        message: `[lcm] Ignoring sessions matching ${this.config.ignoreSessionPatterns.length} pattern(s): ${this.config.ignoreSessionPatterns.join(", ")}`,
-      });
-    }
-    if (this.config.skipStatelessSessions && this.config.statelessSessionPatterns.length > 0) {
-      logStartupBannerOnce({
-        key: "stateless-session-patterns",
-        log: (message) => this.deps.log.info(message),
-        message: `[lcm] Stateless session patterns: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
-      });
     }
 
     this.assembler = new ContextAssembler(
@@ -1071,81 +642,45 @@ export class LcmContextEngine implements ContextEngine {
     this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore);
   }
 
-  /**
-   * Check whether a session should be excluded from LCM processing.
-   *
-   * We prefer sessionKey matching because the configured glob patterns are
-   * documented in terms of session keys, but we fall back to sessionId for
-   * older call sites that may not provide the key yet.
-   */
-  private shouldIgnoreSession(params: { sessionId?: string; sessionKey?: string }): boolean {
-    if (this.ignoreSessionPatterns.length === 0) {
-      return false;
-    }
-
-    const candidate =
-      typeof params.sessionKey === "string" && params.sessionKey.trim()
-        ? params.sessionKey.trim()
-        : (params.sessionId?.trim() ?? "");
-    if (!candidate) {
-      return false;
-    }
-
-    return matchesSessionPattern(candidate, this.ignoreSessionPatterns);
-  }
-
-  /** Check whether a session key should skip all LCM writes while remaining readable. */
-  isStatelessSession(sessionKey: string | undefined): boolean {
-    const trimmedKey = typeof sessionKey === "string" ? sessionKey.trim() : "";
-    if (
-      !this.config.skipStatelessSessions
-      || !trimmedKey
-      || this.statelessSessionPatterns.length === 0
-    ) {
-      return false;
-    }
-    return matchesSessionPattern(trimmedKey, this.statelessSessionPatterns);
-  }
-
   /** Ensure DB schema is up-to-date. Called lazily on first bootstrap/ingest/assemble/compact. */
   private ensureMigrated(): void {
     if (this.migrated) {
       return;
     }
-    runLcmMigrations(this.db, { fts5Available: this.fts5Available });
+    const db = getLcmConnection(this.config.databasePath);
+    runLcmMigrations(db, { fts5Available: this.fts5Available });
     this.migrated = true;
   }
 
   /**
-   * Serialize mutating operations per stable session identity to prevent
-   * ingest/compaction races across runtime UUID recycling.
+   * Serialize mutating operations per session to prevent ingest/compaction races.
    */
-  private async withSessionQueue<T>(queueKey: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.sessionOperationQueues.get(queueKey) ?? Promise.resolve();
+  private async withSessionQueue<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const entry = this.sessionOperationQueues.get(sessionId);
+    const previous = entry?.promise ?? Promise.resolve();
     let releaseQueue: () => void = () => {};
     const current = new Promise<void>((resolve) => {
       releaseQueue = resolve;
     });
     const next = previous.catch(() => {}).then(() => current);
-    this.sessionOperationQueues.set(queueKey, next);
+
+    if (entry) {
+      entry.promise = next;
+      entry.refCount++;
+    } else {
+      this.sessionOperationQueues.set(sessionId, { promise: next, refCount: 1 });
+    }
 
     await previous.catch(() => {});
     try {
       return await operation();
     } finally {
       releaseQueue();
-      void next.finally(() => {
-        if (this.sessionOperationQueues.get(queueKey) === next) {
-          this.sessionOperationQueues.delete(queueKey);
-        }
-      });
+      const queueEntry = this.sessionOperationQueues.get(sessionId);
+      if (queueEntry && --queueEntry.refCount === 0) {
+        this.sessionOperationQueues.delete(sessionId);
+      }
     }
-  }
-
-  /** Prefer stable session keys for queue serialization when available. */
-  private resolveSessionQueueKey(sessionId: string, sessionKey?: string): string {
-    const normalizedSessionKey = sessionKey?.trim();
-    return normalizedSessionKey || sessionId;
   }
 
   /** Normalize optional live token estimates supplied by runtime callers. */
@@ -1159,10 +694,9 @@ export class LcmContextEngine implements ContextEngine {
   /** Resolve token budget from direct params or legacy fallback input. */
   private resolveTokenBudget(params: {
     tokenBudget?: number;
-    runtimeContext?: Record<string, unknown>;
     legacyParams?: Record<string, unknown>;
   }): number | undefined {
-    const lp = asRecord(params.runtimeContext) ?? params.legacyParams ?? {};
+    const lp = params.legacyParams ?? {};
     if (
       typeof params.tokenBudget === "number" &&
       Number.isFinite(params.tokenBudget) &&
@@ -1189,20 +723,12 @@ export class LcmContextEngine implements ContextEngine {
       return undefined;
     }
     try {
-      const bySessionKey = await this.conversationStore.getConversationForSession({
-        sessionKey: trimmedKey,
-      });
-      if (bySessionKey) {
-        return bySessionKey.conversationId;
-      }
-
       const runtimeSessionId = await this.deps.resolveSessionIdFromSessionKey(trimmedKey);
       if (!runtimeSessionId) {
         return undefined;
       }
-      const conversation = await this.conversationStore.getConversationForSession({
-        sessionId: runtimeSessionId,
-      });
+      const conversation =
+        await this.conversationStore.getConversationBySessionId(runtimeSessionId);
       return conversation?.conversationId;
     } catch {
       return undefined;
@@ -1294,53 +820,6 @@ export class LcmContextEngine implements ContextEngine {
     return filePath;
   }
 
-  /** Persist a large text payload and return the resulting compact placeholder. */
-  private async externalizeLargeTextPayload(params: {
-    conversationId: number;
-    content: string;
-    fileName?: string;
-    mimeType?: string;
-    formatReference: (input: { fileId: string; byteSize: number; summary: string }) => string;
-  }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
-    const summarizeText = await this.resolveLargeFileTextSummarizer();
-    const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const extension = extensionFromNameOrMime(params.fileName, params.mimeType);
-    const storageUri = await this.storeLargeFileContent({
-      conversationId: params.conversationId,
-      fileId,
-      extension,
-      content: params.content,
-    });
-    const byteSize = Buffer.byteLength(params.content, "utf8");
-    const explorationSummary = await generateExplorationSummary({
-      content: params.content,
-      fileName: params.fileName,
-      mimeType: params.mimeType,
-      summarizeText,
-    });
-
-    await this.summaryStore.insertLargeFile({
-      fileId,
-      conversationId: params.conversationId,
-      fileName: params.fileName,
-      mimeType: params.mimeType,
-      byteSize,
-      storageUri,
-      explorationSummary,
-    });
-
-    return {
-      fileId,
-      byteSize,
-      summary: explorationSummary,
-      reference: params.formatReference({
-        fileId,
-        byteSize,
-        summary: explorationSummary,
-      }),
-    };
-  }
-
   /**
    * Intercept oversized <file> blocks before persistence and replace them with
    * compact file references backed by large_files records.
@@ -1355,6 +834,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const threshold = Math.max(1, this.config.largeFileTokenThreshold);
+    const summarizeText = await this.resolveLargeFileTextSummarizer();
     const fileIds: string[] = [];
     const rewrittenSegments: string[] = [];
     let cursor = 0;
@@ -1367,25 +847,44 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       interceptedAny = true;
-      const externalized = await this.externalizeLargeTextPayload({
+      const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      const extension = extensionFromNameOrMime(block.fileName, block.mimeType);
+      const storageUri = await this.storeLargeFileContent({
         conversationId: params.conversationId,
+        fileId,
+        extension,
+        content: block.text,
+      });
+      const byteSize = Buffer.byteLength(block.text, "utf8");
+      const explorationSummary = await generateExplorationSummary({
         content: block.text,
         fileName: block.fileName,
         mimeType: block.mimeType,
-        formatReference: ({ fileId, byteSize, summary }) =>
-          formatFileReference({
-            fileId,
-            fileName: block.fileName,
-            mimeType: block.mimeType,
-            byteSize,
-            summary,
-          }),
+        summarizeText,
+      });
+
+      await this.summaryStore.insertLargeFile({
+        fileId,
+        conversationId: params.conversationId,
+        fileName: block.fileName,
+        mimeType: block.mimeType,
+        byteSize,
+        storageUri,
+        explorationSummary,
       });
 
       rewrittenSegments.push(params.content.slice(cursor, block.start));
-      rewrittenSegments.push(externalized.reference);
+      rewrittenSegments.push(
+        formatFileReference({
+          fileId,
+          fileName: block.fileName,
+          mimeType: block.mimeType,
+          byteSize,
+          summary: explorationSummary,
+        }),
+      );
       cursor = block.end;
-      fileIds.push(externalized.fileId);
+      fileIds.push(fileId);
     }
 
     if (!interceptedAny) {
@@ -1399,146 +898,6 @@ export class LcmContextEngine implements ContextEngine {
     };
   }
 
-  /** Externalize oversized textual tool outputs before they are persisted inline. */
-  private async interceptLargeToolResults(params: {
-    conversationId: number;
-    message: AgentMessage;
-  }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
-    if (
-      (params.message.role !== "toolResult" && params.message.role !== "tool") ||
-      !("content" in params.message)
-    ) {
-      return null;
-    }
-    if (!Array.isArray(params.message.content)) {
-      return null;
-    }
-
-    const threshold = Math.max(1, this.config.largeFileTokenThreshold);
-    const rewrittenContent: unknown[] = [];
-    const fileIds: string[] = [];
-    let interceptedAny = false;
-    const topLevel = params.message as Record<string, unknown>;
-    const topLevelToolCallId =
-      safeString(topLevel.toolCallId) ??
-      safeString(topLevel.tool_call_id) ??
-      safeString(topLevel.toolUseId) ??
-      safeString(topLevel.tool_use_id) ??
-      safeString(topLevel.call_id) ??
-      safeString(topLevel.id);
-    const topLevelToolName =
-      safeString(topLevel.toolName) ??
-      safeString(topLevel.tool_name);
-    const topLevelIsError =
-      safeBoolean(topLevel.isError) ??
-      safeBoolean(topLevel.is_error);
-
-    for (const item of params.message.content) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) {
-        rewrittenContent.push(item);
-        continue;
-      }
-
-      const record = item as Record<string, unknown>;
-      const rawType = safeString(record.type);
-      const isStructuredToolResult =
-        rawType !== "tool_result" &&
-        rawType !== "toolResult" &&
-        rawType !== "function_call_output";
-      const isPlainTextToolResult =
-        rawType === "text" &&
-        typeof record.text === "string";
-      if (isStructuredToolResult && !isPlainTextToolResult) {
-        rewrittenContent.push(item);
-        continue;
-      }
-
-      const textSource =
-        isPlainTextToolResult
-          ? record.text
-          : record.output !== undefined
-          ? record.output
-          : record.content !== undefined
-            ? record.content
-            : record;
-      const extractedText = extractStructuredText(textSource);
-      if (typeof extractedText !== "string" || estimateTokens(extractedText) < threshold) {
-        rewrittenContent.push(item);
-        continue;
-      }
-
-      interceptedAny = true;
-      const toolName =
-        safeString(record.name) ??
-        topLevelToolName ??
-        "tool-result";
-      const externalized = await this.externalizeLargeTextPayload({
-        conversationId: params.conversationId,
-        content: extractedText,
-        fileName: `${toolName}.txt`,
-        mimeType: "text/plain",
-        formatReference: ({ fileId, byteSize, summary }) =>
-          formatToolOutputReference({
-            fileId,
-            toolName,
-            byteSize,
-            summary,
-          }),
-      });
-
-      const normalizedRawType =
-        rawType === "function_call_output" ? "function_call_output" : "tool_result";
-      const compactBlock: Record<string, unknown> = {
-        type: normalizedRawType,
-        output: externalized.reference,
-        externalizedFileId: externalized.fileId,
-        originalByteSize: externalized.byteSize,
-        toolOutputExternalized: true,
-        externalizationReason: "large_tool_result",
-      };
-      const callId =
-        safeString(record.tool_use_id) ??
-        safeString(record.toolUseId) ??
-        safeString(record.tool_call_id) ??
-        safeString(record.toolCallId) ??
-        safeString(record.call_id) ??
-        safeString(record.id) ??
-        topLevelToolCallId;
-      if (callId) {
-        if (normalizedRawType === "function_call_output") {
-          compactBlock.call_id = callId;
-        } else {
-          compactBlock.tool_use_id = callId;
-        }
-      }
-      if (typeof record.is_error === "boolean") {
-        compactBlock.is_error = record.is_error;
-      } else if (typeof record.isError === "boolean") {
-        compactBlock.isError = record.isError;
-      } else if (typeof topLevelIsError === "boolean") {
-        compactBlock.isError = topLevelIsError;
-      }
-      if (toolName) {
-        compactBlock.name = toolName;
-      }
-
-      rewrittenContent.push(compactBlock);
-      fileIds.push(externalized.fileId);
-    }
-
-    if (!interceptedAny) {
-      return null;
-    }
-
-    return {
-      rewrittenMessage: {
-        ...params.message,
-        content: rewrittenContent,
-      } as AgentMessage,
-      fileIds,
-    };
-  }
-
   // ── ContextEngine interface ─────────────────────────────────────────────
 
   /**
@@ -1547,7 +906,6 @@ export class LcmContextEngine implements ContextEngine {
    */
   private async reconcileSessionTail(params: {
     sessionId: string;
-    sessionKey?: string;
     conversationId: number;
     historicalMessages: AgentMessage[];
   }): Promise<{
@@ -1643,7 +1001,7 @@ export class LcmContextEngine implements ContextEngine {
     const missingTail = historicalMessages.slice(anchorIndex + 1);
     let importedMessages = 0;
     for (const message of missingTail) {
-      const result = await this.ingestSingle({ sessionId, sessionKey: params.sessionKey, message });
+      const result = await this.ingestSingle({ sessionId, message });
       if (result.ingested) {
         importedMessages += 1;
       }
@@ -1652,260 +1010,108 @@ export class LcmContextEngine implements ContextEngine {
     return { importedMessages, hasOverlap: true };
   }
 
-  async bootstrap(params: {
-    sessionId: string;
-    sessionFile: string;
-    sessionKey?: string;
-  }): Promise<BootstrapResult> {
-    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      return {
-        bootstrapped: false,
-        importedMessages: 0,
-        reason: "session excluded by pattern",
-      };
-    }
-    if (this.isStatelessSession(params.sessionKey)) {
-      return {
-        bootstrapped: false,
-        importedMessages: 0,
-        reason: "stateless session",
-      };
-    }
+  async bootstrap(params: { sessionId: string; sessionFile: string }): Promise<BootstrapResult> {
     this.ensureMigrated();
-    const sessionFileStats = statSync(params.sessionFile);
-    const sessionFileSize = sessionFileStats.size;
-    const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
 
-    const result = await this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () =>
-        this.conversationStore.withTransaction(async () => {
-          const persistBootstrapState = async (
-            conversationId: number,
-            historicalMessages: AgentMessage[],
-          ): Promise<void> => {
-            const lastMessage =
-              historicalMessages.length > 0
-                ? toStoredMessage(historicalMessages[historicalMessages.length - 1]!)
-                : null;
-            await this.summaryStore.upsertConversationBootstrapState({
-              conversationId,
-              sessionFilePath: params.sessionFile,
-              lastSeenSize: sessionFileSize,
-              lastSeenMtimeMs: sessionFileMtimeMs,
-              lastProcessedOffset: sessionFileSize,
-              lastProcessedEntryHash: createBootstrapEntryHash(lastMessage),
-            });
-          };
+    const result = await this.withSessionQueue(params.sessionId, async () =>
+      this.conversationStore.withTransaction(async () => {
+        const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId);
+        const conversationId = conversation.conversationId;
+        const historicalMessages = readLeafPathMessages(params.sessionFile);
 
-          const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
-            sessionKey: params.sessionKey,
-          });
-          const conversationId = conversation.conversationId;
-          const existingCount = await this.conversationStore.getMessageCount(conversationId);
-          const bootstrapState =
-            existingCount > 0
-              ? await this.summaryStore.getConversationBootstrapState(conversationId)
-              : null;
-
-          // If the transcript file is byte-for-byte unchanged from the last
-          // successful bootstrap checkpoint, skip reopening and reparsing it.
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath === params.sessionFile &&
-            bootstrapState.lastSeenSize === sessionFileSize &&
-            bootstrapState.lastSeenMtimeMs === sessionFileMtimeMs
-          ) {
-            if (!conversation.bootstrappedAt) {
-              await this.conversationStore.markConversationBootstrapped(conversationId);
-            }
+        // First-time import path: no LCM rows yet, so seed directly from the
+        // active leaf context snapshot.
+        const existingCount = await this.conversationStore.getMessageCount(conversationId);
+        if (existingCount === 0) {
+          if (historicalMessages.length === 0) {
+            await this.conversationStore.markConversationBootstrapped(conversationId);
             return {
               bootstrapped: false,
               importedMessages: 0,
-              reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
+              reason: "no leaf-path messages in session",
             };
           }
 
-          if (
-            existingCount > 0 &&
-            bootstrapState &&
-            bootstrapState.sessionFilePath === params.sessionFile &&
-            sessionFileSize > bootstrapState.lastSeenSize &&
-            sessionFileMtimeMs >= bootstrapState.lastSeenMtimeMs
-          ) {
-            const latestDbMessage = await this.conversationStore.getLastMessage(conversationId);
-            const latestDbHash = latestDbMessage
-              ? createBootstrapEntryHash({
-                  role: latestDbMessage.role,
-                  content: latestDbMessage.content,
-                  tokenCount: latestDbMessage.tokenCount,
-                })
-              : null;
-            const tailEntryRaw = readLastJsonlEntryBeforeOffset(
-              params.sessionFile,
-              bootstrapState.lastProcessedOffset,
-            );
-            const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
-            const tailEntryHash = tailEntryMessage
-              ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
-              : null;
-
-            if (
-              latestDbHash &&
-              latestDbHash === bootstrapState.lastProcessedEntryHash &&
-              tailEntryHash &&
-              tailEntryHash === bootstrapState.lastProcessedEntryHash
-            ) {
-              const appended = readAppendedLeafPathMessages({
-                sessionFile: params.sessionFile,
-                offset: bootstrapState.lastProcessedOffset,
-              });
-              if (appended.canUseAppendOnly) {
-                if (!conversation.bootstrappedAt) {
-                  await this.conversationStore.markConversationBootstrapped(conversationId);
-                }
-
-                let importedMessages = 0;
-                for (const message of appended.messages) {
-                  const ingestResult = await this.ingestSingle({
-                    sessionId: params.sessionId,
-                    sessionKey: params.sessionKey,
-                    message,
-                  });
-                  if (ingestResult.ingested) {
-                    importedMessages += 1;
-                  }
-                }
-
-                const lastAppendedMessage =
-                  appended.messages.length > 0
-                    ? appended.messages[appended.messages.length - 1]!
-                    : tailEntryMessage;
-                await persistBootstrapState(
-                  conversationId,
-                  lastAppendedMessage ? [lastAppendedMessage] : [],
-                );
-
-                if (importedMessages > 0) {
-                  return {
-                    bootstrapped: true,
-                    importedMessages,
-                    reason: "reconciled missing session messages",
-                  };
-                }
-
-                return {
-                  bootstrapped: false,
-                  importedMessages: 0,
-                  reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
-                };
-              }
-            }
-          }
-
-          const historicalMessages = await readLeafPathMessages(params.sessionFile);
-
-          // First-time import path: no LCM rows yet, so seed directly from the
-          // active leaf context snapshot.
-          if (existingCount === 0) {
-            if (historicalMessages.length === 0) {
-              await this.conversationStore.markConversationBootstrapped(conversationId);
-              await persistBootstrapState(conversationId, historicalMessages);
-              return {
-                bootstrapped: false,
-                importedMessages: 0,
-                reason: "no leaf-path messages in session",
-              };
-            }
-
-            const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
-            const bulkInput = historicalMessages.map((message, index) => {
-              const stored = toStoredMessage(message);
-              return {
-                conversationId,
-                seq: nextSeq + index,
-                role: stored.role,
-                content: stored.content,
-                tokenCount: stored.tokenCount,
-              };
-            });
-
-            const inserted = await this.conversationStore.createMessagesBulk(bulkInput);
-            await this.summaryStore.appendContextMessages(
-              conversationId,
-              inserted.map((record) => record.messageId),
-            );
-            await this.conversationStore.markConversationBootstrapped(conversationId);
-            await persistBootstrapState(conversationId, historicalMessages);
-
-            // Prune HEARTBEAT_OK turns from the freshly imported data
-            if (this.config.pruneHeartbeatOk) {
-              const pruned = await this.pruneHeartbeatOkTurns(conversationId);
-              if (pruned > 0) {
-                console.error(
-                  `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
-                );
-              }
-            }
-
+          const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
+          const bulkInput = historicalMessages.map((message, index) => {
+            const stored = toStoredMessage(message);
             return {
-              bootstrapped: true,
-              importedMessages: inserted.length,
+              conversationId,
+              seq: nextSeq + index,
+              role: stored.role,
+              content: stored.content,
+              tokenCount: stored.tokenCount,
             };
-          }
+          });
 
-          // Existing conversation path: reconcile crash gaps by appending JSONL
-          // messages that were never persisted to LCM.
-          const reconcile = await this.reconcileSessionTail({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
+          const inserted = await this.conversationStore.createMessagesBulk(bulkInput);
+          await this.summaryStore.appendContextMessages(
             conversationId,
-            historicalMessages,
-          });
+            inserted.map((record) => record.messageId),
+          );
+          await this.conversationStore.markConversationBootstrapped(conversationId);
 
-          if (!conversation.bootstrappedAt) {
-            await this.conversationStore.markConversationBootstrapped(conversationId);
-          }
-
-          if (reconcile.importedMessages > 0) {
-            await persistBootstrapState(conversationId, historicalMessages);
-            return {
-              bootstrapped: true,
-              importedMessages: reconcile.importedMessages,
-              reason: "reconciled missing session messages",
-            };
-          }
-
-          if (reconcile.hasOverlap) {
-            await persistBootstrapState(conversationId, historicalMessages);
-          }
-
-          if (conversation.bootstrappedAt) {
-            return {
-              bootstrapped: false,
-              importedMessages: 0,
-              reason: "already bootstrapped",
-            };
+          // Prune HEARTBEAT_OK turns from the freshly imported data
+          if (this.config.pruneHeartbeatOk) {
+            const pruned = await this.pruneHeartbeatOkTurns(conversationId);
+            if (pruned > 0) {
+              console.error(
+                `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
+              );
+            }
           }
 
           return {
+            bootstrapped: true,
+            importedMessages: inserted.length,
+          };
+        }
+
+        // Existing conversation path: reconcile crash gaps by appending JSONL
+        // messages that were never persisted to LCM.
+        const reconcile = await this.reconcileSessionTail({
+          sessionId: params.sessionId,
+          conversationId,
+          historicalMessages,
+        });
+
+        if (!conversation.bootstrappedAt) {
+          await this.conversationStore.markConversationBootstrapped(conversationId);
+        }
+
+        if (reconcile.importedMessages > 0) {
+          return {
+            bootstrapped: true,
+            importedMessages: reconcile.importedMessages,
+            reason: "reconciled missing session messages",
+          };
+        }
+
+        if (conversation.bootstrappedAt) {
+          return {
             bootstrapped: false,
             importedMessages: 0,
-            reason: reconcile.hasOverlap
-              ? "conversation already up to date"
-              : "conversation already has messages",
+            reason: "already bootstrapped",
           };
-        }),
+        }
+
+        return {
+          bootstrapped: false,
+          importedMessages: 0,
+          reason: reconcile.hasOverlap
+            ? "conversation already up to date"
+            : "conversation already has messages",
+        };
+      }),
     );
 
     // Post-bootstrap pruning: clean HEARTBEAT_OK turns that were already
     // in the DB from prior bootstrap cycles (before pruning was enabled).
     if (this.config.pruneHeartbeatOk && result.bootstrapped === false) {
       try {
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-        });
+        const conversation = await this.conversationStore.getConversationBySessionId(
+          params.sessionId,
+        );
         if (conversation) {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
@@ -1927,20 +1133,17 @@ export class LcmContextEngine implements ContextEngine {
 
   private async ingestSingle(params: {
     sessionId: string;
-    sessionKey?: string;
     message: AgentMessage;
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
-    const { sessionId, sessionKey, message, isHeartbeat } = params;
+    const { sessionId, message, isHeartbeat } = params;
     if (isHeartbeat) {
       return { ingested: false };
     }
     const stored = toStoredMessage(message);
 
     // Get or create conversation for this session
-    const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
-      sessionKey,
-    });
+    const conversation = await this.conversationStore.getOrCreateConversation(sessionId);
     const conversationId = conversation.conversationId;
 
     let messageForParts = message;
@@ -1958,17 +1161,6 @@ export class LcmContextEngine implements ContextEngine {
             content: stored.content,
           } as AgentMessage;
         }
-      }
-    } else if (stored.role === "tool") {
-      const intercepted = await this.interceptLargeToolResults({
-        conversationId,
-        message,
-      });
-      if (intercepted) {
-        messageForParts = intercepted.rewrittenMessage;
-        const rewrittenStored = toStoredMessage(intercepted.rewrittenMessage);
-        stored.content = rewrittenStored.content;
-        stored.tokenCount = rewrittenStored.tokenCount;
       }
     }
 
@@ -2001,79 +1193,48 @@ export class LcmContextEngine implements ContextEngine {
 
   async ingest(params: {
     sessionId: string;
-    sessionKey?: string;
     message: AgentMessage;
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
-    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      return { ingested: false };
-    }
-    if (this.isStatelessSession(params.sessionKey)) {
-      return { ingested: false };
-    }
     this.ensureMigrated();
-    return this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      () => this.ingestSingle(params),
-    );
+    return this.withSessionQueue(params.sessionId, () => this.ingestSingle(params));
   }
 
   async ingestBatch(params: {
     sessionId: string;
-    sessionKey?: string;
     messages: AgentMessage[];
     isHeartbeat?: boolean;
   }): Promise<IngestBatchResult> {
-    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      return { ingestedCount: 0 };
-    }
-    if (this.isStatelessSession(params.sessionKey)) {
-      return { ingestedCount: 0 };
-    }
     this.ensureMigrated();
     if (params.messages.length === 0) {
       return { ingestedCount: 0 };
     }
-    return this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () => {
-        let ingestedCount = 0;
-        for (const message of params.messages) {
-          const result = await this.ingestSingle({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            message,
-            isHeartbeat: params.isHeartbeat,
-          });
-          if (result.ingested) {
-            ingestedCount += 1;
-          }
+    return this.withSessionQueue(params.sessionId, async () => {
+      let ingestedCount = 0;
+      for (const message of params.messages) {
+        const result = await this.ingestSingle({
+          sessionId: params.sessionId,
+          message,
+          isHeartbeat: params.isHeartbeat,
+        });
+        if (result.ingested) {
+          ingestedCount += 1;
         }
-        return { ingestedCount };
-      },
-    );
+      }
+      return { ingestedCount };
+    });
   }
 
   async afterTurn(params: {
     sessionId: string;
-    sessionKey?: string;
     sessionFile: string;
     messages: AgentMessage[];
     prePromptMessageCount: number;
     autoCompactionSummary?: string;
     isHeartbeat?: boolean;
     tokenBudget?: number;
-    /** OpenClaw runtime param name (preferred). */
-    runtimeContext?: Record<string, unknown>;
-    /** Back-compat param name. */
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
-    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      return;
-    }
-    if (this.isStatelessSession(params.sessionKey)) {
-      return;
-    }
     this.ensureMigrated();
 
     const ingestBatch: AgentMessage[] = [];
@@ -2093,45 +1254,34 @@ export class LcmContextEngine implements ContextEngine {
     try {
       await this.ingestBatch({
         sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
         messages: ingestBatch,
         isHeartbeat: params.isHeartbeat === true,
       });
-    } catch (err) {
-      // Never compact a stale or partially ingested frontier.
-      console.error(
-        `[lcm] afterTurn: ingest failed, skipping compaction:`,
-        err instanceof Error ? err.message : err,
-      );
-      return;
+    } catch {
+      // Continue with proactive compaction even if ingest fails.
     }
 
-    const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
-    const DEFAULT_AFTER_TURN_TOKEN_BUDGET = 128_000;
-    const resolvedTokenBudget = this.resolveTokenBudget({
-      tokenBudget: params.tokenBudget,
-      runtimeContext: params.runtimeContext,
-      legacyParams,
-    });
-    const tokenBudget = resolvedTokenBudget ?? DEFAULT_AFTER_TURN_TOKEN_BUDGET;
-    if (resolvedTokenBudget === undefined) {
-      console.warn(
-        `[lcm] afterTurn: tokenBudget not provided; using default ${DEFAULT_AFTER_TURN_TOKEN_BUDGET}`,
-      );
+    const tokenBudget =
+      typeof params.tokenBudget === "number" &&
+      Number.isFinite(params.tokenBudget) &&
+      params.tokenBudget > 0
+        ? Math.floor(params.tokenBudget)
+        : undefined;
+    if (!tokenBudget) {
+      return;
     }
 
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
 
     try {
-      const leafTrigger = await this.evaluateLeafTrigger(params.sessionId, params.sessionKey);
+      const leafTrigger = await this.evaluateLeafTrigger(params.sessionId);
       if (leafTrigger.shouldCompact) {
         this.compactLeafAsync({
           sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
           sessionFile: params.sessionFile,
           tokenBudget,
           currentTokenCount: liveContextTokens,
-          legacyParams,
+          legacyParams: params.legacyCompactionParams,
         }).catch(() => {
           // Leaf compaction is best-effort and should not fail the caller.
         });
@@ -2143,12 +1293,11 @@ export class LcmContextEngine implements ContextEngine {
     try {
       await this.compact({
         sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
         sessionFile: params.sessionFile,
         tokenBudget,
         currentTokenCount: liveContextTokens,
         compactionTarget: "threshold",
-        legacyParams,
+        legacyParams: params.legacyCompactionParams,
       });
     } catch {
       // Proactive compaction is best-effort in the post-turn lifecycle.
@@ -2157,23 +1306,15 @@ export class LcmContextEngine implements ContextEngine {
 
   async assemble(params: {
     sessionId: string;
-    sessionKey?: string;
     messages: AgentMessage[];
     tokenBudget?: number;
   }): Promise<AssembleResult> {
-    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      return {
-        messages: params.messages,
-        estimatedTokens: 0,
-      };
-    }
     try {
       this.ensureMigrated();
 
-      const conversation = await this.conversationStore.getConversationForSession({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-      });
+      const conversation = await this.conversationStore.getConversationBySessionId(
+        params.sessionId,
+      );
       if (!conversation) {
         return {
           messages: params.messages,
@@ -2239,16 +1380,13 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /** Evaluate whether incremental leaf compaction should run for a session. */
-  async evaluateLeafTrigger(sessionId: string, sessionKey?: string): Promise<{
+  async evaluateLeafTrigger(sessionId: string): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
     this.ensureMigrated();
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId,
-      sessionKey,
-    });
+    const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
     if (!conversation) {
       const fallbackThreshold =
         typeof this.config.leafChunkTokens === "number" &&
@@ -2268,148 +1406,104 @@ export class LcmContextEngine implements ContextEngine {
   /** Run one incremental leaf compaction pass in the per-session queue. */
   async compactLeafAsync(params: {
     sessionId: string;
-    sessionKey?: string;
     sessionFile: string;
     tokenBudget?: number;
     currentTokenCount?: number;
     customInstructions?: string;
-    /** OpenClaw runtime param name (preferred). */
-    runtimeContext?: Record<string, unknown>;
-    /** Back-compat param name. */
     legacyParams?: Record<string, unknown>;
     force?: boolean;
     previousSummaryContent?: string;
   }): Promise<CompactResult> {
-    if (this.isStatelessSession(params.sessionKey)) {
-      return {
-        ok: true,
-        compacted: false,
-        reason: "stateless session",
-      };
-    }
     this.ensureMigrated();
-    return this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () => {
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-        });
-        if (!conversation) {
-          return {
-            ok: true,
-            compacted: false,
-            reason: "no conversation found for session",
-          };
-        }
-
-        const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
-        const tokenBudget = this.resolveTokenBudget({
-          tokenBudget: params.tokenBudget,
-          runtimeContext: params.runtimeContext,
-          legacyParams,
-        });
-        if (!tokenBudget) {
-          return {
-            ok: false,
-            compacted: false,
-            reason: "missing token budget in compact params",
-          };
-        }
-
-        const lp = legacyParams ?? {};
-        const observedTokens = this.normalizeObservedTokenCount(
-          params.currentTokenCount ??
-            (
-              lp as {
-                currentTokenCount?: unknown;
-              }
-            ).currentTokenCount,
-        );
-        const summarize = await this.resolveSummarize({
-          legacyParams,
-          customInstructions: params.customInstructions,
-        });
-
-        const leafResult = await this.compaction.compactLeaf({
-          conversationId: conversation.conversationId,
-          tokenBudget,
-          summarize,
-          force: params.force,
-          previousSummaryContent: params.previousSummaryContent,
-        });
-        const tokensBefore = observedTokens ?? leafResult.tokensBefore;
-
+    return this.withSessionQueue(params.sessionId, async () => {
+      const conversation = await this.conversationStore.getConversationBySessionId(
+        params.sessionId,
+      );
+      if (!conversation) {
         return {
           ok: true,
-          compacted: leafResult.actionTaken,
-          reason: leafResult.actionTaken ? "compacted" : "below threshold",
-          result: {
-            tokensBefore,
-            tokensAfter: leafResult.tokensAfter,
-            details: {
-              rounds: leafResult.actionTaken ? 1 : 0,
-              targetTokens: tokenBudget,
-              mode: "leaf",
-            },
-          },
+          compacted: false,
+          reason: "no conversation found for session",
         };
-      },
-    );
+      }
+
+      const tokenBudget = this.resolveTokenBudget(params);
+      if (!tokenBudget) {
+        return {
+          ok: false,
+          compacted: false,
+          reason: "missing token budget in compact params",
+        };
+      }
+
+      const lp = params.legacyParams ?? {};
+      const observedTokens = this.normalizeObservedTokenCount(
+        params.currentTokenCount ??
+          (
+            lp as {
+              currentTokenCount?: unknown;
+            }
+          ).currentTokenCount,
+      );
+      const summarize = await this.resolveSummarize({
+        legacyParams: params.legacyParams,
+        customInstructions: params.customInstructions,
+      });
+
+      const leafResult = await this.compaction.compactLeaf({
+        conversationId: conversation.conversationId,
+        tokenBudget,
+        summarize,
+        force: params.force,
+        previousSummaryContent: params.previousSummaryContent,
+      });
+      const tokensBefore = observedTokens ?? leafResult.tokensBefore;
+
+      return {
+        ok: true,
+        compacted: leafResult.actionTaken,
+        reason: leafResult.actionTaken ? "compacted" : "below threshold",
+        result: {
+          tokensBefore,
+          tokensAfter: leafResult.tokensAfter,
+          details: {
+            rounds: leafResult.actionTaken ? 1 : 0,
+            targetTokens: tokenBudget,
+            mode: "leaf",
+          },
+        },
+      };
+    });
   }
 
   async compact(params: {
     sessionId: string;
-    sessionKey?: string;
     sessionFile: string;
     tokenBudget?: number;
     currentTokenCount?: number;
     compactionTarget?: "budget" | "threshold";
     customInstructions?: string;
-    /** OpenClaw runtime param name (preferred). */
-    runtimeContext?: Record<string, unknown>;
-    /** Back-compat param name. */
     legacyParams?: Record<string, unknown>;
     /** Force compaction even if below threshold */
     force?: boolean;
   }): Promise<CompactResult> {
-    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      return {
-        ok: true,
-        compacted: false,
-        reason: "session excluded",
-      };
-    }
-    if (this.isStatelessSession(params.sessionKey)) {
-      return {
-        ok: true,
-        compacted: false,
-        reason: "stateless session",
-      };
-    }
     this.ensureMigrated();
-    return this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () => {
-        const { sessionId, force = false } = params;
+    return this.withSessionQueue(params.sessionId, async () => {
+      const { sessionId, force = false } = params;
 
-        // Look up conversation
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId,
-          sessionKey: params.sessionKey,
-        });
-        if (!conversation) {
-          return {
-            ok: true,
-            compacted: false,
-            reason: "no conversation found for session",
-          };
-        }
+      // Look up conversation
+      const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
+      if (!conversation) {
+        return {
+          ok: true,
+          compacted: false,
+          reason: "no conversation found for session",
+        };
+      }
 
-        const conversationId = conversation.conversationId;
+      const conversationId = conversation.conversationId;
 
-      const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
-      const lp = legacyParams ?? {};
+      const lp = params.legacyParams ?? {};
       const manualCompactionRequested =
         (
           lp as {
@@ -2417,11 +1511,7 @@ export class LcmContextEngine implements ContextEngine {
           }
         ).manualCompaction === true;
       const forceCompaction = force || manualCompactionRequested;
-      const tokenBudget = this.resolveTokenBudget({
-        tokenBudget: params.tokenBudget,
-        runtimeContext: params.runtimeContext,
-        legacyParams,
-      });
+      const tokenBudget = this.resolveTokenBudget(params);
       if (!tokenBudget) {
         return {
           ok: false,
@@ -2431,7 +1521,7 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const summarize = await this.resolveSummarize({
-        legacyParams,
+        legacyParams: params.legacyParams,
         customInstructions: params.customInstructions,
       });
 
@@ -2529,8 +1619,7 @@ export class LcmContextEngine implements ContextEngine {
           },
         },
       };
-      },
-    );
+    });
   }
 
   async prepareSubagentSpawn(params: {
@@ -2538,14 +1627,6 @@ export class LcmContextEngine implements ContextEngine {
     childSessionKey: string;
     ttlMs?: number;
   }): Promise<SubagentSpawnPreparation | undefined> {
-    if (
-      this.shouldIgnoreSession({ sessionKey: params.parentSessionKey })
-      || this.shouldIgnoreSession({ sessionKey: params.childSessionKey })
-      || this.isStatelessSession(params.parentSessionKey)
-      || this.isStatelessSession(params.childSessionKey)
-    ) {
-      return undefined;
-    }
     this.ensureMigrated();
 
     const childSessionKey = params.childSessionKey.trim();
@@ -2564,34 +1645,11 @@ export class LcmContextEngine implements ContextEngine {
         ? Math.floor(params.ttlMs)
         : undefined;
 
-    // Inherit scope from parent grant if one exists (prevents privilege escalation)
-    const parentGrantId = resolveDelegatedExpansionGrantId(parentSessionKey);
-    const parentGrant = parentGrantId
-      ? getRuntimeExpansionAuthManager().getGrant(parentGrantId)
-      : null;
-
-    const childTokenCap = parentGrant
-      ? Math.min(
-          getRuntimeExpansionAuthManager().getRemainingTokenBudget(parentGrantId!) ?? this.config.maxExpandTokens,
-          this.config.maxExpandTokens,
-        )
-      : this.config.maxExpandTokens;
-
-    const childMaxDepth = parentGrant
-      ? Math.max(0, parentGrant.maxDepth - 1)
-      : undefined;
-
-    const childAllowedSummaryIds = parentGrant?.allowedSummaryIds.length
-      ? parentGrant.allowedSummaryIds
-      : undefined;
-
     createDelegatedExpansionGrant({
       delegatedSessionKey: childSessionKey,
       issuerSessionId: parentSessionKey,
       allowedConversationIds: [conversationId],
-      allowedSummaryIds: childAllowedSummaryIds,
-      tokenCap: childTokenCap,
-      maxDepth: childMaxDepth,
+      tokenCap: this.config.maxExpandTokens,
       ttlMs,
     });
 
@@ -2606,12 +1664,6 @@ export class LcmContextEngine implements ContextEngine {
     childSessionKey: string;
     reason: SubagentEndReason;
   }): Promise<void> {
-    if (
-      this.shouldIgnoreSession({ sessionKey: params.childSessionKey })
-      || this.isStatelessSession(params.childSessionKey)
-    ) {
-      return;
-    }
     const childSessionKey = params.childSessionKey.trim();
     if (!childSessionKey) {
       return;
@@ -2636,7 +1688,7 @@ export class LcmContextEngine implements ContextEngine {
     // OpenClaw's runner calls dispose() after every run, but the plugin
     // registers a single engine instance reused by the factory. Closing
     // the DB here would break subsequent runs with "database is not open".
-    // The shared connection is managed for the lifetime of the plugin process.
+    // The connection is cleaned up on process exit via closeLcmConnection().
   }
 
   // ── Public accessors for retrieval (used by subagent expansion) ─────────
@@ -2688,30 +1740,18 @@ export class LcmContextEngine implements ContextEngine {
         continue;
       }
 
-      // Found an exact HEARTBEAT_OK reply. Walk backward to find the turn start
+      // Found a HEARTBEAT_OK reply. Walk backward to find the turn start
       // (the preceding user message).
-      const turnMessages = [msg];
+      const turnMessageIds: number[] = [msg.messageId];
       for (let j = i - 1; j >= 0; j--) {
         const prev = allMessages[j];
-        turnMessages.push(prev);
+        turnMessageIds.push(prev.messageId);
         if (prev.role === "user") {
           break; // Found turn start
         }
       }
 
-      if (!turnMessages.some((record) => record.role === "user")) {
-        continue;
-      }
-      if (turnMessages.some((record) => record.role === "tool")) {
-        continue;
-      }
-
-      const messageIds = turnMessages.map((record) => record.messageId);
-      const hasToolParts = await this.turnHasToolInteractions(messageIds);
-      if (hasToolParts) {
-        continue;
-      }
-      toDelete.push(...messageIds);
+      toDelete.push(...turnMessageIds);
     }
 
     if (toDelete.length === 0) {
@@ -2722,40 +1762,6 @@ export class LcmContextEngine implements ContextEngine {
     const uniqueIds = [...new Set(toDelete)];
     return this.conversationStore.deleteMessages(uniqueIds);
   }
-
-  private async turnHasToolInteractions(messageIds: number[]): Promise<boolean> {
-    for (const messageId of messageIds) {
-      const parts = await this.conversationStore.getMessageParts(messageId);
-      if (parts.some(messagePartIndicatesToolUsage)) {
-        return true;
-      }
-    }
-    return false;
-  }
-}
-
-// ── Tool-part detection ──────────────────────────────────────────────────────
-
-const TOOL_PART_TYPES: ReadonlySet<string> = new Set(["tool"]);
-
-function messagePartIndicatesToolUsage(part: MessagePartRecord): boolean {
-  if (TOOL_PART_TYPES.has(part.partType)) {
-    return true;
-  }
-  if (part.toolCallId || part.toolName || part.toolInput || part.toolOutput) {
-    return true;
-  }
-  if (typeof part.metadata === "string" && part.metadata.length > 0) {
-    try {
-      const meta = JSON.parse(part.metadata) as Record<string, unknown>;
-      if (typeof meta.rawType === "string" && TOOL_RAW_TYPES.has(meta.rawType)) {
-        return true;
-      }
-    } catch {
-      // ignore
-    }
-  }
-  return false;
 }
 
 // ── Heartbeat detection ─────────────────────────────────────────────────────
@@ -2765,11 +1771,40 @@ const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
 /**
  * Detect whether an assistant message is a heartbeat ack.
  *
- * Only exact (case-insensitive) "HEARTBEAT_OK" acknowledgements are pruned.
- * Any additional text indicates the heartbeat carried real content and should remain.
+ * Matches the same pattern as OpenClaw core's heartbeat-events-filter:
+ * content starts with "heartbeat_ok" (case-insensitive) and any character
+ * immediately after is not alphanumeric or underscore.
+ *
+ * This catches:
+ *   - "HEARTBEAT_OK"
+ *   - "  HEARTBEAT_OK  "
+ *   - "HEARTBEAT_OK — weekend, no market."
+ *   - "Saturday 10:48 AM PT — weekend, no market. HEARTBEAT_OK"
+ *
+ * But not:
+ *   - "HEARTBEAT_OK_EXTENDED" (alphanumeric continuation)
  */
 function isHeartbeatOkContent(content: string): boolean {
-  return content.trim().toLowerCase() === HEARTBEAT_OK_TOKEN;
+  const trimmed = content.trim().toLowerCase();
+  if (!trimmed) {
+    return false;
+  }
+
+  // Check if it starts with the token
+  if (trimmed.startsWith(HEARTBEAT_OK_TOKEN)) {
+    const suffix = trimmed.slice(HEARTBEAT_OK_TOKEN.length);
+    if (suffix.length === 0) {
+      return true;
+    }
+    return !/[a-z0-9_]/.test(suffix[0]);
+  }
+
+  // Also check if it ends with the token (chatty prefix + HEARTBEAT_OK)
+  if (trimmed.endsWith(HEARTBEAT_OK_TOKEN)) {
+    return true;
+  }
+
+  return false;
 }
 
 // ── Emergency fallback summarization ────────────────────────────────────────
