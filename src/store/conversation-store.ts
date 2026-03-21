@@ -622,25 +622,26 @@ export class ConversationStore {
     const limit = input.limit ?? 50;
 
     if (input.mode === "full_text") {
+      // FTS5 unicode61 can return incomplete matches for CJK text, so route
+      // those queries through the existing LIKE fallback path immediately.
+      if (containsCjk(input.query)) {
+        return this.searchLike(
+          input.query,
+          limit,
+          input.conversationId,
+          input.since,
+          input.before,
+        );
+      }
       if (this.fts5Available) {
         try {
-          const results = this.searchFullText(
+          return this.searchFullText(
             input.query,
             limit,
             input.conversationId,
             input.since,
             input.before,
           );
-          if (results.length === 0 && containsCjk(input.query)) {
-            return this.searchLike(
-              input.query,
-              limit,
-              input.conversationId,
-              input.since,
-              input.before,
-            );
-          }
-          return results;
         } catch {
           return this.searchLike(
             input.query,
