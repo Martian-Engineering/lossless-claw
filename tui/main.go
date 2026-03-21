@@ -199,6 +199,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "import-memories" {
+		if err := runImportMemoriesCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "lcm-tui import-memories failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	m := newModel()
 	program := tea.NewProgram(m, tea.WithAltScreen())
