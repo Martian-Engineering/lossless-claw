@@ -26,6 +26,7 @@ export type SummaryRecord = {
   conversationId: number;
   kind: SummaryKind;
   depth: number;
+  level?: "normal" | "aggressive" | "fallback";
   content: string;
   tokenCount: number;
   fileIds: string[];
@@ -119,6 +120,7 @@ interface SummaryRow {
   conversation_id: number;
   kind: SummaryKind;
   depth: number;
+  level?: string;
   content: string;
   token_count: number;
   file_ids: string;
@@ -208,6 +210,7 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
     kind: row.kind,
     depth: row.depth,
     content: row.content,
+    level: (row.level as SummaryRecord["level"]) ?? "normal",
     tokenCount: row.token_count,
     fileIds,
     earliestAt: row.earliest_at ? new Date(row.earliest_at) : null,

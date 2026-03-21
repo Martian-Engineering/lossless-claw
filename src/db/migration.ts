@@ -34,6 +34,16 @@ function ensureSummaryDepthColumn(db: DatabaseSync): void {
   }
 }
 
+function ensureSummaryLevelColumn(db: DatabaseSync): void {
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const hasLevel = summaryColumns.some((col) => col.name === "level");
+  if (!hasLevel) {
+    db.exec(
+      `ALTER TABLE summaries ADD COLUMN level TEXT NOT NULL DEFAULT 'normal' CHECK (level IN ('normal', 'aggressive', 'fallback'))`
+    );
+  }
+}
+
 function ensureSummaryMetadataColumns(db: DatabaseSync): void {
   const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
   const hasEarliestAt = summaryColumns.some((col) => col.name === "earliest_at");
@@ -188,6 +198,50 @@ function backfillSummaryDepths(db: DatabaseSync): void {
       }
       updateDepthStmt.run(depth, summary.summary_id);
     }
+  }
+}
+
+function backfillSummaryLevels(db: DatabaseSync): void {
+  // Strategy: check for fallback summaries in compaction events (message_parts with part_type='compaction')
+  // 1. Query all message_parts with part_type='compaction'
+  // 2. Parse metadata JSON to find summaries with level='fallback'
+  // 3. Update those summaries to level='fallback'
+  // 4. Scan remaining summaries for truncation canary in content
+  
+  try {
+    // Phase 1: extract fallback events from message_parts metadata
+    const fallbackSummaryIds = new Set<string>();
+    const eventRows = db
+      .prepare(
+        `SELECT part_id, metadata
+         FROM message_parts
+         WHERE part_type = 'compaction' AND metadata IS NOT NULL`
+      )
+      .all() as Array<{ part_id: string; metadata: string | null }>;
+    
+    for (const row of eventRows) {
+      if (!row.metadata) continue;
+      try {
+        const meta = JSON.parse(row.metadata);
+        if (meta.level === 'fallback' && meta.createdSummaryIds) {
+          const ids = Array.isArray(meta.createdSummaryIds) ? meta.createdSummaryIds : [];
+          for (const id of ids) {
+            if (typeof id === 'string') {
+              fallbackSummaryIds.add(id);
+            }
+          }
+        }
+      } catch {
+        // Skip malformed metadata
+      }
+    }
+    
+    // Phase 2: update extracted fallback summaries
+    for (const summaryId of fallbackSummaryIds) {
+      db.prepare(`UPDATE summaries SET level = 'fallback' WHERE summary_id = ?`).run(summaryId);
+    }
+  } catch {
+    // Backfill is best-effort; swallow errors to avoid blocking migration
   }
 }
 
@@ -394,6 +448,7 @@ export function runLcmMigrations(
       conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
       kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
       depth INTEGER NOT NULL DEFAULT 0,
+      level TEXT NOT NULL DEFAULT 'normal' CHECK (level IN ('normal', 'aggressive', 'fallback')),
       content TEXT NOT NULL,
       token_count INTEGER NOT NULL,
       earliest_at TEXT,
@@ -519,9 +574,11 @@ export function runLcmMigrations(
 
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS conversations_session_key_idx ON conversations (session_key)`);
   ensureSummaryDepthColumn(db);
+  ensureSummaryLevelColumn(db);
   ensureSummaryMetadataColumns(db);
   ensureSummaryModelColumn(db);
   backfillSummaryDepths(db);
+  backfillSummaryLevels(db);
   backfillSummaryMetadata(db);
 
   const fts5Available = options?.fts5Available ?? getLcmDbFeatures(db).fts5Available;

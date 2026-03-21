@@ -1824,7 +1824,7 @@ describe("LCM integration: compaction", () => {
     expect(result.level).toBe("aggressive");
   });
 
-  it("compaction falls back to truncation when aggressive does not converge", async () => {
+  it("compaction skips gracefully when aggressive does not converge", async () => {
     // Ingest messages
     await ingestMessages(convStore, sumStore, 8, {
       contentFn: (i) => `Content ${i}: ${"b".repeat(200)}`,
@@ -1843,14 +1843,13 @@ describe("LCM integration: compaction", () => {
       force: true,
     });
 
-    expect(result.actionTaken).toBe(true);
-    expect(result.level).toBe("fallback");
+    // When summarization can't compress, the engine should bail
+    // instead of creating garbage truncation summaries
+    expect(result.actionTaken).toBe(false);
 
-    // The created summary should contain the truncation marker
+    // No leaf summary should be created — no garbage in the DAG
     const leafSummary = sumStore._summaries.find((s) => s.kind === "leaf");
-    expect(leafSummary).toBeDefined();
-    expect(leafSummary!.content).toContain("[Truncated from");
-    expect(leafSummary!.content).toContain("tokens]");
+    expect(leafSummary).toBeUndefined();
   });
 
   it("compactUntilUnder loops until under budget", async () => {
