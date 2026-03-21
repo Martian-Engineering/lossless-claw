@@ -1,4 +1,4 @@
-# @martian-engineering/lossless-claw
+# @lapal0ma/lcm-pg
 
 ## 0.4.0
 

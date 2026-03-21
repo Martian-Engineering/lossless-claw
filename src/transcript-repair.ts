@@ -151,7 +151,7 @@ function makeMissingToolResult(params: {
     content: [
       {
         type: "text",
-        text: "[lossless-claw] missing tool result in session history; inserted synthetic error result for transcript repair.",
+        text: "[lcm-pg] missing tool result in session history; inserted synthetic error result for transcript repair.",
       },
     ],
     isError: true,

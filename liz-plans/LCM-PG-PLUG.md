@@ -1,6 +1,6 @@
 # LCM + PostgreSQL 多租户提案（LCM-PG-PLUG）
 
-本文档汇总在 lossless-claw（LCM）与 OpenClaw 生态背景下，将 **context engine 后端迁至 PostgreSQL**、支撑 **toB 多用户 / 多实例协作** 的架构共识与实施方向。
+本文档汇总在 LCM-PG（原 lossless-claw / LCM）与 OpenClaw 生态背景下，将 **context engine 后端迁至 PostgreSQL**、支撑 **toB 多用户 / 多实例协作** 的架构共识与实施方向。
 
 ---
 

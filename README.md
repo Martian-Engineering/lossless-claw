@@ -8,9 +8,9 @@ PostgreSQL mirror and multi-tenant groundwork for [lossless-claw](https://github
 
 ## What is LCM-PG / LCM-PG 是什么
 
-**lossless-claw** (LCM) is an OpenClaw context engine plugin. When a conversation exceeds the model's context window, LCM persists every message in SQLite, summarizes older messages into a DAG of summaries, and assembles context each turn from summaries + recent raw messages. Nothing is lost — agents can drill into any summary to recover the original detail via `lcm_grep`, `lcm_describe`, and `lcm_expand`.
+**LCM-PG** (formerly lossless-claw) is an OpenClaw context engine plugin. When a conversation exceeds the model's context window, LCM persists every message in SQLite, summarizes older messages into a DAG of summaries, and assembles context each turn from summaries + recent raw messages. Nothing is lost — agents can drill into any summary to recover the original detail via `lcm_grep`, `lcm_describe`, and `lcm_expand`.
 
-**LCM-PG** adds an **asynchronous PostgreSQL mirror** on top of LCM. After each turn's compaction, selected summary snapshots are written to a `lcm_mirror` table in PostgreSQL — enabling cross-instance search, dashboards, compliance archival, and eventually shared knowledge across multiple OpenClaw instances.
+This fork adds an **asynchronous PostgreSQL mirror** on top of LCM. After each turn's compaction, selected summary snapshots are written to a `lcm_mirror` table in PostgreSQL — enabling cross-instance search, dashboards, compliance archival, and eventually shared knowledge across multiple OpenClaw instances.
 
 LCM-PG 在上游 LCM 基础上增加了 **PostgreSQL 异步镜像**：每次 compaction 后，将摘要快照写入 PG `lcm_mirror` 表，为跨实例检索、数据看板、合规归档以及多实例间共享知识打下基础。本地 agent 仍从 SQLite 读取上下文，PG 写入完全异步、不阻塞主流程。
 
@@ -108,14 +108,14 @@ PG 中有两张独立的表，各自承担不同职责：
 Link this fork as a local plugin:
 
 ```bash
-openclaw plugins install --link /path/to/lossless-claw
+openclaw plugins install --link /path/to/LCM-PG
 ```
 
 Verify it loads:
 
 ```bash
 openclaw plugins list
-# Should show "lossless-claw" as loaded
+# Should show "lcm-pg" as loaded
 ```
 
 ### Enable the PG mirror

@@ -23,12 +23,12 @@ function buildApi(loadConfigResult: Record<string, unknown>): {
 } {
   let factory: RegisteredEngineFactory;
   const loadConfig = vi.fn(() => loadConfigResult);
-  const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+  const dbPath = join(tmpdir(), `lcm-pg-${Date.now()}-${Math.random().toString(16)}.db`);
 
   const api = {
-    id: "lossless-claw",
+    id: "lcm-pg",
     name: "Lossless Context Management",
-    source: "/tmp/lossless-claw",
+    source: "/tmp/lcm-pg",
     config: {},
     pluginConfig: {
       enabled: true,

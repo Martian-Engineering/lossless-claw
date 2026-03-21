@@ -695,7 +695,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         })
       : undefined;
 
-  const nestedPluginConfig = runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config;
+  const nestedPluginConfig =
+    runtimeConfig?.plugins?.entries?.["lcm-pg"]?.config ??
+    runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config;
 
   const summaryLevels = [
     {
@@ -704,7 +706,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       provider: process.env.LCM_SUMMARY_PROVIDER?.trim() ?? "",
     },
     {
-      levelName: "plugin config (lossless-claw)",
+      levelName: "plugin config (lcm-pg)",
       model: readModelRef(nestedPluginConfig?.summaryModel),
       provider: typeof nestedPluginConfig?.summaryProvider === "string" ? nestedPluginConfig.summaryProvider.trim() : "",
     },

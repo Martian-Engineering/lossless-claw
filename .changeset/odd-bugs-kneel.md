@@ -1,5 +1,5 @@
 ---
-"@martian-engineering/lossless-claw": patch
+"@lapal0ma/lcm-pg": patch
 ---
 
 Annotate attachment-only messages during compaction without dropping short captions.

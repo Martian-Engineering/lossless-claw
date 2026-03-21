@@ -18,7 +18,7 @@ afterEach(() => {
 
 describe("FTS fallback", () => {
   it("persists and searches messages and summaries without FTS5", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-no-fts-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-no-fts-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "fallback.db");
     const db = getLcmConnection(dbPath);

@@ -24,9 +24,9 @@ function buildApi(
   const agentDir = options?.agentDir ?? "/tmp/fake-agent";
 
   const api = {
-    id: "lossless-claw",
+    id: "lcm-pg",
     name: "Lossless Context Management",
-    source: "/tmp/lossless-claw",
+    source: "/tmp/lcm-pg",
     config: {},
     pluginConfig,
     runtime: {
@@ -114,7 +114,7 @@ describe("lcm plugin registration", () => {
   });
 
   it("uses api.pluginConfig values during register", { timeout: 20000 }, () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    const dbPath = join(tmpdir(), `lcm-pg-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
 
     const { api, getFactory, infoLog } = buildApi({
@@ -226,7 +226,7 @@ describe("lcm plugin registration", () => {
   });
 
   it("forwards explicit provider and model fields to runtime subagent runs", async () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    const dbPath = join(tmpdir(), `lcm-pg-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
 
     const { api, getFactory } = buildApi({
@@ -358,7 +358,7 @@ describe("lcm plugin registration", () => {
   });
 
   it("dedupes startup banner logs across repeated registration and engine construction", () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    const dbPath = join(tmpdir(), `lcm-pg-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
 
     const pluginConfig = {
@@ -443,7 +443,7 @@ describe("lcm plugin registration", () => {
 
   it("falls back to auth-profiles.json when runtime.modelAuth is unavailable", { timeout: 20000 }, async () => {
     const provider = "lossless-test-provider";
-    const agentDir = mkdtempSync(join(tmpdir(), "lossless-claw-auth-"));
+    const agentDir = mkdtempSync(join(tmpdir(), "lcm-pg-auth-"));
     tempDirs.add(agentDir);
     writeFileSync(
       join(agentDir, "auth-profiles.json"),

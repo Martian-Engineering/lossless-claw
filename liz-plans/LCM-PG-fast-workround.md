@@ -1,6 +1,6 @@
 # LCM-PG 快速折中方案（SQLite 真源 + PG 共享层）
 
-本文档描述一种 **实现成本最低** 的路径：**继续以 lossless-claw（LCM）+ 本地 SQLite 作为 context engine 与会话真源**，**PostgreSQL 集群** 仅承担 **跨 OpenClaw 实例可共享的知识**（以及可选的 **异步镜像**）。在 **`assemble` 阶段** 将 **LCM 输出** 与 **PG 检索结果** 合并进最终上下文。
+本文档描述一种 **实现成本最低** 的路径：**继续以 LCM-PG（原 lossless-claw / LCM）+ 本地 SQLite 作为 context engine 与会话真源**，**PostgreSQL 集群** 仅承担 **跨 OpenClaw 实例可共享的知识**（以及可选的 **异步镜像**）。在 **`assemble` 阶段** 将 **LCM 输出** 与 **PG 检索结果** 合并进最终上下文。
 
 与主方案的关系见 [LCM-PG-PLUG.md](./LCM-PG-PLUG.md) 第 7 节（过渡方案 B）；本文展开工程细节与可选增强。
 

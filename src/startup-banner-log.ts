@@ -9,7 +9,7 @@ type StartupBannerLogState = {
 };
 
 const STARTUP_BANNER_LOG_STATE = Symbol.for(
-  "@martian-engineering/lossless-claw/startup-banner-log-state",
+  "@lapal0ma/lcm-pg/startup-banner-log-state",
 );
 
 /** Return the process-global startup banner log state. */

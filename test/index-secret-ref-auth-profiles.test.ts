@@ -26,12 +26,12 @@ function buildApi(params?: {
   dbPath: string;
 } {
   let factory: RegisteredEngineFactory;
-  const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+  const dbPath = join(tmpdir(), `lcm-pg-${Date.now()}-${Math.random().toString(16)}.db`);
 
   const api = {
-    id: "lossless-claw",
+    id: "lcm-pg",
     name: "Lossless Context Management",
-    source: "/tmp/lossless-claw",
+    source: "/tmp/lcm-pg",
     config: (params?.config ?? {}) as OpenClawPluginApi["config"],
     pluginConfig: {
       enabled: true,
@@ -147,7 +147,7 @@ describe("auth-profile SecretRef resolution in complete()", () => {
   });
 
   it("resolves env-backed tokenRef values from auth-profiles.json", async () => {
-    const agentDir = mkdtempSync(join(tmpdir(), "lossless-claw-auth-"));
+    const agentDir = mkdtempSync(join(tmpdir(), "lcm-pg-auth-"));
     tempDirs.add(agentDir);
 
     writeFileSync(
@@ -192,7 +192,7 @@ describe("auth-profile SecretRef resolution in complete()", () => {
   });
 
   it("resolves file-backed keyRef values through configured secret providers", async () => {
-    const rootDir = mkdtempSync(join(tmpdir(), "lossless-claw-secret-provider-"));
+    const rootDir = mkdtempSync(join(tmpdir(), "lcm-pg-secret-provider-"));
     tempDirs.add(rootDir);
 
     const agentDir = join(rootDir, "agent");

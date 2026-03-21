@@ -111,7 +111,7 @@ CREATE INDEX lcm_mirror_agent_idx ON lcm_mirror (agent_id, ingested_at DESC);
 
 ---
 
-## 7. 代码落点（lossless-claw）
+## 7. 代码落点（LCM-PG）
 
 | 步骤 | 位置（建议） | 内容 |
 |------|----------------|------|

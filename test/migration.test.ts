@@ -16,7 +16,7 @@ afterEach(() => {
 
 describe("runLcmMigrations summary depth backfill", () => {
   it("adds depth and metadata from summary lineage", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-migration-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "legacy.db");
     const db = getLcmConnection(dbPath);
@@ -211,7 +211,7 @@ describe("runLcmMigrations summary depth backfill", () => {
   });
 
   it("skips FTS tables when fts5 is unavailable", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-migration-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "no-fts.db");
     const db = getLcmConnection(dbPath);
@@ -226,7 +226,7 @@ describe("runLcmMigrations summary depth backfill", () => {
   });
 
   it("creates conversation bootstrap state storage", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-migration-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "bootstrap-state.db");
     const db = getLcmConnection(dbPath);

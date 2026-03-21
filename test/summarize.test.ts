@@ -101,7 +101,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         config: {
           plugins: {
             entries: {
-              "lossless-claw": { config: { summaryProvider: "openai-resp" } },
+              "lcm-pg": { config: { summaryProvider: "openai-resp" } },
             },
           },
         },
@@ -131,7 +131,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           },
           plugins: {
             entries: {
-              "lossless-claw": { config: { summaryModel: "gpt-4.1", summaryProvider: "qiniu" } },
+              "lcm-pg": { config: { summaryModel: "gpt-4.1", summaryProvider: "qiniu" } },
             },
           },
         },
@@ -159,7 +159,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           },
           plugins: {
             entries: {
-              "lossless-claw": { config: { summaryModel: "gpt-4.1", summaryProvider: "qiniu" } },
+              "lcm-pg": { config: { summaryModel: "gpt-4.1", summaryProvider: "qiniu" } },
             },
           },
         },
@@ -251,7 +251,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         config: {
           plugins: {
             entries: {
-              "lossless-claw": { config: { summaryModel: "gpt-4o-mini" } },
+              "lcm-pg": { config: { summaryModel: "gpt-4o-mini" } },
             },
           },
         },

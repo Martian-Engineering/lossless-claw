@@ -5,19 +5,19 @@
 Install the plugin with OpenClaw's plugin installer:
 
 ```bash
-openclaw plugins install @martian-engineering/lossless-claw
+openclaw plugins install @lapal0ma/lcm-pg
 ```
 
 If you're running from a local OpenClaw checkout:
 
 ```bash
-pnpm openclaw plugins install @martian-engineering/lossless-claw
+pnpm openclaw plugins install @lapal0ma/lcm-pg
 ```
 
 For local development of this plugin, link your working copy:
 
 ```bash
-openclaw plugins install --link /path/to/lossless-claw
+openclaw plugins install --link /path/to/LCM-PG
 ```
 
 `openclaw plugins install` handles plugin registration/enabling and slot selection automatically.
@@ -155,7 +155,7 @@ Plugin config example:
 {
   "plugins": {
     "entries": {
-      "lossless-claw": {
+      "lcm-pg": {
         "config": {
           "ignoreSessionPatterns": [
             "agent:*:cron:**"

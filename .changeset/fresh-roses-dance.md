@@ -1,5 +1,5 @@
 ---
-"@martian-engineering/lossless-claw": patch
+"@lapal0ma/lcm-pg": patch
 ---
 
 Persist the resolved compaction summarization model on summary records instead of

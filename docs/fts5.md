@@ -1,6 +1,6 @@
 # Optional: enable FTS5 for fast full-text search
 
-`lossless-claw` works without FTS5 as of the current release. When FTS5 is unavailable in the
+`lcm-pg` works without FTS5 as of the current release. When FTS5 is unavailable in the
 Node runtime that runs the OpenClaw gateway, the plugin:
 
 - keeps persisting messages and summaries
@@ -130,7 +130,7 @@ You should see:
 program = /Users/youruser/Projects/node-fts5/bin/node-22.15.0
 ```
 
-## Verify `lossless-claw`
+## Verify `lcm-pg`
 
 Check the logs:
 

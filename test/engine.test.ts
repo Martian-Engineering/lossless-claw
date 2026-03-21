@@ -108,7 +108,7 @@ function createTestDeps(
 }
 
 function createEngine(): LcmContextEngine {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-engine-"));
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
@@ -116,7 +116,7 @@ function createEngine(): LcmContextEngine {
 }
 
 function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies>): LcmContextEngine {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-engine-"));
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
@@ -136,13 +136,13 @@ function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
 }
 
 function createSessionFilePath(name: string): string {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-session-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-session-"));
   tempDirs.push(tempDir);
   return join(tempDir, `${name}.jsonl`);
 }
 
 function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-engine-"));
   tempDirs.push(tempDir);
   const config = {
     ...createTestConfig(join(tempDir, "lcm.db")),
@@ -156,7 +156,7 @@ function createEngineWithDeps(
   configOverrides: Partial<LcmConfig>,
   depOverrides?: Partial<LcmDependencies>,
 ): LcmContextEngine {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-engine-"));
   tempDirs.push(tempDir);
   const config = {
     ...createTestConfig(join(tempDir, "lcm.db")),
@@ -168,7 +168,7 @@ function createEngineWithDeps(
 
 async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
   const originalHome = process.env.HOME;
-  const tempHome = mkdtempSync(join(tmpdir(), "lossless-claw-home-"));
+  const tempHome = mkdtempSync(join(tmpdir(), "lcm-pg-home-"));
   tempDirs.push(tempHome);
   process.env.HOME = tempHome;
 
@@ -769,7 +769,7 @@ describe("ConversationStore session reuse", () => {
 
 describe("LcmContextEngine delegated session continuity", () => {
   it("prepares subagent spawn from an existing conversation found by sessionKey", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-engine-"));
     tempDirs.push(tempDir);
     const config = createTestConfig(join(tempDir, "lcm.db"));
     const db = createLcmDatabaseConnection(config.databasePath);
@@ -1232,7 +1232,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
 
 describe("LcmContextEngine connection lifecycle", () => {
   it("keeps shared sqlite handle open while another engine instance is active", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-shared-db-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-shared-db-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "lcm.db");
 
@@ -1380,7 +1380,7 @@ describe("LcmContextEngine.bootstrap", () => {
   });
 
   it("preserves ordinary bootstrap behavior when no checkpoint exists", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-engine-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "lcm.db");
     const sessionFile = createSessionFilePath("missing-checkpoint");
@@ -1525,7 +1525,7 @@ describe("LcmContextEngine.bootstrap", () => {
   });
 
   it("falls back to full reconciliation when append-only checkpoint validation mismatches", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-engine-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "lcm.db");
     const sessionFile = createSessionFilePath("append-only-mismatch");

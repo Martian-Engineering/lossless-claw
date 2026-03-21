@@ -1,12 +1,12 @@
 # TUI Reference
 
-The Lossless Claw TUI (`lcm-tui`) is an interactive terminal application for inspecting, debugging, and maintaining the LCM database. It provides direct visibility into what the model sees (context assembly), how summaries are structured (DAG hierarchy), and tools for surgical repairs when things go wrong.
+The LCM-PG TUI (`lcm-tui`) is an interactive terminal application for inspecting, debugging, and maintaining the LCM database. It provides direct visibility into what the model sees (context assembly), how summaries are structured (DAG hierarchy), and tools for surgical repairs when things go wrong.
 
 ## Installation
 
 **From GitHub releases:**
 
-Download the latest binary for your platform from [Releases](https://github.com/Martian-Engineering/lossless-claw/releases).
+Download the latest binary for your platform from [Releases](https://github.com/lapal0ma/LCM-PG/releases).
 
 **Build from source:**
 
@@ -14,7 +14,7 @@ Download the latest binary for your platform from [Releases](https://github.com/
 cd tui
 go build -o lcm-tui .
 # or: make build
-# or: go install github.com/Martian-Engineering/lossless-claw/tui@latest
+# or: go install github.com/lapal0ma/LCM-PG/tui@latest
 ```
 
 Requires Go 1.24+.

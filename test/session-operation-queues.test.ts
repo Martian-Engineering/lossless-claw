@@ -80,7 +80,7 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
 }
 
 function createQueueTestEngine(): QueueTestEngine {
-  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-session-queue-"));
+  const tempDir = mkdtempSync(join(tmpdir(), "lcm-pg-session-queue-"));
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);

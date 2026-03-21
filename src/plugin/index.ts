@@ -1,5 +1,5 @@
 /**
- * @martian-engineering/lossless-claw — Lossless Context Management plugin for OpenClaw
+ * @lapal0ma/lcm-pg — LCM-PG Context Management plugin for OpenClaw
  *
  * DAG-based conversation summarization with incremental compaction,
  * full-text search, and sub-agent expansion.
@@ -411,9 +411,9 @@ function resolveApiKeyFromAuthResult(auth: RuntimeModelAuthResult | undefined): 
 function buildLegacyAuthFallbackWarning(): string {
   return [
     "[lcm] OpenClaw runtime.modelAuth is unavailable; using legacy auth-profiles fallback.",
-    `Stock lossless-claw 0.2.7 expects OpenClaw plugin runtime support from PR #41090 (${MODEL_AUTH_PR_URL}).`,
+    `Stock lcm-pg (based on lossless-claw 0.2.7) expects OpenClaw plugin runtime support from PR #41090 (${MODEL_AUTH_PR_URL}).`,
     `OpenClaw 2026.3.8 and 2026.3.8-beta.1 do not include merge commit ${MODEL_AUTH_MERGE_COMMIT};`,
-    `${MODEL_AUTH_REQUIRED_RELEASE} is required for stock lossless-claw 0.2.7 without this fallback patch.`,
+    `${MODEL_AUTH_REQUIRED_RELEASE} is required for lcm-pg without this fallback patch.`,
   ].join(" ");
 }
 
@@ -1306,8 +1306,8 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 }
 
 const lcmPlugin = {
-  id: "lossless-claw",
-  name: "Lossless Context Management",
+  id: "lcm-pg",
+  name: "LCM-PG Context Management",
   description:
     "DAG-based conversation summarization with incremental compaction, full-text search, and sub-agent expansion",
 
@@ -1326,7 +1326,7 @@ const lcmPlugin = {
     const database = createLcmDatabaseConnection(deps.config.databasePath);
     const lcm = new LcmContextEngine(deps, database);
 
-    api.registerContextEngine("lossless-claw", () => lcm);
+    api.registerContextEngine("lcm-pg", () => lcm);
     api.registerContextEngine("default", () => lcm);
     api.registerTool((ctx) =>
       createLcmGrepTool({
