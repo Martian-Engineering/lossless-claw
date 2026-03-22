@@ -4,6 +4,8 @@ import type { DatabaseSync } from "node:sqlite";
 import type { DbClient } from "../db/db-interface.js";
 import { SqliteClient } from "../db/sqlite-client.js";
 import { Dialect, type Backend } from "../db/dialect.js";
+import { EmbeddingClient, toVectorLiteral, type EmbeddingConfig } from "../embeddings.js";
+import { EmbeddingQueue, type QueueableDb } from "../embedding-queue.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { sanitizeTsQuery } from "./tsquery-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
@@ -82,12 +84,14 @@ export type CreateConversationInput = {
   sessionId: string;
   sessionKey?: string;
   title?: string;
+  agentId?: string;
 };
 
 export type ConversationRecord = {
   conversationId: ConversationId;
   sessionId: string;
   sessionKey: string | null;
+  agentId: string | null;
   title: string | null;
   bootstrappedAt: Date | null;
   createdAt: Date;
@@ -97,10 +101,18 @@ export type ConversationRecord = {
 export type MessageSearchInput = {
   conversationId?: ConversationId;
   query: string;
-  mode: "regex" | "full_text";
+  mode: "regex" | "full_text" | "semantic" | "recency_boosted";
   since?: Date;
   before?: Date;
   limit?: number;
+  /** Weight for semantic similarity (0-1). Default 0.7. Only used in recency_boosted mode. */
+  semanticWeight?: number;
+  /** Weight for recency (0-1). Default 0.3. Only used in recency_boosted mode. */
+  recencyWeight?: number;
+  /** Half-life in days for recency decay. Default 7. Only used in recency_boosted mode. */
+  recencyHalfLifeDays?: number;
+  /** Agent ID of the caller. Results from this agent's conversations get a ranking boost. */
+  callerAgentId?: string;
 };
 
 export type MessageSearchResult = {
@@ -118,6 +130,7 @@ interface ConversationRow {
   conversation_id: number;
   session_id: string;
   session_key: string | null;
+  agent_id: string | null;
   title: string | null;
   bootstrapped_at: string | null;
   created_at: string;
@@ -172,6 +185,7 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
     conversationId: row.conversation_id,
     sessionId: row.session_id,
     sessionKey: row.session_key ?? null,
+    agentId: row.agent_id ?? null,
     title: row.title,
     bootstrappedAt: row.bootstrapped_at ? new Date(row.bootstrapped_at) : null,
     createdAt: new Date(row.created_at),
@@ -260,7 +274,7 @@ function normalizeMessageContentForFullTextIndex(content: string): string | null
 }
 
 // Column list constants to avoid repetition
-const CONV_COLS = "conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at";
+const CONV_COLS = "conversation_id, session_id, session_key, agent_id, title, bootstrapped_at, created_at, updated_at";
 const MSG_COLS = "message_id, conversation_id, seq, role, content, token_count, created_at";
 const PART_COLS = "part_id, message_id, session_id, part_type, ordinal, text_content, tool_call_id, tool_name, tool_input, tool_output, metadata";
 
@@ -269,6 +283,8 @@ const PART_COLS = "part_id, message_id, session_id, part_type, ordinal, text_con
 export class ConversationStore {
   private readonly fullTextAvailable: boolean;
   private readonly d: Dialect;
+  private readonly embeddingClient: EmbeddingClient | null;
+  private readonly embeddingQueue: EmbeddingQueue | null;
   /**
    * Root (non-transactional) database client.
    * Query methods use the `db` getter which returns the transaction-scoped
@@ -285,11 +301,40 @@ export class ConversationStore {
 
   constructor(
     db: DbClient | DatabaseSync,
-    options?: { fullTextAvailable?: boolean; fts5Available?: boolean; backend?: Backend },
+    options?: { fullTextAvailable?: boolean; fts5Available?: boolean; backend?: Backend; embeddingConfig?: EmbeddingConfig },
   ) {
     this._rootDb = ensureDbClient(db);
     this.fullTextAvailable = options?.fullTextAvailable ?? options?.fts5Available ?? true;
     this.d = new Dialect(options?.backend ?? "sqlite");
+
+    if (this.d.pg && options?.embeddingConfig) {
+      const client = new EmbeddingClient(options.embeddingConfig);
+      this.embeddingClient = client.isConfigured() ? client : null;
+    } else {
+      this.embeddingClient = null;
+    }
+
+    // Set up batched embedding queue (replaces fire-and-forget embedOnInsert)
+    if (this.embeddingClient) {
+      this.embeddingQueue = new EmbeddingQueue(this.embeddingClient, db as QueueableDb, {
+        log: (msg) => console.error(`[lcm:conv-embedding-queue] ${msg}`),
+      });
+      this.embeddingQueue.start();
+      console.error(`[lcm:conv-store] embedding queue started (batch=2s, retry=5x)`);
+    } else {
+      this.embeddingQueue = null;
+      console.error(`[lcm:conv-store] embedding queue NOT started (no embedding client)`);
+    }
+  }
+
+  /** Flush all pending embeddings without stopping the queue timer. */
+  async drainEmbeddingQueue(): Promise<void> {
+    if (this.embeddingQueue) await this.embeddingQueue.drain();
+  }
+
+  /** Gracefully stop the embedding queue (drain + stop timer). Call on shutdown. */
+  async stopEmbeddingQueue(): Promise<void> {
+    if (this.embeddingQueue) await this.embeddingQueue.stop();
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -303,11 +348,22 @@ export class ConversationStore {
    * so concurrent sessions sharing this store singleton are safe.
    */
   async withTransaction<T>(operation: () => Promise<T> | T): Promise<T> {
+    return this.withTransactionClient(() => operation());
+  }
+
+  /**
+   * Execute an operation within this store's transaction scope and expose the
+   * underlying transaction client so other stores can join the same database
+   * transaction.
+   */
+  async withTransactionClient<T>(
+    operation: (client: DbClient) => Promise<T> | T,
+  ): Promise<T> {
     if (this._txStore.getStore()) {
-      return operation();
+      return operation(this._txStore.getStore()!);
     }
     return this._rootDb.transaction(async (txClient) => {
-      return this._txStore.run(txClient, operation);
+      return this._txStore.run(txClient, () => operation(txClient));
     });
   }
 
@@ -316,9 +372,9 @@ export class ConversationStore {
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
     const d = this.d.reset();
     const result = await this.db.run(
-      `INSERT INTO conversations (session_id, session_key, title)
-       VALUES (${d.p()}, ${d.p()}, ${d.p()}) RETURNING conversation_id`,
-      [input.sessionId, input.sessionKey ?? null, input.title ?? null],
+      `INSERT INTO conversations (session_id, session_key, agent_id, title)
+       VALUES (${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}) RETURNING conversation_id`,
+      [input.sessionId, input.sessionKey ?? null, input.agentId ?? null, input.title ?? null],
     );
     const conversationId = result.lastInsertId!;
 
@@ -387,7 +443,7 @@ export class ConversationStore {
 
   async getOrCreateConversation(
     sessionId: string,
-    titleOrOpts?: string | { title?: string; sessionKey?: string },
+    titleOrOpts?: string | { title?: string; sessionKey?: string; agentId?: string },
   ): Promise<ConversationRecord> {
     const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
     if (opts.sessionKey) {
@@ -415,10 +471,19 @@ export class ConversationStore {
         );
         existing.sessionKey = opts.sessionKey;
       }
+      // Backfill agent_id if it was missing and we now know it
+      if (!existing.agentId && opts.agentId) {
+        const d = this.d.reset();
+        await this.db.run(
+          `UPDATE conversations SET agent_id = ${d.p()}, updated_at = ${d.now()} WHERE conversation_id = ${d.p()}`,
+          [opts.agentId, existing.conversationId],
+        );
+        existing.agentId = opts.agentId;
+      }
       return existing;
     }
 
-    return this.createConversation({ sessionId, title: opts.title, sessionKey: opts.sessionKey });
+    return this.createConversation({ sessionId, title: opts.title, sessionKey: opts.sessionKey, agentId: opts.agentId });
   }
 
   async markConversationBootstrapped(conversationId: ConversationId): Promise<void> {
@@ -444,6 +509,9 @@ export class ConversationStore {
     const messageId = result.lastInsertId!;
 
     await this.indexMessageForFullText(messageId, input.content);
+    if (this.embeddingQueue) {
+      this.embeddingQueue.enqueue("messages", messageId, input.content);
+    }
 
     d.reset();
     const row = await this.db.queryOne<MessageRow>(
@@ -470,6 +538,9 @@ export class ConversationStore {
       const messageId = result.lastInsertId!;
 
       await this.indexMessageForFullText(messageId, input.content);
+      if (this.embeddingQueue) {
+        this.embeddingQueue.enqueue("messages", messageId, input.content);
+      }
 
       d.reset();
       const row = await this.db.queryOne<MessageRow>(
@@ -481,18 +552,13 @@ export class ConversationStore {
     return records;
   }
 
-  async getMessage(messageId: MessageId): Promise<MessageRecord | null> {
+  async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
     const d = this.d.reset();
     const row = await this.db.queryOne<MessageRow>(
       `SELECT ${MSG_COLS} FROM messages WHERE message_id = ${d.p()}`,
       [messageId],
     );
     return row ? toMessageRecord(row) : null;
-  }
-
-  /** Alias for getMessage — matches upstream API naming convention. */
-  async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
-    return this.getMessage(messageId);
   }
 
   async getMessages(
@@ -573,36 +639,35 @@ export class ConversationStore {
 
   // ── Message parts operations ──────────────────────────────────────────────
 
-  async createMessagePart(messageId: MessageId, input: CreateMessagePartInput): Promise<MessagePartRecord> {
-    const partId = randomUUID();
-    const d = this.d.reset();
-    await this.db.run(
-      `INSERT INTO message_parts
-       (part_id, message_id, session_id, part_type, ordinal, text_content,
-        tool_call_id, tool_name, tool_input, tool_output, metadata)
-       VALUES (${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()},
-               ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()})`,
-      [
-        partId, messageId, input.sessionId, input.partType, input.ordinal,
-        input.textContent, input.toolCallId, input.toolName, input.toolInput, input.toolOutput, input.metadata,
-      ],
-    );
-
-    d.reset();
-    const row = await this.db.queryOne<MessagePartRow>(
-      `SELECT ${PART_COLS} FROM message_parts WHERE part_id = ${d.p()}`,
-      [partId],
-    );
-    if (!row) {
-      throw new Error(`Failed to retrieve created message part with ID ${partId}`);
-    }
-    return toMessagePartRecord(row);
-  }
-
-  /** Batch insert multiple message parts. Matches upstream API. */
   async createMessageParts(messageId: MessageId, parts: CreateMessagePartInput[]): Promise<void> {
-    for (const part of parts) {
-      await this.createMessagePart(messageId, part);
+    if (parts.length === 0) {
+      return;
+    }
+
+    let hasToolParts = false;
+    for (const input of parts) {
+      const partId = randomUUID();
+      const d = this.d.reset();
+      await this.db.run(
+        `INSERT INTO message_parts
+         (part_id, message_id, session_id, part_type, ordinal, text_content,
+          tool_call_id, tool_name, tool_input, tool_output, metadata)
+         VALUES (${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()},
+                 ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()}, ${d.p()})`,
+        [
+          partId, messageId, input.sessionId, input.partType, input.ordinal,
+          input.textContent, input.toolCallId, input.toolName, input.toolInput, input.toolOutput, input.metadata,
+        ],
+      );
+      if (input.partType === "tool") hasToolParts = true;
+    }
+
+    // Re-enqueue for embedding if this message has tool parts.
+    // createMessage enqueues immediately but with empty content for tool-only
+    // turns. The queue may flush before parts exist, so re-enqueue now that
+    // parts are persisted and available for synthesis.
+    if (hasToolParts && this.embeddingQueue) {
+      this.embeddingQueue.enqueue("messages", messageId, "");
     }
   }
 
@@ -671,6 +736,35 @@ export class ConversationStore {
 
   async searchMessages(input: MessageSearchInput): Promise<MessageSearchResult[]> {
     const limit = input.limit ?? 50;
+
+    if (input.mode === "recency_boosted") {
+      try {
+        return await this.searchRecencyBoosted(
+          input.query, limit, input.conversationId, input.since, input.before,
+          input.semanticWeight, input.recencyWeight, input.recencyHalfLifeDays,
+          input.callerAgentId,
+        );
+      } catch (err) {
+        console.warn(
+          `[lcm:conv-store] recency_boosted search failed, falling back to semantic: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return this.searchMessages({ ...input, mode: "semantic" });
+      }
+    }
+
+    if (input.mode === "semantic") {
+      try {
+        return await this.searchSemantic(
+          input.query, limit, input.conversationId, input.since, input.before,
+          input.callerAgentId,
+        );
+      } catch (err) {
+        console.warn(
+          `[lcm:conv-store] semantic search failed, falling back to full_text: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return this.searchMessages({ ...input, mode: "full_text" });
+      }
+    }
 
     if (input.mode === "full_text") {
       // FTS5 unicode61 can return incomplete matches for CJK text, so route
@@ -754,7 +848,7 @@ export class ConversationStore {
 
     const sql = `SELECT
          m.message_id, m.conversation_id, m.role,
-         snippet(messages_fts, 0, '[', ']', '...', 32) AS snippet,
+         snippet(messages_fts, 0, '', '', '...', 32) AS snippet,
          bm25(messages_fts) AS rank, m.created_at
        FROM messages_fts
        JOIN messages m ON m.message_id = messages_fts.rowid
@@ -943,4 +1037,158 @@ export class ConversationStore {
     });
   }
 
+  // ── Embedding helpers ──────────────────────────────────────────────────
+
+  private async embedOnInsert(messageId: MessageId, content: string): Promise<void> {
+    if (!this.embeddingClient || !this.d.pg) return;
+    if (!content || content.trim().length === 0) return;
+
+    const embedding = await this.embeddingClient.embedOne(content);
+    await this.db.run(
+      `UPDATE messages SET embedding = $1 WHERE message_id = $2`,
+      [toVectorLiteral(embedding), messageId],
+    );
+  }
+
+  async searchSemantic(
+    query: string, limit: number,
+    conversationId?: ConversationId, since?: Date, before?: Date,
+    callerAgentId?: string,
+  ): Promise<MessageSearchResult[]> {
+    if (!this.d.pg || !this.embeddingClient) {
+      throw new Error("Semantic search requires PostgreSQL with pgvector and a configured embedding API key");
+    }
+
+    const queryEmbedding = await this.embeddingClient.embedOne(query);
+    const vectorLiteral = toVectorLiteral(queryEmbedding);
+
+    const d = this.d.reset();
+    const where: string[] = ["m.embedding IS NOT NULL"];
+    const params: unknown[] = [];
+
+    if (conversationId !== undefined) { where.push(`m.conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`m.created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`m.created_at < ${d.p()}`); params.push(before.toISOString()); }
+
+    const vecParam = d.p();
+    const candidateLimit = d.p();
+    const finalLimit = d.p();
+    params.push(vectorLiteral, limit * 3, limit);
+
+    // Agent affinity: boost results from caller's own conversations by 1.3x
+    let agentBoostExpr = "1.0";
+    if (callerAgentId) {
+      const agentParam = d.p();
+      params.push(callerAgentId);
+      agentBoostExpr = `CASE WHEN c.agent_id = ${agentParam} THEN 1.3 ELSE 1.0 END`;
+    }
+
+    const result = await this.db.query<MessageRow & { rank: number }>(
+      `WITH candidates AS (
+         SELECT m.message_id, m.conversation_id, m.role, m.content, m.created_at,
+           1 - (m.embedding <=> ${vecParam}::vector) AS similarity
+         FROM messages m
+         WHERE ${where.join(" AND ")}
+         ORDER BY m.embedding <=> ${vecParam}::vector
+         LIMIT ${candidateLimit}
+       )
+       SELECT cd.message_id, cd.conversation_id, cd.role, cd.content, cd.created_at,
+         cd.similarity * ${agentBoostExpr} AS rank
+       FROM candidates cd
+       JOIN conversations c ON c.conversation_id = cd.conversation_id
+       ORDER BY rank DESC
+       LIMIT ${finalLimit}`,
+      params,
+    );
+
+    return result.rows.map((row) => ({
+      messageId: row.message_id,
+      conversationId: row.conversation_id,
+      role: row.role,
+      snippet: row.content.substring(0, 200),
+      createdAt: new Date(row.created_at),
+      rank: row.rank,
+    }));
+  }
+
+  /**
+   * Recency-boosted semantic search.
+   *
+   * Blends cosine similarity with an exponential time-decay factor:
+   *   score = semanticWeight * similarity + recencyWeight * exp(-ln(2) * age_days / halfLife)
+   *
+   * Recent messages get a natural lift. The half-life controls how fast
+   * the recency bonus decays (default 7 days = score halves every week).
+   */
+  async searchRecencyBoosted(
+    query: string, limit: number,
+    conversationId?: ConversationId, since?: Date, before?: Date,
+    semanticWeight = 0.7, recencyWeight = 0.3, halfLifeDays = 7,
+    callerAgentId?: string,
+  ): Promise<MessageSearchResult[]> {
+    if (!this.d.pg || !this.embeddingClient) {
+      throw new Error("Recency-boosted search requires PostgreSQL with pgvector and a configured embedding API key");
+    }
+
+    const queryEmbedding = await this.embeddingClient.embedOne(query);
+    const vectorLiteral = toVectorLiteral(queryEmbedding);
+
+    const d = this.d.reset();
+    const where: string[] = ["m.embedding IS NOT NULL"];
+    const params: unknown[] = [];
+
+    if (conversationId !== undefined) { where.push(`m.conversation_id = ${d.p()}`); params.push(conversationId); }
+    if (since) { where.push(`m.created_at >= ${d.p()}`); params.push(since.toISOString()); }
+    if (before) { where.push(`m.created_at < ${d.p()}`); params.push(before.toISOString()); }
+
+    const vecParam = d.p();
+    const swParam = d.p();
+    const rwParam = d.p();
+    const hlParam = d.p();
+    const candidateLimit = d.p();
+    const finalLimit = d.p();
+    params.push(vectorLiteral, semanticWeight, recencyWeight, halfLifeDays, limit * 3, limit);
+
+    // Agent affinity: boost results from caller's own conversations by 1.3x
+    let agentBoostExpr = "1.0";
+    if (callerAgentId) {
+      const agentParam = d.p();
+      params.push(callerAgentId);
+      agentBoostExpr = `CASE WHEN c.agent_id = ${agentParam} THEN 1.3 ELSE 1.0 END`;
+    }
+
+    // Use HNSW index for initial candidate retrieval (ORDER BY distance),
+    // then re-rank with blended score + agent affinity.
+    const result = await this.db.query<MessageRow & { rank: number }>(
+      `WITH candidates AS (
+         SELECT m.message_id, m.conversation_id, m.role, m.content, m.created_at,
+           1 - (m.embedding <=> ${vecParam}::vector) AS similarity,
+           EXP(-LN(2) * EXTRACT(EPOCH FROM (NOW() - m.created_at)) / 86400.0 / ${hlParam}) AS recency
+         FROM messages m
+         WHERE ${where.join(" AND ")}
+         ORDER BY m.embedding <=> ${vecParam}::vector
+         LIMIT ${candidateLimit}
+       )
+       SELECT cd.message_id, cd.conversation_id, cd.role, cd.content, cd.created_at,
+         (${swParam} * cd.similarity + ${rwParam} * cd.recency) * ${agentBoostExpr} AS rank
+       FROM candidates cd
+       JOIN conversations c ON c.conversation_id = cd.conversation_id
+       ORDER BY rank DESC
+       LIMIT ${finalLimit}`,
+      params,
+    );
+
+    return result.rows.map((row) => ({
+      messageId: row.message_id,
+      conversationId: row.conversation_id,
+      role: row.role,
+      snippet: row.content.substring(0, 200),
+      createdAt: new Date(row.created_at),
+      rank: row.rank,
+    }));
+  }
+
+  get embeddingsAvailable(): boolean {
+    return this.embeddingClient !== null && this.d.pg;
+  }
 }

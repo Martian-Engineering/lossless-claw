@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { getLcmConnection, closeLcmConnection } from "../src/db/connection.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
+import { SqliteClient } from "../src/db/sqlite-client.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
 
@@ -33,12 +34,13 @@ describe("FTS fallback", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-no-fts-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "fallback.db");
-    const db = getLcmConnection(dbPath);
+    const sqliteDb = getLcmConnection(dbPath);
 
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(sqliteDb, { fullTextAvailable: false });
 
-    const conversationStore = new ConversationStore(db, { fts5Available: false });
-    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const db = new SqliteClient(sqliteDb);
+    const conversationStore = new ConversationStore(db, { fullTextAvailable: false, backend: "sqlite" });
+    const summaryStore = new SummaryStore(db, { fullTextAvailable: false, backend: "sqlite" });
 
     const conversation = await conversationStore.createConversation({
       sessionId: "fallback-session",
@@ -97,7 +99,7 @@ describe("FTS fallback", () => {
     const deleted = await conversationStore.deleteMessages([assistantMessage.messageId]);
     expect(deleted).toBe(1);
 
-    const ftsTables = db
+    const ftsTables = sqliteDb
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts%'")
       .all() as Array<{ name: string }>;
     expect(ftsTables).toEqual([]);

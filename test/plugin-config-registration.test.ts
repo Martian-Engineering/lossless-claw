@@ -145,6 +145,27 @@ describe("lcm plugin registration", () => {
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
       largeFileTokenThreshold: 12345,
+      backend: expect.stringMatching(/^(sqlite|postgres)$/),
+      embeddingApiKey: expect.any(String),
+      embeddingBaseUrl: 'https://api.openai.com/v1',
+      embeddingModel: 'text-embedding-3-small',
+      leafMinFanout: 8,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      leafChunkTokens: 20000,
+      leafTargetTokens: 1200,
+      condensedTargetTokens: 2000,
+      maxExpandTokens: 4000,
+      largeFileSummaryProvider: '',
+      largeFileSummaryModel: '',
+      autocompactDisabled: false,
+      timezone: 'UTC',
+      pruneHeartbeatOk: false,
+    // instanceId, instanceDisplayName, instanceRole come from env vars (LCM_INSTANCE_*)
+    // not from pluginConfig, so we don't assert specific values here.
+    instanceId: expect.any(String),
+    instanceDisplayName: expect.any(String),
+    instanceRole: expect.any(String),
     });
     expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
