@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig } from "../db/config.js";
-import { createLcmDatabaseConnection } from "../db/connection.js";
+// Connection is now created internally by LcmContextEngine based on config.
 import { LcmContextEngine } from "../engine.js";
 import { logStartupBannerOnce } from "../startup-banner-log.js";
 import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
@@ -1320,8 +1320,7 @@ const lcmPlugin = {
 
   register(api: OpenClawPluginApi) {
     const deps = createLcmDependencies(api);
-    const database = createLcmDatabaseConnection(deps.config.databasePath);
-    const lcm = new LcmContextEngine(deps, database);
+    const lcm = new LcmContextEngine(deps);
 
     api.registerContextEngine("lossless-claw", () => lcm);
     api.registerContextEngine("default", () => lcm);
