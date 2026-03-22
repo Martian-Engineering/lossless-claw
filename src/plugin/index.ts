@@ -838,6 +838,53 @@ async function resolveApiKeyFromAuthProfiles(params: {
     const expires = credential.expires;
     const isExpired =
       typeof expires === "number" && Number.isFinite(expires) && expires > 0 && Date.now() >= expires;
+    const shouldPreferOAuthHelper =
+      typeof params.piAiModule.getOAuthApiKey === "function" &&
+      normalizeProviderId(params.provider) === "openai-codex";
+
+    if (shouldPreferOAuthHelper) {
+      try {
+        const oauthCredential = {
+          access: credential.access ?? "",
+          refresh: credential.refresh ?? "",
+          expires: typeof credential.expires === "number" ? credential.expires : 0,
+          ...(typeof credential.projectId === "string" ? { projectId: credential.projectId } : {}),
+          ...(typeof credential.accountId === "string" ? { accountId: credential.accountId } : {}),
+        };
+        const refreshed = await params.piAiModule.getOAuthApiKey(params.provider, {
+          [params.provider]: oauthCredential,
+        });
+        if (refreshed?.apiKey) {
+          mergedStore.profiles[profileId] = {
+            ...credential,
+            ...refreshed.newCredentials,
+            type: "oauth",
+          };
+          if (persistPath) {
+            try {
+              writeFileSync(
+                persistPath,
+                JSON.stringify(
+                  {
+                    version: 1,
+                    profiles: mergedStore.profiles,
+                    ...(mergedStore.order ? { order: mergedStore.order } : {}),
+                  },
+                  null,
+                  2,
+                ),
+                "utf8",
+              );
+            } catch {
+              // Ignore persistence errors: refreshed credentials remain usable in-memory for this run.
+            }
+          }
+          return refreshed.apiKey;
+        }
+      } catch {
+        // Fall back to the cached access token below when helper resolution fails.
+      }
+    }
 
     if (!isExpired && access) {
       if (
@@ -1114,6 +1161,26 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
               };
 
         let resolvedApiKey = apiKey?.trim();
+        if (!resolvedApiKey && modelAuth) {
+          try {
+            resolvedApiKey = resolveApiKeyFromAuthResult(
+              await modelAuth.getApiKeyForModel({
+                model: buildModelAuthLookupModel({
+                  provider: providerId,
+                  model: modelId,
+                  api: resolvedModel.api,
+                }),
+                cfg: api.config,
+                ...(authProfileId ? { profileId: authProfileId } : {}),
+              }),
+            );
+          } catch (err) {
+            console.error(
+              `[lcm] modelAuth.getApiKeyForModel FAILED:`,
+              err instanceof Error ? err.message : err,
+            );
+          }
+        }
         if (!resolvedApiKey && modelAuth) {
           try {
             resolvedApiKey = resolveApiKeyFromAuthResult(

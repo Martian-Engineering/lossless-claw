@@ -10,6 +10,7 @@ const piAiMock = vi.hoisted(() => ({
   getModel: vi.fn(),
   getModels: vi.fn(),
   getEnvApiKey: vi.fn(),
+  getOAuthApiKey: vi.fn(),
 }));
 
 vi.mock("@mariozechner/pi-ai", () => piAiMock);
@@ -129,6 +130,7 @@ describe("createLcmDependencies.complete provider config resolution", () => {
     piAiMock.getModel.mockReturnValue(undefined);
     piAiMock.getModels.mockReturnValue([]);
     piAiMock.getEnvApiKey.mockReturnValue(undefined);
+    piAiMock.getOAuthApiKey.mockResolvedValue(undefined);
   });
 
   afterEach(() => {

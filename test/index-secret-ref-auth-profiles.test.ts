@@ -11,6 +11,7 @@ const piAiMock = vi.hoisted(() => ({
   getModel: vi.fn(),
   getModels: vi.fn(),
   getEnvApiKey: vi.fn(),
+  getOAuthApiKey: vi.fn(),
 }));
 
 vi.mock("@mariozechner/pi-ai", () => piAiMock);
@@ -136,6 +137,15 @@ describe("auth-profile SecretRef resolution in complete()", () => {
     piAiMock.getModel.mockReturnValue(undefined);
     piAiMock.getModels.mockReturnValue([]);
     piAiMock.getEnvApiKey.mockReturnValue(undefined);
+    piAiMock.getOAuthApiKey.mockResolvedValue({
+      apiKey: "oauth-helper-api-key",
+      newCredentials: {
+        access: "oauth-helper-access",
+        refresh: "oauth-helper-refresh",
+        expires: Date.now() + 60_000,
+        accountId: "acct-1",
+      },
+    });
   });
 
   afterEach(() => {
@@ -246,6 +256,60 @@ describe("auth-profile SecretRef resolution in complete()", () => {
       expect.any(Object),
       expect.objectContaining({
         apiKey: "single-value-secret",
+      }),
+    );
+  });
+
+  it("prefers the OAuth helper for openai-codex auth profiles even when the cached token is unexpired", async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), "lossless-claw-openai-codex-auth-"));
+    tempDirs.add(agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv("OPENCLAW_AGENT_DIR", "");
+    vi.stubEnv("PI_CODING_AGENT_DIR", "");
+
+    writeFileSync(
+      join(agentDir, "auth-profiles.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          profiles: {
+            "openai-codex:default": {
+              type: "oauth",
+              provider: "openai-codex",
+              access: "cached-access-token",
+              refresh: "cached-refresh-token",
+              expires: Date.now() + 60_000,
+              accountId: "acct-cached",
+            },
+          },
+          order: {
+            "openai-codex": ["openai-codex:default"],
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    await callComplete({
+      agentDir,
+      provider: "openai-codex",
+      model: "gpt-5.4",
+    });
+
+    expect(piAiMock.getOAuthApiKey).toHaveBeenCalledWith("openai-codex", {
+      "openai-codex": expect.objectContaining({
+        access: "cached-access-token",
+        refresh: "cached-refresh-token",
+        accountId: "acct-cached",
+      }),
+    });
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.any(Object),
+      expect.objectContaining({
+        apiKey: "oauth-helper-api-key",
       }),
     );
   });

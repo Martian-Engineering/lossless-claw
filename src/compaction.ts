@@ -1015,6 +1015,17 @@ export class CompactionEngine {
       };
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
+    const buildDeterministicFallback = (): { content: string; level: CompactionLevel } => {
+      const truncated =
+        sourceText.length > FALLBACK_MAX_CHARS
+          ? sourceText.slice(0, FALLBACK_MAX_CHARS)
+          : sourceText;
+      return {
+        content: `${truncated}
+[Truncated from ${inputTokens} tokens]`,
+        level: "fallback",
+      };
+    };
 
     const runSummarizer = async (aggressiveMode: boolean): Promise<string | null> => {
       const output = await params.summarize(sourceText, aggressiveMode, params.options);
@@ -1024,7 +1035,9 @@ export class CompactionEngine {
 
     const initialSummary = await runSummarizer(false);
     if (initialSummary === null) {
-      return null;
+      // Empty provider output should still compact deterministically so auth
+      // failures or empty responses do not stall compaction entirely.
+      return buildDeterministicFallback();
     }
     let summaryText = initialSummary;
     let level: CompactionLevel = "normal";
@@ -1032,19 +1045,13 @@ export class CompactionEngine {
     if (estimateTokens(summaryText) >= inputTokens) {
       const aggressiveSummary = await runSummarizer(true);
       if (aggressiveSummary === null) {
-        return null;
+        return buildDeterministicFallback();
       }
       summaryText = aggressiveSummary;
       level = "aggressive";
 
       if (estimateTokens(summaryText) >= inputTokens) {
-        const truncated =
-          sourceText.length > FALLBACK_MAX_CHARS
-            ? sourceText.slice(0, FALLBACK_MAX_CHARS)
-            : sourceText;
-        summaryText = `${truncated}
-[Truncated from ${inputTokens} tokens]`;
-        level = "fallback";
+        return buildDeterministicFallback();
       }
     }
 

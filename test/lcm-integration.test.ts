@@ -1853,6 +1853,30 @@ describe("LCM integration: compaction", () => {
     expect(leafSummary!.content).toContain("tokens]");
   });
 
+  it("compaction still creates a deterministic fallback summary when the summarizer returns empty content", async () => {
+    await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) => `Content ${i}: ${"c".repeat(200)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarize = vi.fn(async () => "");
+
+    const result = await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.level).toBe("fallback");
+
+    const leafSummary = sumStore._summaries.find((s) => s.kind === "leaf");
+    expect(leafSummary).toBeDefined();
+    expect(leafSummary!.content).toContain("[Truncated from");
+    expect(leafSummary!.content).toContain("tokens]");
+  });
+
   it("compactUntilUnder loops until under budget", async () => {
     // Ingest many messages with substantial token counts
     await ingestMessages(convStore, sumStore, 20, {
