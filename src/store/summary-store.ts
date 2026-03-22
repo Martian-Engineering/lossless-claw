@@ -112,6 +112,16 @@ export type ConversationBootstrapStateRecord = {
   updatedAt: Date;
 };
 
+export type TranscriptGcCandidateRecord = {
+  messageId: number;
+  conversationId: number;
+  seq: number;
+  toolCallId: string;
+  toolName: string | null;
+  externalizedFileId: string | null;
+  originalByteSize: number | null;
+};
+
 // ── DB row shapes (snake_case) ────────────────────────────────────────────────
 
 interface SummaryRow {
@@ -191,6 +201,15 @@ interface ConversationBootstrapStateRow {
   last_processed_offset: number;
   last_processed_entry_hash: string | null;
   updated_at: string;
+}
+
+interface TranscriptGcCandidateRow {
+  message_id: number;
+  conversation_id: number;
+  seq: number;
+  tool_call_id: string | null;
+  tool_name: string | null;
+  metadata: string | null;
 }
 
 // ── Row mappers ───────────────────────────────────────────────────────────────
@@ -281,6 +300,42 @@ function toConversationBootstrapStateRecord(
     lastProcessedOffset: row.last_processed_offset,
     lastProcessedEntryHash: row.last_processed_entry_hash,
     updatedAt: new Date(row.updated_at),
+  };
+}
+
+function toTranscriptGcCandidateRecord(
+  row: TranscriptGcCandidateRow,
+): TranscriptGcCandidateRecord | null {
+  if (typeof row.tool_call_id !== "string" || row.tool_call_id.length === 0) {
+    return null;
+  }
+
+  let metadata: Record<string, unknown> | null = null;
+  try {
+    metadata =
+      typeof row.metadata === "string" && row.metadata.length > 0
+        ? (JSON.parse(row.metadata) as Record<string, unknown>)
+        : null;
+  } catch {
+    metadata = null;
+  }
+
+  if (!metadata || metadata.toolOutputExternalized !== true) {
+    return null;
+  }
+
+  return {
+    messageId: row.message_id,
+    conversationId: row.conversation_id,
+    seq: row.seq,
+    toolCallId: row.tool_call_id,
+    toolName: row.tool_name,
+    externalizedFileId:
+      typeof metadata.externalizedFileId === "string" ? metadata.externalizedFileId : null,
+    originalByteSize:
+      typeof metadata.originalByteSize === "number" && Number.isFinite(metadata.originalByteSize)
+        ? Math.max(0, Math.floor(metadata.originalByteSize))
+        : null,
   };
 }
 
@@ -458,6 +513,72 @@ export class SummaryStore {
       )
       .all(summaryId) as unknown as MessageIdRow[];
     return rows.map((r) => r.message_id);
+  }
+
+  /**
+   * Return summarized tool-result messages that are safe candidates for
+   * transcript GC because they are no longer present as raw context items.
+   */
+  async listTranscriptGcCandidates(
+    conversationId: number,
+    options?: { limit?: number },
+  ): Promise<TranscriptGcCandidateRecord[]> {
+    const limit =
+      typeof options?.limit === "number" && Number.isFinite(options.limit) && options.limit > 0
+        ? Math.max(1, Math.floor(options.limit))
+        : 25;
+
+    const rows = this.db
+      .prepare(
+        `SELECT
+           m.message_id,
+           m.conversation_id,
+           m.seq,
+           mp.tool_call_id,
+           mp.tool_name,
+           mp.metadata
+         FROM messages m
+         JOIN message_parts mp
+           ON mp.message_id = m.message_id
+         WHERE m.conversation_id = ?
+           AND m.role = 'tool'
+           AND mp.part_type = 'tool'
+           AND mp.tool_call_id IS NOT NULL
+           AND mp.tool_call_id != ''
+           AND EXISTS (
+             SELECT 1
+             FROM summary_messages sm
+             WHERE sm.message_id = m.message_id
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM context_items ci
+             WHERE ci.conversation_id = m.conversation_id
+               AND ci.item_type = 'message'
+               AND ci.message_id = m.message_id
+           )
+         ORDER BY m.seq ASC, mp.ordinal ASC`,
+      )
+      .all(conversationId) as unknown as TranscriptGcCandidateRow[];
+
+    const seenMessageIds = new Set<number>();
+    const candidates: TranscriptGcCandidateRecord[] = [];
+    for (const row of rows) {
+      if (seenMessageIds.has(row.message_id)) {
+        continue;
+      }
+      const candidate = toTranscriptGcCandidateRecord(row);
+      if (!candidate) {
+        continue;
+      }
+      seenMessageIds.add(candidate.messageId);
+      candidates.push(candidate);
+      if (candidates.length >= limit) {
+        break;
+      }
+    }
+
+    return candidates;
   }
 
   async getSummaryChildren(parentSummaryId: string): Promise<SummaryRecord[]> {
