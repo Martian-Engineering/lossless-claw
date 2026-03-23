@@ -363,6 +363,66 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
   }
 }
 
+/**
+ * Backfill tool_call_id, tool_name, and tool_input from metadata JSON for rows
+ * where the DB columns are NULL but the values exist in metadata.  This covers
+ * legacy text-type parts where the string-content ingestion path stored tool
+ * info only in the metadata JSON (see #158).
+ */
+function backfillToolCallColumns(db: DatabaseSync): void {
+  db.exec(
+    `UPDATE message_parts
+     SET tool_call_id = COALESCE(
+       json_extract(metadata, '$.toolCallId'),
+       json_extract(metadata, '$.raw.id'),
+       json_extract(metadata, '$.raw.toolCallId'),
+       json_extract(metadata, '$.raw.tool_call_id')
+     )
+     WHERE tool_call_id IS NULL
+       AND metadata IS NOT NULL
+       AND COALESCE(
+         json_extract(metadata, '$.toolCallId'),
+         json_extract(metadata, '$.raw.id'),
+         json_extract(metadata, '$.raw.toolCallId'),
+         json_extract(metadata, '$.raw.tool_call_id')
+       ) IS NOT NULL`,
+  );
+
+  db.exec(
+    `UPDATE message_parts
+     SET tool_name = COALESCE(
+       json_extract(metadata, '$.toolName'),
+       json_extract(metadata, '$.raw.name'),
+       json_extract(metadata, '$.raw.toolName'),
+       json_extract(metadata, '$.raw.tool_name')
+     )
+     WHERE tool_name IS NULL
+       AND metadata IS NOT NULL
+       AND COALESCE(
+         json_extract(metadata, '$.toolName'),
+         json_extract(metadata, '$.raw.name'),
+         json_extract(metadata, '$.raw.toolName'),
+         json_extract(metadata, '$.raw.tool_name')
+       ) IS NOT NULL`,
+  );
+
+  db.exec(
+    `UPDATE message_parts
+     SET tool_input = COALESCE(
+       json_extract(metadata, '$.raw.input'),
+       json_extract(metadata, '$.raw.arguments'),
+       json_extract(metadata, '$.raw.toolInput')
+     )
+     WHERE tool_input IS NULL
+       AND metadata IS NOT NULL
+       AND COALESCE(
+         json_extract(metadata, '$.raw.input'),
+         json_extract(metadata, '$.raw.arguments'),
+         json_extract(metadata, '$.raw.toolInput')
+       ) IS NOT NULL`,
+  );
+}
+
 export function runLcmMigrations(
   db: DatabaseSync,
   options?: { fts5Available?: boolean },
@@ -523,6 +583,7 @@ export function runLcmMigrations(
   ensureSummaryModelColumn(db);
   backfillSummaryDepths(db);
   backfillSummaryMetadata(db);
+  backfillToolCallColumns(db);
 
   const fts5Available = options?.fts5Available ?? getLcmDbFeatures(db).fts5Available;
   if (!fts5Available) {
