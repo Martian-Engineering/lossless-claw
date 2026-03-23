@@ -103,6 +103,52 @@ describe("FTS fallback", () => {
     expect(ftsTables).toEqual([]);
   });
 
+  it("ignores lcm_describe helper text in externalized tool-output fallback search", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-no-fts-tool-output-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "tool-output-fallback.db");
+    const db = getLcmConnection(dbPath);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const conversationStore = new ConversationStore(db, { fts5Available: false });
+    const conversation = await conversationStore.createConversation({
+      sessionId: "tool-output-fallback",
+      title: "Tool output fallback search",
+    });
+
+    await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "assistant",
+      content: [
+        "[LCM Tool Output: file_1234567890abcdef | tool=exec | 1,024 bytes]",
+        "",
+        "Exploration Summary:",
+        "Command output summary for pwd.",
+        "",
+        "Use lcm_describe with the file id to inspect the full output.",
+      ].join("\n"),
+      tokenCount: 20,
+    });
+
+    const noisy = await conversationStore.searchMessages({
+      query: "lcm_describe",
+      mode: "full_text",
+      conversationId: conversation.conversationId,
+      limit: 10,
+    });
+    expect(noisy).toHaveLength(0);
+
+    const searchable = await conversationStore.searchMessages({
+      query: "tool=exec",
+      mode: "full_text",
+      conversationId: conversation.conversationId,
+      limit: 10,
+    });
+    expect(searchable).toHaveLength(1);
+  });
+
   itIfFts5("uses LIKE search for CJK queries even when FTS5 is available", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-cjk-fts-"));
     tempDirs.push(tempDir);

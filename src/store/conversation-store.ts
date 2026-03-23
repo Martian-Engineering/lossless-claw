@@ -804,14 +804,24 @@ export class ConversationStore {
       )
       .all(...args) as unknown as MessageRow[];
 
-    return rows.map((row) => ({
-      messageId: row.message_id,
-      conversationId: row.conversation_id,
-      role: row.role,
-      snippet: createFallbackSnippet(row.content, plan.terms),
-      createdAt: new Date(row.created_at),
-      rank: 0,
-    }));
+    return rows
+      .map((row) => {
+        const normalizedContent = normalizeMessageContentForFullTextIndex(row.content) ?? row.content;
+        const haystack = normalizedContent.toLowerCase();
+        const matchesAllTerms = plan.terms.every((term) => haystack.includes(term));
+        if (!matchesAllTerms) {
+          return null;
+        }
+        return {
+          messageId: row.message_id,
+          conversationId: row.conversation_id,
+          role: row.role,
+          snippet: createFallbackSnippet(normalizedContent, plan.terms),
+          createdAt: new Date(row.created_at),
+          rank: 0,
+        };
+      })
+      .filter((row): row is MessageSearchResult => row !== null);
   }
 
   private searchRegex(
