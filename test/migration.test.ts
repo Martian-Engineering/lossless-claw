@@ -247,4 +247,65 @@ describe("runLcmMigrations summary depth backfill", () => {
       "updated_at",
     ]);
   });
+
+  it("backfills legacy tool_call_id values from metadata.raw.call_id", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "legacy-tool-call-id.db");
+    const db = getLcmConnection(dbPath);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    db.prepare(
+      `INSERT INTO conversations (conversation_id, session_id, title)
+       VALUES (?, ?, ?)`,
+    ).run(1, "legacy-session", "Legacy");
+    db.prepare(
+      `INSERT INTO messages (message_id, conversation_id, seq, role, content, token_count)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(1, 1, 1, "assistant", "", 0);
+    db.prepare(
+      `INSERT INTO message_parts (
+         part_id, message_id, session_id, part_type, ordinal, text_content,
+         tool_call_id, tool_name, tool_input, tool_output, metadata
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "part-1",
+      1,
+      "legacy-session",
+      "text",
+      0,
+      null,
+      null,
+      null,
+      null,
+      null,
+      JSON.stringify({
+        rawType: "function_call",
+        originalRole: "assistant",
+        raw: {
+          type: "function_call",
+          call_id: "fc_legacy_123",
+          name: "bash",
+          arguments: { cmd: "pwd" },
+        },
+      }),
+    );
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const row = db.prepare(
+      `SELECT tool_call_id, tool_name, tool_input
+       FROM message_parts
+       WHERE part_id = ?`,
+    ).get("part-1") as {
+      tool_call_id: string | null;
+      tool_name: string | null;
+      tool_input: string | null;
+    };
+
+    expect(row.tool_call_id).toBe("fc_legacy_123");
+    expect(row.tool_name).toBe("bash");
+    expect(row.tool_input).toBe('{"cmd":"pwd"}');
+  });
 });

@@ -372,9 +372,15 @@ export function blockFromPart(part: MessagePartRecord): unknown {
     // often NULL — the values only live inside metadata.raw.  Backfill them here
     // so the reconstructed block keeps the original id/name.
     const rawRecord = metadata.raw as Record<string, unknown>;
-    if (typeof rawRecord.id === "string" && rawRecord.id.length > 0) {
+    const rawToolCallId =
+      typeof rawRecord.id === "string" && rawRecord.id.length > 0
+        ? rawRecord.id
+        : typeof rawRecord.call_id === "string" && rawRecord.call_id.length > 0
+          ? rawRecord.call_id
+          : undefined;
+    if (rawToolCallId) {
       if (typeof part.toolCallId !== "string" || part.toolCallId.length === 0) {
-        part.toolCallId = rawRecord.id;
+        part.toolCallId = rawToolCallId;
       }
     }
     if (typeof rawRecord.name === "string" && rawRecord.name.length > 0) {

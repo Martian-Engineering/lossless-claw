@@ -375,6 +375,7 @@ function backfillToolCallColumns(db: DatabaseSync): void {
      SET tool_call_id = COALESCE(
        json_extract(metadata, '$.toolCallId'),
        json_extract(metadata, '$.raw.id'),
+       json_extract(metadata, '$.raw.call_id'),
        json_extract(metadata, '$.raw.toolCallId'),
        json_extract(metadata, '$.raw.tool_call_id')
      )
@@ -383,6 +384,7 @@ function backfillToolCallColumns(db: DatabaseSync): void {
        AND COALESCE(
          json_extract(metadata, '$.toolCallId'),
          json_extract(metadata, '$.raw.id'),
+         json_extract(metadata, '$.raw.call_id'),
          json_extract(metadata, '$.raw.toolCallId'),
          json_extract(metadata, '$.raw.tool_call_id')
        ) IS NOT NULL`,

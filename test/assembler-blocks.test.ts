@@ -482,6 +482,31 @@ describe("blockFromPart", () => {
     expect(block.name).toBe("read");
   });
 
+  it("backfills toolCallId from metadata.raw.call_id for function_call type", () => {
+    const part = makePart({
+      partType: "text",
+      toolCallId: null,
+      toolName: null,
+      toolInput: null,
+      metadata: JSON.stringify({
+        rawType: "function_call",
+        originalRole: "assistant",
+        raw: {
+          type: "function_call",
+          call_id: "fc_legacy_123",
+          name: "bash",
+          arguments: { cmd: "pwd" },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.type).toBe("function_call");
+    expect(block.call_id).toBe("fc_legacy_123");
+    expect(block.name).toBe("bash");
+    expect(block.arguments).toEqual({ cmd: "pwd" });
+  });
+
   it("prefers DB column over metadata.raw when both are present", () => {
     const part = makePart({
       partType: "text",
