@@ -897,11 +897,14 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     console.error(`[lcm] createLcmSummarize: empty provider="${provider}" or model="${model}"`);
     return undefined;
   }
-  const authProfileId =
+  const legacyAuthProfileId =
     typeof params.legacyParams.authProfileId === "string" &&
     params.legacyParams.authProfileId.trim()
       ? params.legacyParams.authProfileId.trim()
       : undefined;
+  // When LCM selects a dedicated summarizer model/provider, do not leak the
+  // active session's auth profile into that separate credential lookup.
+  const authProfileId = resolvedSummary === undefined ? legacyAuthProfileId : undefined;
   const agentDir =
     typeof params.legacyParams.agentDir === "string" && params.legacyParams.agentDir.trim()
       ? params.legacyParams.agentDir.trim()

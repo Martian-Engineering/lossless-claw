@@ -388,6 +388,51 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     });
   });
 
+  it("does not inherit runtime authProfileId when plugin summary provider/model are explicit", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "kimi-coding",
+        model: "k2p5",
+      })),
+      getApiKey: vi.fn(async () => "resolved-api-key"),
+    });
+    const runtimeConfig = {
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              summaryProvider: "kimi-coding",
+              summaryModel: "k2p5",
+            },
+          },
+        },
+      },
+    };
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "openai-codex",
+        model: "gpt-5.4",
+        authProfileId: "openai-codex:default",
+        config: runtimeConfig,
+      },
+    });
+
+    await summarize!("Summary input");
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("k2p5", "kimi-coding");
+
+    const getApiKeyOptions = vi.mocked(deps.getApiKey).mock.calls[0]?.[2];
+    expect(getApiKeyOptions?.runtimeConfig).toBe(runtimeConfig);
+    expect(getApiKeyOptions?.profileId).toBeUndefined();
+
+    const completeArgs = vi.mocked(deps.complete).mock.calls[0]?.[0];
+    expect(completeArgs?.provider).toBe("kimi-coding");
+    expect(completeArgs?.model).toBe("k2p5");
+    expect(completeArgs?.authProfileId).toBeUndefined();
+  });
+
   it("falls back deterministically when model returns empty summary output after retry", async () => {
     const deps = makeDeps({
       complete: vi.fn(async () => ({
