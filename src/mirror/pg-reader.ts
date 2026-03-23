@@ -59,6 +59,7 @@ CREATE OR REPLACE FUNCTION agent_matches_any(arr TEXT[]) RETURNS BOOLEAN AS $$
 $$ LANGUAGE sql STABLE SECURITY DEFINER;
 
 ALTER TABLE shared_knowledge ENABLE ROW LEVEL SECURITY;
+ALTER TABLE shared_knowledge FORCE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS sk_admin_bypass ON shared_knowledge;
 DROP POLICY IF EXISTS sk_read_shared ON shared_knowledge;
@@ -535,6 +536,8 @@ export async function searchSharedKnowledge(
     connectionString,
     agentId: options.agentId,
     adminRoleName: options.adminRoleName,
+    // Defense in depth: keep visibility checks in-query so superuser/BYPASSRLS
+    // sessions do not leak restricted rows even when table RLS is bypassed.
     fn: (client) =>
       client.query(
         `SELECT
@@ -543,6 +546,12 @@ export async function searchSharedKnowledge(
          FROM shared_knowledge
          WHERE ($1 = '' OR COALESCE(title, '') ILIKE $2 ESCAPE '\\' OR content ILIKE $2 ESCAPE '\\')
            AND ($3::text[] IS NULL OR tags @> $3::text[])
+           AND (
+             current_agent_has_role(current_setting('app.admin_role', true))
+             OR visibility = 'shared'
+             OR owner_agent_id = current_setting('app.agent_id', true)
+             OR (visibility = 'restricted' AND agent_matches_any(visible_to))
+           )
          ORDER BY updated_at DESC
          LIMIT $4`,
         [

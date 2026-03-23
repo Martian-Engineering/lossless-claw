@@ -37,6 +37,23 @@ describePg("pg-reader integration (requires TEST_PG_URL)", () => {
     expect(result.rows.map((row) => row.table_name)).toEqual(["knowledge_roles", "shared_knowledge"]);
   });
 
+  it("ensureSharedKnowledgeTables enforces FORCE ROW LEVEL SECURITY on shared_knowledge", async () => {
+    await ensureSharedKnowledgeTables(pgUrl!);
+    const pg = await import("pg");
+    const pool = new pg.Pool({ connectionString: pgUrl!, max: 1 });
+    const result = await pool.query(
+      `SELECT c.relrowsecurity, c.relforcerowsecurity
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'public' AND c.relname = 'shared_knowledge'
+       LIMIT 1`,
+    );
+    await pool.end();
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]?.relrowsecurity).toBe(true);
+    expect(result.rows[0]?.relforcerowsecurity).toBe(true);
+  });
+
   it("role CRUD works and is idempotent", async () => {
     const runId = Date.now().toString(36);
     const agentId = `agent_${runId}`;
