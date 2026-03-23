@@ -37,14 +37,17 @@ LCM-PG 在上游 LCM 基础上增加了 **PostgreSQL 异步镜像**：每次 com
                           │  table          │
                           └────────────────┘
                                    │
-                        (future: cross-instance
-                         search, shared knowledge,
-                         dashboards)
+                          shared_knowledge
+                          (RLS-controlled)
+                                   │
+                        cross-instance search,
+                        assemble injection,
+                        dashboards
 ```
 
 - **SQLite** remains the primary store — all reads (`assemble`, `lcm_grep`, `lcm_expand`) come from here.
 - **PostgreSQL** receives a write-only mirror of summary snapshots after compaction. The mirror is idempotent (`ON CONFLICT DO NOTHING` by content hash).
-- Agent tools do **not** query PG today. Cross-instance retrieval from PG is planned for milestone FW-M4.
+- **M4 tools** (`lcm_mirror_search`, `lcm_shared_knowledge_search/write`, `lcm_manage_roles`) query PG for cross-instance search and shared knowledge with role-based access control.
 
 ### Data flow / 数据流四层模型
 
@@ -66,7 +69,7 @@ The mirror syncs to PG **after compaction**, not after every turn. If compaction
 
 PG 中有两张独立的表，各自承担不同职责：
 
-| | `lcm_mirror` | `shared_knowledge` (future) |
+| | `lcm_mirror` | `shared_knowledge` |
 |---|---|---|
 | **写入内容** | 单个 agent 的 compaction 摘要快照 | 经过筛选的跨 agent 共享知识 |
 | **谁来写** | 自动 — `afterTurn` compaction 后触发 | 人工/编排 — admin agent 从 mirror 精选后写入 |
@@ -87,7 +90,7 @@ PG 中有两张独立的表，各自承担不同职责：
 | **FW-M1** | `lcm_mirror` DDL + `pg-sink` + integration test | Done |
 | **FW-M2** | `extract` + SQLite fixture tests | Done |
 | **FW-M3** | In-process queue + `afterTurn` hook + config | Done |
-| **FW-M4** | Cross-instance retrieval: PG-side search for mirror + shared knowledge in `assemble` | Not started |
+| **FW-M4** | PG read tools, shared knowledge, role-based access, assemble injection | Done (validated 2026-03-23) |
 | **FW-M5** | Compaction-complete hook (optional) | Not started |
 
 详细实施计划见 [LCM-PG-fw-plan.md](liz-plans/LCM-PG-fw-plan.md)。
@@ -155,6 +158,56 @@ Without these variables (or with `LCM_MIRROR_ENABLED=false`), the plugin behaves
 | `LCM_ROLE_BOOTSTRAP_MAP` | built-in map | JSON map of `agentId -> role[]` for idempotent startup seeding |
 
 All mirror variables can also be set via plugin config (`mirrorEnabled`, `mirrorDatabaseUrl`, etc.). Environment variables take precedence.
+
+### Plugin config file (`openclaw.json`)
+
+Instead of setting environment variables on every gateway start, you can persist the config in `~/.openclaw/openclaw.json` under `plugins.entries.lcm-pg.config`:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lcm-pg": {
+        "enabled": true,
+        "config": {
+          "mirrorEnabled": true,
+          "mirrorDatabaseUrl": "postgresql://user@localhost:5432/mydb",
+          "mirrorMode": "latest_nodes",
+          "contextThreshold": 0.75,
+          "sharedKnowledgeEnabled": true,
+          "mirrorAdminAgents": ["main"]
+        }
+      }
+    }
+  }
+}
+```
+
+With this in place, simply run:
+
+```bash
+openclaw gateway --force
+```
+
+**Config key mapping** (env var → plugin config):
+
+| Environment variable | Plugin config key |
+|---------------------|-------------------|
+| `LCM_MIRROR_ENABLED` | `mirrorEnabled` |
+| `LCM_MIRROR_DATABASE_URL` | `mirrorDatabaseUrl` |
+| `LCM_MIRROR_MODE` | `mirrorMode` |
+| `LCM_MIRROR_AGENT_PG_MAP` | `mirrorAgentDatabaseUrls` (object) |
+| `LCM_SHARED_KNOWLEDGE_ENABLED` | `sharedKnowledgeEnabled` |
+| `LCM_ASSEMBLE_SHARED_KNOWLEDGE` | `assembleSharedKnowledge` |
+| `LCM_ASSEMBLE_SK_TIMEOUT_MS` | `assembleSkTimeoutMs` |
+| `LCM_ASSEMBLE_SK_LIMIT` | `assembleSkLimit` |
+| `LCM_ASSEMBLE_SK_MAX_TOKENS` | `assembleSkMaxTokens` |
+| `LCM_ADMIN_ROLE_NAME` | `adminRoleName` |
+| `LCM_ADMIN_AGENT_IDS` | `mirrorAdminAgents` |
+| `LCM_ROLE_BOOTSTRAP_MAP` | `roleBootstrapMap` (object) |
+| `LCM_CONTEXT_THRESHOLD` | `contextThreshold` |
+
+Env vars always override the config file when both are set.
 
 ### Shared knowledge URL resolution (important)
 
@@ -230,7 +283,8 @@ LCM core settings (`LCM_FRESH_TAIL_COUNT`, `LCM_CONTEXT_THRESHOLD`, session patt
 | [LCM-PG-IMPLEMENTATION-PLAN.md](liz-plans/LCM-PG-IMPLEMENTATION-PLAN.md) | Full implementation plan with milestones / 完整实施计划 |
 | [LCM-PG-fast-workround.md](liz-plans/LCM-PG-fast-workround.md) | Fast workaround: SQLite local + PG shared / 快速落地方案 |
 | [LCM-PG-fw-plan.md](liz-plans/LCM-PG-fw-plan.md) | Async mirror implementation plan / 异步镜像实施拆解 |
-| [LCM-PG-fw-validation.md](liz-plans/LCM-PG-fw-validation.md) | Validation and testing plan / 验证测试计划 |
+| [LCM-PG-fw-validation.md](liz-plans/LCM-PG-fw-validation.md) | Validation and testing plan (Layers 1–9) / 验证测试计划 |
+| [M4/FW-M4-implementation-plan.md](liz-plans/M4/FW-M4-implementation-plan.md) | M4 implementation plan: PG read path + shared knowledge / M4 实施计划 |
 | [deep-dive-rdbms-proposal.md](liz-plans/deep-dive-rdbms-proposal.md) | Original RDBMS exploration notes / 早期 RDBMS 探索笔记 |
 
 ### Architecture decisions
@@ -281,11 +335,13 @@ src/
   types.ts                      # Core types and dependency injection contracts
   plugin/
     index.ts                    # Plugin registration, config resolution, mirror init
-  mirror/                       # ── PG mirror (this fork) ──
+  mirror/                       # ── PG mirror + shared knowledge (this fork) ──
     types.ts                    # LcmMirrorConfig, LcmMirrorRow, LcmMirrorMode
     config.ts                   # Resolve mirror config from env / plugin config
     extract.ts                  # Build mirror payload from SQLite summaries
+    pg-common.ts                # Shared PG pool management
     pg-sink.ts                  # DDL, connection pooling, upsert to lcm_mirror
+    pg-reader.ts                # Shared knowledge DDL, RLS, search, write, role CRUD
     queue.ts                    # Single-lane async job queue
   db/
     config.ts                   # LcmConfig resolution
@@ -299,6 +355,11 @@ src/
     lcm-describe-tool.ts        # lcm_describe
     lcm-expand-tool.ts          # lcm_expand (sub-agent)
     lcm-expand-query-tool.ts    # lcm_expand_query (main agent)
+    lcm-mirror-search-tool.ts   # lcm_mirror_search (admin: cross-agent mirror search)
+    lcm-manage-roles-tool.ts    # lcm_manage_roles (admin: role CRUD)
+    lcm-shared-knowledge-write-tool.ts   # lcm_shared_knowledge_write (admin: curate knowledge)
+    lcm-shared-knowledge-search-tool.ts  # lcm_shared_knowledge_search (RLS-filtered read)
+    lcm-shared-auth.ts          # Caller identity resolution + input validation
 test/                           # Vitest test suite
   mirror-extract.test.ts        # Mirror payload extraction tests
   mirror-deps-default.ts        # Shared disabled-mirror config for tests
