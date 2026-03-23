@@ -1,5 +1,13 @@
 # @martian-engineering/lossless-claw
 
+## 0.5.1
+
+### Patch Changes
+
+- [#159](https://github.com/Martian-Engineering/lossless-claw/pull/159) [`20b6c1b`](https://github.com/Martian-Engineering/lossless-claw/commit/20b6c1bd0c8c5903ce4498e9cef235392fa0cfc4) Thanks [@tmchow](https://github.com/tmchow)! - Fix legacy tool-call backfill for rows that stored ids under `metadata.raw.call_id`.
+
+- [#163](https://github.com/Martian-Engineering/lossless-claw/pull/163) [`31307a6`](https://github.com/Martian-Engineering/lossless-claw/commit/31307a671549438fe795b1ddd941a9af90ec51dc) Thanks [@jalehman](https://github.com/jalehman)! - Prevent the summarizer from reusing the active session auth profile when an explicit LCM summary provider and model are configured.
+
 ## 0.5.0
 
 ### Minor Changes
