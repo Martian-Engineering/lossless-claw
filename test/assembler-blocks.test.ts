@@ -149,7 +149,7 @@ describe("toolCallBlockFromPart", () => {
     expect(block).not.toHaveProperty("input");
   });
 
-  it("omits id when toolCallId is empty string", () => {
+  it("generates synthetic id when toolCallId is empty string", () => {
     const part = makePart({
       toolCallId: "",
       toolName: "read",
@@ -157,8 +157,19 @@ describe("toolCallBlockFromPart", () => {
     });
     const block = toolCallBlockFromPart(part) as Record<string, unknown>;
 
-    expect(block).not.toHaveProperty("id");
+    expect(block.id).toBe("toolu_lcm_test-part-1");
     expect(block.name).toBe("read");
+  });
+
+  it("generates synthetic id when toolCallId is null", () => {
+    const part = makePart({
+      toolCallId: null,
+      toolName: "read",
+      toolInput: '{"path":"a.txt"}',
+    });
+    const block = toolCallBlockFromPart(part) as Record<string, unknown>;
+
+    expect(block.id).toBe("toolu_lcm_test-part-1");
   });
 });
 
@@ -416,5 +427,99 @@ describe("blockFromPart", () => {
     const block = blockFromPart(part) as Record<string, unknown>;
 
     expect(block).toEqual({ type: "text", text: "" });
+  });
+
+  // ─── Regression: #158 — tool call id backfill from metadata.raw ──────────
+
+  it("backfills toolCallId from metadata.raw when DB column is NULL (regression #158)", () => {
+    // This is the exact scenario that crashes downstream providers:
+    // text-type rows with tool call data only in metadata.raw.
+    const part = makePart({
+      partType: "text",
+      toolCallId: null,
+      toolName: null,
+      toolInput: null,
+      metadata: JSON.stringify({
+        rawType: "toolCall",
+        originalRole: "assistant",
+        raw: {
+          type: "toolCall",
+          id: "toolu_01114sYtk4SBgj4gPvTmLrzX",
+          name: "exec",
+          arguments: { command: "ls" },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.type).toBe("toolCall");
+    expect(block.id).toBe("toolu_01114sYtk4SBgj4gPvTmLrzX");
+    expect(block.name).toBe("exec");
+    expect(block.arguments).toEqual({ command: "ls" });
+  });
+
+  it("backfills toolCallId from metadata.raw for tool_use type (regression #158)", () => {
+    const part = makePart({
+      partType: "text",
+      toolCallId: null,
+      toolName: null,
+      toolInput: null,
+      metadata: JSON.stringify({
+        rawType: "tool_use",
+        originalRole: "assistant",
+        raw: {
+          type: "tool_use",
+          id: "toolu_abc123",
+          name: "read",
+          input: { path: "USER.md" },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.type).toBe("tool_use");
+    expect(block.id).toBe("toolu_abc123");
+    expect(block.name).toBe("read");
+  });
+
+  it("prefers DB column over metadata.raw when both are present", () => {
+    const part = makePart({
+      partType: "text",
+      toolCallId: "db-column-id",
+      toolName: "db-tool-name",
+      metadata: JSON.stringify({
+        rawType: "toolCall",
+        originalRole: "assistant",
+        raw: {
+          type: "toolCall",
+          id: "raw-id",
+          name: "raw-name",
+          arguments: { x: 1 },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.id).toBe("db-column-id");
+    expect(block.name).toBe("db-tool-name");
+  });
+
+  it("generates synthetic fallback id when neither DB nor raw has an id", () => {
+    const part = makePart({
+      partType: "text",
+      toolCallId: null,
+      metadata: JSON.stringify({
+        rawType: "toolCall",
+        originalRole: "assistant",
+        raw: {
+          type: "toolCall",
+          name: "exec",
+          arguments: { command: "ls" },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.id).toBe("toolu_lcm_test-part-1");
   });
 });

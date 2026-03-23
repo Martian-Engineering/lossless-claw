@@ -238,9 +238,12 @@ export function toolCallBlockFromPart(part: MessagePartRecord, rawType?: string)
     return block;
   }
 
-  if (typeof part.toolCallId === "string" && part.toolCallId.length > 0) {
-    block.id = part.toolCallId;
-  }
+  // Always set id — downstream providers (e.g. Anthropic) call
+  // normalizeToolCallId(block.id) which crashes on undefined.
+  block.id =
+    typeof part.toolCallId === "string" && part.toolCallId.length > 0
+      ? part.toolCallId
+      : `toolu_lcm_${part.partId ?? "unknown"}`;
   if (typeof part.toolName === "string" && part.toolName.length > 0) {
     block.name = part.toolName;
   }
@@ -361,6 +364,31 @@ export function blockFromPart(part: MessagePartRecord): unknown {
       rawType === "tool_result";
     if (!isToolBlock) {
       return metadata.raw;
+    }
+
+    // When tool blocks are routed through toolCallBlockFromPart (below) instead
+    // of returning raw directly, the function reads part.toolCallId / part.toolName
+    // from the DB columns.  For rows stored as part_type='text' those columns are
+    // often NULL — the values only live inside metadata.raw.  Backfill them here
+    // so the reconstructed block keeps the original id/name.
+    const rawRecord = metadata.raw as Record<string, unknown>;
+    if (typeof rawRecord.id === "string" && rawRecord.id.length > 0) {
+      if (typeof part.toolCallId !== "string" || part.toolCallId.length === 0) {
+        part.toolCallId = rawRecord.id;
+      }
+    }
+    if (typeof rawRecord.name === "string" && rawRecord.name.length > 0) {
+      if (typeof part.toolName !== "string" || part.toolName.length === 0) {
+        part.toolName = rawRecord.name;
+      }
+    }
+    // Backfill toolInput from raw arguments/input so toolCallBlockFromPart
+    // can reconstruct the full block.
+    if (part.toolInput == null || part.toolInput === "") {
+      const rawArgs = rawRecord.arguments ?? rawRecord.input;
+      if (rawArgs !== undefined) {
+        part.toolInput = typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs);
+      }
     }
   }
 
