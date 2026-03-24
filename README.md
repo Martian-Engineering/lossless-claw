@@ -137,6 +137,11 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_EXPANSION_PROVIDER` | *(from OpenClaw)* | Provider override for `lcm_expand_query` sub-agent |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
+| `LCM_RLM_ENABLED` | `false` | Enable RLM (Recurrent Language Model) pattern-based summarization |
+| `LCM_RLM_PROVIDER` | `""` | Provider for RLM pattern analysis (e.g., 'openai', 'anthropic') |
+| `LCM_RLM_MODEL` | `""` | Model for RLM pattern analysis (e.g., 'gpt-4', 'claude-sonnet-4-20250514') |
+| `LCM_RLM_MIN_DEPTH` | `2` | Minimum compaction depth before using RLM |
+| `LCM_RLM_PATTERN_THRESHOLD` | `0.7` | Confidence threshold for pattern detection (0.0 - 1.0) |
 
 ### Expansion model override requirements
 
@@ -191,6 +196,54 @@ For compaction summarization, lossless-claw resolves the model in this order:
 4. Legacy per-call model/provider hints
 
 If `summaryModel` already includes a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that choice. Otherwise, the provider falls back to the matching override, then `OPENCLAW_PROVIDER`, then the provider inferred by the caller.
+
+### RLM (Recurrent Language Model) configuration
+
+RLM adds pattern-based summarization for deep compaction passes. When enabled, RLM analyzes summaries at depth >= `rlmMinDepth` to detect recurring themes, progressions, and task lifecycles. These patterns are compressed into efficient representations, reducing token usage while preserving semantic meaning.
+
+To enable RLM:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "config": {
+          "rlmEnabled": true,
+          "rlmProvider": "openai",
+          "rlmModel": "gpt-4",
+          "rlmMinDepth": 2,
+          "rlmPatternThreshold": 0.7
+        }
+      }
+    }
+  }
+}
+```
+
+Or via environment variables:
+
+```bash
+LCM_RLM_ENABLED=true
+LCM_RLM_PROVIDER=openai
+LCM_RLM_MODEL=gpt-4
+LCM_RLM_MIN_DEPTH=2
+LCM_RLM_PATTERN_THRESHOLD=0.7
+```
+
+**When to use RLM:**
+- Long-running conversations with recurring topics
+- Multi-session projects with evolving requirements
+- Workflows with clear task lifecycles (planning, execution, review)
+
+**RLM pattern types:**
+- **Recurring themes** — topics that appear across multiple summaries
+- **Progressions** — evolving states or sequences
+- **Decision evolution** — how decisions changed over time
+- **Task lifecycles** — tasks being created, worked on, completed
+- **Constraints** — persistent limitations or requirements
+
+RLM operates as a fallback mechanism: if pattern detection fails or confidence is low, standard summarization is used automatically.
 
 ### Recommended starting configuration
 
@@ -356,6 +409,10 @@ src/
   engine.ts                 # LcmContextEngine — implements ContextEngine interface
   assembler.ts              # Context assembly (summaries + messages → model context)
   compaction.ts             # CompactionEngine — leaf passes, condensation, sweeps
+  rlm/                       # RLM (Recurrent Language Model) pattern-based summarization
+    types.ts                 # RLM type definitions for patterns and analysis
+    rlm.ts                   # Core RLM engine with heuristic and LLM-based detection
+    index.ts                 # RLM module exports
   summarize.ts              # Depth-aware prompt generation and LLM summarization
   retrieval.ts              # RetrievalEngine — grep, describe, expand operations
   expansion.ts              # DAG expansion logic for lcm_expand_query

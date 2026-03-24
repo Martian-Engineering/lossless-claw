@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { ConversationStore, CreateMessagePartInput } from "./store/conversation-store.js";
 import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
 import { extractFileIdsFromContent } from "./large-files.js";
+import { RlmEngine, type RlmSummaryEntry } from "./rlm/index.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -49,6 +50,12 @@ export interface CompactionConfig {
   maxRounds: number;
   /** IANA timezone for timestamps in summaries (default: UTC) */
   timezone?: string;
+  /** RLM configuration for pattern-based summarization */
+  rlmEnabled?: boolean;
+  rlmProvider?: string;
+  rlmModel?: string;
+  rlmMinDepth?: number;
+  rlmPatternThreshold?: number;
 }
 
 type CompactionLevel = "normal" | "aggressive" | "fallback";
@@ -57,11 +64,20 @@ type CompactionSummarizeOptions = {
   previousSummary?: string;
   isCondensed?: boolean;
   depth?: number;
+  /** Use RLM (Recurrent Language Model) pattern-based summarization if available */
+  rlmSummarize?: boolean;
 };
 type CompactionSummarizeFn = (
   text: string,
   aggressive?: boolean,
   options?: CompactionSummarizeOptions,
+) => Promise<string>;
+
+/** LLM completion function for RLM pattern analysis */
+type LlmCompleteFn = (
+  prompt: string,
+  system: string,
+  maxTokens: number,
 ) => Promise<string>;
 type PassResult = { summaryId: string; level: CompactionLevel };
 type LeafChunkSelection = {
@@ -167,11 +183,25 @@ function dedupeOrderedIds(ids: Iterable<string>): string[] {
 // ── CompactionEngine ─────────────────────────────────────────────────────────
 
 export class CompactionEngine {
+  private rlmEngine?: RlmEngine;
+
   constructor(
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
     private config: CompactionConfig,
-  ) {}
+    llmCompleteFn?: LlmCompleteFn,
+  ) {
+    // Initialize RLM engine if enabled
+    if (config.rlmEnabled) {
+      this.rlmEngine = new RlmEngine({
+        enabled: true,
+        provider: config.rlmProvider ?? "",
+        model: config.rlmModel ?? "",
+        minDepth: config.rlmMinDepth ?? 2,
+        patternThreshold: config.rlmPatternThreshold ?? 0.7,
+      }, llmCompleteFn);
+    }
+  }
 
   // ── evaluate ─────────────────────────────────────────────────────────────
 
@@ -1001,11 +1031,13 @@ export class CompactionEngine {
   /**
    * Run three-level summarization escalation:
    * normal -> aggressive -> deterministic fallback.
+   * For depth >= 1, optionally uses RLM pattern-based summarization.
    */
   private async summarizeWithEscalation(params: {
     sourceText: string;
     summarize: CompactionSummarizeFn;
     options?: CompactionSummarizeOptions;
+    rlmEntries?: RlmSummaryEntry[];
   }): Promise<{ content: string; level: CompactionLevel } | null> {
     const sourceText = params.sourceText.trim();
     if (!sourceText) {
@@ -1026,6 +1058,36 @@ export class CompactionEngine {
         level: "fallback",
       };
     };
+
+    // Check if RLM should be used for this depth
+    const depth = params.options?.depth ?? 0;
+    const useRlm = params.options?.rlmSummarize === true && 
+                   this.rlmEngine?.shouldUseRlm(depth);
+
+    if (useRlm) {
+      // Try RLM pattern-based summarization
+      try {
+        // Use pre-parsed entries if available, otherwise fall back to text extraction
+        const entries: RlmSummaryEntry[] = params.rlmEntries ?? this.extractEntriesFromSourceText(sourceText);
+        
+        if (entries.length >= 2) {
+          const rlmResult = await this.rlmEngine!.summarize(entries, {
+            previousSummary: params.options?.previousSummary,
+            depth,
+          });
+
+          if (rlmResult.content && !rlmResult.fallbackToStandard) {
+            // RLM summarization succeeded with viable patterns
+            return { 
+              content: rlmResult.content, 
+              level: rlmResult.confidence > 0.8 ? "normal" : "aggressive" 
+            };
+          }
+        }
+      } catch (error) {
+        console.warn(`[lcm] RLM summarization failed, falling back to standard: ${error}`);
+      }
+    }
 
     const runSummarizer = async (aggressiveMode: boolean): Promise<string | null> => {
       const output = await params.summarize(sourceText, aggressiveMode, params.options);
@@ -1056,6 +1118,38 @@ export class CompactionEngine {
     }
 
     return { content: summaryText, level };
+  }
+
+  /**
+   * Extract RLM entries from source text for pattern analysis.
+   * Parses the concatenated summary format used in condensed passes.
+   */
+  private extractEntriesFromSourceText(sourceText: string): RlmSummaryEntry[] {
+    const entries: RlmSummaryEntry[] = [];
+    
+    // Split by common delimiter patterns in condensed summaries
+    const sections = sourceText.split(/\n\n---\n\n|\n\n(?=\[\d{4}-\d{2}-\d{2})/);
+    
+    for (let i = 0; i < sections.length; i++) {
+      const section = sections[i].trim();
+      if (!section) continue;
+
+      // Try to extract timestamp from header like "[2024-01-15 10:30 PST - 2024-01-15 11:00 PST]"
+      const headerMatch = section.match(/^\[(\d{4}-\d{2}-\d{2}[^\]]*)\]/);
+      const createdAt = headerMatch 
+        ? new Date(headerMatch[1].split(" - ")[0].trim()) 
+        : new Date();
+
+      entries.push({
+        summaryId: `extracted_${i}`,
+        content: section,
+        depth: 0, // Will be set by caller
+        createdAt,
+        tokenCount: estimateTokens(section),
+      });
+    }
+
+    return entries;
   }
 
   // ── Private: Media Annotation ────────────────────────────────────────────
@@ -1245,6 +1339,23 @@ export class CompactionEngine {
       targetDepth === 0
         ? await this.resolvePriorSummaryContextAtDepth(conversationId, summaryItems, targetDepth)
         : undefined;
+    
+    // Enable RLM for deeper condensation passes (respecting rlmMinDepth config)
+    const effectiveMinDepth = this.config.rlmMinDepth ?? 2;
+    const nextDepth = targetDepth + 1;
+    const useRlm = this.config.rlmEnabled && nextDepth >= effectiveMinDepth;
+    
+    // Build proper RLM entries from summary records when using RLM
+    const rlmEntries: RlmSummaryEntry[] | undefined = useRlm
+      ? summaryRecords.map((rec) => ({
+          summaryId: rec.summaryId,
+          content: rec.content,
+          depth: rec.depth,
+          createdAt: rec.createdAt,
+          tokenCount: rec.tokenCount ?? estimateTokens(rec.content),
+        }))
+      : undefined;
+    
     const condensed = await this.summarizeWithEscalation({
       sourceText: concatenated,
       summarize,
@@ -1252,7 +1363,9 @@ export class CompactionEngine {
         previousSummary: previousSummaryContent,
         isCondensed: true,
         depth: targetDepth + 1,
+        rlmSummarize: useRlm,
       },
+      rlmEntries,
     });
     if (!condensed) {
       console.warn(
