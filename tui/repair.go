@@ -968,7 +968,12 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 	if baseURL == "" {
 		baseURL = defaultAnthropicBaseURL
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/messages", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		resolveProviderEndpointURL(baseURL, "/v1/messages"),
+		bytes.NewReader(payload),
+	)
 	if err != nil {
 		return "", fmt.Errorf("build Anthropic request: %w", err)
 	}
@@ -1079,7 +1084,12 @@ func (c *anthropicClient) summarizeOpenAI(ctx context.Context, model, prompt str
 	if baseURL == "" {
 		baseURL = defaultOpenAIBaseURL
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/responses", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		resolveProviderEndpointURL(baseURL, "/v1/responses"),
+		bytes.NewReader(payload),
+	)
 	if err != nil {
 		return "", fmt.Errorf("build OpenAI request: %w", err)
 	}
@@ -1539,6 +1549,15 @@ func resolveProviderBaseURL(paths appDataPaths, provider, flagOverride string) s
 	default:
 		return defaultAnthropicBaseURL
 	}
+}
+
+// resolveProviderEndpointURL accepts either API-root base URLs or versioned /v1 URLs.
+func resolveProviderEndpointURL(baseURL, endpointPath string) string {
+	trimmedBaseURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.HasSuffix(trimmedBaseURL, "/v1") && strings.HasPrefix(endpointPath, "/v1/") {
+		return trimmedBaseURL + strings.TrimPrefix(endpointPath, "/v1")
+	}
+	return trimmedBaseURL + endpointPath
 }
 
 func readProviderBaseURL(configPath, provider string) string {

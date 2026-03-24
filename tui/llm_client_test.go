@@ -276,6 +276,33 @@ func TestSummarizeOpenAICustomBaseURL(t *testing.T) {
 	}
 }
 
+func TestSummarizeOpenAICustomBaseURLWithVersionPrefix(t *testing.T) {
+	customBase := "https://proxy.example.com/v1"
+	client := &anthropicClient{
+		provider: "openai",
+		apiKey:   "test-openai-key",
+		model:    "gpt-5.3-codex",
+		baseURL:  customBase,
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			expectedURL := customBase + "/responses"
+			if req.URL.String() != expectedURL {
+				t.Fatalf("expected URL %s, got %s", expectedURL, req.URL.String())
+			}
+			return jsonResponse(200, `{
+				"output":[{"type":"message","content":[{"type":"output_text","text":"versioned proxy response"}]}]
+			}`), nil
+		})},
+	}
+
+	summary, err := client.summarize(context.Background(), "prompt", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
+	if summary != "versioned proxy response" {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
 func stubClaudeCLI(t *testing.T) {
 	t.Helper()
 
@@ -394,6 +421,33 @@ func TestSummarizeAnthropicCustomBaseURL(t *testing.T) {
 		t.Fatalf("summarize returned error: %v", err)
 	}
 	if summary != "proxied anthropic response" {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
+func TestSummarizeAnthropicCustomBaseURLWithVersionPrefix(t *testing.T) {
+	customBase := "https://proxy.example.com/v1"
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "test-anthropic-key",
+		model:    "claude-sonnet-4-20250514",
+		baseURL:  customBase,
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			expectedURL := customBase + "/messages"
+			if req.URL.String() != expectedURL {
+				t.Fatalf("expected URL %s, got %s", expectedURL, req.URL.String())
+			}
+			return jsonResponse(200, `{
+				"content":[{"type":"text","text":"versioned anthropic proxy response"}]
+			}`), nil
+		})},
+	}
+
+	summary, err := client.summarize(context.Background(), "prompt", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
+	if summary != "versioned anthropic proxy response" {
 		t.Fatalf("unexpected summary: %q", summary)
 	}
 }
