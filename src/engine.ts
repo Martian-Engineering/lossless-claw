@@ -1947,6 +1947,29 @@ export class LcmContextEngine implements ContextEngine {
     if (isHeartbeat) {
       return { ingested: false };
     }
+
+    // Skip assistant messages that failed with an error and have no useful content.
+    // These occur when an API call returns a 500 or similar transient error.
+    // Ingesting them pollutes the LCM database: on retry, the error messages
+    // accumulate and get assembled into context, creating a positive feedback
+    // loop where each retry sends an increasingly large (and malformed) payload
+    // that continues to fail.
+    if (message.role === "assistant") {
+      const topLevel = message as unknown as Record<string, unknown>;
+      const stopReason = topLevel.stopReason;
+      if (stopReason === "error" || stopReason === "aborted") {
+        const content = topLevel.content;
+        const isEmpty =
+          content === undefined ||
+          content === null ||
+          content === "" ||
+          (Array.isArray(content) && content.length === 0);
+        if (isEmpty) {
+          return { ingested: false };
+        }
+      }
+    }
+
     const stored = toStoredMessage(message);
 
     // Get or create conversation for this session
