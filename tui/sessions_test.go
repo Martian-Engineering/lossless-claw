@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,6 +41,60 @@ func TestLoadSessionBatchIncludesEstimatedTokens(t *testing.T) {
 	}
 }
 
+func TestLoadSessionBatchIncludesConversationMetadata(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session-1.jsonl")
+	content := `{"type":"message","id":"1","message":{"role":"user","content":"hello"}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	dbPath := filepath.Join(dir, "lcm.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`
+		CREATE TABLE conversations (
+			conversation_id INTEGER PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			session_key TEXT
+		);
+		INSERT INTO conversations (conversation_id, session_id, session_key) VALUES
+			(1, 'session-1', 'agent:main:old'),
+			(2, 'session-1', 'agent:main:latest');
+	`); err != nil {
+		t.Fatalf("seed conversations: %v", err)
+	}
+
+	files := []sessionFileEntry{
+		{
+			filename:  "session-1.jsonl",
+			path:      path,
+			updatedAt: time.Unix(1700000000, 0),
+			byteSize:  int64(len(content)),
+		},
+	}
+
+	sessions, _, err := loadSessionBatch(files, 0, 1, dbPath)
+	if err != nil {
+		t.Fatalf("load session batch: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(sessions))
+	}
+	if sessions[0].conversationID != 2 {
+		t.Fatalf("expected latest conversation id 2, got %d", sessions[0].conversationID)
+	}
+	if sessions[0].sessionKey != "agent:main:latest" {
+		t.Fatalf("expected session key %q, got %q", "agent:main:latest", sessions[0].sessionKey)
+	}
+}
+
 func TestEstimateTokenCountFromBytes(t *testing.T) {
 	t.Parallel()
 
@@ -63,7 +118,7 @@ func TestEstimateTokenCountFromBytes(t *testing.T) {
 	}
 }
 
-func TestRenderSessionsShowsEstimatedTokens(t *testing.T) {
+func TestRenderSessionsShowsSessionKeyAndEstimatedTokens(t *testing.T) {
 	t.Parallel()
 
 	m := model{
@@ -71,6 +126,8 @@ func TestRenderSessionsShowsEstimatedTokens(t *testing.T) {
 		sessionCursor: 0,
 		sessions: []sessionEntry{
 			{
+				id:              "session-1",
+				sessionKey:      "agent:main:main",
 				filename:        "session-1.jsonl",
 				updatedAt:       time.Unix(1700000000, 0),
 				messageCount:    2,
@@ -80,7 +137,40 @@ func TestRenderSessionsShowsEstimatedTokens(t *testing.T) {
 	}
 
 	rendered := m.renderSessions()
+	if !strings.Contains(rendered, "session-1") {
+		t.Fatalf("expected session id in rendered sessions, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, "key:agent:main:main") {
+		t.Fatalf("expected session key in rendered sessions, got: %q", rendered)
+	}
 	if !strings.Contains(rendered, "est:123t") {
 		t.Fatalf("expected estimated token label in rendered sessions, got: %q", rendered)
+	}
+}
+
+func TestRenderHeaderShowsSessionKeyInConversationView(t *testing.T) {
+	t.Parallel()
+
+	m := model{
+		screen:        screenConversation,
+		sessionCursor: 0,
+		sessions: []sessionEntry{
+			{
+				id:             "session-1",
+				sessionKey:     "agent:main:main",
+				conversationID: 42,
+			},
+		},
+	}
+
+	rendered := m.renderHeader()
+	if !strings.Contains(rendered, "session:session-1") {
+		t.Fatalf("expected session id in conversation header, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, "key:agent:main:main") {
+		t.Fatalf("expected session key in conversation header, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, "conv_id:42") {
+		t.Fatalf("expected conversation id in conversation header, got: %q", rendered)
 	}
 }

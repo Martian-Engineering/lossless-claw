@@ -1502,6 +1502,12 @@ func (m model) renderHeader() string {
 		title += " | Sessions" + agentName
 	case screenConversation:
 		title += " | Conversation"
+		if session, ok := m.currentSession(); ok {
+			title += fmt.Sprintf(" | session:%s", session.id)
+			if session.sessionKey != "" {
+				title += fmt.Sprintf(" | key:%s", session.sessionKey)
+			}
+		}
 		if conversationID, ok := m.currentConversationID(); ok {
 			title += fmt.Sprintf(" | conv_id:%d", conversationID)
 		}
@@ -1626,6 +1632,10 @@ func (m model) renderSessions() string {
 	for idx := offset; idx < min(len(m.sessions), offset+visible); idx++ {
 		session := m.sessions[idx]
 		messageCount := formatMessageCount(session.messageCount)
+		label := session.id
+		if session.sessionKey != "" {
+			label += fmt.Sprintf("  key:%s", session.sessionKey)
+		}
 		extras := fmt.Sprintf("  est:%dt", session.estimatedTokens)
 		if session.conversationID > 0 {
 			extras += fmt.Sprintf("  conv_id:%d", session.conversationID)
@@ -1636,9 +1646,9 @@ func (m model) renderSessions() string {
 		if session.fileCount > 0 {
 			extras += fmt.Sprintf("  files:%d", session.fileCount)
 		}
-		line := fmt.Sprintf("  %s  %s  msgs:%s%s", session.filename, formatTimeForList(session.updatedAt), messageCount, extras)
+		line := fmt.Sprintf("  %s  %s  msgs:%s%s", label, formatTimeForList(session.updatedAt), messageCount, extras)
 		if idx == m.sessionCursor {
-			line = selectedStyle.Render(fmt.Sprintf("> %s  %s  msgs:%s%s", session.filename, formatTimeForList(session.updatedAt), messageCount, extras))
+			line = selectedStyle.Render(fmt.Sprintf("> %s  %s  msgs:%s%s", label, formatTimeForList(session.updatedAt), messageCount, extras))
 		}
 		lines = append(lines, line)
 	}
