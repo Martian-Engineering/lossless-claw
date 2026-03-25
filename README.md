@@ -98,8 +98,8 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
           "ignoreSessionPatterns": [
             "agent:*:cron:**"
           ],
-          "summaryProvider": "anthropic",
-          "summaryModel": "claude-3-5-haiku"
+          "summaryModel": "anthropic/claude-haiku-4-5",
+          "expansionModel": "anthropic/claude-haiku-4-5"
         }
       }
     }
@@ -107,7 +107,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 }
 ```
 
-`summaryModel` and `summaryProvider` let you pin compaction summarization to a cheaper or faster model than your main OpenClaw session model. When unset, LCM uses OpenClaw's configured default model/provider.
+`summaryModel` and `summaryProvider` let you pin compaction summarization to a cheaper or faster model than your main OpenClaw session model. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). When unset, both fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
 
 ### Environment variables
 
