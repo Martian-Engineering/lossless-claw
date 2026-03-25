@@ -446,7 +446,7 @@ function pickAuthInspectionValue(value: unknown): unknown {
       subset[key] = value[key];
     }
   }
-  return Object.keys(subset).length > 0 ? subset : value;
+  return Object.keys(subset).length > 0 ? subset : {};
 }
 
 /** @internal Exported for testing only. */
