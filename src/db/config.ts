@@ -46,6 +46,8 @@ export type LcmConfig = {
   maxAssemblyTokenBudget?: number;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
+  /** Custom instructions injected into all summarization prompts. */
+  customInstructions: string;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -195,5 +197,7 @@ export function resolveLcmConfig(
     summaryMaxOverageFactor:
       (env.LCM_SUMMARY_MAX_OVERAGE_FACTOR !== undefined ? parseFloat(env.LCM_SUMMARY_MAX_OVERAGE_FACTOR) : undefined)
         ?? toNumber(pc.summaryMaxOverageFactor) ?? 3,
+    customInstructions:
+      env.LCM_CUSTOM_INSTRUCTIONS?.trim() ?? toStr(pc.customInstructions) ?? "",
   };
 }

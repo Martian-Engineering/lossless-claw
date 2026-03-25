@@ -1241,7 +1241,7 @@ export class LcmContextEngine implements ContextEngine {
       const runtimeSummarizer = await createLcmSummarizeFromLegacyParams({
         deps: this.deps,
         legacyParams: lp,
-        customInstructions: params.customInstructions,
+        customInstructions: params.customInstructions || this.config.customInstructions || undefined,
       });
       if (runtimeSummarizer) {
         return { summarize: runtimeSummarizer.fn, summaryModel: runtimeSummarizer.model };
