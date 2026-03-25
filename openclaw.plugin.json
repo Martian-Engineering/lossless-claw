@@ -44,6 +44,26 @@
     "expansionProvider": {
       "label": "Expansion Provider",
       "help": "Provider override for lcm_expand_query sub-agent (e.g., 'anthropic')"
+    },
+    "rlmEnabled": {
+      "label": "RLM Enabled",
+      "help": "Enable RLM (Recurrent Language Model) pattern-based summarization for deep compaction"
+    },
+    "rlmProvider": {
+      "label": "RLM Provider",
+      "help": "Provider for RLM pattern analysis (e.g., 'openai', 'anthropic')"
+    },
+    "rlmModel": {
+      "label": "RLM Model",
+      "help": "Model for RLM pattern analysis (e.g., 'gpt-4', 'claude-sonnet-4-20250514')"
+    },
+    "rlmMinDepth": {
+      "label": "RLM Minimum Depth",
+      "help": "Minimum compaction depth before using RLM (default: 2)"
+    },
+    "rlmPatternThreshold": {
+      "label": "RLM Pattern Threshold",
+      "help": "Confidence threshold for pattern detection (0.0 - 1.0, default: 0.7)"
     }
   },
   "configSchema": {
@@ -111,6 +131,24 @@
       },
       "expansionProvider": {
         "type": "string"
+      },
+      "rlmEnabled": {
+        "type": "boolean"
+      },
+      "rlmProvider": {
+        "type": "string"
+      },
+      "rlmModel": {
+        "type": "string"
+      },
+      "rlmMinDepth": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "rlmPatternThreshold": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
       }
     }
   }

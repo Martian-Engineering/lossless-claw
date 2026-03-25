@@ -29,10 +29,6 @@ export type LcmConfig = {
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
   largeFileSummaryModel: string;
-  /** Model override for conversation summarization. */
-  summaryModel: string;
-  /** Provider override for conversation summarization. */
-  summaryProvider: string;
   /** Provider override for lcm_expand_query sub-agent. */
   expansionProvider: string;
   /** Model override for lcm_expand_query sub-agent. */
@@ -42,6 +38,16 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+  /** RLM (Recurrent Language Model) configuration for pattern-based summarization */
+  rlmEnabled: boolean;
+  /** Provider for RLM pattern analysis */
+  rlmProvider: string;
+  /** Model for RLM pattern analysis */
+  rlmModel: string;
+  /** Minimum depth before using RLM (default: 2) */
+  rlmMinDepth: number;
+  /** Confidence threshold for pattern detection (0.0 - 1.0, default: 0.7) */
+  rlmPatternThreshold: number;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -185,5 +191,27 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+    rlmEnabled:
+      env.LCM_RLM_ENABLED !== undefined
+        ? env.LCM_RLM_ENABLED !== "false"
+        : toBool(pc.rlmEnabled) ?? false,
+    rlmProvider:
+      env.LCM_RLM_PROVIDER?.trim() ?? toStr(pc.rlmProvider) ?? "",
+    rlmModel:
+      env.LCM_RLM_MODEL?.trim() ?? toStr(pc.rlmModel) ?? "",
+    rlmMinDepth:
+      (env.LCM_RLM_MIN_DEPTH !== undefined ? parseInt(env.LCM_RLM_MIN_DEPTH, 10) : undefined)
+        ?? toNumber(pc.rlmMinDepth) ?? 2,
+    rlmPatternThreshold:
+      (env.LCM_RLM_PATTERN_THRESHOLD !== undefined ? parseFloat(env.LCM_RLM_PATTERN_THRESHOLD) : undefined)
+        ?? toNumber(pc.rlmPatternThreshold) ?? 0.7,
   };
+}
+
+/**
+ * Get the effective RLM minimum depth for a given condensation target depth.
+ * Ensures RLM only triggers at or above the configured threshold.
+ */
+export function getEffectiveRlmMinDepth(config: LcmConfig): number {
+  return config.rlmMinDepth ?? 2;
 }

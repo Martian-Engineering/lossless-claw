@@ -1,9 +1,12 @@
 import type { LcmDependencies } from "./types.js";
+import { createRlmEngine, type RlmConfig, type RlmSummarizeResult } from "./rlm/index.js";
 
 export type LcmSummarizeOptions = {
   previousSummary?: string;
   isCondensed?: boolean;
   depth?: number;
+  /** Use RLM (Recurrent Language Model) pattern-based summarization if available */
+  rlmSummarize?: boolean;
 };
 
 export type LcmSummarizeFn = (
