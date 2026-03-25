@@ -16,6 +16,8 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
+  /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent, falls back to chronological eviction. */
+  prompt?: string;
 }
 
 export interface AssembleContextResult {
@@ -632,8 +634,53 @@ interface ResolvedItem {
   tokens: number;
   /** Whether this came from a raw message (vs. a summary) */
   isMessage: boolean;
+  /** Pre-extracted plain text used for relevance scoring */
+  text: string;
   /** Summary metadata used for dynamic system prompt guidance */
   summarySignal?: SummaryPromptSignal;
+}
+
+// ── BM25-lite relevance scorer ────────────────────────────────────────────────
+
+/** Tokenize text into lowercase alphanumeric terms. */
+function tokenizeText(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length > 1);
+}
+
+/**
+ * Score an item's text against a prompt using BM25-lite (term-frequency overlap).
+ * Returns a score in [0, 1] range relative to the number of prompt terms matched.
+ * Returns 0 when either input is empty.
+ */
+function scoreRelevance(itemText: string, prompt: string): number {
+  const promptTerms = tokenizeText(prompt);
+  if (promptTerms.length === 0) return 0;
+
+  const itemTerms = tokenizeText(itemText);
+  if (itemTerms.length === 0) return 0;
+
+  // Build term-frequency map for the item
+  const freq = new Map<string, number>();
+  for (const term of itemTerms) {
+    freq.set(term, (freq.get(term) ?? 0) + 1);
+  }
+
+  // Sum TF contribution for each unique prompt term
+  const seen = new Set<string>();
+  let score = 0;
+  for (const term of promptTerms) {
+    if (seen.has(term)) continue;
+    seen.add(term);
+    const tf = freq.get(term) ?? 0;
+    if (tf > 0) {
+      // Normalised TF: tf / itemLength (BM25-lite saturation skipped for simplicity)
+      score += tf / itemTerms.length;
+    }
+  }
+  return score;
 }
 
 // ── ContextAssembler ─────────────────────────────────────────────────────────
@@ -719,8 +766,32 @@ export class ContextAssembler {
       // Everything fits
       selected.push(...evictable);
       evictableTokens = evictableTotalTokens;
+    } else if (input.prompt && input.prompt.length > 0) {
+      // Prompt-aware eviction: score each evictable item by relevance to the
+      // prompt, then greedily fill budget from highest-scoring items down.
+      // Re-sort selected items by ordinal to restore chronological order.
+      const scored = evictable.map((item, idx) => ({
+        item,
+        score: scoreRelevance(item.text, input.prompt!),
+        idx, // original index — higher = more recent, used as tiebreaker
+      }));
+      // Sort: highest relevance first; most recent (higher idx) breaks ties
+      scored.sort((a, b) => b.score - a.score || b.idx - a.idx);
+
+      const kept: ResolvedItem[] = [];
+      let accum = 0;
+      for (const { item } of scored) {
+        if (accum + item.tokens <= remainingBudget) {
+          kept.push(item);
+          accum += item.tokens;
+        }
+      }
+      // Restore chronological order by ordinal before appending freshTail
+      kept.sort((a, b) => a.ordinal - b.ordinal);
+      selected.push(...kept);
+      evictableTokens = accum;
     } else {
-      // Need to drop oldest items until we fit.
+      // Chronological eviction (default): drop oldest items until we fit.
       // Walk from the END of evictable (newest first) accumulating tokens,
       // then reverse to restore chronological order.
       const kept: ResolvedItem[] = [];
@@ -865,6 +936,7 @@ export class ContextAssembler {
             } as AgentMessage),
       tokens: tokenCount,
       isMessage: true,
+      text: contentText,
     };
   }
 
@@ -887,6 +959,7 @@ export class ContextAssembler {
       message: { role: "user" as const, content } as AgentMessage,
       tokens,
       isMessage: false,
+      text: summary.content,
       summarySignal: {
         kind: summary.kind,
         depth: summary.depth,

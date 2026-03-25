@@ -2172,6 +2172,8 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     messages: AgentMessage[];
     tokenBudget?: number;
+    /** Optional user query for relevance-based eviction (BM25-lite). When absent, falls back to chronological eviction. */
+    prompt?: string;
   }): Promise<AssembleResult> {
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       return {
@@ -2223,6 +2225,7 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: conversation.conversationId,
         tokenBudget,
         freshTailCount: this.config.freshTailCount,
+        prompt: params.prompt,
       });
 
       // If assembly produced no messages for a non-empty live session,
