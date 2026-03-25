@@ -94,7 +94,7 @@ openclaw plugins enable lossless-claw
 | [Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw) | 上游原始倉庫 |
 | [openclaw/openclaw](https://github.com/openclaw/openclaw) | OpenClaw 主專案 |
 | [catgodtwno4/openclaw-five-layer-memory-nas](https://github.com/catgodtwno4/openclaw-five-layer-memory-nas) | 五層記憶棧 NAS 部署指南 |
-| [catgodtwno4/openclaw-nextjs-dashboard](https://github.com/catgodtwno4/openclaw-nextjs-dashboard) | OpenClaw Dashboard |
+| [catgodtwno4/openclaw-dashboard](https://github.com/catgodtwno4/openclaw-dashboard) | OpenClaw Dashboard |
 
 ## 許可證
 
