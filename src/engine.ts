@@ -45,7 +45,7 @@ import {
   type MessagePartType,
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
-import { createLcmSummarizeFromLegacyParams } from "./summarize.js";
+import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
@@ -1277,7 +1277,15 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       this.largeFileTextSummarizer = async (prompt: string): Promise<string | null> => {
-        const summary = await result.fn(prompt, false);
+        let summary: string;
+        try {
+          summary = await result.fn(prompt, false);
+        } catch (err) {
+          if (err instanceof LcmProviderAuthError) {
+            return null;
+          }
+          throw err;
+        }
         if (typeof summary !== "string") {
           return null;
         }
