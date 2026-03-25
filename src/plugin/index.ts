@@ -1374,7 +1374,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 
       const piAiModuleId = "@mariozechner/pi-ai";
       const mod = (await import(piAiModuleId)) as PiAiModule;
-      return resolveApiKeyFromAuthProfiles({
+      const profileKey = await resolveApiKeyFromAuthProfiles({
         provider,
         authProfileId: options?.profileId,
         agentDir: api.resolvePath("."),
@@ -1382,6 +1382,36 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         piAiModule: mod,
         envSnapshot,
       });
+      if (profileKey) {
+        return profileKey;
+      }
+
+      // Fallback: read apiKey from models.providers config (e.g. proxy providers
+      // like MiniMax that store keys under models.providers.<provider>.apiKey).
+      // Without this, getApiKey() fails for providers whose keys are only in
+      // openclaw.json config but not in process.env or keychain.
+      const runtimeCfg = (() => {
+        try {
+          return api.runtime?.config?.loadConfig?.() ?? api.config;
+        } catch {
+          return api.config;
+        }
+      })();
+      if (isRecord(runtimeCfg)) {
+        const providers = (runtimeCfg as { models?: { providers?: Record<string, unknown> } })
+          .models?.providers;
+        if (providers) {
+          const providerCfg = findProviderConfigValue(providers, provider);
+          if (isRecord(providerCfg) && typeof providerCfg.apiKey === "string") {
+            const cfgKey = providerCfg.apiKey.trim();
+            if (cfgKey) {
+              return cfgKey;
+            }
+          }
+        }
+      }
+
+      return undefined;
     },
     requireApiKey: async (provider, model, options) => {
       const key = await (async () => {
@@ -1410,7 +1440,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 
         const piAiModuleId = "@mariozechner/pi-ai";
         const mod = (await import(piAiModuleId)) as PiAiModule;
-        return resolveApiKeyFromAuthProfiles({
+        const profileKey = await resolveApiKeyFromAuthProfiles({
           provider,
           authProfileId: options?.profileId,
           agentDir: api.resolvePath("."),
@@ -1418,6 +1448,33 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           piAiModule: mod,
           envSnapshot,
         });
+        if (profileKey) {
+          return profileKey;
+        }
+
+        // Fallback: read apiKey from models.providers config (same as getApiKey)
+        const runtimeCfg = (() => {
+          try {
+            return api.runtime?.config?.loadConfig?.() ?? api.config;
+          } catch {
+            return api.config;
+          }
+        })();
+        if (isRecord(runtimeCfg)) {
+          const providers = (runtimeCfg as { models?: { providers?: Record<string, unknown> } })
+            .models?.providers;
+          if (providers) {
+            const providerCfg = findProviderConfigValue(providers, provider);
+            if (isRecord(providerCfg) && typeof providerCfg.apiKey === "string") {
+              const cfgKey = providerCfg.apiKey.trim();
+              if (cfgKey) {
+                return cfgKey;
+              }
+            }
+          }
+        }
+
+        return undefined;
       })();
       if (!key) {
         throw new Error(`Missing API key for provider '${provider}' (model '${model}').`);
