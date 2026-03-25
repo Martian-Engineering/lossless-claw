@@ -122,6 +122,7 @@ func TestRenderSessionsShowsSessionKeyAndEstimatedTokens(t *testing.T) {
 	t.Parallel()
 
 	m := model{
+		width:         160,
 		height:        10,
 		sessionCursor: 0,
 		sessions: []sessionEntry{
@@ -145,6 +146,61 @@ func TestRenderSessionsShowsSessionKeyAndEstimatedTokens(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "est:123t") {
 		t.Fatalf("expected estimated token label in rendered sessions, got: %q", rendered)
+	}
+}
+
+func TestRenderSessionsAlignsColumns(t *testing.T) {
+	t.Parallel()
+
+	m := model{
+		width:         180,
+		height:        10,
+		sessionCursor: -1,
+		sessions: []sessionEntry{
+			{
+				id:              "short",
+				sessionKey:      "agent:main:main",
+				updatedAt:       time.Unix(1700000000, 0),
+				messageCount:    2,
+				estimatedTokens: 123,
+				conversationID:  42,
+				summaryCount:    3,
+				fileCount:       1,
+			},
+			{
+				id:              "much-longer-session-id",
+				sessionKey:      "agent:main:subagent:abcdef1234567890",
+				updatedAt:       time.Unix(1700001000, 0),
+				messageCount:    25,
+				estimatedTokens: 4567,
+				conversationID:  314,
+				summaryCount:    12,
+				fileCount:       8,
+			},
+		},
+	}
+
+	lines := strings.Split(m.renderSessions(), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 rendered lines, got %d", len(lines))
+	}
+
+	msgs0 := strings.Index(lines[0], "msgs:")
+	msgs1 := strings.Index(lines[1], "msgs:")
+	if msgs0 <= 0 || msgs1 <= 0 || msgs0 != msgs1 {
+		t.Fatalf("expected msgs column to align, got %d and %d\n%s\n%s", msgs0, msgs1, lines[0], lines[1])
+	}
+
+	est0 := strings.Index(lines[0], "est:")
+	est1 := strings.Index(lines[1], "est:")
+	if est0 <= 0 || est1 <= 0 || est0 != est1 {
+		t.Fatalf("expected est column to align, got %d and %d\n%s\n%s", est0, est1, lines[0], lines[1])
+	}
+
+	conv0 := strings.Index(lines[0], "conv_id:")
+	conv1 := strings.Index(lines[1], "conv_id:")
+	if conv0 <= 0 || conv1 <= 0 || conv0 != conv1 {
+		t.Fatalf("expected conv_id column to align, got %d and %d\n%s\n%s", conv0, conv1, lines[0], lines[1])
 	}
 }
 

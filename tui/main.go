@@ -1627,32 +1627,62 @@ func (m model) renderSessions() string {
 	}
 	visible := max(1, m.height-4)
 	offset := listOffset(m.sessionCursor, len(m.sessions), visible)
+	end := min(len(m.sessions), offset+visible)
+	labelWidth := m.sessionListLabelWidth(offset, end)
 
 	lines := make([]string, 0, visible)
-	for idx := offset; idx < min(len(m.sessions), offset+visible); idx++ {
+	for idx := offset; idx < end; idx++ {
 		session := m.sessions[idx]
-		messageCount := formatMessageCount(session.messageCount)
 		label := session.id
 		if session.sessionKey != "" {
 			label += fmt.Sprintf("  key:%s", session.sessionKey)
 		}
-		extras := fmt.Sprintf("  est:%dt", session.estimatedTokens)
-		if session.conversationID > 0 {
-			extras += fmt.Sprintf("  conv_id:%d", session.conversationID)
-		}
-		if session.summaryCount > 0 {
-			extras += fmt.Sprintf("  sums:%d", session.summaryCount)
-		}
-		if session.fileCount > 0 {
-			extras += fmt.Sprintf("  files:%d", session.fileCount)
-		}
-		line := fmt.Sprintf("  %s  %s  msgs:%s%s", label, formatTimeForList(session.updatedAt), messageCount, extras)
+		line := fmt.Sprintf(
+			"  %-*s  %-19s  %-9s  %-12s  %-14s  %-8s  %-9s",
+			labelWidth,
+			truncateString(label, labelWidth),
+			formatTimeForList(session.updatedAt),
+			fmt.Sprintf("msgs:%s", formatMessageCount(session.messageCount)),
+			fmt.Sprintf("est:%dt", session.estimatedTokens),
+			formatOptionalSessionMetric("conv_id", session.conversationID > 0, session.conversationID),
+			formatOptionalSessionMetric("sums", session.summaryCount > 0, session.summaryCount),
+			formatOptionalSessionMetric("files", session.fileCount > 0, session.fileCount),
+		)
 		if idx == m.sessionCursor {
-			line = selectedStyle.Render(fmt.Sprintf("> %s  %s  msgs:%s%s", label, formatTimeForList(session.updatedAt), messageCount, extras))
+			line = selectedStyle.Render("> " + line[2:])
 		}
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m model) sessionListLabelWidth(offset, end int) int {
+	const (
+		minLabelWidth = 24
+		maxLabelWidth = 72
+		fixedColumns  = 2 + 19 + 2 + 9 + 2 + 12 + 2 + 14 + 2 + 8 + 2 + 9
+		rowPrefix     = 2
+	)
+
+	available := m.width - rowPrefix - fixedColumns
+	width := max(minLabelWidth, available)
+	width = min(width, maxLabelWidth)
+
+	for idx := offset; idx < end; idx++ {
+		label := m.sessions[idx].id
+		if m.sessions[idx].sessionKey != "" {
+			label += fmt.Sprintf("  key:%s", m.sessions[idx].sessionKey)
+		}
+		width = min(max(width, len(label)), maxLabelWidth)
+	}
+	return width
+}
+
+func formatOptionalSessionMetric(label string, present bool, value any) string {
+	if !present {
+		return ""
+	}
+	return fmt.Sprintf("%s:%v", label, value)
 }
 
 func (m model) renderConversation() string {
