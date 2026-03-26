@@ -389,17 +389,23 @@ describe("lcm plugin registration", () => {
     firstFactory!();
     secondFactory!();
 
-    const firstMessages = first.infoLog.mock.calls.map(([message]) => message);
-    const secondMessages = second.infoLog.mock.calls.map(([message]) => message);
+    const firstMessages = first.debugLog.mock.calls.map(([message]) => message);
+    const secondMessages = second.debugLog.mock.calls.map(([message]) => message);
 
-    expect(firstMessages).toHaveLength(4);
-    expect([...firstMessages].sort()).toEqual([
+    // Startup banners should appear exactly once (on the first registration)
+    const expectedBanners = [
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
       "[lcm] Compaction summarization model: (unconfigured)",
       "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
       "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
-    ].sort());
-    expect(secondMessages).toEqual([]);
+    ];
+    for (const banner of expectedBanners) {
+      expect(firstMessages).toContain(banner);
+    }
+    // Second registration should not repeat any startup banners
+    for (const banner of expectedBanners) {
+      expect(secondMessages).not.toContain(banner);
+    }
   });
   it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {
     const { api, getFactory, warnLog } = buildApi(

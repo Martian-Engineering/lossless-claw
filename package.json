@@ -38,7 +38,7 @@
     "@changesets/changelog-github": "^0.6.0",
     "@changesets/cli": "^2.30.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.2.4"
+    "vitest": "^3.0.0"
   },
   "peerDependencies": {
     "openclaw": "*"
