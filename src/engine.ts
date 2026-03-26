@@ -1722,11 +1722,59 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
           });
           const conversationId = conversation.conversationId;
-          const existingCount = await this.conversationStore.getMessageCount(conversationId);
-          const bootstrapState =
+          let existingCount = await this.conversationStore.getMessageCount(conversationId);
+          let bootstrapState =
             existingCount > 0
               ? await this.summaryStore.getConversationBootstrapState(conversationId)
               : null;
+
+          // Session file rotation detection: OpenClaw may create a new session
+          // file (new UUID.jsonl) on /reset or natural rotation without notifying
+          // LCM. If the file path changed, the conversation data in the DB belongs
+          // to the old file — reset it and re-bootstrap from the new file.
+          if (
+            bootstrapState &&
+            bootstrapState.sessionFilePath !== params.sessionFile
+          ) {
+            console.error(
+              `[lcm] bootstrap: session file rotated for session ${params.sessionId}: ` +
+                `"${bootstrapState.sessionFilePath}" → "${params.sessionFile}" — resetting conversation ${conversationId}`,
+            );
+            // Purge all data for this conversation and start fresh.
+            // Tables are ordered to respect FK constraints; message_parts
+            // cascade-deletes via ON DELETE CASCADE on messages.
+            this.db
+              .prepare(`DELETE FROM context_items WHERE conversation_id = ?`)
+              .run(conversationId);
+            this.db
+              .prepare(`DELETE FROM summary_messages WHERE summary_id IN (SELECT summary_id FROM summaries WHERE conversation_id = ?)`)
+              .run(conversationId);
+            this.db
+              .prepare(`DELETE FROM summary_parents WHERE summary_id IN (SELECT summary_id FROM summaries WHERE conversation_id = ?) OR parent_id IN (SELECT summary_id FROM summaries WHERE conversation_id = ?)`)
+              .run(conversationId, conversationId);
+            this.db
+              .prepare(`DELETE FROM summaries WHERE conversation_id = ?`)
+              .run(conversationId);
+            this.db
+              .prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+              .run(conversationId);
+            this.db
+              .prepare(`DELETE FROM large_files WHERE conversation_id = ?`)
+              .run(conversationId);
+            // messages_fts is a contentless FTS5 table — must be cleaned explicitly.
+            this.db
+              .prepare(`DELETE FROM messages_fts WHERE rowid IN (SELECT message_id FROM messages WHERE conversation_id = ?)`)
+              .run(conversationId);
+            const msgCount = this.db
+              .prepare(`DELETE FROM messages WHERE conversation_id = ?`)
+              .run(conversationId).changes;
+            console.error(
+              `[lcm] bootstrap: purged ${msgCount} messages and all summaries for conversation ${conversationId}`,
+            );
+            // Reset local state so the code below treats this as a fresh conversation.
+            bootstrapState = null;
+            existingCount = 0;
+          }
 
           // If the transcript file is byte-for-byte unchanged from the last
           // successful bootstrap checkpoint, skip reopening and reparsing it.
