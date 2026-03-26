@@ -15,6 +15,12 @@ export type LcmConfig = {
   statelessSessionPatterns: string[];
   /** When true, stateless session pattern matching is enforced. */
   skipStatelessSessions: boolean;
+  /** API key for OpenAI-compatible embedding generation. Falls back to OPENAI_API_KEY env var. */
+  embeddingApiKey: string;
+  /** Base URL for embedding API. Defaults to OpenAI. */
+  embeddingBaseUrl: string;
+  /** Embedding model name. Defaults to text-embedding-3-small. */
+  embeddingModel: string;
   contextThreshold: number;
   freshTailCount: number;
   leafMinFanout: number;
@@ -43,6 +49,14 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+
+  // ── Agent identity ────────────────────────────────────────────────────────
+  /** Unique identifier for this agent instance (e.g. "opus", "grok", "gemini"). */
+  instanceId: string;
+  /** Human-readable name (e.g. "Rivet Opus"). */
+  instanceDisplayName: string;
+  /** Role classification (e.g. "reasoning", "fast", "research", "local"). */
+  instanceRole: string;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -169,6 +183,12 @@ export function resolveLcmConfig(
       env.LCM_SKIP_STATELESS_SESSIONS !== undefined
         ? env.LCM_SKIP_STATELESS_SESSIONS === "true"
         : toBool(pc.skipStatelessSessions) ?? true,
+    embeddingApiKey:
+      env.LCM_EMBEDDING_API_KEY ?? env.OPENAI_API_KEY ?? toStr(pc.embeddingApiKey) ?? "",
+    embeddingBaseUrl:
+      env.LCM_EMBEDDING_BASE_URL ?? toStr(pc.embeddingBaseUrl) ?? "https://api.openai.com/v1",
+    embeddingModel:
+      env.LCM_EMBEDDING_MODEL ?? toStr(pc.embeddingModel) ?? "text-embedding-3-small",
     contextThreshold:
       (env.LCM_CONTEXT_THRESHOLD !== undefined ? parseFloat(env.LCM_CONTEXT_THRESHOLD) : undefined)
         ?? toNumber(pc.contextThreshold) ?? 0.75,
@@ -225,5 +245,10 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+
+    // Agent identity — set via env vars in systemd drop-in
+    instanceId: env.LCM_INSTANCE_ID ?? toStr(pc.instanceId) ?? "",
+    instanceDisplayName: env.LCM_INSTANCE_DISPLAY_NAME ?? toStr(pc.instanceDisplayName) ?? "",
+    instanceRole: env.LCM_INSTANCE_ROLE ?? toStr(pc.instanceRole) ?? "",
   };
 }

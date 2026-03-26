@@ -973,6 +973,10 @@ export class LcmContextEngine implements ContextEngine {
     string,
     { promise: Promise<void>; refCount: number }
   >();
+  /** Global mutex for bootstrap operations. With AsyncLocalStorage handling
+   *  per-session DB scoping, this primarily prevents concurrent bootstraps
+   *  from racing on conversation creation and context_items population. */
+  private bootstrapLock: Promise<void> = Promise.resolve();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
@@ -1017,8 +1021,17 @@ export class LcmContextEngine implements ContextEngine {
           );
         }
       } else {
-        // For Postgres, schema is ensured asynchronously; assume OK for now.
-        // The ensureMigrated() call will run ensurePostgresSchema on first use.
+        // For Postgres, run schema setup and agent registration eagerly.
+        // ensureMigrated() short-circuits when this.migrated is already true,
+        // so registerAgent() must be called here — not deferred.
+        const pgDb = createLcmConnection(this.config);
+        ensurePostgresSchema(pgDb)
+          .then(() => this.registerAgent())
+          .catch((err) =>
+            this.deps.log.error(
+              `[lcm] Postgres schema/registration failed: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          );
         migrationOk = true;
       }
       this.migrated = migrationOk;
@@ -1038,13 +1051,19 @@ export class LcmContextEngine implements ContextEngine {
       ownsCompaction: migrationOk,
     };
 
+    const embeddingConfig = this.config.embeddingApiKey
+      ? { apiKey: this.config.embeddingApiKey, baseUrl: this.config.embeddingBaseUrl, model: this.config.embeddingModel }
+      : undefined;
+
     this.conversationStore = new ConversationStore(db, {
       fullTextAvailable: this.fullTextAvailable,
       backend: features.backend,
+      embeddingConfig,
     });
     this.summaryStore = new SummaryStore(db, {
       fullTextAvailable: this.fullTextAvailable,
       backend: features.backend,
+      embeddingConfig,
     });
 
     if (!this.fullTextAvailable) {
@@ -1142,12 +1161,54 @@ export class LcmContextEngine implements ContextEngine {
       const db = createLcmConnection(this.config);
       await ensurePostgresSchema(db);
       this.migrated = true;
+      // Register agent identity after schema is ready (fire-and-forget)
+      this.registerAgent().catch(() => {});
       return;
     }
 
     const sqliteDb = getLcmConnection(this.config.databasePath);
     runLcmMigrations(sqliteDb, { fts5Available: this.fullTextAvailable });
     this.migrated = true;
+  }
+
+  /**
+   * Get the agent identity for this instance.
+   * Priority: LCM_INSTANCE_ID config > parsed from sessionKey > undefined.
+   */
+  private getAgentId(sessionKey?: string): string | undefined {
+    if (this.config.instanceId) return this.config.instanceId;
+    if (!sessionKey) return undefined;
+    return this.deps.parseAgentSessionKey(sessionKey)?.agentId;
+  }
+
+  /**
+   * Register this agent instance in the agents table.
+   * Upserts on boot, bumping last_seen_at and updating model/host info.
+   */
+  private async registerAgent(): Promise<void> {
+    if (this.config.backend !== "postgres") return;
+    const agentId = this.config.instanceId;
+    if (!agentId) return;
+
+    const db = createLcmConnection(this.config);
+    const displayName = this.config.instanceDisplayName || null;
+    const role = this.config.instanceRole || null;
+    const host = (await import("node:os")).hostname();
+    try {
+      await db.run(
+        `INSERT INTO agents (agent_id, display_name, host, role, metadata)
+         VALUES ($1, $2, $3, $4, '{}')
+         ON CONFLICT (agent_id) DO UPDATE SET
+           display_name = COALESCE(EXCLUDED.display_name, agents.display_name),
+           host = COALESCE(EXCLUDED.host, agents.host),
+           role = COALESCE(EXCLUDED.role, agents.role),
+           last_seen_at = NOW()`,
+        [agentId, displayName, host, role],
+      );
+      this.deps.log.info(`[lcm:engine] registered agent: ${agentId} (${displayName ?? "no display name"}, role=${role ?? "unset"}, host=${host})`);
+    } catch (err) {
+      this.deps.log.warn(`[lcm:engine] failed to register agent: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
@@ -1790,10 +1851,20 @@ export class LcmContextEngine implements ContextEngine {
     const sessionFileSize = sessionFileStats.size;
     const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
 
+    // Serialize all bootstraps globally to prevent this.db swap races.
+    const prevLock = this.bootstrapLock;
+    let releaseLock!: () => void;
+    this.bootstrapLock = new Promise<void>((resolve) => { releaseLock = resolve; });
+    await prevLock;
+
+    const agentId = this.getAgentId(params.sessionKey);
+
+    try {
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () =>
-        this.conversationStore.withTransaction(async () => {
+        this.conversationStore.withTransactionClient(async (txClient) =>
+          this.summaryStore.withClient(txClient, async () => {
           const persistBootstrapState = async (
             conversationId: number,
             historicalMessages: AgentMessage[],
@@ -1814,6 +1885,7 @@ export class LcmContextEngine implements ContextEngine {
 
           const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
             sessionKey: params.sessionKey,
+            agentId,
           });
           const conversationId = conversation.conversationId;
           const existingCount = await this.conversationStore.getMessageCount(conversationId);
@@ -2009,7 +2081,8 @@ export class LcmContextEngine implements ContextEngine {
               ? "conversation already up to date"
               : "conversation already has messages",
           };
-        }),
+          }),
+        ),
     );
 
     // Post-bootstrap pruning: clean HEARTBEAT_OK turns that were already
@@ -2037,6 +2110,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     return result;
+    } finally { releaseLock(); }
   }
 
   private async ingestSingle(params: {
@@ -2052,8 +2126,10 @@ export class LcmContextEngine implements ContextEngine {
     const stored = toStoredMessage(message);
 
     // Get or create conversation for this session
+    const agentId = this.getAgentId(params.sessionKey);
     const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
       sessionKey,
+      agentId,
     });
     const conversationId = conversation.conversationId;
 
@@ -2749,17 +2825,27 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   async dispose(): Promise<void> {
-    // No-op for plugin singleton — the connection is shared across runs.
-    // OpenClaw's runner calls dispose() after every run, but the plugin
-    // registers a single engine instance reused by the factory. Closing
-    // the DB here would break subsequent runs with "database is not open".
-    // The shared connection is managed for the lifetime of the plugin process.
+    // The engine is a plugin singleton reused across runs — don't close
+    // the DB connection (that happens on process exit via closeLcmConnection).
+    // But do drain any pending embedding work so nothing is silently lost
+    // between runs.
+    try {
+      await this.conversationStore.drainEmbeddingQueue();
+    } catch { /* best-effort */ }
+    try {
+      await this.summaryStore.drainEmbeddingQueue();
+    } catch { /* best-effort */ }
   }
 
   // ── Public accessors for retrieval (used by subagent expansion) ─────────
 
   getRetrieval(): RetrievalEngine {
     return this.retrieval;
+  }
+
+  /** Get the configured instance identity (from LCM_INSTANCE_ID), if any. */
+  getInstanceId(): string | undefined {
+    return this.config.instanceId || undefined;
   }
 
   getConversationStore(): ConversationStore {

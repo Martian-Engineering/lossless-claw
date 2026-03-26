@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import lcmPlugin from "../index.js";
+import lcmPlugin, { __lcm_reset_singleton__ } from "../index.js";
 import { closeLcmConnection } from "../src/db/connection.js";
 
 const piAiMock = vi.hoisted(() => ({
@@ -149,6 +149,7 @@ describe("auth-profile SecretRef resolution in complete()", () => {
   });
 
   afterEach(() => {
+    __lcm_reset_singleton__();
     vi.unstubAllEnvs();
     for (const dir of tempDirs) {
       rmSync(dir, { recursive: true, force: true });

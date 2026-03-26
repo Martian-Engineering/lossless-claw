@@ -1,14 +1,42 @@
 import { createRequire } from "node:module";
 import type { DbClient, RunResult } from "./db-interface.js";
 
+// ── Minimal type declarations for node-postgres ────────────────────────────
+// We define just enough structure to avoid `any` without depending on @types/pg.
+
+interface PgQueryResult {
+  rows: Record<string, unknown>[];
+  rowCount: number | null;
+}
+
+interface PgPoolClient {
+  query(sql: string, params?: unknown[]): Promise<PgQueryResult>;
+  release(): void;
+}
+
+interface PgPool {
+  query(sql: string, params?: unknown[]): Promise<PgQueryResult>;
+  connect(): Promise<PgPoolClient>;
+  end(): Promise<void>;
+}
+
+interface PgModule {
+  Pool: new (config: {
+    connectionString: string;
+    min: number;
+    max: number;
+    idleTimeoutMillis: number;
+  }) => PgPool;
+}
+
 // Lazy-loaded pg module — only resolved when PostgresClient is actually instantiated.
 // This prevents "Cannot find module 'pg'" crashes on SQLite-only installs.
-let _pg: any = null;
-function getPg(): any {
+let _pg: PgModule | null = null;
+function getPg(): PgModule {
   if (!_pg) {
     try {
       const require = createRequire(import.meta.url);
-      _pg = require("pg");
+      _pg = require("pg") as PgModule;
     } catch {
       throw new Error(
         "PostgreSQL backend requires the 'pg' package. Install it with: npm install pg",
@@ -22,11 +50,11 @@ function getPg(): any {
  * Extract an integer ID from the first column of the first RETURNING row.
  * Callers write `INSERT ... RETURNING <id_col>`, so the first column is always the ID.
  */
-function extractInsertId(rows: any[]): number | undefined {
+function extractInsertId(rows: Record<string, unknown>[]): number | undefined {
   if (rows.length === 0 || typeof rows[0] !== "object" || rows[0] === null) {
     return undefined;
   }
-  const vals = Object.values(rows[0] as Record<string, unknown>);
+  const vals = Object.values(rows[0]);
   if (vals.length === 0) return undefined;
   const v = vals[0];
   if (typeof v === "number") return v;
@@ -41,7 +69,7 @@ function extractInsertId(rows: any[]): number | undefined {
  * PostgresClient instance, so we don't double-pool).
  */
 export class PostgresClient implements DbClient {
-  private pool: any;
+  private pool: PgPool;
 
   constructor(connectionString: string) {
     const { Pool } = getPg();
@@ -97,7 +125,7 @@ export class PostgresClient implements DbClient {
  * Transaction-scoped PostgreSQL client that uses a single dedicated connection.
  */
 class PostgresTransactionClient implements DbClient {
-  constructor(private client: any) {}
+  constructor(private client: PgPoolClient) {}
 
   async query<T>(sql: string, params: unknown[] = []): Promise<{ rows: T[] }> {
     const result = await this.client.query(sql, params);

@@ -84,6 +84,9 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
+    instanceId: "",
+    instanceDisplayName: "",
+    instanceRole: "",
     },
     complete: vi.fn(),
     callGateway: (params: { method: string; params?: Record<string, unknown> }) =>
