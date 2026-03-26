@@ -24,6 +24,7 @@ type rewriteOptions struct {
 	promptDir  string
 	provider   string
 	model      string
+	baseURL    string
 	showDiff   bool
 	timestamps bool
 	tz         *time.Location
@@ -100,6 +101,7 @@ func runRewriteCommand(args []string) error {
 			apiKey:   apiKey,
 			http:     &http.Client{Timeout: defaultHTTPTimeout},
 			model:    opts.model,
+			baseURL:  resolveProviderBaseURL(paths, opts.provider, opts.baseURL),
 		}
 	} else {
 		apiKey, err := resolveProviderAPIKey(paths, opts.provider)
@@ -109,6 +111,7 @@ func runRewriteCommand(args []string) error {
 				apiKey:   apiKey,
 				http:     &http.Client{Timeout: defaultHTTPTimeout},
 				model:    opts.model,
+				baseURL:  resolveProviderBaseURL(paths, opts.provider, opts.baseURL),
 			}
 		}
 		if client == nil {
@@ -194,6 +197,7 @@ func parseRewriteArgs(args []string) (rewriteOptions, int64, error) {
 	promptDir := fs.String("prompt-dir", "", "custom prompt template directory")
 	provider := fs.String("provider", "", "provider id (e.g. anthropic, openai)")
 	model := fs.String("model", "", "summary model id")
+	baseURL := fs.String("base-url", "", "custom API base URL")
 	showDiff := fs.Bool("diff", false, "show unified diff")
 	timestamps := fs.Bool("timestamps", true, "inject timestamps into source text")
 	tzName := fs.String("tz", "", "timezone for timestamps (e.g. America/Los_Angeles; default: system local)")
@@ -224,6 +228,7 @@ func parseRewriteArgs(args []string) (rewriteOptions, int64, error) {
 		promptDir:  strings.TrimSpace(*promptDir),
 		provider:   strings.TrimSpace(*provider),
 		model:      strings.TrimSpace(*model),
+		baseURL:    strings.TrimSpace(*baseURL),
 		showDiff:   *showDiff,
 		timestamps: *timestamps,
 		tz:         loc,
@@ -273,7 +278,7 @@ func normalizeRewriteArgs(args []string) ([]string, error) {
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		takesValue := arg == "--summary" || arg == "--depth" || arg == "--prompt-dir" || arg == "--provider" || arg == "--model" || arg == "--tz"
+		takesValue := arg == "--summary" || arg == "--depth" || arg == "--prompt-dir" || arg == "--provider" || arg == "--model" || arg == "--tz" || arg == "--base-url"
 		if takesValue {
 			if i+1 >= len(args) {
 				return nil, fmt.Errorf("missing value for %s", arg)
@@ -282,7 +287,7 @@ func normalizeRewriteArgs(args []string) ([]string, error) {
 			i++
 			continue
 		}
-		if strings.HasPrefix(arg, "--summary=") || strings.HasPrefix(arg, "--depth=") || strings.HasPrefix(arg, "--prompt-dir=") || strings.HasPrefix(arg, "--provider=") || strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "--tz=") {
+		if strings.HasPrefix(arg, "--summary=") || strings.HasPrefix(arg, "--depth=") || strings.HasPrefix(arg, "--prompt-dir=") || strings.HasPrefix(arg, "--provider=") || strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "--tz=") || strings.HasPrefix(arg, "--base-url=") {
 			flags = append(flags, arg)
 			continue
 		}
@@ -323,6 +328,7 @@ Flags:
   --prompt-dir <path> custom template directory
   --provider <id>     API provider (inferred from model when omitted)
   --model <model>     API model (default: provider-specific)
+  --base-url <url>    custom API base URL (overrides openclaw.json and env)
   --diff              show unified diff
   --timestamps        inject timestamps into source text (default true)
   --tz <timezone>     timezone for timestamps (e.g. America/Los_Angeles; default: system local)

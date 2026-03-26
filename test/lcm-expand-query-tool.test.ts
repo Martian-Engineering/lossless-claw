@@ -338,6 +338,187 @@ describe("createLcmExpandQueryTool", () => {
     });
   });
 
+  it("retries without override when delegated spawn fails with auth scope error", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    let agentCalls = 0;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        agentCalls += 1;
+        if (agentCalls === 1) {
+          throw new Error("401 Missing scopes: model.request");
+        }
+        return { runId: "run-default-model" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Recovered with default expansion model.",
+                    citedIds: ["sum_a"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 321,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const deps = makeDeps();
+    const tool = createLcmExpandQueryTool({
+      deps: {
+        ...deps,
+        config: {
+          ...deps.config,
+          expansionProvider: "openai-codex",
+          expansionModel: "gpt-5.4",
+        },
+      },
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-auth-fallback", {
+      summaryIds: ["sum_a"],
+      prompt: "Answer this",
+      conversationId: 42,
+    });
+
+    expect(result.details).toMatchObject({
+      answer: "Recovered with default expansion model.",
+      citedIds: ["sum_a"],
+      expandedSummaryCount: 1,
+    });
+
+    const agentCallsWithParams = callGatewayMock.mock.calls
+      .map(([opts]) => opts as { method?: string; params?: Record<string, unknown> })
+      .filter((entry) => entry.method === "agent");
+    expect(agentCallsWithParams).toHaveLength(2);
+    expect(agentCallsWithParams[0]?.params).toMatchObject({
+      provider: "openai-codex",
+      model: "gpt-5.4",
+    });
+    expect(agentCallsWithParams[1]?.params).not.toHaveProperty("provider");
+    expect(agentCallsWithParams[1]?.params).not.toHaveProperty("model");
+    expect(deps.log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Missing scopes: model.request"),
+    );
+    expect(deps.log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("retrying delegated expansion without provider/model override"),
+    );
+  });
+
+  it("retries without override when delegated wait returns model override auth error", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    let agentCalls = 0;
+    let waitCalls = 0;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        agentCalls += 1;
+        return { runId: `run-${agentCalls}` };
+      }
+      if (request.method === "agent.wait") {
+        waitCalls += 1;
+        if (waitCalls === 1) {
+          return { status: "error", error: "provider/model overrides are not authorized for this caller." };
+        }
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Recovered after wait error fallback.",
+                    citedIds: ["sum_a"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 654,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const deps = makeDeps();
+    const tool = createLcmExpandQueryTool({
+      deps: {
+        ...deps,
+        config: {
+          ...deps.config,
+          expansionProvider: "openai-codex",
+          expansionModel: "gpt-5.4",
+        },
+      },
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-wait-fallback", {
+      summaryIds: ["sum_a"],
+      prompt: "Answer this",
+      conversationId: 42,
+    });
+
+    expect(result.details).toMatchObject({
+      answer: "Recovered after wait error fallback.",
+      citedIds: ["sum_a"],
+      expandedSummaryCount: 1,
+    });
+
+    const agentCallsWithParams = callGatewayMock.mock.calls
+      .map(([opts]) => opts as { method?: string; params?: Record<string, unknown> })
+      .filter((entry) => entry.method === "agent");
+    expect(agentCallsWithParams).toHaveLength(2);
+    expect(agentCallsWithParams[0]?.params).toMatchObject({
+      provider: "openai-codex",
+      model: "gpt-5.4",
+    });
+    expect(agentCallsWithParams[1]?.params).not.toHaveProperty("provider");
+    expect(agentCallsWithParams[1]?.params).not.toHaveProperty("model");
+    expect(deps.log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("provider/model overrides are not authorized"),
+    );
+  });
+
   it("returns timeout when delegated run exceeds 120 seconds", async () => {
     const retrieval = makeRetrieval();
     retrieval.describe.mockResolvedValue({

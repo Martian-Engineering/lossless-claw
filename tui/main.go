@@ -85,6 +85,7 @@ type rewriteState struct {
 	provider        string
 	apiKey          string
 	model           string
+	baseURL         string
 	err             error
 }
 
@@ -1207,7 +1208,7 @@ func (m *model) advanceSubtreeQueue() {
 		return
 	}
 
-	provider, model := resolveInteractiveRewriteProviderModel()
+	provider, model, baseURL := resolveInteractiveRewriteProviderModel(m.paths)
 	apiKey, err := resolveProviderAPIKey(m.paths, provider)
 	if err != nil {
 		m.status = "Error: " + err.Error()
@@ -1232,6 +1233,7 @@ func (m *model) advanceSubtreeQueue() {
 		provider:        provider,
 		apiKey:          apiKey,
 		model:           model,
+		baseURL:         baseURL,
 	}
 	m.status = fmt.Sprintf("Subtree rewrite [%d/%d]: %s (d%d)", progress, m.subtreeTotal, item.summaryID, item.depth)
 }
@@ -1298,7 +1300,7 @@ func (m *model) startPendingRewrite() {
 		return
 	}
 
-	provider, model := resolveInteractiveRewriteProviderModel()
+	provider, model, baseURL := resolveInteractiveRewriteProviderModel(m.paths)
 	apiKey, err := resolveProviderAPIKey(m.paths, provider)
 	if err != nil {
 		m.status = "Error: " + err.Error()
@@ -1322,6 +1324,7 @@ func (m *model) startPendingRewrite() {
 		provider:        provider,
 		apiKey:          apiKey,
 		model:           model,
+		baseURL:         baseURL,
 	}
 	m.status = fmt.Sprintf("Ready to rewrite %s", summaryID)
 }
@@ -1337,6 +1340,7 @@ func (m model) startPendingRewriteAPI() tea.Cmd {
 			apiKey:   pending.apiKey,
 			http:     &http.Client{Timeout: defaultHTTPTimeout},
 			model:    pending.model,
+			baseURL:  pending.baseURL,
 		}
 		content, err := client.summarize(context.Background(), pending.prompt, pending.targetTokens)
 		if err != nil {
@@ -1350,7 +1354,7 @@ func (m model) startPendingRewriteAPI() tea.Cmd {
 	}
 }
 
-func resolveInteractiveRewriteProviderModel() (string, string) {
+func resolveInteractiveRewriteProviderModel(paths appDataPaths) (string, string, string) {
 	provider := strings.TrimSpace(os.Getenv("LCM_TUI_SUMMARY_PROVIDER"))
 	if provider == "" {
 		provider = strings.TrimSpace(os.Getenv("LCM_SUMMARY_PROVIDER"))
@@ -1360,7 +1364,10 @@ func resolveInteractiveRewriteProviderModel() (string, string) {
 	if model == "" {
 		model = strings.TrimSpace(os.Getenv("LCM_SUMMARY_MODEL"))
 	}
-	return resolveSummaryProviderModel(provider, model)
+	resolvedProvider, resolvedModel := resolveSummaryProviderModel(provider, model)
+	baseURL := strings.TrimSpace(os.Getenv("LCM_TUI_SUMMARY_BASE_URL"))
+	baseURL = resolveProviderBaseURL(paths, resolvedProvider, baseURL)
+	return resolvedProvider, resolvedModel, baseURL
 }
 
 func rewriteSpinnerTickCmd() tea.Cmd {
@@ -1495,6 +1502,12 @@ func (m model) renderHeader() string {
 		title += " | Sessions" + agentName
 	case screenConversation:
 		title += " | Conversation"
+		if session, ok := m.currentSession(); ok {
+			title += fmt.Sprintf(" | session:%s", session.id)
+			if session.sessionKey != "" {
+				title += fmt.Sprintf(" | key:%s", session.sessionKey)
+			}
+		}
 		if conversationID, ok := m.currentConversationID(); ok {
 			title += fmt.Sprintf(" | conv_id:%d", conversationID)
 		}
@@ -1614,28 +1627,62 @@ func (m model) renderSessions() string {
 	}
 	visible := max(1, m.height-4)
 	offset := listOffset(m.sessionCursor, len(m.sessions), visible)
+	end := min(len(m.sessions), offset+visible)
+	labelWidth := m.sessionListLabelWidth(offset, end)
 
 	lines := make([]string, 0, visible)
-	for idx := offset; idx < min(len(m.sessions), offset+visible); idx++ {
+	for idx := offset; idx < end; idx++ {
 		session := m.sessions[idx]
-		messageCount := formatMessageCount(session.messageCount)
-		extras := fmt.Sprintf("  est:%dt", session.estimatedTokens)
-		if session.conversationID > 0 {
-			extras += fmt.Sprintf("  conv_id:%d", session.conversationID)
+		label := session.id
+		if session.sessionKey != "" {
+			label += fmt.Sprintf("  key:%s", session.sessionKey)
 		}
-		if session.summaryCount > 0 {
-			extras += fmt.Sprintf("  sums:%d", session.summaryCount)
-		}
-		if session.fileCount > 0 {
-			extras += fmt.Sprintf("  files:%d", session.fileCount)
-		}
-		line := fmt.Sprintf("  %s  %s  msgs:%s%s", session.filename, formatTimeForList(session.updatedAt), messageCount, extras)
+		line := fmt.Sprintf(
+			"  %-*s  %-19s  %-9s  %-12s  %-14s  %-8s  %-9s",
+			labelWidth,
+			truncateString(label, labelWidth),
+			formatTimeForList(session.updatedAt),
+			fmt.Sprintf("msgs:%s", formatMessageCount(session.messageCount)),
+			fmt.Sprintf("est:%dt", session.estimatedTokens),
+			formatOptionalSessionMetric("conv_id", session.conversationID > 0, session.conversationID),
+			formatOptionalSessionMetric("sums", session.summaryCount > 0, session.summaryCount),
+			formatOptionalSessionMetric("files", session.fileCount > 0, session.fileCount),
+		)
 		if idx == m.sessionCursor {
-			line = selectedStyle.Render(fmt.Sprintf("> %s  %s  msgs:%s%s", session.filename, formatTimeForList(session.updatedAt), messageCount, extras))
+			line = selectedStyle.Render("> " + line[2:])
 		}
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m model) sessionListLabelWidth(offset, end int) int {
+	const (
+		minLabelWidth = 24
+		maxLabelWidth = 72
+		fixedColumns  = 2 + 19 + 2 + 9 + 2 + 12 + 2 + 14 + 2 + 8 + 2 + 9
+		rowPrefix     = 2
+	)
+
+	available := m.width - rowPrefix - fixedColumns
+	width := max(minLabelWidth, available)
+	width = min(width, maxLabelWidth)
+
+	for idx := offset; idx < end; idx++ {
+		label := m.sessions[idx].id
+		if m.sessions[idx].sessionKey != "" {
+			label += fmt.Sprintf("  key:%s", m.sessions[idx].sessionKey)
+		}
+		width = min(max(width, len(label)), maxLabelWidth)
+	}
+	return width
+}
+
+func formatOptionalSessionMetric(label string, present bool, value any) string {
+	if !present {
+		return ""
+	}
+	return fmt.Sprintf("%s:%v", label, value)
 }
 
 func (m model) renderConversation() string {

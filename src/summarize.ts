@@ -43,6 +43,28 @@ type ProviderAuthFailure = {
 };
 
 /**
+ * Signals that the summarizer hit a provider-auth failure and callers should
+ * avoid treating the result like an empty summary.
+ */
+export class LcmProviderAuthError extends Error {
+  readonly provider: string;
+  readonly model: string;
+  readonly failure: ProviderAuthFailure;
+
+  constructor(params: {
+    provider: string;
+    model: string;
+    failure: ProviderAuthFailure;
+  }) {
+    super(buildProviderAuthWarning(params));
+    this.name = "LcmProviderAuthError";
+    this.provider = params.provider;
+    this.model = params.model;
+    this.failure = params.failure;
+  }
+}
+
+/**
  * Default timeout for a single summarizer LLM call.  Long enough for large
  * context windows on slower providers, short enough to prevent the gateway
  * event loop from starving when a provider hangs.
@@ -976,13 +998,13 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           },
         ],
         maxTokens: targetTokens,
-        temperature: aggressive ? 0.1 : 0.2,
       }), SUMMARIZER_TIMEOUT_MS, "initial");
     } catch (err) {
       const authFailure = extractProviderAuthFailure(err);
       if (authFailure) {
-        console.warn(buildProviderAuthWarning({ provider, model, failure: authFailure }));
-        return "";
+        const authError = new LcmProviderAuthError({ provider, model, failure: authFailure });
+        console.warn(authError.message);
+        throw authError;
       }
       const errMsg = err instanceof Error ? err.message : String(err);
       const isTimeout = errMsg.includes("summarizer timeout");
@@ -1000,8 +1022,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
     const authFailure = extractProviderAuthFailure(result);
     if (authFailure) {
-      console.warn(buildProviderAuthWarning({ provider, model, failure: authFailure }));
-      return "";
+      const authError = new LcmProviderAuthError({ provider, model, failure: authFailure });
+      console.warn(authError.message);
+      throw authError;
     }
 
     const normalized = normalizeCompletionSummary(result.content);
@@ -1059,7 +1082,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             },
           ],
           maxTokens: targetTokens,
-          temperature: 0.05,
           reasoning: "low",
         }), SUMMARIZER_TIMEOUT_MS, "retry");
         const retryAuthFailure = extractProviderAuthFailure(retryResult);

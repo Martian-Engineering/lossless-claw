@@ -9,6 +9,7 @@ import type {
 import { ContextAssembler } from "../src/assembler.js";
 import { CompactionEngine, type CompactionConfig } from "../src/compaction.js";
 import { RetrievalEngine } from "../src/retrieval.js";
+import { LcmProviderAuthError } from "../src/summarize.js";
 
 // ── Mock Store Factories ─────────────────────────────────────────────────────
 
@@ -1875,6 +1876,36 @@ describe("LCM integration: compaction", () => {
     expect(leafSummary).toBeDefined();
     expect(leafSummary!.content).toContain("[Truncated from");
     expect(leafSummary!.content).toContain("tokens]");
+  });
+
+  it("skips summary persistence when the summarizer hits a provider auth failure", async () => {
+    await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) => `Content ${i}: ${"d".repeat(200)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarize = vi.fn(async () => {
+      throw new LcmProviderAuthError({
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+        failure: {
+          statusCode: 401,
+          message: "Missing required scope: model.request",
+          missingModelRequestScope: true,
+        },
+      });
+    });
+
+    const result = await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(false);
+    expect(result.level).toBeUndefined();
+    expect(sumStore._summaries.find((s) => s.kind === "leaf")).toBeUndefined();
   });
 
   it("compactUntilUnder loops until under budget", async () => {

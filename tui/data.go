@@ -36,6 +36,7 @@ type agentEntry struct {
 // sessionEntry describes one JSONL session file.
 type sessionEntry struct {
 	id              string
+	sessionKey      string
 	filename        string
 	path            string
 	updatedAt       time.Time
@@ -269,11 +270,12 @@ func loadSessionBatch(files []sessionFileEntry, offset, limit int, lcmDBPath str
 
 	summaryCounts := loadSummaryCounts(lcmDBPath, sessionIDs)
 	fileCounts := loadFileCounts(lcmDBPath, sessionIDs)
-	conversationIDs := loadConversationIDs(lcmDBPath, sessionIDs)
+	conversationMetadata := loadConversationMetadata(lcmDBPath, sessionIDs)
 	for i := range sessions {
 		sessions[i].summaryCount = summaryCounts[sessions[i].id]
 		sessions[i].fileCount = fileCounts[sessions[i].id]
-		sessions[i].conversationID = conversationIDs[sessions[i].id]
+		sessions[i].conversationID = conversationMetadata[sessions[i].id].conversationID
+		sessions[i].sessionKey = conversationMetadata[sessions[i].id].sessionKey
 	}
 
 	return sessions, end, nil
@@ -1044,15 +1046,20 @@ func loadFileCounts(dbPath string, sessionIDs []string) map[string]int {
 	return counts
 }
 
-func loadConversationIDs(dbPath string, sessionIDs []string) map[string]int64 {
-	// Resolve one LCM conversation_id per session for list/header display.
-	ids := make(map[string]int64, len(sessionIDs))
+type conversationMetadata struct {
+	conversationID int64
+	sessionKey     string
+}
+
+func loadConversationMetadata(dbPath string, sessionIDs []string) map[string]conversationMetadata {
+	// Resolve the latest LCM conversation metadata per session for list/header display.
+	metadata := make(map[string]conversationMetadata, len(sessionIDs))
 	if len(sessionIDs) == 0 {
-		return ids
+		return metadata
 	}
 	db, err := openLCMDB(dbPath)
 	if err != nil {
-		return ids
+		return metadata
 	}
 	defer db.Close()
 
@@ -1063,27 +1070,37 @@ func loadConversationIDs(dbPath string, sessionIDs []string) map[string]int64 {
 		args[i] = sessionID
 	}
 	query := fmt.Sprintf(`
-		SELECT session_id, MAX(conversation_id)
-		FROM conversations
-		WHERE session_id IN (%s)
-		GROUP BY session_id
+		SELECT c.session_id, c.conversation_id, c.session_key
+		FROM conversations c
+		JOIN (
+			SELECT session_id, MAX(conversation_id) AS conversation_id
+			FROM conversations
+			WHERE session_id IN (%s)
+			GROUP BY session_id
+		) latest
+			ON latest.session_id = c.session_id
+			AND latest.conversation_id = c.conversation_id
 	`, strings.Join(placeholders, ","))
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		return ids
+		return metadata
 	}
 	defer rows.Close()
 
 	for rows.Next() {
 		var sessionID string
 		var conversationID int64
-		if err := rows.Scan(&sessionID, &conversationID); err != nil {
+		var sessionKey sql.NullString
+		if err := rows.Scan(&sessionID, &conversationID, &sessionKey); err != nil {
 			continue
 		}
-		ids[sessionID] = conversationID
+		metadata[sessionID] = conversationMetadata{
+			conversationID: conversationID,
+			sessionKey:     sessionKey.String,
+		}
 	}
-	return ids
+	return metadata
 }
 
 func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {

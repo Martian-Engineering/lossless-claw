@@ -268,6 +268,8 @@ describe("lcm plugin registration", () => {
     expect(run).toHaveBeenCalledWith(expect.objectContaining({
       sessionKey: "agent:main:subagent:test",
       message: "Test delegated run",
+      provider: "openrouter",
+      model: "anthropic/claude-haiku-4-5",
       deliver: false,
       idempotencyKey: "idem-1",
     }));

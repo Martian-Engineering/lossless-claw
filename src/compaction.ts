@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { ConversationStore, CreateMessagePartInput } from "./store/conversation-store.js";
 import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
 import { extractFileIdsFromContent } from "./large-files.js";
+import { LcmProviderAuthError } from "./summarize.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -1001,6 +1002,9 @@ export class CompactionEngine {
   /**
    * Run three-level summarization escalation:
    * normal -> aggressive -> deterministic fallback.
+   *
+   * Provider-auth failures are treated as non-compacting skips so we do not
+   * persist truncation artifacts into the summary DAG.
    */
   private async summarizeWithEscalation(params: {
     sourceText: string;
@@ -1026,17 +1030,31 @@ export class CompactionEngine {
         level: "fallback",
       };
     };
+    const authFailure = Symbol("authFailure");
 
-    const runSummarizer = async (aggressiveMode: boolean): Promise<string | null> => {
-      const output = await params.summarize(sourceText, aggressiveMode, params.options);
+    const runSummarizer = async (
+      aggressiveMode: boolean,
+    ): Promise<string | null | typeof authFailure> => {
+      let output: string;
+      try {
+        output = await params.summarize(sourceText, aggressiveMode, params.options);
+      } catch (err) {
+        if (err instanceof LcmProviderAuthError) {
+          return authFailure;
+        }
+        throw err;
+      }
       const trimmed = output.trim();
       return trimmed || null;
     };
 
     const initialSummary = await runSummarizer(false);
+    if (initialSummary === authFailure) {
+      return null;
+    }
     if (initialSummary === null) {
-      // Empty provider output should still compact deterministically so auth
-      // failures or empty responses do not stall compaction entirely.
+      // Empty provider output should still compact deterministically so a
+      // silent no-op does not stall compaction forever.
       return buildDeterministicFallback();
     }
     let summaryText = initialSummary;
@@ -1044,6 +1062,9 @@ export class CompactionEngine {
 
     if (estimateTokens(summaryText) >= inputTokens) {
       const aggressiveSummary = await runSummarizer(true);
+      if (aggressiveSummary === authFailure) {
+        return null;
+      }
       if (aggressiveSummary === null) {
         return buildDeterministicFallback();
       }
@@ -1149,7 +1170,7 @@ export class CompactionEngine {
     });
     if (!summary) {
       console.warn(
-        `[lcm] leaf summarizer returned empty content; conversationId=${conversationId}; chunkMessages=${messageContents.length}; skipping leaf chunk`,
+        `[lcm] leaf compaction skipped summary write; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
       );
       return null;
     }
@@ -1256,7 +1277,7 @@ export class CompactionEngine {
     });
     if (!condensed) {
       console.warn(
-        `[lcm] condensed summarizer returned empty content; conversationId=${conversationId}; depth=${targetDepth}; chunkSummaries=${summaryRecords.length}; skipping condensed chunk`,
+        `[lcm] condensed compaction skipped summary write; conversationId=${conversationId}; depth=${targetDepth}; chunkSummaries=${summaryRecords.length}`,
       );
       return null;
     }

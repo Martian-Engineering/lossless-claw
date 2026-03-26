@@ -1,5 +1,17 @@
 # @martian-engineering/lossless-claw
 
+## 0.5.2
+
+### Patch Changes
+
+- [#185](https://github.com/Martian-Engineering/lossless-claw/pull/185) [`ec74779`](https://github.com/Martian-Engineering/lossless-claw/commit/ec747792c01153e44f08bfbf410ddf2526fca7cf) Thanks [@jalehman](https://github.com/jalehman)! - Fix `lcm-tui doctor` to detect third truncation marker format (`[LCM fallback summary; truncated for context management]`) and harden Claude CLI summarization with `--system-prompt` flag and neutral working directory to prevent workspace contamination.
+
+- [#186](https://github.com/Martian-Engineering/lossless-claw/pull/186) [`c796f7d`](https://github.com/Martian-Engineering/lossless-claw/commit/c796f7d9d014a19f2b55e62895a32327b0347694) Thanks [@jalehman](https://github.com/jalehman)! - Harden LCM summarization so provider auth failures no longer persist fallback summaries, and stop forcing explicit temperature overrides on summarizer requests.
+
+- [#182](https://github.com/Martian-Engineering/lossless-claw/pull/182) [`954a2fd`](https://github.com/Martian-Engineering/lossless-claw/commit/954a2fd848b6444561e26afc2b41ad01e27d5a08) Thanks [@jalehman](https://github.com/jalehman)! - Improve `lcm-tui` session browsing by showing stable session keys in the session list and conversation header, and align the session list columns so message counts and LCM metadata are easier to scan.
+
+- [#128](https://github.com/Martian-Engineering/lossless-claw/pull/128) [`0f1a5d8`](https://github.com/Martian-Engineering/lossless-claw/commit/0f1a5d89a95225baee39e017449e5956e7990b27) Thanks [@TSHOGX](https://github.com/TSHOGX)! - Honor custom API base URL overrides for `lcm-tui rewrite`, `lcm-tui backfill`, and interactive rewrite so TUI summarization can use configured provider proxies and non-default endpoints.
+
 ## 0.5.1
 
 ### Patch Changes

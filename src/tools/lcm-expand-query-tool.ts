@@ -80,6 +80,76 @@ type SummaryCandidate = {
   conversationId: number;
 };
 
+function collectExpansionFailureText(value: unknown, parts: string[], depth = 0): void {
+  if (depth > 3 || value == null) {
+    return;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed) {
+      parts.push(trimmed);
+    }
+    return;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    parts.push(String(value));
+    return;
+  }
+  if (value instanceof Error) {
+    if (value.message.trim()) {
+      parts.push(value.message.trim());
+    }
+    collectExpansionFailureText(value.cause, parts, depth + 1);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectExpansionFailureText(entry, parts, depth + 1);
+    }
+    return;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    for (const key of ["message", "error", "reason", "details", "response", "cause", "code"]) {
+      collectExpansionFailureText(record[key], parts, depth + 1);
+    }
+  }
+}
+
+function formatExpansionFailure(error: unknown): string {
+  const parts: string[] = [];
+  collectExpansionFailureText(error, parts);
+  const message = parts.join(" ").replace(/\s+/g, " ").trim();
+  if (message) {
+    return message;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error.trim();
+  }
+  return "Delegated expansion query failed.";
+}
+
+function shouldRetryWithoutOverride(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return [
+    "model.request",
+    "missing scopes",
+    "insufficient scope",
+    "unauthorized",
+    "not authorized",
+    "forbidden",
+    "provider/model overrides are not authorized",
+    "model override is not authorized",
+    "unknown model",
+    "model not found",
+    "invalid model",
+    "not available",
+    "not supported",
+    "401",
+    "403",
+  ].some((signal) => normalized.includes(signal));
+}
+
 /**
  * Build the sub-agent task message for delegated expansion and prompt answering.
  */
@@ -401,9 +471,6 @@ export function createLcmExpandQueryTool(input: {
         });
       }
 
-      let childSessionKey = "";
-      let grantCreated = false;
-
       try {
         const candidates = await resolveSummaryCandidates({
           lcm: input.lcm,
@@ -448,25 +515,8 @@ export function createLcmExpandQueryTool(input: {
         const requesterAgentId = input.deps.normalizeAgentId(
           input.deps.parseAgentSessionKey(callerSessionKey)?.agentId,
         );
-        childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
         const childExpansionDepth = resolveNextExpansionDepth(callerSessionKey);
         const originSessionKey = recursionCheck.originSessionKey || callerSessionKey || "main";
-
-        createDelegatedExpansionGrant({
-          delegatedSessionKey: childSessionKey,
-          issuerSessionId: callerSessionKey || "main",
-          allowedConversationIds: [sourceConversationId],
-          tokenCap: expansionTokenCap,
-          ttlMs: DELEGATED_WAIT_TIMEOUT_MS + 30_000,
-        });
-        stampDelegatedExpansionContext({
-          sessionKey: childSessionKey,
-          requestId,
-          expansionDepth: childExpansionDepth,
-          originSessionKey,
-          stampedBy: "lcm_expand_query",
-        });
-        grantCreated = true;
 
         const task = buildDelegatedExpandQueryTask({
           summaryIds,
@@ -480,118 +530,160 @@ export function createLcmExpandQueryTool(input: {
           originSessionKey,
         });
 
-        const childIdem = crypto.randomUUID();
         const expansionProvider = input.deps.config.expansionProvider || undefined;
         const expansionModel = input.deps.config.expansionModel || undefined;
-        const response = (await input.deps.callGateway({
-          method: "agent",
-          params: {
-            message: task,
-            sessionKey: childSessionKey,
-            deliver: false,
-            lane: input.deps.agentLaneSubagent,
-            idempotencyKey: childIdem,
-            ...(expansionProvider ? { provider: expansionProvider } : {}),
-            ...(expansionModel ? { model: expansionModel } : {}),
-            extraSystemPrompt: input.deps.buildSubagentSystemPrompt({
-              depth: 1,
-              maxDepth: 8,
-              taskSummary: "Run lcm_expand and return prompt-focused JSON answer",
-            }),
-          },
-          timeoutMs: GATEWAY_TIMEOUT_MS,
-        })) as { runId?: string };
+        const configuredOverrideLabel =
+          expansionProvider && expansionModel
+            ? `${expansionProvider}/${expansionModel}`
+            : expansionModel || expansionProvider || "configured override";
 
-        const runId = typeof response?.runId === "string" ? response.runId.trim() : "";
-        if (!runId) {
-          return jsonResult({
-            error: "Delegated expansion did not return a runId.",
-          });
-        }
+        const runDelegatedQuery = async (provider?: string, model?: string) => {
+          const childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
+          const childIdem = crypto.randomUUID();
+          let grantCreated = false;
 
-        const wait = (await input.deps.callGateway({
-          method: "agent.wait",
-          params: {
-            runId,
-            timeoutMs: DELEGATED_WAIT_TIMEOUT_MS,
-          },
-          timeoutMs: DELEGATED_WAIT_TIMEOUT_MS,
-        })) as { status?: string; error?: string };
-        const status = typeof wait?.status === "string" ? wait.status : "error";
-        if (status === "timeout") {
-          recordExpansionDelegationTelemetry({
-            deps: input.deps,
-            component: "lcm_expand_query",
-            event: "timeout",
-            requestId,
-            sessionKey: callerSessionKey,
-            expansionDepth: childExpansionDepth,
-            originSessionKey,
-            runId,
-          });
-          return jsonResult({
-            error: "lcm_expand_query timed out waiting for delegated expansion (120s).",
-          });
-        }
-        if (status !== "ok") {
-          return jsonResult({
-            error:
-              typeof wait?.error === "string" && wait.error.trim()
-                ? wait.error
-                : "Delegated expansion query failed.",
-          });
-        }
-
-        const replyPayload = (await input.deps.callGateway({
-          method: "sessions.get",
-          params: { key: childSessionKey, limit: 80 },
-          timeoutMs: GATEWAY_TIMEOUT_MS,
-        })) as { messages?: unknown[] };
-        const reply = input.deps.readLatestAssistantReply(
-          Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
-        );
-        const parsed = parseDelegatedExpandQueryReply(reply, summaryIds.length);
-        recordExpansionDelegationTelemetry({
-          deps: input.deps,
-          component: "lcm_expand_query",
-          event: "success",
-          requestId,
-          sessionKey: callerSessionKey,
-          expansionDepth: childExpansionDepth,
-          originSessionKey,
-          runId,
-        });
-
-        return jsonResult({
-          answer: parsed.answer,
-          citedIds: parsed.citedIds,
-          sourceConversationId,
-          expandedSummaryCount: parsed.expandedSummaryCount,
-          totalSourceTokens: parsed.totalSourceTokens,
-          truncated: parsed.truncated,
-        });
-      } catch (error) {
-        return jsonResult({
-          error: error instanceof Error ? error.message : String(error),
-        });
-      } finally {
-        if (childSessionKey) {
           try {
-            await input.deps.callGateway({
-              method: "sessions.delete",
-              params: { key: childSessionKey, deleteTranscript: true },
-              timeoutMs: GATEWAY_TIMEOUT_MS,
+            createDelegatedExpansionGrant({
+              delegatedSessionKey: childSessionKey,
+              issuerSessionId: callerSessionKey || "main",
+              allowedConversationIds: [sourceConversationId],
+              tokenCap: expansionTokenCap,
+              ttlMs: DELEGATED_WAIT_TIMEOUT_MS + 30_000,
             });
-          } catch {
-            // Cleanup is best-effort.
+            stampDelegatedExpansionContext({
+              sessionKey: childSessionKey,
+              requestId,
+              expansionDepth: childExpansionDepth,
+              originSessionKey,
+              stampedBy: "lcm_expand_query",
+            });
+            grantCreated = true;
+
+            const response = (await input.deps.callGateway({
+              method: "agent",
+              params: {
+                message: task,
+                sessionKey: childSessionKey,
+                deliver: false,
+                lane: input.deps.agentLaneSubagent,
+                idempotencyKey: childIdem,
+                ...(provider ? { provider } : {}),
+                ...(model ? { model } : {}),
+                extraSystemPrompt: input.deps.buildSubagentSystemPrompt({
+                  depth: 1,
+                  maxDepth: 8,
+                  taskSummary: "Run lcm_expand and return prompt-focused JSON answer",
+                }),
+              },
+              timeoutMs: GATEWAY_TIMEOUT_MS,
+            })) as { runId?: unknown; error?: unknown };
+
+            const runId = typeof response?.runId === "string" ? response.runId.trim() : "";
+            if (!runId) {
+              throw new Error(
+                formatExpansionFailure(response?.error ?? response)
+                  || "Delegated expansion did not return a runId.",
+              );
+            }
+
+            const wait = (await input.deps.callGateway({
+              method: "agent.wait",
+              params: {
+                runId,
+                timeoutMs: DELEGATED_WAIT_TIMEOUT_MS,
+              },
+              timeoutMs: DELEGATED_WAIT_TIMEOUT_MS,
+            })) as { status?: string; error?: unknown };
+            const status = typeof wait?.status === "string" ? wait.status : "error";
+            if (status === "timeout") {
+              recordExpansionDelegationTelemetry({
+                deps: input.deps,
+                component: "lcm_expand_query",
+                event: "timeout",
+                requestId,
+                sessionKey: callerSessionKey,
+                expansionDepth: childExpansionDepth,
+                originSessionKey,
+                runId,
+              });
+              throw new Error(
+                "lcm_expand_query timed out waiting for delegated expansion (120s).",
+              );
+            }
+            if (status !== "ok") {
+              throw new Error(formatExpansionFailure(wait?.error));
+            }
+
+            const replyPayload = (await input.deps.callGateway({
+              method: "sessions.get",
+              params: { key: childSessionKey, limit: 80 },
+              timeoutMs: GATEWAY_TIMEOUT_MS,
+            })) as { messages?: unknown[] };
+            const reply = input.deps.readLatestAssistantReply(
+              Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
+            );
+            const parsed = parseDelegatedExpandQueryReply(reply, summaryIds.length);
+            recordExpansionDelegationTelemetry({
+              deps: input.deps,
+              component: "lcm_expand_query",
+              event: "success",
+              requestId,
+              sessionKey: callerSessionKey,
+              expansionDepth: childExpansionDepth,
+              originSessionKey,
+              runId,
+            });
+
+            return jsonResult({
+              answer: parsed.answer,
+              citedIds: parsed.citedIds,
+              sourceConversationId,
+              expandedSummaryCount: parsed.expandedSummaryCount,
+              totalSourceTokens: parsed.totalSourceTokens,
+              truncated: parsed.truncated,
+            });
+          } finally {
+            try {
+              await input.deps.callGateway({
+                method: "sessions.delete",
+                params: { key: childSessionKey, deleteTranscript: true },
+                timeoutMs: GATEWAY_TIMEOUT_MS,
+              });
+            } catch {
+              // Cleanup is best-effort.
+            }
+            if (grantCreated) {
+              revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+            }
+            clearDelegatedExpansionContext(childSessionKey);
           }
+        };
+
+        if (!expansionProvider && !expansionModel) {
+          return await runDelegatedQuery();
         }
-        if (grantCreated && childSessionKey) {
-          revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+
+        try {
+          return await runDelegatedQuery(expansionProvider, expansionModel);
+        } catch (error) {
+          const failure = formatExpansionFailure(error);
+          input.deps.log.warn(
+            `[lcm] delegated expansion override failed (${configuredOverrideLabel}): ${failure}`,
+          );
+          if (!shouldRetryWithoutOverride(failure)) {
+            throw new Error(failure);
+          }
+          input.deps.log.warn(
+            `[lcm] retrying delegated expansion without provider/model override after: ${failure}`,
+          );
+          return await runDelegatedQuery();
         }
-        if (childSessionKey) {
-          clearDelegatedExpansionContext(childSessionKey);
-        }
+      } catch (error) {
+        const failure = formatExpansionFailure(error);
+        input.deps.log.error(`[lcm] delegated expansion query failed: ${failure}`);
+        return jsonResult({
+          error: failure,
+        });
       }
     },
   };

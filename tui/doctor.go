@@ -16,7 +16,9 @@ import (
 const (
 	doctorOldMarker          = corruptedSummaryMarker
 	doctorNewMarkerPrefix    = "[Truncated from "
+	doctorLCMFallbackMarker  = "[LCM fallback summary; truncated for context management]"
 	doctorNewMarkerWindow    = 40
+	doctorFallbackWindow     = 80
 	doctorDefaultProvider    = "anthropic"
 	doctorDefaultModel       = "claude-haiku-4-5"
 	doctorDefaultApplyPrompt = ""
@@ -391,6 +393,8 @@ func loadDoctorTargets(ctx context.Context, q sqlQueryer, conversationID *int64)
 				WHEN INSTR(COALESCE(s.content, ''), ?) = 1 THEN 'old'
 				WHEN INSTR(COALESCE(s.content, ''), ?) > 0
 					AND LENGTH(COALESCE(s.content, '')) - INSTR(COALESCE(s.content, ''), ?) < ` + strconv.Itoa(doctorNewMarkerWindow) + ` THEN 'new'
+				WHEN INSTR(COALESCE(s.content, ''), ?) > 0
+					AND LENGTH(COALESCE(s.content, '')) - INSTR(COALESCE(s.content, ''), ?) < ` + strconv.Itoa(doctorFallbackWindow) + ` THEN 'fallback'
 				ELSE ''
 			END AS marker_kind
 		FROM summaries s
@@ -401,7 +405,7 @@ func loadDoctorTargets(ctx context.Context, q sqlQueryer, conversationID *int64)
 		) spc ON spc.summary_id = s.summary_id
 		WHERE
 	`
-	args := []any{doctorOldMarker, doctorNewMarkerPrefix, doctorNewMarkerPrefix}
+	args := []any{doctorOldMarker, doctorNewMarkerPrefix, doctorNewMarkerPrefix, doctorLCMFallbackMarker, doctorLCMFallbackMarker}
 	if conversationID != nil {
 		query += " s.conversation_id = ? AND "
 		args = append(args, *conversationID)
@@ -413,10 +417,14 @@ func loadDoctorTargets(ctx context.Context, q sqlQueryer, conversationID *int64)
 				INSTR(COALESCE(s.content, ''), ?) > 0
 				AND LENGTH(COALESCE(s.content, '')) - INSTR(COALESCE(s.content, ''), ?) < ` + strconv.Itoa(doctorNewMarkerWindow) + `
 			)
+			OR (
+				INSTR(COALESCE(s.content, ''), ?) > 0
+				AND LENGTH(COALESCE(s.content, '')) - INSTR(COALESCE(s.content, ''), ?) < ` + strconv.Itoa(doctorFallbackWindow) + `
+			)
 		)
 		ORDER BY s.conversation_id ASC, COALESCE(s.depth, 0) ASC, s.created_at ASC, s.summary_id ASC
 	`
-	args = append(args, doctorOldMarker, doctorNewMarkerPrefix, doctorNewMarkerPrefix)
+	args = append(args, doctorOldMarker, doctorNewMarkerPrefix, doctorNewMarkerPrefix, doctorLCMFallbackMarker, doctorLCMFallbackMarker)
 
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -471,9 +479,13 @@ func loadDoctorLeafOrdinals(ctx context.Context, q sqlQueryer, conversationID in
 					INSTR(COALESCE(s.content, ''), ?) > 0
 					AND LENGTH(COALESCE(s.content, '')) - INSTR(COALESCE(s.content, ''), ?) < ?
 				)
+				OR (
+					INSTR(COALESCE(s.content, ''), ?) > 0
+					AND LENGTH(COALESCE(s.content, '')) - INSTR(COALESCE(s.content, ''), ?) < ?
+				)
 		  )
 		ORDER BY ci.ordinal ASC
-	`, conversationID, doctorOldMarker, doctorNewMarkerPrefix, doctorNewMarkerPrefix, doctorNewMarkerWindow)
+	`, conversationID, doctorOldMarker, doctorNewMarkerPrefix, doctorNewMarkerPrefix, doctorNewMarkerWindow, doctorLCMFallbackMarker, doctorLCMFallbackMarker, doctorFallbackWindow)
 	if err != nil {
 		return nil, fmt.Errorf("query doctor leaf ordinals for conversation %d: %w", conversationID, err)
 	}
@@ -501,6 +513,10 @@ func detectDoctorMarker(content string) string {
 	idx := strings.Index(content, doctorNewMarkerPrefix)
 	if idx >= 0 && len(content)-idx < doctorNewMarkerWindow {
 		return "new"
+	}
+	fidx := strings.Index(content, doctorLCMFallbackMarker)
+	if fidx >= 0 && len(content)-fidx < doctorFallbackWindow {
+		return "fallback"
 	}
 	return ""
 }

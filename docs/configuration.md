@@ -99,6 +99,7 @@ LCM uses the same model as the parent OpenClaw session for summarization by defa
 # Use a specific model for summarization
 export LCM_SUMMARY_MODEL=anthropic/claude-sonnet-4-20250514
 export LCM_SUMMARY_PROVIDER=anthropic
+export LCM_SUMMARY_BASE_URL=https://api.anthropic.com
 ```
 
 Using a cheaper/faster model for summarization can reduce costs, but quality matters — poor summaries compound as they're condensed into higher-level nodes.

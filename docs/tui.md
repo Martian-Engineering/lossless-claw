@@ -287,6 +287,9 @@ lcm-tui rewrite 44 --all --apply --diff
 # Rewrite with OpenAI Responses API
 lcm-tui rewrite 44 --summary sum_abc123 --provider openai --model gpt-5.3-codex --apply
 
+# Rewrite through a custom OpenAI-compatible proxy
+lcm-tui rewrite 44 --summary sum_abc123 --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai --apply
+
 # Use custom prompt templates
 lcm-tui rewrite 44 --all --apply --prompt-dir ~/.config/lcm-tui/prompts
 ```
@@ -301,6 +304,7 @@ lcm-tui rewrite 44 --all --apply --prompt-dir ~/.config/lcm-tui/prompts
 | `--diff` | Show unified diff |
 | `--provider <id>` | API provider (inferred from `--model` when omitted) |
 | `--model <model>` | API model (default depends on provider) |
+| `--base-url <url>` | Custom API base URL (overrides config and env) |
 | `--prompt-dir <path>` | Custom prompt template directory |
 | `--timestamps` | Inject timestamps into source text (default: true) |
 | `--tz <timezone>` | Timezone for timestamps (default: system local) |
@@ -378,6 +382,9 @@ lcm-tui backfill my-agent session_abc123 --apply --transplant-to 653
 
 # Backfill using OpenAI
 lcm-tui backfill my-agent session_abc123 --apply --provider openai --model gpt-5.3-codex
+
+# Backfill through a custom OpenAI-compatible proxy
+lcm-tui backfill my-agent session_abc123 --apply --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai
 ```
 
 All write paths are transactional:
@@ -404,6 +411,7 @@ An idempotency guard prevents duplicate imports for the same `session_id`.
 | `--fresh-tail <n>` | Preserve freshest N raw messages from leaf compaction |
 | `--provider <id>` | API provider (inferred from model when omitted) |
 | `--model <id>` | API model (default depends on provider) |
+| `--base-url <url>` | Custom API base URL (overrides config and env) |
 | `--prompt-dir <path>` | Custom depth-prompt directory |
 
 ### `lcm-tui prompts`
@@ -479,9 +487,10 @@ If the provider auth profile mode is `oauth` (not `api_key`), set the provider A
 Interactive rewrite (`w`/`W`) can be configured with:
 - `LCM_TUI_SUMMARY_PROVIDER`
 - `LCM_TUI_SUMMARY_MODEL`
+- `LCM_TUI_SUMMARY_BASE_URL`
 - `LCM_TUI_CONVERSATION_WINDOW_SIZE` (default `200`)
 
-It also honors `LCM_SUMMARY_PROVIDER` / `LCM_SUMMARY_MODEL` as fallback.
+It also honors `LCM_SUMMARY_PROVIDER` / `LCM_SUMMARY_MODEL` / `LCM_SUMMARY_BASE_URL` as fallback.
 
 ## Database
 

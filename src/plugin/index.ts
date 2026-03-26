@@ -1294,6 +1294,8 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           return sub.run({
             sessionKey: String(params.params?.sessionKey ?? ""),
             message: String(params.params?.message ?? ""),
+            provider: params.params?.provider as string | undefined,
+            model: params.params?.model as string | undefined,
             extraSystemPrompt: params.params?.extraSystemPrompt as string | undefined,
             lane: params.params?.lane as string | undefined,
             deliver: (params.params?.deliver as boolean) ?? false,

@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createLcmSummarizeFromLegacyParams, type LcmSummarizeFn } from "../src/summarize.js";
+import {
+  createLcmSummarizeFromLegacyParams,
+  LcmProviderAuthError,
+  type LcmSummarizeFn,
+} from "../src/summarize.js";
 import type { LcmDependencies } from "../src/types.js";
 
 async function createSummarizeFn(
@@ -322,7 +326,8 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     const normalMaxTokens = Number(completeMock.mock.calls[0]?.[0]?.maxTokens ?? 0);
     const aggressiveMaxTokens = Number(completeMock.mock.calls[1]?.[0]?.maxTokens ?? 0);
     expect(aggressiveMaxTokens).toBeLessThan(normalMaxTokens);
-    expect(completeMock.mock.calls[1]?.[0]?.temperature).toBe(0.1);
+    expect(completeMock.mock.calls[0]?.[0]?.temperature).toBeUndefined();
+    expect(completeMock.mock.calls[1]?.[0]?.temperature).toBeUndefined();
   });
 
   it("uses condensed prompt mode for condensed summaries", async () => {
@@ -630,9 +635,9 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           legacyParams: { provider: "openai-codex", model: "gpt-5.4" },
         });
 
-        const summary = await result!.fn("A".repeat(8_000), false);
-
-        expect(summary).toBe("");
+        await expect(result!.fn("A".repeat(8_000), false)).rejects.toBeInstanceOf(
+          LcmProviderAuthError,
+        );
         expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
 
         const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
@@ -674,9 +679,9 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           legacyParams: { provider: "openai-codex", model: "gpt-5.4" },
         });
 
-        const summary = await result!.fn("B".repeat(8_000), false);
-
-        expect(summary).toBe("");
+        await expect(result!.fn("B".repeat(8_000), false)).rejects.toBeInstanceOf(
+          LcmProviderAuthError,
+        );
         expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
 
         const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
@@ -725,7 +730,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
         // Retry call should use conservative settings.
         const retryArgs = vi.mocked(deps.complete).mock.calls[1]?.[0];
-        expect(retryArgs?.temperature).toBe(0.05);
+        expect(retryArgs?.temperature).toBeUndefined();
         expect(retryArgs?.reasoning).toBe("low");
 
         // Should log the retry-succeeded diagnostic.

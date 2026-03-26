@@ -30,6 +30,9 @@ const (
 	openAIResponsesModel   = "gpt-5.3-codex"
 	condensedTargetTokens  = 2000
 	defaultHTTPTimeout     = 180 * time.Second
+
+	defaultAnthropicBaseURL = "https://api.anthropic.com"
+	defaultOpenAIBaseURL    = "https://api.openai.com"
 )
 
 var (
@@ -90,6 +93,7 @@ type anthropicClient struct {
 	apiKey   string
 	http     *http.Client
 	model    string
+	baseURL  string
 }
 
 type anthropicRequest struct {
@@ -183,6 +187,7 @@ func runRepairCommand(args []string) error {
 			apiKey:   apiKey,
 			http:     &http.Client{Timeout: defaultHTTPTimeout},
 			model:    anthropicModel,
+			baseURL:  resolveProviderBaseURL(paths, defaultLLMProvider, ""),
 		}
 	}
 
@@ -959,8 +964,16 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 		return summarizeViaCLI(ctx, model, prompt, targetTokens)
 	}
 
-	endpoint := "https://api.anthropic.com/v1/messages"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	baseURL := c.baseURL
+	if baseURL == "" {
+		baseURL = defaultAnthropicBaseURL
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		resolveProviderEndpointURL(baseURL, "/v1/messages"),
+		bytes.NewReader(payload),
+	)
 	if err != nil {
 		return "", fmt.Errorf("build Anthropic request: %w", err)
 	}
@@ -1011,9 +1024,11 @@ func summarizeViaCLI(ctx context.Context, model, prompt string, targetTokens int
 	cmd := execCLICommand(ctx, claudePath,
 		"--print",
 		"--output-format", "text",
+		"--system-prompt", "You are a summarization engine. Output ONLY the requested summary. No preamble, no conversation, no questions, no commentary. Never output HEARTBEAT_OK or any protocol tokens.",
 		"--model", model,
 		"-p", prompt,
 	)
+	cmd.Dir = os.TempDir()
 	// Unset ANTHROPIC_API_KEY so the CLI uses its own stored OAuth credentials.
 	env := os.Environ()
 	filtered := env[:0]
@@ -1067,7 +1082,16 @@ func (c *anthropicClient) summarizeOpenAI(ctx context.Context, model, prompt str
 		return "", fmt.Errorf("marshal OpenAI request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/responses", bytes.NewReader(payload))
+	baseURL := c.baseURL
+	if baseURL == "" {
+		baseURL = defaultOpenAIBaseURL
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		resolveProviderEndpointURL(baseURL, "/v1/responses"),
+		bytes.NewReader(payload),
+	)
 	if err != nil {
 		return "", fmt.Errorf("build OpenAI request: %w", err)
 	}
@@ -1503,6 +1527,68 @@ func readProviderProfileMode(configPath, provider string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+func resolveProviderBaseURL(paths appDataPaths, provider, flagOverride string) string {
+	if flagOverride != "" {
+		return strings.TrimRight(flagOverride, "/")
+	}
+
+	if envVal := strings.TrimSpace(os.Getenv("LCM_SUMMARY_BASE_URL")); envVal != "" {
+		return strings.TrimRight(envVal, "/")
+	}
+
+	normalizedProvider := normalizeProviderID(provider)
+	if normalizedProvider != "" && paths.openclawConfig != "" {
+		if baseURL := readProviderBaseURL(paths.openclawConfig, normalizedProvider); baseURL != "" {
+			return strings.TrimRight(baseURL, "/")
+		}
+	}
+
+	switch normalizedProvider {
+	case "openai", "openai-codex", "github-copilot":
+		return defaultOpenAIBaseURL
+	default:
+		return defaultAnthropicBaseURL
+	}
+}
+
+// resolveProviderEndpointURL accepts either API-root base URLs or versioned /v1 URLs.
+func resolveProviderEndpointURL(baseURL, endpointPath string) string {
+	trimmedBaseURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.HasSuffix(trimmedBaseURL, "/v1") && strings.HasPrefix(endpointPath, "/v1/") {
+		return trimmedBaseURL + strings.TrimPrefix(endpointPath, "/v1")
+	}
+	return trimmedBaseURL + endpointPath
+}
+
+func readProviderBaseURL(configPath, provider string) string {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+
+	var parsed struct {
+		Models struct {
+			Providers map[string]struct {
+				BaseURL string `json:"baseUrl"`
+			} `json:"providers"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return ""
+	}
+
+	normalizedProvider := normalizeProviderID(provider)
+	if p, ok := parsed.Models.Providers[normalizedProvider]; ok && p.BaseURL != "" {
+		return strings.TrimSpace(p.BaseURL)
+	}
+	for name, p := range parsed.Models.Providers {
+		if normalizeProviderID(name) == normalizedProvider && p.BaseURL != "" {
+			return strings.TrimSpace(p.BaseURL)
+		}
+	}
+	return ""
 }
 
 func readKeyFromEnvFileCandidates(path string, envCandidates []string) (string, error) {
