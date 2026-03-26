@@ -3,7 +3,12 @@ import { join } from "path";
 
 export type LcmConfig = {
   enabled: boolean;
+  /** SQLite database file path. Required when backend is 'sqlite'. Ignored for 'postgres'. */
   databasePath: string;
+  /** PostgreSQL connection string. Required when backend is 'postgres'. Ignored for 'sqlite'. */
+  connectionString?: string;
+  /** Database backend. Exactly one of 'sqlite' or 'postgres'. No fallback between them. */
+  backend: 'sqlite' | 'postgres';
   /** Glob patterns for session keys to exclude from LCM storage entirely. */
   ignoreSessionPatterns: string[];
   /** Glob patterns for session keys that may read from LCM but never write to it. */
@@ -29,10 +34,6 @@ export type LcmConfig = {
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
   largeFileSummaryModel: string;
-  /** Model override for conversation summarization. */
-  summaryModel: string;
-  /** Provider override for conversation summarization. */
-  summaryProvider: string;
   /** Provider override for lcm_expand_query sub-agent. */
   expansionProvider: string;
   /** Model override for lcm_expand_query sub-agent. */
@@ -101,16 +102,55 @@ export function resolveLcmConfig(
 ): LcmConfig {
   const pc = pluginConfig ?? {};
 
+  const connectionString =
+    env.LCM_CONNECTION_STRING
+    ?? toStr(pc.connectionString);
+
+  const rawBackend =
+    env.LCM_BACKEND
+    ?? toStr(pc.backend);
+
+  // Determine backend: explicit setting wins, otherwise infer from connectionString presence
+  let backend: 'sqlite' | 'postgres';
+  if (rawBackend === 'postgres') {
+    backend = 'postgres';
+  } else if (rawBackend === 'sqlite') {
+    backend = 'sqlite';
+  } else if (connectionString) {
+    backend = 'postgres';
+  } else {
+    backend = 'sqlite';
+  }
+
+  // Validate: postgres requires connectionString, sqlite requires databasePath
+  const databasePath =
+    env.LCM_DATABASE_PATH
+    ?? toStr(pc.dbPath)
+    ?? toStr(pc.databasePath)
+    ?? (backend === 'sqlite' ? join(homedir(), ".openclaw", "lcm.db") : "");
+
+  if (backend === 'postgres' && !connectionString) {
+    throw new Error(
+      "LCM backend is 'postgres' but no connection string provided. " +
+      "Set LCM_CONNECTION_STRING env var or connectionString in plugin config."
+    );
+  }
+
+  if (backend === 'sqlite' && !databasePath) {
+    throw new Error(
+      "LCM backend is 'sqlite' but no database path provided. " +
+      "Set LCM_DATABASE_PATH env var or databasePath in plugin config."
+    );
+  }
+
   return {
     enabled:
       env.LCM_ENABLED !== undefined
         ? env.LCM_ENABLED !== "false"
         : toBool(pc.enabled) ?? true,
-    databasePath:
-      env.LCM_DATABASE_PATH
-      ?? toStr(pc.dbPath)
-      ?? toStr(pc.databasePath)
-      ?? join(homedir(), ".openclaw", "lcm.db"),
+    databasePath,
+    connectionString,
+    backend,
     ignoreSessionPatterns:
       env.LCM_IGNORE_SESSION_PATTERNS !== undefined
         ? env.LCM_IGNORE_SESSION_PATTERNS

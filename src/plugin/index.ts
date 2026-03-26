@@ -1481,9 +1481,22 @@ const lcmPlugin = {
   },
 
   register(api: OpenClawPluginApi) {
-    const deps = createLcmDependencies(api);
-    const database = createLcmDatabaseConnection(deps.config.databasePath);
-    const lcm = new LcmContextEngine(deps, database);
+    // Singleton: OC may call register() multiple times (once per channel/agent).
+    // Reuse the existing engine to avoid duplicate embedding queues and DB connections.
+    // WeakMap keyed on api so tests with fresh api objects get fresh engines.
+    const cacheMap = ((globalThis as any).__lcm_singleton_map__ ??= new WeakMap()) as WeakMap<
+      object,
+      { deps: ReturnType<typeof createLcmDependencies>; lcm: LcmContextEngine }
+    >;
+    let cached = cacheMap.get(api);
+    if (!cached) {
+      const deps = createLcmDependencies(api);
+      const database = createLcmDatabaseConnection(deps.config.databasePath);
+      const lcm = new LcmContextEngine(deps, database);
+      cached = { deps, lcm };
+      cacheMap.set(api, cached);
+    }
+    const { deps, lcm } = cached;
 
     api.registerContextEngine("lossless-claw", () => lcm);
     api.registerContextEngine("default", () => lcm);
