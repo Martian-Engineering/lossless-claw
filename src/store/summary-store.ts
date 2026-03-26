@@ -573,6 +573,45 @@ export class SummaryStore {
     return rows.map(toContextItemRecord);
   }
 
+  async getMaxContextOrdinal(conversationId: number): Promise<number> {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(ordinal), -1) AS max_ordinal
+       FROM context_items WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as { max_ordinal: number };
+    return row.max_ordinal;
+  }
+
+  async getContextItemsSinceOrdinal(
+    conversationId: number,
+    minOrdinalExclusive: number,
+  ): Promise<Array<{ ordinal: number; itemType: "message" | "summary"; content: string; createdAt: Date }>> {
+    const rows = this.db
+      .prepare(
+        `SELECT ci.ordinal, ci.item_type, ci.created_at,
+                COALESCE(m.content, s.content, '') AS content
+         FROM context_items ci
+         LEFT JOIN messages m ON ci.item_type = 'message' AND ci.message_id = m.message_id
+         LEFT JOIN summaries s ON ci.item_type = 'summary' AND ci.summary_id = s.summary_id
+         WHERE ci.conversation_id = ? AND ci.ordinal > ?
+         ORDER BY ci.ordinal`,
+      )
+      .all(conversationId, Math.floor(minOrdinalExclusive)) as unknown as Array<{
+        ordinal: number;
+        item_type: string;
+        content: string;
+        created_at: string;
+      }>;
+
+    return rows.map((row) => ({
+      ordinal: row.ordinal,
+      itemType: row.item_type === "summary" ? "summary" : "message",
+      content: row.content,
+      createdAt: new Date(row.created_at),
+    }));
+  }
+
   async getDistinctDepthsInContext(
     conversationId: number,
     options?: { maxOrdinalExclusive?: number },

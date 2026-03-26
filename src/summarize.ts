@@ -4,6 +4,9 @@ export type LcmSummarizeOptions = {
   previousSummary?: string;
   isCondensed?: boolean;
   depth?: number;
+  purpose?: "compaction" | "beacon";
+  targetTokens?: number;
+  hardTokenCap?: number;
 };
 
 export type LcmSummarizeFn = (
@@ -778,6 +781,42 @@ function buildD3PlusPrompt(params: {
   ].join("\n\n");
 }
 
+function buildBeaconPrompt(params: {
+  text: string;
+  targetTokens: number;
+  hardTokenCap: number;
+  previousSummary?: string;
+  customInstructions?: string;
+}): string {
+  const { text, targetTokens, hardTokenCap, previousSummary, customInstructions } = params;
+  const previousContext = previousSummary?.trim() ?? "";
+  const previousBlock = previousContext
+    ? `<previous_beacon>\n${previousContext}\n</previous_beacon>`
+    : "<previous_beacon>\n(none)\n</previous_beacon>";
+  const instructionBlock = customInstructions?.trim()
+    ? `Operator instructions:\n${customInstructions.trim()}`
+    : "Operator instructions: (none)";
+
+  return [
+    "You are updating an ambient cross-session relevance beacon for one conversation.",
+    "This beacon is a routing hint that helps decide whether to drill down into this conversation.",
+    instructionBlock,
+    [
+      "Focus on discriminative cues, not narrative retelling.",
+      "Capture:",
+      "- the conversation's project/topic identity,",
+      "- the most recent direction change or progress,",
+      "- one key decision, blocker, or open question.",
+      "Keep wording concrete and specific enough to distinguish this conversation from others.",
+      "Do not include markdown headings, XML, or bullet labels.",
+      "Plain text only.",
+      `Target length: 120-160 tokens. Hard cap: ${hardTokenCap} tokens.`,
+    ].join("\n"),
+    previousBlock,
+    `<new_activity>\n${text}\n</new_activity>`,
+  ].join("\n\n");
+}
+
 /** Build a condensed prompt variant based on the output node depth. */
 function buildCondensedSummaryPrompt(params: {
   text: string;
@@ -955,30 +994,55 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       agentDir,
       runtimeConfig: params.legacyParams.config,
     });
-    const targetTokens = resolveTargetTokens({
-      inputTokens: estimateTokens(text),
-      mode,
-      isCondensed,
-      condensedTargetTokens,
-    });
-    const prompt = isCondensed
-      ? buildCondensedSummaryPrompt({
-          text,
-          targetTokens,
-          depth:
-            typeof options?.depth === "number" && Number.isFinite(options.depth)
-              ? Math.max(1, Math.floor(options.depth))
-              : 1,
-          previousSummary: options?.previousSummary,
-          customInstructions: params.customInstructions,
-        })
-      : buildLeafSummaryPrompt({
-          text,
-          mode,
-          targetTokens,
-          previousSummary: options?.previousSummary,
-          customInstructions: params.customInstructions,
-        });
+    const purpose = options?.purpose === "beacon" ? "beacon" : "compaction";
+    const hardTokenCap =
+      typeof options?.hardTokenCap === "number" &&
+      Number.isFinite(options.hardTokenCap) &&
+      options.hardTokenCap > 0
+        ? Math.max(1, Math.floor(options.hardTokenCap))
+        : 180;
+    const beaconTarget =
+      typeof options?.targetTokens === "number" &&
+      Number.isFinite(options.targetTokens) &&
+      options.targetTokens > 0
+        ? Math.floor(options.targetTokens)
+        : 140;
+    const targetTokens =
+      purpose === "beacon"
+        ? Math.min(hardTokenCap, Math.max(120, Math.min(160, beaconTarget)))
+        : resolveTargetTokens({
+            inputTokens: estimateTokens(text),
+            mode,
+            isCondensed,
+            condensedTargetTokens,
+          });
+    const prompt =
+      purpose === "beacon"
+        ? buildBeaconPrompt({
+            text,
+            targetTokens,
+            hardTokenCap,
+            previousSummary: options?.previousSummary,
+            customInstructions: params.customInstructions,
+          })
+        : isCondensed
+          ? buildCondensedSummaryPrompt({
+              text,
+              targetTokens,
+              depth:
+                typeof options?.depth === "number" && Number.isFinite(options.depth)
+                  ? Math.max(1, Math.floor(options.depth))
+                  : 1,
+              previousSummary: options?.previousSummary,
+              customInstructions: params.customInstructions,
+            })
+          : buildLeafSummaryPrompt({
+              text,
+              mode,
+              targetTokens,
+              previousSummary: options?.previousSummary,
+              customInstructions: params.customInstructions,
+            });
 
     let result: Awaited<ReturnType<typeof params.deps.complete>>;
     try {
@@ -997,7 +1061,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             content: prompt,
           },
         ],
-        maxTokens: targetTokens,
+        maxTokens: purpose === "beacon" ? Math.min(hardTokenCap, targetTokens) : targetTokens,
       }), SUMMARIZER_TIMEOUT_MS, "initial");
     } catch (err) {
       const authFailure = extractProviderAuthFailure(err);
@@ -1081,7 +1145,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               content: prompt,
             },
           ],
-          maxTokens: targetTokens,
+          maxTokens: purpose === "beacon" ? Math.min(hardTokenCap, targetTokens) : targetTokens,
           reasoning: "low",
         }), SUMMARIZER_TIMEOUT_MS, "retry");
         const retryAuthFailure = extractProviderAuthFailure(retryResult);

@@ -34,6 +34,29 @@ function ensureSummaryDepthColumn(db: DatabaseSync): void {
   }
 }
 
+function ensureConversationMetadataColumns(db: DatabaseSync): void {
+  const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
+    name?: string;
+  }>;
+  const hasBootstrappedAt = conversationColumns.some((col) => col.name === "bootstrapped_at");
+  const hasAgentScope = conversationColumns.some((col) => col.name === "agent_scope");
+  const hasProvider = conversationColumns.some((col) => col.name === "provider");
+  const hasSourceLabel = conversationColumns.some((col) => col.name === "source_label");
+
+  if (!hasBootstrappedAt) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
+  }
+  if (!hasAgentScope) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN agent_scope TEXT`);
+  }
+  if (!hasProvider) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN provider TEXT`);
+  }
+  if (!hasSourceLabel) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN source_label TEXT`);
+  }
+}
+
 function ensureSummaryMetadataColumns(db: DatabaseSync): void {
   const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
   const hasEarliestAt = summaryColumns.some((col) => col.name === "earliest_at");
@@ -436,6 +459,9 @@ export function runLcmMigrations(
       session_key TEXT,
       title TEXT,
       bootstrapped_at TEXT,
+      agent_scope TEXT,
+      provider TEXT,
+      source_label TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -554,6 +580,19 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS conversation_digests (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      agent_scope TEXT NOT NULL,
+      provider TEXT,
+      source_label TEXT,
+      digest_text TEXT NOT NULL DEFAULT '',
+      token_count INTEGER NOT NULL DEFAULT 0,
+      last_context_ord INTEGER NOT NULL DEFAULT 0,
+      earliest_at TEXT,
+      latest_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
@@ -563,17 +602,16 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
       ON conversation_bootstrap_state (session_file_path, updated_at);
+    CREATE INDEX IF NOT EXISTS conversation_digests_scope_latest_idx
+      ON conversation_digests (agent_scope, latest_at DESC);
   `);
 
   // Forward-compatible conversations migration for existing DBs.
+  ensureConversationMetadataColumns(db);
+
   const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
     name?: string;
   }>;
-  const hasBootstrappedAt = conversationColumns.some((col) => col.name === "bootstrapped_at");
-  if (!hasBootstrappedAt) {
-    db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
-  }
-
   const hasSessionKey = conversationColumns.some((col) => col.name === "session_key");
   if (!hasSessionKey) {
     db.exec(`ALTER TABLE conversations ADD COLUMN session_key TEXT`);

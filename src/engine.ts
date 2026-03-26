@@ -40,22 +40,60 @@ import { compileSessionPatterns, matchesSessionPattern } from "./session-pattern
 import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
   ConversationStore,
+  type ConversationDigestRecord,
   type CreateMessagePartInput,
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
-import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
+import {
+  createLcmSummarizeFromLegacyParams,
+  LcmProviderAuthError,
+  type LcmSummarizeOptions,
+} from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
+
+const BEACON_TARGET_TOKENS = 140;
+const BEACON_HARD_TOKEN_CAP = 180;
+const BEACON_SUMMARIZER_INSTRUCTIONS = [
+  "Produce an ambient relevance beacon for cross-session routing.",
+  "Lead with what this session IS ABOUT — its purpose and domain (e.g. 'Soulforge workflow engine development', 'Nexus analytics dashboard deployment').",
+  "Then add the most relevant recent context: latest direction change, key decision, or open blocker.",
+  "Keep it concise and discriminative, not a narrative retelling.",
+  "Aim for 120-160 tokens. Do not exceed ~180 tokens.",
+].join(" ");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Rough token estimate: ~4 chars per token. */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+function formatAmbientTimestamp(date: Date | null): string {
+  return date ? date.toISOString() : "unknown";
+}
+
+function escapeXmlAttr(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function formatAmbientBeaconBlock(digest: ConversationDigestRecord): string {
+  const provider = escapeXmlAttr(digest.provider ?? "unknown");
+  const sourceLabel = escapeXmlAttr(digest.sourceLabel ?? "unknown");
+  const latestAt = formatAmbientTimestamp(digest.latestAt);
+  return [
+    `<ambient_beacon provider="${provider}" source_label="${sourceLabel}" latest_at="${latestAt}">`,
+    digest.digestText,
+    "</ambient_beacon>",
+  ].join("\n");
 }
 
 function toJson(value: unknown): string {
@@ -718,6 +756,32 @@ function estimateSessionTokenCountForAfterTurn(messages: AgentMessage[]): number
   return total;
 }
 
+function truncateBeaconToTokenCap(text: string, tokenCap: number): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (estimateTokens(trimmed) <= tokenCap) {
+    return trimmed;
+  }
+
+  const maxChars = Math.max(1, tokenCap * 4);
+  return trimmed.slice(0, maxChars).trimEnd();
+}
+
+function formatDigestSourceItems(
+  items: Array<{ ordinal: number; itemType: "message" | "summary"; content: string; createdAt: Date }>,
+): string {
+  return items
+    .map((item) => {
+      const stamp = item.createdAt.toISOString();
+      const kind = item.itemType === "summary" ? "summary" : "message";
+      return `[ord:${item.ordinal}] [${kind}] [${stamp}]\n${item.content}`;
+    })
+    .join("\n\n");
+}
+
 function isBootstrapMessage(value: unknown): value is AgentMessage {
   if (!value || typeof value !== "object") {
     return false;
@@ -1222,11 +1286,18 @@ export class LcmContextEngine implements ContextEngine {
   private async resolveSummarize(params: {
     legacyParams?: Record<string, unknown>;
     customInstructions?: string;
-  }): Promise<{ summarize: (text: string, aggressive?: boolean) => Promise<string>; summaryModel: string }> {
+  }): Promise<{
+    summarize: (text: string, aggressive?: boolean, options?: LcmSummarizeOptions) => Promise<string>;
+    summaryModel: string;
+  }> {
     const lp = params.legacyParams ?? {};
     if (typeof lp.summarize === "function") {
       return {
-        summarize: lp.summarize as (text: string, aggressive?: boolean) => Promise<string>,
+        summarize: lp.summarize as (
+          text: string,
+          aggressive?: boolean,
+          options?: LcmSummarizeOptions,
+        ) => Promise<string>,
         summaryModel: "unknown",
       };
     }
@@ -1296,6 +1367,140 @@ export class LcmContextEngine implements ContextEngine {
     } catch {
       return undefined;
     }
+  }
+
+  private resolveBeaconMetadata(params: {
+    sessionId: string;
+    sessionKey?: string;
+    conversationAgentScope: string | null;
+    conversationProvider: string | null;
+    conversationSourceLabel: string | null;
+    legacyParams?: Record<string, unknown>;
+  }): { agentScope: string; provider: string | null; sourceLabel: string | null } {
+    const lp = params.legacyParams ?? {};
+    const parsed = this.deps.parseAgentSessionKey(params.sessionId);
+    const sessionKeyForParsing = params.sessionKey ?? safeString(lp.sessionKey);
+    const parsedFromKey = sessionKeyForParsing
+      ? this.deps.parseAgentSessionKey(sessionKeyForParsing)
+      : null;
+
+    const agentScope =
+      safeString(lp.agentScope) ??
+      safeString(lp.agent_scope) ??
+      safeString(lp.agentId) ??
+      safeString(lp.agent_id) ??
+      (parsedFromKey ? this.deps.normalizeAgentId(parsedFromKey.agentId) : null) ??
+      params.conversationAgentScope ??
+      (parsed ? this.deps.normalizeAgentId(parsed.agentId) : this.deps.normalizeAgentId(undefined));
+    const provider =
+      safeString(lp.provider) ??
+      safeString(lp.sessionProvider) ??
+      safeString(lp.session_provider) ??
+      params.conversationProvider ??
+      null;
+    const sourceLabel =
+      safeString(lp.sourceLabel) ??
+      safeString(lp.source_label) ??
+      safeString(lp.channelLabel) ??
+      safeString(lp.channel_label) ??
+      params.conversationSourceLabel ??
+      (parsedFromKey ? parsedFromKey.suffix : null) ??
+      (parsed ? parsed.suffix : null);
+
+    return {
+      agentScope: this.deps.normalizeAgentId(agentScope),
+      provider,
+      sourceLabel,
+    };
+  }
+
+  private async syncConversationMetadata(params: {
+    sessionId: string;
+    sessionKey?: string;
+    legacyParams?: Record<string, unknown>;
+  }): Promise<void> {
+    const existing = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    const metadata = this.resolveBeaconMetadata({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      conversationAgentScope: existing?.agentScope ?? null,
+      conversationProvider: existing?.provider ?? null,
+      conversationSourceLabel: existing?.sourceLabel ?? null,
+      legacyParams: params.legacyParams,
+    });
+    await this.conversationStore.getOrCreateConversation(
+      params.sessionId,
+      { sessionKey: params.sessionKey },
+      {
+        agentScope: metadata.agentScope,
+        provider: metadata.provider,
+        sourceLabel: metadata.sourceLabel,
+      },
+    );
+  }
+
+  private async updateDigest(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    legacyParams?: Record<string, unknown>;
+  }): Promise<void> {
+    const conversation = await this.conversationStore.getConversation(params.conversationId);
+    if (!conversation) {
+      return;
+    }
+
+    const metadata = this.resolveBeaconMetadata({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      conversationAgentScope: conversation.agentScope,
+      conversationProvider: conversation.provider,
+      conversationSourceLabel: conversation.sourceLabel,
+      legacyParams: params.legacyParams,
+    });
+    const existing = await this.conversationStore.getConversationDigest(params.conversationId);
+    const latestContextOrdinal = await this.summaryStore.getMaxContextOrdinal(params.conversationId);
+    const lastContextOrd =
+      existing && existing.lastContextOrd > latestContextOrdinal ? -1 : (existing?.lastContextOrd ?? -1);
+    const newItems = await this.summaryStore.getContextItemsSinceOrdinal(
+      params.conversationId,
+      lastContextOrd,
+    );
+    if (newItems.length === 0) {
+      return;
+    }
+
+    const { summarize } = await this.resolveSummarize({
+      legacyParams: params.legacyParams,
+      customInstructions: BEACON_SUMMARIZER_INSTRUCTIONS,
+    });
+    const digestInput = formatDigestSourceItems(newItems);
+    const digestText = truncateBeaconToTokenCap(
+      await summarize(digestInput, false, {
+        previousSummary: existing?.digestText,
+        purpose: "beacon",
+        targetTokens: BEACON_TARGET_TOKENS,
+        hardTokenCap: BEACON_HARD_TOKEN_CAP,
+      }),
+      BEACON_HARD_TOKEN_CAP,
+    );
+
+    const latestItem = newItems[newItems.length - 1];
+    const maxOrdinal = latestItem.ordinal;
+    await this.conversationStore.upsertConversationDigest({
+      conversationId: params.conversationId,
+      agentScope: metadata.agentScope,
+      provider: metadata.provider,
+      sourceLabel: metadata.sourceLabel,
+      digestText,
+      tokenCount: estimateTokens(digestText),
+      lastContextOrd: maxOrdinal,
+      earliestAt: existing?.earliestAt ?? newItems[0].createdAt,
+      latestAt: latestItem.createdAt,
+    });
   }
 
   /** Persist intercepted large-file text payloads to ~/.openclaw/lcm-files. */
@@ -2173,6 +2378,43 @@ export class LcmContextEngine implements ContextEngine {
     } catch {
       // Proactive compaction is best-effort in the post-turn lifecycle.
     }
+
+    if (this.config.crossSession.enabled === true) {
+      // Skip digest generation for subagent sessions — they're internal
+      // implementation details whose outcomes are captured by the parent
+      // session's beacon. Avoids noise in the ambient context budget.
+      const sessionKey = params.sessionKey ?? safeString(legacyParams?.sessionKey) ?? params.sessionId;
+      const isSubagent = this.deps.isSubagentSessionKey(sessionKey);
+
+      if (!isSubagent) {
+        try {
+          await this.syncConversationMetadata({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            legacyParams,
+          });
+        } catch {
+          // Metadata sync is best-effort in the post-turn lifecycle.
+        }
+
+        try {
+          const conversation = await this.conversationStore.getConversationForSession({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+          });
+          if (conversation) {
+            await this.updateDigest({
+              conversationId: conversation.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              legacyParams,
+            });
+          }
+        } catch {
+          // Digest refresh is best-effort in the post-turn lifecycle.
+        }
+      }
+    }
   }
 
   async assemble(params: {
@@ -2227,9 +2469,23 @@ export class LcmContextEngine implements ContextEngine {
           ? Math.floor(params.tokenBudget)
           : 128_000;
 
+      const ambientBudget =
+        this.config.crossSession.enabled === true
+          ? Math.max(
+              0,
+              Math.min(
+                Math.max(0, tokenBudget - 1),
+                Number.isFinite(this.config.crossSession.totalBudget)
+                  ? Math.floor(this.config.crossSession.totalBudget)
+                  : 0,
+              ),
+            )
+          : 0;
+      const sameSessionBudget = Math.max(0, tokenBudget - ambientBudget);
+
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,
-        tokenBudget,
+        tokenBudget: sameSessionBudget,
         freshTailCount: this.config.freshTailCount,
       });
 
@@ -2242,9 +2498,26 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
+      let outputMessages = assembled.messages;
+      let outputTokens = assembled.estimatedTokens;
+
+      if (ambientBudget > 0) {
+        const parsed = this.deps.parseAgentSessionKey(params.sessionId);
+        const agentScope = this.deps.normalizeAgentId(conversation.agentScope ?? parsed?.agentId);
+        const ambient = await this.assembleAmbientContext(
+          agentScope,
+          conversation.conversationId,
+          ambientBudget,
+        );
+        if (ambient.messages.length > 0) {
+          outputMessages = [...assembled.messages, ...ambient.messages];
+          outputTokens += ambient.estimatedTokens;
+        }
+      }
+
       const result: AssembleResultWithSystemPrompt = {
-        messages: assembled.messages,
-        estimatedTokens: assembled.estimatedTokens,
+        messages: outputMessages,
+        estimatedTokens: outputTokens,
         ...(assembled.systemPromptAddition
           ? { systemPromptAddition: assembled.systemPromptAddition }
           : {}),
@@ -2256,6 +2529,42 @@ export class LcmContextEngine implements ContextEngine {
         estimatedTokens: 0,
       };
     }
+  }
+
+  private async assembleAmbientContext(
+    agentScope: string,
+    excludeConversationId: number,
+    tokenBudget: number,
+  ): Promise<{ messages: AgentMessage[]; estimatedTokens: number }> {
+    if (tokenBudget <= 0) {
+      return { messages: [], estimatedTokens: 0 };
+    }
+
+    const candidates = await this.conversationStore.getConversationDigestsForAgentScope({
+      agentScope,
+      excludeConversationId,
+    });
+
+    const selected: AgentMessage[] = [];
+    let estimatedTokens = 0;
+
+    for (const digest of candidates) {
+      const block = formatAmbientBeaconBlock(digest);
+      const blockTokens = estimateTokens(block);
+      if (estimatedTokens + blockTokens > tokenBudget) {
+        continue;
+      }
+      estimatedTokens += blockTokens;
+      selected.push({
+        role: "user",
+        content: block,
+      } as AgentMessage);
+    }
+
+    return {
+      messages: selected,
+      estimatedTokens,
+    };
   }
 
   /** Evaluate whether incremental leaf compaction should run for a session. */

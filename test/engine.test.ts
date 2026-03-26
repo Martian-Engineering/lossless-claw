@@ -42,9 +42,15 @@ function createTestConfig(databasePath: string): LcmConfig {
     summaryModel: "",
     largeFileSummaryProvider: "",
     largeFileSummaryModel: "",
+    expansionProvider: "",
+    expansionModel: "",
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    crossSession: {
+      enabled: false,
+      totalBudget: 6000,
+    },
   };
 }
 
@@ -162,6 +168,20 @@ function createEngineWithDeps(
   };
   const db = createLcmDatabaseConnection(config.databasePath);
   return new LcmContextEngine(createTestDeps(config, depOverrides), db);
+}
+
+function createEngineWithDepsReturn(
+  overrides?: Partial<LcmConfig>,
+): { engine: LcmContextEngine; deps: LcmDependencies } {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = {
+    ...createTestConfig(join(tempDir, "lcm.db")),
+    ...(overrides ?? {}),
+  };
+  const db = createLcmDatabaseConnection(config.databasePath);
+  const deps = createTestDeps(config);
+  return { engine: new LcmContextEngine(deps, db), deps };
 }
 
 async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
@@ -2185,6 +2205,144 @@ describe("LcmContextEngine.assemble canonical path", () => {
     // Refusal-to-guess
     expect(promptAddition).toContain("Do not guess");
     expect(promptAddition).toContain("Expand first or state that you need to expand");
+  });
+
+  it("injects ambient beacons when cross-session is enabled", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 400,
+      },
+    });
+    const scopeA = "agent-a";
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-a:current",
+      sessionFile: createSessionFilePath("ambient-current"),
+      messages: [makeMessage({ role: "assistant", content: "current thread content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "slack", sourceLabel: "#current" },
+    });
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-a:recent-1",
+      sessionFile: createSessionFilePath("ambient-r1"),
+      messages: [makeMessage({ role: "assistant", content: "recent one content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "discord", sourceLabel: "#recent-1" },
+    });
+
+    const store = engine.getConversationStore();
+    const recent1 = await store.getConversationBySessionId("agent:agent-a:recent-1");
+    expect(recent1).not.toBeNull();
+
+    await store.upsertConversationDigest({
+      conversationId: recent1!.conversationId,
+      agentScope: scopeA,
+      provider: "discord",
+      sourceLabel: "#recent-1",
+      digestText: "recent-one beacon content",
+      tokenCount: 15,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-15T09:00:00.000Z"),
+      latestAt: new Date("2026-03-16T09:00:00.000Z"),
+    });
+
+    const result = await engine.assemble({
+      sessionId: "agent:agent-a:current",
+      messages: [],
+      tokenBudget: 2_000,
+    });
+
+    const ambient = result.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(ambient).toHaveLength(1);
+    expect(ambient[0]).toContain('provider="discord"');
+    expect(ambient[0]).toContain('source_label="#recent-1"');
+    expect(ambient[0]).toContain("recent-one beacon content");
+  });
+
+  it("excludes current session from ambient beacons", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 400,
+      },
+    });
+    const scopeA = "agent-b";
+
+    await engine.afterTurn({
+      sessionId: "agent:agent-b:current",
+      sessionFile: createSessionFilePath("ambient-current-b"),
+      messages: [makeMessage({ role: "assistant", content: "current thread content" })],
+      prePromptMessageCount: 0,
+      runtimeContext: { agentScope: scopeA, provider: "slack", sourceLabel: "#current" },
+    });
+
+    const store = engine.getConversationStore();
+    const current = await store.getConversationBySessionId("agent:agent-b:current");
+    expect(current).not.toBeNull();
+
+    await store.upsertConversationDigest({
+      conversationId: current!.conversationId,
+      agentScope: scopeA,
+      provider: "slack",
+      sourceLabel: "#current",
+      digestText: "current session beacon - should not appear",
+      tokenCount: 15,
+      lastContextOrd: 0,
+      earliestAt: new Date("2026-03-15T09:00:00.000Z"),
+      latestAt: new Date("2026-03-16T09:00:00.000Z"),
+    });
+
+    const result = await engine.assemble({
+      sessionId: "agent:agent-b:current",
+      messages: [],
+      tokenBudget: 2_000,
+    });
+
+    const ambient = result.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(ambient).toHaveLength(0);
+  });
+
+  it("keeps assembly unchanged when cross-session is disabled", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: false,
+        totalBudget: 400,
+      },
+    });
+    const sessionId = "ambient-disabled-budget";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "alpha" } as AgentMessage,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 600,
+    });
+
+    const ambient = result.messages
+      .filter(
+        (message: AgentMessage) => message.role === "user" && typeof message.content === "string",
+      )
+      .map((message: AgentMessage) => message.content as string)
+      .filter((content) => content.startsWith("<ambient_beacon "));
+
+    expect(ambient).toHaveLength(0);
   });
 });
 

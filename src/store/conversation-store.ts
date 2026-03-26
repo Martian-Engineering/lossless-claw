@@ -69,6 +69,15 @@ export type CreateConversationInput = {
   sessionId: string;
   sessionKey?: string;
   title?: string;
+  agentScope?: string | null;
+  provider?: string | null;
+  sourceLabel?: string | null;
+};
+
+export type UpdateConversationMetadataInput = {
+  agentScope?: string | null;
+  provider?: string | null;
+  sourceLabel?: string | null;
 };
 
 export type ConversationRecord = {
@@ -77,8 +86,36 @@ export type ConversationRecord = {
   sessionKey: string | null;
   title: string | null;
   bootstrappedAt: Date | null;
+  agentScope: string | null;
+  provider: string | null;
+  sourceLabel: string | null;
   createdAt: Date;
   updatedAt: Date;
+};
+
+export type ConversationDigestRecord = {
+  conversationId: ConversationId;
+  agentScope: string;
+  provider: string | null;
+  sourceLabel: string | null;
+  digestText: string;
+  tokenCount: number;
+  lastContextOrd: number;
+  earliestAt: Date | null;
+  latestAt: Date | null;
+  updatedAt: Date;
+};
+
+export type UpsertConversationDigestInput = {
+  conversationId: ConversationId;
+  agentScope: string;
+  provider?: string | null;
+  sourceLabel?: string | null;
+  digestText: string;
+  tokenCount: number;
+  lastContextOrd: number;
+  earliestAt?: Date | null;
+  latestAt?: Date | null;
 };
 
 export type MessageSearchInput = {
@@ -107,7 +144,23 @@ interface ConversationRow {
   session_key: string | null;
   title: string | null;
   bootstrapped_at: string | null;
+  agent_scope: string | null;
+  provider: string | null;
+  source_label: string | null;
   created_at: string;
+  updated_at: string;
+}
+
+interface ConversationDigestRow {
+  conversation_id: number;
+  agent_scope: string;
+  provider: string | null;
+  source_label: string | null;
+  digest_text: string;
+  token_count: number;
+  last_context_ord: number;
+  earliest_at: string | null;
+  latest_at: string | null;
   updated_at: string;
 }
 
@@ -161,7 +214,25 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
     sessionKey: row.session_key ?? null,
     title: row.title,
     bootstrappedAt: row.bootstrapped_at ? new Date(row.bootstrapped_at) : null,
+    agentScope: row.agent_scope,
+    provider: row.provider,
+    sourceLabel: row.source_label,
     createdAt: new Date(row.created_at),
+    updatedAt: new Date(row.updated_at),
+  };
+}
+
+function toConversationDigestRecord(row: ConversationDigestRow): ConversationDigestRecord {
+  return {
+    conversationId: row.conversation_id,
+    agentScope: row.agent_scope,
+    provider: row.provider,
+    sourceLabel: row.source_label,
+    digestText: row.digest_text,
+    tokenCount: row.token_count,
+    lastContextOrd: row.last_context_ord,
+    earliestAt: row.earliest_at ? new Date(row.earliest_at) : null,
+    latestAt: row.latest_at ? new Date(row.latest_at) : null,
     updatedAt: new Date(row.updated_at),
   };
 }
@@ -276,12 +347,23 @@ export class ConversationStore {
 
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
     const result = this.db
-      .prepare(`INSERT INTO conversations (session_id, session_key, title) VALUES (?, ?, ?)`)
-      .run(input.sessionId, input.sessionKey ?? null, input.title ?? null);
+      .prepare(
+        `INSERT INTO conversations (session_id, session_key, title, agent_scope, provider, source_label)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.sessionId,
+        input.sessionKey ?? null,
+        input.title ?? null,
+        input.agentScope ?? null,
+        input.provider ?? null,
+        input.sourceLabel ?? null,
+      );
 
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at,
+                agent_scope, provider, source_label, created_at, updated_at
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(Number(result.lastInsertRowid)) as unknown as ConversationRow;
@@ -292,7 +374,8 @@ export class ConversationStore {
   async getConversation(conversationId: ConversationId): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at,
+                agent_scope, provider, source_label, created_at, updated_at
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(conversationId) as unknown as ConversationRow | undefined;
@@ -303,7 +386,8 @@ export class ConversationStore {
   async getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at,
+                agent_scope, provider, source_label, created_at, updated_at
        FROM conversations
        WHERE session_id = ?
        ORDER BY created_at DESC
@@ -317,7 +401,8 @@ export class ConversationStore {
   async getConversationBySessionKey(sessionKey: string): Promise<ConversationRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, session_key, title, bootstrapped_at,
+                agent_scope, provider, source_label, created_at, updated_at
        FROM conversations
        WHERE session_key = ?
        LIMIT 1`,
@@ -351,6 +436,7 @@ export class ConversationStore {
   async getOrCreateConversation(
     sessionId: string,
     titleOrOpts?: string | { title?: string; sessionKey?: string },
+    metadata?: UpdateConversationMetadataInput,
   ): Promise<ConversationRecord> {
     const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
     if (opts.sessionKey) {
@@ -363,6 +449,11 @@ export class ConversationStore {
             )
             .run(sessionId, byKey.conversationId);
           byKey.sessionId = sessionId;
+        }
+        if (metadata && this.hasMetadataUpdates(metadata)) {
+          await this.updateConversationMetadata(byKey.conversationId, metadata);
+          const refreshed = await this.getConversation(byKey.conversationId);
+          return refreshed ?? byKey;
         }
         return byKey;
       }
@@ -378,10 +469,56 @@ export class ConversationStore {
           .run(opts.sessionKey, existing.conversationId);
         existing.sessionKey = opts.sessionKey;
       }
+      if (metadata && this.hasMetadataUpdates(metadata)) {
+        await this.updateConversationMetadata(existing.conversationId, metadata);
+        const refreshed = await this.getConversation(existing.conversationId);
+        return refreshed ?? existing;
+      }
       return existing;
     }
 
-    return this.createConversation({ sessionId, title: opts.title, sessionKey: opts.sessionKey });
+    return this.createConversation({
+      sessionId,
+      title: opts.title,
+      sessionKey: opts.sessionKey,
+      agentScope: metadata?.agentScope,
+      provider: metadata?.provider,
+      sourceLabel: metadata?.sourceLabel,
+    });
+  }
+
+  async updateConversationMetadata(
+    conversationId: ConversationId,
+    input: UpdateConversationMetadataInput,
+  ): Promise<void> {
+    const sets: string[] = [];
+    const args: Array<string | null | number> = [];
+
+    if (input.agentScope !== undefined) {
+      sets.push("agent_scope = ?");
+      args.push(input.agentScope ?? null);
+    }
+    if (input.provider !== undefined) {
+      sets.push("provider = ?");
+      args.push(input.provider ?? null);
+    }
+    if (input.sourceLabel !== undefined) {
+      sets.push("source_label = ?");
+      args.push(input.sourceLabel ?? null);
+    }
+
+    if (sets.length === 0) {
+      return;
+    }
+
+    sets.push("updated_at = datetime('now')");
+    this.db
+      .prepare(
+        `UPDATE conversations
+         SET ${sets.join(", ")}
+         WHERE conversation_id = ?`,
+      )
+      .run(...args, conversationId);
   }
 
   async markConversationBootstrapped(conversationId: ConversationId): Promise<void> {
@@ -393,6 +530,101 @@ export class ConversationStore {
        WHERE conversation_id = ?`,
       )
       .run(conversationId);
+  }
+
+  // ── Digest operations ──────────────────────────────────────────────────────
+
+  async getConversationDigest(
+    conversationId: ConversationId,
+  ): Promise<ConversationDigestRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT conversation_id, agent_scope, provider, source_label, digest_text,
+                token_count, last_context_ord, earliest_at, latest_at, updated_at
+       FROM conversation_digests
+       WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as ConversationDigestRow | undefined;
+    return row ? toConversationDigestRecord(row) : null;
+  }
+
+  async upsertConversationDigest(
+    input: UpsertConversationDigestInput,
+  ): Promise<ConversationDigestRecord> {
+    const earliestAt = input.earliestAt instanceof Date ? input.earliestAt.toISOString() : null;
+    const latestAt = input.latestAt instanceof Date ? input.latestAt.toISOString() : null;
+
+    this.db
+      .prepare(
+        `INSERT INTO conversation_digests (
+          conversation_id,
+          agent_scope,
+          provider,
+          source_label,
+          digest_text,
+          token_count,
+          last_context_ord,
+          earliest_at,
+          latest_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT (conversation_id) DO UPDATE SET
+          agent_scope = excluded.agent_scope,
+          provider = excluded.provider,
+          source_label = excluded.source_label,
+          digest_text = excluded.digest_text,
+          token_count = excluded.token_count,
+          last_context_ord = excluded.last_context_ord,
+          earliest_at = excluded.earliest_at,
+          latest_at = excluded.latest_at,
+          updated_at = datetime('now')`,
+      )
+      .run(
+        input.conversationId,
+        input.agentScope,
+        input.provider ?? null,
+        input.sourceLabel ?? null,
+        input.digestText,
+        Math.max(0, Math.floor(input.tokenCount)),
+        Math.max(0, Math.floor(input.lastContextOrd)),
+        earliestAt,
+        latestAt,
+      );
+
+    const row = this.db
+      .prepare(
+        `SELECT conversation_id, agent_scope, provider, source_label, digest_text,
+                token_count, last_context_ord, earliest_at, latest_at, updated_at
+       FROM conversation_digests
+       WHERE conversation_id = ?`,
+      )
+      .get(input.conversationId) as unknown as ConversationDigestRow;
+
+    return toConversationDigestRecord(row);
+  }
+
+  async getConversationDigestsForAgentScope(params: {
+    agentScope: string;
+    excludeConversationId: ConversationId;
+  }): Promise<ConversationDigestRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT conversation_id, agent_scope, provider, source_label, digest_text,
+                token_count, last_context_ord, earliest_at, latest_at, updated_at
+       FROM conversation_digests
+       WHERE agent_scope = ? AND conversation_id != ?
+       ORDER BY latest_at DESC, updated_at DESC`,
+      )
+      .all(params.agentScope, params.excludeConversationId) as unknown as ConversationDigestRow[];
+    return rows.map(toConversationDigestRecord);
+  }
+
+  private hasMetadataUpdates(input: UpdateConversationMetadataInput): boolean {
+    return (
+      input.agentScope !== undefined ||
+      input.provider !== undefined ||
+      input.sourceLabel !== undefined
+    );
   }
 
   // ── Message operations ────────────────────────────────────────────────────

@@ -29,10 +29,6 @@ export type LcmConfig = {
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
   largeFileSummaryModel: string;
-  /** Model override for conversation summarization. */
-  summaryModel: string;
-  /** Provider override for conversation summarization. */
-  summaryProvider: string;
   /** Provider override for lcm_expand_query sub-agent. */
   expansionProvider: string;
   /** Model override for lcm_expand_query sub-agent. */
@@ -42,6 +38,13 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+  /** Cross-session ambient beacon configuration. */
+  crossSession: {
+    /** When true, ambient beacons are generated and assembled from other sessions. */
+    enabled: boolean;
+    /** Total token budget for ambient context from other sessions. */
+    totalBudget: number;
+  };
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -185,5 +188,17 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+    crossSession: {
+      enabled:
+        env.LCM_CROSS_SESSION_ENABLED !== undefined
+          ? env.LCM_CROSS_SESSION_ENABLED === "true"
+          : toBool((pc.crossSession as Record<string, unknown> | undefined)?.enabled) ?? false,
+      totalBudget:
+        (env.LCM_CROSS_SESSION_TOTAL_BUDGET !== undefined
+          ? parseInt(env.LCM_CROSS_SESSION_TOTAL_BUDGET, 10)
+          : undefined) ??
+        toNumber((pc.crossSession as Record<string, unknown> | undefined)?.totalBudget) ??
+        6000,
+    },
   };
 }
