@@ -111,6 +111,9 @@
       },
       "expansionProvider": {
         "type": "string"
+      },
+      "pruneHeartbeatOk": {
+        "type": "boolean"
       }
     }
   }
