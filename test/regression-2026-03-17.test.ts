@@ -57,6 +57,57 @@ describe("Session key continuity", () => {
     expect(conv1.conversationId).not.toBe(conv2.conversationId);
   });
 
+  it("resolves the active conversation when archived rows share the same sessionKey", async () => {
+    const db = createTestDb();
+    const { convStore } = createStores(db);
+
+    const archived = await convStore.createConversation({
+      sessionId: "uuid-archived",
+      sessionKey: "agent:main:main",
+    });
+    db.prepare(
+      `UPDATE conversations
+       SET active = 0,
+           archived_at = datetime('now'),
+           updated_at = datetime('now')
+       WHERE conversation_id = ?`,
+    ).run(archived.conversationId);
+
+    const active = await convStore.createConversation({
+      sessionId: "uuid-active",
+      sessionKey: "agent:main:main",
+    });
+
+    const byKey = await convStore.getConversationBySessionKey("agent:main:main");
+    expect(byKey?.conversationId).toBe(active.conversationId);
+    expect(byKey?.active).toBe(true);
+  });
+
+  it("creates a fresh active conversation instead of reusing an archived row", async () => {
+    const db = createTestDb();
+    const { convStore } = createStores(db);
+
+    const archived = await convStore.createConversation({
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+    });
+    db.prepare(
+      `UPDATE conversations
+       SET active = 0,
+           archived_at = datetime('now'),
+           updated_at = datetime('now')
+       WHERE conversation_id = ?`,
+    ).run(archived.conversationId);
+
+    const fresh = await convStore.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+
+    expect(fresh.conversationId).not.toBe(archived.conversationId);
+    expect(fresh.active).toBe(true);
+    expect(fresh.archivedAt).toBeNull();
+  });
+
   it("backfills sessionKey when found by sessionId", async () => {
     const db = createTestDb();
     const { convStore } = createStores(db);

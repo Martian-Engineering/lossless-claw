@@ -17,6 +17,10 @@
       "label": "Leaf Chunk Tokens",
       "help": "Maximum source tokens per leaf compaction chunk before summarization"
     },
+    "newSessionRetainDepth": {
+      "label": "New Session Retain Depth",
+      "help": "Summary depth retained after /new (-1 keeps all summaries, 2 keeps d2+)"
+    },
     "dbPath": {
       "label": "Database Path",
       "help": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
@@ -89,6 +93,10 @@
       "leafChunkTokens": {
         "type": "integer",
         "minimum": 1
+      },
+      "newSessionRetainDepth": {
+        "type": "integer",
+        "minimum": -1
       },
       "leafMinFanout": {
         "type": "integer",

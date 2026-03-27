@@ -31,6 +31,7 @@ function createTestConfig(databasePath: string): LcmConfig {
     skipStatelessSessions: true,
     contextThreshold: 0.75,
     freshTailCount: 8,
+    newSessionRetainDepth: 2,
     leafMinFanout: 8,
     condensedMinFanout: 4,
     condensedMinFanoutHard: 2,

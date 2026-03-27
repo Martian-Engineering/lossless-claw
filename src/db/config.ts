@@ -12,6 +12,7 @@ export type LcmConfig = {
   skipStatelessSessions: boolean;
   contextThreshold: number;
   freshTailCount: number;
+  newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
   condensedMinFanoutHard: number;
@@ -147,6 +148,17 @@ export function resolveLcmConfig(
     freshTailCount:
       (env.LCM_FRESH_TAIL_COUNT !== undefined ? parseInt(env.LCM_FRESH_TAIL_COUNT, 10) : undefined)
         ?? toNumber(pc.freshTailCount) ?? 64,
+    newSessionRetainDepth:
+      (env.LCM_NEW_SESSION_RETAIN_DEPTH !== undefined
+        ? parseInt(env.LCM_NEW_SESSION_RETAIN_DEPTH, 10)
+        : undefined)
+        ?? toNumber(pc.newSessionRetainDepth) ?? 2,
+        ?? toNumber(pc.freshTailCount) ?? 64,
+    newSessionRetainDepth:
+      (env.LCM_NEW_SESSION_RETAIN_DEPTH !== undefined
+        ? parseInt(env.LCM_NEW_SESSION_RETAIN_DEPTH, 10)
+        : undefined)
+        ?? toNumber(pc.newSessionRetainDepth) ?? 2,
     leafMinFanout:
       (env.LCM_LEAF_MIN_FANOUT !== undefined ? parseInt(env.LCM_LEAF_MIN_FANOUT, 10) : undefined)
         ?? toNumber(pc.leafMinFanout) ?? 8,

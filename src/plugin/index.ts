@@ -1523,6 +1523,13 @@ const lcmPlugin = {
     const database = createLcmDatabaseConnection(deps.config.databasePath);
     const lcm = new LcmContextEngine(deps, database);
 
+    api.on("before_reset", async (event, ctx) => {
+      await lcm.handleBeforeReset({
+        reason: event.reason,
+        sessionId: ctx.sessionId,
+        sessionKey: ctx.sessionKey,
+      });
+    });
     api.registerContextEngine("lossless-claw", () => lcm);
     api.registerContextEngine("default", () => lcm);
     api.registerTool((ctx) =>

@@ -434,6 +434,8 @@ export function runLcmMigrations(
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
       session_key TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      archived_at TEXT,
       title TEXT,
       bootstrapped_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -579,7 +581,27 @@ export function runLcmMigrations(
     db.exec(`ALTER TABLE conversations ADD COLUMN session_key TEXT`);
   }
 
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS conversations_session_key_idx ON conversations (session_key)`);
+  const hasActive = conversationColumns.some((col) => col.name === "active");
+  if (!hasActive) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN active INTEGER NOT NULL DEFAULT 1`);
+  }
+
+  const hasArchivedAt = conversationColumns.some((col) => col.name === "archived_at");
+  if (!hasArchivedAt) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN archived_at TEXT`);
+  }
+
+  db.exec(`UPDATE conversations SET active = 1 WHERE active IS NULL`);
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS conversations_active_session_key_idx
+    ON conversations (session_key)
+    WHERE session_key IS NOT NULL AND active = 1
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS conversations_session_key_active_created_idx
+    ON conversations (session_key, active, created_at)
+  `);
+  db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
   ensureSummaryDepthColumn(db);
   ensureSummaryMetadataColumns(db);
   ensureSummaryModelColumn(db);

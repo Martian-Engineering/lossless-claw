@@ -1153,9 +1153,10 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /** Prefer stable session keys for queue serialization when available. */
-  private resolveSessionQueueKey(sessionId: string, sessionKey?: string): string {
+  private resolveSessionQueueKey(sessionId?: string, sessionKey?: string): string {
     const normalizedSessionKey = sessionKey?.trim();
-    return normalizedSessionKey || sessionId;
+    const normalizedSessionId = sessionId?.trim();
+    return normalizedSessionKey || normalizedSessionId || "__lcm__";
   }
 
   /** Normalize optional live token estimates supplied by runtime callers. */
@@ -2679,6 +2680,90 @@ export class LcmContextEngine implements ContextEngine {
     // registers a single engine instance reused by the factory. Closing
     // the DB here would break subsequent runs with "database is not open".
     // The shared connection is managed for the lifetime of the plugin process.
+  }
+
+  /** Apply LCM lifecycle semantics for OpenClaw's /new and /reset commands. */
+  async handleBeforeReset(params: {
+    reason?: string;
+    sessionId?: string;
+    sessionKey?: string;
+  }): Promise<void> {
+    const reason = params.reason?.trim();
+    if (reason !== "new" && reason !== "reset") {
+      return;
+    }
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      return;
+    }
+    if (this.isStatelessSession(params.sessionKey)) {
+      return;
+    }
+
+    this.ensureMigrated();
+    await this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () =>
+        this.conversationStore.withTransaction(async () => {
+          if (reason === "new") {
+            const conversation = await this.conversationStore.getConversationForSession({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+            });
+            if (!conversation) {
+              return;
+            }
+
+            const retainDepth =
+              typeof this.config.newSessionRetainDepth === "number"
+              && Number.isFinite(this.config.newSessionRetainDepth)
+                ? this.config.newSessionRetainDepth
+                : 2;
+            await this.summaryStore.pruneForNewSession(conversation.conversationId, retainDepth);
+            this.deps.log.info(
+              `[lcm] /new pruned conversation ${conversation.conversationId} to retain depth ${retainDepth}`,
+            );
+            return;
+          }
+
+          const current = await this.conversationStore.getConversationForSession({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+          });
+          if (current?.active) {
+            const currentMessageCount = await this.conversationStore.getMessageCount(
+              current.conversationId,
+            );
+            const currentContextItems = await this.summaryStore.getContextItems(
+              current.conversationId,
+            );
+            if (
+              currentMessageCount === 0
+              && currentContextItems.length === 0
+              && !current.bootstrappedAt
+            ) {
+              this.deps.log.info(
+                `[lcm] /reset no-op for already fresh conversation ${current.conversationId}`,
+              );
+              return;
+            }
+            await this.conversationStore.archiveConversation(current.conversationId);
+          }
+
+          const nextSessionId = params.sessionId?.trim() || current?.sessionId;
+          if (!nextSessionId) {
+            this.deps.log.warn("[lcm] /reset skipped: no session identity available");
+            return;
+          }
+
+          const freshConversation = await this.conversationStore.createConversation({
+            sessionId: nextSessionId,
+            sessionKey: params.sessionKey?.trim(),
+          });
+          this.deps.log.info(
+            `[lcm] /reset archived prior conversation and created ${freshConversation.conversationId}`,
+          );
+        }),
+    );
   }
 
   // ── Public accessors for retrieval (used by subagent expansion) ─────────

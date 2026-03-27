@@ -687,6 +687,45 @@ export class SummaryStore {
     return rows.map((row) => row.depth);
   }
 
+  async pruneForNewSession(conversationId: number, retainDepth: number): Promise<void> {
+    this.db
+      .prepare(
+        `DELETE FROM context_items
+       WHERE conversation_id = ?
+         AND item_type = 'message'`,
+      )
+      .run(conversationId);
+
+    if (!Number.isFinite(retainDepth)) {
+      this.db
+        .prepare(
+          `DELETE FROM context_items
+         WHERE conversation_id = ?
+           AND item_type = 'summary'`,
+        )
+        .run(conversationId);
+      return;
+    }
+
+    if (retainDepth < 0) {
+      return;
+    }
+
+    this.db
+      .prepare(
+        `DELETE FROM context_items
+       WHERE conversation_id = ?
+         AND item_type = 'summary'
+         AND summary_id IN (
+           SELECT summary_id
+           FROM summaries
+           WHERE conversation_id = ?
+             AND depth < ?
+         )`,
+      )
+      .run(conversationId, conversationId, Math.floor(retainDepth));
+  }
+
   async appendContextMessage(conversationId: number, messageId: number): Promise<void> {
     const row = this.db
       .prepare(

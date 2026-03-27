@@ -29,6 +29,7 @@ function createTestConfig(databasePath: string): LcmConfig {
     skipStatelessSessions: true,
     contextThreshold: 0.75,
     freshTailCount: 8,
+    newSessionRetainDepth: 2,
     leafMinFanout: 8,
     condensedMinFanout: 4,
     condensedMinFanoutHard: 2,
@@ -777,6 +778,197 @@ describe("ConversationStore session reuse", () => {
 
     const refreshed = await store.getConversation(conv1.conversationId);
     expect(refreshed?.sessionId).toBe("uuid-2");
+  });
+});
+
+describe("LcmContextEngine before_reset lifecycle", () => {
+  it("prunes fresh-tail messages and low-depth summaries on /new", async () => {
+    const engine = createEngineWithConfig({ newSessionRetainDepth: 2 });
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const conversationStore = engine.getConversationStore();
+    const summaryStore = engine.getSummaryStore();
+
+    const conversation = await conversationStore.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+
+    const firstMessage = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "first",
+      tokenCount: 5,
+    });
+    const secondMessage = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 2,
+      role: "assistant",
+      content: "second",
+      tokenCount: 5,
+    });
+    await summaryStore.appendContextMessages(conversation.conversationId, [
+      firstMessage.messageId,
+      secondMessage.messageId,
+    ]);
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_d0",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "leaf",
+      tokenCount: 10,
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_d1",
+      conversationId: conversation.conversationId,
+      kind: "condensed",
+      depth: 1,
+      content: "session arc",
+      tokenCount: 10,
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_d2",
+      conversationId: conversation.conversationId,
+      kind: "condensed",
+      depth: 2,
+      content: "project arc",
+      tokenCount: 10,
+    });
+    await summaryStore.appendContextSummary(conversation.conversationId, "sum_d0");
+    await summaryStore.appendContextSummary(conversation.conversationId, "sum_d1");
+    await summaryStore.appendContextSummary(conversation.conversationId, "sum_d2");
+
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: "uuid-2",
+      sessionKey: "agent:main:main",
+    });
+
+    const remainingItems = await summaryStore.getContextItems(conversation.conversationId);
+    expect(remainingItems).toHaveLength(1);
+    expect(remainingItems[0]?.summaryId).toBe("sum_d2");
+  });
+
+  it("keeps summaries but drops fresh-tail messages on /new when retain depth is -1", async () => {
+    const engine = createEngineWithConfig({ newSessionRetainDepth: -1 });
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const conversationStore = engine.getConversationStore();
+    const summaryStore = engine.getSummaryStore();
+
+    const conversation = await conversationStore.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+    const message = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "first",
+      tokenCount: 5,
+    });
+    await summaryStore.appendContextMessage(conversation.conversationId, message.messageId);
+    await summaryStore.insertSummary({
+      summaryId: "sum_keep",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "keep me",
+      tokenCount: 10,
+    });
+    await summaryStore.appendContextSummary(conversation.conversationId, "sum_keep");
+
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: "uuid-2",
+      sessionKey: "agent:main:main",
+    });
+
+    const remainingItems = await summaryStore.getContextItems(conversation.conversationId);
+    expect(remainingItems).toHaveLength(1);
+    expect(remainingItems[0]?.summaryId).toBe("sum_keep");
+  });
+
+  it("archives the prior active conversation and creates a fresh active row on /reset", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const original = await store.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+    await store.createMessage({
+      conversationId: original.conversationId,
+      seq: 1,
+      role: "user",
+      content: "seed",
+      tokenCount: 5,
+    });
+
+    await engine.handleBeforeReset({
+      reason: "reset",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+    });
+
+    const active = await store.getConversationBySessionKey("agent:main:main");
+    const archived = await store.getConversation(original.conversationId);
+
+    expect(active).not.toBeNull();
+    expect(active?.conversationId).not.toBe(original.conversationId);
+    expect(active?.active).toBe(true);
+    expect(archived?.active).toBe(false);
+    expect(archived?.archivedAt).not.toBeNull();
+  });
+
+  it("creates a fresh active conversation on /reset when none exists yet", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    await engine.handleBeforeReset({
+      reason: "reset",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+    });
+
+    const active = await store.getConversationBySessionKey("agent:main:main");
+    expect(active).not.toBeNull();
+    expect(active?.active).toBe(true);
+    expect(active?.sessionId).toBe("uuid-1");
+  });
+
+  it("treats repeated /reset on an already fresh conversation as a no-op", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const original = await store.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+    await store.createMessage({
+      conversationId: original.conversationId,
+      seq: 1,
+      role: "user",
+      content: "seed",
+      tokenCount: 5,
+    });
+
+    await engine.handleBeforeReset({
+      reason: "reset",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+    });
+    const firstFresh = await store.getConversationBySessionKey("agent:main:main");
+
+    await engine.handleBeforeReset({
+      reason: "reset",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+    });
+    const secondFresh = await store.getConversationBySessionKey("agent:main:main");
+
+    expect(firstFresh?.conversationId).not.toBe(original.conversationId);
+    expect(secondFresh?.conversationId).toBe(firstFresh?.conversationId);
   });
 });
 

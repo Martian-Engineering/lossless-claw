@@ -34,6 +34,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       skipStatelessSessions: true,
       contextThreshold: 0.75,
       freshTailCount: 8,
+      newSessionRetainDepth: 2,
       leafMinFanout: 8,
       condensedMinFanout: 4,
       condensedMinFanoutHard: 2,
