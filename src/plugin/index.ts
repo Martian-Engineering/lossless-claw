@@ -1481,22 +1481,23 @@ const lcmPlugin = {
   },
 
   register(api: OpenClawPluginApi) {
-    // Singleton: OC may call register() multiple times (once per channel/agent).
+    // Singleton: OC calls register() multiple times (once per channel/agent combo).
     // Reuse the existing engine to avoid duplicate embedding queues and DB connections.
-    // WeakMap keyed on api so tests with fresh api objects get fresh engines.
-    const cacheMap = ((globalThis as any).__lcm_singleton_map__ ??= new WeakMap()) as WeakMap<
-      object,
-      { deps: ReturnType<typeof createLcmDependencies>; lcm: LcmContextEngine }
-    >;
-    let cached = cacheMap.get(api);
-    if (!cached) {
-      const deps = createLcmDependencies(api);
-      const database = createLcmDatabaseConnection(deps.config.databasePath);
-      const lcm = new LcmContextEngine(deps, database);
-      cached = { deps, lcm };
-      cacheMap.set(api, cached);
+    // Global string key for production (OC passes different api objects each call).
+    // Export __lcm_reset_singleton__ for test cleanup so each test gets a fresh engine.
+    const G = globalThis as any;
+    let deps = G.__lcm_deps__ as ReturnType<typeof createLcmDependencies> | undefined;
+    let lcm = G.__lcm_engine__ as LcmContextEngine | undefined;
+    if (!lcm) {
+      deps = createLcmDependencies(api);
+      const database = deps.config.backend === 'postgres'
+        ? undefined
+        : createLcmDatabaseConnection(deps.config.databasePath);
+      lcm = new LcmContextEngine(deps, database);
+      G.__lcm_deps__ = deps;
+      G.__lcm_engine__ = lcm;
     }
-    const { deps, lcm } = cached;
+    deps = deps ?? G.__lcm_deps__;
 
     api.on("before_reset", async (event, ctx) => {
       await lcm.handleBeforeReset({
@@ -1555,3 +1556,10 @@ const lcmPlugin = {
 };
 
 export default lcmPlugin;
+
+/** Reset the singleton cache — for test isolation only. */
+export function __lcm_reset_singleton__() {
+  const G = globalThis as any;
+  delete G.__lcm_deps__;
+  delete G.__lcm_engine__;
+}

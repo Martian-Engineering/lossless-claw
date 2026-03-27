@@ -280,4 +280,42 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.expansionModel).toEqual({ type: "string" });
     expect(manifest.configSchema.properties.expansionProvider).toEqual({ type: "string" });
   });
+
+  it("reads instance identity from env vars", () => {
+    const config = resolveLcmConfig({
+      LCM_INSTANCE_ID: "opus",
+      LCM_INSTANCE_DISPLAY_NAME: "Rivet Opus",
+      LCM_INSTANCE_ROLE: "reasoning",
+    } as NodeJS.ProcessEnv, {});
+    expect(config.instanceId).toBe("opus");
+    expect(config.instanceDisplayName).toBe("Rivet Opus");
+    expect(config.instanceRole).toBe("reasoning");
+  });
+
+  it("reads instance identity from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      instanceId: "grok",
+      instanceDisplayName: "Rivet Grok",
+      instanceRole: "fast",
+    });
+    expect(config.instanceId).toBe("grok");
+    expect(config.instanceDisplayName).toBe("Rivet Grok");
+    expect(config.instanceRole).toBe("fast");
+  });
+
+  it("defaults instance identity to empty strings", () => {
+    const config = resolveLcmConfig({}, {});
+    expect(config.instanceId).toBe("");
+    expect(config.instanceDisplayName).toBe("");
+    expect(config.instanceRole).toBe("");
+  });
+
+  it("env instance identity overrides plugin config", () => {
+    const config = resolveLcmConfig({
+      LCM_INSTANCE_ID: "opus",
+    } as NodeJS.ProcessEnv, {
+      instanceId: "grok",
+    });
+    expect(config.instanceId).toBe("opus");
+  });
 });
