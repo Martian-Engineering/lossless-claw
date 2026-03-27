@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { getLcmDbFeatures } from "./features.js";
+import type { DbClient } from "./db-interface.js";
 
 type SummaryColumnInfo = {
   name?: string;
@@ -427,7 +428,7 @@ function backfillToolCallColumns(db: DatabaseSync): void {
 
 export function runLcmMigrations(
   db: DatabaseSync,
-  options?: { fts5Available?: boolean },
+  options?: { fullTextAvailable?: boolean; fts5Available?: boolean },
 ): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
@@ -609,8 +610,11 @@ export function runLcmMigrations(
   backfillSummaryMetadata(db);
   backfillToolCallColumns(db);
 
-  const fts5Available = options?.fts5Available ?? getLcmDbFeatures(db).fts5Available;
-  if (!fts5Available) {
+  // Accept both fullTextAvailable (our naming) and fts5Available (upstream compat)
+  const fullTextAvailable = options?.fullTextAvailable ?? options?.fts5Available ?? getLcmDbFeatures(
+    'sqlite', db
+  ).fullTextAvailable;
+  if (!fullTextAvailable) {
     return;
   }
 
@@ -672,3 +676,266 @@ export function runLcmMigrations(
     `);
   }
 }
+
+// ── PostgreSQL schema creation ────────────────────────────────────────────────
+
+/**
+ * Ensure PostgreSQL schema exists. Called once on first bootstrap/ingest.
+ *
+ * Uses IF NOT EXISTS throughout so it's safe to call repeatedly.
+ * Does NOT migrate existing tables — just creates them if absent.
+ */
+export async function ensurePostgresSchema(db: DbClient): Promise<void> {
+  // Check if schema already exists (fast path)
+  const probe = await db.queryOne<{ exists: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'conversations') AS exists`,
+  );
+  if (probe?.exists) {
+    // Schema exists — run forward-compatible migrations for new columns
+    await migratePostgresSchema(db);
+    return;
+  }
+
+  // Create all tables
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      conversation_id SERIAL PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      session_key TEXT,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      archived_at TIMESTAMPTZ,
+      agent_id TEXT,
+      title TEXT,
+      bootstrapped_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      message_id SERIAL PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      seq INTEGER NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+      content TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english'::regconfig, content)) STORED,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (conversation_id, seq)
+    );
+
+    CREATE TABLE IF NOT EXISTS summaries (
+      summary_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
+      depth INTEGER NOT NULL DEFAULT 0,
+      content TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      file_ids TEXT NOT NULL DEFAULT '[]',
+      content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english'::regconfig, content)) STORED,
+      earliest_at TIMESTAMPTZ,
+      latest_at TIMESTAMPTZ,
+      descendant_count INTEGER NOT NULL DEFAULT 0,
+      descendant_token_count INTEGER NOT NULL DEFAULT 0,
+      source_message_token_count INTEGER NOT NULL DEFAULT 0,
+      model TEXT NOT NULL DEFAULT 'unknown',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS message_parts (
+      part_id TEXT PRIMARY KEY,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      part_type TEXT NOT NULL CHECK (part_type IN (
+        'text', 'reasoning', 'tool', 'patch', 'file',
+        'subtask', 'compaction', 'step_start', 'step_finish',
+        'snapshot', 'agent', 'retry'
+      )),
+      ordinal INTEGER NOT NULL,
+      text_content TEXT,
+      is_ignored INTEGER,
+      is_synthetic INTEGER,
+      tool_call_id TEXT,
+      tool_name TEXT,
+      tool_status TEXT,
+      tool_input TEXT,
+      tool_output TEXT,
+      tool_error TEXT,
+      tool_title TEXT,
+      patch_hash TEXT,
+      patch_files TEXT,
+      file_mime TEXT,
+      file_name TEXT,
+      file_url TEXT,
+      subtask_prompt TEXT,
+      subtask_desc TEXT,
+      subtask_agent TEXT,
+      step_reason TEXT,
+      step_cost REAL,
+      step_tokens_in INTEGER,
+      step_tokens_out INTEGER,
+      snapshot_hash TEXT,
+      compaction_auto INTEGER,
+      metadata JSONB,
+      UNIQUE (message_id, ordinal)
+    );
+
+    CREATE TABLE IF NOT EXISTS summary_messages (
+      summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE RESTRICT,
+      ordinal INTEGER NOT NULL,
+      PRIMARY KEY (summary_id, message_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS summary_parents (
+      summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+      parent_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+      ordinal INTEGER NOT NULL,
+      PRIMARY KEY (summary_id, parent_summary_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS context_items (
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL,
+      item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary')),
+      message_id INTEGER REFERENCES messages(message_id) ON DELETE RESTRICT,
+      summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (conversation_id, ordinal),
+      CHECK (
+        (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL) OR
+        (item_type = 'summary' AND summary_id IS NOT NULL AND message_id IS NULL)
+      )
+    );
+
+    CREATE TABLE IF NOT EXISTS large_files (
+      file_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      file_name TEXT,
+      mime_type TEXT,
+      byte_size INTEGER,
+      storage_uri TEXT NOT NULL,
+      exploration_summary TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- Indexes
+    CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations (session_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS conversations_active_session_key_idx ON conversations (session_key) WHERE session_key IS NOT NULL AND active = TRUE;
+    CREATE INDEX IF NOT EXISTS conversations_session_key_active_created_idx ON conversations (session_key, active, created_at);
+    CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages (conversation_id, seq);
+    CREATE INDEX IF NOT EXISTS idx_messages_tsv ON messages USING GIN (content_tsv);
+    CREATE INDEX IF NOT EXISTS idx_summaries_conv_created ON summaries (conversation_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_summaries_tsv ON summaries USING GIN (content_tsv);
+    CREATE INDEX IF NOT EXISTS idx_message_parts_message ON message_parts (message_id);
+    CREATE INDEX IF NOT EXISTS idx_message_parts_type ON message_parts (part_type);
+    CREATE INDEX IF NOT EXISTS idx_context_items_conv ON context_items (conversation_id, ordinal);
+    CREATE INDEX IF NOT EXISTS idx_large_files_conv ON large_files (conversation_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS conversation_bootstrap_state (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      session_file_path TEXT NOT NULL,
+      last_seen_size INTEGER NOT NULL,
+      last_seen_mtime_ms BIGINT NOT NULL,
+      last_processed_offset INTEGER NOT NULL,
+      last_processed_entry_hash TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_bootstrap_state_path
+      ON conversation_bootstrap_state (session_file_path, updated_at);
+  `);
+
+}
+
+/**
+ * Forward-compatible migrations for existing Postgres schemas.
+ * Adds new columns that may not exist on older installs.
+ */
+async function migratePostgresSchema(db: DbClient): Promise<void> {
+  // Add session_key to conversations if missing
+  const hasSessionKey = await db.queryOne<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'conversations' AND column_name = 'session_key'
+     ) AS exists`,
+  );
+  if (!hasSessionKey?.exists) {
+    await db.run(`ALTER TABLE conversations ADD COLUMN session_key TEXT`);
+  }
+
+  // Add active/archived_at to conversations if missing
+  const hasActive = await db.queryOne<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'conversations' AND column_name = 'active'
+     ) AS exists`,
+  );
+  if (!hasActive?.exists) {
+    await db.run(`ALTER TABLE conversations ADD COLUMN active BOOLEAN NOT NULL DEFAULT TRUE`);
+    await db.run(`ALTER TABLE conversations ADD COLUMN archived_at TIMESTAMPTZ`);
+    await db.run(`UPDATE conversations SET active = TRUE WHERE active IS NULL`);
+  }
+
+  // Replace old global session_key uniqueness with active-row uniqueness
+  await db.run(`DROP INDEX IF EXISTS conversations_session_key_idx`);
+  await db.run(`CREATE UNIQUE INDEX IF NOT EXISTS conversations_active_session_key_idx ON conversations (session_key) WHERE session_key IS NOT NULL AND active = TRUE`);
+  await db.run(`CREATE INDEX IF NOT EXISTS conversations_session_key_active_created_idx ON conversations (session_key, active, created_at)`);
+
+  // Add agent_id to conversations if missing
+  const hasAgentId = await db.queryOne<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'conversations' AND column_name = 'agent_id'
+     ) AS exists`,
+  );
+  if (!hasAgentId?.exists) {
+    await db.run(`ALTER TABLE conversations ADD COLUMN agent_id TEXT`);
+  }
+
+  // Add metadata columns to summaries if missing
+  const hasDescendantTokenCount = await db.queryOne<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'summaries' AND column_name = 'descendant_token_count'
+     ) AS exists`,
+  );
+  if (!hasDescendantTokenCount?.exists) {
+    await db.run(`ALTER TABLE summaries ADD COLUMN descendant_token_count INTEGER NOT NULL DEFAULT 0`);
+    await db.run(`ALTER TABLE summaries ADD COLUMN source_message_token_count INTEGER NOT NULL DEFAULT 0`);
+  }
+
+  // Add conversation_bootstrap_state table if missing
+  const hasBootstrapState = await db.queryOne<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.tables
+       WHERE table_name = 'conversation_bootstrap_state'
+     ) AS exists`,
+  );
+  if (!hasBootstrapState?.exists) {
+    await db.run(`
+      CREATE TABLE conversation_bootstrap_state (
+        conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        session_file_path TEXT NOT NULL,
+        last_seen_size INTEGER NOT NULL,
+        last_seen_mtime_ms BIGINT NOT NULL,
+        last_processed_offset INTEGER NOT NULL,
+        last_processed_entry_hash TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.run(`CREATE INDEX idx_bootstrap_state_path ON conversation_bootstrap_state (session_file_path, updated_at)`);
+  }
+
+  // Add model column to summaries if missing
+  const hasModel = await db.queryOne<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'summaries' AND column_name = 'model'
+     ) AS exists`,
+  );
+  if (!hasModel?.exists) {
+    await db.run(`ALTER TABLE summaries ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`);
+  }
+
+}
+
