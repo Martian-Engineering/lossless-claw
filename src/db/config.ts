@@ -3,13 +3,24 @@ import { join } from "path";
 
 export type LcmConfig = {
   enabled: boolean;
+  /** SQLite database file path. Required when backend is 'sqlite'. Ignored for 'postgres'. */
   databasePath: string;
+  /** PostgreSQL connection string. Required when backend is 'postgres'. Ignored for 'sqlite'. */
+  connectionString?: string;
+  /** Database backend. Exactly one of 'sqlite' or 'postgres'. No fallback between them. */
+  backend: 'sqlite' | 'postgres';
   /** Glob patterns for session keys to exclude from LCM storage entirely. */
   ignoreSessionPatterns: string[];
   /** Glob patterns for session keys that may read from LCM but never write to it. */
   statelessSessionPatterns: string[];
   /** When true, stateless session pattern matching is enforced. */
   skipStatelessSessions: boolean;
+  /** API key for OpenAI-compatible embedding generation. Falls back to OPENAI_API_KEY env var. */
+  embeddingApiKey: string;
+  /** Base URL for embedding API. Defaults to OpenAI. */
+  embeddingBaseUrl: string;
+  /** Embedding model name. Defaults to text-embedding-3-small. */
+  embeddingModel: string;
   contextThreshold: number;
   freshTailCount: number;
   newSessionRetainDepth: number;
@@ -30,10 +41,6 @@ export type LcmConfig = {
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
   largeFileSummaryModel: string;
-  /** Model override for conversation summarization. */
-  summaryModel: string;
-  /** Provider override for conversation summarization. */
-  summaryProvider: string;
   /** Provider override for lcm_expand_query sub-agent. */
   expansionProvider: string;
   /** Model override for lcm_expand_query sub-agent. */
@@ -43,6 +50,14 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+
+  // ── Agent identity ────────────────────────────────────────────────────────
+  /** Unique identifier for this agent instance (e.g. "opus", "grok", "gemini"). */
+  instanceId: string;
+  /** Human-readable name (e.g. "Rivet Opus"). */
+  instanceDisplayName: string;
+  /** Role classification (e.g. "reasoning", "fast", "research", "local"). */
+  instanceRole: string;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -102,16 +117,55 @@ export function resolveLcmConfig(
 ): LcmConfig {
   const pc = pluginConfig ?? {};
 
+  const connectionString =
+    env.LCM_CONNECTION_STRING
+    ?? toStr(pc.connectionString);
+
+  const rawBackend =
+    env.LCM_BACKEND
+    ?? toStr(pc.backend);
+
+  // Determine backend: explicit setting wins, otherwise infer from connectionString presence
+  let backend: 'sqlite' | 'postgres';
+  if (rawBackend === 'postgres') {
+    backend = 'postgres';
+  } else if (rawBackend === 'sqlite') {
+    backend = 'sqlite';
+  } else if (connectionString) {
+    backend = 'postgres';
+  } else {
+    backend = 'sqlite';
+  }
+
+  // Validate: postgres requires connectionString, sqlite requires databasePath
+  const databasePath =
+    env.LCM_DATABASE_PATH
+    ?? toStr(pc.dbPath)
+    ?? toStr(pc.databasePath)
+    ?? (backend === 'sqlite' ? join(homedir(), ".openclaw", "lcm.db") : "");
+
+  if (backend === 'postgres' && !connectionString) {
+    throw new Error(
+      "LCM backend is 'postgres' but no connection string provided. " +
+      "Set LCM_CONNECTION_STRING env var or connectionString in plugin config."
+    );
+  }
+
+  if (backend === 'sqlite' && !databasePath) {
+    throw new Error(
+      "LCM backend is 'sqlite' but no database path provided. " +
+      "Set LCM_DATABASE_PATH env var or databasePath in plugin config."
+    );
+  }
+
   return {
     enabled:
       env.LCM_ENABLED !== undefined
         ? env.LCM_ENABLED !== "false"
         : toBool(pc.enabled) ?? true,
-    databasePath:
-      env.LCM_DATABASE_PATH
-      ?? toStr(pc.dbPath)
-      ?? toStr(pc.databasePath)
-      ?? join(homedir(), ".openclaw", "lcm.db"),
+    databasePath,
+    connectionString,
+    backend,
     ignoreSessionPatterns:
       env.LCM_IGNORE_SESSION_PATTERNS !== undefined
         ? env.LCM_IGNORE_SESSION_PATTERNS
@@ -130,6 +184,12 @@ export function resolveLcmConfig(
       env.LCM_SKIP_STATELESS_SESSIONS !== undefined
         ? env.LCM_SKIP_STATELESS_SESSIONS === "true"
         : toBool(pc.skipStatelessSessions) ?? true,
+    embeddingApiKey:
+      env.LCM_EMBEDDING_API_KEY ?? env.OPENAI_API_KEY ?? toStr(pc.embeddingApiKey) ?? "",
+    embeddingBaseUrl:
+      env.LCM_EMBEDDING_BASE_URL ?? toStr(pc.embeddingBaseUrl) ?? "https://api.openai.com/v1",
+    embeddingModel:
+      env.LCM_EMBEDDING_MODEL ?? toStr(pc.embeddingModel) ?? "text-embedding-3-small",
     contextThreshold:
       (env.LCM_CONTEXT_THRESHOLD !== undefined ? parseFloat(env.LCM_CONTEXT_THRESHOLD) : undefined)
         ?? toNumber(pc.contextThreshold) ?? 0.75,
@@ -191,5 +251,10 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+
+    // Agent identity — set via env vars in systemd drop-in
+    instanceId: env.LCM_INSTANCE_ID ?? toStr(pc.instanceId) ?? "",
+    instanceDisplayName: env.LCM_INSTANCE_DISPLAY_NAME ?? toStr(pc.instanceDisplayName) ?? "",
+    instanceRole: env.LCM_INSTANCE_ROLE ?? toStr(pc.instanceRole) ?? "",
   };
 }

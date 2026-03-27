@@ -46,6 +46,9 @@ function createTestConfig(databasePath: string): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    instanceId: "",
+    instanceDisplayName: "",
+    instanceRole: "",
   };
 }
 

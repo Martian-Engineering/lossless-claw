@@ -25,13 +25,13 @@ function formatDisplayTime(
 const LcmGrepSchema = Type.Object({
   pattern: Type.String({
     description:
-      "Search pattern. Interpreted as regex when mode is 'regex', or as a text query for 'full_text' mode.",
+      "Search pattern. Interpreted as regex when mode is 'regex', as a text query for 'full_text' mode, or as a natural language query for 'semantic' mode.",
   }),
   mode: Type.Optional(
     Type.String({
       description:
-        'Search mode: "regex" for regular expression matching, "full_text" for text search. Default: "regex".',
-      enum: ["regex", "full_text"],
+        'Search mode: "regex" for regular expression matching, "full_text" for text search, "semantic" for embedding-based similarity search, "recency_boosted" for semantic search weighted toward recent results. Default: "regex".',
+      enum: ["regex", "full_text", "semantic", "recency_boosted"],
     }),
   ),
   scope: Type.Optional(
@@ -90,7 +90,7 @@ export function createLcmGrepTool(input: {
     name: "lcm_grep",
     label: "LCM Grep",
     description:
-      "Search compacted conversation history using regex or full-text search. " +
+      "Search compacted conversation history using regex, full-text, or semantic search. " +
       "Searches across messages and/or summaries stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
       "active context. Returns matching snippets with their summary/message IDs " +
@@ -102,7 +102,7 @@ export function createLcmGrepTool(input: {
 
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
-      const mode = (p.mode as "regex" | "full_text") ?? "regex";
+      const mode = (p.mode as "regex" | "full_text" | "semantic" | "recency_boosted") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
       let since: Date | undefined;
@@ -134,6 +134,10 @@ export function createLcmGrepTool(input: {
         });
       }
 
+      // Pass the caller's agent identity so search results
+      // from this agent's conversations get a ranking boost.
+      const callerAgentId = input.lcm.getInstanceId();
+
       const result = await retrieval.grep({
         query: pattern,
         mode,
@@ -142,6 +146,7 @@ export function createLcmGrepTool(input: {
         limit,
         since,
         before,
+        callerAgentId,
       });
 
       const lines: string[] = [];

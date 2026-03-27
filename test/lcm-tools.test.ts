@@ -51,6 +51,9 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
+    instanceId: "",
+    instanceDisplayName: "",
+    instanceRole: "",
     },
     complete: vi.fn(),
     callGateway: vi.fn(async () => ({})),
@@ -89,6 +92,7 @@ function buildLcmEngine(params: {
     info: { id: "lcm", name: "LCM", version: "0.0.0" },
     timezone: params.timezone ?? "UTC",
     getRetrieval: () => params.retrieval,
+    getInstanceId: () => undefined,
     getConversationStore: () => ({
       getConversationBySessionId: vi.fn(async () =>
         params.conversationId == null
@@ -170,6 +174,8 @@ describe("LCM tools session scoping", () => {
 
   it("lcm_grep forwards since/before and uses the configured timezone in text output", async () => {
     const createdAt = new Date("2026-01-03T00:00:00.000Z");
+    // Import formatTimestamp to generate expected output
+    const { formatTimestamp } = await import("../src/compaction.js");
     const timezone = "America/Los_Angeles";
     const retrieval = {
       grep: vi.fn(async () => ({

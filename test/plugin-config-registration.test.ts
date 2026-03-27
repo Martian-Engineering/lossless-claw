@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import lcmPlugin from "../index.js";
+import lcmPlugin, { __lcm_reset_singleton__ } from "../index.js";
 import { closeLcmConnection } from "../src/db/connection.js";
 import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
 
@@ -101,6 +101,7 @@ describe("lcm plugin registration", () => {
   const tempDirs = new Set<string>();
 
   afterEach(() => {
+    __lcm_reset_singleton__();
     for (const dbPath of dbPaths) {
       closeLcmConnection(dbPath);
     }
@@ -114,6 +115,10 @@ describe("lcm plugin registration", () => {
   });
 
   it("uses api.pluginConfig values during register", { timeout: 20000 }, () => {
+    // Clear env vars that would override defaults so test is hermetic
+    delete process.env.LCM_EMBEDDING_BASE_URL;
+    delete process.env.LCM_EMBEDDING_MODEL;
+    process.env.TZ = "UTC";
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
 
@@ -147,6 +152,27 @@ describe("lcm plugin registration", () => {
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
       largeFileTokenThreshold: 12345,
+      backend: expect.stringMatching(/^(sqlite|postgres)$/),
+      embeddingApiKey: expect.any(String),
+      embeddingBaseUrl: 'https://api.openai.com/v1',
+      embeddingModel: 'text-embedding-3-small',
+      leafMinFanout: 8,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      leafChunkTokens: 20000,
+      leafTargetTokens: 1200,
+      condensedTargetTokens: 2000,
+      maxExpandTokens: 4000,
+      largeFileSummaryProvider: '',
+      largeFileSummaryModel: '',
+      autocompactDisabled: false,
+      timezone: 'UTC',
+      pruneHeartbeatOk: false,
+    // instanceId, instanceDisplayName, instanceRole come from env vars (LCM_INSTANCE_*)
+    // not from pluginConfig, so we don't assert specific values here.
+    instanceId: expect.any(String),
+    instanceDisplayName: expect.any(String),
+    instanceRole: expect.any(String),
     });
     expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
