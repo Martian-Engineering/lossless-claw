@@ -26,6 +26,7 @@ Set recommended environment variables:
 
 ```bash
 export LCM_FRESH_TAIL_COUNT=32
+export LCM_NEW_SESSION_RETAIN_DEPTH=2
 export LCM_INCREMENTAL_MAX_DEPTH=-1
 ```
 
@@ -50,6 +51,18 @@ For most use cases, 0.75 is a good balance.
 - **Larger values** (e.g., 32–64) give better continuity at the cost of a larger mandatory context floor.
 
 For coding conversations with tool calls (which generate many messages per logical turn), 32 is recommended.
+
+### /new retain depth
+
+`LCM_NEW_SESSION_RETAIN_DEPTH` (default `2`) controls what survives OpenClaw's `/new` command.
+
+- `-1` keeps all summaries and drops only fresh-tail message items.
+- `0` currently behaves the same as `-1`, because all summaries are kept.
+- `1` drops d0 summaries and keeps d1+.
+- `2` drops d0 and d1 summaries, keeping d2+ project-arc context. This is the recommended default.
+- `3+` keeps only deeper, more abstract summaries.
+
+`/new` never deletes the summaries themselves. It only prunes `context_items`, so the summary DAG remains available for later retrieval and expansion.
 
 ### Leaf fanout
 
@@ -116,6 +129,16 @@ If `summaryModel` already includes a provider prefix such as `anthropic/claude-s
 ## Session controls
 
 ### Excluding sessions entirely
+
+### `/new` vs `/reset`
+
+Lossless-claw treats the two OpenClaw reset commands differently:
+
+- `/new` keeps the active LCM conversation and prunes active context according to `newSessionRetainDepth`.
+- `/reset` archives the active conversation row and creates a fresh active row for the same stable `sessionKey`.
+
+This preserves lossless history while still giving users a real clean-slate command.
+OpenClaw's command handlers still own the user-facing post-command disclosure text; lossless-claw applies only the underlying storage transition through `before_reset`.
 
 Use `ignoreSessionPatterns` or `LCM_IGNORE_SESSION_PATTERNS` to keep low-value sessions completely out of LCM. Matching sessions do not create conversations, do not store messages, and do not participate in compaction or delegated expansion grants.
 

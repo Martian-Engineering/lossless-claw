@@ -93,6 +93,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
         "enabled": true,
         "config": {
           "freshTailCount": 32,
+          "newSessionRetainDepth": 2,
           "contextThreshold": 0.75,
           "incrementalMaxDepth": -1,
           "ignoreSessionPatterns": [
@@ -120,6 +121,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_SKIP_STATELESS_SESSIONS` | `true` | Enable stateless-session write skipping for matching session keys |
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window that triggers compaction (0.0–1.0) |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Number of recent messages protected from compaction |
+| `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | Summary depth retained after `/new` (`-1` keeps all summaries, `2` keeps d2+) |
 | `LCM_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |
 | `LCM_CONDENSED_MIN_FANOUT` | `4` | Minimum summaries per condensed node |
 | `LCM_CONDENSED_MIN_FANOUT_HARD` | `2` | Relaxed fanout for forced compaction sweeps |
@@ -177,6 +179,7 @@ Plugin config equivalents:
 - `ignoreSessionPatterns`
 - `statelessSessionPatterns`
 - `skipStatelessSessions`
+- `newSessionRetainDepth`
 - `summaryModel`
 - `summaryProvider`
 
@@ -206,6 +209,23 @@ LCM_CONTEXT_THRESHOLD=0.75
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
 
 ### Session exclusion patterns
+
+### Session reset semantics
+
+Lossless-claw distinguishes OpenClaw's two session-reset commands:
+
+- `/new` keeps the active conversation row and all stored summaries, but prunes `context_items` so the next turn rebuilds context from retained summaries instead of the fresh tail.
+- `/reset` archives the active conversation row and creates a new active row for the same stable `sessionKey`, giving the next turn a clean LCM conversation while preserving prior history.
+
+`newSessionRetainDepth` (or `LCM_NEW_SESSION_RETAIN_DEPTH`) controls how much summary structure survives `/new`:
+
+- `-1`: keep all summaries, drop only fresh-tail messages
+- `0`: same as `-1` for current summary depths
+- `1`: keep d1+ summaries
+- `2`: keep d2+ summaries; recommended default
+- `3+`: keep only deeper, more abstract summaries
+
+Lossless-claw currently applies these storage semantics through the `before_reset` hook only. User-facing confirmation text after `/new` or `/reset` must be emitted by OpenClaw's command handlers.
 
 Use `ignoreSessionPatterns` or `LCM_IGNORE_SESSION_PATTERNS` to keep low-value sessions completely out of LCM. Matching sessions do not create conversations, do not store messages, and do not participate in compaction or delegated expansion grants.
 

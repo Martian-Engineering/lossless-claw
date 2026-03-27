@@ -122,6 +122,7 @@ describe("lcm plugin registration", () => {
       contextThreshold: 0.33,
       incrementalMaxDepth: -1,
       freshTailCount: 7,
+      newSessionRetainDepth: 4,
       dbPath,
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
@@ -140,6 +141,7 @@ describe("lcm plugin registration", () => {
       contextThreshold: 0.33,
       incrementalMaxDepth: -1,
       freshTailCount: 7,
+      newSessionRetainDepth: 4,
       databasePath: dbPath,
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
@@ -158,6 +160,7 @@ describe("lcm plugin registration", () => {
     expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: (unconfigured)",
     );
+    expect(api.on).toHaveBeenCalledWith("before_reset", expect.any(Function));
   });
 
   it("inherits OpenClaw's default model for summarization when no LCM model override is set", () => {

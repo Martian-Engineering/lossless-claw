@@ -11,6 +11,7 @@ describe("resolveLcmConfig", () => {
     expect(config.skipStatelessSessions).toBe(true);
     expect(config.contextThreshold).toBe(0.75);
     expect(config.freshTailCount).toBe(32);
+    expect(config.newSessionRetainDepth).toBe(2);
     expect(config.incrementalMaxDepth).toBe(0);
     expect(config.leafMinFanout).toBe(8);
     expect(config.condensedMinFanout).toBe(4);
@@ -25,6 +26,7 @@ describe("resolveLcmConfig", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: 0.5,
       freshTailCount: 16,
+      newSessionRetainDepth: 3,
       incrementalMaxDepth: -1,
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:ephemeral:**"],
@@ -44,6 +46,7 @@ describe("resolveLcmConfig", () => {
     expect(config.skipStatelessSessions).toBe(false);
     expect(config.contextThreshold).toBe(0.5);
     expect(config.freshTailCount).toBe(16);
+    expect(config.newSessionRetainDepth).toBe(3);
     expect(config.incrementalMaxDepth).toBe(-1);
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
@@ -55,6 +58,7 @@ describe("resolveLcmConfig", () => {
     const env = {
       LCM_CONTEXT_THRESHOLD: "0.9",
       LCM_FRESH_TAIL_COUNT: "64",
+      LCM_NEW_SESSION_RETAIN_DEPTH: "5",
       LCM_INCREMENTAL_MAX_DEPTH: "3",
       LCM_ENABLED: "false",
       LCM_AUTOCOMPACT_DISABLED: "true",
@@ -85,6 +89,7 @@ describe("resolveLcmConfig", () => {
     expect(config.skipStatelessSessions).toBe(false);
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(64); // env wins
+    expect(config.newSessionRetainDepth).toBe(5); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
     expect(config.autocompactDisabled).toBe(true); // env wins
   });
@@ -96,11 +101,13 @@ describe("resolveLcmConfig", () => {
     const pluginConfig = {
       contextThreshold: 0.5, // should be overridden by env
       freshTailCount: 16, // should be used (no env)
+      newSessionRetainDepth: 4, // should be used (no env)
       incrementalMaxDepth: -1, // should be used (no env)
     };
     const config = resolveLcmConfig(env, pluginConfig);
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(16); // plugin config
+    expect(config.newSessionRetainDepth).toBe(4); // plugin config
     expect(config.incrementalMaxDepth).toBe(-1); // plugin config
     expect(config.leafMinFanout).toBe(8); // hardcoded default
   });
@@ -109,12 +116,14 @@ describe("resolveLcmConfig", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: "0.6",
       freshTailCount: "24",
+      newSessionRetainDepth: "6",
       ignoreSessionPatterns: "agent:*:cron:*, agent:main:subagent:**",
       statelessSessionPatterns: "agent:*:ephemeral:**, agent:main:preview:*",
       skipStatelessSessions: "false",
     });
     expect(config.contextThreshold).toBe(0.6);
     expect(config.freshTailCount).toBe(24);
+    expect(config.newSessionRetainDepth).toBe(6);
     expect(config.ignoreSessionPatterns).toEqual([
       "agent:*:cron:*",
       "agent:main:subagent:**",
@@ -130,10 +139,12 @@ describe("resolveLcmConfig", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: "not-a-number",
       freshTailCount: null,
+      newSessionRetainDepth: "nope",
       enabled: "maybe",
     });
     expect(config.contextThreshold).toBe(0.75); // falls through to default
     expect(config.freshTailCount).toBe(32); // falls through to default
+    expect(config.newSessionRetainDepth).toBe(2); // falls through to default
     expect(config.enabled).toBe(true); // falls through to default
   });
 
@@ -262,6 +273,7 @@ describe("resolveLcmConfig", () => {
 
   it("ships a manifest that accepts unlimited incremental depth", () => {
     expect(manifest.configSchema.properties.incrementalMaxDepth.minimum).toBe(-1);
+    expect(manifest.configSchema.properties.newSessionRetainDepth.minimum).toBe(-1);
   });
 
   it("ships a manifest with expansionModel and expansionProvider in schema", () => {

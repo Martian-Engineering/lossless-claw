@@ -110,6 +110,13 @@ describe("runLcmMigrations summary depth backfill", () => {
     const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as Array<{
       name?: string;
     }>;
+    const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
+      name?: string;
+    }>;
+    expect(conversationColumns.some((column) => column.name === "session_key")).toBe(true);
+    expect(conversationColumns.some((column) => column.name === "active")).toBe(true);
+    expect(conversationColumns.some((column) => column.name === "archived_at")).toBe(true);
+    expect(conversationColumns.some((column) => column.name === "bootstrapped_at")).toBe(true);
     expect(summaryColumns.some((column) => column.name === "depth")).toBe(true);
     expect(summaryColumns.some((column) => column.name === "earliest_at")).toBe(true);
     expect(summaryColumns.some((column) => column.name === "latest_at")).toBe(true);
@@ -208,6 +215,60 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_1")).toBe(15);
     expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_2")).toBe(15);
     expect(sourceMessageTokenCountBySummaryId.get("sum_condensed_orphan")).toBe(0);
+  });
+
+  it("replaces global session_key uniqueness with active-row uniqueness", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "session-key-active.db");
+    const db = getLcmConnection(dbPath);
+
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        session_key TEXT,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE UNIQUE INDEX conversations_session_key_idx ON conversations (session_key);
+    `);
+
+    db.prepare(`INSERT INTO conversations (session_id, session_key) VALUES (?, ?)`).run(
+      "legacy-session",
+      "agent:main:main",
+    );
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const activeRow = db
+      .prepare(`SELECT active, archived_at FROM conversations WHERE session_key = ?`)
+      .get("agent:main:main") as { active: number; archived_at: string | null };
+    expect(activeRow.active).toBe(1);
+    expect(activeRow.archived_at).toBeNull();
+
+    const indexRows = db
+      .prepare(`SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'conversations'`)
+      .all() as Array<{ name: string; sql: string | null }>;
+    const indexSqlByName = new Map(indexRows.map((row) => [row.name, row.sql ?? ""]));
+
+    expect(indexSqlByName.has("conversations_session_key_idx")).toBe(false);
+    expect(indexSqlByName.get("conversations_active_session_key_idx")).toContain(
+      "WHERE session_key IS NOT NULL AND active = 1",
+    );
+
+    db.prepare(
+      `INSERT INTO conversations (session_id, session_key, active, archived_at)
+       VALUES (?, ?, 0, datetime('now'))`,
+    ).run("archived-session", "agent:main:main");
+
+    expect(() =>
+      db
+        .prepare(`INSERT INTO conversations (session_id, session_key, active) VALUES (?, ?, 1)`)
+        .run("duplicate-active-session", "agent:main:main"),
+    ).toThrow();
   });
 
   it("skips FTS tables when fts5 is unavailable", () => {
