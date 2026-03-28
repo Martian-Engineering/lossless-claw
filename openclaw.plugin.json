@@ -44,6 +44,10 @@
     "expansionProvider": {
       "label": "Expansion Provider",
       "help": "Provider override for lcm_expand_query sub-agent (e.g., 'anthropic')"
+    },
+    "customInstructions": {
+      "label": "Custom Instructions",
+      "help": "Natural language instructions injected into all summarization prompts (e.g., formatting rules, tone control)"
     }
   },
   "configSchema": {
@@ -110,6 +114,9 @@
         "type": "string"
       },
       "expansionProvider": {
+        "type": "string"
+      },
+      "customInstructions": {
         "type": "string"
       }
     }
