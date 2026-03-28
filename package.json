@@ -4,6 +4,9 @@
   "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with incremental compaction",
   "type": "module",
   "main": "index.ts",
+  "bin": {
+    "lcm-read": "dist/src/cli/lcm-read.js"
+  },
   "license": "MIT",
   "author": "Josh Lehman <josh@martian.engineering>",
   "keywords": [
