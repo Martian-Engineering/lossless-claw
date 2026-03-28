@@ -823,6 +823,85 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(result.messages).toHaveLength(3);
   });
 
+  it("pulls matching tool results into the protected tail when the tail contains their tool call", async () => {
+    await convStore.createConversation({ sessionId: "session-tail-tool-pair" });
+
+    const toolResultMsg = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 1,
+      role: "tool",
+      content: "real tool result",
+      tokenCount: estimateTokens("real tool result"),
+    });
+    await convStore.createMessageParts(toolResultMsg.messageId, [
+      {
+        sessionId: "session-tail-tool-pair",
+        partType: "tool",
+        ordinal: 0,
+        textContent: "real tool result",
+        toolCallId: "call_tail",
+        toolName: "read",
+        metadata: JSON.stringify({
+          originalRole: "toolResult",
+          rawType: "tool_result",
+          toolCallId: "call_tail",
+          toolName: "read",
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, toolResultMsg.messageId);
+
+    const assistantMsg = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 2,
+      role: "assistant",
+      content: "tail tool call",
+      tokenCount: estimateTokens("tail tool call"),
+    });
+    await convStore.createMessageParts(assistantMsg.messageId, [
+      {
+        sessionId: "session-tail-tool-pair",
+        partType: "tool",
+        ordinal: 0,
+        toolCallId: "call_tail",
+        toolName: "read",
+        toolInput: JSON.stringify({ path: "foo.txt" }),
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "toolCall",
+          raw: {
+            type: "toolCall",
+            id: "call_tail",
+            name: "read",
+            input: { path: "foo.txt" },
+          },
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, assistantMsg.messageId);
+
+    const trailingUser = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 3,
+      role: "user",
+      content: "tail marker",
+      tokenCount: estimateTokens("tail marker"),
+    });
+    await sumStore.appendContextMessage(CONV_ID, trailingUser.messageId);
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 1,
+      freshTailCount: 2,
+    });
+
+    expect(result.messages).toHaveLength(3);
+    expect(result.messages[0].role).toBe("assistant");
+    expect(result.messages[1].role).toBe("toolResult");
+    expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_tail");
+    expect(extractMessageText(result.messages[2].content)).toBe("tail marker");
+  });
+
   it("degrades tool rows without toolCallId to assistant text", async () => {
     await ingestMessages(convStore, sumStore, 1, {
       roleFn: () => "tool",
