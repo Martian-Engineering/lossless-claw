@@ -2344,6 +2344,33 @@ describe("LcmContextEngine.assemble canonical path", () => {
 
     expect(ambient).toHaveLength(0);
   });
+
+  it("does not shrink same-session assembly when no ambient beacons are injected", async () => {
+    const engine = createEngineWithConfig({
+      crossSession: {
+        enabled: true,
+        totalBudget: 400,
+      },
+    });
+    const sessionId = "ambient-no-candidates-budget";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "budget sentinel context" } as AgentMessage,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 50,
+    });
+
+    const textContent = result.messages
+      .filter((message: AgentMessage) => typeof message.content === "string")
+      .map((message: AgentMessage) => String(message.content));
+
+    expect(textContent.join("\n")).toContain("budget sentinel context");
+  });
 });
 
 describe("LcmContextEngine fidelity and token budget", () => {

@@ -24,6 +24,7 @@ interface ConversationRow {
 }
 
 interface MessageRow {
+  message_id: number;
   seq: number;
   role: string;
   content: string | null;
@@ -52,6 +53,9 @@ export interface MessagePage {
 }
 
 function parseNonNegativeInteger(value: string, flagName: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${flagName} must be a non-negative integer.`);
+  }
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || Number.isNaN(parsed) || parsed < 0) {
     throw new Error(`${flagName} must be a non-negative integer.`);
@@ -60,6 +64,9 @@ function parseNonNegativeInteger(value: string, flagName: string): number {
 }
 
 function parsePositiveInteger(value: string, flagName: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${flagName} must be a positive integer.`);
+  }
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || Number.isNaN(parsed) || parsed <= 0) {
     throw new Error(`${flagName} must be a positive integer.`);
@@ -168,20 +175,35 @@ function formatHumanTimestamp(rawTimestamp: string): string {
   return `${yyyy}-${mm}-${dd} ${hh}:${min}Z`;
 }
 
-function buildMessageWhere(options: MessageOptions): { clause: string; args: Array<string | number> } {
-  const where = ["conversation_id = ?", "seq > ?"];
+function buildMessageWhere(
+  options: MessageOptions,
+  hasMessagePartsTable: boolean,
+): { clause: string; args: Array<string | number> } {
+  const where = ["m.conversation_id = ?", "m.seq > ?"];
   const args: Array<string | number> = [];
 
   if (options.role) {
-    where.push("role = ?");
+    where.push("m.role = ?");
     args.push(options.role);
   }
 
   if (options.noToolMessages) {
-    where.push("role != 'tool'");
+    where.push("m.role != 'tool'");
+    if (hasMessagePartsTable) {
+      where.push(
+        "NOT EXISTS (SELECT 1 FROM message_parts mp_tool WHERE mp_tool.message_id = m.message_id AND mp_tool.part_type = 'tool')",
+      );
+    }
   }
 
   return { clause: where.join(" AND "), args };
+}
+
+function hasMessagePartsTable(db: DatabaseSync): boolean {
+  const row = db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_parts' LIMIT 1")
+    .get() as unknown as Record<string, unknown> | undefined;
+  return !!row;
 }
 
 function truncate(value: string, maxChars: number): string {
@@ -211,18 +233,46 @@ export function readConversationMessages(
     throw new Error(`Conversation not found: ${conversationId}`);
   }
 
-  const { clause, args } = buildMessageWhere(options);
+  const includeMessageParts = hasMessagePartsTable(db);
+  const { clause, args } = buildMessageWhere(options, includeMessageParts);
+  const contentExpr = includeMessageParts
+    ? `COALESCE(
+         (
+           SELECT group_concat(part_chunk, '\n')
+           FROM (
+             SELECT
+               CASE
+                 WHEN mp.part_type IN ('text', 'reasoning') THEN mp.text_content
+                 WHEN mp.part_type = 'tool' THEN COALESCE(
+                   mp.tool_output,
+                   mp.tool_input,
+                   mp.tool_error,
+                   mp.text_content
+                 )
+                 ELSE mp.text_content
+               END AS part_chunk
+             FROM message_parts mp
+             WHERE mp.message_id = m.message_id
+             ORDER BY mp.ordinal ASC
+           ) part_chunks
+           WHERE part_chunk IS NOT NULL AND part_chunk != ''
+         ),
+         m.content,
+         ''
+       )`
+    : "COALESCE(m.content, '')";
+
   const allRows = db
     .prepare(
-      `SELECT seq, role, content, token_count, created_at
-       FROM messages
+      `SELECT m.message_id, m.seq, m.role, ${contentExpr} AS content, m.token_count, m.created_at
+       FROM messages m
        WHERE ${clause}
-       ORDER BY seq ASC`,
+       ORDER BY m.seq ASC`,
     )
     .all(conversationId, options.afterSeq, ...args) as unknown as MessageRow[];
 
   const totalCountRow = db
-    .prepare(`SELECT COUNT(*) AS total_count FROM messages WHERE ${clause.replace("seq > ?", "1 = 1")}`)
+    .prepare(`SELECT COUNT(*) AS total_count FROM messages m WHERE ${clause.replace("m.seq > ?", "1 = 1")}`)
     .get(conversationId, ...args) as unknown as { total_count: number };
 
   const messages: MessageItem[] = [];

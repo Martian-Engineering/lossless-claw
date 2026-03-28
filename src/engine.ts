@@ -2481,8 +2481,23 @@ export class LcmContextEngine implements ContextEngine {
               ),
             )
           : 0;
-      const sameSessionBudget = Math.max(0, tokenBudget - ambientBudget);
+      let ambientMessages: AgentMessage[] = [];
+      let ambientTokens = 0;
+      if (ambientBudget > 0) {
+        const parsed = this.deps.parseAgentSessionKey(params.sessionId);
+        const agentScope = this.deps.normalizeAgentId(conversation.agentScope ?? parsed?.agentId);
+        const ambient = await this.assembleAmbientContext(
+          agentScope,
+          conversation.conversationId,
+          ambientBudget,
+        );
+        if (ambient.messages.length > 0) {
+          ambientMessages = ambient.messages;
+          ambientTokens = ambient.estimatedTokens;
+        }
+      }
 
+      const sameSessionBudget = Math.max(0, tokenBudget - ambientTokens);
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,
         tokenBudget: sameSessionBudget,
@@ -2498,22 +2513,9 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
-      let outputMessages = assembled.messages;
-      let outputTokens = assembled.estimatedTokens;
-
-      if (ambientBudget > 0) {
-        const parsed = this.deps.parseAgentSessionKey(params.sessionId);
-        const agentScope = this.deps.normalizeAgentId(conversation.agentScope ?? parsed?.agentId);
-        const ambient = await this.assembleAmbientContext(
-          agentScope,
-          conversation.conversationId,
-          ambientBudget,
-        );
-        if (ambient.messages.length > 0) {
-          outputMessages = [...assembled.messages, ...ambient.messages];
-          outputTokens += ambient.estimatedTokens;
-        }
-      }
+      const outputMessages =
+        ambientMessages.length > 0 ? [...assembled.messages, ...ambientMessages] : assembled.messages;
+      const outputTokens = assembled.estimatedTokens + ambientTokens;
 
       const result: AssembleResultWithSystemPrompt = {
         messages: outputMessages,

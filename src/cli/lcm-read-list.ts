@@ -50,6 +50,9 @@ const DEFAULT_MIN_MESSAGES = 1;
 const DEFAULT_SORT: ListSortField = "latest";
 
 function parseNonNegativeInteger(value: string, flagName: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${flagName} must be a non-negative integer.`);
+  }
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || Number.isNaN(parsed) || parsed < 0) {
     throw new Error(`${flagName} must be a non-negative integer.`);
@@ -58,6 +61,9 @@ function parseNonNegativeInteger(value: string, flagName: string): number {
 }
 
 function parsePositiveInteger(value: string, flagName: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${flagName} must be a positive integer.`);
+  }
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || Number.isNaN(parsed) || parsed <= 0) {
     throw new Error(`${flagName} must be a positive integer.`);

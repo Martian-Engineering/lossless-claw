@@ -198,7 +198,7 @@ export function resolveLcmConfig(
           ? parseInt(env.LCM_CROSS_SESSION_TOTAL_BUDGET, 10)
           : undefined) ??
         toNumber((pc.crossSession as Record<string, unknown> | undefined)?.totalBudget) ??
-        6000,
+        10000,
     },
   };
 }

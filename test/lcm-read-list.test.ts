@@ -178,6 +178,8 @@ describe("lcm-read list query and formatting", () => {
     expect(() => parseListOptions(["--sort", "invalid"])).toThrow(/--sort/);
     expect(() => parseListOptions(["--since", "not-a-date"])).toThrow(/--since/);
     expect(() => parseListOptions(["--min-messages", "0"])).toThrow(/--min-messages/);
+    expect(() => parseListOptions(["--limit", "10abc"])).toThrow(/--limit/);
+    expect(() => parseListOptions(["--offset", "2xyz"])).toThrow(/--offset/);
     expect(() => parseListOptions(["--since", "2026-03-01T00:00:00.000Z", "--before", "2026-01-01T00:00:00.000Z"])).toThrow(
       /--since must be earlier than --before/,
     );

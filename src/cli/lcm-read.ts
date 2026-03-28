@@ -19,6 +19,17 @@ const defaultIo: CliIo = {
   },
 };
 
+function parseStrictPositiveInteger(value: string, flagName: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${flagName} must be a positive integer.`);
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || Number.isNaN(parsed) || parsed <= 0) {
+    throw new Error(`${flagName} must be a positive integer.`);
+  }
+  return parsed;
+}
+
 function printUsage(io: CliIo): void {
   io.stdout(`Usage:
   lcm-read list [options]
@@ -46,7 +57,7 @@ Messages options:
   --limit <n>             Max messages (default: 50, max: 500)
   --max-tokens <n>        Token budget for returned messages
   --role <role>           Filter role: user, assistant, tool, system
-  --no-tool-messages      Exclude tool-role messages
+  --no-tool-messages      Exclude tool call/result messages
   --max-chars <n>         Truncate each message content (default: 4000)
   --json                  Output JSON`);
 }
@@ -92,10 +103,7 @@ export function runLcmReadCli(argv: string[], io: CliIo = defaultIo): number {
     if (!conversationIdRaw) {
       throw new Error("messages requires a conversationId.");
     }
-    const conversationId = Number.parseInt(conversationIdRaw, 10);
-    if (!Number.isFinite(conversationId) || Number.isNaN(conversationId) || conversationId <= 0) {
-      throw new Error("conversationId must be a positive integer.");
-    }
+    const conversationId = parseStrictPositiveInteger(conversationIdRaw, "conversationId");
 
     let dbPath = resolveDbPath(undefined);
     const messageArgs: string[] = [];

@@ -116,4 +116,10 @@ describe("lcm-read messages integration", () => {
       ].join("\n"),
     );
   });
+
+  it("rejects partially numeric conversation ids", () => {
+    expect(() => runLcmReadCli(["messages", "77abc", "--db", dbPath])).toThrow(
+      /conversationId must be a positive integer/,
+    );
+  });
 });
