@@ -9,6 +9,15 @@ import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/sum
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 
+const TOOL_CALL_TYPES = new Set([
+  "toolCall",
+  "toolUse",
+  "tool_use",
+  "tool-use",
+  "functionCall",
+  "function_call",
+]);
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface AssembleContextInput {
@@ -555,6 +564,144 @@ function pickToolIsError(parts: MessagePartRecord[]): boolean | undefined {
   return undefined;
 }
 
+function extractToolCallId(block: { id?: unknown; call_id?: unknown }): string | null {
+  if (typeof block.id === "string" && block.id.length > 0) {
+    return block.id;
+  }
+  if (typeof block.call_id === "string" && block.call_id.length > 0) {
+    return block.call_id;
+  }
+  return null;
+}
+
+function extractToolCallIdsFromAssistant(message: AgentMessage): string[] {
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+    return [];
+  }
+
+  const ids: string[] = [];
+  for (const block of message.content) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+    const record = block as { type?: unknown; id?: unknown; call_id?: unknown };
+    if (typeof record.type !== "string" || !TOOL_CALL_TYPES.has(record.type)) {
+      continue;
+    }
+    const id = extractToolCallId(record);
+    if (id) {
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
+function extractToolResultIdFromMessage(message: AgentMessage): string | null {
+  if (!message || typeof message !== "object") {
+    return null;
+  }
+  if (typeof message.toolCallId === "string" && message.toolCallId.length > 0) {
+    return message.toolCallId;
+  }
+  if (typeof message.toolUseId === "string" && message.toolUseId.length > 0) {
+    return message.toolUseId;
+  }
+  return null;
+}
+
+function collectAssistantToolCallIds(items: ResolvedItem[]): Set<string> {
+  const ids = new Set<string>();
+  for (const item of items) {
+    for (const id of extractToolCallIdsFromAssistant(item.message)) {
+      ids.add(id);
+    }
+  }
+  return ids;
+}
+
+function mergeFreshTailWithMatchingToolResults(
+  freshTail: ResolvedItem[],
+  matchingToolResults: ResolvedItem[],
+): ResolvedItem[] {
+  if (matchingToolResults.length === 0) {
+    return freshTail;
+  }
+
+  const resultsById = new Map<string, ResolvedItem[]>();
+  for (const item of matchingToolResults) {
+    const toolResultId = extractToolResultIdFromMessage(item.message);
+    if (!toolResultId) {
+      continue;
+    }
+    const existing = resultsById.get(toolResultId);
+    if (existing) {
+      existing.push(item);
+    } else {
+      resultsById.set(toolResultId, [item]);
+    }
+  }
+
+  const merged: ResolvedItem[] = [];
+  const usedOrdinals = new Set<number>();
+
+  for (const item of freshTail) {
+    merged.push(item);
+
+    const toolCallIds = extractToolCallIdsFromAssistant(item.message);
+    if (toolCallIds.length === 0) {
+      continue;
+    }
+
+    for (const toolCallId of toolCallIds) {
+      const matches = resultsById.get(toolCallId);
+      if (!matches) {
+        continue;
+      }
+      for (const match of matches) {
+        if (usedOrdinals.has(match.ordinal)) {
+          continue;
+        }
+        merged.push(match);
+        usedOrdinals.add(match.ordinal);
+      }
+    }
+  }
+
+  for (const item of matchingToolResults) {
+    if (!usedOrdinals.has(item.ordinal)) {
+      merged.push(item);
+    }
+  }
+
+  return merged;
+}
+
+function dropNonFreshUnpairedAssistantToolCalls(
+  items: ResolvedItem[],
+  freshTailOrdinals: Set<number>,
+): ResolvedItem[] {
+  const availableToolResultIds = new Set<string>();
+  for (const item of items) {
+    const toolResultId = extractToolResultIdFromMessage(item.message);
+    if (toolResultId) {
+      availableToolResultIds.add(toolResultId);
+    }
+  }
+
+  return items.filter((item) => {
+    if (item.message?.role !== "assistant" || freshTailOrdinals.has(item.ordinal)) {
+      return true;
+    }
+
+    const toolCallIds = extractToolCallIdsFromAssistant(item.message);
+    if (toolCallIds.length === 0) {
+      return true;
+    }
+
+    return toolCallIds.every((toolCallId) => availableToolResultIds.has(toolCallId));
+  });
+}
+
 /** Format a Date for XML attributes in the agent's timezone. */
 function formatDateForAttribute(date: Date, timezone?: string): string {
   const tz = timezone ?? "UTC";
@@ -692,8 +839,17 @@ export class ContextAssembler {
 
     // Step 3: Split into evictable prefix and protected fresh tail
     const tailStart = Math.max(0, resolved.length - freshTailCount);
-    const freshTail = resolved.slice(tailStart);
-    const evictable = resolved.slice(0, tailStart);
+    const baseFreshTail = resolved.slice(tailStart);
+    const initialEvictable = resolved.slice(0, tailStart);
+    const freshTailOrdinals = new Set(baseFreshTail.map((item) => item.ordinal));
+    const tailToolCallIds = collectAssistantToolCallIds(baseFreshTail);
+    const tailPairToolResults = initialEvictable.filter((item) => {
+      const toolResultId = extractToolResultIdFromMessage(item.message);
+      return toolResultId !== null && tailToolCallIds.has(toolResultId);
+    });
+    const protectedEvictableOrdinals = new Set(tailPairToolResults.map((item) => item.ordinal));
+    const evictable = initialEvictable.filter((item) => !protectedEvictableOrdinals.has(item.ordinal));
+    const freshTail = mergeFreshTailWithMatchingToolResults(baseFreshTail, tailPairToolResults);
 
     // Step 4: Budget-aware selection
     // First, compute the token cost of the fresh tail (always included).
@@ -747,7 +903,8 @@ export class ContextAssembler {
 
     // Normalize assistant string content to array blocks (some providers return
     // content as a plain string; Anthropic expects content block arrays).
-    const rawMessages = selected.map((item) => item.message);
+    const selectedMessages = dropNonFreshUnpairedAssistantToolCalls(selected, freshTailOrdinals);
+    const rawMessages = selectedMessages.map((item) => item.message);
     for (let i = 0; i < rawMessages.length; i++) {
       const msg = rawMessages[i];
       if (msg?.role === "assistant" && typeof msg.content === "string") {

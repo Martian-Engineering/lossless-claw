@@ -1909,7 +1909,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages).toEqual([]);
   });
 
-  it("inserts synthetic tool results when assembled tool calls have no result", async () => {
+  it("inserts synthetic tool results when fresh-tail tool calls have no result", async () => {
     const engine = createEngine();
     const sessionId = "session-missing-tool-result";
 
@@ -1931,6 +1931,55 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[0]?.role).toBe("assistant");
     expect(result.messages[1]?.role).toBe("toolResult");
     expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_2");
+  });
+
+  it("drops older orphaned assistant tool calls instead of surfacing synthetic repair results", async () => {
+    const engine = createEngine();
+    const sessionId = "session-historical-missing-tool-result";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_old", name: "read", input: { path: "foo.txt" } }],
+      } as AgentMessage,
+    });
+
+    for (let i = 0; i < 8; i += 1) {
+      await engine.ingest({
+        sessionId,
+        message: { role: "user", content: `fresh message ${i}` } as AgentMessage,
+      });
+    }
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(result.messages).toHaveLength(8);
+    expect(
+      result.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          Array.isArray(message.content) &&
+          message.content.some(
+            (block) =>
+              block &&
+              typeof block === "object" &&
+              "id" in block &&
+              (block as { id?: unknown }).id === "call_old",
+          ),
+      ),
+    ).toBe(false);
+    expect(
+      result.messages.some(
+        (message) =>
+          message.role === "toolResult" &&
+          (message as { toolCallId?: string }).toolCallId === "call_old",
+      ),
+    ).toBe(false);
   });
 
   it("repairs OpenAI function_call transcripts without dropping reasoning blocks", async () => {
