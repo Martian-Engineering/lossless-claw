@@ -22,6 +22,9 @@
     "changeset": "changeset",
     "release:verify": "npm test && npm pack --dry-run",
     "test": "vitest run --dir test",
+    "test:compact": "vitest run test/lcm-read-list.test.ts test/lcm-read-cli.list.integration.test.ts test/lcm-read-messages.test.ts test/lcm-read-cli.messages.integration.test.ts test/lcm-read-packaging.test.ts",
+    "typecheck": "tsc -p tsconfig.lcm-read.json --noEmit",
+    "build": "tsc -p tsconfig.lcm-read.build.json",
     "version-packages": "changeset version"
   },
   "files": [

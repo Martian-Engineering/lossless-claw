@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/cli/lcm-read.ts",
+    "src/cli/lcm-read-list.ts",
+    "src/cli/lcm-read-messages.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { formatListTable, listConversations, parseListOptions, resolveDbPath } from "./lcm-read-list.js";
+import { formatMessagesOutput, parseMessagesOptions, readConversationMessages } from "./lcm-read-messages.js";
 
 export interface CliIo {
   stdout: (message: string) => void;
@@ -21,10 +22,11 @@ const defaultIo: CliIo = {
 function printUsage(io: CliIo): void {
   io.stdout(`Usage:
   lcm-read list [options]
+  lcm-read messages <conversationId> [options]
 
 Commands:
   list                    List conversations with filters and pagination
-  messages                Reserved for STORY-2
+  messages                Read conversation messages with cursor pagination
 
 List options:
   --db <path>             Path to LCM database (default: ~/.openclaw/lcm.db)
@@ -36,6 +38,16 @@ List options:
   --sort <field>          Sort by latest, earliest, or messages (default: latest)
   --limit <n>             Max results (default: 50)
   --offset <n>            Pagination offset (default: 0)
+  --json                  Output JSON
+
+Messages options:
+  --db <path>             Path to LCM database (default: ~/.openclaw/lcm.db)
+  --after-seq <n>         Read messages after this sequence number (default: 0)
+  --limit <n>             Max messages (default: 50, max: 500)
+  --max-tokens <n>        Token budget for returned messages
+  --role <role>           Filter role: user, assistant, tool, system
+  --no-tool-messages      Exclude tool-role messages
+  --max-chars <n>         Truncate each message content (default: 4000)
   --json                  Output JSON`);
 }
 
@@ -76,8 +88,46 @@ export function runLcmReadCli(argv: string[], io: CliIo = defaultIo): number {
   }
 
   if (command === "messages") {
-    io.stderr("The messages subcommand is not implemented yet (planned for STORY-2).");
-    return 1;
+    const [conversationIdRaw, ...rawOptions] = rest;
+    if (!conversationIdRaw) {
+      throw new Error("messages requires a conversationId.");
+    }
+    const conversationId = Number.parseInt(conversationIdRaw, 10);
+    if (!Number.isFinite(conversationId) || Number.isNaN(conversationId) || conversationId <= 0) {
+      throw new Error("conversationId must be a positive integer.");
+    }
+
+    let dbPath = resolveDbPath(undefined);
+    const messageArgs: string[] = [];
+    for (let index = 0; index < rawOptions.length; index += 1) {
+      const token = rawOptions[index];
+      if (token === "--db") {
+        const value = rawOptions[index + 1];
+        if (!value) {
+          throw new Error("--db requires a value.");
+        }
+        dbPath = resolveDbPath(value);
+        index += 1;
+        continue;
+      }
+      messageArgs.push(token);
+    }
+
+    const options = parseMessagesOptions(messageArgs);
+    ensureDbExists(dbPath);
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+
+    try {
+      const page = readConversationMessages(db, conversationId, options);
+      if (options.json) {
+        io.stdout(JSON.stringify(page, null, 2));
+      } else {
+        io.stdout(formatMessagesOutput(page));
+      }
+      return 0;
+    } finally {
+      db.close();
+    }
   }
 
   throw new Error(`Unknown command: ${command}`);
