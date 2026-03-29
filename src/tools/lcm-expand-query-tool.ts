@@ -75,6 +75,16 @@ type ExpandQueryReply = {
   truncated: boolean;
 };
 
+type ParsedExpandQueryReply =
+  | {
+      ok: true;
+      value: ExpandQueryReply;
+    }
+  | {
+      ok: false;
+      error: string;
+    };
+
 type SummaryCandidate = {
   summaryId: string;
   conversationId: number;
@@ -211,24 +221,25 @@ function buildDelegatedExpandQueryTask(params: {
   ].join("\n");
 }
 
+function formatInvalidDelegatedReply(reply: string, reason: string): string {
+  const compact = reply.replace(/\s+/g, " ").trim();
+  const snippet = compact.length <= 240 ? compact : `${compact.slice(0, 240)}...`;
+  return `Delegated expansion query returned ${reason}: ${snippet}`;
+}
+
 /**
- * Parse the child reply; accepts plain JSON or fenced JSON.
+ * Parse the child reply; accepts plain JSON or fenced JSON and rejects malformed fallbacks.
  */
 function parseDelegatedExpandQueryReply(
   rawReply: string | undefined,
   fallbackExpandedSummaryCount: number,
-): ExpandQueryReply {
-  const fallback: ExpandQueryReply = {
-    answer: (rawReply ?? "").trim(),
-    citedIds: [],
-    expandedSummaryCount: fallbackExpandedSummaryCount,
-    totalSourceTokens: 0,
-    truncated: false,
-  };
-
+): ParsedExpandQueryReply {
   const reply = rawReply?.trim();
   if (!reply) {
-    return fallback;
+    return {
+      ok: false,
+      error: "Delegated expansion query returned an empty reply.",
+    };
   }
 
   const candidates: string[] = [reply];
@@ -247,6 +258,12 @@ function parseDelegatedExpandQueryReply(
         truncated?: unknown;
       };
       const answer = typeof parsed.answer === "string" ? parsed.answer.trim() : "";
+      if (!answer) {
+        return {
+          ok: false,
+          error: formatInvalidDelegatedReply(reply, 'JSON without a non-empty "answer"'),
+        };
+      }
       const citedIds = normalizeSummaryIds(
         Array.isArray(parsed.citedIds)
           ? parsed.citedIds.filter((value): value is string => typeof value === "string")
@@ -264,18 +281,24 @@ function parseDelegatedExpandQueryReply(
       const truncated = parsed.truncated === true;
 
       return {
-        answer: answer || fallback.answer,
-        citedIds,
-        expandedSummaryCount,
-        totalSourceTokens,
-        truncated,
+        ok: true,
+        value: {
+          answer,
+          citedIds,
+          expandedSummaryCount,
+          totalSourceTokens,
+          truncated,
+        },
       };
     } catch {
       // Try next candidate.
     }
   }
 
-  return fallback;
+  return {
+    ok: false,
+    error: formatInvalidDelegatedReply(reply, "non-JSON output"),
+  };
 }
 
 /**
@@ -626,6 +649,9 @@ export function createLcmExpandQueryTool(input: {
               Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
             );
             const parsed = parseDelegatedExpandQueryReply(reply, summaryIds.length);
+            if (!parsed.ok) {
+              throw new Error(parsed.error);
+            }
             recordExpansionDelegationTelemetry({
               deps: input.deps,
               component: "lcm_expand_query",
@@ -638,12 +664,12 @@ export function createLcmExpandQueryTool(input: {
             });
 
             return jsonResult({
-              answer: parsed.answer,
-              citedIds: parsed.citedIds,
+              answer: parsed.value.answer,
+              citedIds: parsed.value.citedIds,
               sourceConversationId,
-              expandedSummaryCount: parsed.expandedSummaryCount,
-              totalSourceTokens: parsed.totalSourceTokens,
-              truncated: parsed.truncated,
+              expandedSummaryCount: parsed.value.expandedSummaryCount,
+              totalSourceTokens: parsed.value.totalSourceTokens,
+              truncated: parsed.value.truncated,
             });
           } finally {
             try {

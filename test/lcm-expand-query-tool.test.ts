@@ -246,6 +246,62 @@ describe("createLcmExpandQueryTool", () => {
     });
   });
 
+  it("fails closed when the delegated child returns malformed JSON status instead of an answer", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        return { runId: "run-invalid-json" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    status: "need_context",
+                    message: "I do not have enough context.",
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-invalid-json", {
+      summaryIds: ["sum_a"],
+      prompt: "What caused the outage?",
+      conversationId: 42,
+    });
+
+    expect(result.details).toMatchObject({
+      error: expect.stringContaining('JSON without a non-empty "answer"'),
+    });
+  });
+
   it("returns a validation error when prompt is missing", async () => {
     const retrieval = makeRetrieval();
 
