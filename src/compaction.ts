@@ -50,9 +50,11 @@ export interface CompactionConfig {
   maxRounds: number;
   /** IANA timezone for timestamps in summaries (default: UTC) */
   timezone?: string;
+  /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
+  summaryMaxOverageFactor: number;
 }
 
-type CompactionLevel = "normal" | "aggressive" | "fallback";
+type CompactionLevel = "normal" | "aggressive" | "fallback" | "capped";
 type CompactionPass = "leaf" | "condensed";
 type CompactionSummarizeOptions = {
   previousSummary?: string;
@@ -1149,6 +1151,8 @@ export class CompactionEngine {
     sourceText: string;
     summarize: CompactionSummarizeFn;
     options?: CompactionSummarizeOptions;
+    /** Target token count for this summary kind (leaf or condensed). Used for hard-cap enforcement. */
+    targetTokens: number;
   }): Promise<{ content: string; level: CompactionLevel } | null> {
     const sourceText = params.sourceText.trim();
     if (!sourceText) {
@@ -1213,6 +1217,22 @@ export class CompactionEngine {
       if (estimateTokens(summaryText) >= inputTokens) {
         return buildDeterministicFallback();
       }
+    }
+
+    // Hard cap: enforce maximum summary size relative to the kind-appropriate target.
+    const summaryTokens = estimateTokens(summaryText);
+    const maxTokens = Math.ceil(params.targetTokens * this.config.summaryMaxOverageFactor);
+
+    if (summaryTokens > Math.ceil(params.targetTokens * 1.5)) {
+      console.warn(
+        `[lcm] summary exceeds target by ${Math.round((summaryTokens / params.targetTokens - 1) * 100)}%: ${summaryTokens} tokens vs target ${params.targetTokens}`,
+      );
+    }
+
+    if (summaryTokens > maxTokens) {
+      const maxChars = maxTokens * 4;
+      summaryText = `${summaryText.slice(0, maxChars)}\n[Capped from ${summaryTokens} tokens to ~${maxTokens}]`;
+      level = "capped";
     }
 
     return { content: summaryText, level };
@@ -1307,6 +1327,7 @@ export class CompactionEngine {
         previousSummary: previousSummaryContent,
         isCondensed: false,
       },
+      targetTokens: this.config.leafTargetTokens,
     });
     if (!summary) {
       console.warn(
@@ -1414,6 +1435,7 @@ export class CompactionEngine {
         isCondensed: true,
         depth: targetDepth + 1,
       },
+      targetTokens: this.config.condensedTargetTokens,
     });
     if (!condensed) {
       console.warn(

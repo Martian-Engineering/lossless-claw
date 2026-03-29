@@ -1064,6 +1064,7 @@ export class LcmContextEngine implements ContextEngine {
       condensedTargetTokens: this.config.condensedTargetTokens,
       maxRounds: 10,
       timezone: this.config.timezone,
+      summaryMaxOverageFactor: this.config.summaryMaxOverageFactor,
     };
     this.compaction = new CompactionEngine(
       this.conversationStore,
@@ -1187,6 +1188,12 @@ export class LcmContextEngine implements ContextEngine {
       return Math.floor(lp.tokenBudget);
     }
     return undefined;
+  }
+
+  /** Cap a resolved token budget against the configured maxAssemblyTokenBudget. */
+  private applyAssemblyBudgetCap(budget: number): number {
+    const cap = this.config.maxAssemblyTokenBudget;
+    return cap != null && cap > 0 ? Math.min(budget, cap) : budget;
   }
 
   /** Resolve an LCM conversation id from a session key via the session store. */
@@ -2133,7 +2140,7 @@ export class LcmContextEngine implements ContextEngine {
       runtimeContext: params.runtimeContext,
       legacyParams,
     });
-    const tokenBudget = resolvedTokenBudget ?? DEFAULT_AFTER_TURN_TOKEN_BUDGET;
+    const tokenBudget = this.applyAssemblyBudgetCap(resolvedTokenBudget ?? DEFAULT_AFTER_TURN_TOKEN_BUDGET);
     if (resolvedTokenBudget === undefined) {
       console.warn(
         `[lcm] afterTurn: tokenBudget not provided; using default ${DEFAULT_AFTER_TURN_TOKEN_BUDGET}`,
@@ -2220,12 +2227,13 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
-      const tokenBudget =
+      const tokenBudget = this.applyAssemblyBudgetCap(
         typeof params.tokenBudget === "number" &&
         Number.isFinite(params.tokenBudget) &&
         params.tokenBudget > 0
           ? Math.floor(params.tokenBudget)
-          : 128_000;
+          : 128_000,
+      );
 
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,

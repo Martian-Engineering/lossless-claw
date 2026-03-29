@@ -84,6 +84,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
+      summaryMaxOverageFactor: 3,
     },
     complete: vi.fn(),
     callGateway: (params: { method: string; params?: Record<string, unknown> }) =>

@@ -42,6 +42,10 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+  /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
+  maxAssemblyTokenBudget?: number;
+  /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
+  summaryMaxOverageFactor: number;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -185,5 +189,11 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+    maxAssemblyTokenBudget:
+      (env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET !== undefined ? parseInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET, 10) : undefined)
+        ?? toNumber(pc.maxAssemblyTokenBudget) ?? undefined,
+    summaryMaxOverageFactor:
+      (env.LCM_SUMMARY_MAX_OVERAGE_FACTOR !== undefined ? parseFloat(env.LCM_SUMMARY_MAX_OVERAGE_FACTOR) : undefined)
+        ?? toNumber(pc.summaryMaxOverageFactor) ?? 3,
   };
 }

@@ -45,6 +45,7 @@ function createTestConfig(databasePath: string): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    summaryMaxOverageFactor: 3,
   };
 }
 
@@ -3437,5 +3438,77 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
         targetTokens: 200_000,
       }),
     );
+  });
+});
+
+describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
+  it("caps token budget when maxAssemblyTokenBudget is set and runtime budget exceeds it", async () => {
+    const engine = createEngineWithConfig({ maxAssemblyTokenBudget: 5000 });
+    const sessionId = "session-budget-cap";
+
+    for (let i = 0; i < 20; i++) {
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: i % 2 === 0 ? "user" : "assistant",
+          content: `turn ${i} ${"x".repeat(400)}`,
+        } as AgentMessage,
+      });
+    }
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 200_000,
+    });
+
+    expect(result.estimatedTokens).toBeLessThanOrEqual(5000);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
+  });
+
+  it("uses full runtime budget when maxAssemblyTokenBudget is not set", async () => {
+    const engine = createEngine();
+    const sessionId = "session-no-cap";
+
+    for (let i = 0; i < 10; i++) {
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: i % 2 === 0 ? "user" : "assistant",
+          content: `turn ${i} ${"x".repeat(200)}`,
+        } as AgentMessage,
+      });
+    }
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 100_000,
+    });
+
+    expect(result.messages.length).toBe(10);
+  });
+
+  it("caps the 128k fallback when maxAssemblyTokenBudget is set and no runtime budget provided", async () => {
+    const engine = createEngineWithConfig({ maxAssemblyTokenBudget: 3000 });
+    const sessionId = "session-fallback-cap";
+
+    for (let i = 0; i < 20; i++) {
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: i % 2 === 0 ? "user" : "assistant",
+          content: `turn ${i} ${"x".repeat(400)}`,
+        } as AgentMessage,
+      });
+    }
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+    });
+
+    expect(result.estimatedTokens).toBeLessThanOrEqual(3000);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
   });
 });
