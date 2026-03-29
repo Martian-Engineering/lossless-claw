@@ -152,7 +152,7 @@ export function resolveLcmConfig(
         ?? toNumber(pc.leafChunkTokens) ?? 20000,
     leafTargetTokens:
       (env.LCM_LEAF_TARGET_TOKENS !== undefined ? parseInt(env.LCM_LEAF_TARGET_TOKENS, 10) : undefined)
-        ?? toNumber(pc.leafTargetTokens) ?? 1200,
+        ?? toNumber(pc.leafTargetTokens) ?? 2400,
     condensedTargetTokens:
       (env.LCM_CONDENSED_TARGET_TOKENS !== undefined ? parseInt(env.LCM_CONDENSED_TARGET_TOKENS, 10) : undefined)
         ?? toNumber(pc.condensedTargetTokens) ?? 2000,

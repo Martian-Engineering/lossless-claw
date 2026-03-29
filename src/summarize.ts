@@ -35,6 +35,7 @@ type ResolvedSummaryCandidate = SummaryResolutionCandidate & {
 
 type SummaryMode = "normal" | "aggressive";
 
+const DEFAULT_LEAF_TARGET_TOKENS = 2400;
 const DEFAULT_CONDENSED_TARGET_TOKENS = 2000;
 const LCM_SUMMARIZER_SYSTEM_PROMPT =
   "You are a context-compaction summarization engine. Follow user instructions exactly and return plain text summary content only.";
@@ -543,6 +544,15 @@ function extractResponseDiagnostics(result: unknown): string {
   if (typeof result.provider === "string" && result.provider.trim()) {
     parts.push(`resp_provider=${result.provider.trim()}`);
   }
+  if (typeof result.status === "string" && result.status.trim()) {
+    parts.push(`status=${result.status.trim()}`);
+  }
+  if (isRecord(result.incomplete_details) && typeof result.incomplete_details.reason === "string") {
+    const reason = result.incomplete_details.reason.trim();
+    if (reason) {
+      parts.push(`incomplete_reason=${reason}`);
+    }
+  }
   for (const key of [
     "request_provider",
     "request_model",
@@ -606,6 +616,50 @@ function extractResponseDiagnostics(result: unknown): string {
   return parts.join("; ");
 }
 
+/** Collect retry-worthy "incomplete" signals from Responses-style envelopes/items. */
+function collectIncompleteResponseSignals(
+  value: unknown,
+  out: Set<string>,
+  label = "response",
+  depth = 0,
+): void {
+  if (depth >= DIAGNOSTIC_MAX_DEPTH) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.slice(0, DIAGNOSTIC_MAX_ARRAY_ITEMS).forEach((entry, index) => {
+      collectIncompleteResponseSignals(entry, out, `${label}[${index}]`, depth + 1);
+    });
+    return;
+  }
+  if (!isRecord(value)) {
+    return;
+  }
+
+  if (typeof value.status === "string" && value.status.trim().toLowerCase() === "incomplete") {
+    out.add(`${label}.status=incomplete`);
+  }
+  if (isRecord(value.incomplete_details) && typeof value.incomplete_details.reason === "string") {
+    const reason = value.incomplete_details.reason.trim();
+    if (reason) {
+      out.add(`${label}.reason=${reason}`);
+    }
+  }
+
+  for (const key of ["content", "output", "message", "response", "items"] as const) {
+    if (key in value) {
+      collectIncompleteResponseSignals(value[key], out, `${label}.${key}`, depth + 1);
+    }
+  }
+}
+
+/** Extract retry-worthy incomplete-response diagnostics for provider envelopes/items. */
+function extractIncompleteResponseSignals(value: unknown): string[] {
+  const signals = new Set<string>();
+  collectIncompleteResponseSignals(value, signals);
+  return [...signals].sort((a, b) => a.localeCompare(b));
+}
+
 /**
  * Resolve a practical target token count for leaf and condensed summaries.
  * Aggressive leaf mode intentionally aims lower so compaction converges faster.
@@ -614,6 +668,7 @@ function resolveTargetTokens(params: {
   inputTokens: number;
   mode: SummaryMode;
   isCondensed: boolean;
+  leafTargetTokens: number;
   condensedTargetTokens: number;
 }): number {
   if (params.isCondensed) {
@@ -621,10 +676,12 @@ function resolveTargetTokens(params: {
   }
 
   const { inputTokens, mode } = params;
+  const leafTargetTokens = Math.max(192, params.leafTargetTokens);
   if (mode === "aggressive") {
-    return Math.max(96, Math.min(640, Math.floor(inputTokens * 0.2)));
+    const aggressiveCap = Math.max(96, Math.min(leafTargetTokens, Math.floor(leafTargetTokens * 0.55)));
+    return Math.max(96, Math.min(aggressiveCap, Math.floor(inputTokens * 0.2)));
   }
-  return Math.max(192, Math.min(1200, Math.floor(inputTokens * 0.35)));
+  return Math.max(192, Math.min(leafTargetTokens, Math.floor(inputTokens * 0.35)));
 }
 
 /**
@@ -1006,6 +1063,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     params.deps.config.condensedTargetTokens > 0
       ? params.deps.config.condensedTargetTokens
       : DEFAULT_CONDENSED_TARGET_TOKENS;
+  const leafTargetTokens =
+    Number.isFinite(params.deps.config.leafTargetTokens) &&
+    params.deps.config.leafTargetTokens > 0
+      ? params.deps.config.leafTargetTokens
+      : DEFAULT_LEAF_TARGET_TOKENS;
 
   const fn: LcmSummarizeFn = async (
     text: string,
@@ -1022,6 +1084,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       inputTokens: estimateTokens(text),
       mode,
       isCondensed,
+      leafTargetTokens,
       condensedTargetTokens,
     });
     const prompt = isCondensed
@@ -1207,15 +1270,24 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         }
       }
 
-      if (!summary) {
+      const incompleteSignals = extractIncompleteResponseSignals(result);
+      const initialSummary = summary;
+      const shouldRetryIncompleteSummary = summary.length > 0 && incompleteSignals.length > 0;
+
+      if (!summary || shouldRetryIncompleteSummary) {
         const responseDiag = extractResponseDiagnostics(result);
         const diagParts = [
-          `[lcm] empty normalized summary on first attempt`,
+          shouldRetryIncompleteSummary
+            ? `[lcm] incomplete summary response on first attempt`
+            : `[lcm] empty normalized summary on first attempt`,
           `provider=${provider}`,
           `model=${model}`,
           `block_types=${formatBlockTypes(normalized.blockTypes)}`,
           `response_blocks=${result.content.length}`,
         ];
+        if (incompleteSignals.length > 0) {
+          diagParts.push(`incomplete=${incompleteSignals.join(",")}`);
+        }
         if (responseDiag) {
           diagParts.push(responseDiag);
         }
@@ -1227,13 +1299,16 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         try {
           const retryResult = await attemptSummarizerCall("retry", "low");
           const retryNormalized = normalizeCompletionSummary(retryResult.content);
-          summary = retryNormalized.summary;
+          const retryEnvelopeNormalized = retryNormalized.summary
+            ? retryNormalized
+            : normalizeCompletionSummary(retryResult);
+          summary = retryEnvelopeNormalized.summary;
 
           if (summary) {
             summarySource = "retry";
             console.error(
               `[lcm] retry succeeded; provider=${provider}; model=${model}; ` +
-                `block_types=${formatBlockTypes(retryNormalized.blockTypes)}; source=retry`,
+                `block_types=${formatBlockTypes(retryEnvelopeNormalized.blockTypes)}; source=retry`,
             );
           } else {
             const retryDiag = extractResponseDiagnostics(retryResult);
@@ -1241,13 +1316,14 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               `[lcm] retry also returned empty summary`,
               `provider=${provider}`,
               `model=${model}`,
-              `block_types=${formatBlockTypes(retryNormalized.blockTypes)}`,
+              `block_types=${formatBlockTypes(retryEnvelopeNormalized.blockTypes)}`,
               `response_blocks=${retryResult.content.length}`,
             ];
             if (retryDiag) {
               retryParts.push(retryDiag);
             }
             console.error(`${retryParts.join("; ")}; falling back to truncation`);
+            summary = initialSummary;
           }
         } catch (retryErr) {
           if (retryErr instanceof LcmProviderAuthError) {
@@ -1267,6 +1343,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           console.warn(
             `[lcm] retry ${isRetryTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${SUMMARIZER_TIMEOUT_MS}ms; error=${retryErrMsg}; falling back to truncation`,
           );
+          summary = initialSummary;
         }
       }
 

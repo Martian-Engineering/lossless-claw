@@ -370,6 +370,27 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(completeMock.mock.calls[1]?.[0]?.temperature).toBeUndefined();
   });
 
+  it("honors configured leafTargetTokens for normal leaf summaries", async () => {
+    const deps = makeDeps();
+    deps.config.leafTargetTokens = 2400;
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    await summarize!("A".repeat(40_000), false);
+
+    const completeMock = vi.mocked(deps.complete);
+    expect(completeMock).toHaveBeenCalledTimes(1);
+    expect(completeMock.mock.calls[0]?.[0]?.maxTokens).toBe(2400);
+    const prompt = completeMock.mock.calls[0]?.[0]?.messages?.[0]?.content as string;
+    expect(prompt).toContain("Target length: about 2400 tokens or less.");
+  });
+
   it("uses condensed prompt mode for condensed summaries", async () => {
     const deps = makeDeps();
     const summarize = await createSummarizeFn({
@@ -1100,6 +1121,97 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         expect(diagnostics).toContain("retry also returned empty summary");
         expect(diagnostics).toContain("block_types=tool_use");
         expect(diagnostics).toContain('"type":"tool_use"');
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("retries when a non-empty summary comes from an incomplete top-level response", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        let callCount = 0;
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "gpt-5-mini",
+          })),
+          complete: vi.fn(async () => {
+            callCount += 1;
+            if (callCount === 1) {
+              return {
+                content: [{ type: "text", text: "Partial summary from incomplete response." }],
+                status: "incomplete",
+                incomplete_details: { reason: "max_output_tokens" },
+              };
+            }
+            return { content: [{ type: "text", text: "Recovered summary after incomplete retry." }] };
+          }),
+        });
+
+        const summarize = await createSummarizeFn({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5-mini" },
+        });
+
+        const summary = await summarize!("A".repeat(8_000), false);
+
+        expect(summary).toBe("Recovered summary after incomplete retry.");
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+        expect(vi.mocked(deps.complete).mock.calls[1]?.[0]?.reasoning).toBe("low");
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((call) => call.map((entry) => String(entry)))
+          .join(" ");
+        expect(diagnostics).toContain("incomplete summary response on first attempt");
+        expect(diagnostics).toContain("response.status=incomplete");
+        expect(diagnostics).toContain("response.reason=max_output_tokens");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+
+    it("retries when an incomplete message block still carries text output", async () => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        let callCount = 0;
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai",
+            model: "gpt-5-mini",
+          })),
+          complete: vi.fn(async () => {
+            callCount += 1;
+            if (callCount === 1) {
+              return {
+                content: [
+                  {
+                    type: "message",
+                    status: "incomplete",
+                    incomplete_details: { reason: "max_output_tokens" },
+                    content: [{ type: "output_text", text: "Partial text hidden in incomplete item." }],
+                  },
+                ],
+              };
+            }
+            return { content: [{ type: "text", text: "Recovered summary from incomplete item retry." }] };
+          }),
+        });
+
+        const summarize = await createSummarizeFn({
+          deps,
+          legacyParams: { provider: "openai", model: "gpt-5-mini" },
+        });
+
+        const summary = await summarize!("B".repeat(8_000), false);
+
+        expect(summary).toBe("Recovered summary from incomplete item retry.");
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+
+        const diagnostics = consoleError.mock.calls
+          .flatMap((call) => call.map((entry) => String(entry)))
+          .join(" ");
+        expect(diagnostics).toContain("response.content[0].status=incomplete");
+        expect(diagnostics).toContain("response.content[0].reason=max_output_tokens");
       } finally {
         consoleError.mockRestore();
       }
