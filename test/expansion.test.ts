@@ -27,6 +27,7 @@ const BASE_CONFIG: LcmConfig = {
   autocompactDisabled: false,
   timezone: "UTC",
   pruneHeartbeatOk: false,
+  summaryMaxOverageFactor: 3,
 };
 
 function makeExpansionResult() {

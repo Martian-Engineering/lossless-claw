@@ -91,6 +91,25 @@ The actual summary size depends on the LLM's output; these values are guidelines
 - Smaller chunks create summaries more frequently from less material.
 - This also affects the condensed minimum input threshold (10% of this value).
 
+### Maximum assembly token budget
+
+`LCM_MAX_ASSEMBLY_TOKEN_BUDGET` (default: none) caps the token budget used for context assembly and compaction threshold evaluation. When set, this takes precedence over both the 128k fallback and runtime-provided budgets.
+
+Set this if you're using a model with a smaller context window:
+
+- **8k models:** `LCM_MAX_ASSEMBLY_TOKEN_BUDGET=7000`
+- **32k models:** `LCM_MAX_ASSEMBLY_TOKEN_BUDGET=30000`
+- **128k+ models:** No need to set (128k fallback is appropriate)
+
+### Summary size cap
+
+`LCM_SUMMARY_MAX_OVERAGE_FACTOR` (default: `3`) controls the hard ceiling on summary sizes relative to the target tokens (`leafTargetTokens` for leaf summaries, `condensedTargetTokens` for condensed summaries).
+
+If a summary exceeds `overage_factor * target_tokens`, it is deterministically truncated. A warning is logged when any summary exceeds `1.5 * target_tokens`.
+
+- **Lower values** (e.g., 2) enforce tighter summaries but may truncate more often with weaker summarizer models.
+- **Higher values** (e.g., 5) allow more LLM flexibility but risk storing oversized summaries.
+
 ## Model selection
 
 LCM uses the same model as the parent OpenClaw session for summarization by default. You can override this:

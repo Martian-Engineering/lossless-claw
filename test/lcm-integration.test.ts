@@ -683,6 +683,7 @@ const defaultCompactionConfig: CompactionConfig = {
   leafTargetTokens: 600,
   condensedTargetTokens: 900,
   maxRounds: 10,
+  summaryMaxOverageFactor: 3,
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2876,5 +2877,118 @@ describe("LCM integration: media message annotation in compaction", () => {
     expect(summarizedText).not.toContain("[Media attachment]");
     expect(summarizedText).not.toContain("[with media attachment]");
     expect(summarizedText).toContain("Pure text message");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Test Suite: Summary size cap (summaryMaxOverageFactor)
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("LCM integration: summary size cap", () => {
+  let convStore: ReturnType<typeof createMockConversationStore>;
+  let sumStore: ReturnType<typeof createMockSummaryStore>;
+
+  beforeEach(() => {
+    convStore = createMockConversationStore();
+    sumStore = createMockSummaryStore();
+    wireStores(convStore, sumStore);
+  });
+
+  it("caps oversized leaf summary when exceeding summaryMaxOverageFactor * leafTargetTokens", async () => {
+    const compactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      leafTargetTokens: 100,
+      summaryMaxOverageFactor: 2,
+    });
+
+    await ingestMessages(convStore, sumStore, 12, {
+      contentFn: (i) => `Message ${i}: ${"x".repeat(2000)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarize = vi.fn(async () => {
+      return "A".repeat(2000);
+    });
+
+    const result = await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 100_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.level).toBe("capped");
+
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    const summaryItem = contextItems.find((ci) => ci.itemType === "summary");
+    expect(summaryItem).toBeDefined();
+    const summaryRecord = await sumStore.getSummary(summaryItem!.summaryId!);
+    expect(summaryRecord).toBeDefined();
+    expect(summaryRecord!.content).toContain("[Capped from");
+  });
+
+  it("does not cap summary within summaryMaxOverageFactor", async () => {
+    const compactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      leafTargetTokens: 100,
+      summaryMaxOverageFactor: 3,
+    });
+
+    await ingestMessages(convStore, sumStore, 12, {
+      contentFn: (i) => `Message ${i}: ${"x".repeat(2000)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarize = vi.fn(async () => {
+      return "B".repeat(800);
+    });
+
+    const result = await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 100_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.level).not.toBe("capped");
+
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    const summaryItem = contextItems.find((ci) => ci.itemType === "summary");
+    const summaryRecord = await sumStore.getSummary(summaryItem!.summaryId!);
+    expect(summaryRecord!.content).not.toContain("[Capped from");
+  });
+
+  it("warns when summary exceeds 1.5x target but stays under hard cap", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const compactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      leafTargetTokens: 100,
+      summaryMaxOverageFactor: 5,
+    });
+
+    await ingestMessages(convStore, sumStore, 12, {
+      contentFn: (i) => `Message ${i}: ${"x".repeat(2000)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarize = vi.fn(async () => {
+      return "C".repeat(800);
+    });
+
+    await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 100_000,
+      summarize,
+      force: true,
+    });
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] summary exceeds target"),
+    );
+
+    warnSpy.mockRestore();
   });
 });

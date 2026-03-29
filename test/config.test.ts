@@ -268,4 +268,31 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.expansionModel).toEqual({ type: "string" });
     expect(manifest.configSchema.properties.expansionProvider).toEqual({ type: "string" });
   });
+
+  it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {
+    const config = resolveLcmConfig({}, {});
+    expect(config.summaryMaxOverageFactor).toBe(3);
+    expect(config.maxAssemblyTokenBudget).toBeUndefined();
+  });
+
+  it("reads summaryMaxOverageFactor and maxAssemblyTokenBudget from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      summaryMaxOverageFactor: 5,
+      maxAssemblyTokenBudget: 30000,
+    });
+    expect(config.summaryMaxOverageFactor).toBe(5);
+    expect(config.maxAssemblyTokenBudget).toBe(30000);
+  });
+
+  it("env vars override summaryMaxOverageFactor and maxAssemblyTokenBudget", () => {
+    const config = resolveLcmConfig({
+      LCM_SUMMARY_MAX_OVERAGE_FACTOR: "2.5",
+      LCM_MAX_ASSEMBLY_TOKEN_BUDGET: "16000",
+    } as NodeJS.ProcessEnv, {
+      summaryMaxOverageFactor: 5,
+      maxAssemblyTokenBudget: 30000,
+    });
+    expect(config.summaryMaxOverageFactor).toBe(2.5);
+    expect(config.maxAssemblyTokenBudget).toBe(16000);
+  });
 });
