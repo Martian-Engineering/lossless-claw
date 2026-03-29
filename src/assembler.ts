@@ -642,8 +642,8 @@ interface ResolvedItem {
 
 // ── BM25-lite relevance scorer ────────────────────────────────────────────────
 
-/** Tokenize text into lowercase alphanumeric terms. */
-function tokenizeText(text: string): string[] {
+/** @internal Exported for testing only. Tokenize text into lowercase alphanumeric terms. */
+export function tokenizeText(text: string): string[] {
   return text
     .toLowerCase()
     .split(/[^a-z0-9]+/)
@@ -651,11 +651,11 @@ function tokenizeText(text: string): string[] {
 }
 
 /**
+ * @internal Exported for testing only.
  * Score an item's text against a prompt using BM25-lite (term-frequency overlap).
- * Returns a score in [0, 1] range relative to the number of prompt terms matched.
- * Returns 0 when either input is empty.
+ * Higher scores indicate stronger keyword overlap. Returns 0 when either input is empty.
  */
-function scoreRelevance(itemText: string, prompt: string): number {
+export function scoreRelevance(itemText: string, prompt: string): number {
   const promptTerms = tokenizeText(prompt);
   if (promptTerms.length === 0) return 0;
 
