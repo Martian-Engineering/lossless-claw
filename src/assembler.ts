@@ -817,6 +817,16 @@ export class ContextAssembler {
     }
 
     const parts = await this.conversationStore.getMessageParts(msg.messageId);
+
+    // Skip empty assistant messages left by error/aborted responses.
+    // These waste context tokens and can confuse models that reject
+    // consecutive empty assistant turns.  Only skip when both the stored
+    // content text AND the message_parts table are empty — assistant
+    // messages that contain tool calls have empty text content but
+    // non-empty parts and must be preserved.
+    if (msg.role === "assistant" && !msg.content.trim() && parts.length === 0) {
+      return null;
+    }
     const roleFromStore = toRuntimeRole(msg.role, parts);
     const isToolResult = roleFromStore === "toolResult";
     const toolCallId = isToolResult ? pickToolCallId(parts) : undefined;
