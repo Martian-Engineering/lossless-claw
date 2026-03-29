@@ -201,6 +201,15 @@ function collectBlockTypes(value: unknown, out: Set<string>): void {
   }
 }
 
+/** Treat provider reasoning/thinking payloads as diagnostics, not summary text. */
+function isReasoningLikeType(type: unknown): boolean {
+  if (typeof type !== "string") {
+    return false;
+  }
+  const normalized = type.trim().toLowerCase();
+  return normalized.includes("reasoning") || normalized.includes("thinking");
+}
+
 /** Collect text payloads from common provider response shapes. */
 function collectTextLikeFields(value: unknown, out: string[]): void {
   if (Array.isArray(value)) {
@@ -213,7 +222,11 @@ function collectTextLikeFields(value: unknown, out: string[]): void {
     return;
   }
 
-  for (const key of ["text", "output_text", "thinking"]) {
+  if (isReasoningLikeType(value.type)) {
+    return;
+  }
+
+  for (const key of ["text", "output_text"]) {
     appendTextValue(value[key], out);
   }
   for (const key of ["content", "summary", "output", "message", "response"]) {

@@ -577,7 +577,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     }
   });
 
-  it("normalizes OpenAI output_text and reasoning summary blocks", async () => {
+  it("ignores reasoning summary blocks when assistant output text is present", async () => {
     const deps = makeDeps({
       resolveModel: vi.fn(() => ({
         provider: "openai",
@@ -608,8 +608,8 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const summary = await summarize!("Input segment");
 
-    expect(summary).toContain("Reasoning summary line.");
-    expect(summary).toContain("Final condensed summary.");
+    expect(summary).toBe("Final condensed summary.");
+    expect(summary).not.toContain("Reasoning summary line.");
   });
 
   it("logs provider/model/block diagnostics when normalized summary is empty", async () => {
@@ -646,6 +646,71 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  it("does not treat thinking-only completions as summary content", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "openai",
+          model: "gpt-5-mini",
+        })),
+        complete: vi.fn(async () => ({
+          content: [{ type: "thinking", thinking: "Need to plan the summary first." }],
+        })),
+      });
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: {
+          provider: "openai",
+          model: "gpt-5-mini",
+        },
+      });
+
+      const summary = await summarize!("F".repeat(8_000), false);
+
+      expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+
+      const diagnostics = consoleError.mock.calls
+        .flatMap((call) => call.map((entry) => String(entry)))
+        .join(" ");
+      expect(diagnostics).toContain("block_types=thinking");
+      expect(diagnostics).toContain("empty normalized summary on first attempt");
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("drops thinking blocks when a completion also contains text output", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "openai",
+        model: "gpt-5-mini",
+      })),
+      complete: vi.fn(async () => ({
+        content: [
+          { type: "thinking", thinking: "Need to inspect the message chronology." },
+          { type: "output_text", text: "User fixed summary normalization regression." },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "openai",
+        model: "gpt-5-mini",
+      },
+    });
+
+    const summary = await summarize!("G".repeat(4_000), false);
+
+    expect(summary).toBe("User fixed summary normalization regression.");
+    expect(summary).not.toContain("Need to inspect the message chronology.");
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
   });
 
   // --- Empty-summary hardening: focused tests ---
