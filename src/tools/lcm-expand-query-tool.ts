@@ -532,10 +532,13 @@ export function createLcmExpandQueryTool(input: {
 
         const expansionProvider = input.deps.config.expansionProvider || undefined;
         const expansionModel = input.deps.config.expansionModel || undefined;
+        const canonicalExpansionModel = expansionModel?.includes("/") ? expansionModel : undefined;
+        const delegatedOverrideProvider = canonicalExpansionModel ? undefined : expansionProvider;
+        const delegatedOverrideModel = canonicalExpansionModel || expansionModel;
         const configuredOverrideLabel =
-          expansionProvider && expansionModel
-            ? `${expansionProvider}/${expansionModel}`
-            : expansionModel || expansionProvider || "configured override";
+          delegatedOverrideProvider && delegatedOverrideModel
+            ? `${delegatedOverrideProvider}/${delegatedOverrideModel}`
+            : delegatedOverrideModel || delegatedOverrideProvider || "configured override";
 
         const runDelegatedQuery = async (provider?: string, model?: string) => {
           const childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
@@ -664,7 +667,7 @@ export function createLcmExpandQueryTool(input: {
         }
 
         try {
-          return await runDelegatedQuery(expansionProvider, expansionModel);
+          return await runDelegatedQuery(delegatedOverrideProvider, delegatedOverrideModel);
         } catch (error) {
           const failure = formatExpansionFailure(error);
           input.deps.log.warn(

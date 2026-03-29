@@ -266,7 +266,7 @@ describe("createLcmExpandQueryTool", () => {
     expect(callGatewayMock).not.toHaveBeenCalled();
   });
 
-  it("passes expansion provider and model overrides to delegated agent runs", async () => {
+  it("passes split expansion provider and model overrides to delegated agent runs", async () => {
     const retrieval = makeRetrieval();
     retrieval.describe.mockResolvedValue({
       type: "summary",
@@ -333,8 +333,79 @@ describe("createLcmExpandQueryTool", () => {
       .find((entry) => entry.method === "agent");
 
     expect(agentCall?.params).toMatchObject({
-      provider: "openrouter",
       model: "anthropic/claude-haiku-4-5",
+    });
+  });
+
+  it("normalizes canonical expansion model refs before delegated agent runs", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        return { runId: "run-canonical-override" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Handled by canonical override test.",
+                    citedIds: ["sum_a"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 1234,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const deps = makeDeps();
+    const tool = createLcmExpandQueryTool({
+      deps: {
+        ...deps,
+        config: {
+          ...deps.config,
+          expansionProvider: "openai-codex",
+          expansionModel: "openai/gpt-5-mini",
+        },
+      },
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    await tool.execute("call-canonical-overrides", {
+      summaryIds: ["sum_a"],
+      prompt: "Answer this",
+      conversationId: 42,
+    });
+
+    const agentCall = callGatewayMock.mock.calls
+      .map(([opts]) => opts as { method?: string; params?: Record<string, unknown> })
+      .find((entry) => entry.method === "agent");
+
+    expect(agentCall?.params).not.toHaveProperty("provider");
+    expect(agentCall?.params).toMatchObject({
+      model: "openai/gpt-5-mini",
     });
   });
 
