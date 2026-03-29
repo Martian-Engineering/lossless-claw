@@ -2878,3 +2878,200 @@ describe("LCM integration: media message annotation in compaction", () => {
     expect(summarizedText).toContain("Pure text message");
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Test Suite: Prompt-Aware Context Assembly
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("prompt-aware eviction", () => {
+  let convStore: ReturnType<typeof createMockConversationStore>;
+  let sumStore: ReturnType<typeof createMockSummaryStore>;
+  let assembler: ContextAssembler;
+
+  beforeEach(() => {
+    convStore = createMockConversationStore();
+    sumStore = createMockSummaryStore();
+    wireStores(convStore, sumStore);
+    assembler = new ContextAssembler(convStore as any, sumStore as any);
+  });
+
+  /**
+   * Helper: insert a summary into the summary store and append to context items.
+   * The summary content is used as the scoring text.
+   */
+  async function addSummary(content: string, summaryId: string): Promise<void> {
+    await sumStore.insertSummary({
+      summaryId,
+      conversationId: CONV_ID,
+      kind: "leaf",
+      content,
+      tokenCount: estimateTokens(content),
+    });
+    await sumStore.appendContextSummary(CONV_ID, summaryId);
+  }
+
+  it("prefers relevant summaries over irrelevant ones when prompt is set", async () => {
+    // Budget is tight: only one of the two summaries fits in the evictable window.
+    // The relevant summary should win.
+    const irrelevantContent = "painting brushes canvas art watercolor oils"; // ~46 chars → ~12 tokens
+    const relevantContent = "authentication login password security token"; // ~45 chars → ~12 tokens
+
+    // Add irrelevant summary first (older ordinal) then relevant summary (newer ordinal)
+    await addSummary(irrelevantContent, "sum_irrelevant");
+    await addSummary(relevantContent, "sum_relevant");
+
+    // Add fresh tail messages (they are always kept regardless)
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Fresh message ${i}`,
+    });
+
+    // Budget: each summary is ~12 tokens. Fresh tail = 4 messages * ~15 tokens each = ~60 tokens.
+    // Total budget = 75: fresh tail uses ~60, leaving ~15 for evictable.
+    // Only one summary fits. With prompt matching "authentication", the relevant one should be kept.
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 75,
+      freshTailCount: 4,
+      prompt: "how does authentication work",
+    });
+
+    const contents = result.messages.map((m) => extractMessageText(m.content)).join("\n");
+    expect(contents).toContain("authentication");
+    expect(contents).not.toContain("painting brushes");
+  });
+
+  it("falls back to chronological order when no prompt is provided", async () => {
+    // Same setup as above but no prompt. Chronological means newest-first evictable.
+    const olderContent = "authentication login password security token";
+    const newerContent = "painting brushes canvas art watercolor oils";
+
+    await addSummary(olderContent, "sum_older");
+    await addSummary(newerContent, "sum_newer");
+
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Fresh message ${i}`,
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 75,
+      freshTailCount: 4,
+      // no prompt
+    });
+
+    const contents = result.messages.map((m) => extractMessageText(m.content)).join("\n");
+    // Chronological: newer summary (painting) kept, older one (authentication) dropped
+    expect(contents).toContain("painting");
+    expect(contents).not.toContain("authentication login");
+  });
+
+  it("empty string prompt falls back to chronological eviction", async () => {
+    const olderContent = "authentication login password security token";
+    const newerContent = "painting brushes canvas art watercolor oils";
+
+    await addSummary(olderContent, "sum_older");
+    await addSummary(newerContent, "sum_newer");
+
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Fresh message ${i}`,
+    });
+
+    // Empty string prompt should behave identically to no prompt
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 75,
+      freshTailCount: 4,
+      prompt: "",
+    });
+
+    const contents = result.messages.map((m) => extractMessageText(m.content)).join("\n");
+    // Chronological: newer summary kept
+    expect(contents).toContain("painting");
+    expect(contents).not.toContain("authentication login");
+  });
+
+  it("when budget fits everything, prompt has no effect on output", async () => {
+    await addSummary("authentication login security", "sum_auth");
+    await addSummary("painting canvas watercolor", "sum_art");
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => `Message ${i}`,
+    });
+
+    // Large budget fits everything
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 100_000,
+      freshTailCount: 2,
+      prompt: "authentication",
+    });
+
+    // All 4 items present (2 summaries + 2 messages)
+    expect(result.messages).toHaveLength(4);
+    expect(result.stats.summaryCount).toBe(2);
+    expect(result.stats.rawMessageCount).toBe(2);
+  });
+
+  it("single evictable item: kept if it fits, dropped if it does not", async () => {
+    // The summary content acts as a sentinel we can search for in output messages.
+    // "x".repeat(400) = 400 chars ≈ 100 tokens when formatted as XML.
+    const bigContent = "x".repeat(400);
+    await addSummary(bigContent, "sum_big");
+
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Fresh message ${i}`,
+    });
+
+    const hasSummaryInOutput = (messages: { content: unknown }[]): boolean =>
+      messages.some((m) => extractMessageText(m.content).includes("x".repeat(10)));
+
+    // Small budget: fresh tail uses ~16 tokens, remaining budget ~54; summary is ~125 tokens → dropped
+    const smallBudgetResult = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 70,
+      freshTailCount: 4,
+      prompt: "irrelevant query",
+    });
+    expect(hasSummaryInOutput(smallBudgetResult.messages)).toBe(false);
+
+    // Large budget: summary fits regardless of prompt relevance
+    const largeBudgetResult = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 500,
+      freshTailCount: 4,
+      prompt: "irrelevant query",
+    });
+    expect(hasSummaryInOutput(largeBudgetResult.messages)).toBe(true);
+  });
+
+  it("output messages are in chronological order even with prompt-aware eviction", async () => {
+    // Add 3 summaries. The relevant one is the oldest (lowest ordinal).
+    await addSummary("authentication login password security", "sum_auth"); // ordinal 1
+    await addSummary("painting canvas art colors", "sum_art");              // ordinal 2
+    await addSummary("gardening plants flowers soil", "sum_garden");        // ordinal 3
+
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Fresh message ${i}`,
+    });
+
+    // Budget tight: only 1 summary fits from evictable
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 80,
+      freshTailCount: 4,
+      prompt: "how does authentication work",
+    });
+
+    // The relevant summary should be kept
+    const contents = result.messages.map((m) => extractMessageText(m.content)).join("\n");
+    expect(contents).toContain("authentication");
+
+    // Verify output is still in chronological order (summary before fresh messages)
+    const summaryIdx = result.messages.findIndex((m) =>
+      extractMessageText(m.content).includes("authentication"),
+    );
+    const freshIdx = result.messages.findIndex((m) =>
+      extractMessageText(m.content).includes("Fresh message"),
+    );
+    expect(summaryIdx).toBeLessThan(freshIdx);
+  });
+});

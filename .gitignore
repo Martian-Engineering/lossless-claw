@@ -8,3 +8,7 @@ dist/
 tui/lcm-tui
 dist/
 tui/tui
+
+# CE planning artifacts
+docs/plans/
+TASK.md

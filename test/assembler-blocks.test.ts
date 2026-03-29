@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { toolCallBlockFromPart, toolResultBlockFromPart, blockFromPart } from "../src/assembler.js";
+import {
+  toolCallBlockFromPart,
+  toolResultBlockFromPart,
+  blockFromPart,
+  tokenizeText,
+  scoreRelevance,
+} from "../src/assembler.js";
 import type { MessagePartRecord } from "../src/store/conversation-store.js";
 
 /**
@@ -546,5 +552,78 @@ describe("blockFromPart", () => {
     const block = blockFromPart(part) as Record<string, unknown>;
 
     expect(block.id).toBe("toolu_lcm_test-part-1");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// tokenizeText
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("tokenizeText", () => {
+  it("splits on non-alphanumeric characters and lowercases", () => {
+    expect(tokenizeText("Hello World")).toEqual(["hello", "world"]);
+  });
+
+  it("filters out single-character tokens", () => {
+    expect(tokenizeText("I am a test")).toEqual(["am", "test"]);
+  });
+
+  it("returns empty array for empty string", () => {
+    expect(tokenizeText("")).toEqual([]);
+  });
+
+  it("returns empty array for whitespace-only input", () => {
+    expect(tokenizeText("   ")).toEqual([]);
+  });
+
+  it("handles mixed punctuation and numbers", () => {
+    expect(tokenizeText("auth2 login-flow v3.1")).toEqual(["auth2", "login", "flow", "v3"]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// scoreRelevance
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("scoreRelevance", () => {
+  it("returns 0 when prompt is empty", () => {
+    expect(scoreRelevance("some item text", "")).toBe(0);
+  });
+
+  it("returns 0 when item text is empty", () => {
+    expect(scoreRelevance("", "some prompt")).toBe(0);
+  });
+
+  it("returns 0 when there is no keyword overlap", () => {
+    expect(scoreRelevance("painting canvas watercolor", "authentication login")).toBe(0);
+  });
+
+  it("returns positive score when keywords overlap", () => {
+    const score = scoreRelevance("authentication login password security", "how does authentication work");
+    expect(score).toBeGreaterThan(0);
+  });
+
+  it("scores higher for more matching terms", () => {
+    const oneMatch = scoreRelevance("authentication painting canvas", "authentication login security");
+    const twoMatches = scoreRelevance("authentication login canvas", "authentication login security");
+    expect(twoMatches).toBeGreaterThan(oneMatch);
+  });
+
+  it("deduplicates prompt terms (repeated prompt words don't inflate score)", () => {
+    const single = scoreRelevance("authentication login", "authentication");
+    const repeated = scoreRelevance("authentication login", "authentication authentication authentication");
+    expect(repeated).toBe(single);
+  });
+
+  it("handles case-insensitive matching", () => {
+    const score = scoreRelevance("Authentication LOGIN", "authentication login");
+    expect(score).toBeGreaterThan(0);
+  });
+
+  it("ignores single-character terms from prompt", () => {
+    const score = scoreRelevance("login page handler", "I need a login");
+    const direct = scoreRelevance("login page handler", "login");
+    expect(score).toBeGreaterThan(0);
+    expect(direct).toBeGreaterThan(0);
   });
 });
