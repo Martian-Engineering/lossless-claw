@@ -2120,6 +2120,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(promptAddition).toContain("maps to details, not the details themselves");
     expect(promptAddition).toContain("Use LCM tools first for compacted conversation history");
     expect(promptAddition).toContain("prefer any available memory/recall tool");
+    expect(promptAddition).toContain("If newer evidence conflicts with an older summary or recollection, prefer the newer evidence");
+    expect(promptAddition).toContain("If facts seem contradictory or uncertain, verify with LCM tools before answering");
     expect(promptAddition).not.toContain("qmd");
     expect(promptAddition).not.toContain("memory_search as last resort");
     // Tool escalation
@@ -2180,6 +2182,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(promptAddition).toContain("3) Answer with citations to summary IDs used");
     // Uncertainty checklist
     expect(promptAddition).toContain("Uncertainty checklist");
+    expect(promptAddition).toContain("Am I relying on an older summary even though newer evidence disagrees?");
     expect(promptAddition).toContain("Am I making exact factual claims from a condensed summary?");
     expect(promptAddition).toContain("Could compaction have omitted a crucial detail?");
     // Refusal-to-guess
