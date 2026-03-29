@@ -59,6 +59,8 @@ openclaw plugins install --link /path/to/lossless-claw
 
 The install command records the plugin, enables it, and applies compatible slot selection (including `contextEngine` when applicable).
 
+> **Note:** If your OpenClaw config uses `plugins.allow`, make sure both `lossless-claw` and any active plugins you rely on remain allowlisted. In some setups, narrowing the allowlist can prevent plugin-backed integrations from loading, even if `lossless-claw` itself is installed correctly. Restart the gateway after plugin config changes.
+
 ### Configure OpenClaw
 
 In most cases, no manual JSON edits are needed after `openclaw plugins install`.
