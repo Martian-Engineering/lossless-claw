@@ -1511,12 +1511,12 @@ const lcmPlugin = {
 
     logStartupBannerOnce({
       key: "plugin-loaded",
-      log: (message) => api.logger.info(message),
+      log: (message) => api.logger.debug(message),
       message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
     });
     logStartupBannerOnce({
       key: "compaction-model",
-      log: (message) => api.logger.info(message),
+      log: (message) => api.logger.debug(message),
       message: buildCompactionModelLog({
         config: deps.config,
         defaultModelRef: readDefaultModelFromConfig(api.config),
