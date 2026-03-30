@@ -1238,10 +1238,14 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     try {
+      const customInstructions =
+        params.customInstructions !== undefined
+          ? params.customInstructions
+          : (this.config.customInstructions || undefined);
       const runtimeSummarizer = await createLcmSummarizeFromLegacyParams({
         deps: this.deps,
         legacyParams: lp,
-        customInstructions: params.customInstructions || this.config.customInstructions || undefined,
+        customInstructions,
       });
       if (runtimeSummarizer) {
         return { summarize: runtimeSummarizer.fn, summaryModel: runtimeSummarizer.model };
@@ -1278,6 +1282,7 @@ export class LcmContextEngine implements ContextEngine {
       const result = await createLcmSummarizeFromLegacyParams({
         deps: this.deps,
         legacyParams: { provider, model },
+        customInstructions: this.config.customInstructions || undefined,
       });
       if (!result) {
         return undefined;

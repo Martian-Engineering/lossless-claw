@@ -46,6 +46,7 @@ function createTestConfig(databasePath: string): LcmConfig {
     timezone: "UTC",
     pruneHeartbeatOk: false,
     summaryMaxOverageFactor: 3,
+    customInstructions: "",
   };
 }
 
@@ -3106,6 +3107,69 @@ describe("LcmContextEngine fidelity and token budget", () => {
 // ── Compact token budget plumbing ───────────────────────────────────────────
 
 describe("LcmContextEngine.compact token budget plumbing", () => {
+  it("preserves explicit empty-string customInstructions overrides over config defaults", async () => {
+    const completeSpy = vi.fn(async () => ({
+      content: [{ type: "text", text: "summary output" }],
+    }));
+    const engine = createEngineWithDeps(
+      { customInstructions: "Write in third person." },
+      { complete: completeSpy },
+    );
+    const privateEngine = engine as unknown as {
+      resolveSummarize: (params: {
+        legacyParams?: Record<string, unknown>;
+        customInstructions?: string;
+      }) => Promise<{
+        summarize: (text: string, aggressive?: boolean) => Promise<string>;
+        summaryModel: string;
+      }>;
+    };
+
+    const { summarize } = await privateEngine.resolveSummarize({
+      legacyParams: { provider: "anthropic", model: "claude-opus-4-5" },
+      customInstructions: "",
+    });
+
+    await summarize("segment text");
+
+    const firstCall = completeSpy.mock.calls[0]?.[0] as
+      | { messages?: Array<{ content?: string }> }
+      | undefined;
+    const prompt = firstCall?.messages?.[0]?.content;
+    expect(typeof prompt).toBe("string");
+    expect(prompt).toContain("Operator instructions: (none)");
+    expect(prompt).not.toContain("Write in third person.");
+  });
+
+  it("forwards config customInstructions to large-file summarization", async () => {
+    const completeSpy = vi.fn(async () => ({
+      content: [{ type: "text", text: "summary output" }],
+    }));
+    const engine = createEngineWithDeps(
+      {
+        customInstructions: "Use terse factual prose.",
+        largeFileSummaryProvider: "anthropic",
+        largeFileSummaryModel: "claude-opus-4-5",
+      },
+      { complete: completeSpy },
+    );
+    const privateEngine = engine as unknown as {
+      resolveLargeFileTextSummarizer: () => Promise<((prompt: string) => Promise<string | null>) | undefined>;
+    };
+
+    const summarizeText = await privateEngine.resolveLargeFileTextSummarizer();
+    expect(summarizeText).toBeTypeOf("function");
+
+    await summarizeText!("Large file prompt");
+
+    const firstCall = completeSpy.mock.calls[0]?.[0] as
+      | { messages?: Array<{ content?: string }> }
+      | undefined;
+    const prompt = firstCall?.messages?.[0]?.content;
+    expect(typeof prompt).toBe("string");
+    expect(prompt).toContain("Operator instructions:\nUse terse factual prose.");
+  });
+
   it("fails when compact token budget is missing", async () => {
     const engine = createEngine();
     const sessionId = "session-missing-budget";
