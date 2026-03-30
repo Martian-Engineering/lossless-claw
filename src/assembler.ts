@@ -676,10 +676,10 @@ function mergeFreshTailWithMatchingToolResults(
   return merged;
 }
 
-function dropNonFreshUnpairedAssistantToolCalls(
+function filterNonFreshAssistantToolCalls(
   items: ResolvedItem[],
   freshTailOrdinals: Set<number>,
-): ResolvedItem[] {
+): AgentMessage[] {
   const availableToolResultIds = new Set<string>();
   for (const item of items) {
     const toolResultId = extractToolResultIdFromMessage(item.message);
@@ -688,18 +688,48 @@ function dropNonFreshUnpairedAssistantToolCalls(
     }
   }
 
-  return items.filter((item) => {
+  const filteredMessages: AgentMessage[] = [];
+  for (const item of items) {
     if (item.message?.role !== "assistant" || freshTailOrdinals.has(item.ordinal)) {
-      return true;
+      filteredMessages.push(item.message);
+      continue;
     }
 
-    const toolCallIds = extractToolCallIdsFromAssistant(item.message);
-    if (toolCallIds.length === 0) {
-      return true;
+    if (!Array.isArray(item.message.content)) {
+      filteredMessages.push(item.message);
+      continue;
     }
 
-    return toolCallIds.every((toolCallId) => availableToolResultIds.has(toolCallId));
-  });
+    let removedAny = false;
+    const content = item.message.content.filter((block) => {
+      if (!block || typeof block !== "object") {
+        return true;
+      }
+      const record = block as { type?: unknown; id?: unknown; call_id?: unknown };
+      if (typeof record.type !== "string" || !TOOL_CALL_TYPES.has(record.type)) {
+        return true;
+      }
+      const toolCallId = extractToolCallId(record);
+      if (!toolCallId || availableToolResultIds.has(toolCallId)) {
+        return true;
+      }
+      removedAny = true;
+      return false;
+    });
+
+    if (content.length === 0) {
+      continue;
+    }
+    if (!removedAny) {
+      filteredMessages.push(item.message);
+      continue;
+    }
+    filteredMessages.push({
+      ...item.message,
+      content: content as typeof item.message.content,
+    } as AgentMessage);
+  }
+  return filteredMessages;
 }
 
 /** Format a Date for XML attributes in the agent's timezone. */
@@ -903,8 +933,7 @@ export class ContextAssembler {
 
     // Normalize assistant string content to array blocks (some providers return
     // content as a plain string; Anthropic expects content block arrays).
-    const selectedMessages = dropNonFreshUnpairedAssistantToolCalls(selected, freshTailOrdinals);
-    const rawMessages = selectedMessages.map((item) => item.message);
+    const rawMessages = filterNonFreshAssistantToolCalls(selected, freshTailOrdinals);
     for (let i = 0; i < rawMessages.length; i++) {
       const msg = rawMessages[i];
       if (msg?.role === "assistant" && typeof msg.content === "string") {

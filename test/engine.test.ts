@@ -1982,6 +1982,68 @@ describe("LcmContextEngine.assemble canonical path", () => {
     ).toBe(false);
   });
 
+  it("preserves non-tool content and matched tool calls when older assistant turns have stale orphaned calls", async () => {
+    const engine = createEngine();
+    const sessionId = "session-historical-mixed-tool-result";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Let me check two things." },
+          { type: "toolCall", id: "call_kept", name: "read", input: { path: "kept.txt" } },
+          { type: "toolCall", id: "call_dropped", name: "read", input: { path: "dropped.txt" } },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_kept",
+        toolName: "read",
+        content: [{ type: "text", text: "kept result" }],
+      } as AgentMessage,
+    });
+
+    for (let i = 0; i < 8; i += 1) {
+      await engine.ingest({
+        sessionId,
+        message: { role: "user", content: `fresh message ${i}` } as AgentMessage,
+      });
+    }
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const assistantMessage = result.messages.find(
+      (message) => message.role === "assistant" && Array.isArray(message.content),
+    );
+    expect(assistantMessage).toBeDefined();
+    expect(assistantMessage?.content).toEqual([
+      { type: "text", text: "Let me check two things." },
+      { type: "toolCall", id: "call_kept", name: "read", arguments: { path: "kept.txt" } },
+    ]);
+    expect(
+      result.messages.some(
+        (message) =>
+          message.role === "toolResult" &&
+          (message as { toolCallId?: string }).toolCallId === "call_kept",
+      ),
+    ).toBe(true);
+    expect(
+      result.messages.some(
+        (message) =>
+          message.role === "toolResult" &&
+          (message as { toolCallId?: string }).toolCallId === "call_dropped",
+      ),
+    ).toBe(false);
+  });
+
   it("repairs OpenAI function_call transcripts without dropping reasoning blocks", async () => {
     const engine = createEngine();
     const sessionId = "session-openai-function-call";
