@@ -88,6 +88,30 @@ function estimateTokens(content: string): number {
   return Math.ceil(content.length / 4);
 }
 
+/** Deterministically cap summary text so the persisted output stays within maxTokens. */
+function capSummaryText(
+  content: string,
+  originalTokens: number,
+  maxTokens: number,
+): string {
+  const suffixes = [
+    `\n[Capped from ${originalTokens} tokens to ~${maxTokens}]`,
+    `\n[Capped to ~${maxTokens}]`,
+    "\n[Capped]",
+    "",
+  ];
+
+  for (const suffix of suffixes) {
+    const maxChars = Math.max(0, maxTokens * 4 - suffix.length);
+    const capped = `${content.slice(0, maxChars)}${suffix}`;
+    if (estimateTokens(capped) <= maxTokens) {
+      return capped;
+    }
+  }
+
+  return content.slice(0, Math.max(0, maxTokens * 4));
+}
+
 /** Format a timestamp as `YYYY-MM-DD HH:mm TZ` for prompt source text. */
 export function formatTimestamp(value: Date, timezone: string = "UTC"): string {
   try {
@@ -1230,8 +1254,7 @@ export class CompactionEngine {
     }
 
     if (summaryTokens > maxTokens) {
-      const maxChars = maxTokens * 4;
-      summaryText = `${summaryText.slice(0, maxChars)}\n[Capped from ${summaryTokens} tokens to ~${maxTokens}]`;
+      summaryText = capSummaryText(summaryText, summaryTokens, maxTokens);
       level = "capped";
     }
 

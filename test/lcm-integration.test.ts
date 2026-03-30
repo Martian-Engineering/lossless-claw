@@ -2926,6 +2926,7 @@ describe("LCM integration: summary size cap", () => {
     const summaryRecord = await sumStore.getSummary(summaryItem!.summaryId!);
     expect(summaryRecord).toBeDefined();
     expect(summaryRecord!.content).toContain("[Capped from");
+    expect(summaryRecord!.tokenCount).toBeLessThanOrEqual(200);
   });
 
   it("does not cap summary within summaryMaxOverageFactor", async () => {

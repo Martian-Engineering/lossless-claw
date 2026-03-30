@@ -2332,11 +2332,14 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
-        const tokenBudget = this.resolveTokenBudget({
+        const resolvedTokenBudget = this.resolveTokenBudget({
           tokenBudget: params.tokenBudget,
           runtimeContext: params.runtimeContext,
           legacyParams,
         });
+        const tokenBudget = resolvedTokenBudget
+          ? this.applyAssemblyBudgetCap(resolvedTokenBudget)
+          : resolvedTokenBudget;
         if (!tokenBudget) {
           return {
             ok: false,
@@ -2446,11 +2449,14 @@ export class LcmContextEngine implements ContextEngine {
           }
         ).manualCompaction === true;
       const forceCompaction = force || manualCompactionRequested;
-      const tokenBudget = this.resolveTokenBudget({
+      const resolvedTokenBudget = this.resolveTokenBudget({
         tokenBudget: params.tokenBudget,
         runtimeContext: params.runtimeContext,
         legacyParams,
       });
+      const tokenBudget = resolvedTokenBudget
+        ? this.applyAssemblyBudgetCap(resolvedTokenBudget)
+        : resolvedTokenBudget;
       if (!tokenBudget) {
         return {
           ok: false,

@@ -3511,4 +3511,97 @@ describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
     expect(result.estimatedTokens).toBeLessThanOrEqual(3000);
     expect(result.estimatedTokens).toBeGreaterThan(0);
   });
+
+  it("caps token budget in compact when maxAssemblyTokenBudget is set", async () => {
+    const engine = createEngineWithConfig({ maxAssemblyTokenBudget: 5000 });
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 6000,
+      threshold: 3750,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 6000,
+        tokensAfter: 4500,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "compact-budget-cap",
+      message: { role: "user", content: "trigger compact budget cap" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "compact-budget-cap",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 200_000,
+      compactionTarget: "threshold",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 5000);
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 5000,
+      }),
+    );
+  });
+
+  it("caps token budget in compactLeafAsync when maxAssemblyTokenBudget is set", async () => {
+    const engine = createEngineWithConfig({ maxAssemblyTokenBudget: 4096 });
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactLeaf: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const compactLeafSpy = vi
+      .spyOn(privateEngine.compaction, "compactLeaf")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 6000,
+        tokensAfter: 3500,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "compact-leaf-budget-cap",
+      message: { role: "user", content: "trigger compact leaf budget cap" } as AgentMessage,
+    });
+
+    const result = await engine.compactLeafAsync({
+      sessionId: "compact-leaf-budget-cap",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 200_000,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(compactLeafSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 4096,
+      }),
+    );
+  });
 });
