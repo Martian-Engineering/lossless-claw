@@ -1,5 +1,23 @@
 # @martian-engineering/lossless-claw
 
+## 0.5.3
+
+### Patch Changes
+
+- [#228](https://github.com/Martian-Engineering/lossless-claw/pull/228) [`2f5735d`](https://github.com/Martian-Engineering/lossless-claw/commit/2f5735d5e81f3eec2aa2c09d1b62e706e5e0a3b4) Thanks [@jalehman](https://github.com/jalehman)! - Make compaction summarization fall back to the next resolved model when the preferred model times out or returns repeated empty provider errors, and make the startup banner reflect the same compaction model precedence used at runtime.
+
+- [#221](https://github.com/Martian-Engineering/lossless-claw/pull/221) [`9fa4f3d`](https://github.com/Martian-Engineering/lossless-claw/commit/9fa4f3d0b8de013f089e6160025d88cd1e48c76a) Thanks [@jalehman](https://github.com/jalehman)! - Raise the default protected fresh tail to 64 messages and make incremental compaction run one condensed pass by default.
+
+- [#224](https://github.com/Martian-Engineering/lossless-claw/pull/224) [`1fd2a44`](https://github.com/Martian-Engineering/lossless-claw/commit/1fd2a44889411fd1fea3621a9b29aeee4b4e60fe) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Add a configurable delegated expansion timeout for `lcm_expand_query` via plugin config (`delegationTimeoutMs`) and `LCM_DELEGATION_TIMEOUT_MS`.
+
+- [#223](https://github.com/Martian-Engineering/lossless-claw/pull/223) [`028f171`](https://github.com/Martian-Engineering/lossless-claw/commit/028f17182350c120bf94f81781be3c9fbf11b206) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Expose `leafChunkTokens` as a first-class plugin config option so deployments can tune leaf compaction frequency without patching the plugin manifest.
+
+- [#220](https://github.com/Martian-Engineering/lossless-claw/pull/220) [`8f84d8e`](https://github.com/Martian-Engineering/lossless-claw/commit/8f84d8ebfbe2163e6624fffa7468ef0de928a9da) Thanks [@jalehman](https://github.com/jalehman)! - Improve LongMemEval compaction and retrieval reliability by filtering reasoning text from summaries, retrying truncated summaries, hardening delegated expansion, and falling back to raw-message search in shallow trees.
+
+- [#205](https://github.com/Martian-Engineering/lossless-claw/pull/205) [`ef4865f`](https://github.com/Martian-Engineering/lossless-claw/commit/ef4865fb13a1a8e373a045c0dd2a907ae1bbbfde) Thanks [@aquaright1](https://github.com/aquaright1)! - Preserve assistant text and matched tool calls when pruning stale orphaned tool calls from assembled context.
+
+- [#211](https://github.com/Martian-Engineering/lossless-claw/pull/211) [`7975a1e`](https://github.com/Martian-Engineering/lossless-claw/commit/7975a1e86f1d58808ef0d1bb0677c6e993f30c5e) Thanks [@GodsBoy](https://github.com/GodsBoy)! - Fix compaction cap handling so capped summaries stay within the configured token limit and direct compaction APIs respect `maxAssemblyTokenBudget`.
+
 ## 0.5.2
 
 ### Patch Changes
