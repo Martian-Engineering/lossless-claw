@@ -649,4 +649,29 @@ export function runLcmMigrations(
       SELECT summary_id, content FROM summaries;
     `);
   }
+
+  // ── CJK trigram FTS table ────────────────────────────────────────────────
+  // FTS5 unicode61 (porter) tokenizer cannot segment CJK ideographs, so CJK
+  // queries currently fall back to a LIKE path with AND logic.  When the user's
+  // phrasing doesn't match the summary verbatim (e.g. "端到端测试结果" vs
+  // "端到端测试"), ALL terms must match and the query returns 0 candidates.
+  //
+  // A trigram-tokenized table indexes every 3-character substring, enabling
+  // native CJK substring matching via FTS5 MATCH with OR semantics.
+  const cjkTableExists = db
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summaries_fts_cjk'",
+    )
+    .get();
+  if (!cjkTableExists) {
+    db.exec(`
+      CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
+        summary_id UNINDEXED,
+        content,
+        tokenize='trigram'
+      );
+      INSERT INTO summaries_fts_cjk(summary_id, content)
+      SELECT summary_id, content FROM summaries;
+    `);
+  }
 }
