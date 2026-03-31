@@ -19,7 +19,7 @@
     },
     "newSessionRetainDepth": {
       "label": "New Session Retain Depth",
-      "help": "Summary depth retained after /new (-1 keeps all summaries, 2 keeps d2+)"
+      "help": "Context retained after /new (-1 keeps all context, 2 keeps d2+)"
     },
     "dbPath": {
       "label": "Database Path",

@@ -56,8 +56,8 @@ For coding conversations with tool calls (which generate many messages per logic
 
 `LCM_NEW_SESSION_RETAIN_DEPTH` (default `2`) controls what survives OpenClaw's `/new` command.
 
-- `-1` keeps all summaries and drops only fresh-tail message items.
-- `0` currently behaves the same as `-1`, because all summaries are kept.
+- `-1` keeps all existing context items, making `/new` a transcript-only reset from lossless-claw's perspective.
+- `0` drops only fresh-tail message items and keeps all summaries.
 - `1` drops d0 summaries and keeps d1+.
 - `2` drops d0 and d1 summaries, keeping d2+ project-arc context. This is the recommended default.
 - `3+` keeps only deeper, more abstract summaries.

@@ -125,7 +125,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_SKIP_STATELESS_SESSIONS` | `true` | Enable stateless-session write skipping for matching session keys |
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window that triggers compaction (0.0–1.0) |
 | `LCM_FRESH_TAIL_COUNT` | `64` | Number of recent messages protected from compaction |
-| `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | Summary depth retained after `/new` (`-1` keeps all summaries, `2` keeps d2+) |
+| `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | Context retained after `/new` (`-1` keeps all context, `2` keeps d2+) |
 | `LCM_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |
 | `LCM_CONDENSED_MIN_FANOUT` | `4` | Minimum summaries per condensed node |
 | `LCM_CONDENSED_MIN_FANOUT_HARD` | `2` | Relaxed fanout for forced compaction sweeps |
@@ -227,8 +227,8 @@ Lossless-claw distinguishes OpenClaw's two session-reset commands:
 
 `newSessionRetainDepth` (or `LCM_NEW_SESSION_RETAIN_DEPTH`) controls how much summary structure survives `/new`:
 
-- `-1`: keep all summaries, drop only fresh-tail messages
-- `0`: same as `-1` for current summary depths
+- `-1`: keep all existing context items
+- `0`: keep all summaries, drop only fresh-tail messages
 - `1`: keep d1+ summaries
 - `2`: keep d2+ summaries; recommended default
 - `3+`: keep only deeper, more abstract summaries

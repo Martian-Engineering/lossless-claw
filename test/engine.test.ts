@@ -850,8 +850,47 @@ describe("LcmContextEngine before_reset lifecycle", () => {
     expect(remainingItems[0]?.summaryId).toBe("sum_d2");
   });
 
-  it("keeps summaries but drops fresh-tail messages on /new when retain depth is -1", async () => {
+  it("keeps all context items on /new when retain depth is -1", async () => {
     const engine = createEngineWithConfig({ newSessionRetainDepth: -1 });
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const conversationStore = engine.getConversationStore();
+    const summaryStore = engine.getSummaryStore();
+
+    const conversation = await conversationStore.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+    const message = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "first",
+      tokenCount: 5,
+    });
+    await summaryStore.appendContextMessage(conversation.conversationId, message.messageId);
+    await summaryStore.insertSummary({
+      summaryId: "sum_keep",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "keep me",
+      tokenCount: 10,
+    });
+    await summaryStore.appendContextSummary(conversation.conversationId, "sum_keep");
+
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: "uuid-2",
+      sessionKey: "agent:main:main",
+    });
+
+    const remainingItems = await summaryStore.getContextItems(conversation.conversationId);
+    expect(remainingItems).toHaveLength(2);
+    expect(remainingItems[0]?.messageId).toBe(message.messageId);
+    expect(remainingItems[1]?.summaryId).toBe("sum_keep");
+  });
+
+  it("drops fresh-tail messages but keeps all summaries on /new when retain depth is 0", async () => {
+    const engine = createEngineWithConfig({ newSessionRetainDepth: 0 });
     (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
     const conversationStore = engine.getConversationStore();
     const summaryStore = engine.getSummaryStore();
