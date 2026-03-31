@@ -221,6 +221,18 @@ describe("resolveLcmConfig", () => {
     expect(config.delegationTimeoutMs).toBe(180000);
   });
 
+  it("falls back to plugin delegationTimeoutMs when env value is invalid", () => {
+    const config = resolveLcmConfig(
+      {
+        LCM_DELEGATION_TIMEOUT_MS: "not-a-number",
+      } as NodeJS.ProcessEnv,
+      {
+        delegationTimeoutMs: 300000,
+      },
+    );
+    expect(config.delegationTimeoutMs).toBe(300000);
+  });
+
   it("keeps empty ignore session patterns out of resolved config", () => {
     const config = resolveLcmConfig(
       { LCM_IGNORE_SESSION_PATTERNS: " agent:*:cron:* , , " } as NodeJS.ProcessEnv,

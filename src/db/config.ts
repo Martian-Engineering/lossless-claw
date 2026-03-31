@@ -110,7 +110,7 @@ export function resolveLcmConfig(
   const pc = pluginConfig ?? {};
   const envDelegationTimeoutMs =
     env.LCM_DELEGATION_TIMEOUT_MS !== undefined
-      ? parseInt(env.LCM_DELEGATION_TIMEOUT_MS, 10)
+      ? toNumber(env.LCM_DELEGATION_TIMEOUT_MS)
       : undefined;
 
   return {
