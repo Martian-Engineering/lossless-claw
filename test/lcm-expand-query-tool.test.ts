@@ -81,6 +81,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileSummaryModel: "",
       expansionProvider: "",
       expansionModel: "",
+      delegationTimeoutMs: 120000,
       autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
@@ -692,7 +693,7 @@ describe("createLcmExpandQueryTool", () => {
     });
 
     expect(result.details).toMatchObject({
-      error: expect.stringContaining("timed out"),
+      error: "lcm_expand_query timed out waiting for delegated expansion (120s).",
     });
 
     const methods = callGatewayMock.mock.calls.map(
@@ -707,6 +708,66 @@ describe("createLcmExpandQueryTool", () => {
       timeout: 1,
       success: 0,
     });
+  });
+
+  it("uses configured delegationTimeoutMs for delegated wait timeout", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    const waitCalls: Array<{ paramsTimeoutMs?: unknown; timeoutMs?: unknown }> = [];
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as {
+        method?: string;
+        params?: Record<string, unknown>;
+        timeoutMs?: unknown;
+      };
+      if (request.method === "agent") {
+        return { runId: "run-timeout-configured" };
+      }
+      if (request.method === "agent.wait") {
+        waitCalls.push({
+          paramsTimeoutMs: request.params?.timeoutMs,
+          timeoutMs: request.timeoutMs,
+        });
+        return { status: "timeout" };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const deps = makeDeps();
+    const tool = createLcmExpandQueryTool({
+      deps: {
+        ...deps,
+        config: {
+          ...deps.config,
+          delegationTimeoutMs: 300000,
+        },
+      },
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-timeout-config", {
+      summaryIds: ["sum_a"],
+      prompt: "Summarize root cause",
+      conversationId: 42,
+    });
+
+    expect(result.details).toMatchObject({
+      error: "lcm_expand_query timed out waiting for delegated expansion (300s).",
+    });
+    expect(waitCalls).toEqual([
+      {
+        paramsTimeoutMs: 300000,
+        timeoutMs: 300000,
+      },
+    ]);
   });
 
   it("cleans up delegated session and grant when agent call fails", async () => {

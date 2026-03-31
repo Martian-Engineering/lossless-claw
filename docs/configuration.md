@@ -132,6 +132,8 @@ When more than one source is present, compaction summarization resolves in this 
 
 If `summaryModel` already includes a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that choice.
 
+For delegated `lcm_expand_query` runs, you can extend the sub-agent wait window with `delegationTimeoutMs` (plugin config) or `LCM_DELEGATION_TIMEOUT_MS` (environment variable). The default is `120000` milliseconds.
+
 ## Session controls
 
 ### Excluding sessions entirely

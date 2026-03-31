@@ -49,6 +49,10 @@
       "label": "Expansion Provider",
       "help": "Provider override for lcm_expand_query sub-agent (e.g., 'anthropic')"
     },
+    "delegationTimeoutMs": {
+      "label": "Delegation Timeout (ms)",
+      "help": "Maximum time to wait for delegated lcm_expand_query sub-agent completion before timing out"
+    },
     "maxAssemblyTokenBudget": {
       "label": "Max Assembly Token Budget",
       "help": "Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
@@ -131,6 +135,10 @@
       },
       "expansionProvider": {
         "type": "string"
+      },
+      "delegationTimeoutMs": {
+        "type": "integer",
+        "minimum": 1
       },
       "maxAssemblyTokenBudget": {
         "type": "integer",

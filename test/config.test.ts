@@ -181,6 +181,13 @@ describe("resolveLcmConfig", () => {
     expect(config.expansionProvider).toBe("anthropic");
   });
 
+  it("reads delegationTimeoutMs from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      delegationTimeoutMs: 300000,
+    });
+    expect(config.delegationTimeoutMs).toBe(300000);
+  });
+
   it("defaults expansionModel and expansionProvider to empty string", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.expansionModel).toBe("");
@@ -200,6 +207,18 @@ describe("resolveLcmConfig", () => {
     );
     expect(config.expansionModel).toBe("anthropic/claude-sonnet-4-6");
     expect(config.expansionProvider).toBe("openrouter");
+  });
+
+  it("env var overrides delegationTimeoutMs", () => {
+    const config = resolveLcmConfig(
+      {
+        LCM_DELEGATION_TIMEOUT_MS: "180000",
+      } as NodeJS.ProcessEnv,
+      {
+        delegationTimeoutMs: 300000,
+      },
+    );
+    expect(config.delegationTimeoutMs).toBe(180000);
   });
 
   it("keeps empty ignore session patterns out of resolved config", () => {
@@ -270,9 +289,13 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.incrementalMaxDepth.minimum).toBe(-1);
   });
 
-  it("ships a manifest with expansionModel and expansionProvider in schema", () => {
+  it("ships a manifest with expansionModel, expansionProvider, and delegationTimeoutMs in schema", () => {
     expect(manifest.configSchema.properties.expansionModel).toEqual({ type: "string" });
     expect(manifest.configSchema.properties.expansionProvider).toEqual({ type: "string" });
+    expect(manifest.configSchema.properties.delegationTimeoutMs).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
   });
 
   it("ships a manifest with leafChunkTokens in schema", () => {
@@ -284,6 +307,7 @@ describe("resolveLcmConfig", () => {
 
   it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {
     const config = resolveLcmConfig({}, {});
+    expect(config.delegationTimeoutMs).toBe(120000);
     expect(config.summaryMaxOverageFactor).toBe(3);
     expect(config.maxAssemblyTokenBudget).toBeUndefined();
   });

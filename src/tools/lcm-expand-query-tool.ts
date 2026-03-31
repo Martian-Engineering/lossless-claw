@@ -21,7 +21,7 @@ import {
   stampDelegatedExpansionContext,
 } from "./lcm-expansion-recursion-guard.js";
 
-const DELEGATED_WAIT_TIMEOUT_MS = 120_000;
+const DEFAULT_DELEGATED_WAIT_TIMEOUT_MS = 120_000;
 const GATEWAY_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_ANSWER_TOKENS = 2_000;
 
@@ -450,6 +450,10 @@ export function createLcmExpandQueryTool(input: {
   /** Session key for scope fallback when sessionId is unavailable. */
   sessionKey?: string;
 }): AnyAgentTool {
+  const delegatedWaitTimeoutMs =
+    input.deps.config.delegationTimeoutMs || DEFAULT_DELEGATED_WAIT_TIMEOUT_MS;
+  const delegatedWaitTimeoutSeconds = Math.ceil(delegatedWaitTimeoutMs / 1000);
+
   return {
     name: "lcm_expand_query",
     label: "LCM Expand Query",
@@ -644,7 +648,7 @@ export function createLcmExpandQueryTool(input: {
               issuerSessionId: callerSessionKey || "main",
               allowedConversationIds: [sourceConversationId],
               tokenCap: expansionTokenCap,
-              ttlMs: DELEGATED_WAIT_TIMEOUT_MS + 30_000,
+              ttlMs: delegatedWaitTimeoutMs + 30_000,
             });
             stampDelegatedExpansionContext({
               sessionKey: childSessionKey,
@@ -686,9 +690,9 @@ export function createLcmExpandQueryTool(input: {
               method: "agent.wait",
               params: {
                 runId,
-                timeoutMs: DELEGATED_WAIT_TIMEOUT_MS,
+                timeoutMs: delegatedWaitTimeoutMs,
               },
-              timeoutMs: DELEGATED_WAIT_TIMEOUT_MS,
+              timeoutMs: delegatedWaitTimeoutMs,
             })) as { status?: string; error?: unknown };
             const status = typeof wait?.status === "string" ? wait.status : "error";
             if (status === "timeout") {
@@ -703,7 +707,7 @@ export function createLcmExpandQueryTool(input: {
                 runId,
               });
               throw new Error(
-                "lcm_expand_query timed out waiting for delegated expansion (120s).",
+                `lcm_expand_query timed out waiting for delegated expansion (${delegatedWaitTimeoutSeconds}s).`,
               );
             }
             if (status !== "ok") {
