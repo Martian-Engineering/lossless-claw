@@ -108,6 +108,10 @@ export function resolveLcmConfig(
   pluginConfig?: Record<string, unknown>,
 ): LcmConfig {
   const pc = pluginConfig ?? {};
+  const envDelegationTimeoutMs =
+    env.LCM_DELEGATION_TIMEOUT_MS !== undefined
+      ? parseInt(env.LCM_DELEGATION_TIMEOUT_MS, 10)
+      : undefined;
 
   return {
     enabled:
@@ -184,9 +188,7 @@ export function resolveLcmConfig(
       env.LCM_EXPANSION_PROVIDER?.trim() ?? toStr(pc.expansionProvider) ?? "",
     expansionModel:
       env.LCM_EXPANSION_MODEL?.trim() ?? toStr(pc.expansionModel) ?? "",
-    delegationTimeoutMs:
-      (env.LCM_DELEGATION_TIMEOUT_MS !== undefined ? parseInt(env.LCM_DELEGATION_TIMEOUT_MS, 10) : undefined)
-        ?? toNumber(pc.delegationTimeoutMs) ?? 120000,
+    delegationTimeoutMs: envDelegationTimeoutMs ?? toNumber(pc.delegationTimeoutMs) ?? 120000,
     autocompactDisabled:
       env.LCM_AUTOCOMPACT_DISABLED !== undefined
         ? env.LCM_AUTOCOMPACT_DISABLED === "true"
