@@ -13,6 +13,10 @@
       "label": "Fresh Tail Count",
       "help": "Number of recent messages protected from compaction"
     },
+    "leafChunkTokens": {
+      "label": "Leaf Chunk Tokens",
+      "help": "Maximum source tokens per leaf compaction chunk before summarization"
+    },
     "dbPath": {
       "label": "Database Path",
       "help": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
@@ -75,6 +79,10 @@
         "minimum": -1
       },
       "freshTailCount": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "leafChunkTokens": {
         "type": "integer",
         "minimum": 1
       },

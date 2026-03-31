@@ -95,6 +95,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
         "enabled": true,
         "config": {
           "freshTailCount": 64,
+          "leafChunkTokens": 80000,
           "contextThreshold": 0.75,
           "incrementalMaxDepth": 1,
           "ignoreSessionPatterns": [
@@ -109,7 +110,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 }
 ```
 
-`summaryModel` and `summaryProvider` let you pin compaction summarization to a cheaper or faster model than your main OpenClaw session model. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). When unset, both fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
+`leafChunkTokens` controls how many source tokens can accumulate in a leaf compaction chunk before summarization is triggered. The default is `20000`, but quota-limited summary providers may benefit from a larger value to reduce compaction frequency. `summaryModel` and `summaryProvider` let you pin compaction summarization to a cheaper or faster model than your main OpenClaw session model. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). When unset, both fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
 
 ### Environment variables
 
@@ -199,11 +200,13 @@ If `summaryModel` already includes a provider prefix such as `anthropic/claude-s
 
 ```
 LCM_FRESH_TAIL_COUNT=64
+LCM_LEAF_CHUNK_TOKENS=20000
 LCM_INCREMENTAL_MAX_DEPTH=1
 LCM_CONTEXT_THRESHOLD=0.75
 ```
 
 - **freshTailCount=64** protects the last 64 messages from compaction, giving the model more recent context for continuity.
+- **leafChunkTokens=20000** limits how large each leaf compaction chunk can grow before LCM summarizes it. Increase this when your summary provider is quota-limited and frequent leaf compactions are exhausting that quota.
 - **incrementalMaxDepth=1** runs one condensed pass after each leaf compaction by default. Set to `0` for leaf-only behavior, a larger positive integer for a deeper cap, or `-1` for unlimited cascading.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
 
