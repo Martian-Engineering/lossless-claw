@@ -116,13 +116,22 @@ function makeRetrieval() {
   };
 }
 
+function makeSummaryStore() {
+  return {
+    getConversationMaxSummaryDepth: vi.fn(),
+    getLeafSummaryLinksForMessageIds: vi.fn(),
+  };
+}
+
 function makeEngine(params: {
   retrieval: ReturnType<typeof makeRetrieval>;
+  summaryStore?: ReturnType<typeof makeSummaryStore>;
   conversationId?: number;
 }): LcmContextEngine {
   return {
     info: { id: "lcm", name: "LCM", version: "0.0.0" },
     getRetrieval: () => params.retrieval,
+    getSummaryStore: () => params.summaryStore ?? makeSummaryStore(),
     getConversationStore: () => ({
       getConversationBySessionId: vi.fn(async () =>
         typeof params.conversationId === "number"
@@ -834,6 +843,306 @@ describe("createLcmExpandQueryTool", () => {
       sourceConversationId: 7,
       expandedSummaryCount: 2,
       citedIds: ["sum_x", "sum_y"],
+    });
+  });
+
+  it("falls back to messages for shallow trees when summary grep misses", async () => {
+    const retrieval = makeRetrieval();
+    const summaryStore = makeSummaryStore();
+    retrieval.grep
+      .mockResolvedValueOnce({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            messageId: 101,
+            conversationId: 7,
+            role: "user",
+            snippet: "rollback the deploy",
+            createdAt: new Date("2026-01-01T00:02:00.000Z"),
+          },
+        ],
+        summaries: [],
+        totalMatches: 1,
+      });
+    summaryStore.getConversationMaxSummaryDepth.mockResolvedValue(1);
+    summaryStore.getLeafSummaryLinksForMessageIds.mockResolvedValue([
+      {
+        messageId: 101,
+        summaryId: "sum_leaf",
+      },
+    ]);
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        return { runId: "run-shallow-fallback" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "The rollback note only appears in the raw leaf messages.",
+                    citedIds: ["sum_leaf"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 800,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval, summaryStore, conversationId: 7 }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-shallow-fallback", {
+      query: "rollback deploy",
+      prompt: "What happened?",
+    });
+
+    expect(retrieval.grep).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        query: "rollback deploy",
+        mode: "full_text",
+        scope: "summaries",
+        conversationId: 7,
+      }),
+    );
+    expect(retrieval.grep).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        query: "rollback deploy",
+        mode: "full_text",
+        scope: "messages",
+        conversationId: 7,
+      }),
+    );
+    expect(summaryStore.getConversationMaxSummaryDepth).toHaveBeenCalledWith(7);
+    expect(summaryStore.getLeafSummaryLinksForMessageIds).toHaveBeenCalledWith(7, [101]);
+
+    const agentCall = callGatewayMock.mock.calls
+      .map(([opts]) => opts as { method?: string; params?: Record<string, unknown> })
+      .find((entry) => entry.method === "agent");
+    const rawMessage = agentCall?.params?.message;
+    expect(typeof rawMessage).toBe("string");
+    const message = typeof rawMessage === "string" ? rawMessage : "";
+    expect(message).toContain("Seed summary IDs: sum_leaf");
+    expect(message).toContain("Seed summaries requiring raw message expansion: sum_leaf");
+
+    expect(result.details).toMatchObject({
+      answer: "The rollback note only appears in the raw leaf messages.",
+      citedIds: ["sum_leaf"],
+      sourceConversationId: 7,
+      expandedSummaryCount: 1,
+    });
+  });
+
+  it("does not fall back to message grep for deep trees", async () => {
+    const retrieval = makeRetrieval();
+    const summaryStore = makeSummaryStore();
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [],
+      totalMatches: 0,
+    });
+    summaryStore.getConversationMaxSummaryDepth.mockResolvedValue(2);
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval, summaryStore, conversationId: 7 }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-deep-no-fallback", {
+      query: "rollback deploy",
+      prompt: "What happened?",
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledTimes(1);
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: "summaries",
+        conversationId: 7,
+      }),
+    );
+    expect(summaryStore.getConversationMaxSummaryDepth).toHaveBeenCalledWith(7);
+    expect(summaryStore.getLeafSummaryLinksForMessageIds).not.toHaveBeenCalled();
+    expect(callGatewayMock).not.toHaveBeenCalled();
+    expect(result.details).toMatchObject({
+      answer: "No matching summaries found for this scope.",
+      citedIds: [],
+      sourceConversationId: 7,
+      expandedSummaryCount: 0,
+    });
+  });
+
+  it("maps message hits to parent leaf summary ids before delegating", async () => {
+    const retrieval = makeRetrieval();
+    const summaryStore = makeSummaryStore();
+    retrieval.grep
+      .mockResolvedValueOnce({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            messageId: 302,
+            conversationId: 7,
+            role: "assistant",
+            snippet: "second raw fact",
+            createdAt: new Date("2026-01-01T00:03:00.000Z"),
+          },
+          {
+            messageId: 301,
+            conversationId: 7,
+            role: "user",
+            snippet: "first raw fact",
+            createdAt: new Date("2026-01-01T00:02:00.000Z"),
+          },
+        ],
+        summaries: [],
+        totalMatches: 2,
+      });
+    summaryStore.getConversationMaxSummaryDepth.mockResolvedValue(0);
+    summaryStore.getLeafSummaryLinksForMessageIds.mockResolvedValue([
+      {
+        messageId: 302,
+        summaryId: "sum_b",
+      },
+      {
+        messageId: 301,
+        summaryId: "sum_a",
+      },
+      {
+        messageId: 301,
+        summaryId: "sum_a",
+      },
+    ]);
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        return { runId: "run-message-map" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Mapped through leaf summaries.",
+                    citedIds: ["sum_b", "sum_a"],
+                    expandedSummaryCount: 2,
+                    totalSourceTokens: 900,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval, summaryStore, conversationId: 7 }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    await tool.execute("call-message-map", {
+      query: "raw fact",
+      prompt: "What facts are present?",
+    });
+
+    const agentCall = callGatewayMock.mock.calls
+      .map(([opts]) => opts as { method?: string; params?: Record<string, unknown> })
+      .find((entry) => entry.method === "agent");
+    const rawMessage = agentCall?.params?.message;
+    expect(typeof rawMessage).toBe("string");
+    const message = typeof rawMessage === "string" ? rawMessage : "";
+    expect(message).toContain("Seed summary IDs: sum_b, sum_a");
+    expect(message).toContain("Seed summaries requiring raw message expansion: sum_b, sum_a");
+  });
+
+  it("excludes fresh-tail message hits that are not linked to any summary", async () => {
+    const retrieval = makeRetrieval();
+    const summaryStore = makeSummaryStore();
+    retrieval.grep
+      .mockResolvedValueOnce({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            messageId: 999,
+            conversationId: 7,
+            role: "user",
+            snippet: "fresh tail fact",
+            createdAt: new Date("2026-01-01T00:04:00.000Z"),
+          },
+        ],
+        summaries: [],
+        totalMatches: 1,
+      });
+    summaryStore.getConversationMaxSummaryDepth.mockResolvedValue(1);
+    summaryStore.getLeafSummaryLinksForMessageIds.mockResolvedValue([]);
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval, summaryStore, conversationId: 7 }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-fresh-tail-skip", {
+      query: "fresh tail fact",
+      prompt: "What facts are present?",
+    });
+
+    expect(summaryStore.getLeafSummaryLinksForMessageIds).toHaveBeenCalledWith(7, [999]);
+    expect(callGatewayMock).not.toHaveBeenCalled();
+    expect(result.details).toMatchObject({
+      answer: "No matching summaries found for this scope.",
+      citedIds: [],
+      sourceConversationId: 7,
+      expandedSummaryCount: 0,
     });
   });
 

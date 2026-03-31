@@ -45,6 +45,11 @@ export type SummarySubtreeNodeRecord = SummaryRecord & {
   childCount: number;
 };
 
+export type MessageLeafSummaryLinkRecord = {
+  messageId: number;
+  summaryId: string;
+};
+
 export type ContextItemRecord = {
   conversationId: number;
   ordinal: number;
@@ -170,6 +175,15 @@ interface TokenSumRow {
 
 interface MessageIdRow {
   message_id: number;
+}
+
+interface MaxDepthRow {
+  max_depth: number | null;
+}
+
+interface MessageLeafSummaryLinkRow {
+  message_id: number;
+  summary_id: string;
 }
 
 interface LargeFileRow {
@@ -458,6 +472,72 @@ export class SummaryStore {
       )
       .all(summaryId) as unknown as MessageIdRow[];
     return rows.map((r) => r.message_id);
+  }
+
+  /**
+   * Return the deepest persisted summary depth for a conversation.
+   */
+  async getConversationMaxSummaryDepth(conversationId: number): Promise<number | null> {
+    const row = this.db
+      .prepare(
+        `SELECT MAX(depth) AS max_depth
+         FROM summaries
+         WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as MaxDepthRow | undefined;
+    return typeof row?.max_depth === "number" ? row.max_depth : null;
+  }
+
+  /**
+   * Resolve raw message hits back to their linked leaf summaries.
+   */
+  async getLeafSummaryLinksForMessageIds(
+    conversationId: number,
+    messageIds: number[],
+  ): Promise<MessageLeafSummaryLinkRecord[]> {
+    const normalizedMessageIds = Array.from(
+      new Set(
+        messageIds.filter(
+          (messageId): messageId is number => Number.isInteger(messageId) && messageId > 0,
+        ),
+      ),
+    );
+    if (normalizedMessageIds.length === 0) {
+      return [];
+    }
+
+    const placeholders = normalizedMessageIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT sm.message_id, sm.summary_id
+         FROM summary_messages sm
+         JOIN summaries s ON s.summary_id = sm.summary_id
+         WHERE s.conversation_id = ?
+           AND s.kind = 'leaf'
+           AND sm.message_id IN (${placeholders})
+         ORDER BY sm.ordinal ASC, s.created_at ASC`,
+      )
+      .all(conversationId, ...normalizedMessageIds) as unknown as MessageLeafSummaryLinkRow[];
+
+    const summaryIdsByMessageId = new Map<number, string[]>();
+    for (const row of rows) {
+      const existing = summaryIdsByMessageId.get(row.message_id) ?? [];
+      if (!existing.includes(row.summary_id)) {
+        existing.push(row.summary_id);
+        summaryIdsByMessageId.set(row.message_id, existing);
+      }
+    }
+
+    const orderedLinks: MessageLeafSummaryLinkRecord[] = [];
+    for (const messageId of normalizedMessageIds) {
+      for (const summaryId of summaryIdsByMessageId.get(messageId) ?? []) {
+        orderedLinks.push({
+          messageId,
+          summaryId,
+        });
+      }
+    }
+    return orderedLinks;
   }
 
   async getSummaryChildren(parentSummaryId: string): Promise<SummaryRecord[]> {
