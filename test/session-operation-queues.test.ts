@@ -48,6 +48,10 @@ function createTestConfig(databasePath: string): LcmConfig {
     timezone: "UTC",
     pruneHeartbeatOk: false,
     summaryMaxOverageFactor: 3,
+    expansionProvider: "",
+    expansionModel: "",
+    circuitBreakerThreshold: 5,
+    circuitBreakerCooldownMs: 1_800_000,
   };
 }
 

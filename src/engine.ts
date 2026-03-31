@@ -975,6 +975,10 @@ export class LcmContextEngine implements ContextEngine {
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
 
+  // ── Circuit breaker for compaction auth failures ──
+  private circuitBreakerFailures = 0;
+  private circuitBreakerOpenSince: number | null = null;
+
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
     this.config = deps.config;
@@ -1109,6 +1113,42 @@ export class LcmContextEngine implements ContextEngine {
       return false;
     }
     return matchesSessionPattern(trimmedKey, this.statelessSessionPatterns);
+  }
+
+  // ── Circuit breaker helpers ──────────────────────────────────────────────
+
+  private isCircuitBreakerOpen(): boolean {
+    if (this.circuitBreakerOpenSince === null) return false;
+    const elapsed = Date.now() - this.circuitBreakerOpenSince;
+    if (elapsed >= this.config.circuitBreakerCooldownMs) {
+      this.resetCircuitBreaker();
+      return false;
+    }
+    return true;
+  }
+
+  private recordCompactionAuthFailure(): void {
+    this.circuitBreakerFailures++;
+    if (this.circuitBreakerFailures >= this.config.circuitBreakerThreshold) {
+      this.circuitBreakerOpenSince = Date.now();
+      console.error(
+        `[lcm] compaction circuit breaker OPEN: ${this.circuitBreakerFailures} consecutive auth failures. Compaction halted. Will auto-retry after ${Math.round(this.config.circuitBreakerCooldownMs / 60000)}m or gateway restart.`,
+      );
+    }
+  }
+
+  private recordCompactionSuccess(): void {
+    if (this.circuitBreakerFailures > 0 || this.circuitBreakerOpenSince !== null) {
+      console.error(
+        `[lcm] compaction circuit breaker CLOSED: successful compaction after ${this.circuitBreakerFailures} prior failures.`,
+      );
+    }
+    this.resetCircuitBreaker();
+  }
+
+  private resetCircuitBreaker(): void {
+    this.circuitBreakerFailures = 0;
+    this.circuitBreakerOpenSince = null;
   }
 
   /** Ensure DB schema is up-to-date. Called lazily on first bootstrap/ingest/assemble/compact. */
@@ -2320,6 +2360,13 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
+    if (this.isCircuitBreakerOpen()) {
+      return {
+        ok: true,
+        compacted: false,
+        reason: "circuit breaker open",
+      };
+    }
     this.ensureMigrated();
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
@@ -2375,6 +2422,13 @@ export class LcmContextEngine implements ContextEngine {
           previousSummaryContent: params.previousSummaryContent,
           summaryModel,
         });
+
+        if (leafResult.authFailure) {
+          this.recordCompactionAuthFailure();
+        } else if (leafResult.actionTaken) {
+          this.recordCompactionSuccess();
+        }
+
         const tokensBefore = observedTokens ?? leafResult.tokensBefore;
 
         return {
@@ -2422,6 +2476,13 @@ export class LcmContextEngine implements ContextEngine {
         ok: true,
         compacted: false,
         reason: "stateless session",
+      };
+    }
+    if (this.isCircuitBreakerOpen()) {
+      return {
+        ok: true,
+        compacted: false,
+        reason: "circuit breaker open",
       };
     }
     this.ensureMigrated();
@@ -2516,6 +2577,12 @@ export class LcmContextEngine implements ContextEngine {
           summaryModel,
         });
 
+        if (sweepResult.authFailure) {
+          this.recordCompactionAuthFailure();
+        } else if (sweepResult.actionTaken) {
+          this.recordCompactionSuccess();
+        }
+
         return {
           ok: sweepResult.actionTaken || !liveContextStillExceedsTarget,
           compacted: sweepResult.actionTaken,
@@ -2552,6 +2619,13 @@ export class LcmContextEngine implements ContextEngine {
         summarize,
         summaryModel,
       });
+
+      if (compactResult.authFailure) {
+        this.recordCompactionAuthFailure();
+      } else if (compactResult.rounds > 0) {
+        this.recordCompactionSuccess();
+      }
+
       const didCompact = compactResult.rounds > 0;
 
       return {

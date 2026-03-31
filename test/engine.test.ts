@@ -47,6 +47,8 @@ function createTestConfig(databasePath: string): LcmConfig {
     pruneHeartbeatOk: false,
     summaryMaxOverageFactor: 3,
     customInstructions: "",
+    circuitBreakerThreshold: 5,
+    circuitBreakerCooldownMs: 1_800_000,
   };
 }
 

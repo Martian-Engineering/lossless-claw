@@ -28,6 +28,10 @@ const BASE_CONFIG: LcmConfig = {
   timezone: "UTC",
   pruneHeartbeatOk: false,
   summaryMaxOverageFactor: 3,
+  expansionProvider: "",
+  expansionModel: "",
+  circuitBreakerThreshold: 5,
+  circuitBreakerCooldownMs: 1_800_000,
 };
 
 function makeExpansionResult() {

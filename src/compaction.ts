@@ -25,6 +25,8 @@ export interface CompactionResult {
   condensed: boolean;
   /** Escalation level used: "normal" | "aggressive" | "fallback" */
   level?: CompactionLevel;
+  /** Whether compaction was blocked by a provider auth failure */
+  authFailure?: boolean;
 }
 
 export interface CompactionConfig {
@@ -465,6 +467,7 @@ export class CompactionEngine {
         tokensBefore,
         tokensAfter: tokensBefore,
         condensed: false,
+        authFailure: true,
       };
     }
     const tokensAfterLeaf = await this.summaryStore.getContextTokenCount(conversationId);
@@ -581,6 +584,7 @@ export class CompactionEngine {
     let level: CompactionLevel | undefined;
     let previousSummaryContent: string | undefined;
     let previousTokens = tokensBefore;
+    let hadAuthFailure = false;
 
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
     while (true) {
@@ -598,6 +602,7 @@ export class CompactionEngine {
         input.summaryModel,
       );
       if (!leafResult) {
+        hadAuthFailure = true;
         break;
       }
       const passTokensAfter = await this.summaryStore.getContextTokenCount(conversationId);
@@ -644,6 +649,7 @@ export class CompactionEngine {
         input.summaryModel,
       );
       if (!condenseResult) {
+        hadAuthFailure = true;
         break;
       }
       const passTokensAfter = await this.summaryStore.getContextTokenCount(conversationId);
@@ -680,6 +686,7 @@ export class CompactionEngine {
       createdSummaryId,
       condensed,
       level,
+      ...(hadAuthFailure && !actionTaken ? { authFailure: true } : {}),
     };
   }
 
@@ -693,7 +700,7 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
-  }): Promise<{ success: boolean; rounds: number; finalTokens: number }> {
+  }): Promise<{ success: boolean; rounds: number; finalTokens: number; authFailure?: boolean }> {
     const { conversationId, tokenBudget, summarize } = input;
     const targetTokens =
       typeof input.targetTokens === "number" &&
@@ -726,6 +733,15 @@ export class CompactionEngine {
         force: true,
         summaryModel: input.summaryModel,
       });
+
+      if (result.authFailure) {
+        return {
+          success: false,
+          rounds: round,
+          finalTokens: result.tokensAfter,
+          authFailure: true,
+        };
+      }
 
       if (result.tokensAfter <= targetTokens) {
         return {

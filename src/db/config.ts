@@ -50,6 +50,10 @@ export type LcmConfig = {
   summaryMaxOverageFactor: number;
   /** Custom instructions injected into all summarization prompts. */
   customInstructions: string;
+  /** Consecutive auth failures before the compaction circuit breaker trips (default 5). */
+  circuitBreakerThreshold: number;
+  /** Cooldown in milliseconds before the circuit breaker auto-resets (default 30 min). */
+  circuitBreakerCooldownMs: number;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -206,5 +210,11 @@ export function resolveLcmConfig(
         ?? toNumber(pc.summaryMaxOverageFactor) ?? 3,
     customInstructions:
       env.LCM_CUSTOM_INSTRUCTIONS?.trim() ?? toStr(pc.customInstructions) ?? "",
+    circuitBreakerThreshold:
+      (env.LCM_CIRCUIT_BREAKER_THRESHOLD !== undefined ? parseInt(env.LCM_CIRCUIT_BREAKER_THRESHOLD, 10) : undefined)
+        ?? toNumber(pc.circuitBreakerThreshold) ?? 5,
+    circuitBreakerCooldownMs:
+      (env.LCM_CIRCUIT_BREAKER_COOLDOWN_MS !== undefined ? parseInt(env.LCM_CIRCUIT_BREAKER_COOLDOWN_MS, 10) : undefined)
+        ?? toNumber(pc.circuitBreakerCooldownMs) ?? 1_800_000,
   };
 }
