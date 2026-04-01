@@ -150,7 +150,6 @@ describe("lcm plugin registration", () => {
       freshTailCount: 7,
       leafChunkTokens: 80000,
       newSessionRetainDepth: 4,
-      leafChunkTokens: 80000,
       dbPath,
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],

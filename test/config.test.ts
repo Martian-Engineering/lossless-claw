@@ -30,7 +30,6 @@ describe("resolveLcmConfig", () => {
       freshTailCount: 16,
       leafChunkTokens: 80000,
       newSessionRetainDepth: 3,
-      leafChunkTokens: 80000,
       incrementalMaxDepth: -1,
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:ephemeral:**"],
@@ -123,7 +122,6 @@ describe("resolveLcmConfig", () => {
       freshTailCount: "24",
       leafChunkTokens: "64000",
       newSessionRetainDepth: "6",
-      leafChunkTokens: "64000",
       ignoreSessionPatterns: "agent:*:cron:*, agent:main:subagent:**",
       statelessSessionPatterns: "agent:*:ephemeral:**, agent:main:preview:*",
       skipStatelessSessions: "false",
@@ -153,7 +151,6 @@ describe("resolveLcmConfig", () => {
     expect(config.contextThreshold).toBe(0.75); // falls through to default
     expect(config.freshTailCount).toBe(64); // falls through to default
     expect(config.newSessionRetainDepth).toBe(2); // falls through to default
-    expect(config.freshTailCount).toBe(64); // falls through to default
     expect(config.enabled).toBe(true); // falls through to default
   });
 
