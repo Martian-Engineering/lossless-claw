@@ -1499,6 +1499,47 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     buildSubagentSystemPrompt,
     readLatestAssistantReply,
     resolveAgentDir: () => api.resolvePath("."),
+    resolveWorkspaceDir: (agentId?: string) => {
+      try {
+        const cfg = api.runtime.config.loadConfig() as Record<string, unknown>;
+        const agents = cfg.agents as Record<string, unknown> | undefined;
+        const id = normalizeAgentId(agentId);
+
+        const expandTilde = (p: string): string =>
+          p.startsWith("~/") || p === "~"
+            ? (process.env.HOME ?? "") + p.slice(1)
+            : p;
+
+        // agents.list is an array of { id, workspace, ... } entries
+        const agentList = agents?.list as Array<Record<string, unknown>> | undefined;
+        if (Array.isArray(agentList)) {
+          const entry = agentList.find(
+            (a) => normalizeAgentId(a.id as string | undefined) === id,
+          );
+          const ws = entry?.workspace as string | undefined;
+          if (typeof ws === "string" && ws.trim()) {
+            return expandTilde(ws);
+          }
+        }
+
+        // Check default workspace for the default agent
+        const defaultAgentId = normalizeAgentId(
+          (cfg.defaultAgent as string | undefined) ?? (agents?.default as string | undefined),
+        );
+        if (id === defaultAgentId) {
+          const defaultWs = (agents?.defaults as Record<string, unknown>)?.workspace as string | undefined;
+          if (typeof defaultWs === "string" && defaultWs.trim()) {
+            return expandTilde(defaultWs);
+          }
+        }
+
+        // Fallback: OpenClaw convention — ~/.openclaw/workspace-{agentId}
+        const home = process.env.HOME ?? "";
+        return join(home, ".openclaw", `workspace-${id}`);
+      } catch {
+        return undefined;
+      }
+    },
     resolveSessionIdFromSessionKey: async (sessionKey) => {
       const key = sessionKey.trim();
       if (!key) {
