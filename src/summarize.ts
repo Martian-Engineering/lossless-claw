@@ -1185,7 +1185,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
         try {
           const directResult = await runSummarizerCall(directApiKey, "auth-retry", reasoning);
-          const directFailure = extractProviderAuthFailure(directResult);
+          // Use requireStructuralSignal on the retry success path too — the
+          // summary text may legitimately contain auth-error phrases.
+          const directFailure = extractProviderAuthFailure(directResult, {
+            requireStructuralSignal: true,
+          });
           if (directFailure) {
             const retryAuthError = new LcmProviderAuthError({
               provider,
@@ -1203,7 +1207,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           if (directErr instanceof LcmProviderAuthError) {
             throw directErr;
           }
-          const directFailure = extractProviderAuthFailure(directErr);
+          // Catch path: real errors carry structural signals (HTTP 401, error.kind),
+          // so requireStructuralSignal is safe here too.
+          const directFailure = extractProviderAuthFailure(directErr, {
+            requireStructuralSignal: true,
+          });
           if (directFailure) {
             const retryAuthError = new LcmProviderAuthError({
               provider,
