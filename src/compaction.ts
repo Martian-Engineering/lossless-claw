@@ -686,7 +686,7 @@ export class CompactionEngine {
       createdSummaryId,
       condensed,
       level,
-      ...(hadAuthFailure && !actionTaken ? { authFailure: true } : {}),
+      ...(hadAuthFailure ? { authFailure: true } : {}),
     };
   }
 

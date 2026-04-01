@@ -33,6 +33,16 @@ type ResolvedSummaryCandidate = SummaryResolutionCandidate & {
   model: string;
 };
 
+function buildSummarizerBreakerKey(params: {
+  candidate: ResolvedSummaryCandidate;
+  legacyAuthProfileId?: string;
+}): string {
+  const authProfileId = params.candidate.useLegacyAuthProfile
+    ? (params.legacyAuthProfileId ?? "-")
+    : "-";
+  return `provider:${params.candidate.provider};model:${params.candidate.model};authProfile:${authProfileId}`;
+}
+
 type SummaryMode = "normal" | "aggressive";
 
 const DEFAULT_LEAF_TARGET_TOKENS = 2400;
@@ -1058,7 +1068,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   deps: LcmDependencies;
   legacyParams: LcmSummarizerLegacyParams;
   customInstructions?: string;
-}): Promise<{ fn: LcmSummarizeFn; model: string } | undefined> {
+}): Promise<{ fn: LcmSummarizeFn; model: string; breakerKey: string } | undefined> {
   const resolvedCandidates = resolveSummaryCandidates(params);
   if (resolvedCandidates.length === 0) {
     console.error("[lcm] createLcmSummarize: no summary model candidates resolved");
@@ -1417,5 +1427,12 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     return "";
   };
 
-  return { fn, model: resolvedCandidates[0]!.model };
+  return {
+    fn,
+    model: resolvedCandidates[0]!.model,
+    breakerKey: buildSummarizerBreakerKey({
+      candidate: resolvedCandidates[0]!,
+      legacyAuthProfileId,
+    }),
+  };
 }

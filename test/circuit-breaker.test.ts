@@ -45,6 +45,7 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     timezone: "UTC",
     pruneHeartbeatOk: false,
     summaryMaxOverageFactor: 3,
+    delegationTimeoutMs: 120000,
     customInstructions: "",
     circuitBreakerThreshold: 3, // Low threshold for testing
     circuitBreakerCooldownMs: 5000, // 5 seconds for testing
@@ -55,6 +56,21 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
 function createTestDeps(config: LcmConfig): LcmDependencies {
   return {
     config,
+    complete: async () => ({ content: [{ type: "text", text: "Summary" }] }),
+    callGateway: async () => undefined,
+    resolveModel: (modelRef: string | undefined, providerHint?: string) => ({
+      provider: providerHint ?? "test",
+      model: modelRef ?? "test-model",
+    }),
+    getApiKey: async () => "test-api-key",
+    requireApiKey: async () => "test-api-key",
+    parseAgentSessionKey: () => null,
+    isSubagentSessionKey: () => false,
+    normalizeAgentId: (id?: string) => id ?? "",
+    buildSubagentSystemPrompt: () => "",
+    readLatestAssistantReply: () => undefined,
+    resolveAgentDir: () => "",
+    agentLaneSubagent: "subagent",
     log: {
       info: () => {},
       warn: () => {},
@@ -64,6 +80,31 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
     resolveSessionIdFromSessionKey: async () => undefined,
     resolveWorkspaceDir: () => undefined,
   } as unknown as LcmDependencies;
+}
+
+function seedSessionFile(dir: string, name: string = randomUUID()) {
+  const seededSessionId = randomUUID();
+  const seededSessionKey = `agent:test:direct:${name}:${seededSessionId}`;
+  const seededSessionFile = join(dir, `${name}-${seededSessionId}.jsonl`);
+
+  const messages: string[] = [];
+  for (let i = 0; i < 20; i++) {
+    messages.push(JSON.stringify({
+      role: "user",
+      content: `Message ${i}: ${"x".repeat(500)}`,
+    }));
+    messages.push(JSON.stringify({
+      role: "assistant",
+      content: `Response ${i}: ${"y".repeat(500)}`,
+    }));
+  }
+  writeFileSync(seededSessionFile, messages.join("\n") + "\n");
+
+  return {
+    sessionId: seededSessionId,
+    sessionKey: seededSessionKey,
+    sessionFile: seededSessionFile,
+  };
 }
 
 describe("Circuit Breaker", () => {
@@ -76,25 +117,8 @@ describe("Circuit Breaker", () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "lcm-cb-test-"));
-    sessionId = randomUUID();
-    sessionKey = `agent:test:direct:${sessionId}`;
-    sessionFile = join(tmpDir, `${sessionId}.jsonl`);
-    
-    // Create a session file with enough messages to trigger compaction
-    const messages: string[] = [];
-    // We need messages that exceed the leafChunkTokens (2000) threshold
-    for (let i = 0; i < 20; i++) {
-      messages.push(JSON.stringify({
-        role: "user",
-        content: `Message ${i}: ${"x".repeat(500)}`,
-      }));
-      messages.push(JSON.stringify({
-        role: "assistant",
-        content: `Response ${i}: ${"y".repeat(500)}`,
-      }));
-    }
-    writeFileSync(sessionFile, messages.join("\n") + "\n");
-    
+    ({ sessionId, sessionKey, sessionFile } = seedSessionFile(tmpDir));
+
     const config = createTestConfig();
     const deps = createTestDeps(config);
     db = new DatabaseSync(":memory:");
@@ -300,5 +324,91 @@ describe("Circuit Breaker", () => {
       legacyParams: { summarize: toggleSummarizer },
     });
     expect(result.reason).not.toBe("circuit breaker open");
+  });
+
+  it("should scope provider-backed breakers to the resolved provider/model", async () => {
+    const config = createTestConfig({ circuitBreakerThreshold: 1 });
+    const providerDeps = createTestDeps(config);
+    providerDeps.complete = async (params) => {
+      if (params.provider === "broken-provider") {
+        throw new LcmProviderAuthError({
+          provider: "broken-provider",
+          model: params.model,
+          failure: { statusCode: 401, message: "auth failed", missingModelRequestScope: false },
+        });
+      }
+      return { content: [{ type: "text", text: "Summary" }] };
+    };
+
+    const scopedDb = new DatabaseSync(":memory:");
+    const scopedEngine = new LcmContextEngine(providerDeps, scopedDb);
+    const brokenSession = seedSessionFile(tmpDir, "broken-provider");
+    const healthySession = seedSessionFile(tmpDir, "healthy-provider");
+
+    try {
+      await scopedEngine.bootstrap(brokenSession);
+      await scopedEngine.bootstrap(healthySession);
+
+      await scopedEngine.compact({
+        ...brokenSession,
+        tokenBudget: 5000,
+        force: true,
+        legacyParams: { provider: "broken-provider", model: "shared-model" },
+      });
+
+      const healthyResult = await scopedEngine.compact({
+        ...healthySession,
+        tokenBudget: 5000,
+        force: true,
+        legacyParams: { provider: "healthy-provider", model: "shared-model" },
+      });
+
+      expect(healthyResult.reason).not.toBe("circuit breaker open");
+    } finally {
+      try { scopedDb.close(); } catch {}
+    }
+  });
+
+  it("should trip after auth failure during later full-sweep passes", async () => {
+    const config = createTestConfig({ circuitBreakerThreshold: 1 });
+    const deps = createTestDeps(config);
+    const sweepDb = new DatabaseSync(":memory:");
+    const sweepEngine = new LcmContextEngine(deps, sweepDb);
+    const sweepSession = seedSessionFile(tmpDir, "full-sweep");
+
+    try {
+      await sweepEngine.bootstrap(sweepSession);
+
+      let callCount = 0;
+      const mixedSummarizer = async (text: string) => {
+        callCount++;
+        if (callCount === 1) {
+          return `Summary: ${text.slice(0, 50)}`;
+        }
+        throw makeAuthError();
+      };
+
+      const first = await sweepEngine.compact({
+        ...sweepSession,
+        tokenBudget: 5000,
+        force: true,
+        legacyParams: { summarize: mixedSummarizer },
+      });
+
+      const second = await sweepEngine.compact({
+        ...sweepSession,
+        tokenBudget: 5000,
+        force: true,
+        legacyParams: {
+          summarize: async (text: string) => `Summary: ${text.slice(0, 50)}`,
+        },
+      });
+
+      expect(callCount).toBeGreaterThan(1);
+      expect(first.reason).toBe("provider auth failure after partial compaction");
+      expect(second.reason).toBe("circuit breaker open");
+    } finally {
+      try { sweepDb.close(); } catch {}
+    }
   });
 });
