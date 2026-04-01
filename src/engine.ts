@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, createReadStream, openSync, readSync, statSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
@@ -24,6 +24,7 @@ import {
   pickToolCallId,
   pickToolIsError,
   pickToolName,
+  type PinnedFileEntry,
 } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
@@ -2697,11 +2698,15 @@ export class LcmContextEngine implements ContextEngine {
           : 128_000,
       );
 
+      // Resolve pinned files from disk for this agent's workspace
+      const pinnedFiles = await this.resolvePinnedFiles(params.sessionKey);
+
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,
         tokenBudget,
         freshTailCount: this.config.freshTailCount,
         prompt: params.prompt,
+        pinnedFiles,
       });
 
       // If assembly produced no messages for a non-empty live session,
@@ -2727,6 +2732,51 @@ export class LcmContextEngine implements ContextEngine {
         estimatedTokens: 0,
       };
     }
+  }
+
+  /** Maximum bytes per pinned file (100 KB). Files exceeding this are skipped. */
+  private static readonly PINNED_FILE_MAX_BYTES = 100_000;
+
+  /**
+   * Read configured pinned files from disk.
+   * Missing, unreadable, oversized, or path-traversal files are silently skipped.
+   */
+  private async resolvePinnedFiles(sessionKey?: string): Promise<PinnedFileEntry[]> {
+    const paths = this.config.pinnedFiles;
+    if (paths.length === 0) return [];
+
+    // Extract agent ID from session key (e.g. "agent:brunelleschi:telegram:...")
+    const parsed = sessionKey ? (() => {
+      const trimmed = sessionKey.trim();
+      if (!trimmed.startsWith("agent:")) return null;
+      const parts = trimmed.split(":");
+      return parts.length >= 2 ? parts[1]?.trim() : null;
+    })() : undefined;
+
+    const workspaceDir = this.deps.resolveWorkspaceDir?.(parsed ?? undefined);
+    if (!workspaceDir) return [];
+
+    const resolvedRoot = resolve(workspaceDir);
+    const results: PinnedFileEntry[] = [];
+    for (const relativePath of paths) {
+      try {
+        const absolutePath = resolve(workspaceDir, relativePath);
+        // Path traversal guard: resolved path must stay within workspace
+        if (!absolutePath.startsWith(resolvedRoot + "/") && absolutePath !== resolvedRoot) {
+          continue;
+        }
+        // Size guard: check before reading to avoid OOM on huge files
+        const fileStat = await stat(absolutePath);
+        if (!fileStat.isFile() || fileStat.size > LcmContextEngine.PINNED_FILE_MAX_BYTES) {
+          continue;
+        }
+        const content = await readFile(absolutePath, "utf-8");
+        results.push({ path: relativePath, content });
+      } catch {
+        // Silently skip missing or unreadable files
+      }
+    }
+    return results;
   }
 
   /** Evaluate whether incremental leaf compaction should run for a session. */

@@ -32,10 +32,6 @@ export type LcmConfig = {
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
   largeFileSummaryModel: string;
-  /** Model override for conversation summarization. */
-  summaryModel: string;
-  /** Provider override for conversation summarization. */
-  summaryProvider: string;
   /** Provider override for lcm_expand_query sub-agent. */
   expansionProvider: string;
   /** Model override for lcm_expand_query sub-agent. */
@@ -52,6 +48,8 @@ export type LcmConfig = {
   summaryMaxOverageFactor: number;
   /** Custom instructions injected into all summarization prompts. */
   customInstructions: string;
+  /** Workspace-relative file paths injected into every context assembly, outside the compaction DAG. */
+  pinnedFiles: string[];
   /** Consecutive auth failures before the compaction circuit breaker trips (default 5). */
   circuitBreakerThreshold: number;
   /** Cooldown in milliseconds before the circuit breaker auto-resets (default 30 min). */
@@ -232,6 +230,7 @@ export function resolveLcmConfig(
         ?? toNumber(pc.summaryMaxOverageFactor) ?? 3,
     customInstructions:
       env.LCM_CUSTOM_INSTRUCTIONS?.trim() ?? toStr(pc.customInstructions) ?? "",
+    pinnedFiles: toStrArray(pc.pinnedFiles) ?? [],
     circuitBreakerThreshold:
       parseFiniteInt(env.LCM_CIRCUIT_BREAKER_THRESHOLD)
         ?? toNumber(pc.circuitBreakerThreshold) ?? 5,

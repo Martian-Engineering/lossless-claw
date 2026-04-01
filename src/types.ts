@@ -145,6 +145,9 @@ export interface LcmDependencies {
   /** Resolve the OpenClaw agent directory */
   resolveAgentDir: () => string;
 
+  /** Resolve an agent's workspace directory (for workspace-relative file paths) */
+  resolveWorkspaceDir?: (agentId?: string) => string | undefined;
+
   /** Resolve runtime session id from an agent session key */
   resolveSessionIdFromSessionKey: (sessionKey: string) => Promise<string | undefined>;
 
