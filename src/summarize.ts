@@ -439,7 +439,11 @@ function pickAuthInspectionValue(value: unknown): unknown {
   return Object.keys(subset).length > 0 ? subset : value;
 }
 
-function extractProviderAuthFailure(value: unknown): ProviderAuthFailure | undefined {
+/** @internal Exported for testing only. */
+export function extractProviderAuthFailure(
+  value: unknown,
+  opts?: { requireStructuralSignal?: boolean },
+): ProviderAuthFailure | undefined {
   const inspectValue = pickAuthInspectionValue(value);
   const statusCode = extractAuthFailureStatusCode(inspectValue);
   const textParts: string[] = [];
@@ -449,7 +453,20 @@ function extractProviderAuthFailure(value: unknown): ProviderAuthFailure | undef
   const hasScopeSignal =
     missingModelRequestScope || /\b(missing|insufficient)\s+scope\b/i.test(normalizedMessage);
 
-  if (statusCode !== 401 && !hasScopeSignal && !AUTH_ERROR_TEXT_PATTERN.test(normalizedMessage)) {
+  // When requireStructuralSignal is set (e.g. checking a successful API response
+  // rather than a caught error), only detect auth failures that have a concrete
+  // structural indicator (HTTP 401 status code or an explicit provider_auth error
+  // kind).  Plain text matches in the response body are NOT sufficient — the LLM
+  // summary content may legitimately discuss auth errors without being one.
+  const hasExplicitErrorKind =
+    isRecord(value) && isRecord((value as Record<string, unknown>).error) &&
+    ((value as Record<string, unknown>).error as Record<string, unknown>).kind === "provider_auth";
+
+  if (opts?.requireStructuralSignal) {
+    if (statusCode !== 401 && !hasExplicitErrorKind) {
+      return undefined;
+    }
+  } else if (statusCode !== 401 && !hasScopeSignal && !AUTH_ERROR_TEXT_PATTERN.test(normalizedMessage)) {
     return undefined;
   }
 
@@ -1207,7 +1224,12 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         const apiKey = await params.deps.getApiKey(provider, model, lookupOptions);
         try {
           const result = await runSummarizerCall(apiKey, label, reasoning);
-          const authFailure = extractProviderAuthFailure(result);
+          // Use requireStructuralSignal so that LLM summary text containing
+          // auth-related words (e.g. "provider auth error") is NOT mistaken
+          // for an actual API auth failure.
+          const authFailure = extractProviderAuthFailure(result, {
+            requireStructuralSignal: true,
+          });
           if (!authFailure) {
             return result;
           }
