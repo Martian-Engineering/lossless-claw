@@ -59,6 +59,18 @@ const AUTH_ERROR_TEXT_PATTERN =
   /\b401\b|unauthorized|unauthorised|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|authentication failed|authorization failed|missing scope|insufficient scope|model\.request\b/i;
 const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
 const AUTH_ERROR_NESTED_KEYS = ["error", "response", "cause", "details", "data", "body"] as const;
+const AUTH_ERROR_TOP_LEVEL_KEYS = [
+  "error",
+  "errorMessage",
+  "status",
+  "statusCode",
+  "status_code",
+  "code",
+  "details",
+  "cause",
+  "data",
+  "body",
+] as const;
 
 type ProviderAuthFailure = {
   statusCode?: number;
@@ -421,6 +433,14 @@ function extractAuthFailureStatusCode(value: unknown, depth = 0): number | undef
   return undefined;
 }
 
+function hasTopLevelAuthInspectionKeys(value: Record<string, unknown>): boolean {
+  return AUTH_ERROR_TOP_LEVEL_KEYS.some((key) => key in value);
+}
+
+function looksLikeThrownError(value: Record<string, unknown>): boolean {
+  return (typeof value.name === "string" && /\berror\b/i.test(value.name)) || "stack" in value;
+}
+
 function pickAuthInspectionValue(value: unknown): unknown {
   if (!isRecord(value)) {
     return value;
@@ -430,22 +450,35 @@ function pickAuthInspectionValue(value: unknown): unknown {
   }
 
   const subset: Record<string, unknown> = {};
-  for (const key of [
-    "error",
-    "errorMessage",
-    "message",
-    "status",
-    "statusCode",
-    "status_code",
-    "code",
-    "details",
-    "response",
-    "cause",
-  ]) {
+  const hasTopLevelAuthKeys = hasTopLevelAuthInspectionKeys(value);
+  const errorLike = value instanceof Error || looksLikeThrownError(value);
+
+  for (const key of AUTH_ERROR_TOP_LEVEL_KEYS) {
     if (key in value) {
       subset[key] = value[key];
     }
   }
+
+  // Only inspect top-level message payloads when the envelope already looks
+  // error-shaped. Successful summary responses also use `message`.
+  if ((hasTopLevelAuthKeys || errorLike) && "message" in value) {
+    subset.message = value.message;
+  }
+
+  // `response` can carry either an error payload or successful summary text.
+  // Include it only when the surrounding or nested shape already looks like an
+  // error envelope.
+  if ("response" in value) {
+    const response = value.response;
+    if (
+      hasTopLevelAuthKeys ||
+      (isRecord(response) && hasTopLevelAuthInspectionKeys(response)) ||
+      (isRecord(response) && looksLikeThrownError(response))
+    ) {
+      subset.response = response;
+    }
+  }
+
   return Object.keys(subset).length > 0 ? subset : {};
 }
 

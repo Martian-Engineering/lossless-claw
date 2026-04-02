@@ -821,6 +821,96 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       }
     });
 
+    it("still detects auth failures nested under a top-level data envelope", async () => {
+      const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          resolveModel: vi.fn(() => ({
+            provider: "openai-codex",
+            model: "gpt-5.4",
+          })),
+          complete: vi.fn(async () => ({
+            content: [],
+            data: {
+              statusCode: 401,
+              message: "Missing required scope: model.request",
+            },
+          })),
+        });
+
+        const result = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai-codex", model: "gpt-5.4" },
+        });
+
+        await expect(result!.fn("C".repeat(8_000), false)).rejects.toBeInstanceOf(
+          LcmProviderAuthError,
+        );
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+
+        const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
+        expect(warningText).toContain("provider auth error (401 / missing model.request scope)");
+      } finally {
+        consoleWarn.mockRestore();
+      }
+    });
+
+    it("does not misclassify response-envelope summary text as an auth error", async () => {
+      const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          complete: vi.fn(async () => ({
+            content: [],
+            response: {
+              text: "Summary of a debugging session about 401 invalid api key failures.",
+            },
+          })),
+        });
+
+        const summarize = await createSummarizeFn({
+          deps,
+          legacyParams: { provider: "anthropic", model: "claude-opus-4-5" },
+        });
+
+        const summary = await summarize!("D".repeat(8_000), false);
+
+        expect(summary).toBe("Summary of a debugging session about 401 invalid api key failures.");
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+        expect(consoleWarn).not.toHaveBeenCalled();
+      } finally {
+        consoleWarn.mockRestore();
+      }
+    });
+
+    it("does not misclassify message-envelope summary text as an auth error", async () => {
+      const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          complete: vi.fn(async () => ({
+            content: [],
+            message: {
+              text: "Conversation summary: the team fixed an unauthorized error caused by a stale token.",
+            },
+          })),
+        });
+
+        const summarize = await createSummarizeFn({
+          deps,
+          legacyParams: { provider: "anthropic", model: "claude-opus-4-5" },
+        });
+
+        const summary = await summarize!("E".repeat(8_000), false);
+
+        expect(summary).toBe(
+          "Conversation summary: the team fixed an unauthorized error caused by a stale token.",
+        );
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+        expect(consoleWarn).not.toHaveBeenCalled();
+      } finally {
+        consoleWarn.mockRestore();
+      }
+    });
+
     it("falls back to the next resolved model when the preferred model fails auth", async () => {
       const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
