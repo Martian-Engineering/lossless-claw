@@ -210,6 +210,10 @@
       },
       "pruneHeartbeatOk": {
         "type": "boolean"
+      },
+      "databasePath": {
+        "description": "Path to LCM SQLite database (alias for dbPath)",
+        "type": "string"
       }
     }
   }
