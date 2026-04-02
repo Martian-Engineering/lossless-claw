@@ -539,7 +539,15 @@ function buildMessageParts(params: {
   for (let ordinal = 0; ordinal < message.content.length; ordinal++) {
     const block = normalizeUnknownBlock(message.content[ordinal]);
     const metadataRecord = block.metadata.raw as Record<string, unknown> | undefined;
-    const partType = toPartType(block.type);
+    const rawBlockType = safeString(metadataRecord?.rawType) ?? block.type;
+    const partType = toPartType(rawBlockType);
+    const rawBlock =
+      metadataRecord && rawBlockType !== block.type
+        ? {
+            ...metadataRecord,
+            type: rawBlockType,
+          }
+        : (metadataRecord ?? message.content[ordinal]);
     const toolCallId =
       safeString(metadataRecord?.toolCallId) ??
       safeString(metadataRecord?.tool_call_id) ??
@@ -586,8 +594,8 @@ function buildMessageParts(params: {
             : undefined,
         toolOutputExternalized: safeBoolean(metadataRecord?.toolOutputExternalized),
         externalizationReason: safeString(metadataRecord?.externalizationReason),
-        rawType: block.type,
-        raw: metadataRecord ?? message.content[ordinal],
+        rawType: rawBlockType,
+        raw: rawBlock,
       }),
     });
   }
@@ -1588,14 +1596,24 @@ export class LcmContextEngine implements ContextEngine {
 
       const normalizedRawType =
         rawType === "function_call_output" ? "function_call_output" : "tool_result";
-      const compactBlock: Record<string, unknown> = {
-        type: normalizedRawType,
-        output: externalized.reference,
-        externalizedFileId: externalized.fileId,
-        originalByteSize: externalized.byteSize,
-        toolOutputExternalized: true,
-        externalizationReason: "large_tool_result",
-      };
+      const compactBlock: Record<string, unknown> = isPlainTextToolResult
+        ? {
+            type: "text",
+            text: externalized.reference,
+            rawType: normalizedRawType,
+            externalizedFileId: externalized.fileId,
+            originalByteSize: externalized.byteSize,
+            toolOutputExternalized: true,
+            externalizationReason: "large_tool_result",
+          }
+        : {
+            type: normalizedRawType,
+            output: externalized.reference,
+            externalizedFileId: externalized.fileId,
+            originalByteSize: externalized.byteSize,
+            toolOutputExternalized: true,
+            externalizationReason: "large_tool_result",
+          };
       const callId =
         safeString(record.tool_use_id) ??
         safeString(record.toolUseId) ??
