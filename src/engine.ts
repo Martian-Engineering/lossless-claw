@@ -2742,9 +2742,6 @@ export class LcmContextEngine implements ContextEngine {
    * Missing, unreadable, oversized, or path-traversal files are silently skipped.
    */
   private async resolvePinnedFiles(sessionKey?: string): Promise<PinnedFileEntry[]> {
-    const paths = this.config.pinnedFiles;
-    if (paths.length === 0) return [];
-
     // Extract agent ID from session key (e.g. "agent:brunelleschi:telegram:...")
     const parsed = sessionKey ? (() => {
       const trimmed = sessionKey.trim();
@@ -2752,6 +2749,12 @@ export class LcmContextEngine implements ContextEngine {
       const parts = trimmed.split(":");
       return parts.length >= 2 ? parts[1]?.trim() : null;
     })() : undefined;
+
+    const agentId = parsed ?? "main";
+    const globalPaths = this.config.pinnedFiles;
+    const agentPaths = this.config.pinnedFilesPerAgent[agentId] ?? [];
+    const paths = [...new Set([...globalPaths, ...agentPaths])];
+    if (paths.length === 0) return [];
 
     const workspaceDir = this.deps.resolveWorkspaceDir?.(parsed ?? undefined);
     if (!workspaceDir) return [];
