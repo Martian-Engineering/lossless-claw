@@ -216,7 +216,7 @@ describe("lcm command", () => {
     expect(result.text).toContain("stored summary tokens: 12");
     expect(result.text).toContain("summarized source tokens: 21");
     expect(result.text).toContain("tokens in context: 5");
-    expect(result.text).toContain("compression ratio: 17.9% (5 / 28)");
+    expect(result.text).toContain("compression ratio: 1:6");
     expect(result.text).toContain("doctor: 1 issue(s) in this conversation");
   });
 

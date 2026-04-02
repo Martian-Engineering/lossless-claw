@@ -106,12 +106,16 @@ function buildStatLine(label: string, value: string): string {
 }
 
 function formatCompressionRatio(contextTokens: number, compressedTokens: number): string {
-  if (!Number.isFinite(compressedTokens) || compressedTokens <= 0) {
+  if (
+    !Number.isFinite(contextTokens) ||
+    contextTokens <= 0 ||
+    !Number.isFinite(compressedTokens) ||
+    compressedTokens <= 0
+  ) {
     return "n/a";
   }
-  const ratio = (contextTokens / compressedTokens) * 100;
-  const precision = ratio >= 10 ? 1 : 2;
-  return `${ratio.toFixed(precision)}% (${formatNumber(contextTokens)} / ${formatNumber(compressedTokens)})`;
+  const ratio = Math.max(1, Math.round(compressedTokens / contextTokens));
+  return `1:${formatNumber(ratio)}`;
 }
 
 function truncateMiddle(value: string, maxChars: number): string {
