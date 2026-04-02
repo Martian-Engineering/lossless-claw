@@ -9,17 +9,19 @@ Use this skill when the task is about operating, tuning, or debugging the `lossl
 
 Start here:
 
-1. Confirm whether the user needs configuration help, diagnostics, or recall-tool guidance.
+1. Confirm whether the user needs configuration help, diagnostics, recall-tool guidance, or session-lifecycle guidance.
 2. If they need a quick health check, tell them to run `/lossless` (`/lcm` is the shorter alias).
 3. If they suspect summary corruption or truncation, use `/lossless doctor`.
-4. Load the relevant reference file instead of improvising details from memory.
+4. If they ask how `/new` or `/reset` interacts with LCM, read the session-lifecycle reference before answering.
+5. Load the relevant reference file instead of improvising details from memory.
 
 Reference map:
 
-- Configuration: `references/config.md`
+- Configuration (complete config surface on current main): `references/config.md`
 - Internal model and data flow: `references/architecture.md`
 - Diagnostics and summary-health workflow: `references/diagnostics.md`
 - Recall tools and when to use them: `references/recall-tools.md`
+- `/new` and `/reset` behavior with current lossless-claw session mapping: `references/session-lifecycle.md`
 
 Working rules:
 

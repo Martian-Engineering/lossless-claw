@@ -1,5 +1,7 @@
 # Configuration
 
+This reference covers the current `lossless-claw` config surface on `main`, based on `openclaw.plugin.json`.
+
 `lossless-claw` is most effective when the operator understands which settings change compaction behavior and why.
 
 ## First checks
@@ -8,7 +10,9 @@
 - Ensure the context-engine slot points at `lossless-claw` when you want it to own compaction.
 - Run `/lossless` (`/lcm` alias) to confirm the plugin is active and see the live DB path.
 
-## Settings That Matter Most
+## High-impact settings
+
+These are the settings most operators should understand first.
 
 ### `contextThreshold`
 
@@ -65,9 +69,9 @@ Why it matters:
 
 ### `summaryModel` and `summaryProvider`
 
-Overrides the model used for compaction summarization.
+Override the model used for compaction summarization.
 
-Why it matters:
+Why they matter:
 
 - Summary quality compounds upward in the DAG.
 - Cheaper models can reduce cost, but weak summaries create weak recalled context later.
@@ -75,33 +79,169 @@ Why it matters:
 Guidance:
 
 - Pick a cheaper model only if it remains reliably structured and faithful.
+- `summaryProvider` only matters when `summaryModel` is a bare model name rather than a canonical provider/model ref.
 
 ### `expansionModel` and `expansionProvider`
 
-Overrides the model used by delegated recall flows such as `lcm_expand_query`.
+Override the model used by delegated recall flows such as `lcm_expand_query`.
+
+Why they matter:
+
+- This lets recall-heavy work use a different cost/latency profile than normal compaction.
+- These are recall-path settings, not compaction-path settings.
+
+## Complete config surface
+
+## Core enablement and storage
+
+### `enabled`
+
+Boolean on/off switch for the plugin entry.
+
+Use this when:
+
+- you need the plugin installed but temporarily disabled
+- you want to distinguish “installed” from “selected and active”
+
+### `dbPath`
+
+Overrides the SQLite DB location.
 
 Why it matters:
 
-- This lets recall-heavy work use a different cost/latency profile than normal compaction.
+- useful for custom deployments, testing, or isolating environments
+- wrong path selection is a common reason operators think LCM is empty or not growing
 
-## Session controls
+### `largeFileThresholdTokens`
+
+Threshold for externalizing oversized tool/file payloads out of the main transcript into large-file storage.
+
+Why it matters:
+
+- lower values externalize more aggressively
+- higher values keep more payload inline but can bloat storage and compaction inputs
+
+## Compaction timing and shape
+
+### `contextThreshold`
+
+See high-impact settings above.
+
+### `freshTailCount`
+
+See high-impact settings above.
+
+### `leafChunkTokens`
+
+See high-impact settings above.
+
+### `leafMinFanout`
+
+Minimum number of leaf items required before creating a leaf compaction grouping.
+
+Why it matters:
+
+- higher values avoid tiny leaf summaries
+- lower values compact sooner but can create overly granular summaries
+
+### `condensedMinFanout`
+
+Preferred minimum fanout for condensed summaries during normal condensation.
+
+Why it matters:
+
+- controls how eagerly summaries get grouped upward
+- affects DAG breadth and readability of higher-level summaries
+
+### `condensedMinFanoutHard`
+
+Hard lower bound for condensed fanout decisions.
+
+Why it matters:
+
+- acts as the guardrail when normal fanout preferences cannot be met cleanly
+- mostly useful for advanced tuning or pathological summary-tree shapes
+
+### `incrementalMaxDepth`
+
+See high-impact settings above.
+
+## Session-selection controls
 
 ### `ignoreSessionPatterns`
 
-Use this for sessions that should never enter LCM at all.
+Glob-style session-key patterns that should never enter LCM.
 
 Why it matters:
 
-- Keeps low-value automation or noisy sessions out of the DB.
+- keeps low-value automation or noisy sessions out of the DB
+- useful for excluding certain agent lanes or ephemeral traffic entirely
 
 ### `statelessSessionPatterns`
 
-Use this for sessions that may read from LCM but should not write to it.
+Patterns for sessions that may read from LCM but should not write to it.
 
 Why it matters:
 
-- Useful for sub-agents and ephemeral workers.
-- Prevents recall helpers from polluting the main history.
+- useful for sub-agents and ephemeral workers
+- prevents recall helpers from polluting the main history
+
+### `skipStatelessSessions`
+
+Boolean that changes how stateless matches are treated.
+
+Why it matters:
+
+- when enabled, matching stateless sessions skip LCM persistence entirely
+- use carefully, because it affects whether those sessions behave as readers only or are effectively bypassed for writes
+
+## Recall-path and delegation controls
+
+### `expansionModel`
+
+See high-impact settings above.
+
+### `expansionProvider`
+
+See high-impact settings above.
+
+### `delegationTimeoutMs`
+
+Maximum time to wait for delegated recall completion.
+
+Why it matters:
+
+- lower values fail faster under slow sub-agent paths
+- higher values tolerate deeper recall but can make calls feel stuck longer
+
+### `maxAssemblyTokenBudget`
+
+Hard ceiling for assembled LCM token budget.
+
+Why it matters:
+
+- useful when the runtime model window is smaller than the surrounding system assumes
+- can prevent oversized assembly on smaller-context models
+
+## Summary quality and prompt controls
+
+### `summaryMaxOverageFactor`
+
+Maximum allowed overage factor before an oversized summary is truncated/downgraded.
+
+Why it matters:
+
+- guards against runaway summaries that are much larger than their target budget
+- useful when summary models are verbose or unstable
+
+### `customInstructions`
+
+Natural-language instructions injected into summarization prompts.
+
+Why it matters:
+
+- lets operators steer formatting or emphasis without patching code
+- should be used sparingly; low-quality instructions can degrade summary quality system-wide
 
 ## Practical operator workflow
 
@@ -110,6 +250,7 @@ Why it matters:
 3. Start with conservative defaults.
 4. Run `/lossless` after startup to confirm path, size, and summary health.
 5. If recall feels weak, revisit `freshTailCount`, `leafChunkTokens`, and summarizer model quality before changing anything else.
+6. Touch advanced knobs like fanout, large-file thresholds, custom instructions, and assembly caps only after a concrete symptom appears.
 
 ## Reading the status output
 
@@ -117,6 +258,6 @@ Why it matters:
 
 Useful interpretation notes:
 
-- `LCM frontier tokens` (or similarly named frontier/context metric) is the token count of what LCM currently has active in its frontier.
+- `tokens in context` is the current LCM frontier token count in the live LCM state.
 - `compression ratio` is shown as a rounded `1:N`, which is easier to read than a tiny percentage for heavily compacted conversations.
 - `/status` may still show a different context number because it reflects the runtime prompt that was actually assembled and sent on the last turn.
