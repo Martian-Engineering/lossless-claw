@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { getLcmDbFeatures } from "./features.js";
+import { parseUtcTimestampOrNull } from "../store/parse-utc-timestamp.js";
 
 type SummaryColumnInfo = {
   name?: string;
@@ -62,18 +63,7 @@ function ensureSummaryMetadataColumns(db: DatabaseSync): void {
 }
 
 function parseTimestamp(value: string | null | undefined): Date | null {
-  if (typeof value !== "string" || !value.trim()) {
-    return null;
-  }
-
-  const direct = new Date(value);
-  if (!Number.isNaN(direct.getTime())) {
-    return direct;
-  }
-
-  const normalized = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
-  const parsed = new Date(normalized);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
+  return parseUtcTimestampOrNull(value);
 }
 
 function isoStringOrNull(value: Date | null): string | null {

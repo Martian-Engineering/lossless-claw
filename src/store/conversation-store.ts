@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
+import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -166,11 +167,11 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
     sessionId: row.session_id,
     sessionKey: row.session_key ?? null,
     active: row.active === 1,
-    archivedAt: row.archived_at ? new Date(row.archived_at) : null,
+    archivedAt: parseUtcTimestampOrNull(row.archived_at),
     title: row.title,
-    bootstrappedAt: row.bootstrapped_at ? new Date(row.bootstrapped_at) : null,
-    createdAt: new Date(row.created_at),
-    updatedAt: new Date(row.updated_at),
+    bootstrappedAt: parseUtcTimestampOrNull(row.bootstrapped_at),
+    createdAt: parseUtcTimestamp(row.created_at),
+    updatedAt: parseUtcTimestamp(row.updated_at),
   };
 }
 
@@ -182,7 +183,7 @@ function toMessageRecord(row: MessageRow): MessageRecord {
     role: row.role,
     content: row.content,
     tokenCount: row.token_count,
-    createdAt: new Date(row.created_at),
+    createdAt: parseUtcTimestamp(row.created_at),
   };
 }
 
@@ -192,7 +193,7 @@ function toSearchResult(row: MessageSearchRow): MessageSearchResult {
     conversationId: row.conversation_id,
     role: row.role,
     snippet: row.snippet,
-    createdAt: new Date(row.created_at),
+    createdAt: parseUtcTimestamp(row.created_at),
     rank: row.rank,
   };
 }
@@ -855,7 +856,7 @@ export class ConversationStore {
           conversationId: row.conversation_id,
           role: row.role,
           snippet: createFallbackSnippet(normalizedContent, plan.terms),
-          createdAt: new Date(row.created_at),
+          createdAt: parseUtcTimestamp(row.created_at),
           rank: 0,
         };
       })
@@ -920,7 +921,7 @@ export class ConversationStore {
           conversationId: row.conversation_id,
           role: row.role,
           snippet: match[0],
-          createdAt: new Date(row.created_at),
+          createdAt: parseUtcTimestamp(row.created_at),
           rank: 0,
         });
       }

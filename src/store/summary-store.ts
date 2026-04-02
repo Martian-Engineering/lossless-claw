@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
+import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -224,8 +225,8 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
     content: row.content,
     tokenCount: row.token_count,
     fileIds,
-    earliestAt: row.earliest_at ? new Date(row.earliest_at) : null,
-    latestAt: row.latest_at ? new Date(row.latest_at) : null,
+    earliestAt: parseUtcTimestampOrNull(row.earliest_at),
+    latestAt: parseUtcTimestampOrNull(row.latest_at),
     descendantCount:
       typeof row.descendant_count === "number" &&
       Number.isFinite(row.descendant_count) &&
@@ -245,7 +246,7 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
         ? Math.floor(row.source_message_token_count)
         : 0,
     model: typeof row.model === "string" ? row.model : "unknown",
-    createdAt: new Date(row.created_at),
+    createdAt: parseUtcTimestamp(row.created_at),
   };
 }
 
@@ -256,7 +257,7 @@ function toContextItemRecord(row: ContextItemRow): ContextItemRecord {
     itemType: row.item_type,
     messageId: row.message_id,
     summaryId: row.summary_id,
-    createdAt: new Date(row.created_at),
+    createdAt: parseUtcTimestamp(row.created_at),
   };
 }
 
@@ -266,7 +267,7 @@ function toSearchResult(row: SummarySearchRow): SummarySearchResult {
     conversationId: row.conversation_id,
     kind: row.kind,
     snippet: row.snippet,
-    createdAt: new Date(row.created_at),
+    createdAt: parseUtcTimestamp(row.created_at),
     rank: row.rank,
   };
 }
@@ -280,7 +281,7 @@ function toLargeFileRecord(row: LargeFileRow): LargeFileRecord {
     byteSize: row.byte_size,
     storageUri: row.storage_uri,
     explorationSummary: row.exploration_summary,
-    createdAt: new Date(row.created_at),
+    createdAt: parseUtcTimestamp(row.created_at),
   };
 }
 
@@ -294,7 +295,7 @@ function toConversationBootstrapStateRecord(
     lastSeenMtimeMs: row.last_seen_mtime_ms,
     lastProcessedOffset: row.last_processed_offset,
     lastProcessedEntryHash: row.last_processed_entry_hash,
-    updatedAt: new Date(row.updated_at),
+    updatedAt: parseUtcTimestamp(row.updated_at),
   };
 }
 
@@ -989,7 +990,7 @@ export class SummaryStore {
       conversationId: row.conversation_id,
       kind: row.kind,
       snippet: createFallbackSnippet(row.content, plan.terms),
-      createdAt: new Date(row.created_at),
+      createdAt: parseUtcTimestamp(row.created_at),
       rank: 0,
     }));
   }
@@ -1053,7 +1054,7 @@ export class SummaryStore {
           conversationId: row.conversation_id,
           kind: row.kind,
           snippet: match[0],
-          createdAt: new Date(row.created_at),
+          createdAt: parseUtcTimestamp(row.created_at),
           rank: 0,
         });
       }
