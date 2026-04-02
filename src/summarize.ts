@@ -438,7 +438,14 @@ function hasTopLevelAuthInspectionKeys(value: Record<string, unknown>): boolean 
 }
 
 function looksLikeThrownError(value: Record<string, unknown>): boolean {
-  return (typeof value.name === "string" && /\berror\b/i.test(value.name)) || "stack" in value;
+  return (
+    (typeof value.name === "string" && /\berror\b/i.test(value.name)) ||
+    "stack" in value ||
+    (typeof value.message === "string" &&
+      !("content" in value) &&
+      !("response" in value) &&
+      !("output" in value))
+  );
 }
 
 function pickAuthInspectionValue(value: unknown): unknown {
