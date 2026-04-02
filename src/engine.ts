@@ -2312,6 +2312,7 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: conversation.conversationId,
         tokenBudget,
         freshTailCount: this.config.freshTailCount,
+        contextThreshold: this.config.contextThreshold,
       });
 
       // If assembly produced no messages for a non-empty live session,
