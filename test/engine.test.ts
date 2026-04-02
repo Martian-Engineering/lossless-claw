@@ -1012,6 +1012,135 @@ describe("LcmContextEngine before_reset lifecycle", () => {
   });
 });
 
+describe("LcmContextEngine session_end lifecycle", () => {
+  it("ignores session_end new so /new stays a prune-in-place flow", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const original = await store.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+    await store.createMessage({
+      conversationId: original.conversationId,
+      seq: 1,
+      role: "user",
+      content: "seed",
+      tokenCount: 5,
+    });
+
+    await engine.handleSessionEnd({
+      reason: "new",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+      nextSessionId: "uuid-2",
+    });
+
+    const active = await store.getConversationBySessionKey("agent:main:main");
+    expect(active?.conversationId).toBe(original.conversationId);
+    expect(active?.active).toBe(true);
+  });
+
+  it("archives the prior active conversation and creates a fresh active row on idle rollover", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const original = await store.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+    await store.createMessage({
+      conversationId: original.conversationId,
+      seq: 1,
+      role: "user",
+      content: "seed",
+      tokenCount: 5,
+    });
+
+    await engine.handleSessionEnd({
+      reason: "idle",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+      nextSessionId: "uuid-2",
+    });
+
+    const active = await store.getConversationBySessionKey("agent:main:main");
+    const archived = await store.getConversation(original.conversationId);
+
+    expect(active).not.toBeNull();
+    expect(active?.conversationId).not.toBe(original.conversationId);
+    expect(active?.sessionId).toBe("uuid-2");
+    expect(active?.active).toBe(true);
+    expect(archived?.active).toBe(false);
+    expect(archived?.archivedAt).not.toBeNull();
+  });
+
+  it("archives the active conversation without replacement on deleted session_end", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const original = await store.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+    await store.createMessage({
+      conversationId: original.conversationId,
+      seq: 1,
+      role: "user",
+      content: "seed",
+      tokenCount: 5,
+    });
+
+    await engine.handleSessionEnd({
+      reason: "deleted",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+    });
+
+    const active = await store.getConversationBySessionKey("agent:main:main");
+    const archived = await store.getConversation(original.conversationId);
+
+    expect(active).toBeNull();
+    expect(archived?.active).toBe(false);
+    expect(archived?.archivedAt).not.toBeNull();
+  });
+
+  it("treats session_end reset after before_reset as a no-op on the fresh replacement row", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const original = await store.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+    await store.createMessage({
+      conversationId: original.conversationId,
+      seq: 1,
+      role: "user",
+      content: "seed",
+      tokenCount: 5,
+    });
+
+    await engine.handleBeforeReset({
+      reason: "reset",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+    });
+    const firstFresh = await store.getConversationBySessionKey("agent:main:main");
+
+    await engine.handleSessionEnd({
+      reason: "reset",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+      nextSessionId: "uuid-2",
+    });
+    const secondFresh = await store.getConversationBySessionKey("agent:main:main");
+
+    expect(firstFresh?.conversationId).not.toBe(original.conversationId);
+    expect(secondFresh?.conversationId).toBe(firstFresh?.conversationId);
+  });
+});
+
 describe("LcmContextEngine delegated session continuity", () => {
   it("prepares subagent spawn from an existing conversation found by sessionKey", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));

@@ -66,6 +66,14 @@ type RuntimeModelAuthResult = {
   apiKey?: string;
 };
 
+type SessionEndLifecycleEvent = {
+  sessionId?: string;
+  sessionKey?: string;
+  reason?: string;
+  nextSessionId?: string;
+  nextSessionKey?: string;
+};
+
 type RuntimeModelAuthModel = {
   id: string;
   provider: string;
@@ -1568,6 +1576,16 @@ const lcmPlugin = {
     api.on("before_prompt_build", () => ({
       prependSystemContext: LOSSLESS_RECALL_POLICY_PROMPT,
     }));
+    api.on("session_end", async (event) => {
+      const lifecycleEvent = event as SessionEndLifecycleEvent;
+      await lcm.handleSessionEnd({
+        reason: lifecycleEvent.reason,
+        sessionId: lifecycleEvent.sessionId,
+        sessionKey: lifecycleEvent.sessionKey,
+        nextSessionId: lifecycleEvent.nextSessionId,
+        nextSessionKey: lifecycleEvent.nextSessionKey,
+      });
+    });
     api.registerContextEngine("lossless-claw", () => lcm);
     api.registerContextEngine("default", () => lcm);
     api.registerTool((ctx) =>

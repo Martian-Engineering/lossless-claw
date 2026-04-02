@@ -48,6 +48,7 @@ import { compileSessionPatterns, matchesSessionPattern } from "./session-pattern
 import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
   ConversationStore,
+  type ConversationRecord,
   type CreateMessagePartInput,
   type MessagePartRecord,
   type MessagePartType,
@@ -3219,6 +3220,69 @@ export class LcmContextEngine implements ContextEngine {
     // The shared connection is managed for the lifetime of the plugin process.
   }
 
+  /** Detect the empty replacement row created during a prior lifecycle rollover. */
+  private async isFreshLifecycleConversation(conversation: ConversationRecord): Promise<boolean> {
+    const currentMessageCount = await this.conversationStore.getMessageCount(conversation.conversationId);
+    if (currentMessageCount !== 0) {
+      return false;
+    }
+    const currentContextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+    return currentContextItems.length === 0 && !conversation.bootstrappedAt;
+  }
+
+  /**
+   * Archive the current active conversation and optionally create the replacement
+   * row that bootstrap should attach to for the next session transcript.
+   */
+  private async applySessionReplacement(params: {
+    reason: string;
+    sessionId?: string;
+    sessionKey?: string;
+    nextSessionId?: string;
+    nextSessionKey?: string;
+    createReplacement: boolean;
+    createReplacementWhenMissing?: boolean;
+  }): Promise<void> {
+    const current = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    if (!current && !params.createReplacementWhenMissing) {
+      return;
+    }
+
+    if (current?.active) {
+      if (params.createReplacement && await this.isFreshLifecycleConversation(current)) {
+        this.deps.log.info(
+          `[lcm] ${params.reason} lifecycle no-op for already fresh conversation ${current.conversationId}`,
+        );
+        return;
+      }
+      await this.conversationStore.archiveConversation(current.conversationId);
+    }
+
+    if (!params.createReplacement) {
+      this.deps.log.info(
+        `[lcm] ${params.reason} lifecycle archived conversation ${current?.conversationId ?? "(none)"}`,
+      );
+      return;
+    }
+
+    const nextSessionId = params.nextSessionId?.trim() || params.sessionId?.trim() || current?.sessionId;
+    if (!nextSessionId) {
+      this.deps.log.warn(`[lcm] ${params.reason} lifecycle skipped: no session identity available`);
+      return;
+    }
+    const nextSessionKey = params.nextSessionKey?.trim() || params.sessionKey?.trim() || current?.sessionKey;
+    const freshConversation = await this.conversationStore.createConversation({
+      sessionId: nextSessionId,
+      sessionKey: nextSessionKey,
+    });
+    this.deps.log.info(
+      `[lcm] ${params.reason} lifecycle archived prior conversation and created ${freshConversation.conversationId}`,
+    );
+  }
+
   /** Apply LCM lifecycle semantics for OpenClaw's /new and /reset commands. */
   async handleBeforeReset(params: {
     reason?: string;
@@ -3261,44 +3325,50 @@ export class LcmContextEngine implements ContextEngine {
             );
             return;
           }
-
-          const current = await this.conversationStore.getConversationForSession({
+          await this.applySessionReplacement({
+            reason: "/reset",
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
+            createReplacement: true,
+            createReplacementWhenMissing: true,
           });
-          if (current?.active) {
-            const currentMessageCount = await this.conversationStore.getMessageCount(
-              current.conversationId,
-            );
-            const currentContextItems = await this.summaryStore.getContextItems(
-              current.conversationId,
-            );
-            if (
-              currentMessageCount === 0
-              && currentContextItems.length === 0
-              && !current.bootstrappedAt
-            ) {
-              this.deps.log.info(
-                `[lcm] /reset no-op for already fresh conversation ${current.conversationId}`,
-              );
-              return;
-            }
-            await this.conversationStore.archiveConversation(current.conversationId);
-          }
+        }),
+    );
+  }
 
-          const nextSessionId = params.sessionId?.trim() || current?.sessionId;
-          if (!nextSessionId) {
-            this.deps.log.warn("[lcm] /reset skipped: no session identity available");
-            return;
-          }
+  /** Apply generic lifecycle semantics for session rollover and deletion hooks. */
+  async handleSessionEnd(params: {
+    reason?: string;
+    sessionId?: string;
+    sessionKey?: string;
+    nextSessionId?: string;
+    nextSessionKey?: string;
+  }): Promise<void> {
+    const reason = params.reason?.trim();
+    if (!reason || reason === "new" || reason === "unknown") {
+      return;
+    }
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      return;
+    }
+    if (this.isStatelessSession(params.sessionKey ?? params.nextSessionKey)) {
+      return;
+    }
 
-          const freshConversation = await this.conversationStore.createConversation({
-            sessionId: nextSessionId,
-            sessionKey: params.sessionKey?.trim(),
+    const createReplacement = reason !== "deleted";
+    this.ensureMigrated();
+    await this.withSessionQueue(
+      this.resolveSessionQueueKey(params.nextSessionId ?? params.sessionId, params.sessionKey ?? params.nextSessionKey),
+      async () =>
+        this.conversationStore.withTransaction(async () => {
+          await this.applySessionReplacement({
+            reason: `session_end:${reason}`,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey ?? params.nextSessionKey,
+            nextSessionId: params.nextSessionId,
+            nextSessionKey: params.nextSessionKey,
+            createReplacement,
           });
-          this.deps.log.info(
-            `[lcm] /reset archived prior conversation and created ${freshConversation.conversationId}`,
-          );
         }),
     );
   }

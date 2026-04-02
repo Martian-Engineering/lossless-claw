@@ -246,7 +246,7 @@ Lossless-claw distinguishes OpenClaw's two session-reset commands:
 - `2`: keep d2+ summaries; recommended default
 - `3+`: keep only deeper, more abstract summaries
 
-Lossless-claw currently applies these storage semantics through the `before_reset` hook only. User-facing confirmation text after `/new` or `/reset` must be emitted by OpenClaw's command handlers.
+Lossless-claw applies `/new` pruning through `before_reset` and uses `session_end` to catch transcript rollovers such as `/reset`, idle or daily session rotation, compaction session replacement, and deletions. User-facing confirmation text after `/new` or `/reset` must still be emitted by OpenClaw's command handlers.
 
 Use `ignoreSessionPatterns` or `LCM_IGNORE_SESSION_PATTERNS` to keep low-value sessions completely out of LCM. Matching sessions do not create conversations, do not store messages, and do not participate in compaction or delegated expansion grants.
 

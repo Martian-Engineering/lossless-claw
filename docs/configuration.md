@@ -159,7 +159,7 @@ Lossless-claw treats the two OpenClaw reset commands differently:
 - `/reset` archives the active conversation row and creates a fresh active row for the same stable `sessionKey`.
 
 This preserves lossless history while still giving users a real clean-slate command.
-OpenClaw's command handlers still own the user-facing post-command disclosure text; lossless-claw applies only the underlying storage transition through `before_reset`.
+Lossless-claw applies `/new` through `before_reset`, then uses `session_end` to catch the broader rollover cases OpenClaw can emit: `/reset`, idle or daily session rotation, compaction-driven session replacement, and deletions. OpenClaw's command handlers still own the user-facing post-command disclosure text.
 
 Use `ignoreSessionPatterns` or `LCM_IGNORE_SESSION_PATTERNS` to keep low-value sessions completely out of LCM. Matching sessions do not create conversations, do not store messages, and do not participate in compaction or delegated expansion grants.
 
