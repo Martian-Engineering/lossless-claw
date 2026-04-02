@@ -173,3 +173,59 @@ describe("pinnedFiles config", () => {
     expect(config.pinnedFiles).toEqual(["FLEET.md", "BOUNDARIES.md"]);
   });
 });
+
+describe("pinnedFilesPerAgent config", () => {
+  it("resolves per-agent pinned files from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      pinnedFilesPerAgent: {
+        athena: ["system/subject-guides.md", "system/standing-rules.md"],
+      },
+    });
+    expect(config.pinnedFilesPerAgent).toEqual({
+      athena: ["system/subject-guides.md", "system/standing-rules.md"],
+    });
+  });
+
+  it("defaults pinnedFilesPerAgent to empty object", () => {
+    const config = resolveLcmConfig({}, {});
+    expect(config.pinnedFilesPerAgent).toEqual({});
+  });
+
+  it("ignores non-object pinnedFilesPerAgent values", () => {
+    const config = resolveLcmConfig({}, {
+      pinnedFilesPerAgent: "not-an-object",
+    });
+    expect(config.pinnedFilesPerAgent).toEqual({});
+  });
+
+  it("ignores array pinnedFilesPerAgent values", () => {
+    const config = resolveLcmConfig({}, {
+      pinnedFilesPerAgent: ["a", "b"],
+    });
+    expect(config.pinnedFilesPerAgent).toEqual({});
+  });
+
+  it("handles multiple agents", () => {
+    const config = resolveLcmConfig({}, {
+      pinnedFilesPerAgent: {
+        athena: ["a.md"],
+        brunelleschi: ["b.md", "c.md"],
+      },
+    });
+    expect(config.pinnedFilesPerAgent).toEqual({
+      athena: ["a.md"],
+      brunelleschi: ["b.md", "c.md"],
+    });
+  });
+
+  it("filters out non-string entries within per-agent arrays", () => {
+    const config = resolveLcmConfig({}, {
+      pinnedFilesPerAgent: {
+        athena: ["valid.md", 123, null, "also-valid.md"],
+      },
+    });
+    expect(config.pinnedFilesPerAgent).toEqual({
+      athena: ["valid.md", "also-valid.md"],
+    });
+  });
+});

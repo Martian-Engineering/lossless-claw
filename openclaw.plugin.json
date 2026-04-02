@@ -107,6 +107,10 @@
     "pinnedFiles": {
       "label": "Pinned Files",
       "help": "Workspace files always present in context (never compacted). Paths relative to agent workspace."
+    },
+    "pinnedFilesPerAgent": {
+      "label": "Per-Agent Pinned Files",
+      "help": "Agent-specific pinned files keyed by agent ID. Merged with global pinnedFiles."
     }
   },
   "configSchema": {
@@ -234,6 +238,14 @@
         "type": "array",
         "items": { "type": "string" },
         "description": "Workspace-relative file paths injected into every context assembly, outside the compaction DAG. These files are never summarized."
+      },
+      "pinnedFilesPerAgent": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "description": "Per-agent pinned file paths, keyed by agent ID. Merged with global pinnedFiles at resolution time."
       }
     }
   }
