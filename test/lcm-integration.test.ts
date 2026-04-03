@@ -3184,6 +3184,29 @@ describe("prompt-aware eviction", () => {
     expect(contents).not.toContain("authentication login");
   });
 
+  it("whitespace-only prompt falls back to chronological eviction", async () => {
+    const olderContent = "authentication login password security token";
+    const newerContent = "painting brushes canvas art watercolor oils";
+
+    await addSummary(olderContent, "sum_older");
+    await addSummary(newerContent, "sum_newer");
+
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Fresh message ${i}`,
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 75,
+      freshTailCount: 4,
+      prompt: "   ",
+    });
+
+    const contents = result.messages.map((m) => extractMessageText(m.content)).join("\n");
+    expect(contents).toContain("painting");
+    expect(contents).not.toContain("authentication login");
+  });
+
   it("when budget fits everything, prompt has no effect on output", async () => {
     await addSummary("authentication login security", "sum_auth");
     await addSummary("painting canvas watercolor", "sum_art");

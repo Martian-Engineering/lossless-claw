@@ -25,7 +25,7 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
-  /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent, falls back to chronological eviction. */
+  /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
   prompt?: string;
 }
 
@@ -854,6 +854,11 @@ export function scoreRelevance(itemText: string, prompt: string): number {
   return score;
 }
 
+/** Return true when a prompt contains at least one searchable term. */
+function hasSearchablePrompt(prompt?: string): prompt is string {
+  return typeof prompt === "string" && tokenizeText(prompt).length > 0;
+}
+
 // ── ContextAssembler ─────────────────────────────────────────────────────────
 
 export class ContextAssembler {
@@ -946,13 +951,13 @@ export class ContextAssembler {
       // Everything fits
       selected.push(...evictable);
       evictableTokens = evictableTotalTokens;
-    } else if (input.prompt && input.prompt.length > 0) {
+    } else if (hasSearchablePrompt(input.prompt)) {
       // Prompt-aware eviction: score each evictable item by relevance to the
       // prompt, then greedily fill budget from highest-scoring items down.
       // Re-sort selected items by ordinal to restore chronological order.
       const scored = evictable.map((item, idx) => ({
         item,
-        score: scoreRelevance(item.text, input.prompt!),
+        score: scoreRelevance(item.text, input.prompt),
         idx, // original index — higher = more recent, used as tiebreaker
       }));
       // Sort: highest relevance first; most recent (higher idx) breaks ties

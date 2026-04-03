@@ -2260,7 +2260,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     messages: AgentMessage[];
     tokenBudget?: number;
-    /** Optional user query for relevance-based eviction (BM25-lite). When absent, falls back to chronological eviction. */
+    /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
     prompt?: string;
   }): Promise<AssembleResult> {
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
