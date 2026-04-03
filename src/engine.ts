@@ -124,9 +124,27 @@ const DYNAMIC_ACTIVITY_HIGH_DOWNSHIFT_FACTOR = 0.75;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Rough token estimate: ~4 chars per token. */
+/** CJK-aware token estimate. ASCII ~4 chars/token, CJK ~1.5 chars/token, emoji ~0.5 chars/token. */
 function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
+  let tokens = 0;
+  for (const char of text) {
+    const cp = char.codePointAt(0) ?? 0;
+    if (
+      (cp >= 0x4e00 && cp <= 0x9fff) || // CJK Unified Ideographs
+      (cp >= 0x3400 && cp <= 0x4dbf) || // CJK Extension A
+      (cp >= 0xf900 && cp <= 0xfaff) || // CJK Compatibility
+      (cp >= 0x3040 && cp <= 0x30ff) || // Hiragana + Katakana
+      (cp >= 0xac00 && cp <= 0xd7af) || // Hangul
+      (cp >= 0xff00 && cp <= 0xffef)    // Fullwidth forms
+    ) {
+      tokens += 1.5; // CJK: ~1.5 tokens per char
+    } else if (cp > 0xffff) {
+      tokens += 2; // Emoji / supplementary plane
+    } else {
+      tokens += 0.25; // ASCII / Latin: ~4 chars per token
+    }
+  }
+  return Math.ceil(tokens);
 }
 
 function toJson(value: unknown): string {
