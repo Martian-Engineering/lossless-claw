@@ -447,30 +447,6 @@ export function createLcmExpandQueryTool(input: {
       }
 
       const originSessionKey = recursionCheck.originSessionKey || callerSessionKey || "main";
-      const concurrencyCheck = acquireExpansionConcurrencySlot({
-        originSessionKey,
-        requestId,
-      });
-      if (concurrencyCheck.blocked) {
-        recordExpansionDelegationTelemetry({
-          deps: input.deps,
-          component: "lcm_expand_query",
-          event: "block",
-          requestId,
-          sessionKey: callerSessionKey,
-          expansionDepth: recursionCheck.expansionDepth,
-          originSessionKey: concurrencyCheck.originSessionKey,
-          reason: concurrencyCheck.reason,
-        });
-        return jsonResult({
-          errorCode: concurrencyCheck.code,
-          error: concurrencyCheck.message,
-          requestId: concurrencyCheck.requestId,
-          expansionDepth: recursionCheck.expansionDepth,
-          originSessionKey: concurrencyCheck.originSessionKey,
-          reason: concurrencyCheck.reason,
-        });
-      }
 
       try {
         const conversationScope = await resolveLcmConversationScope({
@@ -537,6 +513,31 @@ export function createLcmExpandQueryTool(input: {
         if (summaryIds.length === 0) {
           return jsonResult({
             error: "No summaryIds available after applying conversation scope.",
+          });
+        }
+
+        const concurrencyCheck = acquireExpansionConcurrencySlot({
+          originSessionKey,
+          requestId,
+        });
+        if (concurrencyCheck.blocked) {
+          recordExpansionDelegationTelemetry({
+            deps: input.deps,
+            component: "lcm_expand_query",
+            event: "block",
+            requestId,
+            sessionKey: callerSessionKey,
+            expansionDepth: recursionCheck.expansionDepth,
+            originSessionKey: concurrencyCheck.originSessionKey,
+            reason: concurrencyCheck.reason,
+          });
+          return jsonResult({
+            errorCode: concurrencyCheck.code,
+            error: concurrencyCheck.message,
+            requestId: concurrencyCheck.requestId,
+            expansionDepth: recursionCheck.expansionDepth,
+            originSessionKey: concurrencyCheck.originSessionKey,
+            reason: concurrencyCheck.reason,
           });
         }
 

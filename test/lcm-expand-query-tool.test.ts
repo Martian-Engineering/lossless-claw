@@ -772,6 +772,71 @@ describe("createLcmExpandQueryTool", () => {
     });
   });
 
+  it("does not block concurrent requests that never delegate", async () => {
+    const retrieval = makeRetrieval();
+
+    let releaseFirstGrep!: () => void;
+    const firstGrepGate = new Promise<void>((resolve) => {
+      releaseFirstGrep = () => resolve();
+    });
+    let grepCalls = 0;
+    retrieval.grep.mockImplementation(async () => {
+      grepCalls += 1;
+      if (grepCalls === 1) {
+        await firstGrepGate;
+      }
+      return {
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      };
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval, conversationId: 7 }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+
+    const firstPromise = tool.execute("call-no-match-1", {
+      query: "missing query",
+      prompt: "Look for anything relevant",
+    });
+    const secondPromise = tool.execute("call-no-match-2", {
+      query: "missing query",
+      prompt: "Look for anything relevant again",
+    });
+
+    releaseFirstGrep();
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+    expect(first.details).toMatchObject({
+      answer: "No matching summaries found for this scope.",
+      citedIds: [],
+      sourceConversationId: 7,
+      expandedSummaryCount: 0,
+      totalSourceTokens: 0,
+      truncated: false,
+    });
+    expect(second.details).toMatchObject({
+      answer: "No matching summaries found for this scope.",
+      citedIds: [],
+      sourceConversationId: 7,
+      expandedSummaryCount: 0,
+      totalSourceTokens: 0,
+      truncated: false,
+    });
+
+    expect(callGatewayMock).not.toHaveBeenCalled();
+    expect(getExpansionDelegationTelemetrySnapshotForTests()).toMatchObject({
+      start: 2,
+      block: 0,
+      timeout: 0,
+      success: 0,
+    });
+  });
+
   it("blocks concurrent delegated expansion from the same origin session", async () => {
     const retrieval = makeRetrieval();
     retrieval.describe.mockResolvedValue({
