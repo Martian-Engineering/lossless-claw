@@ -345,11 +345,38 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.pruneHeartbeatOk).toEqual({ type: "boolean" });
   });
 
+  it("ships a manifest with bootstrapMaxTokens in schema", () => {
+    expect(manifest.configSchema.properties.bootstrapMaxTokens).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
+  });
   it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {
     const config = resolveLcmConfig({}, {});
+    expect(config.bootstrapMaxTokens).toBe(6000);
     expect(config.delegationTimeoutMs).toBe(120000);
     expect(config.summaryMaxOverageFactor).toBe(3);
     expect(config.maxAssemblyTokenBudget).toBeUndefined();
+  });
+
+  it("derives bootstrapMaxTokens from leafChunkTokens and allows override", () => {
+    expect(resolveLcmConfig({}, {
+      leafChunkTokens: 80_000,
+    }).bootstrapMaxTokens).toBe(24_000);
+
+    expect(resolveLcmConfig({}, {
+      leafChunkTokens: 80_000,
+      bootstrapMaxTokens: 12_345,
+    }).bootstrapMaxTokens).toBe(12_345);
+  });
+
+  it("env vars override bootstrapMaxTokens", () => {
+    const config = resolveLcmConfig({
+      LCM_BOOTSTRAP_MAX_TOKENS: "4321",
+    } as NodeJS.ProcessEnv, {
+      bootstrapMaxTokens: 12_345,
+    });
+    expect(config.bootstrapMaxTokens).toBe(4321);
   });
 
   it("reads summaryMaxOverageFactor and maxAssemblyTokenBudget from plugin config", () => {

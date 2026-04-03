@@ -1939,6 +1939,33 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(singleSpy).not.toHaveBeenCalled();
   });
 
+  it("limits first-time bootstrap imports to the newest messages within bootstrapMaxTokens", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-token-cap");
+    const sm = SessionManager.open(sessionFile);
+    for (let index = 0; index < 5; index += 1) {
+      sm.appendMessage({
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: [{ type: "text", text: `turn ${index} ${"x".repeat(396)}` }],
+      } as AgentMessage);
+    }
+
+    const engine = createEngineWithConfig({ bootstrapMaxTokens: 250 });
+    const sessionId = "bootstrap-token-cap";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(2);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      `turn 3 ${"x".repeat(396)}`,
+      `turn 4 ${"x".repeat(396)}`,
+    ]);
+  });
+
   it("streams JSONL replay and skips malformed lines while keeping later messages", async () => {
     const sessionFile = createSessionFilePath("streaming-jsonl");
     const lines: string[] = [];

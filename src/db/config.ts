@@ -18,6 +18,8 @@ export type LcmConfig = {
   condensedMinFanoutHard: number;
   incrementalMaxDepth: number;
   leafChunkTokens: number;
+  /** Maximum raw parent-history tokens imported during first-time bootstrap. */
+  bootstrapMaxTokens?: number;
   leafTargetTokens: number;
   condensedTargetTokens: number;
   maxExpandTokens: number;
@@ -112,6 +114,13 @@ export function resolveLcmConfig(
   pluginConfig?: Record<string, unknown>,
 ): LcmConfig {
   const pc = pluginConfig ?? {};
+  const resolvedLeafChunkTokens =
+    (env.LCM_LEAF_CHUNK_TOKENS !== undefined ? parseInt(env.LCM_LEAF_CHUNK_TOKENS, 10) : undefined)
+      ?? toNumber(pc.leafChunkTokens) ?? 20000;
+  const resolvedBootstrapMaxTokens =
+    (env.LCM_BOOTSTRAP_MAX_TOKENS !== undefined ? parseInt(env.LCM_BOOTSTRAP_MAX_TOKENS, 10) : undefined)
+      ?? toNumber(pc.bootstrapMaxTokens)
+      ?? Math.max(6000, Math.floor(resolvedLeafChunkTokens * 0.3));
   const envDelegationTimeoutMs =
     env.LCM_DELEGATION_TIMEOUT_MS !== undefined
       ? toNumber(env.LCM_DELEGATION_TIMEOUT_MS)
@@ -168,9 +177,8 @@ export function resolveLcmConfig(
     incrementalMaxDepth:
       (env.LCM_INCREMENTAL_MAX_DEPTH !== undefined ? parseInt(env.LCM_INCREMENTAL_MAX_DEPTH, 10) : undefined)
         ?? toNumber(pc.incrementalMaxDepth) ?? 1,
-    leafChunkTokens:
-      (env.LCM_LEAF_CHUNK_TOKENS !== undefined ? parseInt(env.LCM_LEAF_CHUNK_TOKENS, 10) : undefined)
-        ?? toNumber(pc.leafChunkTokens) ?? 20000,
+    leafChunkTokens: resolvedLeafChunkTokens,
+    bootstrapMaxTokens: resolvedBootstrapMaxTokens,
     leafTargetTokens:
       (env.LCM_LEAF_TARGET_TOKENS !== undefined ? parseInt(env.LCM_LEAF_TARGET_TOKENS, 10) : undefined)
         ?? toNumber(pc.leafTargetTokens) ?? 2400,

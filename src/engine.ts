@@ -830,6 +830,63 @@ async function readLeafPathMessages(sessionFile: string): Promise<AgentMessage[]
   }
 }
 
+/**
+ * Resolve the first-time bootstrap token budget.
+ *
+ * When unset, bootstrap keeps a modest suffix of the parent session rather than
+ * inheriting the full raw history into a brand-new conversation.
+ */
+function resolveBootstrapMaxTokens(config: Pick<LcmConfig, "bootstrapMaxTokens" | "leafChunkTokens">): number {
+  if (
+    typeof config.bootstrapMaxTokens === "number" &&
+    Number.isFinite(config.bootstrapMaxTokens) &&
+    config.bootstrapMaxTokens > 0
+  ) {
+    return Math.floor(config.bootstrapMaxTokens);
+  }
+
+  const leafChunkTokens =
+    typeof config.leafChunkTokens === "number" &&
+    Number.isFinite(config.leafChunkTokens) &&
+    config.leafChunkTokens > 0
+      ? Math.floor(config.leafChunkTokens)
+      : 20_000;
+  return Math.max(6000, Math.floor(leafChunkTokens * 0.3));
+}
+
+/**
+ * Keep only the newest bootstrap messages that fit within the token budget.
+ *
+ * The newest message is always preserved so a fork never starts empty when the
+ * parent transcript has any recoverable content at all.
+ */
+function trimBootstrapMessagesToBudget(messages: AgentMessage[], maxTokens: number): AgentMessage[] {
+  if (messages.length === 0) {
+    return [];
+  }
+
+  const safeMaxTokens = Number.isFinite(maxTokens) ? Math.floor(maxTokens) : 0;
+  if (safeMaxTokens <= 0) {
+    return [messages[messages.length - 1]!];
+  }
+
+  const kept: AgentMessage[] = [];
+  let totalTokens = 0;
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    const tokenCount = toStoredMessage(message).tokenCount;
+    if (kept.length > 0 && totalTokens + tokenCount > safeMaxTokens) {
+      break;
+    }
+    kept.push(message);
+    totalTokens += tokenCount;
+  }
+
+  kept.reverse();
+  return kept;
+}
+
 function readFileSegment(sessionFile: string, offset: number): string | null {
   let fd: number | null = null;
   try {
@@ -1908,7 +1965,12 @@ export class LcmContextEngine implements ContextEngine {
           // First-time import path: no LCM rows yet, so seed directly from the
           // active leaf context snapshot.
           if (existingCount === 0) {
-            if (historicalMessages.length === 0) {
+            const bootstrapMessages = trimBootstrapMessagesToBudget(
+              historicalMessages,
+              resolveBootstrapMaxTokens(this.config),
+            );
+
+            if (bootstrapMessages.length === 0) {
               await this.conversationStore.markConversationBootstrapped(conversationId);
               await persistBootstrapState(conversationId, historicalMessages);
               return {
@@ -1919,7 +1981,7 @@ export class LcmContextEngine implements ContextEngine {
             }
 
             const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
-            const bulkInput = historicalMessages.map((message, index) => {
+            const bulkInput = bootstrapMessages.map((message, index) => {
               const stored = toStoredMessage(message);
               return {
                 conversationId,
