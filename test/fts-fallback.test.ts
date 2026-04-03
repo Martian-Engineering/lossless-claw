@@ -252,7 +252,7 @@ describe("FTS fallback", () => {
       .spyOn(summaryStore as unknown as { searchFullText: (...args: unknown[]) => unknown[] }, "searchFullText")
       .mockReturnValue(summaryLikeResult);
     const summaryLikeSpy = vi
-      .spyOn(summaryStore as unknown as { searchLike: (...args: unknown[]) => unknown[] }, "searchLike")
+      .spyOn(summaryStore as unknown as { searchLikeCjk: (...args: unknown[]) => unknown[] }, "searchLikeCjk")
       .mockReturnValue(summaryLikeResult);
 
     await expect(
@@ -276,5 +276,91 @@ describe("FTS fallback", () => {
     expect(summaryLikeSpy).toHaveBeenCalledOnce();
     expect(messageFtsSpy).not.toHaveBeenCalled();
     expect(summaryFtsSpy).not.toHaveBeenCalled();
+  });
+
+  itIfFts5("requires both CJK and Latin terms for mixed-language summary queries", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-cjk-mixed-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "mixed-cjk.db");
+    const db = getLcmConnection(dbPath);
+
+    runLcmMigrations(db, { fts5Available: true });
+
+    const conversationStore = new ConversationStore(db, { fts5Available: true });
+    const summaryStore = new SummaryStore(db, { fts5Available: true });
+
+    const conversation = await conversationStore.createConversation({
+      sessionId: "mixed-cjk-session",
+      title: "Mixed CJK search",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_cjk_only",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "这里只提到端到端测试，没有英文标记。",
+      tokenCount: 10,
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_latin_only",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "This summary only references lossless-claw without Chinese text.",
+      tokenCount: 10,
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_mixed",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "lossless-claw 的端到端测试已经通过。",
+      tokenCount: 10,
+    });
+
+    const summaryResults = await summaryStore.searchSummaries({
+      query: "lossless-claw 端到端测试",
+      mode: "full_text",
+      conversationId: conversation.conversationId,
+      limit: 10,
+    });
+
+    expect(summaryResults.map((result) => result.summaryId)).toEqual(["sum_mixed"]);
+  });
+
+  itIfFts5("matches single-character CJK summary queries", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-cjk-single-char-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "single-char-cjk.db");
+    const db = getLcmConnection(dbPath);
+
+    runLcmMigrations(db, { fts5Available: true });
+
+    const conversationStore = new ConversationStore(db, { fts5Available: true });
+    const summaryStore = new SummaryStore(db, { fts5Available: true });
+
+    const conversation = await conversationStore.createConversation({
+      sessionId: "single-char-cjk-session",
+      title: "Single-char CJK search",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_single_char",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "这里记录了飞书集成的排查过程。",
+      tokenCount: 10,
+    });
+
+    const summaryResults = await summaryStore.searchSummaries({
+      query: "飞",
+      mode: "full_text",
+      conversationId: conversation.conversationId,
+      limit: 10,
+    });
+
+    expect(summaryResults.map((result) => result.summaryId)).toEqual(["sum_single_char"]);
   });
 });
