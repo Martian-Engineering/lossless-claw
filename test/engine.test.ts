@@ -3572,6 +3572,44 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((m) => m.content)).toEqual(["hello", "world"]);
   });
+
+  it("preserves a legitimate repeated first new message", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-repeated-first-new-message";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-repeated-first-new-message"),
+      messages: [
+        makeMessage({ role: "user", content: "hello" }),
+        makeMessage({ role: "assistant", content: "first reply" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-repeated-first-new-message-2"),
+      messages: [
+        makeMessage({ role: "user", content: "hello" }),
+        makeMessage({ role: "assistant", content: "first reply" }),
+        makeMessage({ role: "user", content: "hello" }),
+        makeMessage({ role: "assistant", content: "second reply" }),
+      ],
+      prePromptMessageCount: 2,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "hello",
+      "first reply",
+      "hello",
+      "second reply",
+    ]);
+  });
 });
 
 // ── Compact token budget plumbing ───────────────────────────────────────────

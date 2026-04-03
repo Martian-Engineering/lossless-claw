@@ -2027,8 +2027,8 @@ export class LcmContextEngine implements ContextEngine {
 
   /**
    * Remove messages from the batch that already exist in the DB for this session.
-   * Fast path (normal operation): O(1) — if the first message is not in the DB, all are new.
-   * Slow path (restart replay): walks backward to find the anchor point.
+   * Conservative replay detection: only strip a prefix when the incoming
+   * batch begins with the entire stored transcript for the session.
    */
   private async deduplicateAfterTurnBatch(
     sessionId: string,
@@ -2053,53 +2053,30 @@ export class LcmContextEngine implements ContextEngine {
     );
     if (!firstExists) return batch;
 
-    // Slow path: overlap detected — walk backward from the end of the batch
-    // to find the last message that matches the DB tail, then ingest only
-    // what comes after.
+    const storedMessageCount = await this.conversationStore.getMessageCount(conversationId);
+    if (storedMessageCount > batch.length) {
+      return batch;
+    }
+
+    // Replay path: after a gateway restart, afterTurn receives the full
+    // session history rebuilt from JSONL. Only trim when the incoming batch
+    // starts with the exact stored transcript in order.
     const storedBatch = batch.map((m) => toStoredMessage(m));
-    const identityTotals = new Map<string, number>();
-    for (const stored of storedBatch) {
-      const id = messageIdentity(stored.role, stored.content);
-      identityTotals.set(id, (identityTotals.get(id) ?? 0) + 1);
-    }
-
-    const identityCountsAfterIndex = new Map<string, number>();
-    const dbIdentityCounts = new Map<string, number>();
-
-    for (let i = storedBatch.length - 1; i >= 0; i--) {
-      const stored = storedBatch[i]!;
-      const identity = messageIdentity(stored.role, stored.content);
-      const seenAfter = identityCountsAfterIndex.get(identity) ?? 0;
-      const total = identityTotals.get(identity) ?? 0;
-      const occurrencesThroughIndex = total - seenAfter;
-
-      const exists = await this.conversationStore.hasMessage(
-        conversationId,
-        stored.role,
-        stored.content,
-      );
-      identityCountsAfterIndex.set(identity, seenAfter + 1);
-
-      if (!exists) continue;
-
-      let dbCount = dbIdentityCounts.get(identity);
-      if (dbCount === undefined) {
-        dbCount = await this.conversationStore.countMessagesByIdentity(
-          conversationId,
-          stored.role,
-          stored.content,
-        );
-        dbIdentityCounts.set(identity, dbCount);
+    const storedMessages = await this.conversationStore.getMessages(conversationId, {
+      limit: storedMessageCount,
+    });
+    for (let i = 0; i < storedMessageCount; i += 1) {
+      const storedConversationMessage = storedMessages[i]!;
+      const incomingMessage = storedBatch[i]!;
+      if (
+        messageIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
+        messageIdentity(incomingMessage.role, incomingMessage.content)
+      ) {
+        return batch;
       }
-
-      if (dbCount !== occurrencesThroughIndex) continue;
-
-      // Anchor found at index i — everything after is new.
-      return batch.slice(i + 1);
     }
 
-    // No anchor found — all messages are new.
-    return batch;
+    return batch.slice(storedMessageCount);
   }
 
   private async ingestSingle(params: {
