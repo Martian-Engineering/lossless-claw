@@ -3340,6 +3340,240 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 });
 
+// ── afterTurn dedup guard ────────────────────────────────────────────────────
+
+describe("LcmContextEngine afterTurn dedup guard", () => {
+  it("ingests all messages when no prior conversation exists (new session)", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-new-session";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-new-session"),
+      messages: [
+        makeMessage({ role: "user", content: "hello" }),
+        makeMessage({ role: "assistant", content: "hi there" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["hello", "hi there"]);
+  });
+
+  it("ingests all genuinely new messages (normal afterTurn, no restart)", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-normal";
+
+    // Seed DB with initial messages via first afterTurn
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-normal"),
+      messages: [
+        makeMessage({ role: "user", content: "first question" }),
+        makeMessage({ role: "assistant", content: "first answer" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Second afterTurn with genuinely new messages
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-normal-2"),
+      messages: [
+        makeMessage({ role: "user", content: "first question" }),
+        makeMessage({ role: "assistant", content: "first answer" }),
+        makeMessage({ role: "user", content: "second question" }),
+        makeMessage({ role: "assistant", content: "second answer" }),
+      ],
+      prePromptMessageCount: 2, // first two are pre-prompt
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "first question",
+      "first answer",
+      "second question",
+      "second answer",
+    ]);
+  });
+
+  it("skips all duplicates when gateway restart replays full history", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-restart-all-dup";
+
+    // Seed DB
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-restart-all-dup"),
+      messages: [
+        makeMessage({ role: "user", content: "msg A" }),
+        makeMessage({ role: "assistant", content: "msg B" }),
+        makeMessage({ role: "user", content: "msg C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Restart replays the full history (prePromptMessageCount only covers system prompt)
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-restart-all-dup-2"),
+      messages: [
+        makeMessage({ role: "system", content: "system prompt" }),
+        makeMessage({ role: "user", content: "msg A" }),
+        makeMessage({ role: "assistant", content: "msg B" }),
+        makeMessage({ role: "user", content: "msg C" }),
+      ],
+      prePromptMessageCount: 1,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    // Should still only have the original 3 messages
+    expect(stored.map((m) => m.content)).toEqual(["msg A", "msg B", "msg C"]);
+  });
+
+  it("deduplicates old messages but ingests new ones after restart", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-restart-mixed";
+
+    // Seed DB with some messages
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-restart-mixed"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Restart replays old + adds new
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-restart-mixed-2"),
+      messages: [
+        makeMessage({ role: "system", content: "system prompt" }),
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "user", content: "new C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 1,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "new C", "new D"]);
+  });
+
+  it("handles empty batch after slicing", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-empty";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-empty"),
+      messages: [
+        makeMessage({ role: "system", content: "system prompt" }),
+      ],
+      prePromptMessageCount: 1,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).toBeNull();
+  });
+
+  it("handles repeated identical content (e.g. empty tool results) with occurrence counting", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-repeated";
+
+    // Seed with repeated content
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-repeated"),
+      messages: [
+        makeMessage({ role: "user", content: "request" }),
+        makeMessage({ role: "tool", content: "" }),
+        makeMessage({ role: "tool", content: "" }),
+        makeMessage({ role: "assistant", content: "done" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Restart replays all + adds new with another empty tool result
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-repeated-2"),
+      messages: [
+        makeMessage({ role: "user", content: "request" }),
+        makeMessage({ role: "tool", content: "" }),
+        makeMessage({ role: "tool", content: "" }),
+        makeMessage({ role: "assistant", content: "done" }),
+        makeMessage({ role: "user", content: "more work" }),
+        makeMessage({ role: "tool", content: "" }),
+        makeMessage({ role: "assistant", content: "done again" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "request",
+      "",
+      "",
+      "done",
+      "more work",
+      "",
+      "done again",
+    ]);
+  });
+
+  it("ingests single genuinely new message without dedup interference", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-single";
+
+    // Seed
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-single"),
+      messages: [makeMessage({ role: "user", content: "hello" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Single new message
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-single-2"),
+      messages: [
+        makeMessage({ role: "user", content: "hello" }),
+        makeMessage({ role: "assistant", content: "world" }),
+      ],
+      prePromptMessageCount: 1,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["hello", "world"]);
+  });
+});
+
 // ── Compact token budget plumbing ───────────────────────────────────────────
 
 describe("LcmContextEngine.compact token budget plumbing", () => {
