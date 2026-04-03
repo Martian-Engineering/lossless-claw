@@ -952,8 +952,19 @@ export class ContextAssembler {
       }
     }
 
+    // Filter out assistant messages with empty content — these can occur when
+    // tool-use-only turns are stored with content="" and zero message_parts,
+    // or when filterNonFreshAssistantToolCalls strips all tool_use blocks.
+    // Anthropic (and other providers) reject empty content arrays/strings.
+    const cleaned = rawMessages.filter(
+      (m) =>
+        !(
+          m?.role === "assistant" &&
+          (Array.isArray(m.content) ? m.content.length === 0 : !m.content)
+        ),
+    );
     return {
-      messages: sanitizeToolUseResultPairing(rawMessages) as AgentMessage[],
+      messages: sanitizeToolUseResultPairing(cleaned) as AgentMessage[],
       estimatedTokens,
       systemPromptAddition,
       stats: {
