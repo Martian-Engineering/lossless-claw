@@ -1398,17 +1398,16 @@ describe("LcmContextEngine.ingest content extraction", () => {
         role: string;
         toolCallId?: string;
         toolName?: string;
-        content?: Array<{ text?: unknown; output?: unknown }>;
+        content?: Array<{ type?: unknown; text?: unknown; output?: unknown }>;
       };
       expect(assembledToolResult.role).toBe("toolResult");
       expect(assembledToolResult.toolCallId).toBe("call_live_exec");
       expect(assembledToolResult.toolName).toBe("exec");
-      // Plain text blocks preserve {type: "text", text: ...} after externalization
-      // so providers that read c.text (e.g. amazon-bedrock) don't crash on undefined
       const block = assembledToolResult.content?.[0];
-      const externRef = block?.text ?? block?.output;
-      expect(typeof externRef).toBe("string");
-      expect(String(externRef)).toContain(fileId);
+      expect(block?.type).toBe("text");
+      expect(typeof block?.text).toBe("string");
+      expect(String(block?.text)).toContain(fileId);
+      expect(block).not.toHaveProperty("output");
     });
   });
 

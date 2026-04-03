@@ -281,6 +281,20 @@ export function toolResultBlockFromPart(
   rawType?: string,
   raw?: Record<string, unknown>,
 ): unknown {
+  if (
+    raw &&
+    typeof raw.text === "string" &&
+    raw.output === undefined &&
+    raw.content === undefined &&
+    (part.toolOutput == null || part.toolOutput === "") &&
+    (part.textContent == null || part.textContent === raw.text)
+  ) {
+    return {
+      type: "text",
+      text: raw.text,
+    };
+  }
+
   const type =
     rawType === "function_call_output" || rawType === "toolResult" || rawType === "tool_result"
       ? rawType

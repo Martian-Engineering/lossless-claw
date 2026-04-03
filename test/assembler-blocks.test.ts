@@ -246,6 +246,27 @@ describe("toolResultBlockFromPart", () => {
     expect(block.content).toEqual([{ type: "text", text: "command output" }]);
     expect(block).not.toHaveProperty("output");
   });
+
+  it("restores externalized plain-text tool results as text blocks", () => {
+    const part = makePart({
+      partType: "tool",
+      toolCallId: "toolu_externalized",
+      toolName: "exec",
+      textContent: "[LCM Tool Output: file_deadbeef12345678 tool=exec]",
+      toolOutput: null,
+    });
+    const block = toolResultBlockFromPart(part, "tool_result", {
+      type: "tool_result",
+      text: "[LCM Tool Output: file_deadbeef12345678 tool=exec]",
+      externalizedFileId: "file_deadbeef12345678",
+      toolOutputExternalized: true,
+    }) as Record<string, unknown>;
+
+    expect(block).toEqual({
+      type: "text",
+      text: "[LCM Tool Output: file_deadbeef12345678 tool=exec]",
+    });
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
