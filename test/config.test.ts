@@ -379,6 +379,24 @@ describe("resolveLcmConfig", () => {
     expect(config.bootstrapMaxTokens).toBe(4321);
   });
 
+  it("falls back cleanly when numeric env vars are invalid", () => {
+    const config = resolveLcmConfig({
+      LCM_LEAF_CHUNK_TOKENS: "oops",
+      LCM_BOOTSTRAP_MAX_TOKENS: "still-nope",
+      LCM_CONTEXT_THRESHOLD: "bad",
+      LCM_SUMMARY_MAX_OVERAGE_FACTOR: "nah",
+    } as NodeJS.ProcessEnv, {
+      leafChunkTokens: 80_000,
+      contextThreshold: 0.5,
+      summaryMaxOverageFactor: 5,
+    });
+
+    expect(config.leafChunkTokens).toBe(80_000);
+    expect(config.bootstrapMaxTokens).toBe(24_000);
+    expect(config.contextThreshold).toBe(0.5);
+    expect(config.summaryMaxOverageFactor).toBe(5);
+  });
+
   it("reads summaryMaxOverageFactor and maxAssemblyTokenBudget from plugin config", () => {
     const config = resolveLcmConfig({}, {
       summaryMaxOverageFactor: 5,

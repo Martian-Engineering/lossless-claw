@@ -1966,6 +1966,28 @@ describe("LcmContextEngine.bootstrap", () => {
     ]);
   });
 
+  it("drops an oversized singleton bootstrap tail that exceeds bootstrapMaxTokens", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-oversized-singleton");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "x".repeat(5000) }],
+    } as AgentMessage);
+
+    const engine = createEngineWithConfig({ bootstrapMaxTokens: 100 });
+    const sessionId = "bootstrap-oversized-singleton";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+
+    expect(result.bootstrapped).toBe(false);
+    expect(result.importedMessages).toBe(0);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toEqual([]);
+  });
+
   it("streams JSONL replay and skips malformed lines while keeping later messages", async () => {
     const sessionFile = createSessionFilePath("streaming-jsonl");
     const lines: string[] = [];
