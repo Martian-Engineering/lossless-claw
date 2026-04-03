@@ -20,7 +20,6 @@ describe("resolveLcmConfig", () => {
     expect(config.leafTargetTokens).toBe(2400);
     expect(config.summaryProvider).toBe("");
     expect(config.summaryModel).toBe("");
-    expect(config.autocompactDisabled).toBe(false);
     expect(config.pruneHeartbeatOk).toBe(false);
   });
 
@@ -36,7 +35,6 @@ describe("resolveLcmConfig", () => {
       skipStatelessSessions: false,
       leafMinFanout: 4,
       condensedMinFanout: 2,
-      autocompactDisabled: true,
       pruneHeartbeatOk: true,
       enabled: false,
     });
@@ -54,7 +52,6 @@ describe("resolveLcmConfig", () => {
     expect(config.incrementalMaxDepth).toBe(-1);
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
-    expect(config.autocompactDisabled).toBe(true);
     expect(config.pruneHeartbeatOk).toBe(true);
   });
 
@@ -65,7 +62,6 @@ describe("resolveLcmConfig", () => {
       LCM_NEW_SESSION_RETAIN_DEPTH: "5",
       LCM_INCREMENTAL_MAX_DEPTH: "3",
       LCM_ENABLED: "false",
-      LCM_AUTOCOMPACT_DISABLED: "true",
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
       LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
       LCM_SKIP_STATELESS_SESSIONS: "false",
@@ -78,7 +74,6 @@ describe("resolveLcmConfig", () => {
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
       enabled: true,
-      autocompactDisabled: false,
     };
     const config = resolveLcmConfig(env, pluginConfig);
     expect(config.enabled).toBe(false); // env wins
@@ -95,7 +90,6 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.newSessionRetainDepth).toBe(5); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
-    expect(config.autocompactDisabled).toBe(true); // env wins
   });
 
   it("plugin config fills gaps when env vars are absent", () => {
@@ -327,6 +321,28 @@ describe("resolveLcmConfig", () => {
       type: "integer",
       minimum: 1,
     });
+  });
+
+  it("ships a manifest with plugin-config schema entries for runtime token controls", () => {
+    expect(manifest.configSchema.properties.leafTargetTokens).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
+    expect(manifest.configSchema.properties.condensedTargetTokens).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
+    expect(manifest.configSchema.properties.maxExpandTokens).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
+  });
+
+  it("ships a manifest with schema entries for runtime-only toggles and model overrides", () => {
+    expect(manifest.configSchema.properties.largeFileSummaryModel).toEqual({ type: "string" });
+    expect(manifest.configSchema.properties.largeFileSummaryProvider).toEqual({ type: "string" });
+    expect(manifest.configSchema.properties.timezone).toEqual({ type: "string" });
+    expect(manifest.configSchema.properties.pruneHeartbeatOk).toEqual({ type: "boolean" });
   });
 
   it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {

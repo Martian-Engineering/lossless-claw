@@ -25,7 +25,6 @@ const BASE_CONFIG: LcmConfig = {
   summaryModel: "",
   largeFileSummaryProvider: "",
   largeFileSummaryModel: "",
-  autocompactDisabled: false,
   timezone: "UTC",
   pruneHeartbeatOk: false,
   summaryMaxOverageFactor: 3,

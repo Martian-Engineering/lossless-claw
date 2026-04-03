@@ -45,7 +45,6 @@ function createTestConfig(databasePath: string): LcmConfig {
     summaryModel: "",
     largeFileSummaryProvider: "",
     largeFileSummaryModel: "",
-    autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
     summaryMaxOverageFactor: 3,

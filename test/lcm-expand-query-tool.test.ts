@@ -83,7 +83,6 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       expansionProvider: "",
       expansionModel: "",
       delegationTimeoutMs: 120000,
-      autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
       summaryMaxOverageFactor: 3,

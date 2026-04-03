@@ -40,7 +40,6 @@ export type LcmConfig = {
   expansionModel: string;
   /** Max time to wait for delegated lcm_expand_query sub-agent completion. */
   delegationTimeoutMs: number;
-  autocompactDisabled: boolean;
   /** IANA timezone for timestamps in summaries (from TZ env or system default) */
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
@@ -199,10 +198,6 @@ export function resolveLcmConfig(
     expansionModel:
       env.LCM_EXPANSION_MODEL?.trim() ?? toStr(pc.expansionModel) ?? "",
     delegationTimeoutMs: envDelegationTimeoutMs ?? toNumber(pc.delegationTimeoutMs) ?? 120000,
-    autocompactDisabled:
-      env.LCM_AUTOCOMPACT_DISABLED !== undefined
-        ? env.LCM_AUTOCOMPACT_DISABLED === "true"
-        : toBool(pc.autocompactDisabled) ?? false,
     timezone: env.TZ ?? toStr(pc.timezone) ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
     pruneHeartbeatOk:
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined

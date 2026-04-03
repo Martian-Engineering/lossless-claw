@@ -14,3 +14,9 @@
 ## Release Notes Source Of Truth
 
 - Follow [RELEASING.md](./RELEASING.md) for the repo's full Changesets and publish workflow.
+
+## Config Schema Sync
+
+- Whenever you add, rename, or remove a plugin config option in the runtime config loader or docs, update [`openclaw.plugin.json`](./openclaw.plugin.json) in the same change.
+- Keep the manifest `configSchema` and `uiHints` aligned with every supported `plugins.entries.lossless-claw.config` field so OpenClaw accepts documented config keys.
+- Add or update a regression test when changing config options so schema drift is caught before release.

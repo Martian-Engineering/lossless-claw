@@ -21,6 +21,18 @@
       "label": "New Session Retain Depth",
       "help": "Context retained after /new (-1 keeps all context, 2 keeps d2+)"
     },
+    "leafTargetTokens": {
+      "label": "Leaf Target Tokens",
+      "help": "Target token count for leaf summaries"
+    },
+    "condensedTargetTokens": {
+      "label": "Condensed Target Tokens",
+      "help": "Target token count for condensed summaries"
+    },
+    "maxExpandTokens": {
+      "label": "Max Expand Tokens",
+      "help": "Token cap for lcm_expand_query expansion calls"
+    },
     "dbPath": {
       "label": "Database Path",
       "help": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
@@ -45,6 +57,14 @@
       "label": "Summary Provider",
       "help": "Provider override used only when summaryModel is a bare model name (e.g., 'openai-resp')"
     },
+    "largeFileSummaryModel": {
+      "label": "Large File Summary Model",
+      "help": "Model override for large-file summarization"
+    },
+    "largeFileSummaryProvider": {
+      "label": "Large File Summary Provider",
+      "help": "Provider override for large-file summarization"
+    },
     "expansionModel": {
       "label": "Expansion Model",
       "help": "Model override for lcm_expand_query sub-agent (e.g., 'anthropic/claude-haiku-4-5')"
@@ -68,6 +88,14 @@
     "customInstructions": {
       "label": "Custom Instructions",
       "help": "Natural language instructions injected into all summarization prompts (e.g., formatting rules, tone control)"
+    },
+    "timezone": {
+      "label": "Timezone",
+      "help": "IANA timezone used for summary timestamps"
+    },
+    "pruneHeartbeatOk": {
+      "label": "Prune HEARTBEAT_OK",
+      "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
     }
   },
   "configSchema": {
@@ -97,6 +125,18 @@
       "newSessionRetainDepth": {
         "type": "integer",
         "minimum": -1
+      },
+      "leafTargetTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "condensedTargetTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "maxExpandTokens": {
+        "type": "integer",
+        "minimum": 1
       },
       "leafMinFanout": {
         "type": "integer",
@@ -138,6 +178,12 @@
       "summaryProvider": {
         "type": "string"
       },
+      "largeFileSummaryModel": {
+        "type": "string"
+      },
+      "largeFileSummaryProvider": {
+        "type": "string"
+      },
       "expansionModel": {
         "type": "string"
       },
@@ -158,6 +204,12 @@
       },
       "customInstructions": {
         "type": "string"
+      },
+      "timezone": {
+        "type": "string"
+      },
+      "pruneHeartbeatOk": {
+        "type": "boolean"
       }
     }
   }
