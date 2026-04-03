@@ -369,6 +369,89 @@ function backfillSummaryMetadata(db: DatabaseSync): void {
  * legacy text-type parts where the string-content ingestion path stored tool
  * info only in the metadata JSON (see #158).
  */
+/**
+ * Migrate summary_messages, summary_lineage, and context_items FK constraints
+ * from ON DELETE RESTRICT to CASCADE / SET NULL for existing databases.
+ *
+ * SQLite doesn't support ALTER CONSTRAINT, so we rebuild the tables.
+ * This is idempotent — checks current FK actions before rebuilding.
+ */
+function migrateForeignKeyCascade(db: DatabaseSync): void {
+  // Check if summary_messages still has RESTRICT on message_id
+  const smFks = db.prepare(`PRAGMA foreign_key_list(summary_messages)`).all() as Array<{
+    from?: string;
+    on_delete?: string;
+  }>;
+  const smMessageFk = smFks.find((fk) => fk.from === "message_id");
+
+  if (smMessageFk && smMessageFk.on_delete === "RESTRICT") {
+    db.exec(`
+      CREATE TABLE summary_messages_new (
+        summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+        message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL,
+        PRIMARY KEY (summary_id, message_id)
+      );
+      INSERT INTO summary_messages_new SELECT * FROM summary_messages
+        WHERE message_id IN (SELECT message_id FROM messages)
+          AND summary_id IN (SELECT summary_id FROM summaries);
+      DROP TABLE summary_messages;
+      ALTER TABLE summary_messages_new RENAME TO summary_messages;
+    `);
+  }
+
+  // Check if summary_lineage still has RESTRICT on parent_summary_id
+  const slFks = db.prepare(`PRAGMA foreign_key_list(summary_lineage)`).all() as Array<{
+    from?: string;
+    on_delete?: string;
+  }>;
+  const slParentFk = slFks.find((fk) => fk.from === "parent_summary_id");
+
+  if (slParentFk && slParentFk.on_delete === "RESTRICT") {
+    db.exec(`
+      CREATE TABLE summary_lineage_new (
+        summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+        parent_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+        UNIQUE (summary_id, parent_summary_id)
+      );
+      INSERT INTO summary_lineage_new SELECT * FROM summary_lineage
+        WHERE summary_id IN (SELECT summary_id FROM summaries)
+          AND parent_summary_id IN (SELECT summary_id FROM summaries);
+      DROP TABLE summary_lineage;
+      ALTER TABLE summary_lineage_new RENAME TO summary_lineage;
+    `);
+  }
+
+  // Check if context_items still has RESTRICT on message_id/summary_id
+  const ciFks = db.prepare(`PRAGMA foreign_key_list(context_items)`).all() as Array<{
+    from?: string;
+    on_delete?: string;
+  }>;
+  const ciMessageFk = ciFks.find((fk) => fk.from === "message_id");
+
+  if (ciMessageFk && ciMessageFk.on_delete === "RESTRICT") {
+    db.exec(`
+      CREATE TABLE context_items_new (
+        context_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        message_id INTEGER REFERENCES messages(message_id) ON DELETE SET NULL,
+        summary_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
+        token_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (conversation_id, ordinal)
+      );
+      INSERT INTO context_items_new
+        SELECT * FROM context_items;
+      DROP TABLE context_items;
+      ALTER TABLE context_items_new RENAME TO context_items;
+      CREATE INDEX IF NOT EXISTS context_items_conv_idx
+        ON context_items (conversation_id, ordinal);
+    `);
+  }
+}
+
 function backfillToolCallColumns(db: DatabaseSync): void {
   db.exec(
     `UPDATE message_parts
@@ -509,14 +592,14 @@ export function runLcmMigrations(
 
     CREATE TABLE IF NOT EXISTS summary_messages (
       summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
-      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE RESTRICT,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
       ordinal INTEGER NOT NULL,
       PRIMARY KEY (summary_id, message_id)
     );
 
     CREATE TABLE IF NOT EXISTS summary_parents (
       summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
-      parent_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+      parent_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
       ordinal INTEGER NOT NULL,
       PRIMARY KEY (summary_id, parent_summary_id)
     );
@@ -525,8 +608,8 @@ export function runLcmMigrations(
       conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
       ordinal INTEGER NOT NULL,
       item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary')),
-      message_id INTEGER REFERENCES messages(message_id) ON DELETE RESTRICT,
-      summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+      message_id INTEGER REFERENCES messages(message_id) ON DELETE SET NULL,
+      summary_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       PRIMARY KEY (conversation_id, ordinal),
       CHECK (
@@ -608,6 +691,7 @@ export function runLcmMigrations(
   backfillSummaryDepths(db);
   backfillSummaryMetadata(db);
   backfillToolCallColumns(db);
+  migrateForeignKeyCascade(db);
 
   const fts5Available = options?.fts5Available ?? getLcmDbFeatures(db).fts5Available;
   if (!fts5Available) {
