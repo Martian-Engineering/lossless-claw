@@ -193,6 +193,10 @@ interface ConversationBootstrapStateRow {
   updated_at: string;
 }
 
+const CJK_QUERY_SEGMENT_RE =
+  /[\u2E80-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\uAC00-\uD7AF\u3040-\u309F\u30A0-\u30FF]+/g;
+const LATIN_QUERY_TOKEN_RE = /[a-zA-Z0-9][\w./-]*/g;
+
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
 function toSummaryRecord(row: SummaryRow): SummaryRecord {
@@ -766,19 +770,23 @@ export class SummaryStore {
       // semantics (instead of the original AND logic which fails when the
       // user's phrasing doesn't exactly match the summary text).
       if (containsCjk(input.query)) {
-        try {
-          const trigramResults = this.searchCjkTrigram(
-            input.query,
-            limit,
-            input.conversationId,
-            input.since,
-            input.before,
-          );
-          if (trigramResults.length > 0) {
-            return trigramResults;
+        const cjkSegments = this.extractCjkSegments(input.query);
+        const hasShortCjkSegment = cjkSegments.some((segment) => segment.length < 3);
+        if (!hasShortCjkSegment) {
+          try {
+            const trigramResults = this.searchCjkTrigram(
+              input.query,
+              limit,
+              input.conversationId,
+              input.since,
+              input.before,
+            );
+            if (trigramResults.length > 0) {
+              return trigramResults;
+            }
+          } catch {
+            // trigram table may not exist; fall through to LIKE OR
           }
-        } catch {
-          // trigram table may not exist; fall through to LIKE OR
         }
         return this.searchLikeCjk(
           input.query,
@@ -902,10 +910,24 @@ export class SummaryStore {
     }));
   }
 
+  private extractCjkSegments(query: string): string[] {
+    return query.match(CJK_QUERY_SEGMENT_RE) ?? [];
+  }
+
+  private extractLatinTokens(query: string): string[] {
+    const tokens = query.match(LATIN_QUERY_TOKEN_RE) ?? [];
+    return [...new Set(tokens.map((token) => token.toLowerCase()))];
+  }
+
+  private escapeLikeTerm(term: string): string {
+    return term.replace(/([\\%_])/g, "\\$1");
+  }
+
   // ── CJK trigram FTS search ──────────────────────────────────────────────
-  // Splits query into CJK and non-CJK segments.  Each CJK segment of 3+
-  // chars is split into overlapping 4-char chunks for trigram MATCH with OR
-  // semantics.  Non-CJK tokens use the standard porter FTS table.
+  // Each CJK segment of 3+ chars is split into overlapping 4-char chunks for
+  // trigram MATCH with OR semantics within the segment. Segment groups are
+  // combined with AND, and Latin tokens are applied as LIKE filters so mixed
+  // queries still require every part of the user's intent.
 
   /**
    * Split a CJK string into overlapping chunks of `size` characters.
@@ -930,138 +952,65 @@ export class SummaryStore {
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
-    const CJK_SEGMENT_RE =
-      /[\u2E80-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\uAC00-\uD7AF\u3040-\u309F\u30A0-\u30FF]{3,}/g;
-    const cjkSegments = query.match(CJK_SEGMENT_RE) ?? [];
-
-    const NON_CJK_TOKEN_RE = /[a-zA-Z0-9][\w./-]*/g;
-    const latinTokens = query.match(NON_CJK_TOKEN_RE) ?? [];
-
-    if (cjkSegments.length === 0 && latinTokens.length === 0) {
+    const cjkSegments = this.extractCjkSegments(query).filter((segment) => segment.length >= 3);
+    if (cjkSegments.length === 0) {
       return [];
     }
+    const latinTokens = this.extractLatinTokens(query);
 
-    // Build overlapping 4-char chunks from each CJK segment for trigram OR.
-    const cjkChunks: string[] = [];
+    // Build one OR group per CJK segment, then require every segment group and
+    // every Latin token to match so mixed queries preserve full-intent search.
+    const cjkGroups: string[] = [];
     for (const segment of cjkSegments) {
-      if (segment.length <= 4) {
-        cjkChunks.push(segment);
-      } else {
-        cjkChunks.push(...this.splitCjkChunks(segment, 4));
-      }
-    }
-    const uniqueChunks = [...new Set(cjkChunks)];
-
-    const resultMap = new Map<
-      string,
-      SummarySearchRow & { _matchCount?: number }
-    >();
-
-    // Search CJK chunks in trigram table
-    if (uniqueChunks.length > 0) {
-      const ftsExpr = uniqueChunks
-        .map((c) => '"' + c.replace(/"/g, '""') + '"')
+      const segmentTerms =
+        segment.length <= 4 ? [segment] : this.splitCjkChunks(segment, 4);
+      const groupExpr = [...new Set(segmentTerms)]
+        .map((term) => `"${term.replace(/"/g, '""')}"`)
         .join(" OR ");
-
-      const where: string[] = ["summaries_fts_cjk MATCH ?"];
-      const args: Array<string | number> = [ftsExpr];
-      if (conversationId != null) {
-        where.push("s.conversation_id = ?");
-        args.push(conversationId);
-      }
-      if (since) {
-        where.push("julianday(s.created_at) >= julianday(?)");
-        args.push(since.toISOString());
-      }
-      if (before) {
-        where.push("julianday(s.created_at) < julianday(?)");
-        args.push(before.toISOString());
-      }
-      args.push(limit);
-
-      try {
-        const sql = `SELECT
-             f.summary_id,
-             s.conversation_id,
-             s.kind,
-             snippet(summaries_fts_cjk, 1, '', '', '...', 32) AS snippet,
-             rank,
-             s.created_at
-           FROM summaries_fts_cjk f
-           JOIN summaries s ON s.summary_id = f.summary_id
-           WHERE ${where.join(" AND ")}
-           ORDER BY rank
-           LIMIT ?`;
-        const rows = this.db
-          .prepare(sql)
-          .all(...args) as unknown as SummarySearchRow[];
-        for (const row of rows) {
-          resultMap.set(row.summary_id, row);
-        }
-      } catch {
-        // trigram table missing or query error; fall through
-      }
+      cjkGroups.push(`(${groupExpr})`);
     }
 
-    // Search Latin tokens in standard porter FTS table
-    if (latinTokens.length > 0 && this.fts5Available) {
-      const ftsQuery = latinTokens
-        .map((t) => '"' + t.replace(/"/g, '""') + '"')
-        .join(" OR ");
-      const where: string[] = ["summaries_fts MATCH ?"];
-      const args: Array<string | number> = [ftsQuery];
-      if (conversationId != null) {
-        where.push("s.conversation_id = ?");
-        args.push(conversationId);
-      }
-      if (since) {
-        where.push("julianday(s.created_at) >= julianday(?)");
-        args.push(since.toISOString());
-      }
-      if (before) {
-        where.push("julianday(s.created_at) < julianday(?)");
-        args.push(before.toISOString());
-      }
-      args.push(limit);
-
-      try {
-        const sql = `SELECT
-             summaries_fts.summary_id,
-             s.conversation_id,
-             s.kind,
-             snippet(summaries_fts, 1, '', '', '...', 32) AS snippet,
-             rank,
-             s.created_at
-           FROM summaries_fts
-           JOIN summaries s ON s.summary_id = summaries_fts.summary_id
-           WHERE ${where.join(" AND ")}
-           ORDER BY rank
-           LIMIT ?`;
-        const rows = this.db
-          .prepare(sql)
-          .all(...args) as unknown as SummarySearchRow[];
-        for (const row of rows) {
-          if (!resultMap.has(row.summary_id)) {
-            resultMap.set(row.summary_id, row);
-          }
-        }
-      } catch {
-        // Ignore
-      }
+    const where: string[] = ["summaries_fts_cjk MATCH ?"];
+    const args: Array<string | number> = [cjkGroups.join(" AND ")];
+    for (const token of latinTokens) {
+      where.push("LOWER(s.content) LIKE ? ESCAPE '\\'");
+      args.push(`%${this.escapeLikeTerm(token)}%`);
     }
+    if (conversationId != null) {
+      where.push("s.conversation_id = ?");
+      args.push(conversationId);
+    }
+    if (since) {
+      where.push("julianday(s.created_at) >= julianday(?)");
+      args.push(since.toISOString());
+    }
+    if (before) {
+      where.push("julianday(s.created_at) < julianday(?)");
+      args.push(before.toISOString());
+    }
+    args.push(limit);
 
-    // Sort by recency and return
-    const combined = [...resultMap.values()].sort(
-      (a, b) =>
-        new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-    );
-    return combined.slice(0, limit).map(toSearchResult);
+    const sql = `SELECT
+         f.summary_id,
+         s.conversation_id,
+         s.kind,
+         snippet(summaries_fts_cjk, 1, '', '', '...', 32) AS snippet,
+         rank,
+         s.created_at
+       FROM summaries_fts_cjk f
+       JOIN summaries s ON s.summary_id = f.summary_id
+       WHERE ${where.join(" AND ")}
+       ORDER BY rank
+       LIMIT ?`;
+    const rows = this.db.prepare(sql).all(...args) as unknown as SummarySearchRow[];
+    return rows.map(toSearchResult);
   }
 
-  // ── CJK LIKE fallback with OR semantics ──────────────────────────────────
-  // When the trigram table is unavailable, split CJK text into bigrams
-  // (2-char sliding window) so partial matches work.  Uses OR instead of
-  // the original AND logic to avoid zero-result queries.
+  // ── CJK LIKE fallback ────────────────────────────────────────────────────
+  // When the trigram table is unavailable, split each CJK segment into
+  // sliding-window terms so partial matches still work. Terms within a single
+  // segment are ORed together, but each segment and Latin token still has to
+  // match so mixed queries keep full-intent semantics.
 
   private searchLikeCjk(
     query: string,
@@ -1070,37 +1019,37 @@ export class SummaryStore {
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
-    const CJK_RE =
-      /[\u2E80-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\uAC00-\uD7AF\u3040-\u309F\u30A0-\u30FF]+/g;
-    const cjkBigrams: string[] = [];
-    for (const seg of query.match(CJK_RE) ?? []) {
-      for (let i = 0; i < seg.length - 1; i++) {
-        const bigram = seg.slice(i, i + 2);
-        if (!cjkBigrams.includes(bigram)) {
-          cjkBigrams.push(bigram);
-        }
-      }
-    }
-
-    const NON_CJK_TOKEN_RE = /[a-zA-Z0-9][\w./-]*/g;
-    const latinTokens = (query.match(NON_CJK_TOKEN_RE) ?? []).map((t) =>
-      t.toLowerCase(),
-    );
-
-    const allTerms = [...cjkBigrams, ...latinTokens];
-    if (allTerms.length === 0) {
+    const cjkSegments = this.extractCjkSegments(query);
+    const latinTokens = this.extractLatinTokens(query);
+    if (cjkSegments.length === 0 && latinTokens.length === 0) {
       return [];
     }
 
-    const likeClauses = allTerms.map(
-      () => `LOWER(content) LIKE ? ESCAPE '\\'`,
-    );
-    const likeArgs = allTerms.map(
-      (t) => `%${t.replace(/([\\%_])/g, "\\$1")}%`,
-    );
+    const cjkTerms: string[] = [];
+    const cjkClauses: string[] = [];
+    const cjkArgs: string[] = [];
+    for (const segment of cjkSegments) {
+      const segmentTerms =
+        segment.length === 1
+          ? [segment]
+          : segment.length === 2
+            ? [segment]
+            : this.splitCjkChunks(segment, 2);
+      const uniqueTerms = [...new Set(segmentTerms)];
+      cjkTerms.push(...uniqueTerms);
+      cjkClauses.push(
+        `(${uniqueTerms.map(() => `LOWER(content) LIKE ? ESCAPE '\\'`).join(" OR ")})`,
+      );
+      cjkArgs.push(
+        ...uniqueTerms.map((term) => `%${this.escapeLikeTerm(term.toLowerCase())}%`),
+      );
+    }
 
-    const where: string[] = [`(${likeClauses.join(" OR ")})`];
-    const args: Array<string | number> = [...likeArgs];
+    const latinClauses = latinTokens.map(() => `LOWER(content) LIKE ? ESCAPE '\\'`);
+    const latinArgs = latinTokens.map((token) => `%${this.escapeLikeTerm(token)}%`);
+
+    const where: string[] = [...cjkClauses, ...latinClauses];
+    const args: Array<string | number> = [...cjkArgs, ...latinArgs];
     if (conversationId != null) {
       where.push("conversation_id = ?");
       args.push(conversationId);
@@ -1127,11 +1076,12 @@ export class SummaryStore {
       )
       .all(...args) as unknown as SummaryRow[];
 
+    const snippetTerms = cjkTerms.length > 0 ? [...new Set([...cjkTerms, ...latinTokens])] : latinTokens;
     return rows.map((row) => ({
       summaryId: row.summary_id,
       conversationId: row.conversation_id,
       kind: row.kind,
-      snippet: createFallbackSnippet(row.content, allTerms),
+      snippet: createFallbackSnippet(row.content, snippetTerms),
       createdAt: new Date(row.created_at),
       rank: 0,
     }));
