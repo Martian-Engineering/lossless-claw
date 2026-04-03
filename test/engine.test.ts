@@ -648,6 +648,89 @@ describe("LcmContextEngine stateless sessions", () => {
     ).toBe(1);
   });
 
+  it("skips ingest for assistant messages with stopReason error and empty content", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const sessionKey = "agent:poppy:main";
+
+    // Ingest a normal user message first
+    const userResult = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "ping" }),
+    });
+    expect(userResult).toEqual({ ingested: true });
+
+    // Ingest an error assistant message with empty content array
+    const errorResult = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: {
+        role: "assistant" as AgentMessage["role"],
+        content: [],
+        stopReason: "error",
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+    expect(errorResult).toEqual({ ingested: false });
+
+    // Ingest an error assistant message with empty string content
+    const errorResult2 = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: {
+        role: "assistant" as AgentMessage["role"],
+        content: "",
+        stopReason: "error",
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+    expect(errorResult2).toEqual({ ingested: false });
+
+    // Ingest an aborted assistant message with no content
+    const abortedResult = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: {
+        role: "assistant" as AgentMessage["role"],
+        content: [],
+        stopReason: "aborted",
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+    expect(abortedResult).toEqual({ ingested: false });
+
+    // A normal assistant message should still be ingested
+    const normalResult = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "pong" }),
+    });
+    expect(normalResult).toEqual({ ingested: true });
+
+    // An error assistant with actual content should still be ingested
+    const errorWithContentResult = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: {
+        role: "assistant" as AgentMessage["role"],
+        content: [{ type: "text", text: "Partial response before error" }],
+        stopReason: "error",
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+    expect(errorWithContentResult).toEqual({ ingested: true });
+
+    // Verify only the 3 valid messages were stored (user + normal assistant + error-with-content)
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(
+      await engine.getConversationStore().getMessageCount(conversation!.conversationId),
+    ).toBe(3);
+  });
+
   it("allows assemble reads for stateless session keys", async () => {
     const engine = createEngineWithConfig({
       statelessSessionPatterns: ["agent:*:subagent:worker-*"],
