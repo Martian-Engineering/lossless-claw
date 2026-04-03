@@ -6,9 +6,17 @@
  */
 export function parseUtcTimestamp(value: string): Date {
   const s = value.trim();
-  return new Date(s.endsWith("Z") ? s : s + "Z");
+  if (/(?:[zZ]|[+-]\d{2}:\d{2})$/.test(s)) {
+    return new Date(s);
+  }
+
+  const normalized = s.includes("T") ? s : s.replace(" ", "T");
+  return new Date(`${normalized}Z`);
 }
 
+/**
+ * Parse a nullable SQLite UTC timestamp string into a Date object.
+ */
 export function parseUtcTimestampOrNull(
   value: string | null | undefined,
 ): Date | null {
