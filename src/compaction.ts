@@ -383,12 +383,12 @@ export class CompactionEngine {
    * `leafChunkTokens`. This lets callers trigger a soft incremental leaf pass
    * before the full context threshold is breached.
    */
-  async evaluateLeafTrigger(conversationId: number): Promise<{
+  async evaluateLeafTrigger(conversationId: number, runtimeTokenBudget?: number): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
-    const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId);
+    const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId, runtimeTokenBudget);
     const threshold = this.resolveLeafChunkTokens();
     return {
       shouldCompact: rawTokensOutsideTail >= threshold,
@@ -429,7 +429,7 @@ export class CompactionEngine {
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    const leafTrigger = await this.evaluateLeafTrigger(conversationId, tokenBudget);
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {
@@ -440,7 +440,7 @@ export class CompactionEngine {
       };
     }
 
-    const leafChunk = await this.selectOldestLeafChunk(conversationId);
+    const leafChunk = await this.selectOldestLeafChunk(conversationId, tokenBudget);
     if (leafChunk.items.length === 0) {
       return {
         actionTaken: false,
@@ -557,7 +557,7 @@ export class CompactionEngine {
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    const leafTrigger = await this.evaluateLeafTrigger(conversationId, tokenBudget);
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {
@@ -588,7 +588,7 @@ export class CompactionEngine {
 
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
     while (true) {
-      const leafChunk = await this.selectOldestLeafChunk(conversationId);
+      const leafChunk = await this.selectOldestLeafChunk(conversationId, tokenBudget);
       if (leafChunk.items.length === 0) {
         break;
       }
@@ -798,6 +798,73 @@ export class CompactionEngine {
     return 0;
   }
 
+  /** Tail token budget derived from the existing contextThreshold config. */
+  private resolveTailTokenBudget(runtimeTokenBudget: number): number {
+    return Math.floor(this.config.contextThreshold * runtimeTokenBudget);
+  }
+
+  /**
+   * Build a set of protected ordinals using a unified token budget.
+   *
+   * Walks backward from the most recent message. A message is protected
+   * as long as:
+   *  - The unified token budget has room
+   *  - The position cap (freshTailCount) hasn't been reached
+   */
+  private async resolveTokenBudgetProtectedOrdinals(
+    contextItems: ContextItemRecord[],
+    runtimeTokenBudget: number,
+  ): Promise<Set<number> | undefined> {
+    const positionCap = this.resolveFreshTailCount();
+    // Token budget only applies when freshTailCount > 0
+    if (positionCap <= 0) {
+      return undefined;
+    }
+
+    const tailBudget = this.resolveTailTokenBudget(runtimeTokenBudget);
+    if (tailBudget <= 0) {
+      return undefined;
+    }
+    const rawMessageItems = contextItems.filter(
+      (item) => item.itemType === "message" && item.messageId != null,
+    );
+    if (rawMessageItems.length === 0) {
+      return new Set();
+    }
+
+    // If the position-based tail fits within the token budget, fall back
+    // to stock behavior — no override needed.
+    const tailStartIdx = Math.max(0, rawMessageItems.length - positionCap);
+    let positionTailTokens = 0;
+    for (let i = tailStartIdx; i < rawMessageItems.length; i++) {
+      positionTailTokens += await this.getMessageTokenCount(rawMessageItems[i]!.messageId!);
+    }
+    if (positionTailTokens <= tailBudget) {
+      return undefined;
+    }
+
+    // Position-based tail would exceed the token budget — use token-budget protection instead.
+    const protectedOrdinals = new Set<number>();
+    let tokensUsed = 0;
+    let countUsed = 0;
+
+    for (let i = rawMessageItems.length - 1; i >= 0; i--) {
+      if (countUsed >= positionCap) {
+        break;
+      }
+      const item = rawMessageItems[i]!;
+      const tokens = await this.getMessageTokenCount(item.messageId!);
+      if (tokensUsed + tokens > tailBudget) {
+        break;
+      }
+      tokensUsed += tokens;
+      countUsed++;
+      protectedOrdinals.add(item.ordinal);
+    }
+
+    return protectedOrdinals;
+  }
+
   /**
    * Compute the ordinal boundary for protected fresh messages.
    *
@@ -837,21 +904,28 @@ export class CompactionEngine {
   }
 
   /** Sum raw message tokens outside the protected fresh tail. */
-  private async countRawTokensOutsideFreshTail(conversationId: number): Promise<number> {
+  private async countRawTokensOutsideFreshTail(
+    conversationId: number,
+    runtimeTokenBudget?: number,
+  ): Promise<number> {
     const contextItems = await this.summaryStore.getContextItems(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
-    let rawTokens = 0;
+    const protectedOrdinals = runtimeTokenBudget
+      ? await this.resolveTokenBudgetProtectedOrdinals(contextItems, runtimeTokenBudget)
+      : undefined;
+    const freshTailOrdinal = protectedOrdinals === undefined
+      ? this.resolveFreshTailOrdinal(contextItems)
+      : -1;
 
+    let rawTokens = 0;
     for (const item of contextItems) {
-      if (item.ordinal >= freshTailOrdinal) {
+      if (protectedOrdinals !== undefined) {
+        if (protectedOrdinals.has(item.ordinal)) continue;
+      } else if (item.ordinal >= freshTailOrdinal) {
         break;
       }
-      if (item.itemType !== "message" || item.messageId == null) {
-        continue;
-      }
+      if (item.itemType !== "message" || item.messageId == null) continue;
       rawTokens += await this.getMessageTokenCount(item.messageId);
     }
-
     return rawTokens;
   }
 
@@ -861,19 +935,28 @@ export class CompactionEngine {
    * The selected chunk size is capped by `leafChunkTokens`, but we always pick
    * at least one message when any compactable message exists.
    */
-  private async selectOldestLeafChunk(conversationId: number): Promise<LeafChunkSelection> {
+  private async selectOldestLeafChunk(
+    conversationId: number,
+    runtimeTokenBudget?: number,
+  ): Promise<LeafChunkSelection> {
     const contextItems = await this.summaryStore.getContextItems(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
+    const protectedOrdinals = runtimeTokenBudget
+      ? await this.resolveTokenBudgetProtectedOrdinals(contextItems, runtimeTokenBudget)
+      : undefined;
+    const freshTailOrdinal = protectedOrdinals === undefined
+      ? this.resolveFreshTailOrdinal(contextItems)
+      : -1;
     const threshold = this.resolveLeafChunkTokens();
+
+    const isProtected = (ordinal: number): boolean => {
+      if (protectedOrdinals !== undefined) return protectedOrdinals.has(ordinal);
+      return ordinal >= freshTailOrdinal;
+    };
 
     let rawTokensOutsideTail = 0;
     for (const item of contextItems) {
-      if (item.ordinal >= freshTailOrdinal) {
-        break;
-      }
-      if (item.itemType !== "message" || item.messageId == null) {
-        continue;
-      }
+      if (isProtected(item.ordinal)) continue;
+      if (item.itemType !== "message" || item.messageId == null) continue;
       rawTokensOutsideTail += await this.getMessageTokenCount(item.messageId);
     }
 
@@ -881,32 +964,22 @@ export class CompactionEngine {
     let chunkTokens = 0;
     let started = false;
     for (const item of contextItems) {
-      if (item.ordinal >= freshTailOrdinal) {
-        break;
+      if (isProtected(item.ordinal)) {
+        if (started) break;
+        continue;
       }
-
       if (!started) {
-        if (item.itemType !== "message" || item.messageId == null) {
-          continue;
-        }
+        if (item.itemType !== "message" || item.messageId == null) continue;
         started = true;
       } else if (item.itemType !== "message" || item.messageId == null) {
         break;
       }
-
-      if (item.messageId == null) {
-        continue;
-      }
+      if (item.messageId == null) continue;
       const messageTokens = await this.getMessageTokenCount(item.messageId);
-      if (chunk.length > 0 && chunkTokens + messageTokens > threshold) {
-        break;
-      }
-
+      if (chunk.length > 0 && chunkTokens + messageTokens > threshold) break;
       chunk.push(item);
       chunkTokens += messageTokens;
-      if (chunkTokens >= threshold) {
-        break;
-      }
+      if (chunkTokens >= threshold) break;
     }
 
     return { items: chunk, rawTokensOutsideTail, threshold };
