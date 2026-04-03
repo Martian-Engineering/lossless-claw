@@ -87,7 +87,17 @@ type CondensedPhaseCandidate = {
 
 /** Estimate token count from character length (~4 chars per token). */
 function estimateTokens(content: string): number {
-  return Math.ceil(content.length / 4);
+  let count = 0;
+  for (const ch of content) {
+    const code = ch.codePointAt(0)!;
+    // CJK Unified Ideographs + Extension A: ~1.5 tokens per char
+    if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF)) {
+      count += 1.5;
+    } else {
+      count += 0.25;
+    }
+  }
+  return Math.ceil(count);
 }
 
 /** Deterministically cap summary text so the persisted output stays within maxTokens. */
