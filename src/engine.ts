@@ -55,12 +55,7 @@ type CircuitBreakerState = {
   openSince: number | null;
 };
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Rough token estimate: ~4 chars per token. */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
+import { estimateTokens } from "./estimate-tokens.js";
 
 function toJson(value: unknown): string {
   const encoded = JSON.stringify(value);

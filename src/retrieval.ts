@@ -107,14 +107,9 @@ export interface ExpandResult {
   truncated: boolean;
 }
 
+import { estimateTokens } from "./estimate-tokens.js";
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Rough token estimate: ~4 chars per token. */
-function estimateTokens(content: string): number {
-  return Math.ceil(content.length / 4);
-}
-
-// ── RetrievalEngine ──────────────────────────────────────────────────────────
 
 export class RetrievalEngine {
   constructor(
