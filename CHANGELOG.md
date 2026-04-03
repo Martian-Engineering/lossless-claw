@@ -1,5 +1,43 @@
 # @martian-engineering/lossless-claw
 
+## 0.6.0
+
+### Minor Changes
+
+- [#195](https://github.com/Martian-Engineering/lossless-claw/pull/195) [`8efd2e9`](https://github.com/Martian-Engineering/lossless-claw/commit/8efd2e98a0000edf90953ecbb5060cf9c56baad3) Thanks [@jalehman](https://github.com/jalehman)! - Add explicit `/new` and `/reset` lifecycle handling for OpenClaw sessions.
+
+  `/new` now prunes fresh context from the active conversation while preserving retained summaries by configured depth, and `/reset` now archives the current conversation before starting a fresh active conversation for the same stable session key.
+
+- [#243](https://github.com/Martian-Engineering/lossless-claw/pull/243) [`f074000`](https://github.com/Martian-Engineering/lossless-claw/commit/f07400009be2f181f3fe382dbab5985793873540) Thanks [@jalehman](https://github.com/jalehman)! - Add the bundled `lossless-claw` skill and the MVP `/lcm` command surface with summary-health diagnostics.
+
+- [#148](https://github.com/Martian-Engineering/lossless-claw/pull/148) [`ef445da`](https://github.com/Martian-Engineering/lossless-claw/commit/ef445da2fa518cbb6abeabffa4577588f5d9d74e) Thanks [@jalehman](https://github.com/jalehman)! - Add runtime-assisted transcript GC for summarized externalized tool results so active session transcripts can shrink after oversized tool output has been condensed and preserved in `large_files`.
+
+### Patch Changes
+
+- [#255](https://github.com/Martian-Engineering/lossless-claw/pull/255) [`a1bda9b`](https://github.com/Martian-Engineering/lossless-claw/commit/a1bda9becb9914af8cfc5c091ef7f6bcdbdbf199) Thanks [@jalehman](https://github.com/jalehman)! - Limit first-time fork bootstrap imports so new conversations only inherit the newest slice of raw parent history instead of loading the entire parent transcript into lossless memory.
+
+- [#258](https://github.com/Martian-Engineering/lossless-claw/pull/258) [`cd18739`](https://github.com/Martian-Engineering/lossless-claw/commit/cd18739b08410e5c1e4dcd529afb6016a48bf303) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Add regression coverage for bootstrap budget edge cases and invalid numeric env fallback behavior.
+
+- [#230](https://github.com/Martian-Engineering/lossless-claw/pull/230) [`ca51445`](https://github.com/Martian-Engineering/lossless-claw/commit/ca51445c52e4c1c102023f0336a9d7e29f78c226) Thanks [@liu51115](https://github.com/liu51115)! - Fix compaction auth circuit breaker handling so auth failures during multi-pass sweeps still trip the breaker, while failures for one resolved summarizer no longer block unrelated providers or sessions.
+
+- [#229](https://github.com/Martian-Engineering/lossless-claw/pull/229) [`1fb8b8f`](https://github.com/Martian-Engineering/lossless-claw/commit/1fb8b8ff37055eab16e4c9204249bdb91aa401ac) Thanks [@tingyiy](https://github.com/tingyiy)! - Preserve explicit timezone offsets when parsing stored timestamps while still treating bare SQLite `datetime('now')` values as UTC.
+
+- [#219](https://github.com/Martian-Engineering/lossless-claw/pull/219) [`69e5f6a`](https://github.com/Martian-Engineering/lossless-claw/commit/69e5f6a1cc740107658c1a594945ef50834a45cc) Thanks [@catgodtwno4](https://github.com/catgodtwno4)! - Fix CJK summary search so mixed-language queries still require all terms, and single-character CJK queries continue to return matches.
+
+- [#222](https://github.com/Martian-Engineering/lossless-claw/pull/222) [`d8261d7`](https://github.com/Martian-Engineering/lossless-claw/commit/d8261d74ec9c9d866045b4283034f123f38b5d81) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Block overlapping `lcm_expand_query` delegations from the same origin session so concurrent expansion requests fail fast instead of deadlocking on the shared sub-agent lane.
+
+- [#257](https://github.com/Martian-Engineering/lossless-claw/pull/257) [`ea43f58`](https://github.com/Martian-Engineering/lossless-claw/commit/ea43f58746cf8c96b8feb5a9f6b8a1fe02477573) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Fix the hardened `afterTurn()` replay dedup path so it ingests the intended post-turn batch, and add coverage for restart replay when an auto-compaction summary is present.
+
+- [#180](https://github.com/Martian-Engineering/lossless-claw/pull/180) [`ea84f45`](https://github.com/Martian-Engineering/lossless-claw/commit/ea84f454a07d205ff225b5c73d4f91f73e2614bd) Thanks [@GodsBoy](https://github.com/GodsBoy)! - Fix prompt-aware context eviction so blank or otherwise unsearchable prompts fall back to the existing chronological behavior instead of entering the relevance-scoring path.
+
+- [#178](https://github.com/Martian-Engineering/lossless-claw/pull/178) [`0613b7f`](https://github.com/Martian-Engineering/lossless-claw/commit/0613b7fc7707a4ccea1ffbf7d2c8be82bd4dcee6) Thanks [@catgodtwno4](https://github.com/catgodtwno4)! - Fix summarizer auth-error detection so real provider auth envelopes nested under `data` or `body` still trigger handling, while successful summary payloads in `message` or `response` no longer cause false-positive auth failures.
+
+- [#242](https://github.com/Martian-Engineering/lossless-claw/pull/242) [`3fe823f`](https://github.com/Martian-Engineering/lossless-claw/commit/3fe823f4dcec720c158f712fa4c4487482e80ade) Thanks [@jalehman](https://github.com/jalehman)! - Move static lossless recall policy guidance into the plugin prompt hook while keeping `systemPromptAddition` limited to session-specific compaction reminders.
+
+  This makes the stable recall-order guidance cacheable, clarifies that lossless-claw takes precedence over generic memory recall only for compacted conversation history, and leaves deep-compaction expand-before-asserting guidance in the dynamic assembled prompt.
+
+- [#252](https://github.com/Martian-Engineering/lossless-claw/pull/252) [`e843638`](https://github.com/Martian-Engineering/lossless-claw/commit/e8436388311e110b983d280e2157a9f013e41d4e) Thanks [@jalehman](https://github.com/jalehman)! - Sync the published plugin manifest schema with the runtime-supported plugin config surface so documented config keys are accepted by OpenClaw. This also removes the undocumented `autocompactDisabled` setting from the advertised config surface because it was parsed but not wired to runtime behavior.
+
 ## 0.5.3
 
 ### Patch Changes
