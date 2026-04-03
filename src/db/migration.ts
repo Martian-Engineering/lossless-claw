@@ -425,6 +425,71 @@ function backfillToolCallColumns(db: DatabaseSync): void {
   );
 }
 
+/**
+ * Migrate summary_messages.message_id FK from ON DELETE RESTRICT to ON DELETE CASCADE.
+ *
+ * SQLite does not support ALTER CONSTRAINT, so we rebuild the table.  The old
+ * RESTRICT policy caused orphan rows in summary_messages when messages were
+ * deleted (e.g. by heartbeat-ok pruning or external cleanup) while FK
+ * enforcement was off (PRAGMA foreign_keys = 0, the SQLite default).
+ *
+ * Similarly, context_items references are changed from RESTRICT to SET NULL so
+ * that deleting a message or summary nullifies the pointer instead of blocking
+ * the delete or leaving a dangling reference.
+ */
+function migrateSummaryMessagesCascade(db: DatabaseSync): void {
+  // Check if migration is needed by inspecting the FK definition.
+  const fks = db.prepare(`PRAGMA foreign_key_list(summary_messages)`).all() as Array<{
+    from?: string;
+    on_delete?: string;
+  }>;
+  const messagesFk = fks.find((fk) => fk.from === "message_id");
+  if (!messagesFk || messagesFk.on_delete === "CASCADE") {
+    return; // Already migrated or fresh DB.
+  }
+
+  // Rebuild summary_messages with CASCADE.
+  db.exec(`
+    CREATE TABLE summary_messages_new (
+      summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL,
+      PRIMARY KEY (summary_id, message_id)
+    );
+    INSERT INTO summary_messages_new SELECT * FROM summary_messages
+      WHERE message_id IN (SELECT message_id FROM messages);
+    DROP TABLE summary_messages;
+    ALTER TABLE summary_messages_new RENAME TO summary_messages;
+  `);
+
+  // Rebuild context_items with SET NULL.
+  const ciFks = db.prepare(`PRAGMA foreign_key_list(context_items)`).all() as Array<{
+    from?: string;
+    on_delete?: string;
+  }>;
+  const ciMsgFk = ciFks.find((fk) => fk.from === "message_id");
+  if (ciMsgFk && ciMsgFk.on_delete === "RESTRICT") {
+    db.exec(`
+      CREATE TABLE context_items_new (
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL,
+        item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary')),
+        message_id INTEGER REFERENCES messages(message_id) ON DELETE SET NULL,
+        summary_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (conversation_id, ordinal),
+        CHECK (
+          (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL) OR
+          (item_type = 'summary' AND summary_id IS NOT NULL AND message_id IS NULL)
+        )
+      );
+      INSERT INTO context_items_new SELECT * FROM context_items;
+      DROP TABLE context_items;
+      ALTER TABLE context_items_new RENAME TO context_items;
+    `);
+  }
+}
+
 export function runLcmMigrations(
   db: DatabaseSync,
   options?: { fts5Available?: boolean },
@@ -509,7 +574,7 @@ export function runLcmMigrations(
 
     CREATE TABLE IF NOT EXISTS summary_messages (
       summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
-      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE RESTRICT,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
       ordinal INTEGER NOT NULL,
       PRIMARY KEY (summary_id, message_id)
     );
@@ -525,8 +590,8 @@ export function runLcmMigrations(
       conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
       ordinal INTEGER NOT NULL,
       item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary')),
-      message_id INTEGER REFERENCES messages(message_id) ON DELETE RESTRICT,
-      summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+      message_id INTEGER REFERENCES messages(message_id) ON DELETE SET NULL,
+      summary_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       PRIMARY KEY (conversation_id, ordinal),
       CHECK (
@@ -608,6 +673,7 @@ export function runLcmMigrations(
   backfillSummaryDepths(db);
   backfillSummaryMetadata(db);
   backfillToolCallColumns(db);
+  migrateSummaryMessagesCascade(db);
 
   const fts5Available = options?.fts5Available ?? getLcmDbFeatures(db).fts5Available;
   if (!fts5Available) {
