@@ -1558,12 +1558,7 @@ export class CompactionEngine {
     return { summaryId, level: condensed.level };
   }
 
-  /**
-   * Persist durable compaction events into canonical history as message parts.
-   *
-   * Event persistence is best-effort: failures are swallowed to avoid
-   * compromising the core compaction path.
-   */
+  /** Emit compaction telemetry without mutating canonical conversation history. */
   private async persistCompactionEvents(input: {
     conversationId: number;
     tokensBefore: number;
@@ -1624,7 +1619,7 @@ export class CompactionEngine {
     }
   }
 
-  /** Write one compaction event message + part atomically where possible. */
+  /** Log one compaction event without appending a synthetic chat message. */
   private async persistCompactionEvent(input: {
     conversationId: number;
     sessionId: string;
@@ -1637,43 +1632,8 @@ export class CompactionEngine {
     condensedPassOccurred: boolean;
   }): Promise<void> {
     const content = `LCM compaction ${input.pass} pass (${input.level}): ${input.tokensBefore} -> ${input.tokensAfter}`;
-    const metadata = JSON.stringify({
-      conversationId: input.conversationId,
-      pass: input.pass,
-      level: input.level,
-      tokensBefore: input.tokensBefore,
-      tokensAfter: input.tokensAfter,
-      createdSummaryId: input.createdSummaryId,
-      createdSummaryIds: input.createdSummaryIds,
-      condensedPassOccurred: input.condensedPassOccurred,
-    });
-
-    const writeEvent = async (): Promise<void> => {
-      const seq = (await this.conversationStore.getMaxSeq(input.conversationId)) + 1;
-      const eventMessage = await this.conversationStore.createMessage({
-        conversationId: input.conversationId,
-        seq,
-        role: "system",
-        content,
-        tokenCount: estimateTokens(content),
-      });
-
-      const parts: CreateMessagePartInput[] = [
-        {
-          sessionId: input.sessionId,
-          partType: "compaction",
-          ordinal: 0,
-          textContent: content,
-          metadata,
-        },
-      ];
-      await this.conversationStore.createMessageParts(eventMessage.messageId, parts);
-    };
-
-    try {
-      await this.conversationStore.withTransaction(() => writeEvent());
-    } catch {
-      // Compaction should still succeed if event persistence fails.
-    }
+    console.info(
+      `[lcm] ${content} conversation=${input.conversationId} summary=${input.createdSummaryId}`,
+    );
   }
 }
