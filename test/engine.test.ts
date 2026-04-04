@@ -3843,6 +3843,57 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "new C", "new D"]);
   });
 
+  it("deduplicates replay when runtime sessionId changes but stable sessionKey continues", async () => {
+    const engine = createEngine();
+    const firstSessionId = "dedup-session-key-runtime-1";
+    const secondSessionId = "dedup-session-key-runtime-2";
+    const sessionKey = "agent:main:main";
+
+    await engine.afterTurn({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: createSessionFilePath("dedup-session-key-runtime-1"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const firstConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(firstConversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: createSessionFilePath("dedup-session-key-runtime-2"),
+      messages: [
+        makeMessage({ role: "system", content: "system prompt" }),
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "user", content: "new C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 1,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    expect(conversation!.conversationId).toBe(firstConversation!.conversationId);
+    expect(conversation!.sessionId).toBe(secondSessionId);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "new C", "new D"]);
+  });
+
   it("handles empty batch after slicing", async () => {
     const engine = createEngine();
     const sessionId = "dedup-empty";

@@ -2219,11 +2219,15 @@ export class LcmContextEngine implements ContextEngine {
    */
   private async deduplicateAfterTurnBatch(
     sessionId: string,
+    sessionKey: string | undefined,
     batch: AgentMessage[],
   ): Promise<AgentMessage[]> {
     if (batch.length === 0) return batch;
 
-    const conversation = await this.conversationStore.getConversationBySessionId(sessionId);
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
     if (!conversation) return batch;
 
     const conversationId = conversation.conversationId;
@@ -2562,7 +2566,11 @@ export class LcmContextEngine implements ContextEngine {
     // full history. Run on newMessages BEFORE prepending autoCompactionSummary
     // so synthetic summaries cannot interfere with replay detection.
     const newMessages = params.messages.slice(params.prePromptMessageCount);
-    const dedupedNewMessages = await this.deduplicateAfterTurnBatch(params.sessionId, newMessages);
+    const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
+      params.sessionId,
+      params.sessionKey,
+      newMessages,
+    );
 
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
