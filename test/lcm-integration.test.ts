@@ -1343,7 +1343,7 @@ describe("LCM integration: compaction", () => {
     expect(leafSummary!.fileIds).toEqual(["file_aaaabbbbccccdddd", "file_1111222233334444"]);
   });
 
-  it("compaction emits one durable compaction part for a leaf-only pass", async () => {
+  it("compaction keeps leaf-only telemetry out of canonical transcript state", async () => {
     await convStore.createConversation({ sessionId: "leaf-only-session" });
     await ingestMessages(convStore, sumStore, 5, {
       contentFn: (i) => `Turn ${i}: ${"l".repeat(160)}`,
@@ -1359,25 +1359,28 @@ describe("LCM integration: compaction", () => {
 
     expect(result.actionTaken).toBe(true);
     expect(result.condensed).toBe(false);
+    expect(result.createdSummaryId).toBeTypeOf("string");
+    expect(result.tokensBefore).toBeTypeOf("number");
+    expect(result.tokensAfter).toBeTypeOf("number");
+    expect(result.tokensBefore).toBeGreaterThan(result.tokensAfter);
+    expect(result.level).toBeDefined();
 
     const compactionParts = convStore._messageParts.filter(
       (part) => part.partType === "compaction",
     );
-    expect(compactionParts).toHaveLength(1);
+    expect(compactionParts).toHaveLength(0);
 
-    const metadata = JSON.parse(compactionParts[0].metadata ?? "{}") as Record<string, unknown>;
-    expect(metadata.conversationId).toBe(CONV_ID);
-    expect(metadata.pass).toBe("leaf");
-    expect(metadata.tokensBefore).toBeTypeOf("number");
-    expect(metadata.tokensAfter).toBeTypeOf("number");
-    expect((metadata.tokensBefore as number) > (metadata.tokensAfter as number)).toBe(true);
-    expect(metadata.level).toBeDefined();
-    expect(metadata.createdSummaryId).toBeTypeOf("string");
-    expect(metadata.createdSummaryIds).toEqual([metadata.createdSummaryId]);
-    expect(metadata.condensedPassOccurred).toBe(false);
+    const createdSummary = sumStore._summaries.find(
+      (summary) => summary.summaryId === result.createdSummaryId,
+    );
+    expect(createdSummary).toBeDefined();
+    expect(createdSummary!.kind).toBe("leaf");
+
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    expect(contextItems.some((item) => item.itemType === "summary")).toBe(true);
   });
 
-  it("compaction emits durable compaction parts for leaf and condensed passes", async () => {
+  it("compaction keeps leaf and condensed telemetry out of canonical transcript state", async () => {
     const condensedFriendlyEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       leafMinFanout: 2,
@@ -1400,36 +1403,33 @@ describe("LCM integration: compaction", () => {
 
     expect(result.actionTaken).toBe(true);
     expect(result.condensed).toBe(true);
+    expect(result.createdSummaryId).toBeTypeOf("string");
+    expect(result.tokensBefore).toBeTypeOf("number");
+    expect(result.tokensAfter).toBeTypeOf("number");
+    expect(result.tokensBefore).toBeGreaterThan(result.tokensAfter);
+    expect(result.level).toBeDefined();
 
     const compactionParts = convStore._messageParts.filter(
       (part) => part.partType === "compaction",
     );
-    expect(compactionParts.length).toBeGreaterThanOrEqual(2);
+    expect(compactionParts).toHaveLength(0);
 
-    const compactionMetadata = compactionParts.map(
-      (part) => JSON.parse(part.metadata ?? "{}") as Record<string, unknown>,
+    const leafSummaries = sumStore._summaries.filter((summary) => summary.kind === "leaf");
+    const condensedSummaries = sumStore._summaries.filter(
+      (summary) => summary.kind === "condensed",
     );
-    const leafPart = compactionMetadata.find((metadata) => metadata.pass === "leaf");
-    const condensedPart = compactionMetadata.find((metadata) => metadata.pass === "condensed");
 
-    expect(leafPart).toBeDefined();
-    expect(condensedPart).toBeDefined();
-    expect(leafPart!.conversationId).toBe(CONV_ID);
-    expect(condensedPart!.conversationId).toBe(CONV_ID);
-    expect(leafPart!.tokensBefore).toBeTypeOf("number");
-    expect(leafPart!.tokensAfter).toBeTypeOf("number");
-    expect(condensedPart!.tokensBefore).toBeTypeOf("number");
-    expect(condensedPart!.tokensAfter).toBeTypeOf("number");
-    expect(leafPart!.level).toBeDefined();
-    expect(condensedPart!.level).toBeDefined();
-    expect(leafPart!.createdSummaryId).toBeTypeOf("string");
-    expect(condensedPart!.createdSummaryId).toBeTypeOf("string");
-    expect(Array.isArray(leafPart!.createdSummaryIds)).toBe(true);
-    expect(Array.isArray(condensedPart!.createdSummaryIds)).toBe(true);
-    expect((leafPart!.createdSummaryIds as unknown[]).length).toBeGreaterThanOrEqual(1);
-    expect((condensedPart!.createdSummaryIds as unknown[]).length).toBeGreaterThanOrEqual(1);
-    expect(typeof leafPart!.condensedPassOccurred).toBe("boolean");
-    expect(typeof condensedPart!.condensedPassOccurred).toBe("boolean");
+    expect(leafSummaries.length).toBeGreaterThanOrEqual(1);
+    expect(condensedSummaries.length).toBeGreaterThanOrEqual(1);
+
+    const createdSummary = sumStore._summaries.find(
+      (summary) => summary.summaryId === result.createdSummaryId,
+    );
+    expect(createdSummary).toBeDefined();
+    expect(["leaf", "condensed"]).toContain(createdSummary!.kind);
+
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    expect(contextItems.some((item) => item.itemType === "summary")).toBe(true);
   });
 
   it("depth-aware condensation sets condensed depth to max parent depth plus one", async () => {
