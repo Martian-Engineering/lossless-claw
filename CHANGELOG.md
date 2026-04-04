@@ -1,5 +1,11 @@
 # @martian-engineering/lossless-claw
 
+## 0.6.1
+
+### Patch Changes
+
+- [`d1a9eb3`](https://github.com/Martian-Engineering/lossless-claw/commit/d1a9eb36b543050bdda442faab93bab48bd3e130) Thanks [@jalehman](https://github.com/jalehman)! - Fix conversation integrity regressions by pruning heartbeat-shaped ACK turns before compaction, avoiding synthetic compaction telemetry in canonical transcript history, and deduplicating replayed history using stable session key continuity during afterTurn processing.
+
 ## 0.6.0
 
 ### Minor Changes
