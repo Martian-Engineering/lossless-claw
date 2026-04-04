@@ -32,10 +32,6 @@ export type LcmConfig = {
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
   largeFileSummaryModel: string;
-  /** Model override for conversation summarization. */
-  summaryModel: string;
-  /** Provider override for conversation summarization. */
-  summaryProvider: string;
   /** Provider override for lcm_expand_query sub-agent. */
   expansionProvider: string;
   /** Model override for lcm_expand_query sub-agent. */
@@ -52,6 +48,10 @@ export type LcmConfig = {
   summaryMaxOverageFactor: number;
   /** Custom instructions injected into all summarization prompts. */
   customInstructions: string;
+  /** Workspace-relative file paths injected into every context assembly, outside the compaction DAG. */
+  pinnedFiles: string[];
+  /** Per-agent pinned file overrides, keyed by agent ID. Merged with global pinnedFiles at resolution time. */
+  pinnedFilesPerAgent: Record<string, string[]>;
   /** Consecutive auth failures before the compaction circuit breaker trips (default 5). */
   circuitBreakerThreshold: number;
   /** Cooldown in milliseconds before the circuit breaker auto-resets (default 30 min). */
@@ -98,6 +98,17 @@ function toStr(value: unknown): string | undefined {
     return trimmed.length > 0 ? trimmed : undefined;
   }
   return undefined;
+}
+
+/** Coerce a plugin config value into a Record<string, string[]> where each value is a string array. */
+function toStrArrayRecord(value: unknown): Record<string, string[]> | undefined {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const result: Record<string, string[]> = {};
+  for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+    const arr = toStrArray(val);
+    if (arr) result[key] = arr;
+  }
+  return Object.keys(result).length > 0 ? result : {};
 }
 
 /** Coerce a plugin config value into a trimmed string array when possible. */
@@ -232,6 +243,8 @@ export function resolveLcmConfig(
         ?? toNumber(pc.summaryMaxOverageFactor) ?? 3,
     customInstructions:
       env.LCM_CUSTOM_INSTRUCTIONS?.trim() ?? toStr(pc.customInstructions) ?? "",
+    pinnedFiles: toStrArray(pc.pinnedFiles) ?? [],
+    pinnedFilesPerAgent: toStrArrayRecord(pc.pinnedFilesPerAgent) ?? {},
     circuitBreakerThreshold:
       parseFiniteInt(env.LCM_CIRCUIT_BREAKER_THRESHOLD)
         ?? toNumber(pc.circuitBreakerThreshold) ?? 5,

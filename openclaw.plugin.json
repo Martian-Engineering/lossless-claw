@@ -103,6 +103,14 @@
     "pruneHeartbeatOk": {
       "label": "Prune HEARTBEAT_OK",
       "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
+    },
+    "pinnedFiles": {
+      "label": "Pinned Files",
+      "help": "Workspace files always present in context (never compacted). Paths relative to agent workspace."
+    },
+    "pinnedFilesPerAgent": {
+      "label": "Per-Agent Pinned Files",
+      "help": "Agent-specific pinned files keyed by agent ID. Merged with global pinnedFiles."
     }
   },
   "configSchema": {
@@ -225,6 +233,19 @@
       "databasePath": {
         "description": "Path to LCM SQLite database (alias for dbPath)",
         "type": "string"
+      },
+      "pinnedFiles": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Workspace-relative file paths injected into every context assembly, outside the compaction DAG. These files are never summarized."
+      },
+      "pinnedFilesPerAgent": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "description": "Per-agent pinned file paths, keyed by agent ID. Merged with global pinnedFiles at resolution time."
       }
     }
   }

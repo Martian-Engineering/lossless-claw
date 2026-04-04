@@ -20,6 +20,13 @@ const TOOL_CALL_TYPES = new Set([
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
+export interface PinnedFileEntry {
+  /** Workspace-relative path */
+  path: string;
+  /** File content read from disk */
+  content: string;
+}
+
 export interface AssembleContextInput {
   conversationId: number;
   tokenBudget: number;
@@ -27,6 +34,8 @@ export interface AssembleContextInput {
   freshTailCount?: number;
   /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
   prompt?: string;
+  /** Files to inject at the start of context, outside the compaction DAG */
+  pinnedFiles?: PinnedFileEntry[];
 }
 
 export interface AssembleContextResult {
@@ -899,14 +908,27 @@ export class ContextAssembler {
   async assemble(input: AssembleContextInput): Promise<AssembleContextResult> {
     const { conversationId, tokenBudget } = input;
     const freshTailCount = input.freshTailCount ?? 8;
+    const pinnedFiles = input.pinnedFiles ?? [];
+
+    // Step 0: Build pinned file messages and subtract from budget
+    const pinnedMessages: AgentMessage[] = [];
+    let pinnedTokens = 0;
+    for (const pf of pinnedFiles) {
+      const safePath = pf.path.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const text = `<pinned_file path="${safePath}">\n${pf.content}\n</pinned_file>`;
+      const tokens = estimateTokens(text);
+      pinnedMessages.push({ role: "user", content: text } as AgentMessage);
+      pinnedTokens += tokens;
+    }
+    const effectiveBudget = Math.max(0, tokenBudget - pinnedTokens);
 
     // Step 1: Get all context items ordered by ordinal
     const contextItems = await this.summaryStore.getContextItems(conversationId);
 
     if (contextItems.length === 0) {
       return {
-        messages: [],
-        estimatedTokens: 0,
+        messages: pinnedMessages,
+        estimatedTokens: pinnedTokens,
         stats: { rawMessageCount: 0, summaryCount: 0, totalContextItems: 0 },
       };
     }
@@ -955,7 +977,7 @@ export class ContextAssembler {
     // Fill remaining budget from evictable items, oldest first.
     // If the fresh tail alone exceeds the budget we still include it
     // (we never drop fresh items), but we skip all evictable items.
-    const remainingBudget = Math.max(0, tokenBudget - tailTokens);
+    const remainingBudget = Math.max(0, effectiveBudget - tailTokens);
     const selected: ResolvedItem[] = [];
     let evictableTokens = 0;
 
@@ -1017,11 +1039,11 @@ export class ContextAssembler {
     // Append fresh tail after the evictable prefix
     selected.push(...freshTail);
 
-    const estimatedTokens = evictableTokens + tailTokens;
+    const estimatedTokens = pinnedTokens + evictableTokens + tailTokens;
 
     // Normalize assistant string content to array blocks (some providers return
     // content as a plain string; Anthropic expects content block arrays).
-    const rawMessages = filterNonFreshAssistantToolCalls(selected, freshTailOrdinals);
+    const rawMessages = [...pinnedMessages, ...filterNonFreshAssistantToolCalls(selected, freshTailOrdinals)];
     for (let i = 0; i < rawMessages.length; i++) {
       const msg = rawMessages[i];
       if (msg?.role === "assistant" && typeof msg.content === "string") {
