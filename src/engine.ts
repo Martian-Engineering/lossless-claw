@@ -3020,8 +3020,9 @@ export class LcmContextEngine implements ContextEngine {
           };
         }
 
-        const useSweep =
-          manualCompactionRequested || forceCompaction || params.compactionTarget === "threshold";
+        // Forced budget recovery should use the capped convergence loop so live
+        // overflow counts can drive recovery even when persisted context is already small.
+        const useSweep = manualCompactionRequested || params.compactionTarget === "threshold";
         if (useSweep) {
           const sweepResult = await this.compaction.compactFullSweep({
             conversationId,

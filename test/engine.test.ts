@@ -4416,6 +4416,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
         tokensAfter: 280,
         condensed: false,
       });
+    const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
 
     await engine.ingest({
       sessionId: "threshold-target-session",
@@ -4441,6 +4442,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
         hardTrigger: false,
       }),
     );
+    expect(compactUntilUnderSpy).not.toHaveBeenCalled();
   });
 
   it("passes currentTokenCount through to compaction evaluation and loop", async () => {
@@ -4536,7 +4538,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(result.reason).toBe("already under target");
   });
 
-  it("reports live overflow when a forced sweep cannot compact stored context", async () => {
+  it("routes forced budget recovery through compactUntilUnder for the issue #268 overflow shape", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
       compaction: {
@@ -4546,20 +4548,21 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
           observed?: number,
         ) => Promise<unknown>;
         compactFullSweep: (input: unknown) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
       };
     };
 
-    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
       shouldCompact: true,
       reason: "threshold",
       currentTokens: 277_403,
       threshold: 150_000,
     });
-    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
-      actionTaken: false,
-      tokensBefore: 17_561,
-      tokensAfter: 17_561,
-      condensed: false,
+    const compactFullSweepSpy = vi.spyOn(privateEngine.compaction, "compactFullSweep");
+    const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder").mockResolvedValue({
+      success: true,
+      rounds: 2,
+      finalTokens: 199_500,
     });
 
     await engine.ingest({
@@ -4576,15 +4579,26 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
       compactionTarget: "budget",
     });
 
-    expect(result.ok).toBe(false);
-    expect(result.compacted).toBe(false);
-    expect(result.reason).toBe("live context still exceeds target");
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(result.reason).toBe("compacted");
     expect(result.result?.tokensBefore).toBe(277_403);
-    expect(result.result?.tokensAfter).toBe(17_561);
+    expect(result.result?.tokensAfter).toBe(199_500);
     expect(result.result?.details).toEqual(
       expect.objectContaining({
-        rounds: 0,
+        rounds: 2,
         targetTokens: 200_000,
+      }),
+    );
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000, 277_403);
+    expect(compactFullSweepSpy).not.toHaveBeenCalled();
+    expect(compactUntilUnderSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 200_000,
+        targetTokens: 200_000,
+        currentTokens: 277_403,
+        summarize: expect.any(Function),
       }),
     );
   });
