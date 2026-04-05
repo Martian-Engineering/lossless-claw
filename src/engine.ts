@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, createReadStream, openSync, readSync, statSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -1916,6 +1916,20 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const missingTail = historicalMessages.slice(anchorIndex + 1);
+
+    // Defense-in-depth: cap reconcile imports at 20% of existing DB message
+    // count to prevent catastrophic duplicate floods if the anchor lands at
+    // the wrong position (e.g. due to many identical messages).
+    const existingDbCount = await this.conversationStore.getMessageCount(conversationId);
+    if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
+      console.error(
+        `[lcm] reconcileSessionTail: aborting — would import ${missingTail.length} messages ` +
+          `into conversation ${conversationId} with ${existingDbCount} existing messages ` +
+          `(exceeds 20% cap). This likely indicates a stale bootstrap checkpoint.`,
+      );
+      return { importedMessages: 0, hasOverlap: true };
+    }
+
     let importedMessages = 0;
     for (const message of missingTail) {
       const result = await this.ingestSingle({ sessionId, sessionKey: params.sessionKey, message });
@@ -2041,11 +2055,14 @@ export class LcmContextEngine implements ContextEngine {
                 }
 
                 let importedMessages = 0;
-                for (const message of appended.messages) {
+                for (let i = 0; i < appended.messages.length; i++) {
+                  const message = appended.messages[i];
+                  const entryId = appended.annotated[i]?.entryId;
                   const ingestResult = await this.ingestSingle({
                     sessionId: params.sessionId,
                     sessionKey: params.sessionKey,
                     message,
+                    jsonlEntryId: entryId,
                   });
                   if (ingestResult.ingested) {
                     importedMessages += 1;
@@ -2405,9 +2422,37 @@ export class LcmContextEngine implements ContextEngine {
           };
         }
 
-        return params.runtimeContext.rewriteTranscriptEntries({
+        const rewriteResult = await params.runtimeContext.rewriteTranscriptEntries({
           replacements,
         });
+
+        // After a successful JSONL rewrite, update the bootstrap checkpoint so
+        // the next bootstrap() sees the new file state and doesn't fall through
+        // to the fragile reconcileSessionTail() anchor-matching path.
+        if (rewriteResult.changed && conversation) {
+          try {
+            const newStats = await stat(params.sessionFile);
+            const newSize = newStats.size;
+            const newMtimeMs = Math.trunc(newStats.mtimeMs);
+            const lastEntryRaw = readLastJsonlEntryBeforeOffset(params.sessionFile, newSize);
+            const lastEntryMessage = readBootstrapMessageFromJsonLine(lastEntryRaw);
+            const lastEntryHash = lastEntryMessage
+              ? createBootstrapEntryHash(toStoredMessage(lastEntryMessage))
+              : null;
+            await this.summaryStore.upsertConversationBootstrapState({
+              conversationId: conversation.conversationId,
+              sessionFilePath: params.sessionFile,
+              lastSeenSize: newSize,
+              lastSeenMtimeMs: newMtimeMs,
+              lastProcessedOffset: newSize,
+              lastProcessedEntryHash: lastEntryHash,
+            });
+          } catch (err) {
+            console.error("[lcm] maintain: failed to update bootstrap checkpoint after rewrite:", err);
+          }
+        }
+
+        return rewriteResult;
       },
     );
   }
