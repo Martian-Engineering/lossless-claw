@@ -1236,6 +1236,7 @@ export class LcmContextEngine implements ContextEngine {
       leafTargetTokens: this.config.leafTargetTokens,
       condensedTargetTokens: this.config.condensedTargetTokens,
       maxRounds: 10,
+      maxLeafPasses: this.config.maxLeafPasses,
       timezone: this.config.timezone,
       summaryMaxOverageFactor: this.config.summaryMaxOverageFactor,
     };
@@ -1312,7 +1313,7 @@ export class LcmContextEngine implements ContextEngine {
     if (state.failures >= this.config.circuitBreakerThreshold) {
       state.openSince = Date.now();
       console.error(
-        `[lcm] compaction circuit breaker OPEN: ${state.failures} consecutive auth failures for ${key}. Compaction halted. Will auto-retry after ${Math.round(this.config.circuitBreakerCooldownMs / 60000)}m or gateway restart.`,
+        `[lcm] compaction circuit breaker OPEN: ${state.failures} consecutive failures for ${key}. Compaction halted. Will auto-retry after ${Math.round(this.config.circuitBreakerCooldownMs / 60000)}m or gateway restart.`,
       );
     }
   }
@@ -2917,14 +2918,22 @@ export class LcmContextEngine implements ContextEngine {
           };
         }
 
-        const leafResult = await this.compaction.compactLeaf({
-          conversationId: conversation.conversationId,
-          tokenBudget,
-          summarize,
-          force: params.force,
-          previousSummaryContent: params.previousSummaryContent,
-          summaryModel,
-        });
+        let leafResult: Awaited<ReturnType<typeof this.compaction.compactLeaf>>;
+        try {
+          leafResult = await this.compaction.compactLeaf({
+            conversationId: conversation.conversationId,
+            tokenBudget,
+            summarize,
+            force: params.force,
+            previousSummaryContent: params.previousSummaryContent,
+            summaryModel,
+          });
+        } catch (err) {
+          if (breakerKey) {
+            this.recordCompactionAuthFailure(breakerKey);
+          }
+          throw err;
+        }
 
         if (leafResult.authFailure && breakerKey) {
           this.recordCompactionAuthFailure(breakerKey);
@@ -3076,20 +3085,35 @@ export class LcmContextEngine implements ContextEngine {
         const useSweep =
           manualCompactionRequested || forceCompaction || params.compactionTarget === "threshold";
         if (useSweep) {
-          const sweepResult = await this.compaction.compactFullSweep({
-            conversationId,
-            tokenBudget,
-            summarize,
-            force: forceCompaction,
-            hardTrigger: false,
-            summaryModel,
-          });
+          let sweepResult: Awaited<ReturnType<typeof this.compaction.compactFullSweep>>;
+          try {
+            sweepResult = await this.compaction.compactFullSweep({
+              conversationId,
+              tokenBudget,
+              summarize,
+              force: forceCompaction,
+              hardTrigger: false,
+              summaryModel,
+            });
+          } catch (err) {
+            // Treat unexpected errors (timeouts, network failures, gateway
+            // restarts) as circuit-breaker–worthy failures so that repeated
+            // crashes don't keep re-triggering the same expensive sweep.
+            if (breakerKey) {
+              this.recordCompactionAuthFailure(breakerKey);
+            }
+            throw err;
+          }
 
           if (sweepResult.authFailure && breakerKey) {
             this.recordCompactionAuthFailure(breakerKey);
           } else if (sweepResult.actionTaken && breakerKey) {
             this.recordCompactionSuccess(breakerKey);
           }
+
+          const cappedReason = sweepResult.cappedByPassLimit
+            ? "compacted (capped by pass limit)"
+            : undefined;
 
           return {
             ok: !sweepResult.authFailure && (sweepResult.actionTaken || !liveContextStillExceedsTarget),
@@ -3098,13 +3122,14 @@ export class LcmContextEngine implements ContextEngine {
               ? (sweepResult.actionTaken
                   ? "provider auth failure after partial compaction"
                   : "provider auth failure")
-              : sweepResult.actionTaken
-                ? "compacted"
-                : manualCompactionRequested
-                  ? "nothing to compact"
-                  : liveContextStillExceedsTarget
-                    ? "live context still exceeds target"
-                    : "already under target",
+              : cappedReason
+                ?? (sweepResult.actionTaken
+                  ? "compacted"
+                  : manualCompactionRequested
+                    ? "nothing to compact"
+                    : liveContextStillExceedsTarget
+                      ? "live context still exceeds target"
+                      : "already under target"),
             result: {
               tokensBefore: decision.currentTokens,
               tokensAfter: sweepResult.tokensAfter,
@@ -3123,14 +3148,22 @@ export class LcmContextEngine implements ContextEngine {
             ? decision.threshold
             : tokenBudget;
 
-        const compactResult = await this.compaction.compactUntilUnder({
-          conversationId,
-          tokenBudget,
-          targetTokens: convergenceTargetTokens,
-          ...(observedTokens !== undefined ? { currentTokens: observedTokens } : {}),
-          summarize,
-          summaryModel,
-        });
+        let compactResult: Awaited<ReturnType<typeof this.compaction.compactUntilUnder>>;
+        try {
+          compactResult = await this.compaction.compactUntilUnder({
+            conversationId,
+            tokenBudget,
+            targetTokens: convergenceTargetTokens,
+            ...(observedTokens !== undefined ? { currentTokens: observedTokens } : {}),
+            summarize,
+            summaryModel,
+          });
+        } catch (err) {
+          if (breakerKey) {
+            this.recordCompactionAuthFailure(breakerKey);
+          }
+          throw err;
+        }
 
         if (compactResult.authFailure && breakerKey) {
           this.recordCompactionAuthFailure(breakerKey);

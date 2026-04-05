@@ -27,6 +27,8 @@ export interface CompactionResult {
   level?: CompactionLevel;
   /** Whether compaction was blocked by a provider auth failure */
   authFailure?: boolean;
+  /** Whether the sweep was capped by maxLeafPasses before completing all leaf work */
+  cappedByPassLimit?: boolean;
 }
 
 export interface CompactionConfig {
@@ -50,6 +52,8 @@ export interface CompactionConfig {
   condensedTargetTokens: number;
   /** Maximum compaction rounds (default 10) */
   maxRounds: number;
+  /** Maximum Phase 1 leaf passes per full sweep (default 25). */
+  maxLeafPasses?: number;
   /** IANA timezone for timestamps in summaries (default: UTC) */
   timezone?: string;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
@@ -585,13 +589,21 @@ export class CompactionEngine {
     let previousSummaryContent: string | undefined;
     let previousTokens = tokensBefore;
     let hadAuthFailure = false;
+    let cappedByPassLimit = false;
 
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
+    const maxLeafPasses = this.config.maxLeafPasses ?? 25;
+    let leafPassCount = 0;
     while (true) {
+      if (leafPassCount >= maxLeafPasses) {
+        cappedByPassLimit = true;
+        break;
+      }
       const leafChunk = await this.selectOldestLeafChunk(conversationId);
       if (leafChunk.items.length === 0) {
         break;
       }
+      leafPassCount++;
 
       const passTokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
       const leafResult = await this.leafPass(
@@ -687,6 +699,7 @@ export class CompactionEngine {
       condensed,
       level,
       ...(hadAuthFailure ? { authFailure: true } : {}),
+      ...(cappedByPassLimit ? { cappedByPassLimit: true } : {}),
     };
   }
 
