@@ -108,6 +108,9 @@ export interface LcmDependencies {
   /** LLM completion function for summarization */
   complete: CompleteFn;
 
+  /** Whether a provider uses runtime-managed OAuth / auth profiles instead of direct API keys. */
+  isRuntimeManagedAuthProvider?: (provider: string, providerApi?: string) => boolean;
+
   /** Gateway RPC call function (for subagent spawning, session ops) */
   callGateway: CallGatewayFn;
 

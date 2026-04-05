@@ -105,7 +105,7 @@ export class LcmProviderAuthError extends Error {
  * context windows on slower providers, short enough to prevent the gateway
  * event loop from starving when a provider hangs.
  */
-const SUMMARIZER_TIMEOUT_MS = 60_000;
+const DEFAULT_SUMMARIZER_TIMEOUT_MS = 60_000;
 
 /** Error used to distinguish summarizer timeouts from provider failures. */
 class SummarizerTimeoutError extends Error {
@@ -1136,6 +1136,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       ? params.deps.config.leafTargetTokens
       : DEFAULT_LEAF_TARGET_TOKENS;
 
+  const summarizerTimeoutMs =
+    Number.isFinite(params.deps.config.summaryTimeoutMs) && params.deps.config.summaryTimeoutMs > 0
+      ? params.deps.config.summaryTimeoutMs
+      : DEFAULT_SUMMARIZER_TIMEOUT_MS;
+
   const fn: LcmSummarizeFn = async (
     text: string,
     aggressive?: boolean,
@@ -1210,13 +1215,17 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           ],
           maxTokens: targetTokens,
           ...(reasoning ? { reasoning } : {}),
-        }), SUMMARIZER_TIMEOUT_MS, label);
+        }), summarizerTimeoutMs, label);
 
       const retryWithoutModelAuth = async (
         failure: ProviderAuthFailure,
         reasoning?: string,
       ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
         const initialAuthError = new LcmProviderAuthError({ provider, model, failure });
+        const runtimeManagedAuth = params.deps.isRuntimeManagedAuthProvider?.(provider, providerApi) === true;
+        if (runtimeManagedAuth) {
+          throw initialAuthError;
+        }
         console.warn(initialAuthError.message);
         console.warn(
           `[lcm] summarizer auth retry: retrying ${provider}/${model} without runtime.modelAuth credentials.`,
@@ -1279,7 +1288,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         label: string,
         reasoning?: string,
       ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
-        const apiKey = await params.deps.getApiKey(provider, model, lookupOptions);
+        const runtimeManagedAuth = params.deps.isRuntimeManagedAuthProvider?.(provider, providerApi) === true;
+        const apiKey = runtimeManagedAuth
+          ? undefined
+          : await params.deps.getApiKey(provider, model, lookupOptions);
         try {
           const result = await runSummarizerCall(apiKey, label, reasoning);
           // Use requireStructuralSignal so that LLM summary text containing
@@ -1318,7 +1330,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         const errMsg = err instanceof Error ? err.message : String(err);
         const isTimeout = errMsg.includes("summarizer timeout");
         console.warn(
-          `[lcm] summarizer ${isTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${SUMMARIZER_TIMEOUT_MS}ms; error=${errMsg}`,
+          `[lcm] summarizer ${isTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${summarizerTimeoutMs}ms; error=${errMsg}`,
         );
         if (nextCandidate) {
           console.warn(
@@ -1433,12 +1445,12 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           const isRetryTimeout = retryErrMsg.includes("summarizer timeout");
           if (nextCandidate) {
             console.warn(
-              `[lcm] retry ${isRetryTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${SUMMARIZER_TIMEOUT_MS}ms; error=${retryErrMsg}; retrying with ${nextCandidate.provider}/${nextCandidate.model}`,
+              `[lcm] retry ${isRetryTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${summarizerTimeoutMs}ms; error=${retryErrMsg}; retrying with ${nextCandidate.provider}/${nextCandidate.model}`,
             );
             continue;
           }
           console.warn(
-            `[lcm] retry ${isRetryTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${SUMMARIZER_TIMEOUT_MS}ms; error=${retryErrMsg}; falling back to truncation`,
+            `[lcm] retry ${isRetryTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${summarizerTimeoutMs}ms; error=${retryErrMsg}; falling back to truncation`,
           );
           summary = initialSummary;
         }

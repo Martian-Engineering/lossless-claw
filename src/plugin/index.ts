@@ -1171,6 +1171,13 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 
   return {
     config,
+    isRuntimeManagedAuthProvider: (provider: string, providerApi?: string) => {
+      const normalizedProvider = normalizeProviderId(provider);
+      if (normalizedProvider === "openai-codex" || normalizedProvider === "github-copilot") {
+        return true;
+      }
+      return isCodexResponsesApi(providerApi);
+    },
     complete: async ({
       provider,
       model,

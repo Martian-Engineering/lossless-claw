@@ -84,6 +84,10 @@
       "label": "Delegation Timeout (ms)",
       "help": "Maximum time to wait for delegated lcm_expand_query sub-agent completion before timing out"
     },
+    "summaryTimeoutMs": {
+      "label": "Summary Timeout (ms)",
+      "help": "Maximum time to wait for a single model-backed LCM summarizer call before timing out"
+    },
     "maxAssemblyTokenBudget": {
       "label": "Max Assembly Token Budget",
       "help": "Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
@@ -202,6 +206,10 @@
         "type": "string"
       },
       "delegationTimeoutMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "summaryTimeoutMs": {
         "type": "integer",
         "minimum": 1
       },

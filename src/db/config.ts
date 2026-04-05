@@ -42,6 +42,8 @@ export type LcmConfig = {
   expansionModel: string;
   /** Max time to wait for delegated lcm_expand_query sub-agent completion. */
   delegationTimeoutMs: number;
+  /** Max time to wait for a single model-backed LCM summarizer call. */
+  summaryTimeoutMs: number;
   /** IANA timezone for timestamps in summaries (from TZ env or system default) */
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
@@ -219,6 +221,9 @@ export function resolveLcmConfig(
     expansionModel:
       env.LCM_EXPANSION_MODEL?.trim() ?? toStr(pc.expansionModel) ?? "",
     delegationTimeoutMs: envDelegationTimeoutMs ?? toNumber(pc.delegationTimeoutMs) ?? 120000,
+    summaryTimeoutMs:
+      parseFiniteInt(env.LCM_SUMMARY_TIMEOUT_MS)
+        ?? toNumber(pc.summaryTimeoutMs) ?? 120000,
     timezone: env.TZ ?? toStr(pc.timezone) ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
     pruneHeartbeatOk:
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
