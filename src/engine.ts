@@ -1206,14 +1206,14 @@ export class LcmContextEngine implements ContextEngine {
     if (this.config.ignoreSessionPatterns.length > 0) {
       logStartupBannerOnce({
         key: "ignore-session-patterns",
-        log: (message) => this.deps.log.info(message),
+        log: (message) => this.deps.log.debug(message),
         message: `[lcm] Ignoring sessions matching ${this.config.ignoreSessionPatterns.length} pattern(s): ${this.config.ignoreSessionPatterns.join(", ")}`,
       });
     }
     if (this.config.skipStatelessSessions && this.config.statelessSessionPatterns.length > 0) {
       logStartupBannerOnce({
         key: "stateless-session-patterns",
-        log: (message) => this.deps.log.info(message),
+        log: (message) => this.deps.log.debug(message),
         message: `[lcm] Stateless session patterns: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
       });
     }

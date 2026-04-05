@@ -16,10 +16,12 @@ function buildApi(
   api: OpenClawPluginApi;
   getFactory: () => RegisteredEngineFactory;
   infoLog: ReturnType<typeof vi.fn>;
+  debugLog: ReturnType<typeof vi.fn>;
   warnLog: ReturnType<typeof vi.fn>;
 } {
   let factory: RegisteredEngineFactory;
   const infoLog = vi.fn();
+  const debugLog = vi.fn();
   const warnLog = vi.fn();
   const agentDir = options?.agentDir ?? "/tmp/fake-agent";
 
@@ -57,7 +59,7 @@ function buildApi(
       info: infoLog,
       warn: warnLog,
       error: vi.fn(),
-      debug: vi.fn(),
+      debug: debugLog,
     },
     registerContextEngine: vi.fn((_id: string, nextFactory: () => unknown) => {
       factory = nextFactory;
@@ -80,6 +82,7 @@ function buildApi(
     api,
     getFactory: () => factory,
     infoLog,
+    debugLog,
     warnLog,
   };
 }
@@ -143,7 +146,7 @@ describe("lcm plugin registration", () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
 
-    const { api, getFactory, infoLog } = buildApi({
+    const { api, getFactory, debugLog } = buildApi({
       enabled: true,
       contextThreshold: 0.33,
       incrementalMaxDepth: -1,
@@ -184,16 +187,16 @@ describe("lcm plugin registration", () => {
       skipStatelessSessions: true,
       largeFileTokenThreshold: 12345,
     });
-    expect(infoLog).toHaveBeenCalledWith(
+    expect(debugLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
     );
-    expect(infoLog).toHaveBeenCalledWith(
+    expect(debugLog).toHaveBeenCalledWith(
       "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
     );
-    expect(infoLog).toHaveBeenCalledWith(
+    expect(debugLog).toHaveBeenCalledWith(
       "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
     );
-    expect(infoLog).toHaveBeenCalledWith(
+    expect(debugLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: (unconfigured)",
     );
     expect(api.on).toHaveBeenCalledWith("before_reset", expect.any(Function));
@@ -384,7 +387,7 @@ describe("lcm plugin registration", () => {
   });
 
   it("logs compaction summarization overrides at startup", () => {
-    const { api, infoLog } = buildApi({
+    const { api, debugLog } = buildApi({
       enabled: true,
       summaryModel: "gpt-5.4",
       summaryProvider: "openai-resp",
@@ -393,7 +396,7 @@ describe("lcm plugin registration", () => {
 
     lcmPlugin.register(api);
 
-    expect(infoLog).toHaveBeenCalledWith(
+    expect(debugLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: openai-resp/gpt-5.4 (override)",
     );
   });
@@ -459,17 +462,23 @@ describe("lcm plugin registration", () => {
     firstFactory!();
     secondFactory!();
 
-    const firstMessages = first.infoLog.mock.calls.map(([message]) => message);
-    const secondMessages = second.infoLog.mock.calls.map(([message]) => message);
+    const firstMessages = first.debugLog.mock.calls.map(([message]) => message);
+    const secondMessages = second.debugLog.mock.calls.map(([message]) => message);
 
-    expect(firstMessages).toHaveLength(4);
-    expect([...firstMessages].sort()).toEqual([
+    // Startup banners should appear exactly once (on the first registration)
+    const expectedBanners = [
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
       "[lcm] Compaction summarization model: (unconfigured)",
       "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
       "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
-    ].sort());
-    expect(secondMessages).toEqual([]);
+    ];
+    for (const banner of expectedBanners) {
+      expect(firstMessages).toContain(banner);
+    }
+    // Second registration should not repeat any startup banners
+    for (const banner of expectedBanners) {
+      expect(secondMessages).not.toContain(banner);
+    }
   });
   it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {
     const { api, getFactory, warnLog } = buildApi(
