@@ -1852,17 +1852,18 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number;
     historicalMessages: AgentMessage[];
   }): Promise<{
+    blockedByImportCap: boolean;
     importedMessages: number;
     hasOverlap: boolean;
   }> {
     const { sessionId, conversationId, historicalMessages } = params;
     if (historicalMessages.length === 0) {
-      return { importedMessages: 0, hasOverlap: false };
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
     }
 
     const latestDbMessage = await this.conversationStore.getLastMessage(conversationId);
     if (!latestDbMessage) {
-      return { importedMessages: 0, hasOverlap: false };
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
     }
 
     const storedHistoricalMessages = historicalMessages.map((message) => toStoredMessage(message));
@@ -1883,7 +1884,7 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
       if (dbOccurrences === historicalOccurrences) {
-        return { importedMessages: 0, hasOverlap: true };
+        return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
       }
     }
 
@@ -1935,10 +1936,10 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (anchorIndex < 0) {
-      return { importedMessages: 0, hasOverlap: false };
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
     }
     if (anchorIndex >= historicalMessages.length - 1) {
-      return { importedMessages: 0, hasOverlap: true };
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
     }
 
     const missingTail = historicalMessages.slice(anchorIndex + 1);
@@ -1946,7 +1947,7 @@ export class LcmContextEngine implements ContextEngine {
     const existingDbCount = await this.conversationStore.getMessageCount(conversationId);
     if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
       console.error(`[lcm] reconcileSessionTail: import cap exceeded — would import ${missingTail.length} messages (existing: ${existingDbCount}). Aborting to prevent flood.`);
-      return { importedMessages: 0, hasOverlap: true };
+      return { blockedByImportCap: true, importedMessages: 0, hasOverlap: true };
     }
 
     let importedMessages = 0;
@@ -1957,7 +1958,7 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    return { importedMessages, hasOverlap: true };
+    return { blockedByImportCap: false, importedMessages, hasOverlap: true };
   }
 
   async bootstrap(params: {
@@ -2176,6 +2177,14 @@ export class LcmContextEngine implements ContextEngine {
             conversationId,
             historicalMessages,
           });
+
+          if (reconcile.blockedByImportCap) {
+            return {
+              bootstrapped: false,
+              importedMessages: 0,
+              reason: "reconcile import capped",
+            };
+          }
 
           if (!conversation.bootstrappedAt) {
             await this.conversationStore.markConversationBootstrapped(conversationId);
@@ -2447,7 +2456,7 @@ export class LcmContextEngine implements ContextEngine {
           try {
             const fileStat = statSync(params.sessionFile);
             const newSize = fileStat.size;
-            const newMtimeMs = fileStat.mtimeMs;
+            const newMtimeMs = Math.trunc(fileStat.mtimeMs);
             const lastEntryRaw = readLastJsonlEntryBeforeOffset(params.sessionFile, newSize, true);
             const lastEntryMsg = readBootstrapMessageFromJsonLine(lastEntryRaw);
             const lastEntryHash = lastEntryMsg ? createBootstrapEntryHash(toStoredMessage(lastEntryMsg)) : null;

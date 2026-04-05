@@ -1641,6 +1641,25 @@ describe("LcmContextEngine.ingest content extraction", () => {
           output: expect.stringContaining("[LCM Tool Output: file_"),
         }),
       ]);
+
+      const bootstrapState = await engine
+        .getSummaryStore()
+        .getConversationBootstrapState(conversation!.conversationId);
+      const sessionFileStats = statSync(sessionFile);
+      expect(bootstrapState).not.toBeNull();
+      expect(bootstrapState?.lastSeenSize).toBe(sessionFileStats.size);
+      expect(bootstrapState?.lastSeenMtimeMs).toBe(Math.trunc(sessionFileStats.mtimeMs));
+      expect(bootstrapState?.lastProcessedOffset).toBe(sessionFileStats.size);
+      expect(bootstrapState?.lastProcessedEntryHash).toMatch(/^[a-f0-9]{64}$/);
+
+      const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+      const bootstrap = await engine.bootstrap({ sessionId, sessionFile });
+      expect(bootstrap).toEqual({
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "conversation already up to date",
+      });
+      expect(reconcileSpy).not.toHaveBeenCalled();
     });
   });
 
@@ -2148,6 +2167,87 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(conversation).not.toBeNull();
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((message) => message.content)).toEqual(["db only user", "db only assistant"]);
+  });
+
+  it("does not advance the bootstrap checkpoint when reconcile aborts at the import cap", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("reconcile-import-cap");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "bootstrap-reconcile-import-cap";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const firstBootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(firstBootstrapState).not.toBeNull();
+
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE conversation_bootstrap_state
+           SET last_processed_entry_hash = ?
+           WHERE conversation_id = ?`,
+        )
+        .run("mismatch", conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const staleBootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(staleBootstrapState).not.toBeNull();
+    expect(staleBootstrapState?.lastProcessedEntryHash).toBe("mismatch");
+
+    for (let index = 0; index < 60; index += 1) {
+      sm.appendMessage({
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: [{ type: "text", text: `missing tail ${index}` }],
+      } as AgentMessage);
+    }
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "reconcile import capped",
+    });
+
+    const storedAfterCap = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(storedAfterCap.map((message) => message.content)).toEqual(["seed user", "seed assistant"]);
+
+    const secondBootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(secondBootstrapState).toEqual(staleBootstrapState);
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+    const third = await engine.bootstrap({ sessionId, sessionFile });
+    expect(third).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "reconcile import capped",
+    });
+    expect(reconcileSpy).toHaveBeenCalledTimes(1);
   });
 
   it("uses the bulk import path for initial bootstrap", async () => {
