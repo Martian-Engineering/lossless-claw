@@ -1,5 +1,15 @@
 # @martian-engineering/lossless-claw
 
+## 0.6.2
+
+### Patch Changes
+
+- [#270](https://github.com/Martian-Engineering/lossless-claw/pull/270) [`8618ea7`](https://github.com/Martian-Engineering/lossless-claw/commit/8618ea75278daec1f7e4be00775e40d5961d5697) Thanks [@jalehman](https://github.com/jalehman)! - Fix forced timeout-recovery compaction so live budget overflows use the capped `compactUntilUnder()` path instead of no-oping through a stored-context full sweep.
+
+- [#273](https://github.com/Martian-Engineering/lossless-claw/pull/273) [`40c90b1`](https://github.com/Martian-Engineering/lossless-claw/commit/40c90b1e30d53202dee08ae86a91464aedd9d420) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Fix LCM summarization for runtime-managed OAuth providers like `openai-codex` by preserving first-pass credential resolution and skipping the incompatible direct-credential retry path. Also add configurable summarizer timeouts via `summaryTimeoutMs` and `LCM_SUMMARY_TIMEOUT_MS`.
+
+- [#261](https://github.com/Martian-Engineering/lossless-claw/pull/261) [`65c76f1`](https://github.com/Martian-Engineering/lossless-claw/commit/65c76f17ad82f1b3392be4e1a5e85e3172eb9a3d) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Fix shared-SQLite transaction coordination during bootstrap and compaction so concurrent sessions do not collide on one database connection, and nested transaction scopes on the same async path stay safe.
+
 ## 0.6.1
 
 ### Patch Changes
