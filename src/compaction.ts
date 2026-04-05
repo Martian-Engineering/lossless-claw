@@ -83,12 +83,7 @@ type CondensedPhaseCandidate = {
   chunk: CondensedChunkSelection;
 };
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Estimate token count from character length (~4 chars per token). */
-function estimateTokens(content: string): number {
-  return Math.ceil(content.length / 4);
-}
+import { estimateTokens } from "./estimate-tokens.js";
 
 /** Deterministically cap summary text so the persisted output stays within maxTokens. */
 function capSummaryText(

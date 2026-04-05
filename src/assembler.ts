@@ -44,12 +44,7 @@ export interface AssembleContextResult {
   };
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Simple token estimate: ~4 chars per token, same as VoltCode's Token.estimate */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
+import { estimateTokens } from "./estimate-tokens.js";
 
 type SummaryPromptSignal = Pick<SummaryRecord, "kind" | "depth" | "descendantCount">;
 
