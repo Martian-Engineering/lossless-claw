@@ -205,6 +205,10 @@ function createMockSummaryStore() {
   const largeFiles: LargeFileRecord[] = [];
 
   const store = {
+    withTransaction: vi.fn(async <T>(operation: () => Promise<T> | T): Promise<T> => {
+      return await operation();
+    }),
+
     // ── Context items ───────────────────────────────────────────────────
 
     getContextItems: vi.fn(async (conversationId: number): Promise<ContextItemRecord[]> => {

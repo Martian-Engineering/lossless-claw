@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { acquireTransactionLock } from "../transaction-mutex.js";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
@@ -821,6 +821,11 @@ export class SummaryStore {
     return rows.map((row) => row.depth);
   }
 
+  /** Serialize a multi-step summary write sequence on the shared database. */
+  async withTransaction<T>(operation: () => Promise<T> | T): Promise<T> {
+    return withDatabaseTransaction(this.db, "BEGIN", operation);
+  }
+
   async pruneForNewSession(conversationId: number, retainDepth: number): Promise<void> {
     if (Number.isFinite(retainDepth) && retainDepth < 0) {
       return;
@@ -920,61 +925,60 @@ export class SummaryStore {
     endOrdinal: number;
     summaryId: string;
   }): Promise<void> {
+    await this.withTransaction(() => {
+      this.replaceContextRangeWithSummaryInTransaction(input);
+    });
+  }
+
+  // Update the context slice in-place while the caller already owns the txn.
+  private replaceContextRangeWithSummaryInTransaction(input: {
+    conversationId: number;
+    startOrdinal: number;
+    endOrdinal: number;
+    summaryId: string;
+  }): void {
     const { conversationId, startOrdinal, endOrdinal, summaryId } = input;
 
-    const release = await acquireTransactionLock(this.db);
-    try {
-      this.db.exec("BEGIN");
-      try {
-        // 1. Delete context items in the range [startOrdinal, endOrdinal]
-        this.db
-          .prepare(
-            `DELETE FROM context_items
-           WHERE conversation_id = ?
-             AND ordinal >= ?
-             AND ordinal <= ?`,
-          )
-          .run(conversationId, startOrdinal, endOrdinal);
+    // 1. Delete context items in the range [startOrdinal, endOrdinal]
+    this.db
+      .prepare(
+        `DELETE FROM context_items
+         WHERE conversation_id = ?
+           AND ordinal >= ?
+           AND ordinal <= ?`,
+      )
+      .run(conversationId, startOrdinal, endOrdinal);
 
-        // 2. Insert the replacement summary item at startOrdinal
-        this.db
-          .prepare(
-            `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
-           VALUES (?, ?, 'summary', ?)`,
-          )
-          .run(conversationId, startOrdinal, summaryId);
+    // 2. Insert the replacement summary item at startOrdinal
+    this.db
+      .prepare(
+        `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
+         VALUES (?, ?, 'summary', ?)`,
+      )
+      .run(conversationId, startOrdinal, summaryId);
 
-        // 3. Resequence all ordinals to maintain contiguity (no gaps).
-        //    Fetch current items, then update ordinals in order.
-        const items = this.db
-          .prepare(
-            `SELECT ordinal FROM context_items
-           WHERE conversation_id = ?
-           ORDER BY ordinal`,
-          )
-          .all(conversationId) as unknown as { ordinal: number }[];
+    // 3. Resequence all ordinals to maintain contiguity (no gaps).
+    //    Fetch current items, then update ordinals in order.
+    const items = this.db
+      .prepare(
+        `SELECT ordinal FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
+      )
+      .all(conversationId) as unknown as { ordinal: number }[];
 
-        const updateStmt = this.db.prepare(
-          `UPDATE context_items
-           SET ordinal = ?
-           WHERE conversation_id = ? AND ordinal = ?`,
-        );
+    const updateStmt = this.db.prepare(
+      `UPDATE context_items
+       SET ordinal = ?
+       WHERE conversation_id = ? AND ordinal = ?`,
+    );
 
-        // Use negative temp ordinals first to avoid unique constraint conflicts
-        for (let i = 0; i < items.length; i++) {
-          updateStmt.run(-(i + 1), conversationId, items[i].ordinal);
-        }
-        for (let i = 0; i < items.length; i++) {
-          updateStmt.run(i, conversationId, -(i + 1));
-        }
-
-        this.db.exec("COMMIT");
-      } catch (err) {
-        this.db.exec("ROLLBACK");
-        throw err;
-      }
-    } finally {
-      release();
+    // Use negative temp ordinals first to avoid unique constraint conflicts.
+    for (let i = 0; i < items.length; i++) {
+      updateStmt.run(-(i + 1), conversationId, items[i].ordinal);
+    }
+    for (let i = 0; i < items.length; i++) {
+      updateStmt.run(i, conversationId, -(i + 1));
     }
   }
 

@@ -1379,45 +1379,47 @@ export class CompactionEngine {
     const summaryId = generateSummaryId(summary.content);
     const tokenCount = estimateTokens(summary.content);
 
-    await this.summaryStore.insertSummary({
-      summaryId,
-      conversationId,
-      kind: "leaf",
-      depth: 0,
-      content: summary.content,
-      tokenCount,
-      fileIds,
-      earliestAt:
-        messageContents.length > 0
-          ? new Date(Math.min(...messageContents.map((message) => message.createdAt.getTime())))
-          : undefined,
-      latestAt:
-        messageContents.length > 0
-          ? new Date(Math.max(...messageContents.map((message) => message.createdAt.getTime())))
-          : undefined,
-      descendantCount: 0,
-      descendantTokenCount: 0,
-      sourceMessageTokenCount: messageContents.reduce(
-        (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
-        0,
-      ),
-      model: summaryModel,
-    });
+    await this.summaryStore.withTransaction(async () => {
+      await this.summaryStore.insertSummary({
+        summaryId,
+        conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: summary.content,
+        tokenCount,
+        fileIds,
+        earliestAt:
+          messageContents.length > 0
+            ? new Date(Math.min(...messageContents.map((message) => message.createdAt.getTime())))
+            : undefined,
+        latestAt:
+          messageContents.length > 0
+            ? new Date(Math.max(...messageContents.map((message) => message.createdAt.getTime())))
+            : undefined,
+        descendantCount: 0,
+        descendantTokenCount: 0,
+        sourceMessageTokenCount: messageContents.reduce(
+          (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
+          0,
+        ),
+        model: summaryModel,
+      });
 
-    // Link to source messages
-    const messageIds = messageContents.map((m) => m.messageId);
-    await this.summaryStore.linkSummaryToMessages(summaryId, messageIds);
+      // Link to source messages before the context swap becomes visible.
+      const messageIds = messageContents.map((m) => m.messageId);
+      await this.summaryStore.linkSummaryToMessages(summaryId, messageIds);
 
-    // Replace the message range in context with the new summary
-    const ordinals = messageItems.map((ci) => ci.ordinal);
-    const startOrdinal = Math.min(...ordinals);
-    const endOrdinal = Math.max(...ordinals);
+      // Replace the message range in context with the new summary.
+      const ordinals = messageItems.map((ci) => ci.ordinal);
+      const startOrdinal = Math.min(...ordinals);
+      const endOrdinal = Math.max(...ordinals);
 
-    await this.summaryStore.replaceContextRangeWithSummary({
-      conversationId,
-      startOrdinal,
-      endOrdinal,
-      summaryId,
+      await this.summaryStore.replaceContextRangeWithSummary({
+        conversationId,
+        startOrdinal,
+        endOrdinal,
+        summaryId,
+      });
     });
 
     return { summaryId, level: summary.level, content: summary.content };
@@ -1487,72 +1489,76 @@ export class CompactionEngine {
     const summaryId = generateSummaryId(condensed.content);
     const tokenCount = estimateTokens(condensed.content);
 
-    await this.summaryStore.insertSummary({
-      summaryId,
-      conversationId,
-      kind: "condensed",
-      depth: targetDepth + 1,
-      content: condensed.content,
-      tokenCount,
-      fileIds,
-      earliestAt:
-        summaryRecords.length > 0
-          ? new Date(
-              Math.min(
-                ...summaryRecords.map((summary) =>
-                  (summary.earliestAt ?? summary.createdAt).getTime(),
+    await this.summaryStore.withTransaction(async () => {
+      await this.summaryStore.insertSummary({
+        summaryId,
+        conversationId,
+        kind: "condensed",
+        depth: targetDepth + 1,
+        content: condensed.content,
+        tokenCount,
+        fileIds,
+        earliestAt:
+          summaryRecords.length > 0
+            ? new Date(
+                Math.min(
+                  ...summaryRecords.map((summary) =>
+                    (summary.earliestAt ?? summary.createdAt).getTime(),
+                  ),
                 ),
-              ),
-            )
-          : undefined,
-      latestAt:
-        summaryRecords.length > 0
-          ? new Date(
-              Math.max(
-                ...summaryRecords.map((summary) => (summary.latestAt ?? summary.createdAt).getTime()),
-              ),
-            )
-          : undefined,
-      descendantCount: summaryRecords.reduce((count, summary) => {
-        const childDescendants =
-          typeof summary.descendantCount === "number" && Number.isFinite(summary.descendantCount)
-            ? Math.max(0, Math.floor(summary.descendantCount))
-            : 0;
-        return count + childDescendants + 1;
-      }, 0),
-      descendantTokenCount: summaryRecords.reduce((count, summary) => {
-        const childDescendantTokens =
-          typeof summary.descendantTokenCount === "number" &&
-          Number.isFinite(summary.descendantTokenCount)
-            ? Math.max(0, Math.floor(summary.descendantTokenCount))
-            : 0;
-        return count + Math.max(0, Math.floor(summary.tokenCount)) + childDescendantTokens;
-      }, 0),
-      sourceMessageTokenCount: summaryRecords.reduce((count, summary) => {
-        const sourceTokens =
-          typeof summary.sourceMessageTokenCount === "number" &&
-          Number.isFinite(summary.sourceMessageTokenCount)
-            ? Math.max(0, Math.floor(summary.sourceMessageTokenCount))
-            : 0;
-        return count + sourceTokens;
-      }, 0),
-      model: summaryModel,
-    });
+              )
+            : undefined,
+        latestAt:
+          summaryRecords.length > 0
+            ? new Date(
+                Math.max(
+                  ...summaryRecords.map(
+                    (summary) => (summary.latestAt ?? summary.createdAt).getTime(),
+                  ),
+                ),
+              )
+            : undefined,
+        descendantCount: summaryRecords.reduce((count, summary) => {
+          const childDescendants =
+            typeof summary.descendantCount === "number" && Number.isFinite(summary.descendantCount)
+              ? Math.max(0, Math.floor(summary.descendantCount))
+              : 0;
+          return count + childDescendants + 1;
+        }, 0),
+        descendantTokenCount: summaryRecords.reduce((count, summary) => {
+          const childDescendantTokens =
+            typeof summary.descendantTokenCount === "number" &&
+            Number.isFinite(summary.descendantTokenCount)
+              ? Math.max(0, Math.floor(summary.descendantTokenCount))
+              : 0;
+          return count + Math.max(0, Math.floor(summary.tokenCount)) + childDescendantTokens;
+        }, 0),
+        sourceMessageTokenCount: summaryRecords.reduce((count, summary) => {
+          const sourceTokens =
+            typeof summary.sourceMessageTokenCount === "number" &&
+            Number.isFinite(summary.sourceMessageTokenCount)
+              ? Math.max(0, Math.floor(summary.sourceMessageTokenCount))
+              : 0;
+          return count + sourceTokens;
+        }, 0),
+        model: summaryModel,
+      });
 
-    // Link to parent summaries
-    const parentSummaryIds = summaryRecords.map((s) => s.summaryId);
-    await this.summaryStore.linkSummaryToParents(summaryId, parentSummaryIds);
+      // Link to parent summaries before the context swap becomes visible.
+      const parentSummaryIds = summaryRecords.map((s) => s.summaryId);
+      await this.summaryStore.linkSummaryToParents(summaryId, parentSummaryIds);
 
-    // Replace all summary items in context with the condensed summary
-    const ordinals = summaryItems.map((ci) => ci.ordinal);
-    const startOrdinal = Math.min(...ordinals);
-    const endOrdinal = Math.max(...ordinals);
+      // Replace all summary items in context with the condensed summary.
+      const ordinals = summaryItems.map((ci) => ci.ordinal);
+      const startOrdinal = Math.min(...ordinals);
+      const endOrdinal = Math.max(...ordinals);
 
-    await this.summaryStore.replaceContextRangeWithSummary({
-      conversationId,
-      startOrdinal,
-      endOrdinal,
-      summaryId,
+      await this.summaryStore.replaceContextRangeWithSummary({
+        conversationId,
+        startOrdinal,
+        endOrdinal,
+        summaryId,
+      });
     });
 
     return { summaryId, level: condensed.level };

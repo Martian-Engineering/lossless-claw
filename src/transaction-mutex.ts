@@ -14,6 +14,7 @@
  * database gets its own queue, and databases are garbage-collected normally.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { DatabaseSync } from "node:sqlite";
 
 interface MutexState {
@@ -22,6 +23,9 @@ interface MutexState {
 }
 
 const mutexMap = new WeakMap<DatabaseSync, MutexState>();
+const heldLockContext = new AsyncLocalStorage<Map<DatabaseSync, number>>();
+
+let nextSavepointId = 0;
 
 function getOrCreateMutex(db: DatabaseSync): MutexState {
   let state = mutexMap.get(db);
@@ -32,13 +36,22 @@ function getOrCreateMutex(db: DatabaseSync): MutexState {
   return state;
 }
 
+function getHeldLockDepth(db: DatabaseSync): number {
+  return heldLockContext.getStore()?.get(db) ?? 0;
+}
+
+function nextSavepointName(): string {
+  nextSavepointId += 1;
+  return `lcm_txn_savepoint_${nextSavepointId}`;
+}
+
 /**
  * Acquire exclusive async access to the database for a transaction.
  *
- * This hotfix mutex is intentionally non-reentrant: reacquiring the same
- * database lock before releasing it will wait forever. Current in-tree
- * patched entry points do not re-enter on the same async path, but callers
- * must avoid nesting transaction entry on the same DatabaseSync handle.
+ * Direct lock acquisition is intentionally low-level and non-reentrant.
+ * Callers that need nested transaction scopes should use
+ * `withDatabaseTransaction()`, which reuses the held lock and isolates nested
+ * work with SQLite savepoints.
  *
  * Usage:
  *   const release = await acquireTransactionLock(this.db);
@@ -71,4 +84,53 @@ export function acquireTransactionLock(db: DatabaseSync): Promise<() => void> {
 
   // Wait for the previous holder to release, then return our release fn
   return waitOn.then(() => releaseResolve);
+}
+
+export type BeginTransactionStatement = "BEGIN" | "BEGIN IMMEDIATE";
+
+/**
+ * Run an operation inside a serialized database transaction.
+ *
+ * The first scope on an async path acquires the per-database mutex and opens
+ * the requested transaction mode. Nested scopes on the same database reuse the
+ * held lock and isolate their work with a savepoint instead of hanging.
+ */
+export async function withDatabaseTransaction<T>(
+  db: DatabaseSync,
+  beginStatement: BeginTransactionStatement,
+  operation: () => Promise<T> | T,
+): Promise<T> {
+  if (getHeldLockDepth(db) > 0) {
+    const savepointName = nextSavepointName();
+    db.exec(`SAVEPOINT ${savepointName}`);
+    try {
+      const result = await operation();
+      db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+      return result;
+    } catch (error) {
+      db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+      db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+      throw error;
+    }
+  }
+
+  const release = await acquireTransactionLock(db);
+  try {
+    const heldLocks = new Map(heldLockContext.getStore() ?? []);
+    heldLocks.set(db, (heldLocks.get(db) ?? 0) + 1);
+
+    return await heldLockContext.run(heldLocks, async () => {
+      db.exec(beginStatement);
+      try {
+        const result = await operation();
+        db.exec("COMMIT");
+        return result;
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    });
+  } finally {
+    release();
+  }
 }

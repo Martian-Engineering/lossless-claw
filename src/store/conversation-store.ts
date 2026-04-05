@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { acquireTransactionLock } from "../transaction-mutex.js";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
@@ -271,20 +271,7 @@ export class ConversationStore {
   // ── Transaction helpers ──────────────────────────────────────────────────
 
   async withTransaction<T>(operation: () => Promise<T> | T): Promise<T> {
-    const release = await acquireTransactionLock(this.db);
-    try {
-      this.db.exec("BEGIN IMMEDIATE");
-      try {
-        const result = await operation();
-        this.db.exec("COMMIT");
-        return result;
-      } catch (error) {
-        this.db.exec("ROLLBACK");
-        throw error;
-      }
-    } finally {
-      release();
-    }
+    return withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", operation);
   }
 
   // ── Conversation operations ───────────────────────────────────────────────

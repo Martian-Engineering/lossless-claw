@@ -186,6 +186,40 @@ describe("transaction-mutex", () => {
       await expect(p1).rejects.toThrow("intentional failure");
       await expect(p2).resolves.toBe("ok");
     });
+
+    it("supports nested transaction scopes on the same async path", async () => {
+      const { db, fts5Available } = createTestDb();
+      const store = new ConversationStore(db, { fts5Available });
+      const conv = await store.createConversation({
+        sessionId: "sess-nested",
+        sessionKey: "key-nested",
+      });
+
+      await expect(
+        store.withTransaction(async () => {
+          await store.createMessage({
+            conversationId: conv.conversationId,
+            seq: 1,
+            role: "user",
+            content: "outer txn message",
+            tokenCount: 5,
+          });
+
+          await store.withTransaction(async () => {
+            await store.createMessage({
+              conversationId: conv.conversationId,
+              seq: 2,
+              role: "assistant",
+              content: "inner txn message",
+              tokenCount: 5,
+            });
+          });
+        }),
+      ).resolves.toBeUndefined();
+
+      const messages = await store.getMessages(conv.conversationId);
+      expect(messages).toHaveLength(2);
+    });
   });
 
   describe("SummaryStore.replaceContextRangeWithSummary concurrent safety", () => {
@@ -333,6 +367,70 @@ describe("transaction-mutex", () => {
       for (const result of results) {
         expect(result.status).toBe("fulfilled");
       }
+    });
+
+    it("serializes broader summary write sequences before context replacement", async () => {
+      const { db, fts5Available } = createTestDb();
+      const convStore = new ConversationStore(db, { fts5Available });
+      const summaryStore = new SummaryStore(db, { fts5Available });
+
+      const conv = await convStore.createConversation({
+        sessionId: "sess-wide",
+        sessionKey: "key-wide",
+      });
+
+      const contextMessageIds: number[] = [];
+      for (let i = 0; i < 4; i++) {
+        const message = await convStore.createMessage({
+          conversationId: conv.conversationId,
+          seq: i,
+          role: i % 2 === 0 ? "user" : "assistant",
+          content: `context ${i}`,
+          tokenCount: 5,
+        });
+        contextMessageIds.push(message.messageId);
+        await summaryStore.appendContextMessage(conv.conversationId, message.messageId);
+      }
+
+      const results = await Promise.allSettled([
+        summaryStore.withTransaction(async () => {
+          await summaryStore.insertSummary({
+            summaryId: "sum_scope_001",
+            conversationId: conv.conversationId,
+            kind: "leaf",
+            content: "Scoped summary",
+            tokenCount: 10,
+            depth: 0,
+            fileIds: [],
+          });
+          await summaryStore.linkSummaryToMessages("sum_scope_001", contextMessageIds.slice(0, 2));
+          await delay(20);
+          await summaryStore.replaceContextRangeWithSummary({
+            conversationId: conv.conversationId,
+            startOrdinal: 0,
+            endOrdinal: 1,
+            summaryId: "sum_scope_001",
+          });
+          return "summary-done";
+        }),
+        convStore.withTransaction(async () => {
+          await delay(10);
+          await convStore.createMessage({
+            conversationId: conv.conversationId,
+            seq: 100,
+            role: "user",
+            content: "competing tx",
+            tokenCount: 5,
+          });
+          return "conversation-done";
+        }),
+      ]);
+
+      for (const result of results) {
+        expect(result.status).toBe("fulfilled");
+      }
+
+      await expect(summaryStore.getSummary("sum_scope_001")).resolves.not.toBeNull();
     });
   });
 

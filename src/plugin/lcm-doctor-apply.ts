@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { acquireTransactionLock } from "../transaction-mutex.js";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
 import type { LcmSummarizeFn } from "../summarize.js";
@@ -140,10 +140,7 @@ export async function applyScopedDoctorRepair(params: {
   }
 
   if (repairedSummaryIds.length > 0) {
-    const release = await acquireTransactionLock(params.db);
-    try {
-      params.db.exec("BEGIN IMMEDIATE");
-      try {
+    await withDatabaseTransaction(params.db, "BEGIN IMMEDIATE", async () => {
         for (const summaryId of repairedSummaryIds) {
           const override = overrides.get(summaryId);
           if (!override) {
@@ -158,14 +155,7 @@ export async function applyScopedDoctorRepair(params: {
             .run(override.content, override.tokenCount, summaryId);
           updateSummaryFts(params.db, summaryId, override.content);
         }
-        params.db.exec("COMMIT");
-      } catch (error) {
-        params.db.exec("ROLLBACK");
-        throw error;
-      }
-    } finally {
-      release();
-    }
+    });
   }
 
   return {
