@@ -805,7 +805,12 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         await expect(result!.fn("R".repeat(8_000), false)).rejects.toBeInstanceOf(
           LcmProviderAuthError,
         );
-        expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
+        expect(vi.mocked(deps.getApiKey)).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(deps.getApiKey)).toHaveBeenCalledWith("openai-codex", "gpt-5.4", {
+          profileId: undefined,
+          agentDir: undefined,
+          runtimeConfig: undefined,
+        });
         expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
 
         const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");

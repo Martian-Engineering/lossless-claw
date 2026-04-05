@@ -1288,10 +1288,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         label: string,
         reasoning?: string,
       ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
-        const runtimeManagedAuth = params.deps.isRuntimeManagedAuthProvider?.(provider, providerApi) === true;
-        const apiKey = runtimeManagedAuth
-          ? undefined
-          : await params.deps.getApiKey(provider, model, lookupOptions);
+        const apiKey = await params.deps.getApiKey(provider, model, lookupOptions);
         try {
           const result = await runSummarizerCall(apiKey, label, reasoning);
           // Use requireStructuralSignal so that LLM summary text containing

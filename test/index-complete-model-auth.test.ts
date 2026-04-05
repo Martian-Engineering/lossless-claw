@@ -97,6 +97,7 @@ describe("createLcmDependencies.complete modelAuth lookup order", () => {
     vi.clearAllMocks();
   });
 
+
   it("prefers runtime.modelAuth.getApiKeyForModel over provider-only auth resolution", async () => {
     const { api, getFactory } = buildApi();
     lcmPlugin.register(api);
