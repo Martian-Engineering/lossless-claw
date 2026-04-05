@@ -1176,7 +1176,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       if (normalizedProvider === "openai-codex" || normalizedProvider === "github-copilot") {
         return true;
       }
-      return shouldOmitTemperatureForApi(providerApi);
+      return isCodexResponsesApi(providerApi);
     },
     complete: async ({
       provider,

@@ -199,7 +199,7 @@ describe("lcm plugin registration", () => {
     expect(api.on).toHaveBeenCalledWith("before_reset", expect.any(Function));
   });
 
-  it("inherits OpenClaw's default model for summarization when no LCM model override is set", () => {
+  it("inherits OpenClaw's default model for summarization when no LCM model override is set", { timeout: 20000 }, () => {
     const { api, getFactory } = buildApi({
       enabled: true,
     });

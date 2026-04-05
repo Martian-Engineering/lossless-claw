@@ -1222,6 +1222,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         reasoning?: string,
       ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
         const initialAuthError = new LcmProviderAuthError({ provider, model, failure });
+        const runtimeManagedAuth = params.deps.isRuntimeManagedAuthProvider?.(provider, providerApi) === true;
+        if (runtimeManagedAuth) {
+          throw initialAuthError;
+        }
         console.warn(initialAuthError.message);
         console.warn(
           `[lcm] summarizer auth retry: retrying ${provider}/${model} without runtime.modelAuth credentials.`,
@@ -1284,7 +1288,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         label: string,
         reasoning?: string,
       ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
-        const apiKey = await params.deps.getApiKey(provider, model, lookupOptions);
+        const runtimeManagedAuth = params.deps.isRuntimeManagedAuthProvider?.(provider, providerApi) === true;
+        const apiKey = runtimeManagedAuth
+          ? undefined
+          : await params.deps.getApiKey(provider, model, lookupOptions);
         try {
           const result = await runSummarizerCall(apiKey, label, reasoning);
           // Use requireStructuralSignal so that LLM summary text containing

@@ -776,6 +776,45 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       }
     });
 
+    it("skips direct api-key lookup and direct-credential retry for runtime-managed auth providers", async () => {
+      const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const deps = makeDeps({
+          config: { summaryTimeoutMs: 60_000 },
+          resolveModel: vi.fn(() => ({
+            provider: "openai-codex",
+            model: "gpt-5.4",
+          })),
+          getApiKey: vi.fn(async () => "should-not-be-used"),
+          isRuntimeManagedAuthProvider: vi.fn(() => true),
+          complete: vi.fn(async () => ({
+            content: [],
+            error: {
+              kind: "provider_auth",
+              statusCode: 401,
+              message: "Missing required scope: model.request",
+            },
+          })),
+        });
+
+        const result = await createLcmSummarizeFromLegacyParams({
+          deps,
+          legacyParams: { provider: "openai-codex", model: "gpt-5.4" },
+        });
+
+        await expect(result!.fn("R".repeat(8_000), false)).rejects.toBeInstanceOf(
+          LcmProviderAuthError,
+        );
+        expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
+        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+
+        const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
+        expect(warningText).not.toContain("summarizer auth retry");
+      } finally {
+        consoleWarn.mockRestore();
+      }
+    });
+
     it("does not enter conservative retry/fallback when the completion call throws an auth error", async () => {
       const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
