@@ -52,6 +52,9 @@ export type LcmConfig = {
   summaryMaxOverageFactor: number;
   /** Custom instructions injected into all summarization prompts. */
   customInstructions: string;
+  /** Maximum number of Phase 1 leaf passes per compactFullSweep invocation (default 25).
+   *  When exhausted the sweep returns partial progress instead of blocking indefinitely. */
+  maxLeafPasses: number;
   /** Consecutive auth failures before the compaction circuit breaker trips (default 5). */
   circuitBreakerThreshold: number;
   /** Cooldown in milliseconds before the circuit breaker auto-resets (default 30 min). */
@@ -232,6 +235,9 @@ export function resolveLcmConfig(
         ?? toNumber(pc.summaryMaxOverageFactor) ?? 3,
     customInstructions:
       env.LCM_CUSTOM_INSTRUCTIONS?.trim() ?? toStr(pc.customInstructions) ?? "",
+    maxLeafPasses:
+      parseFiniteInt(env.LCM_MAX_LEAF_PASSES)
+        ?? toNumber(pc.maxLeafPasses) ?? 25,
     circuitBreakerThreshold:
       parseFiniteInt(env.LCM_CIRCUIT_BREAKER_THRESHOLD)
         ?? toNumber(pc.circuitBreakerThreshold) ?? 5,
