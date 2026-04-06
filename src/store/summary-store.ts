@@ -958,28 +958,30 @@ export class SummaryStore {
       .run(conversationId, startOrdinal, summaryId);
 
     // 3. Resequence all ordinals to maintain contiguity (no gaps).
-    //    Two bulk UPDATEs using negative temps — handles both the gap
-    //    from the delete AND any pre-existing gaps (e.g., from pruning).
-    //    Step 3a assigns each row a negative ordinal based on its rank.
-    //    Step 3b flips to positive (0, 1, 2, ...).
-    this.db
+    //    Pre-compute ranks from a SELECT (safe snapshot), then apply
+    //    via 2-pass UPDATE loop using negative temps to avoid UNIQUE
+    //    constraint violations. The SELECT is safe because it reads
+    //    a consistent snapshot before any mutations.
+    const items = this.db
       .prepare(
-        `UPDATE context_items
-         SET ordinal = -(
-           (SELECT COUNT(*) FROM context_items ci2
-            WHERE ci2.conversation_id = context_items.conversation_id
-              AND ci2.ordinal <= context_items.ordinal)
-         )
-         WHERE conversation_id = ?`,
+        `SELECT ordinal FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
       )
-      .run(conversationId);
-    this.db
-      .prepare(
-        `UPDATE context_items
-         SET ordinal = (-ordinal) - 1
-         WHERE conversation_id = ? AND ordinal < 0`,
-      )
-      .run(conversationId);
+      .all(conversationId) as unknown as { ordinal: number }[];
+
+    if (items.length > 0 && items.some((item, i) => item.ordinal !== i)) {
+      const updateStmt = this.db.prepare(
+        `UPDATE context_items SET ordinal = ?
+         WHERE conversation_id = ? AND ordinal = ?`,
+      );
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(-(i + 1), conversationId, items[i].ordinal);
+      }
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(i, conversationId, -(i + 1));
+      }
+    }
     }
   }
 

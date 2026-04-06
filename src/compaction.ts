@@ -364,8 +364,9 @@ export class CompactionEngine {
   /** Read context items, using per-phase cache when active. */
   private async getContextItemsCached(conversationId: number): Promise<ContextItemRecord[]> {
     if (this._contextItemsCache) {
-      const cached = this._contextItemsCache.get(conversationId);
-      if (cached) return cached;
+      if (this._contextItemsCache.has(conversationId)) {
+        return this._contextItemsCache.get(conversationId)!;
+      }
       const items = await this.summaryStore.getContextItems(conversationId);
       this._contextItemsCache.set(conversationId, items);
       return items;
