@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -268,14 +267,21 @@ func loadSessionBatch(files []sessionFileEntry, offset, limit int, lcmDBPath str
 		})
 	}
 
-	summaryCounts := loadSummaryCounts(lcmDBPath, sessionIDs)
-	fileCounts := loadFileCounts(lcmDBPath, sessionIDs)
 	conversationMetadata := loadConversationMetadata(lcmDBPath, sessionIDs)
+	conversationIDs := make([]int64, 0, len(conversationMetadata))
+	for _, metadata := range conversationMetadata {
+		if metadata.conversationID > 0 {
+			conversationIDs = append(conversationIDs, metadata.conversationID)
+		}
+	}
+	summaryCounts := loadSummaryCounts(lcmDBPath, conversationIDs)
+	fileCounts := loadFileCounts(lcmDBPath, conversationIDs)
 	for i := range sessions {
-		sessions[i].summaryCount = summaryCounts[sessions[i].id]
-		sessions[i].fileCount = fileCounts[sessions[i].id]
-		sessions[i].conversationID = conversationMetadata[sessions[i].id].conversationID
-		sessions[i].sessionKey = conversationMetadata[sessions[i].id].sessionKey
+		metadata := conversationMetadata[sessions[i].id]
+		sessions[i].conversationID = metadata.conversationID
+		sessions[i].sessionKey = metadata.sessionKey
+		sessions[i].summaryCount = summaryCounts[metadata.conversationID]
+		sessions[i].fileCount = fileCounts[metadata.conversationID]
 	}
 
 	return sessions, end, nil
@@ -779,21 +785,11 @@ func lookupConversationID(db *sql.DB, sessionID string) (int64, error) {
 		return 0, fmt.Errorf("LCM database has no tables yet — start a conversation first so the plugin can initialize the schema")
 	}
 
-	var conversationID int64
-	err := db.QueryRow(`
-		SELECT conversation_id
-		FROM conversations
-		WHERE session_id = ?
-		ORDER BY updated_at DESC
-		LIMIT 1
-	`, sessionID).Scan(&conversationID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, fmt.Errorf("no LCM conversation found for session %q", sessionID)
-		}
-		return 0, fmt.Errorf("lookup conversation for session %q: %w", sessionID, err)
+	metadata := loadConversationMetadataFromDB(db, []string{sessionID})
+	if metadata[sessionID].conversationID == 0 {
+		return 0, fmt.Errorf("no LCM conversation found for session %q", sessionID)
 	}
-	return conversationID, nil
+	return metadata[sessionID].conversationID, nil
 }
 
 func loadSummaryNodes(db *sql.DB, conversationID int64) (map[string]*summaryNode, error) {
@@ -918,9 +914,9 @@ func loadSummarySources(dbPath, summaryID string) ([]summarySource, error) {
 	return sources, nil
 }
 
-func loadSummaryCounts(dbPath string, sessionIDs []string) map[string]int {
-	counts := make(map[string]int, len(sessionIDs))
-	if len(sessionIDs) == 0 {
+func loadSummaryCounts(dbPath string, conversationIDs []int64) map[int64]int {
+	counts := make(map[int64]int, len(conversationIDs))
+	if len(conversationIDs) == 0 {
 		return counts
 	}
 	db, err := openLCMDB(dbPath)
@@ -929,19 +925,17 @@ func loadSummaryCounts(dbPath string, sessionIDs []string) map[string]int {
 	}
 	defer db.Close()
 
-	// Build query with placeholders
-	placeholders := make([]string, len(sessionIDs))
-	args := make([]any, len(sessionIDs))
-	for i, id := range sessionIDs {
+	placeholders := make([]string, len(conversationIDs))
+	args := make([]any, len(conversationIDs))
+	for i, id := range conversationIDs {
 		placeholders[i] = "?"
 		args[i] = id
 	}
 	query := fmt.Sprintf(`
-		SELECT c.session_id, COUNT(s.summary_id)
-		FROM conversations c
-		JOIN summaries s ON s.conversation_id = c.conversation_id
-		WHERE c.session_id IN (%s)
-		GROUP BY c.session_id
+		SELECT s.conversation_id, COUNT(s.summary_id)
+		FROM summaries s
+		WHERE s.conversation_id IN (%s)
+		GROUP BY s.conversation_id
 	`, strings.Join(placeholders, ","))
 
 	rows, err := db.Query(query, args...)
@@ -951,12 +945,12 @@ func loadSummaryCounts(dbPath string, sessionIDs []string) map[string]int {
 	defer rows.Close()
 
 	for rows.Next() {
-		var sessionID string
+		var conversationID int64
 		var count int
-		if err := rows.Scan(&sessionID, &count); err != nil {
+		if err := rows.Scan(&conversationID, &count); err != nil {
 			continue
 		}
-		counts[sessionID] = count
+		counts[conversationID] = count
 	}
 	return counts
 }
@@ -1004,9 +998,9 @@ func loadLargeFiles(dbPath, sessionID string) ([]largeFileEntry, error) {
 	return files, nil
 }
 
-func loadFileCounts(dbPath string, sessionIDs []string) map[string]int {
-	counts := make(map[string]int, len(sessionIDs))
-	if len(sessionIDs) == 0 {
+func loadFileCounts(dbPath string, conversationIDs []int64) map[int64]int {
+	counts := make(map[int64]int, len(conversationIDs))
+	if len(conversationIDs) == 0 {
 		return counts
 	}
 	db, err := openLCMDB(dbPath)
@@ -1015,18 +1009,17 @@ func loadFileCounts(dbPath string, sessionIDs []string) map[string]int {
 	}
 	defer db.Close()
 
-	placeholders := make([]string, len(sessionIDs))
-	args := make([]any, len(sessionIDs))
-	for i, id := range sessionIDs {
+	placeholders := make([]string, len(conversationIDs))
+	args := make([]any, len(conversationIDs))
+	for i, id := range conversationIDs {
 		placeholders[i] = "?"
 		args[i] = id
 	}
 	query := fmt.Sprintf(`
-		SELECT c.session_id, COUNT(lf.file_id)
-		FROM conversations c
-		JOIN large_files lf ON lf.conversation_id = c.conversation_id
-		WHERE c.session_id IN (%s)
-		GROUP BY c.session_id
+		SELECT lf.conversation_id, COUNT(lf.file_id)
+		FROM large_files lf
+		WHERE lf.conversation_id IN (%s)
+		GROUP BY lf.conversation_id
 	`, strings.Join(placeholders, ","))
 
 	rows, err := db.Query(query, args...)
@@ -1036,12 +1029,12 @@ func loadFileCounts(dbPath string, sessionIDs []string) map[string]int {
 	defer rows.Close()
 
 	for rows.Next() {
-		var sessionID string
+		var conversationID int64
 		var count int
-		if err := rows.Scan(&sessionID, &count); err != nil {
+		if err := rows.Scan(&conversationID, &count); err != nil {
 			continue
 		}
-		counts[sessionID] = count
+		counts[conversationID] = count
 	}
 	return counts
 }
@@ -1049,6 +1042,14 @@ func loadFileCounts(dbPath string, sessionIDs []string) map[string]int {
 type conversationMetadata struct {
 	conversationID int64
 	sessionKey     string
+}
+
+// sessionLookupKey preserves the on-disk session filename while also tracking
+// the normalized DB lookup keys used for topic-backed Telegram sessions.
+type sessionLookupKey struct {
+	requestedSessionID  string
+	normalizedSessionID string
+	exactSessionKey     string
 }
 
 func loadConversationMetadata(dbPath string, sessionIDs []string) map[string]conversationMetadata {
@@ -1063,24 +1064,49 @@ func loadConversationMetadata(dbPath string, sessionIDs []string) map[string]con
 	}
 	defer db.Close()
 
-	placeholders := make([]string, len(sessionIDs))
-	args := make([]any, len(sessionIDs))
-	for i, sessionID := range sessionIDs {
-		placeholders[i] = "?"
-		args[i] = sessionID
+	return loadConversationMetadataFromDB(db, sessionIDs)
+}
+
+func loadConversationMetadataFromDB(db *sql.DB, sessionIDs []string) map[string]conversationMetadata {
+	metadata := make(map[string]conversationMetadata, len(sessionIDs))
+	if len(sessionIDs) == 0 {
+		return metadata
 	}
+
+	lookups := buildSessionLookupKeys(sessionIDs)
+	sessionIDPlaceholders := make([]string, 0, len(lookups))
+	sessionIDArgs := make([]any, 0, len(lookups))
+	sessionKeyPlaceholders := make([]string, 0, len(lookups))
+	sessionKeyArgs := make([]any, 0, len(lookups))
+	for _, lookup := range lookups {
+		sessionIDPlaceholders = append(sessionIDPlaceholders, "?")
+		sessionIDArgs = append(sessionIDArgs, lookup.normalizedSessionID)
+		if lookup.exactSessionKey != "" {
+			sessionKeyPlaceholders = append(sessionKeyPlaceholders, "?")
+			sessionKeyArgs = append(sessionKeyArgs, lookup.exactSessionKey)
+		}
+	}
+
+	whereParts := make([]string, 0, 2)
+	args := make([]any, 0, len(sessionKeyArgs)+len(sessionIDArgs))
+	if len(sessionKeyPlaceholders) > 0 {
+		whereParts = append(whereParts, fmt.Sprintf("session_key IN (%s)", strings.Join(sessionKeyPlaceholders, ",")))
+		args = append(args, sessionKeyArgs...)
+	}
+	if len(sessionIDPlaceholders) > 0 {
+		whereParts = append(whereParts, fmt.Sprintf("session_id IN (%s)", strings.Join(sessionIDPlaceholders, ",")))
+		args = append(args, sessionIDArgs...)
+	}
+	if len(whereParts) == 0 {
+		return metadata
+	}
+
 	query := fmt.Sprintf(`
-		SELECT c.session_id, c.conversation_id, c.session_key
-		FROM conversations c
-		JOIN (
-			SELECT session_id, MAX(conversation_id) AS conversation_id
-			FROM conversations
-			WHERE session_id IN (%s)
-			GROUP BY session_id
-		) latest
-			ON latest.session_id = c.session_id
-			AND latest.conversation_id = c.conversation_id
-	`, strings.Join(placeholders, ","))
+		SELECT conversation_id, session_id, session_key
+		FROM conversations
+		WHERE %s
+		ORDER BY conversation_id DESC
+	`, strings.Join(whereParts, " OR "))
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -1088,19 +1114,89 @@ func loadConversationMetadata(dbPath string, sessionIDs []string) map[string]con
 	}
 	defer rows.Close()
 
+	bySessionKey := make(map[string]conversationMetadata, len(lookups))
+	bySessionID := make(map[string]conversationMetadata, len(lookups))
 	for rows.Next() {
-		var sessionID string
 		var conversationID int64
+		var sessionID string
 		var sessionKey sql.NullString
-		if err := rows.Scan(&sessionID, &conversationID, &sessionKey); err != nil {
+		if err := rows.Scan(&conversationID, &sessionID, &sessionKey); err != nil {
 			continue
 		}
-		metadata[sessionID] = conversationMetadata{
+		row := conversationMetadata{
 			conversationID: conversationID,
 			sessionKey:     sessionKey.String,
 		}
+		if row.sessionKey != "" {
+			if _, exists := bySessionKey[row.sessionKey]; !exists {
+				bySessionKey[row.sessionKey] = row
+			}
+		}
+		if _, exists := bySessionID[sessionID]; !exists {
+			bySessionID[sessionID] = row
+		}
+	}
+
+	for _, lookup := range lookups {
+		if lookup.exactSessionKey != "" {
+			if row, ok := bySessionKey[lookup.exactSessionKey]; ok {
+				metadata[lookup.requestedSessionID] = row
+				continue
+			}
+		}
+		if row, ok := bySessionID[lookup.normalizedSessionID]; ok {
+			metadata[lookup.requestedSessionID] = row
+		}
 	}
 	return metadata
+}
+
+func buildSessionLookupKeys(sessionIDs []string) []sessionLookupKey {
+	lookups := make([]sessionLookupKey, 0, len(sessionIDs))
+	seen := make(map[string]bool, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		if seen[sessionID] {
+			continue
+		}
+		seen[sessionID] = true
+		normalizedSessionID, exactSessionKey := normalizeSessionLookupID(sessionID)
+		lookups = append(lookups, sessionLookupKey{
+			requestedSessionID:  sessionID,
+			normalizedSessionID: normalizedSessionID,
+			exactSessionKey:     exactSessionKey,
+		})
+	}
+	return lookups
+}
+
+// normalizeSessionLookupID keeps non-topic sessions unchanged, but for
+// <session-id>-topic-<n> files it falls back to the bare session_id while still
+// preserving the full topic suffix for exact session_key matches.
+func normalizeSessionLookupID(sessionID string) (normalizedSessionID, exactSessionKey string) {
+	if baseSessionID, ok := trimTopicSessionSuffix(sessionID); ok {
+		return baseSessionID, sessionID
+	}
+	return sessionID, ""
+}
+
+// trimTopicSessionSuffix recognizes the topic session filenames written by the
+// Telegram adapter so TUI DB lookups can normalize them deterministically.
+func trimTopicSessionSuffix(sessionID string) (string, bool) {
+	const topicMarker = "-topic-"
+	idx := strings.LastIndex(sessionID, topicMarker)
+	if idx <= 0 {
+		return "", false
+	}
+	topicSuffix := sessionID[idx+len(topicMarker):]
+	if topicSuffix == "" {
+		return "", false
+	}
+	for _, r := range topicSuffix {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	return sessionID[:idx], true
 }
 
 func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {

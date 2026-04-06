@@ -95,6 +95,115 @@ func TestLoadSessionBatchIncludesConversationMetadata(t *testing.T) {
 	}
 }
 
+func TestLoadSessionBatchResolvesTopicSessionFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "telegram-runtime-topic-8.jsonl")
+	content := `{"type":"message","id":"1","message":{"role":"user","content":"hello topic"}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	dbPath := filepath.Join(dir, "lcm.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`
+		CREATE TABLE conversations (
+			conversation_id INTEGER PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			session_key TEXT
+		);
+		CREATE TABLE summaries (
+			summary_id TEXT PRIMARY KEY,
+			conversation_id INTEGER NOT NULL
+		);
+		CREATE TABLE large_files (
+			file_id TEXT PRIMARY KEY,
+			conversation_id INTEGER NOT NULL
+		);
+		INSERT INTO conversations (conversation_id, session_id, session_key) VALUES
+			(11, 'telegram-runtime', 'telegram-runtime-topic-7'),
+			(12, 'telegram-runtime', 'telegram-runtime-topic-8');
+		INSERT INTO summaries (summary_id, conversation_id) VALUES
+			('sum-topic-7-a', 11),
+			('sum-topic-7-b', 11),
+			('sum-topic-8-a', 12);
+		INSERT INTO large_files (file_id, conversation_id) VALUES
+			('file-topic-7-a', 11),
+			('file-topic-8-a', 12),
+			('file-topic-8-b', 12);
+	`); err != nil {
+		t.Fatalf("seed topic conversations: %v", err)
+	}
+
+	files := []sessionFileEntry{
+		{
+			filename:  "telegram-runtime-topic-8.jsonl",
+			path:      path,
+			updatedAt: time.Unix(1700000000, 0),
+			byteSize:  int64(len(content)),
+		},
+	}
+
+	sessions, _, err := loadSessionBatch(files, 0, 1, dbPath)
+	if err != nil {
+		t.Fatalf("load session batch: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(sessions))
+	}
+	if sessions[0].conversationID != 12 {
+		t.Fatalf("expected topic conversation id 12, got %d", sessions[0].conversationID)
+	}
+	if sessions[0].sessionKey != "telegram-runtime-topic-8" {
+		t.Fatalf("expected session key %q, got %q", "telegram-runtime-topic-8", sessions[0].sessionKey)
+	}
+	if sessions[0].summaryCount != 1 {
+		t.Fatalf("expected summary count 1, got %d", sessions[0].summaryCount)
+	}
+	if sessions[0].fileCount != 2 {
+		t.Fatalf("expected file count 2, got %d", sessions[0].fileCount)
+	}
+}
+
+func TestLookupConversationIDResolvesTopicSessionFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "lcm.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`
+		CREATE TABLE conversations (
+			conversation_id INTEGER PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			session_key TEXT
+		);
+		INSERT INTO conversations (conversation_id, session_id, session_key) VALUES
+			(21, 'telegram-runtime', 'telegram-runtime-topic-7'),
+			(22, 'telegram-runtime', 'telegram-runtime-topic-8');
+	`); err != nil {
+		t.Fatalf("seed conversations: %v", err)
+	}
+
+	conversationID, err := lookupConversationID(db, "telegram-runtime-topic-8")
+	if err != nil {
+		t.Fatalf("lookup conversation id: %v", err)
+	}
+	if conversationID != 22 {
+		t.Fatalf("expected topic conversation id 22, got %d", conversationID)
+	}
+}
+
 func TestEstimateTokenCountFromBytes(t *testing.T) {
 	t.Parallel()
 
