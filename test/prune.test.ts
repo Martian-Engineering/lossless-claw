@@ -248,6 +248,61 @@ describe("pruneConversations", () => {
     expect(messages.cnt).toBe(1);
   });
 
+  it("deletes eligible conversations across multiple batches", () => {
+    const fixture = createPruneFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    for (let index = 0; index < 5; index += 1) {
+      seedConversation(fixture, {
+        sessionId: `old-batch-${index}`,
+        sessionKey: `old-batch-${index}`,
+        messageCreatedAt: `2025-02-0${index + 1}T00:00:00.000Z`,
+      });
+    }
+
+    const result = pruneConversations(fixture.db, {
+      before: "90d",
+      confirm: true,
+      batchSize: 2,
+      now: "2025-06-01T00:00:00.000Z",
+    });
+
+    expect(result.deleted).toBe(5);
+    expect(result.candidates).toHaveLength(5);
+    expect(
+      fixture.db.prepare(`SELECT COUNT(*) AS cnt FROM conversations`).get() as { cnt: number },
+    ).toEqual({ cnt: 0 });
+  });
+
+  it("can stop after a bounded number of batches", () => {
+    const fixture = createPruneFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    for (let index = 0; index < 5; index += 1) {
+      seedConversation(fixture, {
+        sessionId: `old-cap-${index}`,
+        sessionKey: `old-cap-${index}`,
+        messageCreatedAt: `2025-02-1${index}T00:00:00.000Z`,
+      });
+    }
+
+    const result = pruneConversations(fixture.db, {
+      before: "90d",
+      confirm: true,
+      batchSize: 2,
+      maxBatches: 1,
+      now: "2025-06-01T00:00:00.000Z",
+    });
+
+    expect(result.deleted).toBe(2);
+    expect(result.candidates).toHaveLength(2);
+    expect(
+      fixture.db.prepare(`SELECT COUNT(*) AS cnt FROM conversations`).get() as { cnt: number },
+    ).toEqual({ cnt: 3 });
+  });
+
   it("deletes conversations with summary lineage and context items", async () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);
@@ -284,6 +339,44 @@ describe("pruneConversations", () => {
       fixture.db
         .prepare(`SELECT COUNT(*) AS cnt FROM context_items WHERE conversation_id = ?`)
         .get(conversationId) as { cnt: number },
+    ).toEqual({ cnt: 0 });
+  });
+
+  it("deletes retained conversation context that points at pruned summaries", async () => {
+    const fixture = createPruneFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const prunedConversationId = await seedConversationWithSummary(fixture, {
+      sessionId: "old-with-exported-summary",
+      messageCreatedAt: "2025-02-01 00:00:00",
+    });
+    const retainedConversationId = seedConversation(fixture, {
+      sessionId: "recent-consumer",
+      messageCreatedAt: "2025-05-25T00:00:00.000Z",
+    });
+    const summaryStore = new SummaryStore(fixture.db, {
+      fts5Available: getLcmDbFeatures(fixture.db).fts5Available,
+    });
+    await summaryStore.appendContextSummary(retainedConversationId, `summary-${prunedConversationId}`);
+
+    const result = pruneConversations(fixture.db, {
+      before: "90d",
+      confirm: true,
+      batchSize: 10,
+      now: "2025-06-01T00:00:00.000Z",
+    });
+
+    expect(result.deleted).toBe(1);
+    expect(
+      fixture.db
+        .prepare(`SELECT COUNT(*) AS cnt FROM conversations WHERE conversation_id = ?`)
+        .get(retainedConversationId) as { cnt: number },
+    ).toEqual({ cnt: 1 });
+    expect(
+      fixture.db
+        .prepare(`SELECT COUNT(*) AS cnt FROM context_items WHERE conversation_id = ?`)
+        .get(retainedConversationId) as { cnt: number },
     ).toEqual({ cnt: 0 });
   });
 

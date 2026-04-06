@@ -72,6 +72,10 @@ export type PruneOptions = {
   before: string;
   /** When true, actually delete. Default is dry-run (false). */
   confirm?: boolean;
+  /** Maximum conversations to delete per write transaction. Default 100. */
+  batchSize?: number;
+  /** Maximum delete batches to run before returning. Default unlimited. */
+  maxBatches?: number;
   /** When true, run VACUUM after deletion. Default false. */
   vacuum?: boolean;
   /** Override "now" for testing. ISO-8601 UTC string. */
@@ -124,11 +128,46 @@ function computeCutoffDate(days: number, now?: string): string {
 }
 
 /**
+ * Normalize prune batch size to a small positive integer.
+ */
+function resolveBatchSize(batchSize?: number): number {
+  if (batchSize == null) {
+    return 100;
+  }
+  if (!Number.isFinite(batchSize) || batchSize <= 0) {
+    throw new Error(`Invalid batch size "${batchSize}". Expected a positive integer.`);
+  }
+  return Math.floor(batchSize);
+}
+
+/**
+ * Normalize the optional batch cap for confirm-mode pruning.
+ */
+function resolveMaxBatches(maxBatches?: number): number | null {
+  if (maxBatches == null) {
+    return null;
+  }
+  if (!Number.isFinite(maxBatches) || maxBatches <= 0) {
+    throw new Error(`Invalid max batches "${maxBatches}". Expected a positive integer.`);
+  }
+  return Math.floor(maxBatches);
+}
+
+/**
  * Load prune candidates using SQLite date math so mixed timestamp formats are
  * compared chronologically instead of lexically.
  */
-function loadPruneCandidates(db: DatabaseSync, cutoffDate: string): PruneCandidate[] {
-  const rows = db.prepare(SELECT_PRUNE_CANDIDATES_SQL).all(cutoffDate) as PruneCandidateRow[];
+function loadPruneCandidates(
+  db: DatabaseSync,
+  cutoffDate: string,
+  limit?: number,
+): PruneCandidate[] {
+  const sql = limit == null ? SELECT_PRUNE_CANDIDATES_SQL : `${SELECT_PRUNE_CANDIDATES_SQL}\n LIMIT ?`;
+  const rows = (
+    limit == null
+      ? db.prepare(sql).all(cutoffDate)
+      : db.prepare(sql).all(cutoffDate, limit)
+  ) as PruneCandidateRow[];
   return rows.map((row) => ({
     conversationId: row.conversation_id,
     sessionKey: row.session_key,
@@ -150,26 +189,45 @@ function hasTable(db: DatabaseSync, tableName: string): boolean {
 }
 
 /**
- * Create a temp table containing the conversations selected for pruning.
+ * Create temp tables containing the conversations, summaries, and messages
+ * selected for pruning so dependent deletes can use simple indexed lookups.
  */
 function stageCandidateConversationIds(
   db: DatabaseSync,
   candidates: PruneCandidate[],
 ): void {
   db.exec(`DROP TABLE IF EXISTS temp.prune_candidate_ids`);
+  db.exec(`DROP TABLE IF EXISTS temp.prune_candidate_summary_ids`);
+  db.exec(`DROP TABLE IF EXISTS temp.prune_candidate_message_ids`);
   db.exec(`CREATE TEMP TABLE prune_candidate_ids (conversation_id INTEGER PRIMARY KEY)`);
+  db.exec(`CREATE TEMP TABLE prune_candidate_summary_ids (summary_id TEXT PRIMARY KEY)`);
+  db.exec(`CREATE TEMP TABLE prune_candidate_message_ids (message_id INTEGER PRIMARY KEY)`);
   const insertStmt = db.prepare(
     `INSERT INTO temp.prune_candidate_ids (conversation_id) VALUES (?)`,
   );
   for (const candidate of candidates) {
     insertStmt.run(candidate.conversationId);
   }
+  db.exec(`
+    INSERT INTO temp.prune_candidate_summary_ids (summary_id)
+    SELECT s.summary_id
+    FROM summaries s
+    JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
+  `);
+  db.exec(`
+    INSERT INTO temp.prune_candidate_message_ids (message_id)
+    SELECT m.message_id
+    FROM messages m
+    JOIN temp.prune_candidate_ids p ON p.conversation_id = m.conversation_id
+  `);
 }
 
 /**
  * Remove the temp candidate table.
  */
 function dropCandidateConversationIds(db: DatabaseSync): void {
+  db.exec(`DROP TABLE IF EXISTS temp.prune_candidate_message_ids`);
+  db.exec(`DROP TABLE IF EXISTS temp.prune_candidate_summary_ids`);
   db.exec(`DROP TABLE IF EXISTS temp.prune_candidate_ids`);
 }
 
@@ -191,30 +249,32 @@ function deleteCandidates(db: DatabaseSync, candidates: PruneCandidate[]): numbe
   try {
     db.prepare(
       `DELETE FROM summary_messages
-       WHERE summary_id IN (
-         SELECT s.summary_id
-         FROM summaries s
-         JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
-       )
-          OR message_id IN (
-         SELECT m.message_id
-         FROM messages m
-         JOIN temp.prune_candidate_ids p ON p.conversation_id = m.conversation_id
-       )`,
+       WHERE summary_id IN (SELECT summary_id FROM temp.prune_candidate_summary_ids)`,
+    ).run();
+
+    db.prepare(
+      `DELETE FROM summary_messages
+       WHERE message_id IN (SELECT message_id FROM temp.prune_candidate_message_ids)`,
     ).run();
 
     db.prepare(
       `DELETE FROM summary_parents
-       WHERE summary_id IN (
-         SELECT s.summary_id
-         FROM summaries s
-         JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
-       )
-          OR parent_summary_id IN (
-         SELECT s.summary_id
-         FROM summaries s
-         JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
-       )`,
+       WHERE summary_id IN (SELECT summary_id FROM temp.prune_candidate_summary_ids)`,
+    ).run();
+
+    db.prepare(
+      `DELETE FROM summary_parents
+       WHERE parent_summary_id IN (SELECT summary_id FROM temp.prune_candidate_summary_ids)`,
+    ).run();
+
+    db.prepare(
+      `DELETE FROM context_items
+       WHERE message_id IN (SELECT message_id FROM temp.prune_candidate_message_ids)`,
+    ).run();
+
+    db.prepare(
+      `DELETE FROM context_items
+       WHERE summary_id IN (SELECT summary_id FROM temp.prune_candidate_summary_ids)`,
     ).run();
 
     db.prepare(
@@ -225,33 +285,21 @@ function deleteCandidates(db: DatabaseSync, candidates: PruneCandidate[]): numbe
     if (tableOptions.hasMessagesFts) {
       db.prepare(
         `DELETE FROM messages_fts
-         WHERE rowid IN (
-           SELECT m.message_id
-           FROM messages m
-           JOIN temp.prune_candidate_ids p ON p.conversation_id = m.conversation_id
-         )`,
+         WHERE rowid IN (SELECT message_id FROM temp.prune_candidate_message_ids)`,
       ).run();
     }
 
     if (tableOptions.hasSummariesFts) {
       db.prepare(
         `DELETE FROM summaries_fts
-         WHERE summary_id IN (
-           SELECT s.summary_id
-           FROM summaries s
-           JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
-         )`,
+         WHERE summary_id IN (SELECT summary_id FROM temp.prune_candidate_summary_ids)`,
       ).run();
     }
 
     if (tableOptions.hasSummariesFtsCjk) {
       db.prepare(
         `DELETE FROM summaries_fts_cjk
-         WHERE summary_id IN (
-           SELECT s.summary_id
-           FROM summaries s
-           JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
-         )`,
+         WHERE summary_id IN (SELECT summary_id FROM temp.prune_candidate_summary_ids)`,
       ).run();
     }
 
@@ -287,6 +335,8 @@ export function pruneConversations(
   }
 
   const cutoffDate = computeCutoffDate(days, options.now);
+  const batchSize = resolveBatchSize(options.batchSize);
+  const maxBatches = resolveMaxBatches(options.maxBatches);
 
   let deleted = 0;
   let vacuumed = false;
@@ -295,14 +345,32 @@ export function pruneConversations(
   if (!options.confirm) {
     candidates = loadPruneCandidates(db, cutoffDate);
   } else {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      candidates = loadPruneCandidates(db, cutoffDate);
-      deleted = deleteCandidates(db, candidates);
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
+    candidates = [];
+    let batchesRun = 0;
+    while (true) {
+      let batchCount = 0;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const batch = loadPruneCandidates(db, cutoffDate, batchSize);
+        batchCount = batch.length;
+        if (batch.length === 0) {
+          db.exec("COMMIT");
+          break;
+        }
+        deleted += deleteCandidates(db, batch);
+        candidates.push(...batch);
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+      if (batchCount < batchSize) {
+        break;
+      }
+      batchesRun += 1;
+      if (maxBatches != null && batchesRun >= maxBatches) {
+        break;
+      }
     }
   }
 

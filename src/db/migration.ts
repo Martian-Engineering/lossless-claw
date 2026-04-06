@@ -549,6 +549,8 @@ export function runLcmMigrations(
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
+    CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
+    CREATE INDEX IF NOT EXISTS summary_parents_parent_summary_idx ON summary_parents (parent_summary_id);
     CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts (message_id);
     CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type);
     CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal);
