@@ -23,7 +23,6 @@
 export function sanitizeFts5Query(raw: string): string {
   // Preserve user-quoted phrases: extract "..." groups first, then tokenize the rest.
   const parts: string[] = [];
-  let remaining = raw;
   const phraseRegex = /"([^"]+)"/g;
   let match: RegExpExecArray | null;
   let lastIndex = 0;
@@ -42,9 +41,8 @@ export function sanitizeFts5Query(raw: string): string {
     lastIndex = match.index + match[0].length;
   }
 
-  // Process remaining unquoted text after last phrase
-  remaining = raw.slice(lastIndex);
-  for (const t of remaining.split(/\s+/).filter(Boolean)) {
+  // Process unquoted text after last phrase
+  for (const t of raw.slice(lastIndex).split(/\s+/).filter(Boolean)) {
     parts.push(`"${t.replace(/"/g, "")}"`);
   }
 

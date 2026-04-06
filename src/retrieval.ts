@@ -250,12 +250,16 @@ export class RetrievalEngine {
     // window. A truly relevant older result outside the LIMIT window won't appear.
     // This is a known limitation — fixing it would require passing sort mode into
     // the SQL layer (ORDER BY rank LIMIT ?), which is a larger change.
-    const sortMode = input.sort ?? "recency";
-    if (sortMode === "relevance" && mode === "full_text") {
+    // Relevance/hybrid only meaningful for full_text mode; fall back to recency for regex.
+    const sortMode = (input.sort === "relevance" || input.sort === "hybrid") && mode !== "full_text"
+      ? "recency"
+      : input.sort ?? "recency";
+    if (sortMode === "relevance") {
       // FTS5 rank is negative (more negative = better match). Sort ascending.
-      messages.sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0));
-      summaries.sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0));
-    } else if (sortMode === "hybrid" && mode === "full_text") {
+      // Tiebreaker: recency (newest first) when ranks are equal.
+      messages.sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0) || b.createdAt.getTime() - a.createdAt.getTime());
+      summaries.sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0) || b.createdAt.getTime() - a.createdAt.getTime());
+    } else if (sortMode === "hybrid") {
       // Blend relevance with recency. FTS5 rank is negative (lower = better),
       // so we negate it to get a positive relevance score, then penalize age.
       const now = Date.now();
