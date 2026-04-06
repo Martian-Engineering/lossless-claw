@@ -25,7 +25,7 @@ Summaries form a directed acyclic graph with two node types:
 - Created from a chunk of raw messages
 - Linked to source messages via `summary_messages`
 - Contain a narrative summary with timestamps
-- Typically 800–1200 tokens
+- Typically 1200–2400 tokens (target: `leafTargetTokens`, default 2400)
 
 **Condensed summaries** (depth 1+, kind `"condensed"`):
 - Created from a chunk of summaries at the same depth

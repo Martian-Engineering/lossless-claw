@@ -167,8 +167,8 @@ This is why compaction model choice matters so much — a slow model turns full 
 |---------|---------|---------|-------------|
 | `contextThreshold` | `0.75` | `LCM_CONTEXT_THRESHOLD` | Fraction of budget that triggers full-sweep compaction |
 | `leafChunkTokens` | `20000` | `LCM_LEAF_CHUNK_TOKENS` | Max raw tokens per leaf pass |
-| `leafTargetTokens` | `2400` | — | Target output tokens for leaf summaries |
-| `condensedTargetTokens` | `2000` | — | Target output tokens for condensed summaries |
+| `leafTargetTokens` | `2400` | `LCM_LEAF_TARGET_TOKENS` | Target output tokens for leaf summaries |
+| `condensedTargetTokens` | `2000` | `LCM_CONDENSED_TARGET_TOKENS` | Target output tokens for condensed summaries |
 | `freshTailCount` | `64` | `LCM_FRESH_TAIL_COUNT` | Messages protected from compaction |
 | `incrementalMaxDepth` | `1` | `LCM_INCREMENTAL_MAX_DEPTH` | Max condensation depth per turn (-1 = unlimited) |
 | `leafMinFanout` | `8` | — | Min leaf summaries before condensation |

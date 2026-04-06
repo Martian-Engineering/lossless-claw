@@ -45,7 +45,7 @@ For most use cases, 0.75 is a good balance.
 
 ### Fresh tail count
 
-`LCM_FRESH_TAIL_COUNT` (default `32`) is the number of most recent messages that are never compacted. These raw messages give the model immediate conversational continuity.
+`LCM_FRESH_TAIL_COUNT` (default `64`) is the number of most recent messages that are never compacted. These raw messages give the model immediate conversational continuity.
 
 - **Smaller values** (e.g., 8–16) save context space for summaries but may lose recent nuance.
 - **Larger values** (e.g., 32–64) give better continuity at the cost of a larger mandatory context floor.
@@ -80,7 +80,7 @@ For coding conversations with tool calls (which generate many messages per logic
 
 ### Incremental max depth
 
-`LCM_INCREMENTAL_MAX_DEPTH` (default `0`) controls whether condensation happens automatically after leaf passes.
+`LCM_INCREMENTAL_MAX_DEPTH` (default `1`) controls whether condensation happens automatically after leaf passes.
 
 - **0** — Only leaf summaries are created incrementally. Condensation only happens during manual `/compact` or overflow.
 - **1** — After each leaf pass, attempt to condense d0 summaries into d1.
@@ -89,7 +89,7 @@ For coding conversations with tool calls (which generate many messages per logic
 
 ### Summary target tokens
 
-`LCM_LEAF_TARGET_TOKENS` (default `1200`) and `LCM_CONDENSED_TARGET_TOKENS` (default `2000`) control the target size of generated summaries.
+`LCM_LEAF_TARGET_TOKENS` (default `2400`) and `LCM_CONDENSED_TARGET_TOKENS` (default `2000`) control the target size of generated summaries.
 
 - Larger targets preserve more detail but consume more context space.
 - Smaller targets are more aggressive, losing detail faster.
