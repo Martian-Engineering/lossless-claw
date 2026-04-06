@@ -676,6 +676,33 @@ describe("lcm command", () => {
     expect(result.text).toContain("`/lossless help`");
     expect(result.text).toContain("`/lcm` is accepted as a shorter alias.");
   });
+
+  it("accepts db as a lazy function and does not invoke it for help", async () => {
+    const dbFn = vi.fn((): never => {
+      throw new Error("should not be called for help");
+    });
+    const config = resolveLcmConfig({}, { dbPath: "/tmp/unused.db" });
+    const command = createLcmCommand({ db: dbFn, config });
+
+    const result = await command.handler(createCommandContext("help"));
+    expect(result.text).toContain("/lossless");
+    expect(dbFn).not.toHaveBeenCalled();
+  });
+
+  it("invokes the lazy db function for status subcommand", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const db = createLcmDatabaseConnection(fixture.dbPath);
+    const config = resolveLcmConfig({}, { dbPath: fixture.dbPath });
+    const dbFn = vi.fn(() => db);
+    const command = createLcmCommand({ db: dbFn, config });
+
+    const result = await command.handler(createCommandContext());
+    expect(dbFn).toHaveBeenCalled();
+    expect(result.text).toContain("**🦀 Lossless Claw");
+  });
 });
 
 describe("lcm command helpers", () => {

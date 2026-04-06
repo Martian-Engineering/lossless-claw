@@ -1621,6 +1621,7 @@ const lcmPlugin = {
         closeLcmConnection(database);
         database = null;
       }
+      deferredEngine = null;
     });
 
     function getDatabase(): DatabaseSync {
@@ -1637,6 +1638,9 @@ const lcmPlugin = {
     // If init was deferred, build the engine lazily after DB is ready.
     let deferredEngine: LcmContextEngine | null = null;
     function getEngine(): LcmContextEngine {
+      if (!database) {
+        throw new Error("[lcm] Database is closed");
+      }
       if (lcm) return lcm;
       if (!deferredEngine) {
         deferredEngine = new LcmContextEngine(deps, getDatabase());

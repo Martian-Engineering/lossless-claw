@@ -81,7 +81,13 @@ function closeDatabase(db: DatabaseSync | undefined): void {
  */
 export function createLcmDatabaseConnection(dbPath: string): DatabaseSync {
   ensureDbDirectory(dbPath);
-  const db = configureConnection(new DatabaseSync(dbPath));
+  const db = new DatabaseSync(dbPath);
+  try {
+    configureConnection(db);
+  } catch (err) {
+    try { db.close(); } catch { /* ignore cleanup failure */ }
+    throw err;
+  }
   trackConnection(dbPath, db);
   return db;
 }

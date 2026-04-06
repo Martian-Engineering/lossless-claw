@@ -726,23 +726,22 @@ export function createLcmCommand(params: {
     description: "Show Lossless Claw health, scan broken summaries, and repair scoped doctor issues.",
     acceptsArgs: true,
     handler: async (ctx) => {
-      const db = getDb();
       const parsed = parseLcmCommand(ctx.args);
       switch (parsed.kind) {
         case "status":
-          return { text: await buildStatusText({ ctx, db, config: params.config }) };
+          return { text: await buildStatusText({ ctx, db: getDb(), config: params.config }) };
         case "doctor":
           return parsed.apply
             ? {
                 text: await buildDoctorApplyText({
                   ctx,
-                  db,
+                  db: getDb(),
                   config: params.config,
                   deps: params.deps,
                   summarize: params.summarize,
                 }),
               }
-            : { text: await buildDoctorText({ ctx, db }) };
+            : { text: await buildDoctorText({ ctx, db: getDb() }) };
         case "help":
           return { text: buildHelpText(parsed.error) };
       }
