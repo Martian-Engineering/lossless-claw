@@ -1616,7 +1616,9 @@ const lcmPlugin = {
       }
     }
 
+    let stopped = false;
     api.on("gateway_stop", async () => {
+      stopped = true;
       if (database) {
         closeLcmConnection(database);
         database = null;
@@ -1625,6 +1627,9 @@ const lcmPlugin = {
     });
 
     function getDatabase(): DatabaseSync {
+      if (stopped) {
+        throw new Error("[lcm] Database connection closed after gateway_stop");
+      }
       if (!database) {
         throw new Error(
           "[lcm] Plugin not yet initialized — waiting for gateway_start",
@@ -1638,12 +1643,10 @@ const lcmPlugin = {
     // If init was deferred, build the engine lazily after DB is ready.
     let deferredEngine: LcmContextEngine | null = null;
     function getEngine(): LcmContextEngine {
-      if (!database) {
-        throw new Error("[lcm] Database is closed");
-      }
       if (lcm) return lcm;
+      const db = getDatabase();
       if (!deferredEngine) {
-        deferredEngine = new LcmContextEngine(deps, getDatabase());
+        deferredEngine = new LcmContextEngine(deps, db);
       }
       return deferredEngine;
     }
