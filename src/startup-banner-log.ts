@@ -1,6 +1,7 @@
 type StartupBannerKey =
   | "plugin-loaded"
   | "compaction-model"
+  | "fallback-providers"
   | "ignore-session-patterns"
   | "stateless-session-patterns";
 

@@ -1068,6 +1068,17 @@ function resolveSummaryCandidates(params: {
     },
   ];
 
+  // Append explicit fallback providers from config.
+  for (const fb of params.deps.config.fallbackProviders ?? []) {
+    resolutionCandidates.push({
+      levelName: `explicit fallback (${fb.provider}/${fb.model})`,
+      modelRef: `${fb.provider}/${fb.model}`,
+      providerHint: fb.provider,
+      hasExplicitProvider: true,
+      useLegacyAuthProfile: false,
+    });
+  }
+
   const resolvedCandidates: ResolvedSummaryCandidate[] = [];
   for (const candidate of resolutionCandidates) {
     if (!candidate.modelRef) {
@@ -1317,22 +1328,26 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         if (err instanceof LcmProviderAuthError) {
           lastAuthError = err;
           if (nextCandidate) {
-            console.warn(
-              `[lcm] summarizer auth fallback: retrying with ${nextCandidate.provider}/${nextCandidate.model} after ${provider}/${model} failed auth.`,
+            console.error(
+              `[lcm] PROVIDER FALLBACK: ${provider}/${model} auth failed → trying ${nextCandidate.provider}/${nextCandidate.model}`,
             );
+            const backoffMs = Math.min(500 * Math.pow(2, index), 8000);
+            await new Promise((r) => setTimeout(r, backoffMs));
             continue;
           }
           throw lastAuthError;
         }
         const errMsg = err instanceof Error ? err.message : String(err);
         const isTimeout = errMsg.includes("summarizer timeout");
-        console.warn(
+        console.error(
           `[lcm] summarizer ${isTimeout ? "timed out" : "failed"}; provider=${provider}; model=${model}; timeout=${summarizerTimeoutMs}ms; error=${errMsg}`,
         );
         if (nextCandidate) {
-          console.warn(
-            `[lcm] summarizer candidate fallback: retrying with ${nextCandidate.provider}/${nextCandidate.model} after ${provider}/${model} ${isTimeout ? "timed out" : "failed"}.`,
+          console.error(
+            `[lcm] PROVIDER FALLBACK: ${provider}/${model} ${isTimeout ? "timed out" : "failed"} → trying ${nextCandidate.provider}/${nextCandidate.model}`,
           );
+          const backoffMs = Math.min(500 * Math.pow(2, index), 8000);
+          await new Promise((r) => setTimeout(r, backoffMs));
           continue;
         }
         if (err instanceof SummarizerTimeoutError) {
@@ -1430,9 +1445,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           if (retryErr instanceof LcmProviderAuthError) {
             lastAuthError = retryErr;
             if (nextCandidate) {
-              console.warn(
-                `[lcm] summarizer auth fallback: retrying with ${nextCandidate.provider}/${nextCandidate.model} after ${provider}/${model} failed auth.`,
+              console.error(
+                `[lcm] PROVIDER FALLBACK: ${provider}/${model} auth failed on retry → trying ${nextCandidate.provider}/${nextCandidate.model}`,
               );
+              const backoffMs = Math.min(500 * Math.pow(2, index), 8000);
+              await new Promise((r) => setTimeout(r, backoffMs));
               continue;
             }
             throw lastAuthError;
@@ -1470,6 +1487,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       return summary;
     }
 
+    console.error(
+      `[lcm] ALL PROVIDERS EXHAUSTED: ${resolvedCandidates.length} candidate(s) tried, none succeeded. Compaction falling back to deterministic truncation. Check provider keys and quotas.`,
+    );
     if (lastAuthError) {
       throw lastAuthError;
     }

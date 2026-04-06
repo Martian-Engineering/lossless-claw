@@ -58,6 +58,8 @@ export type LcmConfig = {
   circuitBreakerThreshold: number;
   /** Cooldown in milliseconds before the circuit breaker auto-resets (default 30 min). */
   circuitBreakerCooldownMs: number;
+  /** Explicit fallback provider/model pairs for compaction summarization. */
+  fallbackProviders: Array<{ provider: string; model: string }>;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -83,6 +85,39 @@ function parseFiniteNumber(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const parsed = parseFloat(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/** Parse fallback providers from env string (format: "provider/model,provider/model"). */
+function parseFallbackProviders(value: string | undefined): Array<{ provider: string; model: string }> | undefined {
+  if (!value?.trim()) return undefined;
+  const entries: Array<{ provider: string; model: string }> = [];
+  for (const part of value.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const slashIdx = trimmed.indexOf("/");
+    if (slashIdx > 0 && slashIdx < trimmed.length - 1) {
+      const provider = trimmed.slice(0, slashIdx).trim();
+      const model = trimmed.slice(slashIdx + 1).trim();
+      if (provider && model) {
+        entries.push({ provider, model });
+      }
+    }
+  }
+  return entries.length > 0 ? entries : undefined;
+}
+
+/** Parse fallback providers from plugin config array (object items only). */
+function toFallbackProviderArray(value: unknown): Array<{ provider: string; model: string }> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const entries: Array<{ provider: string; model: string }> = [];
+  for (const item of value) {
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      const p = toStr((item as Record<string, unknown>).provider);
+      const m = toStr((item as Record<string, unknown>).model);
+      if (p && m) entries.push({ provider: p, model: m });
+    }
+  }
+  return entries.length > 0 ? entries : undefined;
 }
 
 /** Safely coerce an unknown value to a boolean, or return undefined. */
@@ -243,5 +278,8 @@ export function resolveLcmConfig(
     circuitBreakerCooldownMs:
       parseFiniteInt(env.LCM_CIRCUIT_BREAKER_COOLDOWN_MS)
         ?? toNumber(pc.circuitBreakerCooldownMs) ?? 1_800_000,
+    fallbackProviders:
+      parseFallbackProviders(env.LCM_FALLBACK_PROVIDERS)
+        ?? toFallbackProviderArray(pc.fallbackProviders) ?? [],
   };
 }

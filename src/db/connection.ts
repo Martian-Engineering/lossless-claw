@@ -13,7 +13,7 @@ function isInMemoryPath(dbPath: string): boolean {
   return normalized === ":memory:" || normalized.startsWith("file::memory:");
 }
 
-function normalizePath(dbPath: string): ConnectionKey {
+export function normalizePath(dbPath: string): ConnectionKey {
   if (isInMemoryPath(dbPath)) {
     const trimmed = dbPath.trim();
     return trimmed.length > 0 ? trimmed : ":memory:";

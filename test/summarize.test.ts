@@ -956,6 +956,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     it("falls back to the next resolved model when the preferred model fails auth", async () => {
       const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
       try {
         const deps = makeDeps({
           resolveModel: vi.fn((modelRef?: string, providerHint?: string) => {
@@ -1026,11 +1027,12 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           model: "claude-sonnet-4-6",
         });
 
-        const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");
-        expect(warningText).toContain("summarizer auth fallback");
-        expect(warningText).toContain("retrying with anthropic/claude-sonnet-4-6");
+        const errorText = consoleError.mock.calls.flatMap((call) => call.map(String)).join(" ");
+        expect(errorText).toContain("PROVIDER FALLBACK");
+        expect(errorText).toContain("anthropic/claude-sonnet-4-6");
       } finally {
         consoleWarn.mockRestore();
+        consoleError.mockRestore();
       }
     });
 

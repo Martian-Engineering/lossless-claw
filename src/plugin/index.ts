@@ -9,9 +9,11 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig } from "../db/config.js";
-import { closeLcmConnection, createLcmDatabaseConnection } from "../db/connection.js";
+import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
 import { logStartupBannerOnce } from "../startup-banner-log.js";
+import { getSharedInit, setSharedInit, removeSharedInit } from "./shared-init.js";
+import type { SharedLcmInit } from "./shared-init.js";
 import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
@@ -1546,6 +1548,62 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   };
 }
 
+/**
+ * Wire event handlers, context engines, tools, and commands to the
+ * OpenClaw plugin API using shared init closures.
+ */
+function wirePluginHandlers(
+  api: OpenClawPluginApi,
+  deps: LcmDependencies,
+  shared: SharedLcmInit,
+): void {
+  api.on("before_reset", async (event, ctx) => {
+    await (await shared.waitForEngine()).handleBeforeReset({
+      reason: event.reason,
+      sessionId: ctx.sessionId,
+      sessionKey: ctx.sessionKey,
+    });
+  });
+  api.on("before_prompt_build", () => ({
+    prependSystemContext: LOSSLESS_RECALL_POLICY_PROMPT,
+  }));
+  api.on("session_end", async (event) => {
+    const lifecycleEvent = event as SessionEndLifecycleEvent;
+    await (await shared.waitForEngine()).handleSessionEnd({
+      reason: lifecycleEvent.reason,
+      sessionId: lifecycleEvent.sessionId,
+      sessionKey: lifecycleEvent.sessionKey,
+      nextSessionId: lifecycleEvent.nextSessionId,
+      nextSessionKey: lifecycleEvent.nextSessionKey,
+    });
+  });
+
+  api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
+  api.registerContextEngine("default", () => shared.getCachedEngine() ?? shared.waitForEngine());
+
+  api.registerTool((ctx) =>
+    createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmExpandQueryTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+      requesterSessionKey: ctx.sessionKey,
+    }),
+  );
+
+  api.registerCommand(
+    createLcmCommand({ db: shared.waitForDatabase, config: deps.config, deps }),
+  );
+}
+
 const lcmPlugin = {
   id: "lossless-claw",
   name: "Lossless Context Management",
@@ -1565,6 +1623,17 @@ const lcmPlugin = {
   register(api: OpenClawPluginApi) {
     const deps = createLcmDependencies(api);
     const dbPath = deps.config.databasePath;
+    const normalizedDbPath = normalizePath(dbPath);
+
+    // ── Singleton check ─────────────────────────────────────────────
+    // OpenClaw v2026.4.5+ calls register() per-agent-context (main,
+    // subagents, cron lanes). Reuse the existing connection and engine
+    // when the same DB path is already initialized.
+    const existingInit = getSharedInit(normalizedDbPath);
+    if (existingInit && !existingInit.stopped) {
+      wirePluginHandlers(api, deps, existingInit);
+      return;
+    }
 
     // ── Eager-first DB init with deferred fallback on lock ──────────
     let database: DatabaseSync | null = null;
@@ -1694,8 +1763,17 @@ const lcmPlugin = {
       });
     }
 
+    const shared: SharedLcmInit = {
+      stopped: false,
+      getCachedEngine: () => lcm,
+      waitForEngine,
+      waitForDatabase,
+    };
+    setSharedInit(normalizedDbPath, shared);
+
     api.on("gateway_stop", async () => {
       stopped = true;
+      shared.stopped = true;
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
@@ -1704,73 +1782,10 @@ const lcmPlugin = {
         database = null;
       }
       lcm = null;
+      removeSharedInit(normalizedDbPath);
     });
 
-    // ── Event handlers ──────────────────────────────────────────────
-    api.on("before_reset", async (event, ctx) => {
-      await (await waitForEngine()).handleBeforeReset({
-        reason: event.reason,
-        sessionId: ctx.sessionId,
-        sessionKey: ctx.sessionKey,
-      });
-    });
-    api.on("before_prompt_build", () => ({
-      prependSystemContext: LOSSLESS_RECALL_POLICY_PROMPT,
-    }));
-    api.on("session_end", async (event) => {
-      const lifecycleEvent = event as SessionEndLifecycleEvent;
-      await (await waitForEngine()).handleSessionEnd({
-        reason: lifecycleEvent.reason,
-        sessionId: lifecycleEvent.sessionId,
-        sessionKey: lifecycleEvent.sessionKey,
-        nextSessionId: lifecycleEvent.nextSessionId,
-        nextSessionKey: lifecycleEvent.nextSessionKey,
-      });
-    });
-
-    // ── Context engines ─────────────────────────────────────────────
-    api.registerContextEngine("lossless-claw", () => lcm ?? waitForEngine());
-    api.registerContextEngine("default", () => lcm ?? waitForEngine());
-
-    // ── Tools ───────────────────────────────────────────────────────
-    api.registerTool((ctx) =>
-      createLcmGrepTool({
-        deps,
-        getLcm: waitForEngine,
-        sessionKey: ctx.sessionKey,
-      }),
-    );
-    api.registerTool((ctx) =>
-      createLcmDescribeTool({
-        deps,
-        getLcm: waitForEngine,
-        sessionKey: ctx.sessionKey,
-      }),
-    );
-    api.registerTool((ctx) =>
-      createLcmExpandTool({
-        deps,
-        getLcm: waitForEngine,
-        sessionKey: ctx.sessionKey,
-      }),
-    );
-    api.registerTool((ctx) =>
-      createLcmExpandQueryTool({
-        deps,
-        getLcm: waitForEngine,
-        sessionKey: ctx.sessionKey,
-        requesterSessionKey: ctx.sessionKey,
-      }),
-    );
-
-    // ── Command ─────────────────────────────────────────────────────
-    api.registerCommand(
-      createLcmCommand({
-        db: waitForDatabase,
-        config: deps.config,
-        deps,
-      }),
-    );
+    wirePluginHandlers(api, deps, shared);
 
     logStartupBannerOnce({
       key: "plugin-loaded",
@@ -1786,6 +1801,13 @@ const lcmPlugin = {
         defaultProvider: process.env.OPENCLAW_PROVIDER?.trim() ?? "",
       }),
     });
+    if (deps.config.fallbackProviders.length > 0) {
+      logStartupBannerOnce({
+        key: "fallback-providers",
+        log: (message) => console.error(message),
+        message: `[lcm] Fallback providers: ${deps.config.fallbackProviders.map((fp) => `${fp.provider}/${fp.model}`).join(", ")}`,
+      });
+    }
   },
 };
 

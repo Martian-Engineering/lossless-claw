@@ -1335,10 +1335,17 @@ export class LcmContextEngine implements ContextEngine {
   private recordCompactionAuthFailure(key: string): void {
     const state = this.getCircuitBreakerState(key);
     state.failures++;
+    const halfThreshold = Math.ceil(this.config.circuitBreakerThreshold / 2);
+    if (state.failures === halfThreshold && state.failures < this.config.circuitBreakerThreshold) {
+      console.error(
+        `[lcm] WARNING: compaction degraded — ${state.failures}/${this.config.circuitBreakerThreshold} consecutive auth failures for ${key}`,
+      );
+    }
     if (state.failures >= this.config.circuitBreakerThreshold) {
       state.openSince = Date.now();
+      const cooldownMin = Math.round(this.config.circuitBreakerCooldownMs / 60000);
       console.error(
-        `[lcm] compaction circuit breaker OPEN: ${state.failures} consecutive auth failures for ${key}. Compaction halted. Will auto-retry after ${Math.round(this.config.circuitBreakerCooldownMs / 60000)}m or gateway restart.`,
+        `[lcm] CIRCUIT BREAKER OPEN: compaction disabled for ${key}. Auto-retry in ${cooldownMin}m. LCM is operating in degraded mode.`,
       );
     }
   }

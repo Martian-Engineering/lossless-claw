@@ -107,6 +107,10 @@
     "pruneHeartbeatOk": {
       "label": "Prune HEARTBEAT_OK",
       "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
+    },
+    "fallbackProviders": {
+      "label": "Fallback Providers",
+      "help": "Explicit fallback provider/model pairs for compaction summarization (e.g., [{\"provider\": \"anthropic\", \"model\": \"claude-haiku-4-5\"}])"
     }
   },
   "configSchema": {
@@ -233,6 +237,18 @@
       "databasePath": {
         "description": "Path to LCM SQLite database (alias for dbPath)",
         "type": "string"
+      },
+      "fallbackProviders": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "provider": { "type": "string" },
+            "model": { "type": "string" }
+          },
+          "required": ["provider", "model"],
+          "additionalProperties": false
+        }
       }
     }
   }
