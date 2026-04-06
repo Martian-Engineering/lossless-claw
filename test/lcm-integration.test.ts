@@ -3346,7 +3346,7 @@ describe("evaluateLeafTrigger skip guards", () => {
         summaryId: "existing-summary-1",
         conversationId: CONV_ID,
         kind: "leaf",
-        content: "x".repeat(opts.summaryTokens * 4),
+        content: "mock summary content",
         tokenCount: opts.summaryTokens,
       });
       await sumStore.appendContextSummary(CONV_ID, "existing-summary-1");
@@ -3474,8 +3474,8 @@ describe("evaluateLeafTrigger skip guards", () => {
   // ── Edge cases ─────────────────────────────────────────────────
 
   it("handles totalAssembledTokens=0 (empty conversation)", async () => {
-    const engine = createCompaction({ leafChunkTokens: 0 });
-    // No messages ingested
+    // No messages ingested — rawTokensOutsideTail=0 which is below any threshold
+    const engine = createCompaction();
     const result = await engine.evaluateLeafTrigger(CONV_ID);
     expect(result.shouldCompact).toBe(false);
     expect(result.rawTokensOutsideTail).toBe(0);
@@ -3519,14 +3519,20 @@ describe("evaluateLeafTrigger skip guards", () => {
     expect(result.shouldCompact).toBe(true);
   });
 
-  it("leafBudgetHeadroomFactor=0 disables headroom skip", async () => {
-    // ceiling = 0*0.75*200000 = 0 → totalAssembled < 0 is never true → headroom skip disabled
+  it("leafBudgetHeadroomFactor=0 disables headroom check (no false budget pressure)", async () => {
+    // factor=0 → headroomEnabled=false → no headroom skip, no budget pressure
+    // Falls through to cache-aware check with no budget pressure override.
+    // 10 msgs at 3000, freshTailCount=4 → 6 outside = 18000
+    // leafChunkTokens=15000 → perPass = min(18000,15000) = 15000
+    // estimatedReduction = 15000 - 2400 = 12600
+    // totalAssembled = 30000, 5% = 1500 → 12600 > 1500 → cache check passes → compact
     const engine = createCompaction({ leafBudgetHeadroomFactor: 0, leafChunkTokens: 15_000 });
     await setupConversation({ messageCount: 10, tokensPerMessage: 3000 });
 
     const result = await engine.evaluateLeafTrigger(CONV_ID, 200_000);
-    // Headroom disabled → falls to cache-aware → reduction is large enough → compact
+    // No budget pressure (headroom disabled), cache-aware passes → compact
     expect(result.shouldCompact).toBe(true);
+    expect(result.skipReason).toBeUndefined();
   });
 
   it("clamps leafBudgetHeadroomFactor above 1.0 to 1.0", async () => {
