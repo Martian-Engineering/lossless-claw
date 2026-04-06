@@ -2712,8 +2712,11 @@ export class LcmContextEngine implements ContextEngine {
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
 
     try {
-      const leafTrigger = await this.evaluateLeafTrigger(params.sessionId, params.sessionKey, tokenBudget);
+      const leafTrigger = await this.evaluateLeafTrigger(params.sessionId, params.sessionKey, tokenBudget, liveContextTokens);
       if (leafTrigger.shouldCompact) {
+        this.deps.log.info(
+          `[lcm] afterTurn: leaf compaction triggered (raw=${leafTrigger.rawTokensOutsideTail}, threshold=${leafTrigger.threshold}${leafTrigger.context ? `, assembled=${leafTrigger.context.totalAssembledTokens}, pressure=${leafTrigger.context.budgetPressure}` : ""})`,
+        );
         this.compactLeafAsync({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -2725,7 +2728,7 @@ export class LcmContextEngine implements ContextEngine {
           // Leaf compaction is best-effort and should not fail the caller.
         });
       } else if (leafTrigger.skipReason) {
-        this.deps.log.debug?.(
+        this.deps.log.info(
           `[lcm] afterTurn: leaf compaction skipped (${leafTrigger.skipReason})`,
         );
       }
@@ -2836,11 +2839,19 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /** Evaluate whether incremental leaf compaction should run for a session. */
-  async evaluateLeafTrigger(sessionId: string, sessionKey?: string, tokenBudget?: number): Promise<{
+  async evaluateLeafTrigger(sessionId: string, sessionKey?: string, tokenBudget?: number, liveContextTokens?: number): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
     skipReason?: string;
+    context?: {
+      totalAssembledTokens: number;
+      budgetCeiling?: number;
+      budgetPressure: boolean;
+      estimatedReduction?: number;
+      reductionThreshold?: number;
+      headroomFactor: number;
+    };
   }> {
     this.ensureMigrated();
     const conversation = await this.conversationStore.getConversationForSession({
@@ -2860,7 +2871,7 @@ export class LcmContextEngine implements ContextEngine {
         threshold: fallbackThreshold,
       };
     }
-    return this.compaction.evaluateLeafTrigger(conversation.conversationId, tokenBudget);
+    return this.compaction.evaluateLeafTrigger(conversation.conversationId, tokenBudget, liveContextTokens);
   }
 
   /** Run one incremental leaf compaction pass in the per-session queue. */
