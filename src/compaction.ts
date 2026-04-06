@@ -55,9 +55,9 @@ export interface CompactionConfig {
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
   /** Minimum estimated reduction fraction to justify leaf compaction (default 0.05). */
-  leafSkipReductionThreshold: number;
+  leafSkipReductionThreshold?: number;
   /** Skip leaf compaction when assembled tokens < factor × contextThreshold × tokenBudget (default 0.8). */
-  leafBudgetHeadroomFactor: number;
+  leafBudgetHeadroomFactor?: number;
 }
 
 export type LeafTriggerResult = {
