@@ -54,6 +54,10 @@ export interface CompactionConfig {
   timezone?: string;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
+  /** Minimum estimated reduction fraction to justify leaf compaction (default 0.05). */
+  leafSkipReductionThreshold: number;
+  /** Skip leaf compaction when assembled tokens < factor × contextThreshold × tokenBudget (default 0.8). */
+  leafBudgetHeadroomFactor: number;
 }
 
 type CompactionLevel = "normal" | "aggressive" | "fallback" | "capped";
@@ -383,18 +387,59 @@ export class CompactionEngine {
    * `leafChunkTokens`. This lets callers trigger a soft incremental leaf pass
    * before the full context threshold is breached.
    */
-  async evaluateLeafTrigger(conversationId: number): Promise<{
+  async evaluateLeafTrigger(
+    conversationId: number,
+    tokenBudget?: number,
+  ): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
+    skipReason?: string;
   }> {
     const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId);
     const threshold = this.resolveLeafChunkTokens();
-    return {
-      shouldCompact: rawTokensOutsideTail >= threshold,
-      rawTokensOutsideTail,
-      threshold,
-    };
+
+    if (rawTokensOutsideTail < threshold) {
+      return { shouldCompact: false, rawTokensOutsideTail, threshold };
+    }
+
+    const totalAssembledTokens = await this.summaryStore.getContextTokenCount(conversationId);
+
+    // Cache-aware skip: if estimated reduction is tiny relative to total
+    // context, the prompt-cache prefix invalidation cost exceeds the gain.
+    const estimatedReduction = rawTokensOutsideTail - this.config.leafTargetTokens;
+    const reductionThreshold = this.config.leafSkipReductionThreshold ?? 0.05;
+    if (
+      totalAssembledTokens > 0 &&
+      estimatedReduction > 0 &&
+      estimatedReduction < reductionThreshold * totalAssembledTokens
+    ) {
+      return {
+        shouldCompact: false,
+        rawTokensOutsideTail,
+        threshold,
+        skipReason: `cache-aware: reduction ${estimatedReduction} < ${(reductionThreshold * 100).toFixed(0)}% of ${totalAssembledTokens} assembled`,
+      };
+    }
+
+    // Budget headroom skip: if assembled tokens are well under the budget
+    // ceiling, skip to avoid unnecessary cache prefix churn.
+    const headroomFactor = this.config.leafBudgetHeadroomFactor ?? 0.8;
+    if (typeof tokenBudget === "number" && tokenBudget > 0) {
+      const budgetCeiling = Math.floor(
+        headroomFactor * this.config.contextThreshold * tokenBudget,
+      );
+      if (totalAssembledTokens < budgetCeiling) {
+        return {
+          shouldCompact: false,
+          rawTokensOutsideTail,
+          threshold,
+          skipReason: `budget-headroom: ${totalAssembledTokens} assembled < ${budgetCeiling} ceiling`,
+        };
+      }
+    }
+
+    return { shouldCompact: true, rawTokensOutsideTail, threshold };
   }
 
   // ── compact ──────────────────────────────────────────────────────────────
@@ -429,7 +474,7 @@ export class CompactionEngine {
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    const leafTrigger = await this.evaluateLeafTrigger(conversationId, tokenBudget);
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {
@@ -557,7 +602,7 @@ export class CompactionEngine {
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    const leafTrigger = await this.evaluateLeafTrigger(conversationId, tokenBudget);
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {

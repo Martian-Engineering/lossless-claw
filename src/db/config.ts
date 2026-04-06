@@ -58,6 +58,12 @@ export type LcmConfig = {
   circuitBreakerThreshold: number;
   /** Cooldown in milliseconds before the circuit breaker auto-resets (default 30 min). */
   circuitBreakerCooldownMs: number;
+  /** Minimum estimated reduction (fraction of total assembled tokens) to justify leaf compaction.
+   *  Prevents cache-prefix invalidation when the gain is tiny relative to total context. Default 0.05. */
+  leafSkipReductionThreshold: number;
+  /** Skip leaf compaction when assembled tokens < factor × contextThreshold × tokenBudget.
+   *  Avoids unnecessary compaction when there is ample budget headroom. Default 0.8. */
+  leafBudgetHeadroomFactor: number;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -243,5 +249,11 @@ export function resolveLcmConfig(
     circuitBreakerCooldownMs:
       parseFiniteInt(env.LCM_CIRCUIT_BREAKER_COOLDOWN_MS)
         ?? toNumber(pc.circuitBreakerCooldownMs) ?? 1_800_000,
+    leafSkipReductionThreshold:
+      parseFiniteNumber(env.LCM_LEAF_SKIP_REDUCTION_THRESHOLD)
+        ?? toNumber(pc.leafSkipReductionThreshold) ?? 0.05,
+    leafBudgetHeadroomFactor:
+      parseFiniteNumber(env.LCM_LEAF_BUDGET_HEADROOM_FACTOR)
+        ?? toNumber(pc.leafBudgetHeadroomFactor) ?? 0.8,
   };
 }

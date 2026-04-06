@@ -3690,7 +3690,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       tokenBudget: 4096,
     });
 
-    expect(evaluateLeafTriggerSpy).toHaveBeenCalledWith(sessionId, undefined);
+    expect(evaluateLeafTriggerSpy).toHaveBeenCalledWith(sessionId, undefined, 4096);
     expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
     expect(compactSpy).toHaveBeenCalledWith(
       expect.objectContaining({

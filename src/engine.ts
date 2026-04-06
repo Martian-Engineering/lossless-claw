@@ -1264,6 +1264,8 @@ export class LcmContextEngine implements ContextEngine {
       maxRounds: 10,
       timezone: this.config.timezone,
       summaryMaxOverageFactor: this.config.summaryMaxOverageFactor,
+      leafSkipReductionThreshold: this.config.leafSkipReductionThreshold ?? 0.05,
+      leafBudgetHeadroomFactor: this.config.leafBudgetHeadroomFactor ?? 0.8,
     };
     this.compaction = new CompactionEngine(
       this.conversationStore,
@@ -2710,7 +2712,7 @@ export class LcmContextEngine implements ContextEngine {
     const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
 
     try {
-      const leafTrigger = await this.evaluateLeafTrigger(params.sessionId, params.sessionKey);
+      const leafTrigger = await this.evaluateLeafTrigger(params.sessionId, params.sessionKey, tokenBudget);
       if (leafTrigger.shouldCompact) {
         this.compactLeafAsync({
           sessionId: params.sessionId,
@@ -2722,6 +2724,10 @@ export class LcmContextEngine implements ContextEngine {
         }).catch(() => {
           // Leaf compaction is best-effort and should not fail the caller.
         });
+      } else if (leafTrigger.skipReason) {
+        this.deps.log.debug?.(
+          `[lcm] afterTurn: leaf compaction skipped (${leafTrigger.skipReason})`,
+        );
       }
     } catch {
       // Leaf trigger checks are best-effort.
@@ -2830,10 +2836,11 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /** Evaluate whether incremental leaf compaction should run for a session. */
-  async evaluateLeafTrigger(sessionId: string, sessionKey?: string): Promise<{
+  async evaluateLeafTrigger(sessionId: string, sessionKey?: string, tokenBudget?: number): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
+    skipReason?: string;
   }> {
     this.ensureMigrated();
     const conversation = await this.conversationStore.getConversationForSession({
@@ -2853,7 +2860,7 @@ export class LcmContextEngine implements ContextEngine {
         threshold: fallbackThreshold,
       };
     }
-    return this.compaction.evaluateLeafTrigger(conversation.conversationId);
+    return this.compaction.evaluateLeafTrigger(conversation.conversationId, tokenBudget);
   }
 
   /** Run one incremental leaf compaction pass in the per-session queue. */
