@@ -2728,7 +2728,7 @@ export class LcmContextEngine implements ContextEngine {
           // Leaf compaction is best-effort and should not fail the caller.
         });
       } else if (leafTrigger.skipReason) {
-        this.deps.log.info(
+        this.deps.log.debug?.(
           `[lcm] afterTurn: leaf compaction skipped (${leafTrigger.skipReason})`,
         );
       }
