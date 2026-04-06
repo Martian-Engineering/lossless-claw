@@ -1540,7 +1540,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       info: (msg) => console.error(msg),
       warn: (msg) => console.error(msg),
       error: (msg) => console.error(msg),
-      debug: (msg) => console.error(msg),
+      debug: (msg) => api.logger.debug?.(msg),
     },
   };
 }
@@ -1627,12 +1627,12 @@ const lcmPlugin = {
 
     logStartupBannerOnce({
       key: "plugin-loaded",
-      log: (message) => api.logger.info(message),
+      log: (message) => console.error(message),
       message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
     });
     logStartupBannerOnce({
       key: "compaction-model",
-      log: (message) => api.logger.info(message),
+      log: (message) => console.error(message),
       message: buildCompactionModelLog({
         config: deps.config,
         openClawConfig: api.config,
