@@ -1611,7 +1611,8 @@ const lcmPlugin = {
           }
         });
       } else {
-        // Non-lock error — rethrow so the engine constructor logs it.
+        // Non-lock error — rethrow so plugin startup fails fast and the
+        // surrounding framework can log or surface the initialization error.
         throw err;
       }
     }
@@ -1643,8 +1644,8 @@ const lcmPlugin = {
     // If init was deferred, build the engine lazily after DB is ready.
     let deferredEngine: LcmContextEngine | null = null;
     function getEngine(): LcmContextEngine {
-      if (lcm) return lcm;
       const db = getDatabase();
+      if (lcm) return lcm;
       if (!deferredEngine) {
         deferredEngine = new LcmContextEngine(deps, db);
       }
