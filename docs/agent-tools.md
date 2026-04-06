@@ -32,6 +32,8 @@ Summaries are lossy by design. The "Expand for details about:" footer at the end
 
 Search across messages and/or summaries using regex or full-text search.
 
+Use `mode: "full_text"` for keyword or topical recall. Wrap exact multi-word phrases in quotes to preserve phrase matching. Keep the default `sort: "recency"` for recent events, switch to `sort: "relevance"` when looking for the best older match on a topic, and use `sort: "hybrid"` when you want relevance without giving up recency entirely.
+
 **Parameters:**
 
 | Param | Type | Required | Default | Description |
@@ -44,6 +46,7 @@ Search across messages and/or summaries using regex or full-text search.
 | `since` | string | | — | ISO timestamp lower bound |
 | `before` | string | | — | ISO timestamp upper bound |
 | `limit` | number | | 50 | Max results (1–200) |
+| `sort` | string | | `"recency"` | `"recency"`, `"relevance"`, or `"hybrid"` for full-text ranking |
 
 **Returns:** Array of matches with:
 - `id` — Message or summary ID
@@ -58,6 +61,9 @@ Search across messages and/or summaries using regex or full-text search.
 ```
 # Full-text search across all conversations
 lcm_grep(pattern: "database migration", mode: "full_text", allConversations: true)
+
+# Older-topic recall ranked by FTS relevance
+lcm_grep(pattern: "\"error handling\" retries", mode: "full_text", sort: "relevance")
 
 # Regex search in summaries only
 lcm_grep(pattern: "config\\.threshold.*0\\.[0-9]+", scope: "summaries")
@@ -167,7 +173,7 @@ Add instructions to your agent's system prompt so it knows when to use LCM tools
 ## Memory & Context
 
 Use LCM tools for recall:
-1. `lcm_grep` — Search all conversations by keyword/regex
+1. `lcm_grep` — Search all conversations by keyword/regex. Prefer `mode: "full_text"` for topic recall, quote exact phrases, use `sort: "relevance"` for older-topic lookups, and `sort: "hybrid"` when recency should still matter.
 2. `lcm_describe` — Inspect a specific summary (cheap, no sub-agent)
 3. `lcm_expand_query` — Deep recall with sub-agent expansion
 

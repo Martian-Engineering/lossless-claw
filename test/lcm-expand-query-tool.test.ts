@@ -979,6 +979,9 @@ describe("createLcmExpandQueryTool", () => {
     const message = typeof rawMessage === "string" ? rawMessage : "";
     expect(message).toContain("sum_x");
     expect(message).toContain("sum_y");
+    expect(message).toContain('Prefer `mode: "full_text"`');
+    expect(message).toContain('sort: "relevance"');
+    expect(message).toContain('sort: "hybrid"');
 
     expect(result.details).toMatchObject({
       sourceConversationId: 7,

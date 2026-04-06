@@ -124,6 +124,11 @@ describe("lcm plugin prompt hook", () => {
     );
     expect(result.prependSystemContext).toContain("Recall order for compacted conversation history:");
     expect(result.prependSystemContext).toContain("1. `lcm_grep` — search by regex or full-text");
+    expect(result.prependSystemContext).toContain("`lcm_grep` routing guidance");
+    expect(result.prependSystemContext).toContain('Prefer `mode: "full_text"` for keyword or topical recall');
+    expect(result.prependSystemContext).toContain('Wrap exact multi-word phrases in quotes');
+    expect(result.prependSystemContext).toContain('Use `sort: "relevance"` when hunting for the best older match');
+    expect(result.prependSystemContext).toContain('Use `sort: "hybrid"` when relevance matters but newer context should still get a boost');
     expect(result.prependSystemContext).toContain("2. `lcm_describe` — inspect a specific summary");
     expect(result.prependSystemContext).toContain(
       "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent",

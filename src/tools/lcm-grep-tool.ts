@@ -25,7 +25,7 @@ function formatDisplayTime(
 const LcmGrepSchema = Type.Object({
   pattern: Type.String({
     description:
-      "Search pattern. Interpreted as regex when mode is 'regex', or as a text query for 'full_text' mode.",
+      'Search pattern. Interpreted as regex when mode is "regex", or as a text query for "full_text" mode. In full_text mode, wrap exact multi-word phrases in quotes to preserve phrase matching.',
   }),
   mode: Type.Optional(
     Type.String({
@@ -73,7 +73,7 @@ const LcmGrepSchema = Type.Object({
   sort: Type.Optional(
     Type.String({
       description:
-        'Sort order: "recency" (newest first, default), "relevance" (best FTS5 match first, full_text mode only), or "hybrid" (blends relevance with recency). Note: relevance/hybrid re-rank within the top results by recency, so very old matches may not appear. Increase limit for broader coverage.',
+        'Sort order: "recency" (newest first, default), "relevance" (best FTS5 match first, full_text mode only), or "hybrid" (full_text mode only; balances relevance with recency). Applied before limit is enforced.',
       enum: ["recency", "relevance", "hybrid"],
     }),
   ),
@@ -101,7 +101,7 @@ export function createLcmGrepTool(input: {
       "Search compacted conversation history using regex or full-text search. " +
       "Searches across messages and/or summaries stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
-      "active context. Returns matching snippets with their summary/message IDs " +
+      "active context. In full_text mode, quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. Returns matching snippets with their summary/message IDs " +
       "for follow-up with lcm_expand or lcm_describe.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
@@ -117,6 +117,8 @@ export function createLcmGrepTool(input: {
       const mode = (p.mode as "regex" | "full_text") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
+      const requestedSort = (p.sort as "recency" | "relevance" | "hybrid") ?? "recency";
+      const effectiveSort = mode === "full_text" ? requestedSort : "recency";
       let since: Date | undefined;
       let before: Date | undefined;
       try {
@@ -145,8 +147,6 @@ export function createLcmGrepTool(input: {
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
         });
       }
-
-      const sort = (p.sort as "recency" | "relevance" | "hybrid") ?? "recency";
       const result = await retrieval.grep({
         query: pattern,
         mode,
@@ -155,13 +155,13 @@ export function createLcmGrepTool(input: {
         limit,
         since,
         before,
-        sort,
+        sort: effectiveSort,
       });
 
       const lines: string[] = [];
       lines.push("## LCM Grep Results");
       lines.push(`**Pattern:** \`${pattern}\``);
-      lines.push(`**Mode:** ${mode} | **Scope:** ${scope}`);
+      lines.push(`**Mode:** ${mode} | **Scope:** ${scope} | **Sort:** ${effectiveSort}`);
       if (conversationScope.allConversations) {
         lines.push("**Conversation scope:** all conversations");
       } else if (conversationScope.conversationId != null) {

@@ -95,6 +95,8 @@ function buildSystemPromptAddition(summarySignals: SummaryPromptSignal[]): strin
       "2) `lcm_expand_query` with a focused prompt",
       "3) Answer with citations to summary IDs used",
       "",
+      "`lcm_grep` tips: prefer `mode: \"full_text\"` for keyword/topic lookup, quote exact multi-word phrases, use `sort: \"relevance\"` for older-topic retrieval, and use `sort: \"hybrid\"` when recency should still influence ranking.",
+      "",
       "**Uncertainty checklist (run before answering):**",
       "- Am I making an exact factual claim from a compressed or condensed summary?",
       "- Could compaction have omitted a crucial detail?",

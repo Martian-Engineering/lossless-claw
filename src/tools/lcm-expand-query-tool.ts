@@ -195,7 +195,7 @@ function buildDelegatedExpandQueryTask(params: {
     "",
     "Strategy:",
     "1. Start with `lcm_describe` on seed summaries to inspect subtree manifests and branch costs.",
-    "2. If additional candidates are needed, use `lcm_grep` scoped to summaries.",
+    "2. If additional candidates are needed, use `lcm_grep` scoped to summaries. Prefer `mode: \"full_text\"`, quote exact multi-word phrases, use `sort: \"relevance\"` for older-topic recall, and `sort: \"hybrid\"` when recency should still matter.",
     "3. Select branches that fit remaining budget; prefer high-signal paths first.",
     "4. Call `lcm_expand` selectively (do not expand everything blindly).",
     "5. Keep includeMessages=false by default; use includeMessages=true for the message-backed seed summaries above and any other specific leaf evidence.",

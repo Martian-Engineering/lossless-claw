@@ -9,6 +9,7 @@ import type {
   SummarySearchResult,
   LargeFileRecord,
 } from "./store/summary-store.js";
+import type { SearchSort } from "./store/full-text-sort.js";
 
 // ── Public interfaces ────────────────────────────────────────────────────────
 
@@ -71,7 +72,7 @@ export interface GrepInput {
   /** Sort order for results. Default "recency" (newest first).
    *  "relevance" sorts by FTS5 BM25 rank (full_text mode only).
    *  "hybrid" blends relevance with recency. */
-  sort?: "recency" | "relevance" | "hybrid";
+  sort?: SearchSort;
 }
 
 export interface GrepResult {
@@ -226,9 +227,9 @@ export class RetrievalEngine {
    * Depending on `scope`, searches messages, summaries, or both (in parallel).
    */
   async grep(input: GrepInput): Promise<GrepResult> {
-    const { query, mode, scope, conversationId, since, before, limit } = input;
+    const { query, mode, scope, conversationId, since, before, limit, sort } = input;
 
-    const searchInput = { query, mode, conversationId, since, before, limit };
+    const searchInput = { query, mode, conversationId, since, before, limit, sort };
 
     let messages: MessageSearchResult[] = [];
     let summaries: SummarySearchResult[] = [];
@@ -243,42 +244,6 @@ export class RetrievalEngine {
         this.conversationStore.searchMessages(searchInput),
         this.summaryStore.searchSummaries(searchInput),
       ]);
-    }
-
-    // NOTE: sort is applied post-fetch. The store queries use ORDER BY created_at
-    // DESC LIMIT ?, so relevance/hybrid modes re-rank within the top-N-by-recency
-    // window. A truly relevant older result outside the LIMIT window won't appear.
-    // This is a known limitation — fixing it would require passing sort mode into
-    // the SQL layer (ORDER BY rank LIMIT ?), which is a larger change.
-    // Relevance/hybrid only meaningful for full_text mode; fall back to recency for regex.
-    const sortMode = (input.sort === "relevance" || input.sort === "hybrid") && mode !== "full_text"
-      ? "recency"
-      : input.sort ?? "recency";
-    if (sortMode === "relevance") {
-      // FTS5 rank is negative (more negative = better match). Sort ascending.
-      // Tiebreaker: recency (newest first) when ranks are equal.
-      messages.sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0) || b.createdAt.getTime() - a.createdAt.getTime());
-      summaries.sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0) || b.createdAt.getTime() - a.createdAt.getTime());
-    } else if (sortMode === "hybrid") {
-      // Blend relevance with recency. FTS5 rank is negative (lower = better),
-      // so we negate it to get a positive relevance score, then penalize age.
-      // AGE_DECAY_RATE: ~1% relevance penalty per 10 hours of age.
-      // At 100h: ~9% penalty. At 1000h (~6 weeks): ~50% penalty.
-      const AGE_DECAY_RATE = 0.001;
-      const now = Date.now();
-      const score = (item: { rank?: number; createdAt: Date }) => {
-        const relevance = -(item.rank ?? 0); // higher = more relevant
-        const ageHours = (now - item.createdAt.getTime()) / 3_600_000;
-        const agePenalty = 1 + ageHours * AGE_DECAY_RATE;
-        return -(relevance / agePenalty); // negate so sort ascending = best first
-      };
-      // Tiebreaker: recency (newest first) when hybrid scores are equal.
-      messages.sort((a, b) => score(a) - score(b) || b.createdAt.getTime() - a.createdAt.getTime());
-      summaries.sort((a, b) => score(a) - score(b) || b.createdAt.getTime() - a.createdAt.getTime());
-    } else {
-      // Default: recency (newest first)
-      messages.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-      summaries.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
     }
 
     return {

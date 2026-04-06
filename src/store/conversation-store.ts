@@ -4,6 +4,7 @@ import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
+import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -94,6 +95,7 @@ export type MessageSearchInput = {
   since?: Date;
   before?: Date;
   limit?: number;
+  sort?: SearchSort;
 };
 
 export type MessageSearchResult = {
@@ -714,6 +716,7 @@ export class ConversationStore {
             input.conversationId,
             input.since,
             input.before,
+            input.sort,
           );
         } catch {
           return this.searchLike(
@@ -764,6 +767,7 @@ export class ConversationStore {
     conversationId?: ConversationId,
     since?: Date,
     before?: Date,
+    sort?: SearchSort,
   ): MessageSearchResult[] {
     const where: string[] = ["messages_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
@@ -780,6 +784,7 @@ export class ConversationStore {
       args.push(before.toISOString());
     }
     args.push(limit);
+    const orderBy = buildFtsOrderBy(sort, "m.created_at");
 
     const sql = `SELECT
          m.message_id,
@@ -791,7 +796,7 @@ export class ConversationStore {
        FROM messages_fts
        JOIN messages m ON m.message_id = messages_fts.rowid
        WHERE ${where.join(" AND ")}
-       ORDER BY m.created_at DESC
+       ORDER BY ${orderBy}
        LIMIT ?`;
     const rows = this.db.prepare(sql).all(...args) as unknown as MessageSearchRow[];
     return rows.map(toSearchResult);

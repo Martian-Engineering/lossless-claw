@@ -215,6 +215,39 @@ describe("LCM tools session scoping", () => {
     expect(text).toContain("deployment timeline");
   });
 
+  it("lcm_grep forwards full-text sort mode and reports it in output", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-sort", {
+      pattern: '"error handling" retries',
+      mode: "full_text",
+      sort: "relevance",
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        mode: "full_text",
+        sort: "relevance",
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("**Mode:** full_text | **Scope:** both | **Sort:** relevance");
+  });
+
   it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({

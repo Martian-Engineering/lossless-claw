@@ -3028,6 +3028,10 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(promptAddition).toContain("1) `lcm_grep` to locate relevant summary/message IDs");
     expect(promptAddition).toContain("2) `lcm_expand_query` with a focused prompt");
     expect(promptAddition).toContain("3) Answer with citations to summary IDs used");
+    expect(promptAddition).toContain("prefer `mode: \"full_text\"` for keyword/topic lookup");
+    expect(promptAddition).toContain("quote exact multi-word phrases");
+    expect(promptAddition).toContain("use `sort: \"relevance\"` for older-topic retrieval");
+    expect(promptAddition).toContain("use `sort: \"hybrid\"` when recency should still influence ranking");
     expect(promptAddition).toContain("Uncertainty checklist");
     expect(promptAddition).toContain("Am I making an exact factual claim from a compressed or condensed summary?");
     expect(promptAddition).toContain("Could compaction have omitted a crucial detail?");
