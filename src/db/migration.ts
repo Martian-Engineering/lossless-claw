@@ -606,13 +606,12 @@ export function runLcmMigrations(
   `);
   db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
   ensureSummaryDepthColumn(db);
-  // Index depends on depth column — must come after ensureSummaryDepthColumn.
-  // Column order: (conversation_id, depth, kind) matches the primary query pattern
-  // in getDistinctDepthsInContext which filters by conversation_id + depth.
-  db.exec(`CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`);
   ensureSummaryMetadataColumns(db);
   ensureSummaryModelColumn(db);
   backfillSummaryDepths(db);
+  // Index on depth — created AFTER backfillSummaryDepths to avoid index
+  // maintenance overhead during bulk depth updates on large existing DBs.
+  db.exec(`CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`);
   backfillSummaryMetadata(db);
   backfillToolCallColumns(db);
 
