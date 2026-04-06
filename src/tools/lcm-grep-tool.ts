@@ -50,7 +50,7 @@ const LcmGrepSchema = Type.Object({
   allConversations: Type.Optional(
     Type.Boolean({
       description:
-        "Set true to explicitly search across all conversations. Ignored when conversationId is provided.",
+        "Search across all conversations. Defaults to true when conversationId is not provided. Set false to restrict to the current session conversation.",
     }),
   ),
   since: Type.Optional(
@@ -91,9 +91,9 @@ export function createLcmGrepTool(input: {
     label: "LCM Grep",
     description:
       "Search compacted conversation history using regex or full-text search. " +
-      "Searches across messages and/or summaries stored by LCM. " +
-      "Use this to find specific content that may have been compacted away from " +
-      "active context. Returns matching snippets with their summary/message IDs " +
+      "By default searches across ALL conversations. " +
+      "Use conversationId to restrict to a specific conversation, or allConversations=false " +
+      "to restrict to the current session. Returns matching snippets with their summary/message IDs " +
       "for follow-up with lcm_expand or lcm_describe.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
@@ -120,12 +120,19 @@ export function createLcmGrepTool(input: {
           error: "`since` must be earlier than `before`.",
         });
       }
+      // Default to searching all conversations when neither conversationId
+      // nor allConversations is explicitly provided.
+      const effectiveParams =
+        p.conversationId === undefined && p.allConversations === undefined
+          ? { ...p, allConversations: true }
+          : p;
+
       const conversationScope = await resolveLcmConversationScope({
         lcm: input.lcm,
         deps: input.deps,
         sessionId: input.sessionId,
         sessionKey: input.sessionKey,
-        params: p,
+        params: effectiveParams,
       });
       if (!conversationScope.allConversations && conversationScope.conversationId == null) {
         return jsonResult({

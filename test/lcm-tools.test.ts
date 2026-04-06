@@ -201,21 +201,51 @@ describe("LCM tools session scoping", () => {
       before: "2026-01-04T00:00:00.000Z",
     });
 
+    // lcm_grep defaults to allConversations when no conversationId is provided
     expect(retrieval.grep).toHaveBeenCalledWith(
       expect.objectContaining({
-        conversationId: 42,
+        conversationId: undefined,
         since: expect.any(Date),
         before: expect.any(Date),
       }),
     );
     const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("all conversations");
     expect(text).toContain(formatTimestamp(createdAt, timezone));
     expect(text).toContain(formatTimestamp(new Date("2026-01-01T00:00:00.000Z"), timezone));
     expect(text).toContain(formatTimestamp(new Date("2026-01-04T00:00:00.000Z"), timezone));
     expect(text).toContain("deployment timeline");
   });
 
-  it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {
+  it("lcm_grep scopes to current session when allConversations is explicitly false", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    await tool.execute("call-scope", {
+      pattern: "test",
+      allConversations: false,
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+      }),
+    );
+  });
+
+  it("lcm_grep resolves conversation scope via sessionKey continuity when allConversations is explicitly false", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
         messages: [],
@@ -233,13 +263,41 @@ describe("LCM tools session scoping", () => {
       lcm: buildLcmEngine({ retrieval, conversationIdBySessionKey: 42 }) as never,
       sessionKey: "agent:main:main",
     });
-    await tool.execute("call-2b", { pattern: "deployment" });
+    await tool.execute("call-2b", { pattern: "deployment", allConversations: false });
 
     expect(retrieval.grep).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: 42,
       }),
     );
+  });
+
+  it("lcm_grep defaults to all conversations when no scope params provided", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-default", { pattern: "test" });
+
+    // Should search all conversations, not scope to conversation 42
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: undefined,
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("all conversations");
   });
 
   it("lcm_describe blocks cross-conversation lookup unless allConversations=true", async () => {
