@@ -1463,9 +1463,10 @@ export class CompactionEngine {
     const tokenCount = estimateTokens(summary.content);
     // Note: removedTokens uses resolveMessageTokenCount values (which fall back to
     // estimateTokens for messages with token_count <= 0). This can diverge from
-    // getContextTokenCount() which would sum the stored 0. In practice, messages
-    // with token_count=0 are rare (only for empty/corrupt messages) and the delta
-    // is used for soft convergence checks, not hard limits.
+    // getContextTokenCount() which would sum the stored 0. The delta feeds into
+    // stopping decisions (threshold checks, progress guards), but the divergence
+    // is bounded to empty/corrupt messages (token_count=0) which are rare.
+    // For summaries, removedTokens matches the DB exactly (same tokenCount column).
     const removedTokens = messageContents.reduce(
       (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
       0,
