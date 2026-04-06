@@ -399,6 +399,17 @@ describe("pruneConversations", () => {
 
     expect(result.deleted).toBe(1);
     expect(result.vacuumed).toBe(true);
+    expect(
+      fixture.db.prepare(`PRAGMA wal_checkpoint(PASSIVE)`).get() as {
+        busy: number;
+        log: number;
+        checkpointed: number;
+      },
+    ).toEqual({
+      busy: 0,
+      log: 0,
+      checkpointed: 0,
+    });
   });
 
   it("treats conversations with no messages as candidates based on created_at", () => {

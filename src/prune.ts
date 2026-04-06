@@ -376,6 +376,9 @@ export function pruneConversations(
 
   if (options.vacuum && deleted > 0) {
     db.exec("VACUUM");
+    // VACUUM in WAL mode can leave the reclaimed pages in the WAL file until
+    // a checkpoint folds them back into the main database.
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     vacuumed = true;
   }
 
