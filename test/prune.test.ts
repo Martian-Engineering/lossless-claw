@@ -151,6 +151,27 @@ describe("pruneConversations", () => {
     expect(remaining.cnt).toBe(2);
   });
 
+  it("compares SQLite and ISO timestamps chronologically instead of lexically", () => {
+    const fixture = createPruneFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    // SQLite defaults to "YYYY-MM-DD HH:MM:SS". This timestamp is newer than
+    // the cutoff even though it sorts before an ISO string lexically.
+    seedConversation(fixture, {
+      sessionId: "same-day-sqlite-format",
+      sessionKey: "same-day-sqlite-format",
+      messageCreatedAt: "2025-03-03 23:59:59",
+    });
+
+    const result = pruneConversations(fixture.db, {
+      before: "90d",
+      now: "2025-06-01T00:00:00.000Z",
+    });
+
+    expect(result.candidates).toHaveLength(0);
+  });
+
   it("deletes conversations when confirm is true", () => {
     const fixture = createPruneFixture();
     tempDirs.add(fixture.tempDir);

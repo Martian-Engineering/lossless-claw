@@ -80,6 +80,40 @@ export type PruneOptions = {
 
 // ── Core prune logic ────────────────────────────────────────────────────────
 
+type PruneCandidateRow = {
+  conversation_id: number;
+  session_key: string | null;
+  message_count: number;
+  summary_count: number;
+  latest_message_at: string;
+  created_at: string;
+};
+
+const SELECT_PRUNE_CANDIDATES_SQL = `SELECT
+   c.conversation_id,
+   c.session_key,
+   COALESCE(msg_stats.message_count, 0) AS message_count,
+   COALESCE(sum_stats.summary_count, 0) AS summary_count,
+   COALESCE(msg_stats.latest_message_at, c.created_at) AS latest_message_at,
+   c.created_at
+ FROM conversations c
+ LEFT JOIN (
+   SELECT conversation_id,
+          COUNT(*) AS message_count,
+          MAX(created_at) AS latest_message_at
+   FROM messages
+   GROUP BY conversation_id
+ ) msg_stats ON msg_stats.conversation_id = c.conversation_id
+ LEFT JOIN (
+   SELECT conversation_id,
+          COUNT(*) AS summary_count
+   FROM summaries
+   GROUP BY conversation_id
+ ) sum_stats ON sum_stats.conversation_id = c.conversation_id
+ WHERE julianday(COALESCE(msg_stats.latest_message_at, c.created_at)) < julianday(?)
+ ORDER BY julianday(COALESCE(msg_stats.latest_message_at, c.created_at)) ASC,
+          c.conversation_id ASC`;
+
 /**
  * Compute the UTC cutoff date by subtracting `days` from `now`.
  */
@@ -87,6 +121,34 @@ function computeCutoffDate(days: number, now?: string): string {
   const base = now ? new Date(now) : new Date();
   base.setUTCDate(base.getUTCDate() - days);
   return base.toISOString();
+}
+
+/**
+ * Load prune candidates using SQLite date math so mixed timestamp formats are
+ * compared chronologically instead of lexically.
+ */
+function loadPruneCandidates(db: DatabaseSync, cutoffDate: string): PruneCandidate[] {
+  const rows = db.prepare(SELECT_PRUNE_CANDIDATES_SQL).all(cutoffDate) as PruneCandidateRow[];
+  return rows.map((row) => ({
+    conversationId: row.conversation_id,
+    sessionKey: row.session_key,
+    messageCount: row.message_count,
+    summaryCount: row.summary_count,
+    latestMessageAt: row.latest_message_at,
+    createdAt: row.created_at,
+  }));
+}
+
+/**
+ * Delete candidate conversations and return the number of rows removed.
+ */
+function deleteCandidates(db: DatabaseSync, candidates: PruneCandidate[]): number {
+  const deleteStmt = db.prepare(`DELETE FROM conversations WHERE conversation_id = ?`);
+  let deleted = 0;
+  for (const candidate of candidates) {
+    deleted += Number(deleteStmt.run(candidate.conversationId).changes ?? 0);
+  }
+  return deleted;
 }
 
 /**
@@ -109,72 +171,31 @@ export function pruneConversations(
 
   const cutoffDate = computeCutoffDate(days, options.now);
 
-  // Find conversations where the most recent message is older than the cutoff.
-  // Conversations with zero messages are also candidates (they have no useful data).
-  const candidates = db
-    .prepare(
-      `SELECT
-         c.conversation_id,
-         c.session_key,
-         COALESCE(msg_stats.message_count, 0) AS message_count,
-         COALESCE(sum_stats.summary_count, 0) AS summary_count,
-         COALESCE(msg_stats.latest_message_at, c.created_at) AS latest_message_at,
-         c.created_at
-       FROM conversations c
-       LEFT JOIN (
-         SELECT conversation_id,
-                COUNT(*) AS message_count,
-                MAX(created_at) AS latest_message_at
-         FROM messages
-         GROUP BY conversation_id
-       ) msg_stats ON msg_stats.conversation_id = c.conversation_id
-       LEFT JOIN (
-         SELECT conversation_id,
-                COUNT(*) AS summary_count
-         FROM summaries
-         GROUP BY conversation_id
-       ) sum_stats ON sum_stats.conversation_id = c.conversation_id
-       WHERE COALESCE(msg_stats.latest_message_at, c.created_at) < ?
-       ORDER BY latest_message_at ASC`,
-    )
-    .all(cutoffDate) as Array<{
-    conversation_id: number;
-    session_key: string | null;
-    message_count: number;
-    summary_count: number;
-    latest_message_at: string;
-    created_at: string;
-  }>;
-
-  const mapped: PruneCandidate[] = candidates.map((row) => ({
-    conversationId: row.conversation_id,
-    sessionKey: row.session_key,
-    messageCount: row.message_count,
-    summaryCount: row.summary_count,
-    latestMessageAt: row.latest_message_at,
-    createdAt: row.created_at,
-  }));
-
   let deleted = 0;
   let vacuumed = false;
+  let candidates: PruneCandidate[];
 
-  if (options.confirm && mapped.length > 0) {
-    const deleteStmt = db.prepare(
-      `DELETE FROM conversations WHERE conversation_id = ?`,
-    );
-    for (const candidate of mapped) {
-      deleteStmt.run(candidate.conversationId);
-    }
-    deleted = mapped.length;
-
-    if (options.vacuum) {
-      db.exec("VACUUM");
-      vacuumed = true;
+  if (!options.confirm) {
+    candidates = loadPruneCandidates(db, cutoffDate);
+  } else {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      candidates = loadPruneCandidates(db, cutoffDate);
+      deleted = deleteCandidates(db, candidates);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
     }
   }
 
+  if (options.vacuum && deleted > 0) {
+    db.exec("VACUUM");
+    vacuumed = true;
+  }
+
   return {
-    candidates: mapped,
+    candidates,
     deleted,
     vacuumed,
     cutoffDate,
