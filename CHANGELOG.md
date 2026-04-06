@@ -1,5 +1,15 @@
 # @martian-engineering/lossless-claw
 
+## 0.6.3
+
+### Patch Changes
+
+- [#244](https://github.com/Martian-Engineering/lossless-claw/pull/244) [`cb51dd2`](https://github.com/Martian-Engineering/lossless-claw/commit/cb51dd237693e8992efb0d6eea843609619bd2bf) Thanks [@jalehman](https://github.com/jalehman)! - Use OpenClaw's enriched `session_end` hook to preserve clean LCM conversation boundaries across automatic session rollover, compaction session replacement, and session deletion.
+
+- [`4ddf05c`](https://github.com/Martian-Engineering/lossless-claw/commit/4ddf05c399a2a752bd296cf4ddcdb87e0dc36a01) Thanks [@mvanhorn](https://github.com/mvanhorn)! - Route all LCM startup diagnostics to stderr so `--json` CLI output stays machine-readable, while keeping debug-only migration details behind the host logger's debug gating.
+
+- [#280](https://github.com/Martian-Engineering/lossless-claw/pull/280) [`9a2c3e1`](https://github.com/Martian-Engineering/lossless-claw/commit/9a2c3e1a3e74957e1280b8026cebad4b0e7f0418) Thanks [@liu51115](https://github.com/liu51115)! - Fix bootstrap checkpoint refresh after transcript maintenance so unchanged restarts stay on the fast path, and avoid advancing the checkpoint when replay-safety import caps abort reconciliation.
+
 ## 0.6.2
 
 ### Patch Changes
