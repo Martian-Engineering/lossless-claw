@@ -990,6 +990,559 @@ describe("createLcmExpandQueryTool", () => {
     });
   });
 
+  it("merges delegated answers across multiple conversations when allConversations=true", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_beta",
+          conversationId: 9,
+          kind: "leaf",
+          snippet: "beta",
+          createdAt: new Date("2026-01-02T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_alpha",
+          conversationId: 7,
+          kind: "leaf",
+          snippet: "alpha",
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_gamma",
+          conversationId: 9,
+          kind: "leaf",
+          snippet: "gamma",
+          createdAt: new Date("2026-01-03T00:00:00.000Z"),
+        },
+      ],
+      totalMatches: 3,
+    });
+
+    const agentMessages: string[] = [];
+    let sessionGetCalls = 0;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        agentMessages.push(String(request.params?.message ?? ""));
+        return { runId: `run-${agentMessages.length}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionGetCalls += 1;
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    sessionGetCalls === 1
+                      ? {
+                          answer: "Conversation 9 concluded the rollback should proceed first.",
+                          citedIds: ["sum_beta", "sum_gamma"],
+                          expandedSummaryCount: 2,
+                          totalSourceTokens: 700,
+                          truncated: false,
+                        }
+                      : {
+                          answer: "Conversation 7 captured the earlier mitigation context.",
+                          citedIds: ["sum_alpha"],
+                          expandedSummaryCount: 1,
+                          totalSourceTokens: 300,
+                          truncated: false,
+                        },
+                  ),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-multi-query", {
+      query: "rollback plan",
+      prompt: "What did we decide across sessions?",
+      allConversations: true,
+      tokenCap: 2000,
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        query: "rollback plan",
+        mode: "full_text",
+        scope: "summaries",
+        conversationId: undefined,
+      }),
+    );
+    expect(agentMessages).toHaveLength(2);
+    expect(agentMessages[0]).toContain("Conversation scope: 9");
+    expect(agentMessages[0]).toContain("Seed summary IDs: sum_beta, sum_gamma");
+    expect(agentMessages[1]).toContain("Conversation scope: 7");
+    expect(agentMessages[1]).toContain("Seed summary IDs: sum_alpha");
+
+    expect(result.details).toMatchObject({
+      sourceConversationIds: [7, 9],
+      citedIds: ["sum_beta", "sum_gamma", "sum_alpha"],
+      expandedSummaryCount: 3,
+      totalSourceTokens: 1000,
+      truncated: false,
+      conversationBreakdown: [
+        {
+          conversationId: 9,
+          expandedSummaryCount: 2,
+          status: "success",
+        },
+        {
+          conversationId: 7,
+          expandedSummaryCount: 1,
+          status: "success",
+        },
+      ],
+    });
+    expect(result.details).not.toHaveProperty("sourceConversationId");
+    expect((result.details as { answer?: string }).answer).toContain(
+      "Merged findings across 2 conversations:",
+    );
+    expect((result.details as { answer?: string }).answer).toContain(
+      "Conversation 9 concluded the rollback should proceed first.",
+    );
+    expect((result.details as { answer?: string }).answer).toContain(
+      "Conversation 7 captured the earlier mitigation context.",
+    );
+  });
+
+  it("expands explicit summaryIds across conversations when allConversations=true", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockImplementation(async (summaryId: string) => {
+      if (summaryId === "sum_a") {
+        return {
+          type: "summary",
+          summary: {
+            conversationId: 7,
+            createdAt: new Date("2026-01-01T00:00:00.000Z"),
+          },
+        };
+      }
+      if (summaryId === "sum_b") {
+        return {
+          type: "summary",
+          summary: {
+            conversationId: 11,
+            createdAt: new Date("2026-01-02T00:00:00.000Z"),
+          },
+        };
+      }
+      return null;
+    });
+
+    const agentMessages: string[] = [];
+    let sessionGetCalls = 0;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        agentMessages.push(String(request.params?.message ?? ""));
+        return { runId: `run-explicit-${agentMessages.length}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionGetCalls += 1;
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    sessionGetCalls === 1
+                      ? {
+                          answer: "Conversation 11 contains the final deployment checklist.",
+                          citedIds: ["sum_b"],
+                          expandedSummaryCount: 1,
+                          totalSourceTokens: 400,
+                          truncated: false,
+                        }
+                      : {
+                          answer: "Conversation 7 documents the earlier rollback rationale.",
+                          citedIds: ["sum_a"],
+                          expandedSummaryCount: 1,
+                          totalSourceTokens: 250,
+                          truncated: false,
+                        },
+                  ),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-explicit-multi", {
+      summaryIds: ["sum_a", "sum_b"],
+      prompt: "What rollout steps were captured?",
+      allConversations: true,
+      tokenCap: 2000,
+    });
+
+    expect(agentMessages).toHaveLength(2);
+    expect(agentMessages[0]).toContain("Conversation scope: 11");
+    expect(agentMessages[0]).toContain("Seed summary IDs: sum_b");
+    expect(agentMessages[1]).toContain("Conversation scope: 7");
+    expect(agentMessages[1]).toContain("Seed summary IDs: sum_a");
+
+    expect(result.details).toMatchObject({
+      sourceConversationIds: [7, 11],
+      citedIds: ["sum_b", "sum_a"],
+      expandedSummaryCount: 2,
+      totalSourceTokens: 650,
+      truncated: false,
+    });
+    expect(result.details).not.toHaveProperty("sourceConversationId");
+    expect((result.details as { answer?: string }).answer).toContain(
+      "Conversation 11 contains the final deployment checklist.",
+    );
+    expect((result.details as { answer?: string }).answer).toContain(
+      "Conversation 7 documents the earlier rollback rationale.",
+    );
+  });
+
+  it("marks lower-ranked buckets as skipped when the conversation bucket cap is reached", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_d",
+          conversationId: 40,
+          kind: "leaf",
+          snippet: "d",
+          createdAt: new Date("2026-01-04T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_c",
+          conversationId: 30,
+          kind: "leaf",
+          snippet: "c",
+          createdAt: new Date("2026-01-03T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_b",
+          conversationId: 20,
+          kind: "leaf",
+          snippet: "b",
+          createdAt: new Date("2026-01-02T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_a",
+          conversationId: 10,
+          kind: "leaf",
+          snippet: "a",
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      ],
+      totalMatches: 4,
+    });
+
+    let sessionGetCalls = 0;
+    const agentMessages: string[] = [];
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        agentMessages.push(String(request.params?.message ?? ""));
+        return { runId: `run-cap-${agentMessages.length}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionGetCalls += 1;
+        const conversationId = [40, 30, 20][sessionGetCalls - 1];
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: `Conversation ${conversationId} contributed evidence.`,
+                    citedIds: [`sum_${String.fromCharCode(100 - (sessionGetCalls - 1))}`],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 100,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-bucket-cap", {
+      query: "deploy notes",
+      prompt: "What happened across sessions?",
+      allConversations: true,
+      tokenCap: 2000,
+    });
+
+    expect(agentMessages).toHaveLength(3);
+    expect(result.details).toMatchObject({
+      sourceConversationIds: [20, 30, 40],
+      expandedSummaryCount: 3,
+      totalSourceTokens: 300,
+      truncated: true,
+    });
+    expect(result.details).toMatchObject({
+      conversationBreakdown: expect.arrayContaining([
+        expect.objectContaining({
+          conversationId: 10,
+          status: "skipped",
+          error: "skipped after reaching max conversation bucket limit (3)",
+        }),
+      ]),
+    });
+    expect((result.details as { answer?: string }).answer).toContain("skipped conversations");
+  });
+
+  it("returns a partial answer when one cross-conversation bucket times out", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_timeout",
+          conversationId: 9,
+          kind: "leaf",
+          snippet: "timeout",
+          createdAt: new Date("2026-01-02T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_ok",
+          conversationId: 7,
+          kind: "leaf",
+          snippet: "ok",
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      ],
+      totalMatches: 2,
+    });
+
+    let agentCalls = 0;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        agentCalls += 1;
+        return { runId: `run-timeout-${agentCalls}` };
+      }
+      if (request.method === "agent.wait") {
+        if (agentCalls === 1) {
+          return { status: "timeout" };
+        }
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Conversation 7 preserved the recovery steps.",
+                    citedIds: ["sum_ok"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 250,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-partial-timeout", {
+      query: "recovery steps",
+      prompt: "What did we preserve?",
+      allConversations: true,
+      tokenCap: 2000,
+    });
+
+    expect(result.details).toMatchObject({
+      sourceConversationIds: [7],
+      citedIds: ["sum_ok"],
+      expandedSummaryCount: 1,
+      totalSourceTokens: 250,
+      truncated: true,
+    });
+    expect(result.details).toMatchObject({
+      conversationBreakdown: expect.arrayContaining([
+        expect.objectContaining({
+          conversationId: 9,
+          status: "failed",
+          error: "lcm_expand_query timed out waiting for delegated expansion (120s).",
+        }),
+        expect.objectContaining({
+          conversationId: 7,
+          status: "success",
+        }),
+      ]),
+    });
+    expect((result.details as { answer?: string }).answer).toContain(
+      "Conversation 7 preserved the recovery steps.",
+    );
+    expect((result.details as { answer?: string }).answer).toContain("failed conversations");
+  });
+
+  it("returns partial coverage when the global token budget is exhausted mid-run", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_large",
+          conversationId: 9,
+          kind: "leaf",
+          snippet: "large",
+          createdAt: new Date("2026-01-02T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_small",
+          conversationId: 7,
+          kind: "leaf",
+          snippet: "small",
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      ],
+      totalMatches: 2,
+    });
+
+    let sessionGetCalls = 0;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        return { runId: "run-budget" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionGetCalls += 1;
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Conversation 9 used the whole retrieval budget.",
+                    citedIds: ["sum_large"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 500,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-budget-exhausted", {
+      query: "budgeted search",
+      prompt: "What did we learn?",
+      allConversations: true,
+      tokenCap: 500,
+    });
+
+    expect(sessionGetCalls).toBe(1);
+    expect(result.details).toMatchObject({
+      sourceConversationIds: [9],
+      citedIds: ["sum_large"],
+      expandedSummaryCount: 1,
+      totalSourceTokens: 500,
+      truncated: true,
+    });
+    expect(result.details).toMatchObject({
+      conversationBreakdown: expect.arrayContaining([
+        expect.objectContaining({
+          conversationId: 9,
+          status: "success",
+        }),
+        expect.objectContaining({
+          conversationId: 7,
+          status: "skipped",
+          error: "global token budget exhausted",
+        }),
+      ]),
+    });
+    expect((result.details as { answer?: string }).answer).toContain("skipped conversations");
+  });
+
   it("falls back to messages for shallow trees when summary grep misses", async () => {
     const retrieval = makeRetrieval();
     const summaryStore = makeSummaryStore();

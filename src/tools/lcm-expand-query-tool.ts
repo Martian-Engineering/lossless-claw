@@ -26,6 +26,7 @@ import {
 const DEFAULT_DELEGATED_WAIT_TIMEOUT_MS = 120_000;
 const GATEWAY_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_ANSWER_TOKENS = 2_000;
+const DEFAULT_MAX_CONVERSATION_BUCKETS = 3;
 
 const LcmExpandQuerySchema = Type.Object({
   summaryIds: Type.Optional(
@@ -69,7 +70,28 @@ const LcmExpandQuerySchema = Type.Object({
   ),
 });
 
+type ConversationBreakdown = {
+  conversationId: number;
+  expandedSummaryCount: number;
+  citedIds: string[];
+  totalSourceTokens: number;
+  truncated: boolean;
+  status?: "success" | "failed" | "skipped";
+  error?: string;
+};
+
 type ExpandQueryReply = {
+  answer: string;
+  citedIds: string[];
+  sourceConversationIds: number[];
+  expandedSummaryCount: number;
+  totalSourceTokens: number;
+  truncated: boolean;
+  conversationBreakdown?: ConversationBreakdown[];
+  sourceConversationId?: number;
+};
+
+type DelegatedExpandQueryReply = {
   answer: string;
   citedIds: string[];
   expandedSummaryCount: number;
@@ -80,7 +102,7 @@ type ExpandQueryReply = {
 type ParsedExpandQueryReply =
   | {
       ok: true;
-      value: ExpandQueryReply;
+      value: DelegatedExpandQueryReply;
     }
   | {
       ok: false;
@@ -91,6 +113,48 @@ type SummaryCandidate = {
   summaryId: string;
   conversationId: number;
   requiresMessageExpansion: boolean;
+  isExplicit: boolean;
+  matchedAt?: Date;
+};
+
+type ConversationBucket = {
+  conversationId: number;
+  summaryIds: string[];
+  messageBackedSummaryIds: string[];
+  candidateCount: number;
+  explicitSummaryCount: number;
+  messageBackedCount: number;
+  newestMatchAt?: Date;
+};
+
+type BucketExecutionResult =
+  | {
+      conversationId: number;
+      status: "success";
+      candidateCount: number;
+      reply: DelegatedExpandQueryReply;
+    }
+  | {
+      conversationId: number;
+      status: "failed" | "skipped";
+      candidateCount: number;
+      error: string;
+    };
+
+type RunDelegatedExpandQueryParams = {
+  deps: LcmDependencies;
+  callerSessionKey: string;
+  requesterAgentId: string;
+  bucket: ConversationBucket;
+  query?: string;
+  prompt: string;
+  maxTokens: number;
+  tokenCap: number;
+  requestId: string;
+  childExpansionDepth: number;
+  originSessionKey: string;
+  delegatedWaitTimeoutMs: number;
+  delegatedWaitTimeoutSeconds: number;
 };
 
 function collectExpansionFailureText(value: unknown, parts: string[], depth = 0): void {
@@ -163,6 +227,16 @@ function shouldRetryWithoutOverride(message: string): boolean {
   ].some((signal) => normalized.includes(signal));
 }
 
+function maxDate(left?: Date, right?: Date): Date | undefined {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  return left.getTime() >= right.getTime() ? left : right;
+}
+
 /**
  * Build the sub-agent task message for delegated expansion and prompt answering.
  */
@@ -227,13 +301,183 @@ function buildDelegatedExpandQueryTask(params: {
     "- expandedSummaryCount should reflect how many summaries were expanded/used.",
     "- totalSourceTokens should estimate total tokens consumed from expansion calls.",
     "- truncated should indicate whether source expansion appears truncated.",
-  ].join("\n");
+  ]
+    .filter((line): line is string => typeof line === "string")
+    .join("\n");
 }
 
 function formatInvalidDelegatedReply(reply: string, reason: string): string {
   const compact = reply.replace(/\s+/g, " ").trim();
   const snippet = compact.length <= 240 ? compact : `${compact.slice(0, 240)}...`;
   return `Delegated expansion query returned ${reason}: ${snippet}`;
+}
+
+function buildConversationBuckets(candidates: SummaryCandidate[]): ConversationBucket[] {
+  const buckets = new Map<
+    number,
+    {
+      conversationId: number;
+      summaryIds: string[];
+      messageBackedSummaryIds: string[];
+      summaryIdSet: Set<string>;
+      explicitSummaryIdSet: Set<string>;
+      messageBackedSummaryIdSet: Set<string>;
+      newestMatchAt?: Date;
+    }
+  >();
+
+  for (const candidate of candidates) {
+    const bucket =
+      buckets.get(candidate.conversationId) ??
+      {
+        conversationId: candidate.conversationId,
+        summaryIds: [],
+        messageBackedSummaryIds: [],
+        summaryIdSet: new Set<string>(),
+        explicitSummaryIdSet: new Set<string>(),
+        messageBackedSummaryIdSet: new Set<string>(),
+        newestMatchAt: undefined,
+      };
+
+    if (!bucket.summaryIdSet.has(candidate.summaryId)) {
+      bucket.summaryIds.push(candidate.summaryId);
+      bucket.summaryIdSet.add(candidate.summaryId);
+    }
+    if (candidate.isExplicit) {
+      bucket.explicitSummaryIdSet.add(candidate.summaryId);
+    }
+    if (
+      candidate.requiresMessageExpansion &&
+      !bucket.messageBackedSummaryIdSet.has(candidate.summaryId)
+    ) {
+      bucket.messageBackedSummaryIds.push(candidate.summaryId);
+      bucket.messageBackedSummaryIdSet.add(candidate.summaryId);
+    }
+    bucket.newestMatchAt = maxDate(bucket.newestMatchAt, candidate.matchedAt);
+    buckets.set(candidate.conversationId, bucket);
+  }
+
+  return Array.from(buckets.values()).map((bucket) => ({
+    conversationId: bucket.conversationId,
+    summaryIds: normalizeSummaryIds(bucket.summaryIds),
+    messageBackedSummaryIds: normalizeSummaryIds(bucket.messageBackedSummaryIds),
+    candidateCount: bucket.summaryIds.length,
+    explicitSummaryCount: bucket.explicitSummaryIdSet.size,
+    messageBackedCount: bucket.messageBackedSummaryIds.length,
+    newestMatchAt: bucket.newestMatchAt,
+  }));
+}
+
+function compareConversationBuckets(left: ConversationBucket, right: ConversationBucket): number {
+  const explicitDelta = right.explicitSummaryCount - left.explicitSummaryCount;
+  if (explicitDelta !== 0) {
+    return explicitDelta;
+  }
+
+  const candidateDelta = right.candidateCount - left.candidateCount;
+  if (candidateDelta !== 0) {
+    return candidateDelta;
+  }
+
+  const recencyDelta =
+    (right.newestMatchAt?.getTime() ?? 0) - (left.newestMatchAt?.getTime() ?? 0);
+  if (recencyDelta !== 0) {
+    return recencyDelta;
+  }
+
+  const messageBackedDelta = right.messageBackedCount - left.messageBackedCount;
+  if (messageBackedDelta !== 0) {
+    return messageBackedDelta;
+  }
+
+  return left.conversationId - right.conversationId;
+}
+
+function buildExpandQueryReply(params: {
+  answer: string;
+  citedIds: string[];
+  sourceConversationIds: number[];
+  expandedSummaryCount: number;
+  totalSourceTokens: number;
+  truncated: boolean;
+  conversationBreakdown?: ConversationBreakdown[];
+}): ExpandQueryReply {
+  const sourceConversationIds = [...params.sourceConversationIds].sort((left, right) => left - right);
+
+  return {
+    answer: params.answer,
+    citedIds: normalizeSummaryIds(params.citedIds),
+    sourceConversationIds,
+    ...(sourceConversationIds.length === 1
+      ? { sourceConversationId: sourceConversationIds[0] }
+      : {}),
+    expandedSummaryCount: params.expandedSummaryCount,
+    totalSourceTokens: params.totalSourceTokens,
+    truncated: params.truncated,
+    ...(params.conversationBreakdown ? { conversationBreakdown: params.conversationBreakdown } : {}),
+  };
+}
+
+function synthesizeConversationAnswers(params: {
+  prompt: string;
+  results: BucketExecutionResult[];
+}): string {
+  const successfulResults = params.results.filter(
+    (result): result is Extract<BucketExecutionResult, { status: "success" }> =>
+      result.status === "success",
+  );
+  const failedResults = params.results.filter(
+    (result): result is Extract<BucketExecutionResult, { status: "failed" }> =>
+      result.status === "failed",
+  );
+  const skippedResults = params.results.filter(
+    (result): result is Extract<BucketExecutionResult, { status: "skipped" }> =>
+      result.status === "skipped",
+  );
+
+  if (successfulResults.length === 1 && failedResults.length === 0 && skippedResults.length === 0) {
+    return successfulResults[0].reply.answer;
+  }
+
+  const lines: string[] = [];
+  if (successfulResults.length > 1) {
+    lines.push(`Merged findings across ${successfulResults.length} conversations:`);
+    lines.push("");
+  }
+
+  for (const result of successfulResults) {
+    if (successfulResults.length > 1) {
+      lines.push(`Conversation ${result.conversationId}:`);
+    }
+    lines.push(result.reply.answer);
+    if (successfulResults.length > 1) {
+      lines.push("");
+    }
+  }
+
+  const notes: string[] = [];
+  if (failedResults.length > 0) {
+    notes.push(
+      `failed conversations: ${failedResults
+        .map((result) => `${result.conversationId} (${result.error})`)
+        .join("; ")}`,
+    );
+  }
+  if (skippedResults.length > 0) {
+    notes.push(
+      `skipped conversations: ${skippedResults
+        .map((result) => `${result.conversationId} (${result.error})`)
+        .join("; ")}`,
+    );
+  }
+  if (notes.length > 0) {
+    if (lines.length > 0 && lines[lines.length - 1] !== "") {
+      lines.push("");
+    }
+    lines.push(`Partial coverage for "${params.prompt}": ${notes.join("; ")}`);
+  }
+
+  return lines.join("\n").trim();
 }
 
 /**
@@ -348,6 +592,19 @@ function resolveSourceConversationId(params: {
   );
 }
 
+function selectSingleConversationBucket(params: {
+  sourceConversationId: number;
+  buckets: ConversationBucket[];
+}): ConversationBucket {
+  const bucket = params.buckets.find(
+    (candidateBucket) => candidateBucket.conversationId === params.sourceConversationId,
+  );
+  if (!bucket || bucket.summaryIds.length === 0) {
+    throw new Error("No summaryIds available after applying conversation scope.");
+  }
+  return bucket;
+}
+
 function upsertSummaryCandidate(
   candidates: Map<string, SummaryCandidate>,
   candidate: SummaryCandidate,
@@ -361,6 +618,8 @@ function upsertSummaryCandidate(
     ...existing,
     requiresMessageExpansion:
       existing.requiresMessageExpansion || candidate.requiresMessageExpansion,
+    isExplicit: existing.isExplicit || candidate.isExplicit,
+    matchedAt: maxDate(existing.matchedAt, candidate.matchedAt),
   });
 }
 
@@ -385,6 +644,8 @@ async function resolveSummaryCandidates(params: {
       summaryId,
       conversationId: described.summary.conversationId,
       requiresMessageExpansion: false,
+      isExplicit: true,
+      matchedAt: described.summary.latestAt ?? described.summary.createdAt,
     });
   }
 
@@ -401,6 +662,8 @@ async function resolveSummaryCandidates(params: {
         summaryId: summary.summaryId,
         conversationId: summary.conversationId,
         requiresMessageExpansion: false,
+        isExplicit: false,
+        matchedAt: summary.createdAt,
       });
     }
 
@@ -432,6 +695,8 @@ async function resolveSummaryCandidates(params: {
               summaryId,
               conversationId: params.conversationId,
               requiresMessageExpansion: true,
+              isExplicit: false,
+              matchedAt: message.createdAt,
             });
           }
         }
@@ -442,6 +707,177 @@ async function resolveSummaryCandidates(params: {
   return Array.from(candidates.values());
 }
 
+/**
+ * Run a single delegated lcm_expand_query bucket against one conversation.
+ */
+async function runDelegatedExpandQuery(
+  params: RunDelegatedExpandQueryParams,
+): Promise<DelegatedExpandQueryReply> {
+  const task = buildDelegatedExpandQueryTask({
+    summaryIds: params.bucket.summaryIds,
+    messageBackedSummaryIds: params.bucket.messageBackedSummaryIds,
+    conversationId: params.bucket.conversationId,
+    query: params.query,
+    prompt: params.prompt,
+    maxTokens: params.maxTokens,
+    tokenCap: params.tokenCap,
+    requestId: params.requestId,
+    expansionDepth: params.childExpansionDepth,
+    originSessionKey: params.originSessionKey,
+  });
+
+  const expansionProvider = params.deps.config.expansionProvider || undefined;
+  const expansionModel = params.deps.config.expansionModel || undefined;
+  const canonicalExpansionModel = expansionModel?.includes("/") ? expansionModel : undefined;
+  const delegatedOverrideProvider = canonicalExpansionModel ? undefined : expansionProvider;
+  const delegatedOverrideModel = canonicalExpansionModel || expansionModel;
+  const configuredOverrideLabel =
+    delegatedOverrideProvider && delegatedOverrideModel
+      ? `${delegatedOverrideProvider}/${delegatedOverrideModel}`
+      : delegatedOverrideModel || delegatedOverrideProvider || "configured override";
+
+  const runDelegatedQuery = async (provider?: string, model?: string) => {
+    const childSessionKey = `agent:${params.requesterAgentId}:subagent:${crypto.randomUUID()}`;
+    const childIdem = crypto.randomUUID();
+    let grantCreated = false;
+
+    try {
+      createDelegatedExpansionGrant({
+        delegatedSessionKey: childSessionKey,
+        issuerSessionId: params.callerSessionKey || "main",
+        allowedConversationIds: [params.bucket.conversationId],
+        tokenCap: params.tokenCap,
+        ttlMs: params.delegatedWaitTimeoutMs + 30_000,
+      });
+      stampDelegatedExpansionContext({
+        sessionKey: childSessionKey,
+        requestId: params.requestId,
+        expansionDepth: params.childExpansionDepth,
+        originSessionKey: params.originSessionKey,
+        stampedBy: "lcm_expand_query",
+      });
+      grantCreated = true;
+
+      const response = (await params.deps.callGateway({
+        method: "agent",
+        params: {
+          message: task,
+          sessionKey: childSessionKey,
+          deliver: false,
+          lane: params.deps.agentLaneSubagent,
+          idempotencyKey: childIdem,
+          ...(provider ? { provider } : {}),
+          ...(model ? { model } : {}),
+          extraSystemPrompt: params.deps.buildSubagentSystemPrompt({
+            depth: 1,
+            maxDepth: 8,
+            taskSummary: "Run lcm_expand and return prompt-focused JSON answer",
+          }),
+        },
+        timeoutMs: GATEWAY_TIMEOUT_MS,
+      })) as { runId?: unknown; error?: unknown };
+
+      const runId = typeof response?.runId === "string" ? response.runId.trim() : "";
+      if (!runId) {
+        throw new Error(
+          formatExpansionFailure(response?.error ?? response)
+            || "Delegated expansion did not return a runId.",
+        );
+      }
+
+      const wait = (await params.deps.callGateway({
+        method: "agent.wait",
+        params: {
+          runId,
+          timeoutMs: params.delegatedWaitTimeoutMs,
+        },
+        timeoutMs: params.delegatedWaitTimeoutMs,
+      })) as { status?: string; error?: unknown };
+      const status = typeof wait?.status === "string" ? wait.status : "error";
+      if (status === "timeout") {
+        recordExpansionDelegationTelemetry({
+          deps: params.deps,
+          component: "lcm_expand_query",
+          event: "timeout",
+          requestId: params.requestId,
+          sessionKey: params.callerSessionKey,
+          expansionDepth: params.childExpansionDepth,
+          originSessionKey: params.originSessionKey,
+          runId,
+        });
+        throw new Error(
+          `lcm_expand_query timed out waiting for delegated expansion (${params.delegatedWaitTimeoutSeconds}s).`,
+        );
+      }
+      if (status !== "ok") {
+        throw new Error(formatExpansionFailure(wait?.error));
+      }
+
+      const replyPayload = (await params.deps.callGateway({
+        method: "sessions.get",
+        params: { key: childSessionKey, limit: 80 },
+        timeoutMs: GATEWAY_TIMEOUT_MS,
+      })) as { messages?: unknown[] };
+      const reply = params.deps.readLatestAssistantReply(
+        Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
+      );
+      const parsed = parseDelegatedExpandQueryReply(reply, params.bucket.summaryIds.length);
+      if (!parsed.ok) {
+        throw new Error(parsed.error);
+      }
+      recordExpansionDelegationTelemetry({
+        deps: params.deps,
+        component: "lcm_expand_query",
+        event: "success",
+        requestId: params.requestId,
+        sessionKey: params.callerSessionKey,
+        expansionDepth: params.childExpansionDepth,
+        originSessionKey: params.originSessionKey,
+        runId,
+      });
+
+      return parsed.value;
+    } finally {
+      try {
+        await params.deps.callGateway({
+          method: "sessions.delete",
+          params: { key: childSessionKey, deleteTranscript: true },
+          timeoutMs: GATEWAY_TIMEOUT_MS,
+        });
+      } catch {
+        // Cleanup is best-effort.
+      }
+      if (grantCreated) {
+        revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+      }
+      clearDelegatedExpansionContext(childSessionKey);
+    }
+  };
+
+  if (!expansionProvider && !expansionModel) {
+    return await runDelegatedQuery();
+  }
+
+  try {
+    return await runDelegatedQuery(delegatedOverrideProvider, delegatedOverrideModel);
+  } catch (error) {
+    const failure = formatExpansionFailure(error);
+    params.deps.log.warn(
+      `[lcm] delegated expansion override failed (${configuredOverrideLabel}) for conversation ${params.bucket.conversationId}: ${failure}`,
+    );
+    if (!shouldRetryWithoutOverride(failure)) {
+      throw new Error(failure);
+    }
+    params.deps.log.warn(
+      `[lcm] retrying delegated expansion without provider/model override after: ${failure}`,
+    );
+    return await runDelegatedQuery();
+  }
+}
+
+/**
+ * Create the top-level lcm_expand_query tool wrapper for main-agent use.
+ */
 export function createLcmExpandQueryTool(input: {
   deps: LcmDependencies;
   lcm?: LcmContextEngine;
@@ -480,7 +916,8 @@ export function createLcmExpandQueryTool(input: {
         typeof requestedMaxTokens === "number" && Number.isFinite(requestedMaxTokens)
           ? Math.max(1, requestedMaxTokens)
           : DEFAULT_MAX_ANSWER_TOKENS;
-      const requestedTokenCap = typeof p.tokenCap === "number" ? Math.trunc(p.tokenCap) : undefined;
+      const requestedTokenCap =
+        typeof p.tokenCap === "number" ? Math.trunc(p.tokenCap) : undefined;
       const expansionTokenCap =
         typeof requestedTokenCap === "number" && Number.isFinite(requestedTokenCap)
           ? Math.max(1, requestedTokenCap)
@@ -581,41 +1018,19 @@ export function createLcmExpandQueryTool(input: {
               error: "No matching summaries found.",
             });
           }
-          return jsonResult({
-            answer: "No matching summaries found for this scope.",
-            citedIds: [],
-            sourceConversationId: scopedConversationId,
-            expandedSummaryCount: 0,
-            totalSourceTokens: 0,
-            truncated: false,
-          });
+          return jsonResult(
+            buildExpandQueryReply({
+              answer: "No matching summaries found for this scope.",
+              citedIds: [],
+              sourceConversationIds: [scopedConversationId],
+              expandedSummaryCount: 0,
+              totalSourceTokens: 0,
+              truncated: false,
+            }),
+          );
         }
 
-        const sourceConversationId = resolveSourceConversationId({
-          scopedConversationId,
-          allConversations: conversationScope.allConversations,
-          candidates,
-        });
-        const summaryIds = normalizeSummaryIds(
-          candidates
-            .filter((candidate) => candidate.conversationId === sourceConversationId)
-            .map((candidate) => candidate.summaryId),
-        );
-        const messageBackedSummaryIds = normalizeSummaryIds(
-          candidates
-            .filter(
-              (candidate) =>
-                candidate.conversationId === sourceConversationId &&
-                candidate.requiresMessageExpansion,
-            )
-            .map((candidate) => candidate.summaryId),
-        );
-
-        if (summaryIds.length === 0) {
-          return jsonResult({
-            error: "No summaryIds available after applying conversation scope.",
-          });
-        }
+        const conversationBuckets = buildConversationBuckets(candidates);
 
         const concurrencyCheck = acquireExpansionConcurrencySlot({
           originSessionKey,
@@ -647,173 +1062,161 @@ export function createLcmExpandQueryTool(input: {
         );
         const childExpansionDepth = resolveNextExpansionDepth(callerSessionKey);
 
-        const task = buildDelegatedExpandQueryTask({
-          summaryIds,
-          messageBackedSummaryIds,
-          conversationId: sourceConversationId,
-          query: query || undefined,
-          prompt,
-          maxTokens,
-          tokenCap: expansionTokenCap,
-          requestId,
-          expansionDepth: childExpansionDepth,
-          originSessionKey,
-        });
+        if (!conversationScope.allConversations) {
+          const sourceConversationId = resolveSourceConversationId({
+            scopedConversationId,
+            allConversations: conversationScope.allConversations,
+            candidates,
+          });
+          const bucket = selectSingleConversationBucket({
+            sourceConversationId,
+            buckets: conversationBuckets,
+          });
+          const delegatedReply = await runDelegatedExpandQuery({
+            deps: input.deps,
+            callerSessionKey,
+            requesterAgentId,
+            bucket,
+            query: query || undefined,
+            prompt,
+            maxTokens,
+            tokenCap: expansionTokenCap,
+            requestId,
+            childExpansionDepth,
+            originSessionKey,
+            delegatedWaitTimeoutMs,
+            delegatedWaitTimeoutSeconds,
+          });
 
-        const expansionProvider = input.deps.config.expansionProvider || undefined;
-        const expansionModel = input.deps.config.expansionModel || undefined;
-        const canonicalExpansionModel = expansionModel?.includes("/") ? expansionModel : undefined;
-        const delegatedOverrideProvider = canonicalExpansionModel ? undefined : expansionProvider;
-        const delegatedOverrideModel = canonicalExpansionModel || expansionModel;
-        const configuredOverrideLabel =
-          delegatedOverrideProvider && delegatedOverrideModel
-            ? `${delegatedOverrideProvider}/${delegatedOverrideModel}`
-            : delegatedOverrideModel || delegatedOverrideProvider || "configured override";
+          return jsonResult(
+            buildExpandQueryReply({
+              answer: delegatedReply.answer,
+              citedIds: delegatedReply.citedIds,
+              sourceConversationIds: [sourceConversationId],
+              expandedSummaryCount: delegatedReply.expandedSummaryCount,
+              totalSourceTokens: delegatedReply.totalSourceTokens,
+              truncated: delegatedReply.truncated,
+            }),
+          );
+        }
 
-        const runDelegatedQuery = async (provider?: string, model?: string) => {
-          const childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
-          const childIdem = crypto.randomUUID();
-          let grantCreated = false;
+        const rankedBuckets = [...conversationBuckets].sort(compareConversationBuckets);
+        const bucketResults: BucketExecutionResult[] = [];
+        const bucketsToExpand = rankedBuckets.slice(0, DEFAULT_MAX_CONVERSATION_BUCKETS);
+        const skippedBuckets = rankedBuckets.slice(DEFAULT_MAX_CONVERSATION_BUCKETS);
+        let remainingTokenCap = expansionTokenCap;
+        let firstFailure: string | undefined;
+
+        for (const bucket of bucketsToExpand) {
+          if (remainingTokenCap <= 0) {
+            bucketResults.push({
+              conversationId: bucket.conversationId,
+              status: "skipped",
+              candidateCount: bucket.candidateCount,
+              error: "global token budget exhausted",
+            });
+            continue;
+          }
 
           try {
-            createDelegatedExpansionGrant({
-              delegatedSessionKey: childSessionKey,
-              issuerSessionId: callerSessionKey || "main",
-              allowedConversationIds: [sourceConversationId],
-              tokenCap: expansionTokenCap,
-              ttlMs: delegatedWaitTimeoutMs + 30_000,
-            });
-            stampDelegatedExpansionContext({
-              sessionKey: childSessionKey,
-              requestId,
-              expansionDepth: childExpansionDepth,
-              originSessionKey,
-              stampedBy: "lcm_expand_query",
-            });
-            grantCreated = true;
-
-            const response = (await input.deps.callGateway({
-              method: "agent",
-              params: {
-                message: task,
-                sessionKey: childSessionKey,
-                deliver: false,
-                lane: input.deps.agentLaneSubagent,
-                idempotencyKey: childIdem,
-                ...(provider ? { provider } : {}),
-                ...(model ? { model } : {}),
-                extraSystemPrompt: input.deps.buildSubagentSystemPrompt({
-                  depth: 1,
-                  maxDepth: 8,
-                  taskSummary: "Run lcm_expand and return prompt-focused JSON answer",
-                }),
-              },
-              timeoutMs: GATEWAY_TIMEOUT_MS,
-            })) as { runId?: unknown; error?: unknown };
-
-            const runId = typeof response?.runId === "string" ? response.runId.trim() : "";
-            if (!runId) {
-              throw new Error(
-                formatExpansionFailure(response?.error ?? response)
-                  || "Delegated expansion did not return a runId.",
-              );
-            }
-
-            const wait = (await input.deps.callGateway({
-              method: "agent.wait",
-              params: {
-                runId,
-                timeoutMs: delegatedWaitTimeoutMs,
-              },
-              timeoutMs: delegatedWaitTimeoutMs,
-            })) as { status?: string; error?: unknown };
-            const status = typeof wait?.status === "string" ? wait.status : "error";
-            if (status === "timeout") {
-              recordExpansionDelegationTelemetry({
-                deps: input.deps,
-                component: "lcm_expand_query",
-                event: "timeout",
-                requestId,
-                sessionKey: callerSessionKey,
-                expansionDepth: childExpansionDepth,
-                originSessionKey,
-                runId,
-              });
-              throw new Error(
-                `lcm_expand_query timed out waiting for delegated expansion (${delegatedWaitTimeoutSeconds}s).`,
-              );
-            }
-            if (status !== "ok") {
-              throw new Error(formatExpansionFailure(wait?.error));
-            }
-
-            const replyPayload = (await input.deps.callGateway({
-              method: "sessions.get",
-              params: { key: childSessionKey, limit: 80 },
-              timeoutMs: GATEWAY_TIMEOUT_MS,
-            })) as { messages?: unknown[] };
-            const reply = input.deps.readLatestAssistantReply(
-              Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
-            );
-            const parsed = parseDelegatedExpandQueryReply(reply, summaryIds.length);
-            if (!parsed.ok) {
-              throw new Error(parsed.error);
-            }
-            recordExpansionDelegationTelemetry({
+            const delegatedReply = await runDelegatedExpandQuery({
               deps: input.deps,
-              component: "lcm_expand_query",
-              event: "success",
+              callerSessionKey,
+              requesterAgentId,
+              bucket,
+              query: query || undefined,
+              prompt,
+              maxTokens,
+              tokenCap: remainingTokenCap,
               requestId,
-              sessionKey: callerSessionKey,
-              expansionDepth: childExpansionDepth,
+              childExpansionDepth,
               originSessionKey,
-              runId,
+              delegatedWaitTimeoutMs,
+              delegatedWaitTimeoutSeconds,
             });
-
-            return jsonResult({
-              answer: parsed.value.answer,
-              citedIds: parsed.value.citedIds,
-              sourceConversationId,
-              expandedSummaryCount: parsed.value.expandedSummaryCount,
-              totalSourceTokens: parsed.value.totalSourceTokens,
-              truncated: parsed.value.truncated,
+            bucketResults.push({
+              conversationId: bucket.conversationId,
+              status: "success",
+              candidateCount: bucket.candidateCount,
+              reply: delegatedReply,
             });
-          } finally {
-            try {
-              await input.deps.callGateway({
-                method: "sessions.delete",
-                params: { key: childSessionKey, deleteTranscript: true },
-                timeoutMs: GATEWAY_TIMEOUT_MS,
-              });
-            } catch {
-              // Cleanup is best-effort.
-            }
-            if (grantCreated) {
-              revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
-            }
-            clearDelegatedExpansionContext(childSessionKey);
+            remainingTokenCap = Math.max(
+              0,
+              remainingTokenCap - Math.max(0, delegatedReply.totalSourceTokens),
+            );
+          } catch (error) {
+            const failure = formatExpansionFailure(error);
+            firstFailure ??= failure;
+            bucketResults.push({
+              conversationId: bucket.conversationId,
+              status: "failed",
+              candidateCount: bucket.candidateCount,
+              error: failure,
+            });
           }
-        };
-
-        if (!expansionProvider && !expansionModel) {
-          return await runDelegatedQuery();
         }
 
-        try {
-          return await runDelegatedQuery(delegatedOverrideProvider, delegatedOverrideModel);
-        } catch (error) {
-          const failure = formatExpansionFailure(error);
-          input.deps.log.warn(
-            `[lcm] delegated expansion override failed (${configuredOverrideLabel}): ${failure}`,
-          );
-          if (!shouldRetryWithoutOverride(failure)) {
-            throw new Error(failure);
-          }
-          input.deps.log.warn(
-            `[lcm] retrying delegated expansion without provider/model override after: ${failure}`,
-          );
-          return await runDelegatedQuery();
+        for (const bucket of skippedBuckets) {
+          bucketResults.push({
+            conversationId: bucket.conversationId,
+            status: "skipped",
+            candidateCount: bucket.candidateCount,
+            error: `skipped after reaching max conversation bucket limit (${DEFAULT_MAX_CONVERSATION_BUCKETS})`,
+          });
         }
+
+        const successfulResults = bucketResults.filter(
+          (result): result is Extract<BucketExecutionResult, { status: "success" }> =>
+            result.status === "success",
+        );
+        if (successfulResults.length === 0) {
+          throw new Error(firstFailure ?? "Delegated expansion query failed.");
+        }
+
+        const conversationBreakdown: ConversationBreakdown[] = bucketResults.map((result) => {
+          if (result.status === "success") {
+            return {
+              conversationId: result.conversationId,
+              expandedSummaryCount: result.reply.expandedSummaryCount,
+              citedIds: result.reply.citedIds,
+              totalSourceTokens: result.reply.totalSourceTokens,
+              truncated: result.reply.truncated,
+              status: "success",
+            };
+          }
+          return {
+            conversationId: result.conversationId,
+            expandedSummaryCount: 0,
+            citedIds: [],
+            totalSourceTokens: 0,
+            truncated: true,
+            status: result.status,
+            error: result.error,
+          };
+        });
+
+        return jsonResult(
+          buildExpandQueryReply({
+            answer: synthesizeConversationAnswers({
+              prompt,
+              results: bucketResults,
+            }),
+            citedIds: successfulResults.flatMap((result) => result.reply.citedIds),
+            sourceConversationIds: successfulResults.map((result) => result.conversationId),
+            expandedSummaryCount: successfulResults.reduce(
+              (total, result) => total + result.reply.expandedSummaryCount,
+              0,
+            ),
+            totalSourceTokens: successfulResults.reduce(
+              (total, result) => total + result.reply.totalSourceTokens,
+              0,
+            ),
+            truncated:
+              successfulResults.some((result) => result.reply.truncated)
+              || bucketResults.some((result) => result.status !== "success"),
+            conversationBreakdown,
+          }),
+        );
       } catch (error) {
         const failure = formatExpansionFailure(error);
         input.deps.log.error(`[lcm] delegated expansion query failed: ${failure}`);
