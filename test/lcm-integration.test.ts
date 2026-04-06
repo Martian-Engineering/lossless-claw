@@ -3296,3 +3296,281 @@ describe("prompt-aware eviction", () => {
     expect(summaryIdx).toBeLessThan(freshIdx);
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Test Suite: evaluateLeafTrigger skip guards
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("evaluateLeafTrigger skip guards", () => {
+  let convStore: ReturnType<typeof createMockConversationStore>;
+  let sumStore: ReturnType<typeof createMockSummaryStore>;
+
+  beforeEach(() => {
+    convStore = createMockConversationStore();
+    sumStore = createMockSummaryStore();
+    wireStores(convStore, sumStore);
+  });
+
+  function createCompaction(overrides?: Partial<CompactionConfig>): InstanceType<typeof CompactionEngine> {
+    return new CompactionEngine(convStore as any, sumStore as any, {
+      contextThreshold: 0.75,
+      freshTailCount: 4,
+      leafMinFanout: 8,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      incrementalMaxDepth: 0,
+      leafChunkTokens: 20_000,
+      leafTargetTokens: 2400,
+      condensedTargetTokens: 900,
+      maxRounds: 10,
+      summaryMaxOverageFactor: 3,
+      leafSkipReductionThreshold: 0.05,
+      leafBudgetHeadroomFactor: 0.8,
+      ...overrides,
+    });
+  }
+
+  // Helper: ingest N messages with fixed token count, freshTailCount=4 means
+  // first (N-4) are outside fresh tail.
+  async function setupConversation(opts: {
+    messageCount: number;
+    tokensPerMessage: number;
+    summaryTokens?: number;
+  }): Promise<void> {
+    await ingestMessages(convStore, sumStore, opts.messageCount, {
+      tokenCountFn: () => opts.tokensPerMessage,
+    });
+    // Optionally add a summary to inflate totalAssembledTokens
+    if (opts.summaryTokens) {
+      await sumStore.insertSummary({
+        summaryId: "existing-summary-1",
+        conversationId: CONV_ID,
+        kind: "leaf",
+        content: "x".repeat(opts.summaryTokens * 4),
+        tokenCount: opts.summaryTokens,
+      });
+      await sumStore.appendContextSummary(CONV_ID, "existing-summary-1");
+    }
+  }
+
+  // ── Basic threshold ────────────────────────────────────────────
+
+  it("returns shouldCompact=false when raw tokens below threshold", async () => {
+    // 8 messages at 1000 tokens each, freshTailCount=4 → 4 outside tail = 4000 tokens
+    // leafChunkTokens=20000 → 4000 < 20000 → no compaction
+    const engine = createCompaction();
+    await setupConversation({ messageCount: 8, tokensPerMessage: 1000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID);
+    expect(result.shouldCompact).toBe(false);
+    expect(result.rawTokensOutsideTail).toBe(4000);
+    expect(result.threshold).toBe(20_000);
+    expect(result.skipReason).toBeUndefined();
+  });
+
+  it("returns shouldCompact=true when raw tokens exceed threshold and no skip applies", async () => {
+    // 12 messages at 5000 tokens each, freshTailCount=4 → 8 outside tail = 40000 tokens
+    // leafChunkTokens=20000 → 40000 >= 20000 → basic threshold met
+    // estimatedReduction = min(40000,20000) - 2400 = 17600
+    // totalAssembled = 60000, 5% of 60000 = 3000 → 17600 > 3000 → cache check passes
+    // tokenBudget=80000 → ceiling = 0.8*0.75*80000 = 48000 → 60000 > 48000 → headroom check passes
+    const engine = createCompaction();
+    await setupConversation({ messageCount: 12, tokensPerMessage: 5000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID, 80_000);
+    expect(result.shouldCompact).toBe(true);
+    expect(result.skipReason).toBeUndefined();
+  });
+
+  // ── Budget headroom skip ───────────────────────────────────────
+
+  it("skips due to budget headroom when assembled tokens are well under ceiling", async () => {
+    // 10 messages at 3000 tokens each, freshTailCount=4 → 6 outside tail = 18000 tokens
+    // But leafChunkTokens=15000 → 18000 >= 15000 → threshold met
+    // totalAssembled = 30000, tokenBudget=200000 → ceiling = 0.8*0.75*200000 = 120000
+    // 30000 < 120000 → budget headroom → SKIP
+    const engine = createCompaction({ leafChunkTokens: 15_000 });
+    await setupConversation({ messageCount: 10, tokensPerMessage: 3000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID, 200_000);
+    expect(result.shouldCompact).toBe(false);
+    expect(result.skipReason).toContain("budget-headroom");
+  });
+
+  it("does NOT skip headroom when assembled tokens exceed ceiling", async () => {
+    // 12 messages at 5000 tokens, freshTailCount=4 → 8 outside = 40000
+    // totalAssembled = 60000, tokenBudget=80000 → ceiling = 0.8*0.75*80000 = 48000
+    // 60000 > 48000 → no headroom → continues
+    const engine = createCompaction();
+    await setupConversation({ messageCount: 12, tokensPerMessage: 5000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID, 80_000);
+    expect(result.shouldCompact).toBe(true);
+  });
+
+  it("skips headroom check when tokenBudget is undefined", async () => {
+    // Same setup as headroom skip test, but no tokenBudget → headroom check bypassed
+    // Falls through to cache-aware check
+    const engine = createCompaction({ leafChunkTokens: 15_000 });
+    await setupConversation({ messageCount: 10, tokensPerMessage: 3000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID);
+    // Without tokenBudget, headroom check is skipped → falls to cache-aware
+    // estimatedReduction = min(18000,15000) - 2400 = 12600
+    // 5% of 30000 = 1500 → 12600 > 1500 → cache check passes → shouldCompact
+    expect(result.shouldCompact).toBe(true);
+  });
+
+  // ── Cache-aware skip ───────────────────────────────────────────
+
+  it("skips due to cache-aware when reduction is tiny relative to total context", async () => {
+    // Use a large summary to inflate totalAssembledTokens relative to raw tokens
+    // 8 messages at 6000 tokens, freshTailCount=4 → 4 outside tail = 24000 tokens
+    // Plus a 500000-token summary → totalAssembled = 548000
+    // leafChunkTokens=20000 → 24000 >= 20000 → threshold met
+    // estimatedReduction = min(24000,20000) - 2400 = 17600
+    // 5% of 548000 = 27400 → 17600 < 27400 → cache skip → SKIP
+    // BUT: tokenBudget matters — if over ceiling, budget pressure overrides
+    // Set tokenBudget high enough that headroom exists (no budget pressure)
+    // ceiling = 0.8*0.75*800000 = 480000 → 548000 > 480000 → budget pressure!
+    // So we need to NOT pass tokenBudget to test cache-aware in isolation
+    const engine = createCompaction();
+    await setupConversation({ messageCount: 8, tokensPerMessage: 6000, summaryTokens: 500_000 });
+
+    // No tokenBudget → headroom check is bypassed, no budget pressure
+    const result = await engine.evaluateLeafTrigger(CONV_ID);
+    expect(result.shouldCompact).toBe(false);
+    expect(result.skipReason).toContain("cache-aware");
+  });
+
+  it("does NOT cache-skip when reduction is large enough", async () => {
+    // 12 messages at 5000 tokens, freshTailCount=4 → 8 outside = 40000
+    // totalAssembled = 60000
+    // estimatedReduction = min(40000,20000) - 2400 = 17600
+    // 5% of 60000 = 3000 → 17600 > 3000 → cache check passes → compact
+    const engine = createCompaction();
+    await setupConversation({ messageCount: 12, tokensPerMessage: 5000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID);
+    expect(result.shouldCompact).toBe(true);
+  });
+
+  // ── Budget pressure overrides cache skip ───────────────────────
+
+  it("compacts when over budget ceiling even if cache reduction is tiny (no starvation)", async () => {
+    // This is the Scenario C fix: large context, tiny relative reduction, but budget pressure
+    // 8 messages at 6000 tokens, freshTailCount=4 → 4 outside = 24000
+    // Plus 500000-token summary → totalAssembled = 548000
+    // tokenBudget=750000 → ceiling = 0.8*0.75*750000 = 450000
+    // 548000 > 450000 → budget pressure → cache skip bypassed → COMPACT
+    const engine = createCompaction();
+    await setupConversation({ messageCount: 8, tokensPerMessage: 6000, summaryTokens: 500_000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID, 750_000);
+    expect(result.shouldCompact).toBe(true);
+    expect(result.skipReason).toBeUndefined();
+  });
+
+  // ── Edge cases ─────────────────────────────────────────────────
+
+  it("handles totalAssembledTokens=0 (empty conversation)", async () => {
+    const engine = createCompaction({ leafChunkTokens: 0 });
+    // No messages ingested
+    const result = await engine.evaluateLeafTrigger(CONV_ID);
+    expect(result.shouldCompact).toBe(false);
+    expect(result.rawTokensOutsideTail).toBe(0);
+  });
+
+  it("handles estimatedReduction <= 0 (raw tokens < leafTargetTokens)", async () => {
+    // leafChunkTokens=2000, 6 messages at 500 tokens, freshTailCount=4 → 2 outside = 1000
+    // But wait — 1000 < 2000 → below threshold, returns early
+    // Use leafChunkTokens=500 so threshold is met at 1000
+    // estimatedReduction = min(1000,500) - 2400 = -1900 (negative)
+    // The estimatedReduction > 0 guard prevents cache skip → falls through to compact
+    const engine = createCompaction({ leafChunkTokens: 500 });
+    await setupConversation({ messageCount: 6, tokensPerMessage: 500 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID);
+    expect(result.shouldCompact).toBe(true);
+  });
+
+  it("respects custom leafSkipReductionThreshold", async () => {
+    // With threshold=0.50 (50%), even large reductions get skipped
+    // 12 messages at 5000, freshTailCount=4 → 8 outside = 40000
+    // estimatedReduction = min(40000,20000) - 2400 = 17600
+    // 50% of 60000 = 30000 → 17600 < 30000 → cache skip
+    const engine = createCompaction({ leafSkipReductionThreshold: 0.50 });
+    await setupConversation({ messageCount: 12, tokensPerMessage: 5000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID);
+    expect(result.shouldCompact).toBe(false);
+    expect(result.skipReason).toContain("cache-aware");
+  });
+
+  it("leafSkipReductionThreshold=0 disables cache-aware skip", async () => {
+    // Same setup as above but threshold=0 → estimatedReduction < 0 is never true
+    const engine = createCompaction({
+      leafSkipReductionThreshold: 0,
+    });
+    await setupConversation({ messageCount: 8, tokensPerMessage: 6000, summaryTokens: 500_000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID);
+    // No budget pressure (no tokenBudget), cache skip disabled → should compact
+    expect(result.shouldCompact).toBe(true);
+  });
+
+  it("leafBudgetHeadroomFactor=0 disables headroom skip", async () => {
+    // ceiling = 0*0.75*200000 = 0 → totalAssembled < 0 is never true → headroom skip disabled
+    const engine = createCompaction({ leafBudgetHeadroomFactor: 0, leafChunkTokens: 15_000 });
+    await setupConversation({ messageCount: 10, tokensPerMessage: 3000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID, 200_000);
+    // Headroom disabled → falls to cache-aware → reduction is large enough → compact
+    expect(result.shouldCompact).toBe(true);
+  });
+
+  it("clamps leafBudgetHeadroomFactor above 1.0 to 1.0", async () => {
+    // factor=1.5 → clamped to 1.0 → ceiling = 1.0*0.75*100000 = 75000
+    // 30000 < 75000 → headroom skip
+    const engine = createCompaction({ leafBudgetHeadroomFactor: 1.5, leafChunkTokens: 15_000 });
+    await setupConversation({ messageCount: 10, tokensPerMessage: 3000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID, 100_000);
+    expect(result.shouldCompact).toBe(false);
+    expect(result.skipReason).toContain("budget-headroom");
+  });
+
+  // ── Orchestration scenario ─────────────────────────────────────
+
+  it("orchestrator with headroom skips, sub-agent at capacity compacts", async () => {
+    // Orchestrator: 40K assembled, 200K budget → ceiling=120K → 40K<120K → SKIP
+    const orchestratorEngine = createCompaction({ leafChunkTokens: 15_000 });
+    await ingestMessages(convStore, sumStore, 10, {
+      conversationId: 1,
+      tokenCountFn: () => 4000,
+    });
+    const orchResult = await orchestratorEngine.evaluateLeafTrigger(1, 200_000);
+    expect(orchResult.shouldCompact).toBe(false);
+
+    // Sub-agent: same raw tokens but tiny budget → ceiling=9600 → 40K>9600 → compact
+    const subResult = await orchestratorEngine.evaluateLeafTrigger(1, 16_000);
+    expect(subResult.shouldCompact).toBe(true);
+  });
+
+  // ── Per-pass chunk size estimate ───────────────────────────────
+
+  it("uses per-pass chunk size (min of raw tokens and threshold) for reduction estimate", async () => {
+    // 20 messages at 5000 tokens, freshTailCount=4 → 16 outside = 80000
+    // leafChunkTokens=20000 → threshold met (80000 >= 20000)
+    // Per-pass: min(80000, 20000) = 20000
+    // estimatedReduction = 20000 - 2400 = 17600
+    // 5% of 100000 = 5000 → 17600 > 5000 → no cache skip → compact
+    // Without per-pass capping, estimatedReduction would be 80000-2400=77600,
+    // which would also pass — but the estimate would be wrong
+    const engine = createCompaction();
+    await setupConversation({ messageCount: 20, tokensPerMessage: 5000 });
+
+    const result = await engine.evaluateLeafTrigger(CONV_ID);
+    expect(result.shouldCompact).toBe(true);
+  });
+});

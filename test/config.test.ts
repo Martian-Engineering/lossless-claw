@@ -363,6 +363,48 @@ describe("resolveLcmConfig", () => {
     expect(config.maxAssemblyTokenBudget).toBeUndefined();
   });
 
+  it("defaults leafSkipReductionThreshold to 0.05 and leafBudgetHeadroomFactor to 0.8", () => {
+    const config = resolveLcmConfig({}, {});
+    expect(config.leafSkipReductionThreshold).toBe(0.05);
+    expect(config.leafBudgetHeadroomFactor).toBe(0.8);
+  });
+
+  it("reads leafSkipReductionThreshold and leafBudgetHeadroomFactor from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      leafSkipReductionThreshold: 0.10,
+      leafBudgetHeadroomFactor: 0.65,
+    });
+    expect(config.leafSkipReductionThreshold).toBe(0.10);
+    expect(config.leafBudgetHeadroomFactor).toBe(0.65);
+  });
+
+  it("env vars override leafSkipReductionThreshold and leafBudgetHeadroomFactor", () => {
+    const config = resolveLcmConfig({
+      LCM_LEAF_SKIP_REDUCTION_THRESHOLD: "0.03",
+      LCM_LEAF_BUDGET_HEADROOM_FACTOR: "0.60",
+    } as NodeJS.ProcessEnv, {
+      leafSkipReductionThreshold: 0.10,
+      leafBudgetHeadroomFactor: 0.90,
+    });
+    expect(config.leafSkipReductionThreshold).toBe(0.03);
+    expect(config.leafBudgetHeadroomFactor).toBe(0.60);
+  });
+
+  it("ships a manifest with leafSkipReductionThreshold and leafBudgetHeadroomFactor in schema", () => {
+    expect(manifest.configSchema.properties.leafSkipReductionThreshold).toEqual({
+      description: expect.any(String),
+      type: "number",
+      minimum: 0,
+      maximum: 1,
+    });
+    expect(manifest.configSchema.properties.leafBudgetHeadroomFactor).toEqual({
+      description: expect.any(String),
+      type: "number",
+      minimum: 0,
+      maximum: 1,
+    });
+  });
+
   it("derives bootstrapMaxTokens from leafChunkTokens and allows override", () => {
     expect(resolveLcmConfig({}, {
       leafChunkTokens: 80_000,
