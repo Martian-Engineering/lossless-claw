@@ -405,11 +405,43 @@ export class CompactionEngine {
 
     const totalAssembledTokens = await this.summaryStore.getContextTokenCount(conversationId);
 
-    // Cache-aware skip: if estimated reduction is tiny relative to total
-    // context, the prompt-cache prefix invalidation cost exceeds the gain.
+    // ── Budget headroom check (evaluated first) ───────────────────
+    // If assembled tokens are well under the budget ceiling, skip to
+    // avoid unnecessary cache prefix churn.  This check runs first so
+    // that budget pressure always takes priority over cache concerns.
+    const headroomFactor = Math.min(this.config.leafBudgetHeadroomFactor ?? 0.8, 1.0);
+    let hasHeadroom = false;
+    if (typeof tokenBudget === "number" && tokenBudget > 0) {
+      const budgetCeiling = Math.floor(
+        headroomFactor * this.config.contextThreshold * tokenBudget,
+      );
+      hasHeadroom = totalAssembledTokens < budgetCeiling;
+      if (hasHeadroom) {
+        return {
+          shouldCompact: false,
+          rawTokensOutsideTail,
+          threshold,
+          skipReason: `budget-headroom: ${totalAssembledTokens} assembled < ${budgetCeiling} ceiling`,
+        };
+      }
+    }
+
+    // ── Cache-aware skip ──────────────────────────────────────────
+    // If the estimated token reduction is tiny relative to the total
+    // assembled context, the prompt-cache prefix invalidation cost
+    // exceeds the compression benefit.
+    //
+    // This check is ONLY applied when either (a) budget headroom
+    // status is unknown (no tokenBudget provided) or (b) we have not
+    // yet breached the headroom ceiling.  Once over the ceiling,
+    // budget pressure takes priority and compaction fires regardless
+    // of cache impact — preventing compaction starvation in large
+    // contexts where the relative threshold would scale unboundedly.
     const estimatedReduction = rawTokensOutsideTail - this.config.leafTargetTokens;
     const reductionThreshold = this.config.leafSkipReductionThreshold ?? 0.05;
+    const budgetPressure = typeof tokenBudget === "number" && tokenBudget > 0 && !hasHeadroom;
     if (
+      !budgetPressure &&
       totalAssembledTokens > 0 &&
       estimatedReduction > 0 &&
       estimatedReduction < reductionThreshold * totalAssembledTokens
@@ -420,23 +452,6 @@ export class CompactionEngine {
         threshold,
         skipReason: `cache-aware: reduction ${estimatedReduction} < ${(reductionThreshold * 100).toFixed(0)}% of ${totalAssembledTokens} assembled`,
       };
-    }
-
-    // Budget headroom skip: if assembled tokens are well under the budget
-    // ceiling, skip to avoid unnecessary cache prefix churn.
-    const headroomFactor = this.config.leafBudgetHeadroomFactor ?? 0.8;
-    if (typeof tokenBudget === "number" && tokenBudget > 0) {
-      const budgetCeiling = Math.floor(
-        headroomFactor * this.config.contextThreshold * tokenBudget,
-      );
-      if (totalAssembledTokens < budgetCeiling) {
-        return {
-          shouldCompact: false,
-          rawTokensOutsideTail,
-          threshold,
-          skipReason: `budget-headroom: ${totalAssembledTokens} assembled < ${budgetCeiling} ceiling`,
-        };
-      }
     }
 
     return { shouldCompact: true, rawTokensOutsideTail, threshold };
