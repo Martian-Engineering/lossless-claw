@@ -1537,10 +1537,10 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     },
     agentLaneSubagent: "subagent",
     log: {
-      info: (msg) => api.logger.info(msg),
-      warn: (msg) => api.logger.warn(msg),
-      error: (msg) => api.logger.error(msg),
-      debug: (msg) => api.logger.debug?.(msg),
+      info: (msg) => console.error(msg),
+      warn: (msg) => console.error(msg),
+      error: (msg) => console.error(msg),
+      debug: (msg) => console.error(msg),
     },
   };
 }
