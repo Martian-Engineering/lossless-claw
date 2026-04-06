@@ -70,6 +70,13 @@ const LcmGrepSchema = Type.Object({
       maximum: 200,
     }),
   ),
+  sort: Type.Optional(
+    Type.String({
+      description:
+        'Sort order: "recency" (newest first, default), "relevance" (best FTS5 match first, full_text mode only), or "hybrid" (blends relevance with recency).',
+      enum: ["recency", "relevance", "hybrid"],
+    }),
+  ),
 });
 
 function truncateSnippet(content: string, maxLen: number = 200): string {
@@ -139,6 +146,7 @@ export function createLcmGrepTool(input: {
         });
       }
 
+      const sort = (p.sort as "recency" | "relevance" | "hybrid") ?? "recency";
       const result = await retrieval.grep({
         query: pattern,
         mode,
@@ -147,6 +155,7 @@ export function createLcmGrepTool(input: {
         limit,
         since,
         before,
+        sort,
       });
 
       const lines: string[] = [];

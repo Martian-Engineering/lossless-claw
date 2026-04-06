@@ -68,6 +68,10 @@ export interface GrepInput {
   since?: Date;
   before?: Date;
   limit?: number;
+  /** Sort order for results. Default "recency" (newest first).
+   *  "relevance" sorts by FTS5 BM25 rank (full_text mode only).
+   *  "hybrid" blends relevance with recency. */
+  sort?: "recency" | "relevance" | "hybrid";
 }
 
 export interface GrepResult {
@@ -241,8 +245,25 @@ export class RetrievalEngine {
       ]);
     }
 
-    messages.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-    summaries.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    const sortMode = input.sort ?? "recency";
+    if (sortMode === "relevance" && mode === "full_text") {
+      // FTS5 rank is negative (lower = better match). Sort ascending.
+      messages.sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0));
+      summaries.sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0));
+    } else if (sortMode === "hybrid" && mode === "full_text") {
+      // Blend relevance with recency: rank (lower=better) adjusted by time
+      const now = Date.now();
+      const score = (item: { rank?: number; createdAt: Date }) => {
+        const ageHours = (now - item.createdAt.getTime()) / 3_600_000;
+        return (item.rank ?? 0) * (1 + ageHours * 0.001);
+      };
+      messages.sort((a, b) => score(a) - score(b));
+      summaries.sort((a, b) => score(a) - score(b));
+    } else {
+      // Default: recency (newest first)
+      messages.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      summaries.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    }
 
     return {
       messages,
