@@ -517,6 +517,7 @@ export class CompactionEngine {
     conversationId: number;
     tokenBudget: number;
     summarize: CompactionSummarizeFn;
+    currentTokenCount?: number;
     force?: boolean;
     previousSummaryContent?: string;
     summaryModel?: string;
@@ -525,7 +526,12 @@ export class CompactionEngine {
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId, tokenBudget, undefined, tokensBefore);
+    const leafTrigger = await this.evaluateLeafTrigger(
+      conversationId,
+      tokenBudget,
+      input.currentTokenCount,
+      tokensBefore,
+    );
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {
@@ -645,6 +651,7 @@ export class CompactionEngine {
     conversationId: number;
     tokenBudget: number;
     summarize: CompactionSummarizeFn;
+    currentTokenCount?: number;
     force?: boolean;
     hardTrigger?: boolean;
     summaryModel?: string;
@@ -653,7 +660,12 @@ export class CompactionEngine {
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId, tokenBudget, undefined, tokensBefore);
+    const leafTrigger = await this.evaluateLeafTrigger(
+      conversationId,
+      tokenBudget,
+      input.currentTokenCount,
+      tokensBefore,
+    );
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {

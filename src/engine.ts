@@ -2954,6 +2954,7 @@ export class LcmContextEngine implements ContextEngine {
         const leafResult = await this.compaction.compactLeaf({
           conversationId: conversation.conversationId,
           tokenBudget,
+          currentTokenCount: observedTokens,
           summarize,
           force: params.force,
           previousSummaryContent: params.previousSummaryContent,
@@ -3114,6 +3115,7 @@ export class LcmContextEngine implements ContextEngine {
           const sweepResult = await this.compaction.compactFullSweep({
             conversationId,
             tokenBudget,
+            currentTokenCount: observedTokens,
             summarize,
             force: forceCompaction,
             hardTrigger: false,

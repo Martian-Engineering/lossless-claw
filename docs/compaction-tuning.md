@@ -31,7 +31,7 @@ Add these settings to your plugin config in `openclaw.json` under `plugins.entri
 }
 ```
 
-**Sonnet 4.6 (200K context, general use)** — defaults work well:
+**Sonnet 4.6 (1M context, general use)** — defaults work well:
 ```json
 {
   "summaryModel": "claude-haiku-4-5",
@@ -211,7 +211,7 @@ This is why compaction model choice matters so much — a slow model turns full 
 | Scenario | skipThreshold | headroomFactor | leafChunkTokens | summaryModel | Rationale |
 |----------|---------------|----------------|-----------------|--------------|-----------|
 | **Opus 1M coding** | 0.02 | 0.55 | 35000 | Haiku/GPT-4o-mini | At $5/MTok, moderate early compaction. Larger chunks = fewer cache busts. |
-| **Sonnet 200K general** | 0.05 | 0.80 | 20000 | Haiku | Defaults work here. Break-even ~13.5 turns. |
+| **Sonnet 1M general** | 0.05 | 0.80 | 20000 | Haiku | Defaults work here. Break-even ~13.5 turns. |
 | **Haiku quick** | 0.10 | 0.90 | 15000 | Haiku | Short sessions rarely recoup cache invalidation. |
 | **Orchestration** | 0.02 | 0.60 | 25000 | Sonnet | Sub-agents accumulate fast. Compact early. |
 

@@ -4486,6 +4486,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
       expect.objectContaining({
         conversationId: expect.any(Number),
         tokenBudget: 400,
+        currentTokenCount: 500,
         summarize: expect.any(Function),
         force: false,
         hardTrigger: false,
@@ -4763,6 +4764,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
       expect.objectContaining({
         conversationId: expect.any(Number),
         tokenBudget: 400,
+        currentTokenCount: 500,
         summarize: expect.any(Function),
         force: false,
         hardTrigger: false,
@@ -5033,6 +5035,50 @@ describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
       expect.objectContaining({
         conversationId: expect.any(Number),
         tokenBudget: 4096,
+      }),
+    );
+  });
+
+  it("passes currentTokenCount through to compactLeafAsync worker compaction", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactLeaf: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const compactLeafSpy = vi
+      .spyOn(privateEngine.compaction, "compactLeaf")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 500,
+        tokensAfter: 280,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "compact-leaf-observed-token-session",
+      message: { role: "user", content: "trigger compact leaf" } as AgentMessage,
+    });
+
+    const result = await engine.compactLeafAsync({
+      sessionId: "compact-leaf-observed-token-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 400,
+      currentTokenCount: 500,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(compactLeafSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 400,
+        currentTokenCount: 500,
       }),
     );
   });

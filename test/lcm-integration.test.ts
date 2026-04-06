@@ -2126,6 +2126,54 @@ describe("LCM integration: compaction", () => {
     expect(summarize).toHaveBeenCalled();
   });
 
+  it("compactLeaf uses currentTokenCount for headroom decisions when stored tokens are stale", async () => {
+    const staleAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      leafChunkTokens: 15_000,
+    });
+
+    await ingestMessages(convStore, sumStore, 10, {
+      contentFn: (i) => `Turn ${i}: ${"x".repeat(11_980)}`,
+      tokenCountFn: () => 3_000,
+    });
+
+    const summarize = vi.fn(async (text: string) => `summary ${text.length}`);
+
+    const result = await staleAwareEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 100_000,
+      currentTokenCount: 80_000,
+      summarize,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(summarize).toHaveBeenCalled();
+  });
+
+  it("compactFullSweep uses currentTokenCount for threshold sweeps when stored tokens are stale", async () => {
+    const staleAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      leafChunkTokens: 15_000,
+    });
+
+    await ingestMessages(convStore, sumStore, 10, {
+      contentFn: (i) => `Turn ${i}: ${"y".repeat(11_980)}`,
+      tokenCountFn: () => 3_000,
+    });
+
+    const summarize = vi.fn(async (text: string) => `summary ${text.length}`);
+
+    const result = await staleAwareEngine.compactFullSweep({
+      conversationId: CONV_ID,
+      tokenBudget: 100_000,
+      currentTokenCount: 80_000,
+      summarize,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(summarize).toHaveBeenCalled();
+  });
+
   it("compact skips when under threshold and not forced", async () => {
     await ingestMessages(convStore, sumStore, 2, {
       contentFn: () => "Short",
