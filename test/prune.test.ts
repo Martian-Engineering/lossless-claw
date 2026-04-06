@@ -6,6 +6,7 @@ import { runLcmMigrations } from "../src/db/migration.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
 import { createLcmDatabaseConnection, closeLcmConnection } from "../src/db/connection.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
+import { SummaryStore } from "../src/store/summary-store.js";
 import { parseDuration, pruneConversations } from "../src/prune.js";
 
 function createPruneFixture() {
@@ -97,6 +98,43 @@ describe("pruneConversations", () => {
       .run(convRow.conversation_id, opts.messageCreatedAt);
 
     return convRow.conversation_id;
+  }
+
+  async function seedConversationWithSummary(
+    fixture: ReturnType<typeof createPruneFixture>,
+    opts: { sessionId: string; messageCreatedAt: string },
+  ) {
+    const conversationId = seedConversation(fixture, opts);
+    const summaryStore = new SummaryStore(fixture.db, {
+      fts5Available: getLcmDbFeatures(fixture.db).fts5Available,
+    });
+    const messageRow = fixture.db
+      .prepare(`SELECT message_id FROM messages WHERE conversation_id = ? LIMIT 1`)
+      .get(conversationId) as { message_id: number };
+
+    await summaryStore.insertSummary({
+      summaryId: `summary-${conversationId}`,
+      conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "prunable summary",
+      tokenCount: 7,
+      fileIds: [],
+      earliestAt: new Date(opts.messageCreatedAt.replace(" ", "T") + "Z"),
+      latestAt: new Date(opts.messageCreatedAt.replace(" ", "T") + "Z"),
+      descendantCount: 1,
+      descendantTokenCount: 5,
+      sourceMessageTokenCount: 5,
+      model: "test",
+    });
+    await summaryStore.linkSummaryToMessages(`summary-${conversationId}`, [messageRow.message_id]);
+    fixture.db
+      .prepare(
+        `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
+         VALUES (?, 1, 'summary', ?)`,
+      )
+      .run(conversationId, `summary-${conversationId}`);
+    return conversationId;
   }
 
   it("returns empty candidates when no conversations exist", () => {
@@ -208,6 +246,45 @@ describe("pruneConversations", () => {
       .prepare(`SELECT COUNT(*) AS cnt FROM messages`)
       .get() as { cnt: number };
     expect(messages.cnt).toBe(1);
+  });
+
+  it("deletes conversations with summary lineage and context items", async () => {
+    const fixture = createPruneFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversationId = await seedConversationWithSummary(fixture, {
+      sessionId: "old-with-summary",
+      messageCreatedAt: "2025-02-01 00:00:00",
+    });
+
+    const result = pruneConversations(fixture.db, {
+      before: "90d",
+      confirm: true,
+      now: "2025-06-01T00:00:00.000Z",
+    });
+
+    expect(result.deleted).toBe(1);
+    expect(
+      fixture.db
+        .prepare(`SELECT COUNT(*) AS cnt FROM conversations WHERE conversation_id = ?`)
+        .get(conversationId) as { cnt: number },
+    ).toEqual({ cnt: 0 });
+    expect(
+      fixture.db
+        .prepare(`SELECT COUNT(*) AS cnt FROM summaries WHERE conversation_id = ?`)
+        .get(conversationId) as { cnt: number },
+    ).toEqual({ cnt: 0 });
+    expect(
+      fixture.db
+        .prepare(`SELECT COUNT(*) AS cnt FROM summary_messages`)
+        .get() as { cnt: number },
+    ).toEqual({ cnt: 0 });
+    expect(
+      fixture.db
+        .prepare(`SELECT COUNT(*) AS cnt FROM context_items WHERE conversation_id = ?`)
+        .get(conversationId) as { cnt: number },
+    ).toEqual({ cnt: 0 });
   });
 
   it("runs VACUUM when vacuum option is set", () => {

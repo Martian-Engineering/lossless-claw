@@ -140,15 +140,132 @@ function loadPruneCandidates(db: DatabaseSync, cutoffDate: string): PruneCandida
 }
 
 /**
+ * Detect whether an optional SQLite table exists.
+ */
+function hasTable(db: DatabaseSync, tableName: string): boolean {
+  const row = db
+    .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1`)
+    .get(tableName) as { found: number } | undefined;
+  return row?.found === 1;
+}
+
+/**
+ * Create a temp table containing the conversations selected for pruning.
+ */
+function stageCandidateConversationIds(
+  db: DatabaseSync,
+  candidates: PruneCandidate[],
+): void {
+  db.exec(`DROP TABLE IF EXISTS temp.prune_candidate_ids`);
+  db.exec(`CREATE TEMP TABLE prune_candidate_ids (conversation_id INTEGER PRIMARY KEY)`);
+  const insertStmt = db.prepare(
+    `INSERT INTO temp.prune_candidate_ids (conversation_id) VALUES (?)`,
+  );
+  for (const candidate of candidates) {
+    insertStmt.run(candidate.conversationId);
+  }
+}
+
+/**
+ * Remove the temp candidate table.
+ */
+function dropCandidateConversationIds(db: DatabaseSync): void {
+  db.exec(`DROP TABLE IF EXISTS temp.prune_candidate_ids`);
+}
+
+/**
  * Delete candidate conversations and return the number of rows removed.
  */
 function deleteCandidates(db: DatabaseSync, candidates: PruneCandidate[]): number {
-  const deleteStmt = db.prepare(`DELETE FROM conversations WHERE conversation_id = ?`);
-  let deleted = 0;
-  for (const candidate of candidates) {
-    deleted += Number(deleteStmt.run(candidate.conversationId).changes ?? 0);
+  if (candidates.length === 0) {
+    return 0;
   }
-  return deleted;
+
+  const tableOptions = {
+    hasMessagesFts: hasTable(db, "messages_fts"),
+    hasSummariesFts: hasTable(db, "summaries_fts"),
+    hasSummariesFtsCjk: hasTable(db, "summaries_fts_cjk"),
+  };
+
+  stageCandidateConversationIds(db, candidates);
+  try {
+    db.prepare(
+      `DELETE FROM summary_messages
+       WHERE summary_id IN (
+         SELECT s.summary_id
+         FROM summaries s
+         JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
+       )
+          OR message_id IN (
+         SELECT m.message_id
+         FROM messages m
+         JOIN temp.prune_candidate_ids p ON p.conversation_id = m.conversation_id
+       )`,
+    ).run();
+
+    db.prepare(
+      `DELETE FROM summary_parents
+       WHERE summary_id IN (
+         SELECT s.summary_id
+         FROM summaries s
+         JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
+       )
+          OR parent_summary_id IN (
+         SELECT s.summary_id
+         FROM summaries s
+         JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
+       )`,
+    ).run();
+
+    db.prepare(
+      `DELETE FROM context_items
+       WHERE conversation_id IN (SELECT conversation_id FROM temp.prune_candidate_ids)`,
+    ).run();
+
+    if (tableOptions.hasMessagesFts) {
+      db.prepare(
+        `DELETE FROM messages_fts
+         WHERE rowid IN (
+           SELECT m.message_id
+           FROM messages m
+           JOIN temp.prune_candidate_ids p ON p.conversation_id = m.conversation_id
+         )`,
+      ).run();
+    }
+
+    if (tableOptions.hasSummariesFts) {
+      db.prepare(
+        `DELETE FROM summaries_fts
+         WHERE summary_id IN (
+           SELECT s.summary_id
+           FROM summaries s
+           JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
+         )`,
+      ).run();
+    }
+
+    if (tableOptions.hasSummariesFtsCjk) {
+      db.prepare(
+        `DELETE FROM summaries_fts_cjk
+         WHERE summary_id IN (
+           SELECT s.summary_id
+           FROM summaries s
+           JOIN temp.prune_candidate_ids p ON p.conversation_id = s.conversation_id
+         )`,
+      ).run();
+    }
+
+    return Number(
+      db
+        .prepare(
+          `DELETE FROM conversations
+           WHERE conversation_id IN (SELECT conversation_id FROM temp.prune_candidate_ids)`,
+        )
+        .run().changes ?? 0,
+    );
+  } finally {
+    dropCandidateConversationIds(db);
+  }
 }
 
 /**
