@@ -156,6 +156,7 @@ describe("lcm plugin registration", () => {
       skipStatelessSessions: true,
       largeFileThresholdTokens: 12345,
     });
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     lcmPlugin.register(api);
     expect(api.registerCommand).toHaveBeenCalledWith(
@@ -187,15 +188,16 @@ describe("lcm plugin registration", () => {
     expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
     );
-    expect(infoLog).toHaveBeenCalledWith(
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
       "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
     );
-    expect(infoLog).toHaveBeenCalledWith(
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
       "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
     );
     expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: (unconfigured)",
     );
+    consoleErrorSpy.mockRestore();
     expect(api.on).toHaveBeenCalledWith("before_reset", expect.any(Function));
     expect(api.on).toHaveBeenCalledWith("session_end", expect.any(Function));
   });
@@ -447,6 +449,7 @@ describe("lcm plugin registration", () => {
     };
     const first = buildApi(pluginConfig);
     const second = buildApi(pluginConfig);
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     lcmPlugin.register(first.api);
     lcmPlugin.register(second.api);
@@ -462,15 +465,19 @@ describe("lcm plugin registration", () => {
 
     const firstMessages = first.infoLog.mock.calls.map(([message]) => message);
     const secondMessages = second.infoLog.mock.calls.map(([message]) => message);
+    const errorMessages = consoleErrorSpy.mock.calls.map(([message]) => message);
 
-    expect(firstMessages).toHaveLength(4);
+    expect(firstMessages).toHaveLength(2);
     expect([...firstMessages].sort()).toEqual([
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
       "[lcm] Compaction summarization model: (unconfigured)",
+    ].sort());
+    expect(errorMessages).toEqual(expect.arrayContaining([
       "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
       "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
-    ].sort());
+    ]));
     expect(secondMessages).toEqual([]);
+    consoleErrorSpy.mockRestore();
   });
   it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {
     const { api, getFactory, warnLog } = buildApi(
