@@ -437,7 +437,10 @@ export class CompactionEngine {
     // budget pressure takes priority and compaction fires regardless
     // of cache impact — preventing compaction starvation in large
     // contexts where the relative threshold would scale unboundedly.
-    const estimatedReduction = rawTokensOutsideTail - this.config.leafTargetTokens;
+    // Estimate reduction from a single leaf pass, not all raw tokens.
+    // A leaf pass only compacts one chunk capped at leafChunkTokens.
+    const perPassRawTokens = Math.min(rawTokensOutsideTail, threshold);
+    const estimatedReduction = perPassRawTokens - this.config.leafTargetTokens;
     const reductionThreshold = this.config.leafSkipReductionThreshold ?? 0.05;
     const budgetPressure = typeof tokenBudget === "number" && tokenBudget > 0 && !hasHeadroom;
     if (

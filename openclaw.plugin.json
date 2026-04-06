@@ -233,6 +233,18 @@
       "databasePath": {
         "description": "Path to LCM SQLite database (alias for dbPath)",
         "type": "string"
+      },
+      "leafSkipReductionThreshold": {
+        "description": "Minimum estimated reduction (fraction of total assembled tokens) to justify leaf compaction. Prevents cache-prefix invalidation when the gain is tiny. Set to 0 to disable. Default 0.05.",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "leafBudgetHeadroomFactor": {
+        "description": "Skip leaf compaction when assembled tokens are below this fraction of contextThreshold × tokenBudget. Set to 0 to disable. Default 0.8.",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
       }
     }
   }
