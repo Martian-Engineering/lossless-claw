@@ -14,7 +14,11 @@ type HookHandler = (event: unknown, context: unknown) => unknown;
 
 function buildApi(
   pluginConfig: unknown,
-  options?: { includeModelAuth?: boolean; agentDir?: string },
+  options?: {
+    includeModelAuth?: boolean;
+    agentDir?: string;
+    runtimeConfig?: Record<string, unknown>;
+  },
 ): {
   api: OpenClawPluginApi;
   getFactory: () => RegisteredEngineFactory;
@@ -58,7 +62,7 @@ function buildApi(
             },
           }),
       config: {
-        loadConfig: vi.fn(() => ({})),
+        loadConfig: vi.fn(() => options?.runtimeConfig ?? {}),
       },
       logging: {
         getChildLogger: vi.fn(() => ({
@@ -517,6 +521,35 @@ describe("lcm plugin registration", () => {
       "[lcm] Compaction summarization model: openai-resp/gpt-5.4 (override)",
     );
     expect(sessionInfoLog).not.toHaveBeenCalled();
+  });
+
+  it("falls back to runtime plugin config for the startup banner when register runs before api.pluginConfig is populated", () => {
+    const { api } = buildApi(
+      {},
+      {
+        runtimeConfig: {
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                enabled: true,
+                config: {
+                  summaryModel: "openai-codex/gpt-5.4",
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+    api.config = {} as OpenClawPluginApi["config"];
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    lcmPlugin.register(api);
+
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      "[lcm] Compaction summarization model: openai-codex/gpt-5.4 (override)",
+    );
+    consoleErrorSpy.mockRestore();
   });
 
   it("logs the OpenClaw compaction model at startup when no plugin override is set", () => {

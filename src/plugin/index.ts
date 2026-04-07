@@ -344,6 +344,72 @@ function readDefaultModelFromConfig(config: unknown): string {
   return typeof primary === "string" ? primary.trim() : "";
 }
 
+/** Load the best available validated OpenClaw config during plugin registration. */
+function loadEffectiveOpenClawConfig(api: OpenClawPluginApi): unknown {
+  try {
+    const runtimeConfig = api.runtime.config.loadConfig();
+    if (runtimeConfig !== undefined) {
+      if (isRecord(runtimeConfig) && Object.keys(runtimeConfig).length > 0) {
+        return runtimeConfig;
+      }
+      if (!isRecord(api.config) || Object.keys(api.config).length === 0) {
+        return runtimeConfig;
+      }
+    }
+  } catch {
+    // Older runtimes or early startup can leave loadConfig unavailable.
+  }
+  return api.config;
+}
+
+/** Read this plugin's config from the validated OpenClaw runtime config. */
+function readPluginConfigFromOpenClawConfig(
+  openClawConfig: unknown,
+  pluginId: string,
+): Record<string, unknown> | undefined {
+  if (!isRecord(openClawConfig)) {
+    return undefined;
+  }
+
+  const plugins = openClawConfig.plugins;
+  if (!isRecord(plugins)) {
+    return undefined;
+  }
+
+  const entries = plugins.entries;
+  if (!isRecord(entries)) {
+    return undefined;
+  }
+
+  const entry = entries[pluginId];
+  if (!isRecord(entry) || !isRecord(entry.config)) {
+    return undefined;
+  }
+
+  return entry.config;
+}
+
+/** Resolve the config surfaces that should drive registration-time behavior. */
+function resolveRegistrationConfig(api: OpenClawPluginApi): {
+  openClawConfig: unknown;
+  pluginConfig?: Record<string, unknown>;
+} {
+  const apiPluginConfig =
+    api.pluginConfig && typeof api.pluginConfig === "object" && !Array.isArray(api.pluginConfig)
+      ? api.pluginConfig
+      : undefined;
+
+  if (apiPluginConfig && Object.keys(apiPluginConfig).length > 0) {
+    return { openClawConfig: api.config, pluginConfig: apiPluginConfig };
+  }
+
+  const openClawConfig = loadEffectiveOpenClawConfig(api);
+  return {
+    openClawConfig,
+    pluginConfig: readPluginConfigFromOpenClawConfig(openClawConfig, api.id),
+  };
+}
+
 /** Read OpenClaw's configured compaction model from the validated runtime config. */
 function readCompactionModelFromConfig(config: unknown): string {
   if (!config || typeof config !== "object") {
@@ -1278,12 +1344,15 @@ function readLatestAssistantReply(messages: unknown[]): string | undefined {
 }
 
 /** Construct LCM dependencies from plugin API/runtime surfaces. */
-function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
+function createLcmDependencies(
+  api: OpenClawPluginApi,
+  registrationConfig = resolveRegistrationConfig(api),
+): LcmDependencies {
   const envSnapshot = snapshotPluginEnv();
-  envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(api.config);
+  envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(registrationConfig.openClawConfig);
   const modelAuth = getRuntimeModelAuth(api);
   const readEnv: ReadEnvFn = (key) => process.env[key];
-  const pluginConfig = resolvePluginConfig(api);
+  const pluginConfig = registrationConfig.pluginConfig;
   const log = createLcmLogger(api);
   const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
 
@@ -1943,7 +2012,8 @@ const lcmPlugin = {
   },
 
   register(api: OpenClawPluginApi) {
-    const deps = createLcmDependencies(api);
+    const registrationConfig = resolveRegistrationConfig(api);
+    const deps = createLcmDependencies(api, registrationConfig);
     const dbPath = deps.config.databasePath;
     const normalizedDbPath = normalizePath(dbPath);
 
@@ -2132,7 +2202,7 @@ const lcmPlugin = {
       log: (message) => deps.log.info(message),
       message: buildCompactionModelLog({
         config: deps.config,
-        openClawConfig: api.config,
+        openClawConfig: registrationConfig.openClawConfig,
         defaultProvider: process.env.OPENCLAW_PROVIDER?.trim() ?? "",
       }),
     });
