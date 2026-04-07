@@ -5086,4 +5086,41 @@ describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
       }),
     );
   });
+
+  it("omits currentTokenCount when not provided to compactLeafAsync", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactLeaf: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const compactLeafSpy = vi
+      .spyOn(privateEngine.compaction, "compactLeaf")
+      .mockResolvedValue({
+        actionTaken: false,
+        tokensBefore: 200,
+        tokensAfter: 200,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "no-observed-token-session",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    await engine.compactLeafAsync({
+      sessionId: "no-observed-token-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 400,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    const callArg = compactLeafSpy.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    expect(callArg).toBeDefined();
+    expect(callArg!.currentTokenCount).toBeUndefined();
+  });
 });
