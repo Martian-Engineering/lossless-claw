@@ -31,7 +31,7 @@ Add these settings to your plugin config in `openclaw.json` under `plugins.entri
 }
 ```
 
-**Sonnet 4.6 (1M context, general use)** — defaults work well:
+**Sonnet 4.6 (1M context, general use)** — skip thresholds and chunk sizes work well at defaults; just set the compaction model:
 ```json
 {
   "summaryModel": "claude-haiku-4-5",
