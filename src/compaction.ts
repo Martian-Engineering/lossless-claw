@@ -54,7 +54,27 @@ export interface CompactionConfig {
   timezone?: string;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
+  /** Minimum estimated reduction fraction to justify leaf compaction (default 0.05). */
+  leafSkipReductionThreshold?: number;
+  /** Skip leaf compaction when assembled tokens < factor × contextThreshold × tokenBudget (default 0.8). */
+  leafBudgetHeadroomFactor?: number;
 }
+
+export type LeafTriggerResult = {
+  shouldCompact: boolean;
+  rawTokensOutsideTail: number;
+  threshold: number;
+  skipReason?: string;
+  /** Structured decision context for diagnostics and telemetry. */
+  context?: {
+    totalAssembledTokens: number;
+    budgetCeiling?: number;
+    budgetPressure: boolean;
+    estimatedReduction?: number;
+    reductionThreshold?: number;
+    headroomFactor: number;
+  };
+};
 
 type CompactionLevel = "normal" | "aggressive" | "fallback" | "capped";
 type CompactionPass = "leaf" | "condensed";
@@ -436,17 +456,82 @@ export class CompactionEngine {
    * `leafChunkTokens`. This lets callers trigger a soft incremental leaf pass
    * before the full context threshold is breached.
    */
-  async evaluateLeafTrigger(conversationId: number): Promise<{
-    shouldCompact: boolean;
-    rawTokensOutsideTail: number;
-    threshold: number;
-  }> {
+  async evaluateLeafTrigger(
+    conversationId: number,
+    tokenBudget?: number,
+    liveContextTokens?: number,
+    precomputedTokenCount?: number,
+  ): Promise<LeafTriggerResult> {
     const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId);
     const threshold = this.resolveLeafChunkTokens();
+
+    if (rawTokensOutsideTail < threshold) {
+      return { shouldCompact: false, rawTokensOutsideTail, threshold };
+    }
+
+    // Reuse a precomputed token count when the caller already fetched it
+    // (avoids a duplicate getContextTokenCount DB read).
+    // Use the higher of stored/precomputed count and live context estimate
+    // for more accurate headroom decisions.
+    const storedTokens = precomputedTokenCount ?? await this.summaryStore.getContextTokenCount(conversationId);
+    const totalAssembledTokens =
+      typeof liveContextTokens === "number" && liveContextTokens > storedTokens
+        ? liveContextTokens
+        : storedTokens;
+
+    // ── Budget headroom check (evaluated first) ───────────────────
+    // If assembled tokens are well under the budget ceiling, skip to
+    // avoid unnecessary cache prefix churn.
+    const rawHeadroomFactor = this.config.leafBudgetHeadroomFactor ?? 0.8;
+    const headroomFactor = Math.min(Math.max(rawHeadroomFactor, 0), 1.0);
+    const headroomEnabled = headroomFactor > 0 && typeof tokenBudget === "number" && tokenBudget > 0;
+    const budgetCeiling = headroomEnabled
+      ? Math.floor(headroomFactor * this.config.contextThreshold * tokenBudget)
+      : undefined;
+    let hasHeadroom = false;
+    if (headroomEnabled && budgetCeiling !== undefined) {
+      hasHeadroom = totalAssembledTokens < budgetCeiling;
+      if (hasHeadroom) {
+        return {
+          shouldCompact: false,
+          rawTokensOutsideTail,
+          threshold,
+          skipReason: `budget-headroom: ${totalAssembledTokens} assembled < ${budgetCeiling} ceiling`,
+          context: { totalAssembledTokens, budgetCeiling, budgetPressure: false, headroomFactor },
+        };
+      }
+    }
+
+    // ── Cache-aware skip ──────────────────────────────────────────
+    // If the estimated token reduction is tiny relative to the total
+    // assembled context, the prompt-cache prefix invalidation cost
+    // exceeds the compression benefit.
+    // Budget pressure override: when headroom is enabled and context
+    // reaches or exceeds the ceiling, compaction fires unconditionally.
+    const perPassRawTokens = Math.min(rawTokensOutsideTail, threshold);
+    const estimatedReduction = perPassRawTokens - this.config.leafTargetTokens;
+    const reductionThreshold = Math.min(Math.max(this.config.leafSkipReductionThreshold ?? 0.05, 0), 1.0);
+    const budgetPressure = headroomEnabled && !hasHeadroom;
+    if (
+      !budgetPressure &&
+      totalAssembledTokens > 0 &&
+      estimatedReduction > 0 &&
+      estimatedReduction < reductionThreshold * totalAssembledTokens
+    ) {
+      return {
+        shouldCompact: false,
+        rawTokensOutsideTail,
+        threshold,
+        skipReason: `cache-aware: reduction ${estimatedReduction} < ${(reductionThreshold * 100).toFixed(0)}% of ${totalAssembledTokens} assembled`,
+        context: { totalAssembledTokens, budgetCeiling, budgetPressure, estimatedReduction, reductionThreshold, headroomFactor },
+      };
+    }
+
     return {
-      shouldCompact: rawTokensOutsideTail >= threshold,
+      shouldCompact: true,
       rawTokensOutsideTail,
       threshold,
+      context: { totalAssembledTokens, budgetCeiling, budgetPressure, estimatedReduction, reductionThreshold, headroomFactor },
     };
   }
 
@@ -474,6 +559,7 @@ export class CompactionEngine {
     conversationId: number;
     tokenBudget: number;
     summarize: CompactionSummarizeFn;
+    currentTokenCount?: number;
     force?: boolean;
     previousSummaryContent?: string;
     summaryModel?: string;
@@ -485,6 +571,7 @@ export class CompactionEngine {
     conversationId: number;
     tokenBudget: number;
     summarize: CompactionSummarizeFn;
+    currentTokenCount?: number;
     force?: boolean;
     previousSummaryContent?: string;
     summaryModel?: string;
@@ -493,7 +580,12 @@ export class CompactionEngine {
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    const leafTrigger = await this.evaluateLeafTrigger(
+      conversationId,
+      tokenBudget,
+      input.currentTokenCount,
+      tokensBefore,
+    );
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {
@@ -616,6 +708,7 @@ export class CompactionEngine {
     conversationId: number;
     tokenBudget: number;
     summarize: CompactionSummarizeFn;
+    currentTokenCount?: number;
     force?: boolean;
     hardTrigger?: boolean;
     summaryModel?: string;
@@ -624,7 +717,12 @@ export class CompactionEngine {
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    const leafTrigger = await this.evaluateLeafTrigger(
+      conversationId,
+      tokenBudget,
+      input.currentTokenCount,
+      tokensBefore,
+    );
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {

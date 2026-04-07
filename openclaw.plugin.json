@@ -108,6 +108,14 @@
       "label": "Prune HEARTBEAT_OK",
       "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
     },
+    "leafSkipReductionThreshold": {
+      "label": "Leaf Skip Reduction Threshold",
+      "help": "Minimum estimated reduction (fraction of total assembled tokens) to justify leaf compaction. Set to 0 to disable. Default 0.05."
+    },
+    "leafBudgetHeadroomFactor": {
+      "label": "Leaf Budget Headroom Factor",
+      "help": "Skip leaf compaction when assembled tokens are below this fraction of contextThreshold × tokenBudget. Set to 0 to disable. Default 0.8."
+    },
     "fallbackProviders": {
       "label": "Fallback Providers",
       "help": "Explicit fallback provider/model pairs for compaction summarization (e.g., [{\"provider\": \"anthropic\", \"model\": \"claude-haiku-4-5\"}])"
@@ -249,6 +257,18 @@
           "required": ["provider", "model"],
           "additionalProperties": false
         }
+      },
+      "leafSkipReductionThreshold": {
+        "description": "Minimum estimated reduction (fraction of total assembled tokens) to justify leaf compaction. Prevents cache-prefix invalidation when the gain is tiny. Set to 0 to disable. Default 0.05.",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "leafBudgetHeadroomFactor": {
+        "description": "Skip leaf compaction when assembled tokens are below this fraction of contextThreshold × tokenBudget. Set to 0 to disable. Default 0.8.",
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
       }
     }
   }
