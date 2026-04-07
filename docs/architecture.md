@@ -106,7 +106,7 @@ The incremental leaf trigger evaluates skip guards before compacting, to avoid u
 
 ```mermaid
 flowchart TD
-    A["raw tokens >= leafChunkTokens?"] -->|No| Z["Skip"]
+    A["raw tokens outside fresh tail >= leafChunkTokens?"] -->|No| Z["Skip"]
     A -->|Yes| B["assembled < headroom ceiling?"]
     B -->|Yes| Y["Skip: budget headroom"]
     B -->|No| C["budget pressure?"]

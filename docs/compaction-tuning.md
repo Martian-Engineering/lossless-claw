@@ -4,7 +4,7 @@
 
 Lossless Claw compresses your conversation history into summaries so long sessions don't blow the context window or your API bill. On a 200-turn Opus session, proper tuning can cut input token costs by 40-60%.
 
-> **Example:** A 200-turn Opus coding session costs ~$4 in input tokens without compaction tuning. With the recommended Opus config below and Sonnet as the compaction model, effective cost drops to ~$1.80 (compaction overhead: ~$0.40). **Net savings: ~$1.80/session (45%).**
+> **Example:** A 200-turn Opus coding session costs ~$4 in input tokens without compaction tuning. With the recommended Opus config below and Haiku as the compaction model, effective cost drops to ~$1.80 (compaction overhead: ~$0.40). **Net savings: ~$1.80/session (45%).**
 
 **Three things to configure:**
 
@@ -332,7 +332,7 @@ When compaction runs on the main agent session, it stalls all connected sessions
 **"Compaction never fires"** — Check:
 1. Is `leafChunkTokens` set too high? Default is 20K; if your turns are small, raw tokens may never accumulate enough.
 2. Is `leafBudgetHeadroomFactor` too high? With a large budget (1M) and default 0.8, the headroom ceiling is 600K — compaction won't fire until then.
-3. Enable debug logging to see skip reasons. Look for lines matching `[lcm] afterTurn: leaf compaction skipped` in stderr output.
+3. Enable debug logging to see skip reasons. Look for `[lcm] afterTurn:` lines in stderr — triggered compactions log `leaf compaction triggered`, skipped ones log `leaf compaction skipped` with the guard reason.
 
 **"Compaction fires every turn"** — Check:
 1. Is `leafChunkTokens` too low? If set to 2000, compaction triggers after just 2-3 messages.
