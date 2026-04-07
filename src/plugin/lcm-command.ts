@@ -545,14 +545,13 @@ async function buildStatusText(params: {
     "",
   ];
 
+  const conversationDoctor = current.kind === "resolved"
+    ? doctor.byConversation.get(current.stats.conversationId) ?? {
+        total: 0, old: 0, truncated: 0, fallback: 0,
+      }
+    : { total: 0, old: 0, truncated: 0, fallback: 0 };
+
   if (current.kind === "resolved") {
-    const conversationDoctor =
-      doctor.byConversation.get(current.stats.conversationId) ?? {
-        total: 0,
-        old: 0,
-        truncated: 0,
-        fallback: 0,
-      };
     lines.push(
       buildSection("📍 Current conversation", [
         buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
@@ -692,8 +691,11 @@ async function buildStatusText(params: {
       const losslessPct = totalSummaries > 0
         ? Math.round(((totalSummaries - lossyIssues) / totalSummaries) * 100)
         : 100;
-      const compressionRatio = current.stats.compressedTokenCount > 0
-        ? current.stats.contextTokenCount / current.stats.compressedTokenCount
+      // compressedTokenCount = original source tokens that were compressed into summaries.
+      // contextTokenCount = tokens currently in the assembled context.
+      // Ratio = source / context → higher means more compression.
+      const compressionRatio = current.stats.contextTokenCount > 0
+        ? current.stats.compressedTokenCount / current.stats.contextTokenCount
         : 0;
       const compressionHealth = compressionRatio === 0 ? "no compression yet"
         : compressionRatio < 2 ? "conservative \u2014 summaries are barely compressing"

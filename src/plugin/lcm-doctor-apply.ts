@@ -3,7 +3,7 @@ import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
 import type { LcmSummarizeFn } from "../summarize.js";
-import { createLcmSummarizeFromLegacyParams } from "../summarize.js";
+import { createLcmSummarizeFromLegacyParams, extractSummaryText } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
 import { detectDoctorMarker, loadDoctorTargets, type DoctorTargetRecord } from "./lcm-doctor-shared.js";
 
@@ -101,11 +101,12 @@ export async function applyScopedDoctorRepair(params: {
         overrides,
       });
 
-      const rewritten = (await summarize(sourceText, false, {
+      const rewrittenRaw = await summarize(sourceText, false, {
         previousSummary,
         isCondensed: isCondensedTarget(target),
         ...(isCondensedTarget(target) ? { depth: target.depth } : {}),
-      })).trim();
+      });
+      const rewritten = extractSummaryText(rewrittenRaw).trim();
       if (!rewritten) {
         skipped.push({
           summaryId: target.summaryId,

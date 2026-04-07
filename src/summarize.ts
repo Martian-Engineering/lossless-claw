@@ -12,6 +12,11 @@ export type LcmSummarizeResult = {
   modelUsed?: string;
 };
 
+/** Extract the summary text from a summarizer result (handles both string and object returns). */
+export function extractSummaryText(result: string | LcmSummarizeResult): string {
+  return typeof result === "string" ? result : result.text;
+}
+
 export type LcmSummarizeFn = (
   text: string,
   aggressive?: boolean,
