@@ -1916,6 +1916,23 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
+  /** Format stable session identifiers for LCM diagnostic logs. */
+  private formatSessionLogContext(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+  }): string {
+    const parts = [
+      `conversation=${params.conversationId}`,
+      `session=${params.sessionId}`,
+    ];
+    const trimmedSessionKey = params.sessionKey?.trim();
+    if (trimmedSessionKey) {
+      parts.push(`sessionKey=${trimmedSessionKey}`);
+    }
+    return parts.join(" ");
+  }
+
   /** Build a summarize callback with runtime provider fallback handling. */
   private async resolveSummarize(params: {
     legacyParams?: Record<string, unknown>;
@@ -2388,7 +2405,14 @@ export class LcmContextEngine implements ContextEngine {
 
     const existingDbCount = await this.conversationStore.getMessageCount(conversationId);
     if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
-      console.error(`[lcm] reconcileSessionTail: import cap exceeded — would import ${missingTail.length} messages (existing: ${existingDbCount}). Aborting to prevent flood.`);
+      const sessionContext = this.formatSessionLogContext({
+        conversationId,
+        sessionId,
+        sessionKey: params.sessionKey,
+      });
+      console.error(
+        `[lcm] reconcileSessionTail: import cap exceeded for ${sessionContext} — would import ${missingTail.length} messages (existing: ${existingDbCount}). Aborting to prevent flood.`,
+      );
       return { blockedByImportCap: true, importedMessages: 0, hasOverlap: true };
     }
 
@@ -3120,8 +3144,13 @@ export class LcmContextEngine implements ContextEngine {
         if (conversation) {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
+            const sessionContext = this.formatSessionLogContext({
+              conversationId: conversation.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+            });
             console.error(
-              `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages from conversation ${conversation.conversationId}`,
+              `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
             );
             return;
           }

@@ -2328,8 +2328,9 @@ describe("LcmContextEngine.bootstrap", () => {
 
     const engine = createEngineAtDatabasePath(dbPath);
     const sessionId = "bootstrap-reconcile-import-cap";
+    const sessionKey = "agent:main:test:bootstrap-reconcile-import-cap";
 
-    const first = await engine.bootstrap({ sessionId, sessionFile });
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
     expect(first.bootstrapped).toBe(true);
     expect(first.importedMessages).toBe(2);
 
@@ -2367,12 +2368,16 @@ describe("LcmContextEngine.bootstrap", () => {
       } as AgentMessage);
     }
 
-    const second = await engine.bootstrap({ sessionId, sessionFile });
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const second = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
     expect(second).toEqual({
       bootstrapped: false,
       importedMessages: 0,
       reason: "reconcile import capped",
     });
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      `[lcm] reconcileSessionTail: import cap exceeded for conversation=${conversation!.conversationId} session=${sessionId} sessionKey=${sessionKey} — would import 60 messages (existing: 2). Aborting to prevent flood.`,
+    );
 
     const storedAfterCap = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(storedAfterCap.map((message) => message.content)).toEqual(["seed user", "seed assistant"]);
@@ -2383,13 +2388,14 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(secondBootstrapState).toEqual(staleBootstrapState);
 
     const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
-    const third = await engine.bootstrap({ sessionId, sessionFile });
+    const third = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
     expect(third).toEqual({
       bootstrapped: false,
       importedMessages: 0,
       reason: "reconcile import capped",
     });
     expect(reconcileSpy).toHaveBeenCalledTimes(1);
+    consoleErrorSpy.mockRestore();
   });
 
   it("uses the bulk import path for initial bootstrap", async () => {
@@ -4384,6 +4390,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
   it("afterTurn prunes heartbeat-shaped ACK turns before compaction even without the heartbeat flag", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-heartbeat-prune";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-prune";
 
     const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
     const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
@@ -4392,6 +4399,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
     await engine.afterTurn({
       sessionId,
+      sessionKey,
       sessionFile: createSessionFilePath("after-turn-heartbeat-prune"),
       messages: [
         makeMessage({
@@ -4422,7 +4430,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
     expect(compactSpy).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith(
-      expect.stringContaining("heartbeat ack messages"),
+      expect.stringContaining(
+        `heartbeat ack messages for conversation=${conversation!.conversationId} session=${sessionId} sessionKey=${sessionKey}`,
+      ),
     );
 
     consoleErrorSpy.mockRestore();
