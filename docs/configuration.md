@@ -104,6 +104,32 @@ The actual summary size depends on the LLM's output; these values are guidelines
 - Smaller chunks create summaries more frequently from less material.
 - This also affects the condensed minimum input threshold (10% of this value).
 
+### Cache-aware incremental compaction
+
+Cache-aware incremental compaction is enabled by default when prompt-cache telemetry is available from OpenClaw. It affects only incremental leaf compaction; full sweeps still follow the existing threshold and overflow rules.
+
+Plugin config:
+
+```json
+{
+  "cacheAwareCompaction": {
+    "enabled": true,
+    "maxColdCacheCatchupPasses": 2
+  }
+}
+```
+
+Environment overrides:
+
+- `LCM_CACHE_AWARE_COMPACTION_ENABLED` (default `true`)
+- `LCM_MAX_COLD_CACHE_CATCHUP_PASSES` (default `2`)
+
+Behavior:
+
+- **Hot cache**: defer incremental compaction more often to preserve cache reuse.
+- **Cold cache**: allow up to `maxColdCacheCatchupPasses` bounded incremental passes in one maintenance cycle.
+- **Unknown / no telemetry**: fall back to the current token-driven incremental behavior.
+
 ### Maximum assembly token budget
 
 `LCM_MAX_ASSEMBLY_TOKEN_BUDGET` (default: none) caps the token budget used for context assembly and compaction threshold evaluation. When set, this takes precedence over both the 128k fallback and runtime-provided budgets.

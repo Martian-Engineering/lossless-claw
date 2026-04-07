@@ -1,6 +1,11 @@
 import { homedir } from "os";
 import { join } from "path";
 
+export type CacheAwareCompactionConfig = {
+  enabled: boolean;
+  maxColdCacheCatchupPasses: number;
+};
+
 export type LcmConfig = {
   enabled: boolean;
   databasePath: string;
@@ -60,6 +65,8 @@ export type LcmConfig = {
   circuitBreakerCooldownMs: number;
   /** Explicit fallback provider/model pairs for compaction summarization. */
   fallbackProviders: Array<{ provider: string; model: string }>;
+  /** Cache-sensitive policy for incremental leaf compaction. */
+  cacheAwareCompaction: CacheAwareCompactionConfig;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -155,6 +162,12 @@ function toStrArray(value: unknown): string[] | undefined {
     .filter(Boolean);
 }
 
+function toRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
 /**
  * Resolve LCM configuration with three-tier precedence:
  *   1. Environment variables (highest — backward compat)
@@ -166,6 +179,7 @@ export function resolveLcmConfig(
   pluginConfig?: Record<string, unknown>,
 ): LcmConfig {
   const pc = pluginConfig ?? {};
+  const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const resolvedLeafChunkTokens =
     parseFiniteInt(env.LCM_LEAF_CHUNK_TOKENS)
       ?? toNumber(pc.leafChunkTokens) ?? 20000;
@@ -281,5 +295,15 @@ export function resolveLcmConfig(
     fallbackProviders:
       parseFallbackProviders(env.LCM_FALLBACK_PROVIDERS)
         ?? toFallbackProviderArray(pc.fallbackProviders) ?? [],
+    cacheAwareCompaction: {
+      enabled:
+        env.LCM_CACHE_AWARE_COMPACTION_ENABLED !== undefined
+          ? env.LCM_CACHE_AWARE_COMPACTION_ENABLED !== "false"
+          : toBool(cacheAwareCompaction?.enabled) ?? true,
+      maxColdCacheCatchupPasses:
+        parseFiniteInt(env.LCM_MAX_COLD_CACHE_CATCHUP_PASSES)
+          ?? toNumber(cacheAwareCompaction?.maxColdCacheCatchupPasses)
+          ?? 2,
+    },
   };
 }

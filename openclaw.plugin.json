@@ -100,6 +100,14 @@
       "label": "Custom Instructions",
       "help": "Natural language instructions injected into all summarization prompts (e.g., formatting rules, tone control)"
     },
+    "cacheAwareCompaction.enabled": {
+      "label": "Cache-Aware Compaction",
+      "help": "When enabled, hot prompt cache defers incremental compaction while cold cache allows bounded catch-up passes"
+    },
+    "cacheAwareCompaction.maxColdCacheCatchupPasses": {
+      "label": "Cold Cache Catch-Up Passes",
+      "help": "Maximum incremental leaf passes allowed in one maintenance cycle when prompt cache is cold"
+    },
     "timezone": {
       "label": "Timezone",
       "help": "IANA timezone used for summary timestamps"
@@ -227,6 +235,19 @@
       },
       "customInstructions": {
         "type": "string"
+      },
+      "cacheAwareCompaction": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxColdCacheCatchupPasses": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
       },
       "timezone": {
         "type": "string"

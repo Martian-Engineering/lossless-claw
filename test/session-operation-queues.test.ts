@@ -45,13 +45,21 @@ function createTestConfig(databasePath: string): LcmConfig {
     summaryModel: "",
     largeFileSummaryProvider: "",
     largeFileSummaryModel: "",
+    delegationTimeoutMs: 120_000,
+    summaryTimeoutMs: 60_000,
     timezone: "UTC",
     pruneHeartbeatOk: false,
     summaryMaxOverageFactor: 3,
     expansionProvider: "",
     expansionModel: "",
+    customInstructions: "",
     circuitBreakerThreshold: 5,
     circuitBreakerCooldownMs: 1_800_000,
+    fallbackProviders: [],
+    cacheAwareCompaction: {
+      enabled: true,
+      maxColdCacheCatchupPasses: 2,
+    },
   };
 }
 

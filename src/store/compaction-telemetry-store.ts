@@ -1,0 +1,123 @@
+import type { DatabaseSync } from "node:sqlite";
+import { withDatabaseTransaction } from "../transaction-mutex.js";
+import { parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
+
+export type CacheState = "hot" | "cold" | "unknown";
+
+export type ConversationCompactionTelemetryRecord = {
+  conversationId: number;
+  lastObservedCacheRead: number | null;
+  lastObservedCacheWrite: number | null;
+  lastObservedCacheHitAt: Date | null;
+  lastObservedCacheBreakAt: Date | null;
+  cacheState: CacheState;
+  retention: string | null;
+  updatedAt: Date;
+};
+
+export type UpsertConversationCompactionTelemetryInput = {
+  conversationId: number;
+  lastObservedCacheRead?: number | null;
+  lastObservedCacheWrite?: number | null;
+  lastObservedCacheHitAt?: Date | null;
+  lastObservedCacheBreakAt?: Date | null;
+  cacheState: CacheState;
+  retention?: string | null;
+};
+
+type ConversationCompactionTelemetryRow = {
+  conversation_id: number;
+  last_observed_cache_read: number | null;
+  last_observed_cache_write: number | null;
+  last_observed_cache_hit_at: string | null;
+  last_observed_cache_break_at: string | null;
+  cache_state: CacheState;
+  retention: string | null;
+  updated_at: string;
+};
+
+function toConversationCompactionTelemetryRecord(
+  row: ConversationCompactionTelemetryRow,
+): ConversationCompactionTelemetryRecord {
+  return {
+    conversationId: row.conversation_id,
+    lastObservedCacheRead: row.last_observed_cache_read,
+    lastObservedCacheWrite: row.last_observed_cache_write,
+    lastObservedCacheHitAt: parseUtcTimestampOrNull(row.last_observed_cache_hit_at),
+    lastObservedCacheBreakAt: parseUtcTimestampOrNull(row.last_observed_cache_break_at),
+    cacheState: row.cache_state,
+    retention: row.retention,
+    updatedAt: parseUtcTimestampOrNull(row.updated_at) ?? new Date(0),
+  };
+}
+
+/**
+ * Persist and query per-conversation prompt-cache telemetry used by
+ * cache-aware incremental compaction.
+ */
+export class CompactionTelemetryStore {
+  constructor(private readonly db: DatabaseSync) {}
+
+  /** Execute multiple telemetry writes atomically. */
+  withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    return withDatabaseTransaction(this.db, "BEGIN", fn);
+  }
+
+  /** Load the latest persisted telemetry for a conversation. */
+  async getConversationCompactionTelemetry(
+    conversationId: number,
+  ): Promise<ConversationCompactionTelemetryRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT
+           conversation_id,
+           last_observed_cache_read,
+           last_observed_cache_write,
+           last_observed_cache_hit_at,
+           last_observed_cache_break_at,
+           cache_state,
+           retention,
+           updated_at
+         FROM conversation_compaction_telemetry
+         WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as ConversationCompactionTelemetryRow | undefined;
+    return row ? toConversationCompactionTelemetryRecord(row) : null;
+  }
+
+  /** Upsert the current cache telemetry snapshot for a conversation. */
+  async upsertConversationCompactionTelemetry(
+    input: UpsertConversationCompactionTelemetryInput,
+  ): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO conversation_compaction_telemetry (
+           conversation_id,
+           last_observed_cache_read,
+           last_observed_cache_write,
+           last_observed_cache_hit_at,
+           last_observed_cache_break_at,
+           cache_state,
+           retention,
+           updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(conversation_id) DO UPDATE SET
+           last_observed_cache_read = excluded.last_observed_cache_read,
+           last_observed_cache_write = excluded.last_observed_cache_write,
+           last_observed_cache_hit_at = excluded.last_observed_cache_hit_at,
+           last_observed_cache_break_at = excluded.last_observed_cache_break_at,
+           cache_state = excluded.cache_state,
+           retention = excluded.retention,
+           updated_at = datetime('now')`,
+      )
+      .run(
+        input.conversationId,
+        input.lastObservedCacheRead ?? null,
+        input.lastObservedCacheWrite ?? null,
+        input.lastObservedCacheHitAt?.toISOString() ?? null,
+        input.lastObservedCacheBreakAt?.toISOString() ?? null,
+        input.cacheState,
+        input.retention ?? null,
+      );
+  }
+}
