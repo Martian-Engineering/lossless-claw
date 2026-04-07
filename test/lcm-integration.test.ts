@@ -2133,7 +2133,7 @@ describe("LCM integration: compaction", () => {
     });
 
     await ingestMessages(convStore, sumStore, 10, {
-      contentFn: (i) => `Turn ${i}: ${"x".repeat(11_980)}`,
+      contentFn: (i) => `Turn ${i}: stale token test`,
       tokenCountFn: () => 3_000,
     });
 
@@ -2157,7 +2157,7 @@ describe("LCM integration: compaction", () => {
     });
 
     await ingestMessages(convStore, sumStore, 10, {
-      contentFn: (i) => `Turn ${i}: ${"y".repeat(11_980)}`,
+      contentFn: (i) => `Turn ${i}: stale sweep test`,
       tokenCountFn: () => 3_000,
     });
 
