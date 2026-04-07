@@ -29,6 +29,7 @@ type LcmConversationStatusStats = {
   conversationId: number;
   sessionId: string;
   sessionKey: string | null;
+  createdAt: string | null;
   messageCount: number;
   summaryCount: number;
   storedSummaryTokens: number;
@@ -220,6 +221,7 @@ function getConversationStatusStats(
          c.conversation_id,
          c.session_id,
          c.session_key,
+         c.created_at,
          COALESCE((SELECT COUNT(*) FROM messages WHERE conversation_id = c.conversation_id), 0) AS message_count,
          COALESCE((SELECT COUNT(*) FROM summaries WHERE conversation_id = c.conversation_id), 0) AS summary_count,
          COALESCE((SELECT SUM(token_count) FROM summaries WHERE conversation_id = c.conversation_id), 0) AS stored_summary_tokens,
@@ -257,6 +259,7 @@ function getConversationStatusStats(
         conversation_id: number;
         session_id: string;
         session_key: string | null;
+        created_at: string | null;
         message_count: number;
         summary_count: number;
         stored_summary_tokens: number;
@@ -276,6 +279,7 @@ function getConversationStatusStats(
     conversationId: row.conversation_id,
     sessionId: row.session_id,
     sessionKey: row.session_key,
+    createdAt: row.created_at,
     messageCount: row.message_count,
     summaryCount: row.summary_count,
     storedSummaryTokens: row.stored_summary_tokens,
@@ -442,6 +446,56 @@ function buildHelpText(error?: string): string {
   return lines.join("\n");
 }
 
+function formatTimeAgo(isoDate: string | null): string {
+  if (!isoDate) return "unknown";
+  const then = new Date(isoDate + "Z"); // SQLite datetime() is UTC
+  const now = Date.now();
+  const diffMs = now - then.getTime();
+  if (diffMs < 0) return "just now";
+  const mins = Math.floor(diffMs / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ${mins % 60}m ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h ago`;
+}
+
+function getCompactionHealthStats(db: DatabaseSync, conversationId: number): {
+  lastCompactionAt: string | null;
+  lastCompactionPass: string | null;
+  passesLastHour: number;
+  passesLast24h: number;
+} {
+  try {
+    const last = db
+      .prepare(
+        `SELECT created_at, pass FROM compaction_events
+         WHERE conversation_id = ?
+         ORDER BY event_id DESC LIMIT 1`,
+      )
+      .get(conversationId) as { created_at: string; pass: string } | undefined;
+
+    const counts = db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN created_at > datetime('now', '-1 hour') THEN 1 ELSE 0 END) AS last_hour,
+           SUM(CASE WHEN created_at > datetime('now', '-24 hours') THEN 1 ELSE 0 END) AS last_24h
+         FROM compaction_events WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as { last_hour: number; last_24h: number } | undefined;
+
+    return {
+      lastCompactionAt: last?.created_at ?? null,
+      lastCompactionPass: last?.pass ?? null,
+      passesLastHour: counts?.last_hour ?? 0,
+      passesLast24h: counts?.last_24h ?? 0,
+    };
+  } catch {
+    return { lastCompactionAt: null, lastCompactionPass: null, passesLastHour: 0, passesLast24h: 0 };
+  }
+}
+
 async function buildStatusText(params: {
   ctx: PluginCommandContext;
   db: DatabaseSync;
@@ -525,6 +579,80 @@ async function buildStatusText(params: {
     );
   }
 
+  // Health section (only when current conversation is available)
+  if (current.kind === "resolved") {
+    const health = getCompactionHealthStats(params.db, current.stats.conversationId);
+    const freshTailConfig = params.config.freshTailCount ?? 64;
+    const summaryModel = params.config.summaryModel;
+    const summaryProvider = params.config.summaryProvider;
+
+    const healthLines: string[] = [];
+
+    // Conversation age
+    healthLines.push(
+      buildStatLine("conversation age", formatTimeAgo(current.stats.createdAt)),
+    );
+
+    // Last compaction
+    const lastLabel = health.lastCompactionAt
+      ? `${formatTimeAgo(health.lastCompactionAt)} (${health.lastCompactionPass})`
+      : "never";
+    const lastIndicator = health.lastCompactionAt
+      ? "\u2713"
+      : current.stats.messageCount > freshTailConfig * 2
+        ? "\u26A0 \u2014 compaction may be stalled"
+        : "";
+    healthLines.push(buildStatLine("last compaction", `${lastLabel} ${lastIndicator}`.trim()));
+
+    // Compaction activity
+    healthLines.push(
+      buildStatLine("compaction activity", `${health.passesLastHour} in last 1h, ${health.passesLast24h} in last 24h`),
+    );
+
+    // Fresh tail
+    const unsummarizedCount = Math.max(0, current.stats.messageCount - (current.stats.summaryCount > 0
+      ? current.stats.messageCount - freshTailConfig
+      : 0));
+    const freshTailHealthy = current.stats.messageCount <= freshTailConfig || current.stats.summaryCount > 0;
+    healthLines.push(
+      buildStatLine(
+        "fresh tail",
+        `${formatNumber(Math.min(current.stats.messageCount, freshTailConfig))} of ${formatNumber(current.stats.messageCount)} msgs protected${freshTailHealthy ? " \u2713" : " \u26A0"}`,
+      ),
+    );
+
+    // Summary model
+    const modelDisplay = summaryModel
+      ? `${summaryProvider ? `${summaryProvider}/` : ""}${summaryModel}`
+      : null;
+    if (modelDisplay) {
+      const isExpensive = modelDisplay.toLowerCase().includes("opus");
+      healthLines.push(
+        buildStatLine("summary model", `${modelDisplay}${isExpensive ? " \u26A0 \u2014 expensive for compaction" : " \u2713"}`),
+      );
+    } else {
+      healthLines.push(
+        buildStatLine("summary model", "(default \u2014 may use expensive model) \u26A0"),
+      );
+    }
+
+    // Doctor issues (only when problems exist — clean state already shown above)
+    if (conversationDoctor.total > 0) {
+      healthLines.push(
+        buildStatLine("doctor issues", `${conversationDoctor.total} \u2014 run ${formatCommand(`${VISIBLE_COMMAND} doctor apply`)} to repair \u26A0`),
+      );
+    }
+
+    // Key config
+    const threshold = Math.round((params.config.contextThreshold ?? 0.75) * 100);
+    const leafChunk = Math.round((params.config.leafChunkTokens ?? 20000) / 1000);
+    healthLines.push(
+      buildStatLine("config", `threshold=${threshold}%, freshTail=${freshTailConfig}, leafChunk=${leafChunk}k`),
+    );
+
+    lines.push("", buildSection("\uD83C\uDFE5 Health", healthLines));
+  }
+
   // Efficiency section (only when compaction events exist for current conversation)
   if (current.kind === "resolved") {
     const effStats = getCompactionEfficiencyStats(params.db, current.stats.conversationId);
@@ -542,8 +670,8 @@ async function buildStatusText(params: {
       const recommendation = net >= 0
         ? "Compaction is saving money"
         : topModel.toLowerCase().includes("opus")
-          ? "Switch summaryModel to haiku \u2014 Opus is ~5x more expensive"
-          : "Compaction cost exceeds savings \u2014 check summaryModel";
+          ? 'Set "summaryModel": "claude-haiku-4-5" or export LCM_SUMMARY_MODEL=claude-haiku-4-5'
+          : 'Compaction cost exceeds savings \u2014 set "summaryModel" to a cheaper model';
 
       // Memory quality metrics
       const totalSummaries = current.stats.summaryCount;
@@ -700,17 +828,17 @@ async function buildEfficiencyText(params: {
   for (const m of stats.modelBreakdown) {
     const lower = m.model.toLowerCase();
     if (lower.includes("opus")) {
-      recommendations.push(`\u26A0 Using ${m.model} for compaction costs ~$0.16/call. Switch to haiku (~$0.03) or gpt-4o-mini (~$0.004).`);
+      recommendations.push(`\u26A0 Using ${m.model} (~$0.16/call). Fix: set "summaryModel": "claude-haiku-4-5" or export LCM_SUMMARY_MODEL=claude-haiku-4-5`);
     }
     if (lower.includes("sonnet") && stats.totalPasses > 5) {
-      recommendations.push(`\uD83D\uDCA1 Using ${m.model}. Consider haiku for 3x cost reduction with similar quality.`);
+      recommendations.push(`\uD83D\uDCA1 Using ${m.model}. Haiku is 3x cheaper: set "summaryModel": "claude-haiku-4-5"`);
     }
   }
   if (net < 0) {
-    recommendations.push("\u26A0 Compaction is costing more than it saves. Check your summaryModel setting.");
+    recommendations.push('\u26A0 Compaction is costing more than it saves. Set "summaryModel" to a cheaper model.');
   }
   if (stats.totalTokensSaved > 0 && stats.totalTokensSaved / stats.totalPasses < 2000) {
-    recommendations.push("\uD83D\uDCA1 Average tokens saved per pass is low (<2K). Consider raising leafSkipReductionThreshold.");
+    recommendations.push('\uD83D\uDCA1 Average tokens saved per pass is low (<2K). Raise: export LCM_LEAF_SKIP_REDUCTION_THRESHOLD=0.10');
   }
   if (recommendations.length > 0) {
     lines.push(buildSection("\uD83D\uDCA1 Recommendations", recommendations));
