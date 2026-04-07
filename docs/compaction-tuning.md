@@ -245,7 +245,7 @@ Compaction calls the LLM to summarize message chunks. Each call:
 2. Receives ~600-2400 output tokens (the summary)
 3. Blocks until complete (full sweep is synchronous)
 
-**Compaction model comparison** (cost per call = 20K input + 2.4K output):
+**Compaction model comparison** (cost per call = 20K input + 2.4K output). Model names below are marketing names — use the provider-qualified config ID (e.g., `gpt-4o-mini`, `claude-haiku-4-5`) when setting `summaryModel`:
 
 | Model | Input $/MTok | Output $/MTok | Cost/call | Context | Latency | Notes |
 |-------|-------------|--------------|-----------|---------|---------|-------|
