@@ -447,11 +447,14 @@ function buildHelpText(error?: string): string {
 }
 
 function formatTimeAgo(isoDate: string | null): string {
-  if (!isoDate) return "unknown";
+  if (!isoDate?.trim()) return "unknown";
   // SQLite datetime() returns "YYYY-MM-DD HH:MM:SS" (space-separated, UTC).
-  // Normalize to ISO 8601 by replacing space with T before appending Z.
-  const normalized = isoDate.includes("T") ? isoDate : isoDate.replace(" ", "T");
-  const then = new Date(normalized.endsWith("Z") ? normalized : normalized + "Z");
+  // Normalize to ISO 8601: replace space with T, append Z only if no timezone.
+  const trimmed = isoDate.trim();
+  const normalized = trimmed.includes("T") ? trimmed : trimmed.replace(" ", "T");
+  const hasTimezone = /Z|[+-]\d{2}:\d{2}$/.test(normalized);
+  const then = new Date(hasTimezone ? normalized : normalized + "Z");
+  if (Number.isNaN(then.getTime())) return "unknown";
   const now = Date.now();
   const diffMs = now - then.getTime();
   if (diffMs < 0) return "just now";
@@ -475,7 +478,7 @@ function getCompactionHealthStats(db: DatabaseSync, conversationId: number): {
       .prepare(
         `SELECT created_at, pass FROM compaction_events
          WHERE conversation_id = ?
-         ORDER BY event_id DESC LIMIT 1`,
+         ORDER BY created_at DESC LIMIT 1`,
       )
       .get(conversationId) as { created_at: string; pass: string } | undefined;
 

@@ -7,20 +7,22 @@
 type ModelPricing = { input: number; output: number };
 
 const MODEL_PRICING: Array<[prefix: string, pricing: ModelPricing]> = [
-  // Anthropic
+  // Anthropic (Opus 4.5/4.6 = $5/$25, Sonnet 4.x = $3/$15, Haiku 4.5 = $1/$5)
   ["claude-opus-4", { input: 5.00, output: 25.00 }],
   ["claude-sonnet-4", { input: 3.00, output: 15.00 }],
   ["claude-haiku-4", { input: 1.00, output: 5.00 }],
+  ["claude-haiku-3", { input: 0.25, output: 1.25 }],
   // OpenAI
+  ["gpt-4.1-nano", { input: 0.10, output: 0.40 }],
   ["gpt-4o-mini", { input: 0.15, output: 0.60 }],
-  ["gpt-4.1-mini", { input: 0.40, output: 1.60 }],
+  ["gpt-4.1-mini", { input: 0.20, output: 0.80 }],
   ["gpt-4o", { input: 2.50, output: 10.00 }],
   ["gpt-5.4-mini", { input: 0.75, output: 4.50 }],
   // Google
   ["gemini-2.5-flash", { input: 0.30, output: 2.50 }],
   ["gemini-2.5-pro", { input: 1.25, output: 10.00 }],
   // Others
-  ["mistral-small", { input: 0.15, output: 0.60 }],
+  ["mistral-small", { input: 0.20, output: 0.60 }],
   ["deepseek-v3", { input: 0.28, output: 0.42 }],
 ];
 
