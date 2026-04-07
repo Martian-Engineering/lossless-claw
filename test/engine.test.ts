@@ -3955,7 +3955,18 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn persists prompt-cache telemetry for hot sessions", async () => {
-    const engine = createEngine();
+    const debugLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: {
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: debugLog,
+        },
+      },
+    );
     const sessionId = "after-turn-prompt-cache-hot";
     const privateEngine = engine as unknown as {
       compaction: {
@@ -4020,10 +4031,27 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
     expect(telemetry?.lastObservedCacheHitAt).toBeInstanceOf(Date);
     expect(telemetry?.lastObservedCacheBreakAt).toBeNull();
+    expect(debugLog).toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] compaction telemetry updated:"),
+    );
+    expect(debugLog).toHaveBeenCalledWith(
+      expect.stringContaining("cacheState=hot"),
+    );
   });
 
   it("afterTurn defers incremental compaction when prompt cache is hot and pressure is modest", async () => {
-    const engine = createEngine();
+    const debugLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: {
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: debugLog,
+        },
+      },
+    );
     const sessionId = "after-turn-hot-cache-defer";
     const privateEngine = engine as unknown as {
       compaction: {
@@ -4077,6 +4105,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
         tokenBudget: 4096,
         compactionTarget: "threshold",
       }),
+    );
+    expect(debugLog).toHaveBeenCalledWith(
+      expect.stringContaining("reason=hot-cache-defer"),
     );
   });
 
@@ -4155,12 +4186,23 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn increases the working leaf chunk target for busy sessions when dynamic sizing is enabled", async () => {
-    const engine = createEngineWithConfig({
-      dynamicLeafChunkTokens: {
-        enabled: true,
-        max: 40_000,
+    const debugLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {
+        dynamicLeafChunkTokens: {
+          enabled: true,
+          max: 40_000,
+        },
       },
-    });
+      {
+        log: {
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: debugLog,
+        },
+      },
+    );
     const sessionId = "after-turn-dynamic-leaf-chunk-high";
     const privateEngine = engine as unknown as {
       compaction: {
@@ -4212,6 +4254,12 @@ describe("LcmContextEngine fidelity and token budget", () => {
         fallbackLeafChunkTokens: [40_000, 30_000, 20_000],
         activityBand: "high",
       }),
+    );
+    expect(debugLog).toHaveBeenCalledWith(
+      expect.stringContaining("activityBand=high"),
+    );
+    expect(debugLog).toHaveBeenCalledWith(
+      expect.stringContaining("preferredLeafChunkTokens=40000"),
     );
   });
 
