@@ -25,7 +25,7 @@ import {
   pickToolIsError,
   pickToolName,
 } from "./assembler.js";
-import { CompactionEngine, type CompactionConfig } from "./compaction.js";
+import { CompactionEngine, type CompactionConfig, type LeafTriggerResult } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
@@ -2846,20 +2846,7 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /** Evaluate whether incremental leaf compaction should run for a session. */
-  async evaluateLeafTrigger(sessionId: string, sessionKey?: string, tokenBudget?: number, liveContextTokens?: number): Promise<{
-    shouldCompact: boolean;
-    rawTokensOutsideTail: number;
-    threshold: number;
-    skipReason?: string;
-    context?: {
-      totalAssembledTokens: number;
-      budgetCeiling?: number;
-      budgetPressure: boolean;
-      estimatedReduction?: number;
-      reductionThreshold?: number;
-      headroomFactor: number;
-    };
-  }> {
+  async evaluateLeafTrigger(sessionId: string, sessionKey?: string, tokenBudget?: number, liveContextTokens?: number): Promise<LeafTriggerResult> {
     this.ensureMigrated();
     const conversation = await this.conversationStore.getConversationForSession({
       sessionId,

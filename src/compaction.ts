@@ -556,6 +556,7 @@ export class CompactionEngine {
     tokenBudget: number;
     /** LLM call function for summarization */
     summarize: CompactionSummarizeFn;
+    currentTokenCount?: number;
     force?: boolean;
     hardTrigger?: boolean;
     summaryModel?: string;
