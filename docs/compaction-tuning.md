@@ -194,8 +194,9 @@ This is why compaction model choice matters so much — a slow model turns full 
 | `condensedTargetTokens` | `2000` | `LCM_CONDENSED_TARGET_TOKENS` | Target output tokens for condensed summaries |
 | `freshTailCount` | `64` | `LCM_FRESH_TAIL_COUNT` | Messages protected from compaction |
 | `incrementalMaxDepth` | `1` | `LCM_INCREMENTAL_MAX_DEPTH` | Max condensation depth per turn (-1 = unlimited) |
-| `leafMinFanout` | `8` | — | Min leaf summaries before condensation |
-| `condensedMinFanout` | `4` | — | Min same-depth summaries before condensation |
+| `leafMinFanout` | `8` | `LCM_LEAF_MIN_FANOUT` | Min leaf summaries before condensation |
+| `condensedMinFanout` | `4` | `LCM_CONDENSED_MIN_FANOUT` | Min same-depth summaries before condensation |
+| `condensedMinFanoutHard` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Relaxed fanout for forced compaction sweeps |
 | `summaryModel` | `""` | `LCM_SUMMARY_MODEL` | Model for compaction (critical — use fast models) |
 | `summaryProvider` | `""` | `LCM_SUMMARY_PROVIDER` | Provider for compaction model |
 | `expansionModel` | `""` | `LCM_EXPANSION_MODEL` | Model for `lcm_expand_query` sub-agent (defaults to main model — set to cheap model!) |
@@ -293,7 +294,7 @@ flowchart TD
     B -->|"Yes (has headroom)"| Y["Skip: budget headroom<br/>No pressure, preserve cache"]
     B -->|"No / disabled"| C["Budget pressure detected?"]
     C -->|Yes| E["COMPACT<br/>Budget pressure overrides cache"]
-    C -->|"No (headroom disabled<br/>or no tokenBudget)"| D["Reduction < 5% of total context?"]
+    C -->|"No (headroom disabled<br/>or no tokenBudget)"| D["Reduction < leafSkipReductionThreshold<br/>(default 5%) of total context?"]
     D -->|Yes| X["Skip: cache-aware<br/>Reduction too small for cache cost"]
     D -->|No| G["COMPACT<br/>Reduction is worthwhile"]
 

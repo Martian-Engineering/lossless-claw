@@ -111,7 +111,7 @@ flowchart TD
     B -->|Yes| Y["Skip: budget headroom"]
     B -->|No| C["budget pressure?"]
     C -->|Yes| E["COMPACT: budget wins"]
-    C -->|No| D["reduction < 5% of total?"]
+    C -->|No| D["reduction < leafSkipReductionThreshold<br/>(default 5%) of total?"]
     D -->|Yes| X["Skip: cache-aware"]
     D -->|No| G["COMPACT"]
 ```
