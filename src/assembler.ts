@@ -25,6 +25,8 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
+  /** Context threshold as fraction of budget, used for token-budget tail. */
+  contextThreshold?: number;
   /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
   prompt?: string;
 }
@@ -936,9 +938,31 @@ export class ContextAssembler {
     const systemPromptAddition = buildSystemPromptAddition(summarySignals);
 
     // Step 3: Split into evictable prefix and protected fresh tail
-    const tailStart = Math.max(0, resolved.length - freshTailCount);
-    const baseFreshTail = resolved.slice(tailStart);
-    const initialEvictable = resolved.slice(0, tailStart);
+    let baseFreshTail: ResolvedItem[];
+    let initialEvictable: ResolvedItem[];
+
+    if (input.contextThreshold && input.contextThreshold > 0) {
+      const tailBudget = Math.floor(input.contextThreshold * tokenBudget);
+      let tokensUsed = 0;
+      let totalCount = 0;
+      let splitIdx = resolved.length;
+
+      for (let i = resolved.length - 1; i >= 0; i--) {
+        if (freshTailCount > 0 && totalCount >= freshTailCount) break;
+        const item = resolved[i]!;
+        if (tokensUsed + item.tokens > tailBudget) break;
+        tokensUsed += item.tokens;
+        splitIdx = i;
+        totalCount++;
+      }
+
+      baseFreshTail = resolved.slice(splitIdx);
+      initialEvictable = resolved.slice(0, splitIdx);
+    } else {
+      const tailStart = Math.max(0, resolved.length - freshTailCount);
+      baseFreshTail = resolved.slice(tailStart);
+      initialEvictable = resolved.slice(0, tailStart);
+    }
     const freshTailOrdinals = new Set(baseFreshTail.map((item) => item.ordinal));
     const tailToolCallIds = collectAssistantToolCallIds(baseFreshTail);
     const tailPairToolResults = initialEvictable.filter((item) => {

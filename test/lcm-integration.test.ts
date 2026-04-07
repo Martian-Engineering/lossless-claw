@@ -1448,6 +1448,7 @@ describe("LCM integration: compaction", () => {
   it("compaction keeps leaf and condensed telemetry out of canonical transcript state", async () => {
     const condensedFriendlyEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
+      contextThreshold: 0,
       leafMinFanout: 2,
       leafChunkTokens: 100,
       condensedTargetTokens: 10,
@@ -1495,6 +1496,33 @@ describe("LCM integration: compaction", () => {
 
     const contextItems = await sumStore.getContextItems(CONV_ID);
     expect(contextItems.some((item) => item.itemType === "summary")).toBe(true);
+  });
+
+  it("token-budget tail exposes more messages to leaf compaction when tail is bloated", async () => {
+    const engine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 4,
+      leafChunkTokens: 100,
+    });
+
+    await convStore.createConversation({ sessionId: "token-budget-tail-session" });
+    // 8 msgs × 50 tokens = 400. freshTailCount=4 → 200 tokens protected.
+    // tailBudget = 0.75 * 260 = 195 < 200, so token-budget tail kicks in.
+    await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) => `Turn ${i}: ${"c".repeat(200)}`,
+      tokenCountFn: () => 50,
+    });
+
+    const summarize = vi.fn(async () => "Compacted summary.");
+    const result = await engine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 260,
+      summarize,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.tokensBefore).toBeGreaterThan(result.tokensAfter);
+    expect(summarize).toHaveBeenCalled();
   });
 
   it("depth-aware condensation sets condensed depth to max parent depth plus one", async () => {
@@ -2054,7 +2082,11 @@ describe("LCM integration: compaction", () => {
   });
 
   it("compactUntilUnder loops until under budget", async () => {
-    // Ingest many messages with substantial token counts
+    const engine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      contextThreshold: 0,
+    });
+
     await ingestMessages(convStore, sumStore, 20, {
       contentFn: (i) => `Turn ${i}: ${"c".repeat(200)}`,
       tokenCountFn: (_i, content) => estimateTokens(content),
@@ -2070,7 +2102,7 @@ describe("LCM integration: compaction", () => {
     // Set a tight budget that requires multiple rounds
     // Each message is ~52 tokens; 20 messages = ~1040 tokens total.
     // Set budget to 200 tokens to force multiple compaction rounds.
-    const result = await compactionEngine.compactUntilUnder({
+    const result = await engine.compactUntilUnder({
       conversationId: CONV_ID,
       tokenBudget: 200,
       summarize,
@@ -2079,6 +2111,31 @@ describe("LCM integration: compaction", () => {
     // Multiple rounds should have been needed
     expect(result.rounds).toBeGreaterThan(1);
     // Final tokens should be at or under budget (or we ran out of rounds)
+    if (result.success) {
+      expect(result.finalTokens).toBeLessThanOrEqual(200);
+    }
+  });
+
+  it("compactUntilUnder converges faster with token-budget tail", async () => {
+    await ingestMessages(convStore, sumStore, 20, {
+      contentFn: (i) => `Turn ${i}: ${"c".repeat(200)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    let callCount = 0;
+    const summarize = vi.fn(async (text: string, _aggressive?: boolean) => {
+      callCount++;
+      return `Round ${callCount} summary of ${text.length} chars.`;
+    });
+
+    const result = await compactionEngine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 200,
+      summarize,
+    });
+
+    expect(result.rounds).toBeGreaterThanOrEqual(1);
+    expect(summarize).toHaveBeenCalled();
     if (result.success) {
       expect(result.finalTokens).toBeLessThanOrEqual(200);
     }

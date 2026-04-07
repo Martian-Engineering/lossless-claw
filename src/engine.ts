@@ -3427,6 +3427,7 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: conversation.conversationId,
         tokenBudget,
         freshTailCount: this.config.freshTailCount,
+        contextThreshold: this.config.contextThreshold,
         prompt: params.prompt,
       });
 
