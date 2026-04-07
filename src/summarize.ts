@@ -6,11 +6,17 @@ export type LcmSummarizeOptions = {
   depth?: number;
 };
 
+export type LcmSummarizeResult = {
+  text: string;
+  /** The provider/model that actually produced this summary (may differ from configured model after fallback). */
+  modelUsed?: string;
+};
+
 export type LcmSummarizeFn = (
   text: string,
   aggressive?: boolean,
   options?: LcmSummarizeOptions,
-) => Promise<string>;
+) => Promise<string | LcmSummarizeResult>;
 
 export type LcmSummarizerLegacyParams = {
   provider?: unknown;
@@ -1156,7 +1162,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     text: string,
     aggressive?: boolean,
     options?: LcmSummarizeOptions,
-  ): Promise<string> => {
+  ): Promise<string | LcmSummarizeResult> => {
     if (!text.trim()) {
       return "";
     }
@@ -1484,7 +1490,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         );
       }
 
-      return summary;
+      return { text: summary, modelUsed: `${provider}/${model}` };
     }
 
     console.error(

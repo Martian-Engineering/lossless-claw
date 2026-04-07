@@ -99,6 +99,8 @@ type PassResult = {
   modelInputTokensEst: number;
   /** Estimated tokens produced by the compaction model. */
   modelOutputTokensEst: number;
+  /** The provider/model that actually produced this summary (may differ from configured after fallback). */
+  modelUsed?: string;
 };
 type LeafChunkSelection = {
   items: ContextItemRecord[];
@@ -657,7 +659,7 @@ export class CompactionEngine {
       tokensBefore,
       tokensAfterLeaf,
       tokensAfterFinal: tokensAfterLeaf,
-      leafResult: { summaryId: leafResult.summaryId, level: leafResult.level, inputTokensEst: leafResult.modelInputTokensEst, outputTokensEst: leafResult.modelOutputTokensEst },
+      leafResult: { summaryId: leafResult.summaryId, level: leafResult.level, inputTokensEst: leafResult.modelInputTokensEst, outputTokensEst: leafResult.modelOutputTokensEst, modelUsed: leafResult.modelUsed },
       condenseResult: null,
       compactionModel: input.summaryModel,
     });
@@ -804,7 +806,7 @@ export class CompactionEngine {
         tokensBefore: passTokensBefore,
         tokensAfterLeaf: passTokensAfter,
         tokensAfterFinal: passTokensAfter,
-        leafResult: { summaryId: leafResult.summaryId, level: leafResult.level, inputTokensEst: leafResult.modelInputTokensEst, outputTokensEst: leafResult.modelOutputTokensEst },
+        leafResult: { summaryId: leafResult.summaryId, level: leafResult.level, inputTokensEst: leafResult.modelInputTokensEst, outputTokensEst: leafResult.modelOutputTokensEst, modelUsed: leafResult.modelUsed },
         condenseResult: null,
         compactionModel: input.summaryModel,
       });
@@ -1401,7 +1403,7 @@ export class CompactionEngine {
     options?: CompactionSummarizeOptions;
     /** Target token count for this summary kind (leaf or condensed). Used for hard-cap enforcement. */
     targetTokens: number;
-  }): Promise<{ content: string; level: CompactionLevel } | null> {
+  }): Promise<{ content: string; level: CompactionLevel; modelUsed?: string } | null> {
     const sourceText = params.sourceText.trim();
     if (!sourceText) {
       return {
@@ -1423,17 +1425,24 @@ export class CompactionEngine {
     };
     const authFailure = Symbol("authFailure");
 
+    let resolvedModelUsed: string | undefined;
+
     const runSummarizer = async (
       aggressiveMode: boolean,
     ): Promise<string | null | typeof authFailure> => {
-      let output: string;
+      let rawOutput: string | { text: string; modelUsed?: string };
       try {
-        output = await params.summarize(sourceText, aggressiveMode, params.options);
+        rawOutput = await params.summarize(sourceText, aggressiveMode, params.options);
       } catch (err) {
         if (err instanceof LcmProviderAuthError) {
           return authFailure;
         }
         throw err;
+      }
+      // Handle union return: string or { text, modelUsed }
+      const output = typeof rawOutput === "string" ? rawOutput : rawOutput.text;
+      if (typeof rawOutput === "object" && rawOutput.modelUsed) {
+        resolvedModelUsed = rawOutput.modelUsed;
       }
       const trimmed = output.trim();
       return trimmed || null;
@@ -1482,7 +1491,7 @@ export class CompactionEngine {
       level = "capped";
     }
 
-    return { content: summaryText, level };
+    return { content: summaryText, level, modelUsed: resolvedModelUsed };
   }
 
   // ── Private: Media Annotation ────────────────────────────────────────────
@@ -1538,7 +1547,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
     summaryModel?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number; modelInputTokensEst: number; modelOutputTokensEst: number } | null> {
+  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number; modelInputTokensEst: number; modelOutputTokensEst: number; modelUsed?: string } | null> {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
       [];
@@ -1648,6 +1657,7 @@ export class CompactionEngine {
         + estimateTokens(previousSummaryContent ?? "")
         + 500, // prompt wrapper overhead (instructions, XML tags)
       modelOutputTokensEst: tokenCount,
+      modelUsed: summary.modelUsed,
     };
   }
 
@@ -1801,6 +1811,7 @@ export class CompactionEngine {
         + estimateTokens(previousSummaryContent ?? "")
         + 500, // prompt wrapper overhead
       modelOutputTokensEst: tokenCount,
+      modelUsed: condensed.modelUsed,
     };
   }
 
@@ -1810,8 +1821,8 @@ export class CompactionEngine {
     tokensBefore: number;
     tokensAfterLeaf: number;
     tokensAfterFinal: number;
-    leafResult: { summaryId: string; level: CompactionLevel; inputTokensEst?: number; outputTokensEst?: number } | null;
-    condenseResult: { summaryId: string; level: CompactionLevel; inputTokensEst?: number; outputTokensEst?: number } | null;
+    leafResult: { summaryId: string; level: CompactionLevel; inputTokensEst?: number; outputTokensEst?: number; modelUsed?: string } | null;
+    condenseResult: { summaryId: string; level: CompactionLevel; inputTokensEst?: number; outputTokensEst?: number; modelUsed?: string } | null;
     compactionModel?: string;
   }): Promise<void> {
     const {
@@ -1847,7 +1858,7 @@ export class CompactionEngine {
         tokensAfter: tokensAfterLeaf,
         inputTokensEst: leafResult.inputTokensEst ?? 0,
         outputTokensEst: leafResult.outputTokensEst ?? 0,
-        compactionModel: input.compactionModel,
+        compactionModel: leafResult.modelUsed ?? input.compactionModel,
         createdSummaryId: leafResult.summaryId,
         createdSummaryIds,
         condensedPassOccurred,
@@ -1864,7 +1875,7 @@ export class CompactionEngine {
         tokensAfter: tokensAfterFinal,
         inputTokensEst: condenseResult.inputTokensEst ?? 0,
         outputTokensEst: condenseResult.outputTokensEst ?? 0,
-        compactionModel: input.compactionModel,
+        compactionModel: condenseResult.modelUsed ?? input.compactionModel,
         createdSummaryId: condenseResult.summaryId,
         createdSummaryIds,
         condensedPassOccurred,
