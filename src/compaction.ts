@@ -469,6 +469,13 @@ export class CompactionEngine {
       return { shouldCompact: false, rawTokensOutsideTail, threshold };
     }
 
+    // Short-circuit when both guards are disabled — avoid unnecessary DB read.
+    const rawHeadroomFactor = this.config.leafBudgetHeadroomFactor ?? 0.8;
+    const reductionThreshold = Math.min(Math.max(this.config.leafSkipReductionThreshold ?? 0.05, 0), 1.0);
+    if (rawHeadroomFactor <= 0 && reductionThreshold <= 0) {
+      return { shouldCompact: true, rawTokensOutsideTail, threshold };
+    }
+
     // Reuse a precomputed token count when the caller already fetched it
     // (avoids a duplicate getContextTokenCount DB read).
     // Use the higher of stored/precomputed count and live context estimate
@@ -486,7 +493,6 @@ export class CompactionEngine {
     // ── Budget headroom check (evaluated first) ───────────────────
     // If assembled tokens are well under the budget ceiling, skip to
     // avoid unnecessary cache prefix churn.
-    const rawHeadroomFactor = this.config.leafBudgetHeadroomFactor ?? 0.8;
     const headroomFactor = Math.min(Math.max(rawHeadroomFactor, 0), 1.0);
     // headroomEnabled: only run the headroom check when factor > 0 and
     // tokenBudget is available.  Setting factor to 0 disables the check
@@ -523,7 +529,6 @@ export class CompactionEngine {
     // to prevent starvation in large contexts.
     const perPassRawTokens = Math.min(rawTokensOutsideTail, threshold);
     const estimatedReduction = perPassRawTokens - this.config.leafTargetTokens;
-    const reductionThreshold = Math.min(Math.max(this.config.leafSkipReductionThreshold ?? 0.05, 0), 1.0);
     const budgetPressure = headroomEnabled && !hasHeadroom;
     if (
       !budgetPressure &&

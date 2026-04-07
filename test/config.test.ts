@@ -405,6 +405,22 @@ describe("resolveLcmConfig", () => {
     });
   });
 
+  it("clamps leafSkipReductionThreshold and leafBudgetHeadroomFactor to [0, 1]", () => {
+    const below = resolveLcmConfig({}, {
+      leafSkipReductionThreshold: -0.5,
+      leafBudgetHeadroomFactor: -1.0,
+    });
+    expect(below.leafSkipReductionThreshold).toBe(0);
+    expect(below.leafBudgetHeadroomFactor).toBe(0);
+
+    const above = resolveLcmConfig({}, {
+      leafSkipReductionThreshold: 1.5,
+      leafBudgetHeadroomFactor: 2.0,
+    });
+    expect(above.leafSkipReductionThreshold).toBe(1);
+    expect(above.leafBudgetHeadroomFactor).toBe(1);
+  });
+
   it("derives bootstrapMaxTokens from leafChunkTokens and allows override", () => {
     expect(resolveLcmConfig({}, {
       leafChunkTokens: 80_000,
