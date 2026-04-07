@@ -546,7 +546,21 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS compaction_events (
+      event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      pass TEXT NOT NULL CHECK (pass IN ('leaf', 'condensed')),
+      level TEXT NOT NULL,
+      tokens_before INTEGER NOT NULL,
+      tokens_after INTEGER NOT NULL,
+      input_tokens_est INTEGER NOT NULL DEFAULT 0,
+      output_tokens_est INTEGER NOT NULL DEFAULT 0,
+      compaction_model TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Indexes
+    CREATE INDEX IF NOT EXISTS compaction_events_conv_idx ON compaction_events (conversation_id);
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);

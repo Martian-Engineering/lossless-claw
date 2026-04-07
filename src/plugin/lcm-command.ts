@@ -11,6 +11,7 @@ import {
   getDoctorSummaryStats,
   type DoctorSummaryStats,
 } from "./lcm-doctor-shared.js";
+import { estimateModelCost, estimateSavings, formatCurrency } from "./pricing.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
@@ -52,6 +53,7 @@ type CurrentConversationResolution =
 type ParsedLcmCommand =
   | { kind: "status" }
   | { kind: "doctor"; apply: boolean }
+  | { kind: "efficiency" }
   | { kind: "help"; error?: string };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -161,12 +163,16 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
         kind: "help",
         error: "`/lcm doctor` accepts no arguments, or `apply` for the scoped repair path.",
       };
+    case "efficiency":
+      return rest.length === 0
+        ? { kind: "efficiency" }
+        : { kind: "help", error: "`/lcm efficiency` does not accept extra arguments." };
     case "help":
       return { kind: "help" };
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, doctor, doctor apply.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, doctor, doctor apply, efficiency.`,
       };
   }
 }
@@ -424,6 +430,7 @@ function buildHelpText(error?: string): string {
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} status`), "Show plugin, Global, and current-conversation status."),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor apply`), "Repair broken summaries in the current conversation."),
+      buildStatLine(formatCommand(`${VISIBLE_COMMAND} efficiency`), "Detailed compaction cost/savings analysis with recommendations."),
     ]),
     "",
     buildSection("🧭 Notes", [
@@ -517,6 +524,178 @@ async function buildStatusText(params: {
       ]),
     );
   }
+
+  // Efficiency section (only when compaction events exist for current conversation)
+  if (current.kind === "resolved") {
+    const effStats = getCompactionEfficiencyStats(params.db, current.stats.conversationId);
+    if (effStats.totalPasses > 0) {
+      const compactionCost = effStats.modelBreakdown.reduce((sum, m) => {
+        return sum + estimateModelCost(m.model, m.inputTokens, m.outputTokens).totalCost;
+      }, 0);
+      const savings = estimateSavings(effStats.totalTokensSaved);
+      const net = savings - compactionCost;
+      const effPct = savings > 0 ? Math.round((net / savings) * 100) : 0;
+      const modelLabel = effStats.modelBreakdown[0]?.model ?? "unknown";
+      const recommendation = net >= 0
+        ? "Compaction is saving money"
+        : modelLabel.includes("opus")
+          ? "Switch summaryModel to haiku \u2014 Opus costs 40x more"
+          : "Compaction cost exceeds savings \u2014 check summaryModel";
+
+      lines.push(
+        "",
+        buildSection("\u26A1 Compaction efficiency", [
+          buildStatLine("passes", `${formatNumber(effStats.totalPasses)} (${formatNumber(effStats.leafPasses)} leaf, ${formatNumber(effStats.condensedPasses)} condensed)`),
+          buildStatLine("tokens saved", formatNumber(effStats.totalTokensSaved)),
+          buildStatLine("compaction cost", `~${formatCurrency(compactionCost)} (${effStats.totalPasses} calls \u00D7 ${modelLabel})`),
+          buildStatLine("estimated savings", `~${formatCurrency(savings)}`),
+          buildStatLine("net efficiency", `${net >= 0 ? "+" : ""}${formatCurrency(net)} (${effPct}% efficient)`),
+          buildStatLine("recommendation", net >= 0 ? `\u2713 ${recommendation}` : `\u26A0 ${recommendation}`),
+        ]),
+      );
+    }
+  }
+
+  return lines.join("\n");
+}
+
+function getCompactionEfficiencyStats(db: DatabaseSync, conversationId?: number): {
+  totalPasses: number;
+  leafPasses: number;
+  condensedPasses: number;
+  totalTokensSaved: number;
+  modelBreakdown: Array<{ model: string; passes: number; inputTokens: number; outputTokens: number }>;
+} {
+  try {
+    const whereClause = conversationId !== undefined ? "WHERE conversation_id = ?" : "";
+    const params = conversationId !== undefined ? [conversationId] : [];
+
+    const agg = db
+      .prepare(
+        `SELECT
+           COUNT(*) AS total_passes,
+           SUM(CASE WHEN pass = 'leaf' THEN 1 ELSE 0 END) AS leaf_passes,
+           SUM(CASE WHEN pass = 'condensed' THEN 1 ELSE 0 END) AS condensed_passes,
+           SUM(tokens_before - tokens_after) AS total_tokens_saved
+         FROM compaction_events ${whereClause}`,
+      )
+      .get(...params) as {
+      total_passes: number;
+      leaf_passes: number;
+      condensed_passes: number;
+      total_tokens_saved: number;
+    };
+
+    const modelRows = db
+      .prepare(
+        `SELECT
+           COALESCE(compaction_model, 'unknown') AS model,
+           COUNT(*) AS passes,
+           SUM(input_tokens_est) AS input_tokens,
+           SUM(output_tokens_est) AS output_tokens
+         FROM compaction_events ${whereClause}
+         GROUP BY COALESCE(compaction_model, 'unknown')
+         ORDER BY passes DESC`,
+      )
+      .all(...params) as Array<{
+      model: string;
+      passes: number;
+      input_tokens: number;
+      output_tokens: number;
+    }>;
+
+    return {
+      totalPasses: agg.total_passes ?? 0,
+      leafPasses: agg.leaf_passes ?? 0,
+      condensedPasses: agg.condensed_passes ?? 0,
+      totalTokensSaved: agg.total_tokens_saved ?? 0,
+      modelBreakdown: modelRows.map((r) => ({
+        model: r.model,
+        passes: r.passes,
+        inputTokens: r.input_tokens,
+        outputTokens: r.output_tokens,
+      })),
+    };
+  } catch {
+    return { totalPasses: 0, leafPasses: 0, condensedPasses: 0, totalTokensSaved: 0, modelBreakdown: [] };
+  }
+}
+
+async function buildEfficiencyText(params: {
+  ctx: PluginCommandContext;
+  db: DatabaseSync;
+}): Promise<string> {
+  const current = await resolveCurrentConversation({ ctx: params.ctx, db: params.db });
+  const convId = current.kind === "resolved" ? current.stats.conversationId : undefined;
+  const stats = getCompactionEfficiencyStats(params.db, convId);
+
+  if (stats.totalPasses === 0) {
+    return [
+      ...buildHeaderLines(),
+      "",
+      buildSection("\u26A1 Compaction efficiency", [
+        buildStatLine("status", "No compaction events recorded yet."),
+        buildStatLine("tip", "Run a session with 10+ turns to generate compaction data."),
+      ]),
+    ].join("\n");
+  }
+
+  const lines = [...buildHeaderLines(), ""];
+
+  // Summary
+  const totalCompactionCost = stats.modelBreakdown.reduce((sum, m) => {
+    return sum + estimateModelCost(m.model, m.inputTokens, m.outputTokens).totalCost;
+  }, 0);
+  const savings = estimateSavings(stats.totalTokensSaved);
+  const net = savings - totalCompactionCost;
+  const effPct = savings > 0 ? Math.round((net / savings) * 100) : 0;
+
+  lines.push(
+    buildSection("\u26A1 Summary", [
+      buildStatLine("total passes", `${formatNumber(stats.totalPasses)} (${formatNumber(stats.leafPasses)} leaf, ${formatNumber(stats.condensedPasses)} condensed)`),
+      buildStatLine("tokens saved", formatNumber(stats.totalTokensSaved)),
+      buildStatLine("compaction cost", `~${formatCurrency(totalCompactionCost)}`),
+      buildStatLine("estimated savings", `~${formatCurrency(savings)}`),
+      buildStatLine("net", `${net >= 0 ? "+" : ""}${formatCurrency(net)} (${effPct}% efficient)`),
+    ]),
+    "",
+  );
+
+  // Per-model breakdown
+  if (stats.modelBreakdown.length > 0) {
+    const modelLines: string[] = [];
+    for (const m of stats.modelBreakdown) {
+      const cost = estimateModelCost(m.model, m.inputTokens, m.outputTokens);
+      modelLines.push(
+        buildStatLine(m.model, `${m.passes} passes, ~${formatCurrency(cost.totalCost)}${!cost.matched ? " (unknown model \u2014 using estimate)" : ""}`),
+      );
+    }
+    lines.push(buildSection("\uD83D\uDCCA By model", modelLines), "");
+  }
+
+  // Recommendations
+  const recommendations: string[] = [];
+  for (const m of stats.modelBreakdown) {
+    if (m.model.includes("opus")) {
+      recommendations.push(`\u26A0 Using ${m.model} for compaction costs ~$0.16/call. Switch to haiku (~$0.03) or gpt-4o-mini (~$0.004).`);
+    }
+    if (m.model.includes("sonnet") && stats.totalPasses > 5) {
+      recommendations.push(`\uD83D\uDCA1 Using ${m.model}. Consider haiku for 3x cost reduction with similar quality.`);
+    }
+  }
+  if (net < 0) {
+    recommendations.push("\u26A0 Compaction is costing more than it saves. Check your summaryModel setting.");
+  }
+  if (stats.totalTokensSaved > 0 && stats.totalTokensSaved / stats.totalPasses < 2000) {
+    recommendations.push("\uD83D\uDCA1 Average tokens saved per pass is low (<2K). Consider raising leafSkipReductionThreshold.");
+  }
+  if (recommendations.length > 0) {
+    lines.push(buildSection("\uD83D\uDCA1 Recommendations", recommendations));
+  } else {
+    lines.push(buildSection("\u2713 Status", ["Compaction is working efficiently. No action needed."]));
+  }
+
+  lines.push("", "_Costs are estimates based on published API pricing (Apr 2026). Actual costs depend on your provider agreement._");
 
   return lines.join("\n");
 }
@@ -742,6 +921,8 @@ export function createLcmCommand(params: {
                 }),
               }
             : { text: await buildDoctorText({ ctx, db: await getDb() }) };
+        case "efficiency":
+          return { text: await buildEfficiencyText({ ctx, db: await getDb() }) };
         case "help":
           return { text: buildHelpText(parsed.error) };
       }

@@ -653,8 +653,9 @@ export class CompactionEngine {
       tokensBefore,
       tokensAfterLeaf,
       tokensAfterFinal: tokensAfterLeaf,
-      leafResult: { summaryId: leafResult.summaryId, level: leafResult.level },
+      leafResult: { summaryId: leafResult.summaryId, level: leafResult.level, inputTokensEst: leafResult.removedTokens, outputTokensEst: leafResult.addedTokens },
       condenseResult: null,
+      compactionModel: input.summaryModel,
     });
 
     let tokensAfter = tokensAfterLeaf;
@@ -691,7 +692,8 @@ export class CompactionEngine {
           tokensAfterLeaf: passTokensBefore,
           tokensAfterFinal: passTokensAfter,
           leafResult: null,
-          condenseResult,
+          condenseResult: { ...condenseResult, inputTokensEst: condenseResult.removedTokens, outputTokensEst: condenseResult.addedTokens },
+          compactionModel: input.summaryModel,
         });
 
         tokensAfter = passTokensAfter;
@@ -798,8 +800,9 @@ export class CompactionEngine {
         tokensBefore: passTokensBefore,
         tokensAfterLeaf: passTokensAfter,
         tokensAfterFinal: passTokensAfter,
-        leafResult: { summaryId: leafResult.summaryId, level: leafResult.level },
+        leafResult: { summaryId: leafResult.summaryId, level: leafResult.level, inputTokensEst: leafResult.removedTokens, outputTokensEst: leafResult.addedTokens },
         condenseResult: null,
+        compactionModel: input.summaryModel,
       });
 
       actionTaken = true;
@@ -847,7 +850,8 @@ export class CompactionEngine {
         tokensAfterLeaf: passTokensBefore,
         tokensAfterFinal: passTokensAfter,
         leafResult: null,
-        condenseResult,
+        condenseResult: { ...condenseResult, inputTokensEst: condenseResult.removedTokens, outputTokensEst: condenseResult.addedTokens },
+        compactionModel: input.summaryModel,
       });
 
       actionTaken = true;
@@ -1783,8 +1787,9 @@ export class CompactionEngine {
     tokensBefore: number;
     tokensAfterLeaf: number;
     tokensAfterFinal: number;
-    leafResult: { summaryId: string; level: CompactionLevel } | null;
-    condenseResult: { summaryId: string; level: CompactionLevel } | null;
+    leafResult: { summaryId: string; level: CompactionLevel; inputTokensEst?: number; outputTokensEst?: number } | null;
+    condenseResult: { summaryId: string; level: CompactionLevel; inputTokensEst?: number; outputTokensEst?: number } | null;
+    compactionModel?: string;
   }): Promise<void> {
     const {
       conversationId,
@@ -1817,6 +1822,9 @@ export class CompactionEngine {
         level: leafResult.level,
         tokensBefore,
         tokensAfter: tokensAfterLeaf,
+        inputTokensEst: leafResult.inputTokensEst ?? 0,
+        outputTokensEst: leafResult.outputTokensEst ?? 0,
+        compactionModel: input.compactionModel,
         createdSummaryId: leafResult.summaryId,
         createdSummaryIds,
         condensedPassOccurred,
@@ -1831,6 +1839,9 @@ export class CompactionEngine {
         level: condenseResult.level,
         tokensBefore: tokensAfterLeaf,
         tokensAfter: tokensAfterFinal,
+        inputTokensEst: condenseResult.inputTokensEst ?? 0,
+        outputTokensEst: condenseResult.outputTokensEst ?? 0,
+        compactionModel: input.compactionModel,
         createdSummaryId: condenseResult.summaryId,
         createdSummaryIds,
         condensedPassOccurred,
@@ -1838,7 +1849,7 @@ export class CompactionEngine {
     }
   }
 
-  /** Log one compaction event without appending a synthetic chat message. */
+  /** Log and persist one compaction event. */
   private async persistCompactionEvent(input: {
     conversationId: number;
     sessionId: string;
@@ -1846,6 +1857,9 @@ export class CompactionEngine {
     level: CompactionLevel;
     tokensBefore: number;
     tokensAfter: number;
+    inputTokensEst: number;
+    outputTokensEst: number;
+    compactionModel?: string;
     createdSummaryId: string;
     createdSummaryIds: string[];
     condensedPassOccurred: boolean;
@@ -1854,5 +1868,18 @@ export class CompactionEngine {
     console.info(
       `[lcm] ${content} conversation=${input.conversationId} summary=${input.createdSummaryId}`,
     );
+
+    if (typeof this.summaryStore.insertCompactionEvent === "function") {
+      this.summaryStore.insertCompactionEvent({
+        conversationId: input.conversationId,
+        pass: input.pass,
+        level: input.level,
+        tokensBefore: input.tokensBefore,
+        tokensAfter: input.tokensAfter,
+        inputTokensEst: input.inputTokensEst,
+        outputTokensEst: input.outputTokensEst,
+        compactionModel: input.compactionModel,
+      });
+    }
   }
 }

@@ -1516,4 +1516,39 @@ export class SummaryStore {
 
     return toConversationBootstrapStateRecord(row);
   }
+
+  // ── Compaction events ──────────────────────────────────────────
+
+  insertCompactionEvent(event: {
+    conversationId: number;
+    pass: "leaf" | "condensed";
+    level: string;
+    tokensBefore: number;
+    tokensAfter: number;
+    inputTokensEst: number;
+    outputTokensEst: number;
+    compactionModel?: string;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO compaction_events
+           (conversation_id, pass, level, tokens_before, tokens_after,
+            input_tokens_est, output_tokens_est, compaction_model)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          event.conversationId,
+          event.pass,
+          event.level,
+          event.tokensBefore,
+          event.tokensAfter,
+          event.inputTokensEst,
+          event.outputTokensEst,
+          event.compactionModel ?? null,
+        );
+    } catch {
+      // Best-effort — don't fail compaction if event recording fails
+    }
+  }
 }
