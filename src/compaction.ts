@@ -95,6 +95,10 @@ type PassResult = {
   removedTokens: number;
   /** Token count of the newly created summary. */
   addedTokens: number;
+  /** Estimated tokens sent to the compaction model. */
+  modelInputTokensEst: number;
+  /** Estimated tokens produced by the compaction model. */
+  modelOutputTokensEst: number;
 };
 type LeafChunkSelection = {
   items: ContextItemRecord[];
@@ -653,7 +657,7 @@ export class CompactionEngine {
       tokensBefore,
       tokensAfterLeaf,
       tokensAfterFinal: tokensAfterLeaf,
-      leafResult: { summaryId: leafResult.summaryId, level: leafResult.level, inputTokensEst: leafResult.removedTokens, outputTokensEst: leafResult.addedTokens },
+      leafResult: { summaryId: leafResult.summaryId, level: leafResult.level, inputTokensEst: leafResult.modelInputTokensEst, outputTokensEst: leafResult.modelOutputTokensEst },
       condenseResult: null,
       compactionModel: input.summaryModel,
     });
@@ -692,7 +696,7 @@ export class CompactionEngine {
           tokensAfterLeaf: passTokensBefore,
           tokensAfterFinal: passTokensAfter,
           leafResult: null,
-          condenseResult: { ...condenseResult, inputTokensEst: condenseResult.removedTokens, outputTokensEst: condenseResult.addedTokens },
+          condenseResult: { ...condenseResult, inputTokensEst: condenseResult.modelInputTokensEst, outputTokensEst: condenseResult.modelOutputTokensEst },
           compactionModel: input.summaryModel,
         });
 
@@ -800,7 +804,7 @@ export class CompactionEngine {
         tokensBefore: passTokensBefore,
         tokensAfterLeaf: passTokensAfter,
         tokensAfterFinal: passTokensAfter,
-        leafResult: { summaryId: leafResult.summaryId, level: leafResult.level, inputTokensEst: leafResult.removedTokens, outputTokensEst: leafResult.addedTokens },
+        leafResult: { summaryId: leafResult.summaryId, level: leafResult.level, inputTokensEst: leafResult.modelInputTokensEst, outputTokensEst: leafResult.modelOutputTokensEst },
         condenseResult: null,
         compactionModel: input.summaryModel,
       });
@@ -850,7 +854,7 @@ export class CompactionEngine {
         tokensAfterLeaf: passTokensBefore,
         tokensAfterFinal: passTokensAfter,
         leafResult: null,
-        condenseResult: { ...condenseResult, inputTokensEst: condenseResult.removedTokens, outputTokensEst: condenseResult.addedTokens },
+        condenseResult: { ...condenseResult, inputTokensEst: condenseResult.modelInputTokensEst, outputTokensEst: condenseResult.modelOutputTokensEst },
         compactionModel: input.summaryModel,
       });
 
@@ -1534,7 +1538,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
     summaryModel?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
+  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number; modelInputTokensEst: number; modelOutputTokensEst: number } | null> {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
       [];
@@ -1634,7 +1638,15 @@ export class CompactionEngine {
     });
     this.invalidateContextCache(conversationId);
 
-    return { summaryId, level: summary.level, content: summary.content, removedTokens, addedTokens: tokenCount };
+    return {
+      summaryId,
+      level: summary.level,
+      content: summary.content,
+      removedTokens,
+      addedTokens: tokenCount,
+      modelInputTokensEst: estimateTokens(concatenated),
+      modelOutputTokensEst: tokenCount,
+    };
   }
 
   // ── Private: Condensed Pass ──────────────────────────────────────────────
@@ -1778,7 +1790,14 @@ export class CompactionEngine {
       (sum, s) => sum + Math.max(0, Math.floor(s.tokenCount)),
       0,
     );
-    return { summaryId, level: condensed.level, removedTokens, addedTokens: tokenCount };
+    return {
+      summaryId,
+      level: condensed.level,
+      removedTokens,
+      addedTokens: tokenCount,
+      modelInputTokensEst: estimateTokens(concatenated),
+      modelOutputTokensEst: tokenCount,
+    };
   }
 
   /** Emit compaction telemetry without mutating canonical conversation history. */

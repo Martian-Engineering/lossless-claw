@@ -535,12 +535,30 @@ async function buildStatusText(params: {
       const savings = estimateSavings(effStats.totalTokensSaved);
       const net = savings - compactionCost;
       const effPct = savings > 0 ? Math.round((net / savings) * 100) : 0;
-      const modelLabel = effStats.modelBreakdown[0]?.model ?? "unknown";
+      const topModel = effStats.modelBreakdown[0]?.model ?? "unknown";
+      const modelLabel = effStats.modelBreakdown.length > 1
+        ? `${topModel} +${effStats.modelBreakdown.length - 1} more`
+        : topModel;
       const recommendation = net >= 0
         ? "Compaction is saving money"
-        : modelLabel.includes("opus")
-          ? "Switch summaryModel to haiku \u2014 Opus costs 40x more"
+        : topModel.toLowerCase().includes("opus")
+          ? "Switch summaryModel to haiku \u2014 Opus is ~5x more expensive"
           : "Compaction cost exceeds savings \u2014 check summaryModel";
+
+      // Memory quality metrics
+      const totalSummaries = current.stats.summaryCount;
+      const doctorIssues = conversationDoctor.total;
+      const losslessPct = totalSummaries > 0
+        ? Math.round(((totalSummaries - doctorIssues) / totalSummaries) * 100)
+        : 100;
+      const compressionRatio = current.stats.compressedTokenCount > 0
+        ? current.stats.contextTokenCount / current.stats.compressedTokenCount
+        : 0;
+      const compressionHealth = compressionRatio === 0 ? "no compression yet"
+        : compressionRatio < 2 ? "conservative \u2014 summaries are barely compressing"
+        : compressionRatio <= 8 ? "healthy"
+        : compressionRatio <= 15 ? "aggressive \u2014 detail may be hard to retrieve"
+        : "very aggressive \u2014 check fallback rate";
 
       lines.push(
         "",
@@ -550,6 +568,10 @@ async function buildStatusText(params: {
           buildStatLine("compaction cost", `~${formatCurrency(compactionCost)} (${effStats.totalPasses} calls \u00D7 ${modelLabel})`),
           buildStatLine("estimated savings", `~${formatCurrency(savings)}`),
           buildStatLine("net efficiency", `${net >= 0 ? "+" : ""}${formatCurrency(net)} (${effPct}% efficient)`),
+          buildStatLine("summary quality", totalSummaries > 0
+            ? `${losslessPct}% lossless (${doctorIssues > 0 ? `${doctorIssues} fallback/truncated` : "all clean"} of ${totalSummaries})`
+            : "no summaries yet"),
+          buildStatLine("compression health", compressionHealth),
           buildStatLine("recommendation", net >= 0 ? `\u2713 ${recommendation}` : `\u26A0 ${recommendation}`),
         ]),
       );
@@ -676,10 +698,11 @@ async function buildEfficiencyText(params: {
   // Recommendations
   const recommendations: string[] = [];
   for (const m of stats.modelBreakdown) {
-    if (m.model.includes("opus")) {
+    const lower = m.model.toLowerCase();
+    if (lower.includes("opus")) {
       recommendations.push(`\u26A0 Using ${m.model} for compaction costs ~$0.16/call. Switch to haiku (~$0.03) or gpt-4o-mini (~$0.004).`);
     }
-    if (m.model.includes("sonnet") && stats.totalPasses > 5) {
+    if (lower.includes("sonnet") && stats.totalPasses > 5) {
       recommendations.push(`\uD83D\uDCA1 Using ${m.model}. Consider haiku for 3x cost reduction with similar quality.`);
     }
   }
