@@ -2527,6 +2527,70 @@ describe("LCM integration: retrieval", () => {
   });
 });
 
+describe("LCM integration: dynamic leaf chunk sizing", () => {
+  let convStore: ReturnType<typeof createMockConversationStore>;
+  let sumStore: ReturnType<typeof createMockSummaryStore>;
+  let compactionEngine: CompactionEngine;
+
+  beforeEach(() => {
+    convStore = createMockConversationStore();
+    sumStore = createMockSummaryStore();
+    wireStores(convStore, sumStore);
+    compactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 2,
+      leafChunkTokens: 200,
+      leafTargetTokens: 40,
+      incrementalMaxDepth: 0,
+    });
+  });
+
+  it("evaluateLeafTrigger respects an overridden working leaf chunk threshold", async () => {
+    await ingestMessages(convStore, sumStore, 5, {
+      tokenCountFn: () => 100,
+      contentFn: (i) => `trigger message ${i}`,
+    });
+
+    const baseline = await compactionEngine.evaluateLeafTrigger(CONV_ID);
+    expect(baseline).toEqual({
+      shouldCompact: true,
+      rawTokensOutsideTail: 300,
+      threshold: 200,
+    });
+
+    const overridden = await compactionEngine.evaluateLeafTrigger(CONV_ID, 400);
+    expect(overridden).toEqual({
+      shouldCompact: false,
+      rawTokensOutsideTail: 300,
+      threshold: 400,
+    });
+  });
+
+  it("compactLeaf uses the overridden working leaf chunk size when selecting the oldest raw chunk", async () => {
+    await ingestMessages(convStore, sumStore, 5, {
+      tokenCountFn: () => 100,
+      contentFn: (i) => `dynamic chunk message ${i}`,
+    });
+
+    const summarize = vi.fn(async (text: string) => `summary ${text.length}`);
+
+    await compactionEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 8_000,
+      leafChunkTokens: 300,
+      summarize,
+      force: true,
+    });
+
+    expect(summarize).toHaveBeenCalledTimes(1);
+    const compactedText = summarize.mock.calls[0]?.[0] ?? "";
+    expect(compactedText).toContain("dynamic chunk message 0");
+    expect(compactedText).toContain("dynamic chunk message 1");
+    expect(compactedText).toContain("dynamic chunk message 2");
+    expect(compactedText).not.toContain("dynamic chunk message 3");
+  });
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Test Suite: Full Round-Trip (ingest -> compact -> assemble -> retrieve)
 // ═════════════════════════════════════════════════════════════════════════════

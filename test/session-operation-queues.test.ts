@@ -60,6 +60,10 @@ function createTestConfig(databasePath: string): LcmConfig {
       enabled: true,
       maxColdCacheCatchupPasses: 2,
     },
+    dynamicLeafChunkTokens: {
+      enabled: false,
+      max: 40_000,
+    },
   };
 }
 

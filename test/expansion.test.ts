@@ -40,6 +40,10 @@ const BASE_CONFIG: LcmConfig = {
     enabled: true,
     maxColdCacheCatchupPasses: 2,
   },
+  dynamicLeafChunkTokens: {
+    enabled: false,
+    max: 40_000,
+  },
 };
 
 function makeExpansionResult() {

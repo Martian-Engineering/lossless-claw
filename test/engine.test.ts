@@ -58,6 +58,10 @@ function createTestConfig(databasePath: string): LcmConfig {
       enabled: true,
       maxColdCacheCatchupPasses: 2,
     },
+    dynamicLeafChunkTokens: {
+      enabled: false,
+      max: 40_000,
+    },
   };
 }
 
@@ -4150,6 +4154,153 @@ describe("LcmContextEngine fidelity and token budget", () => {
     );
   });
 
+  it("afterTurn increases the working leaf chunk target for busy sessions when dynamic sizing is enabled", async () => {
+    const engine = createEngineWithConfig({
+      dynamicLeafChunkTokens: {
+        enabled: true,
+        max: 40_000,
+      },
+    });
+    const sessionId = "after-turn-dynamic-leaf-chunk-high";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockImplementation(
+      async (_conversationId: number, leafChunkTokens?: number) => ({
+        shouldCompact: true,
+        rawTokensOutsideTail: 40_000,
+        threshold: leafChunkTokens ?? 20_000,
+      }),
+    );
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 500,
+      threshold: 3_072,
+    });
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync").mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+    vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-dynamic-leaf-chunk-high"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 128_000,
+    });
+
+    expect(compactLeafAsyncSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        leafChunkTokens: 40_000,
+        fallbackLeafChunkTokens: [40_000, 30_000, 20_000],
+        activityBand: "high",
+      }),
+    );
+  });
+
+  it("afterTurn bumps to the max working leaf chunk when cache-aware compaction is cold", async () => {
+    const engine = createEngineWithConfig({
+      dynamicLeafChunkTokens: {
+        enabled: true,
+        max: 40_000,
+      },
+    });
+    const sessionId = "after-turn-dynamic-leaf-chunk-cold-max";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation!.conversationId,
+      cacheState: "unknown",
+      turnsSinceLeafCompaction: 2,
+      tokensAccumulatedSinceLeafCompaction: 35_000,
+      lastActivityBand: "medium",
+    });
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockImplementation(
+      async (_conversationId: number, leafChunkTokens?: number) => ({
+        shouldCompact: (leafChunkTokens ?? 20_000) <= 35_000,
+        rawTokensOutsideTail: 35_000,
+        threshold: leafChunkTokens ?? 20_000,
+      }),
+    );
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 500,
+      threshold: 3_072,
+    });
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync").mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+    vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-dynamic-leaf-chunk-cold-max"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 128_000,
+      runtimeContext: {
+        promptCache: {
+          lastCallUsage: {
+            cacheRead: 0,
+            cacheWrite: 0,
+          },
+          observation: {
+            broke: true,
+          },
+        },
+      },
+    });
+
+    expect(compactLeafAsyncSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        leafChunkTokens: 40_000,
+        fallbackLeafChunkTokens: [40_000, 30_000, 20_000],
+        activityBand: "medium",
+      }),
+    );
+  });
+
   it("afterTurn skips compaction when ingest fails", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-ingest-failure";
@@ -4654,6 +4805,52 @@ describe("LcmContextEngine compaction telemetry", () => {
       }),
     );
     expect(compactLeafSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("compactLeafAsync retries with a smaller leaf chunk target after a provider token-limit error", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactLeaf: (input: { leafChunkTokens?: number }) => Promise<unknown>;
+      };
+    };
+    const sessionId = "compact-leaf-retry-smaller-chunk";
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed" }),
+    });
+
+    const compactLeafSpy = vi
+      .spyOn(privateEngine.compaction, "compactLeaf")
+      .mockRejectedValueOnce(new Error("context window exceeded for this request"))
+      .mockResolvedValueOnce({
+        actionTaken: true,
+        tokensBefore: 900,
+        tokensAfter: 520,
+        condensed: false,
+      });
+
+    const result = await engine.compactLeafAsync({
+      sessionId,
+      sessionFile: createSessionFilePath("compact-leaf-retry-smaller-chunk"),
+      tokenBudget: 4096,
+      leafChunkTokens: 40_000,
+      fallbackLeafChunkTokens: [40_000, 30_000, 20_000],
+      legacyParams: {
+        summarize: async () => "short summary",
+      },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(compactLeafSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ leafChunkTokens: 40_000 }),
+    );
+    expect(compactLeafSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ leafChunkTokens: 30_000 }),
+    );
   });
 });
 

@@ -3,6 +3,7 @@ import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 
 export type CacheState = "hot" | "cold" | "unknown";
+export type ActivityBand = "low" | "medium" | "high";
 
 export type ConversationCompactionTelemetryRecord = {
   conversationId: number;
@@ -12,6 +13,10 @@ export type ConversationCompactionTelemetryRecord = {
   lastObservedCacheBreakAt: Date | null;
   cacheState: CacheState;
   retention: string | null;
+  lastLeafCompactionAt: Date | null;
+  turnsSinceLeafCompaction: number;
+  tokensAccumulatedSinceLeafCompaction: number;
+  lastActivityBand: ActivityBand;
   updatedAt: Date;
 };
 
@@ -23,6 +28,10 @@ export type UpsertConversationCompactionTelemetryInput = {
   lastObservedCacheBreakAt?: Date | null;
   cacheState: CacheState;
   retention?: string | null;
+  lastLeafCompactionAt?: Date | null;
+  turnsSinceLeafCompaction?: number;
+  tokensAccumulatedSinceLeafCompaction?: number;
+  lastActivityBand?: ActivityBand;
 };
 
 type ConversationCompactionTelemetryRow = {
@@ -33,6 +42,10 @@ type ConversationCompactionTelemetryRow = {
   last_observed_cache_break_at: string | null;
   cache_state: CacheState;
   retention: string | null;
+  last_leaf_compaction_at: string | null;
+  turns_since_leaf_compaction: number | null;
+  tokens_accumulated_since_leaf_compaction: number | null;
+  last_activity_band: ActivityBand | null;
   updated_at: string;
 };
 
@@ -47,6 +60,10 @@ function toConversationCompactionTelemetryRecord(
     lastObservedCacheBreakAt: parseUtcTimestampOrNull(row.last_observed_cache_break_at),
     cacheState: row.cache_state,
     retention: row.retention,
+    lastLeafCompactionAt: parseUtcTimestampOrNull(row.last_leaf_compaction_at),
+    turnsSinceLeafCompaction: row.turns_since_leaf_compaction ?? 0,
+    tokensAccumulatedSinceLeafCompaction: row.tokens_accumulated_since_leaf_compaction ?? 0,
+    lastActivityBand: row.last_activity_band ?? "low",
     updatedAt: parseUtcTimestampOrNull(row.updated_at) ?? new Date(0),
   };
 }
@@ -77,6 +94,10 @@ export class CompactionTelemetryStore {
            last_observed_cache_break_at,
            cache_state,
            retention,
+           last_leaf_compaction_at,
+           turns_since_leaf_compaction,
+           tokens_accumulated_since_leaf_compaction,
+           last_activity_band,
            updated_at
          FROM conversation_compaction_telemetry
          WHERE conversation_id = ?`,
@@ -99,8 +120,12 @@ export class CompactionTelemetryStore {
            last_observed_cache_break_at,
            cache_state,
            retention,
+           last_leaf_compaction_at,
+           turns_since_leaf_compaction,
+           tokens_accumulated_since_leaf_compaction,
+           last_activity_band,
            updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(conversation_id) DO UPDATE SET
            last_observed_cache_read = excluded.last_observed_cache_read,
            last_observed_cache_write = excluded.last_observed_cache_write,
@@ -108,6 +133,10 @@ export class CompactionTelemetryStore {
            last_observed_cache_break_at = excluded.last_observed_cache_break_at,
            cache_state = excluded.cache_state,
            retention = excluded.retention,
+           last_leaf_compaction_at = excluded.last_leaf_compaction_at,
+           turns_since_leaf_compaction = excluded.turns_since_leaf_compaction,
+           tokens_accumulated_since_leaf_compaction = excluded.tokens_accumulated_since_leaf_compaction,
+           last_activity_band = excluded.last_activity_band,
            updated_at = datetime('now')`,
       )
       .run(
@@ -118,6 +147,10 @@ export class CompactionTelemetryStore {
         input.lastObservedCacheBreakAt?.toISOString() ?? null,
         input.cacheState,
         input.retention ?? null,
+        input.lastLeafCompactionAt?.toISOString() ?? null,
+        input.turnsSinceLeafCompaction ?? 0,
+        input.tokensAccumulatedSinceLeafCompaction ?? 0,
+        input.lastActivityBand ?? "low",
       );
   }
 }

@@ -50,6 +50,7 @@ import {
   CompactionTelemetryStore,
   type ConversationCompactionTelemetryRecord,
   type CacheState,
+  type ActivityBand,
 } from "./store/compaction-telemetry-store.js";
 import {
   ConversationStore,
@@ -81,6 +82,15 @@ type IncrementalCompactionDecision = {
   maxPasses: number;
   rawTokensOutsideTail: number;
   threshold: number;
+  leafChunkTokens: number;
+  fallbackLeafChunkTokens: number[];
+  activityBand: ActivityBand;
+};
+type DynamicLeafChunkBounds = {
+  floor: number;
+  medium: number;
+  high: number;
+  max: number;
 };
 type TranscriptRewriteReplacement = {
   entryId: string;
@@ -103,6 +113,12 @@ type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
 
 const TRANSCRIPT_GC_BATCH_SIZE = 12;
 const HOT_CACHE_RAW_HISTORY_PRESSURE_FACTOR = 1.5;
+const DYNAMIC_LEAF_CHUNK_MEDIUM_MULTIPLIER = 1.5;
+const DYNAMIC_LEAF_CHUNK_HIGH_MULTIPLIER = 2;
+const DYNAMIC_ACTIVITY_MEDIUM_UPSHIFT_FACTOR = 0.5;
+const DYNAMIC_ACTIVITY_MEDIUM_DOWNSHIFT_FACTOR = 0.35;
+const DYNAMIC_ACTIVITY_HIGH_UPSHIFT_FACTOR = 1.0;
+const DYNAMIC_ACTIVITY_HIGH_DOWNSHIFT_FACTOR = 0.75;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1483,6 +1499,128 @@ export class LcmContextEngine implements ContextEngine {
     return Math.floor(value);
   }
 
+  /** Resolve bounded dynamic leaf chunk sizes from config and the active token budget. */
+  private resolveDynamicLeafChunkBounds(tokenBudget?: number): DynamicLeafChunkBounds {
+    const floor = Math.max(1, Math.floor(this.config.leafChunkTokens));
+    const configuredMax = this.config.dynamicLeafChunkTokens.enabled
+      ? Math.max(floor, Math.floor(this.config.dynamicLeafChunkTokens.max))
+      : floor;
+    const budgetCap =
+      typeof tokenBudget === "number" &&
+      Number.isFinite(tokenBudget) &&
+      tokenBudget > 0
+        ? Math.max(floor, Math.floor(tokenBudget * this.config.contextThreshold))
+        : configuredMax;
+    const max = Math.max(floor, Math.min(configuredMax, budgetCap));
+    const medium = Math.max(
+      floor,
+      Math.min(max, Math.floor(floor * DYNAMIC_LEAF_CHUNK_MEDIUM_MULTIPLIER)),
+    );
+    const high = Math.max(
+      floor,
+      Math.min(max, Math.floor(floor * DYNAMIC_LEAF_CHUNK_HIGH_MULTIPLIER)),
+    );
+    return { floor, medium, high, max };
+  }
+
+  /** Classify the current refill rate into a simple step band with downshift hysteresis. */
+  private classifyDynamicLeafActivityBand(params: {
+    lastActivityBand?: ActivityBand;
+    tokensAccumulatedSinceLeafCompaction: number;
+    turnsSinceLeafCompaction: number;
+    floor: number;
+  }): ActivityBand {
+    const turns = Math.max(1, params.turnsSinceLeafCompaction);
+    const tokensPerTurn = params.tokensAccumulatedSinceLeafCompaction / turns;
+    const mediumUpshift = params.floor * DYNAMIC_ACTIVITY_MEDIUM_UPSHIFT_FACTOR;
+    const mediumDownshift = params.floor * DYNAMIC_ACTIVITY_MEDIUM_DOWNSHIFT_FACTOR;
+    const highUpshift = params.floor * DYNAMIC_ACTIVITY_HIGH_UPSHIFT_FACTOR;
+    const highDownshift = params.floor * DYNAMIC_ACTIVITY_HIGH_DOWNSHIFT_FACTOR;
+    const lastBand = params.lastActivityBand ?? "low";
+
+    if (lastBand === "high") {
+      if (tokensPerTurn >= highDownshift) {
+        return "high";
+      }
+      return tokensPerTurn >= mediumDownshift ? "medium" : "low";
+    }
+    if (lastBand === "medium") {
+      if (tokensPerTurn >= highUpshift) {
+        return "high";
+      }
+      if (tokensPerTurn < mediumDownshift) {
+        return "low";
+      }
+      return "medium";
+    }
+    if (tokensPerTurn >= highUpshift) {
+      return "high";
+    }
+    if (tokensPerTurn >= mediumUpshift) {
+      return "medium";
+    }
+    return "low";
+  }
+
+  /** Map an activity band to the corresponding working leaf chunk size. */
+  private resolveLeafChunkTokensForBand(
+    band: ActivityBand,
+    bounds: DynamicLeafChunkBounds,
+  ): number {
+    switch (band) {
+      case "high":
+        return bounds.high;
+      case "medium":
+        return bounds.medium;
+      default:
+        return bounds.floor;
+    }
+  }
+
+  /** Build descending fallback chunk sizes used when a provider rejects a larger chunk. */
+  private buildLeafChunkFallbacks(params: {
+    preferred: number;
+    bounds: DynamicLeafChunkBounds;
+  }): number[] {
+    const ordered = [params.preferred, params.bounds.max, params.bounds.high, params.bounds.medium, params.bounds.floor];
+    const seen = new Set<number>();
+    const fallbacks: number[] = [];
+    for (const value of ordered) {
+      const normalized = Math.max(params.bounds.floor, Math.floor(value));
+      if (seen.has(normalized)) {
+        continue;
+      }
+      seen.add(normalized);
+      fallbacks.push(normalized);
+    }
+    return fallbacks.sort((a, b) => b - a);
+  }
+
+  /** Detect provider/model token-limit failures that should trigger a lower chunk retry. */
+  private isRecoverableLeafChunkOverflowError(error: unknown): boolean {
+    const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+    if (!message) {
+      return false;
+    }
+    return [
+      "context length",
+      "context window",
+      "maximum context",
+      "max context",
+      "too many tokens",
+      "too many input tokens",
+      "input tokens",
+      "token limit",
+      "context limit",
+      "input is too large",
+      "input too large",
+      "prompt is too long",
+      "request too large",
+      "exceeds the model",
+      "exceeds context",
+    ].some((fragment) => message.includes(fragment));
+  }
+
   /** Extract the current prompt-cache snapshot from runtime context, if present. */
   private readPromptCacheSnapshot(runtimeContext?: Record<string, unknown>): PromptCacheSnapshot | null {
     const promptCache = asRecord(runtimeContext?.promptCache);
@@ -1520,38 +1658,78 @@ export class LcmContextEngine implements ContextEngine {
     };
   }
 
-  /** Persist the current turn's prompt-cache telemetry for later compaction decisions. */
-  private async updatePromptCacheTelemetry(params: {
+  /** Persist the current turn's compaction telemetry for later policy decisions. */
+  private async updateCompactionTelemetry(params: {
     conversationId: number;
     runtimeContext?: Record<string, unknown>;
+    tokenBudget?: number;
+    rawTokensOutsideTail?: number;
   }): Promise<ConversationCompactionTelemetryRecord | null> {
     const snapshot = this.readPromptCacheSnapshot(params.runtimeContext);
     const existing = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
       params.conversationId,
     );
-    if (!snapshot) {
+    if (!snapshot && params.rawTokensOutsideTail === undefined) {
       return existing;
     }
 
     const now = new Date();
+    const bounds = this.resolveDynamicLeafChunkBounds(params.tokenBudget);
+    const turnsSinceLeafCompaction =
+      (existing?.turnsSinceLeafCompaction ?? 0) + 1;
+    const tokensAccumulatedSinceLeafCompaction =
+      params.rawTokensOutsideTail ?? existing?.tokensAccumulatedSinceLeafCompaction ?? 0;
+    const lastActivityBand = this.classifyDynamicLeafActivityBand({
+      lastActivityBand: existing?.lastActivityBand,
+      tokensAccumulatedSinceLeafCompaction,
+      turnsSinceLeafCompaction,
+      floor: bounds.floor,
+    });
     await this.compactionTelemetryStore.upsertConversationCompactionTelemetry({
       conversationId: params.conversationId,
-      lastObservedCacheRead: snapshot.lastObservedCacheRead ?? existing?.lastObservedCacheRead ?? null,
+      lastObservedCacheRead: snapshot?.lastObservedCacheRead ?? existing?.lastObservedCacheRead ?? null,
       lastObservedCacheWrite:
-        snapshot.lastObservedCacheWrite ?? existing?.lastObservedCacheWrite ?? null,
+        snapshot?.lastObservedCacheWrite ?? existing?.lastObservedCacheWrite ?? null,
       lastObservedCacheHitAt:
-        snapshot.cacheState === "hot"
+        snapshot?.cacheState === "hot"
           ? now
           : existing?.lastObservedCacheHitAt ?? null,
       lastObservedCacheBreakAt:
-        snapshot.sawExplicitBreak
+        snapshot?.sawExplicitBreak
           ? now
           : existing?.lastObservedCacheBreakAt ?? null,
-      cacheState: snapshot.cacheState,
-      retention: snapshot.retention ?? existing?.retention ?? null,
+      cacheState: snapshot?.cacheState ?? existing?.cacheState ?? "unknown",
+      retention: snapshot?.retention ?? existing?.retention ?? null,
+      lastLeafCompactionAt: existing?.lastLeafCompactionAt ?? null,
+      turnsSinceLeafCompaction,
+      tokensAccumulatedSinceLeafCompaction,
+      lastActivityBand,
     });
 
     return this.compactionTelemetryStore.getConversationCompactionTelemetry(params.conversationId);
+  }
+
+  /** Reset refill counters after any successful leaf-producing compaction. */
+  private async markLeafCompactionTelemetrySuccess(params: {
+    conversationId: number;
+    activityBand?: ActivityBand;
+  }): Promise<void> {
+    const existing = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+      params.conversationId,
+    );
+    await this.compactionTelemetryStore.upsertConversationCompactionTelemetry({
+      conversationId: params.conversationId,
+      lastObservedCacheRead: existing?.lastObservedCacheRead ?? null,
+      lastObservedCacheWrite: existing?.lastObservedCacheWrite ?? null,
+      lastObservedCacheHitAt: existing?.lastObservedCacheHitAt ?? null,
+      lastObservedCacheBreakAt: existing?.lastObservedCacheBreakAt ?? null,
+      cacheState: existing?.cacheState ?? "unknown",
+      retention: existing?.retention ?? null,
+      lastLeafCompactionAt: new Date(),
+      turnsSinceLeafCompaction: 0,
+      tokensAccumulatedSinceLeafCompaction: 0,
+      lastActivityBand: params.activityBand ?? existing?.lastActivityBand ?? "low",
+    });
   }
 
   /** Resolve the cache-aware incremental-compaction policy for the current session. */
@@ -1560,17 +1738,6 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget: number;
     currentTokenCount?: number;
   }): Promise<IncrementalCompactionDecision> {
-    const leafTrigger = await this.compaction.evaluateLeafTrigger(params.conversationId);
-    if (!leafTrigger.shouldCompact) {
-      return {
-        shouldCompact: false,
-        cacheState: "unknown",
-        maxPasses: 1,
-        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
-        threshold: leafTrigger.threshold,
-      };
-    }
-
     const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
       params.conversationId,
     );
@@ -1578,6 +1745,46 @@ export class LcmContextEngine implements ContextEngine {
       this.config.cacheAwareCompaction.enabled
         ? (telemetry?.cacheState ?? "unknown")
         : "unknown";
+    const bounds = this.resolveDynamicLeafChunkBounds(params.tokenBudget);
+    const activityBand =
+      this.config.dynamicLeafChunkTokens.enabled
+        ? this.classifyDynamicLeafActivityBand({
+          lastActivityBand: telemetry?.lastActivityBand,
+          tokensAccumulatedSinceLeafCompaction:
+            telemetry?.tokensAccumulatedSinceLeafCompaction ?? 0,
+          turnsSinceLeafCompaction: telemetry?.turnsSinceLeafCompaction ?? 0,
+          floor: bounds.floor,
+        })
+        : "low";
+    const triggerLeafChunkTokens =
+      this.config.dynamicLeafChunkTokens.enabled
+        ? this.resolveLeafChunkTokensForBand(activityBand, bounds)
+        : bounds.floor;
+    const preferredLeafChunkTokens =
+      this.config.cacheAwareCompaction.enabled && cacheState === "cold"
+        ? bounds.max
+        : triggerLeafChunkTokens;
+    const fallbackLeafChunkTokens = this.buildLeafChunkFallbacks({
+      preferred: preferredLeafChunkTokens,
+      bounds,
+    });
+    const leafTrigger = await this.compaction.evaluateLeafTrigger(
+      params.conversationId,
+      triggerLeafChunkTokens,
+    );
+    if (!leafTrigger.shouldCompact) {
+      return {
+        shouldCompact: false,
+        cacheState,
+        maxPasses: 1,
+        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
+        threshold: leafTrigger.threshold,
+        leafChunkTokens: preferredLeafChunkTokens,
+        fallbackLeafChunkTokens,
+        activityBand,
+      };
+    }
+
     const budgetDecision = await this.compaction.evaluate(
       params.conversationId,
       params.tokenBudget,
@@ -1590,6 +1797,9 @@ export class LcmContextEngine implements ContextEngine {
         maxPasses: 1,
         rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
         threshold: leafTrigger.threshold,
+        leafChunkTokens: preferredLeafChunkTokens,
+        fallbackLeafChunkTokens,
+        activityBand,
       };
     }
 
@@ -1604,6 +1814,9 @@ export class LcmContextEngine implements ContextEngine {
         maxPasses: 1,
         rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
         threshold: leafTrigger.threshold,
+        leafChunkTokens: preferredLeafChunkTokens,
+        fallbackLeafChunkTokens,
+        activityBand,
       };
     }
 
@@ -1616,6 +1829,9 @@ export class LcmContextEngine implements ContextEngine {
           : 1,
       rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
       threshold: leafTrigger.threshold,
+      leafChunkTokens: preferredLeafChunkTokens,
+      fallbackLeafChunkTokens,
+      activityBand,
     };
   }
 
@@ -2890,13 +3106,16 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
-      await this.updatePromptCacheTelemetry({
+      const rawLeafTrigger = await this.compaction.evaluateLeafTrigger(conversation.conversationId);
+      await this.updateCompactionTelemetry({
         conversationId: conversation.conversationId,
         runtimeContext: asRecord(params.runtimeContext),
+        tokenBudget,
+        rawTokensOutsideTail: rawLeafTrigger.rawTokensOutsideTail,
       });
     } catch (err) {
       console.warn(
-        `[lcm] afterTurn: prompt-cache telemetry update failed:`,
+        `[lcm] afterTurn: compaction telemetry update failed:`,
         err instanceof Error ? err.message : err,
       );
     }
@@ -2916,6 +3135,9 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: liveContextTokens,
           legacyParams,
           maxPasses: leafDecision.maxPasses,
+          leafChunkTokens: leafDecision.leafChunkTokens,
+          fallbackLeafChunkTokens: leafDecision.fallbackLeafChunkTokens,
+          activityBand: leafDecision.activityBand,
         }).catch(() => {
           // Leaf compaction is best-effort and should not fail the caller.
         });
@@ -3068,6 +3290,9 @@ export class LcmContextEngine implements ContextEngine {
     force?: boolean;
     previousSummaryContent?: string;
     maxPasses?: number;
+    leafChunkTokens?: number;
+    fallbackLeafChunkTokens?: number[];
+    activityBand?: ActivityBand;
   }): Promise<CompactResult> {
     if (this.isStatelessSession(params.sessionKey)) {
       return {
@@ -3140,20 +3365,53 @@ export class LcmContextEngine implements ContextEngine {
           params.maxPasses > 0
             ? Math.floor(params.maxPasses)
             : 1;
+        const fallbackLeafChunkTokens = Array.isArray(params.fallbackLeafChunkTokens)
+          ? [...new Set(params.fallbackLeafChunkTokens
+            .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0)
+            .map((value) => Math.floor(value)))]
+              .sort((a, b) => b - a)
+          : [];
+        let activeLeafChunkTokens =
+          typeof params.leafChunkTokens === "number" &&
+          Number.isFinite(params.leafChunkTokens) &&
+          params.leafChunkTokens > 0
+            ? Math.floor(params.leafChunkTokens)
+            : fallbackLeafChunkTokens[0];
 
         let rounds = 0;
         let finalTokens = observedTokens ?? storedTokensBefore;
         let authFailure = false;
 
         for (let pass = 0; pass < maxPasses; pass += 1) {
-          const leafResult = await this.compaction.compactLeaf({
-            conversationId: conversation.conversationId,
-            tokenBudget,
-            summarize,
-            force: params.force,
-            previousSummaryContent: pass === 0 ? params.previousSummaryContent : undefined,
-            summaryModel,
-          });
+          let leafResult: Awaited<ReturnType<typeof this.compaction.compactLeaf>> | undefined;
+          while (true) {
+            try {
+              leafResult = await this.compaction.compactLeaf({
+                conversationId: conversation.conversationId,
+                tokenBudget,
+                summarize,
+                ...(activeLeafChunkTokens !== undefined ? { leafChunkTokens: activeLeafChunkTokens } : {}),
+                force: params.force,
+                previousSummaryContent: pass === 0 ? params.previousSummaryContent : undefined,
+                summaryModel,
+              });
+              break;
+            } catch (err) {
+              const nextLeafChunkTokens = fallbackLeafChunkTokens.find(
+                (value) => activeLeafChunkTokens !== undefined && value < activeLeafChunkTokens,
+              );
+              if (!this.isRecoverableLeafChunkOverflowError(err) || nextLeafChunkTokens === undefined) {
+                throw err;
+              }
+              console.warn(
+                `[lcm] compactLeafAsync: retrying with smaller leafChunkTokens=${nextLeafChunkTokens} after provider token-limit error: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              activeLeafChunkTokens = nextLeafChunkTokens;
+            }
+          }
+          if (!leafResult) {
+            break;
+          }
           finalTokens = leafResult.tokensAfter;
 
           if (leafResult.authFailure) {
@@ -3173,6 +3431,12 @@ export class LcmContextEngine implements ContextEngine {
           this.recordCompactionAuthFailure(breakerKey);
         } else if (rounds > 0 && breakerKey) {
           this.recordCompactionSuccess(breakerKey);
+        }
+        if (rounds > 0) {
+          await this.markLeafCompactionTelemetrySuccess({
+            conversationId: conversation.conversationId,
+            activityBand: params.activityBand,
+          });
         }
 
         const tokensBefore = observedTokens ?? storedTokensBefore;
@@ -3335,6 +3599,9 @@ export class LcmContextEngine implements ContextEngine {
           } else if (sweepResult.actionTaken && breakerKey) {
             this.recordCompactionSuccess(breakerKey);
           }
+          if (sweepResult.actionTaken) {
+            await this.markLeafCompactionTelemetrySuccess({ conversationId });
+          }
 
           return {
             ok: !sweepResult.authFailure && (sweepResult.actionTaken || !liveContextStillExceedsTarget),
@@ -3384,6 +3651,9 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         const didCompact = compactResult.rounds > 0;
+        if (didCompact) {
+          await this.markLeafCompactionTelemetrySuccess({ conversationId });
+        }
 
         return {
           ok: compactResult.success,

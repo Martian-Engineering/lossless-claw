@@ -54,6 +54,10 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
       enabled: true,
       maxColdCacheCatchupPasses: 2,
     },
+    dynamicLeafChunkTokens: {
+      enabled: false,
+      max: 4_000,
+    },
     ...overrides,
   };
 }

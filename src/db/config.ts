@@ -6,6 +6,11 @@ export type CacheAwareCompactionConfig = {
   maxColdCacheCatchupPasses: number;
 };
 
+export type DynamicLeafChunkTokensConfig = {
+  enabled: boolean;
+  max: number;
+};
+
 export type LcmConfig = {
   enabled: boolean;
   databasePath: string;
@@ -37,10 +42,6 @@ export type LcmConfig = {
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
   largeFileSummaryModel: string;
-  /** Model override for conversation summarization. */
-  summaryModel: string;
-  /** Provider override for conversation summarization. */
-  summaryProvider: string;
   /** Provider override for lcm_expand_query sub-agent. */
   expansionProvider: string;
   /** Model override for lcm_expand_query sub-agent. */
@@ -67,6 +68,8 @@ export type LcmConfig = {
   fallbackProviders: Array<{ provider: string; model: string }>;
   /** Cache-sensitive policy for incremental leaf compaction. */
   cacheAwareCompaction: CacheAwareCompactionConfig;
+  /** Dynamic step-band policy for incremental leaf chunk sizing. */
+  dynamicLeafChunkTokens: DynamicLeafChunkTokensConfig;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -180,6 +183,7 @@ export function resolveLcmConfig(
 ): LcmConfig {
   const pc = pluginConfig ?? {};
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
+  const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
   const resolvedLeafChunkTokens =
     parseFiniteInt(env.LCM_LEAF_CHUNK_TOKENS)
       ?? toNumber(pc.leafChunkTokens) ?? 20000;
@@ -191,6 +195,12 @@ export function resolveLcmConfig(
     env.LCM_DELEGATION_TIMEOUT_MS !== undefined
       ? toNumber(env.LCM_DELEGATION_TIMEOUT_MS)
       : undefined;
+  const resolvedDynamicLeafChunkMax = Math.max(
+    resolvedLeafChunkTokens,
+    parseFiniteInt(env.LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX)
+      ?? toNumber(dynamicLeafChunkTokens?.max)
+      ?? Math.floor(resolvedLeafChunkTokens * 2),
+  );
 
   return {
     enabled:
@@ -304,6 +314,13 @@ export function resolveLcmConfig(
         parseFiniteInt(env.LCM_MAX_COLD_CACHE_CATCHUP_PASSES)
           ?? toNumber(cacheAwareCompaction?.maxColdCacheCatchupPasses)
           ?? 2,
+    },
+    dynamicLeafChunkTokens: {
+      enabled:
+        env.LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED !== undefined
+          ? env.LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED === "true"
+          : toBool(dynamicLeafChunkTokens?.enabled) ?? false,
+      max: resolvedDynamicLeafChunkMax,
     },
   };
 }

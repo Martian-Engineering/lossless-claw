@@ -130,6 +130,33 @@ Behavior:
 - **Cold cache**: allow up to `maxColdCacheCatchupPasses` bounded incremental passes in one maintenance cycle.
 - **Unknown / no telemetry**: fall back to the current token-driven incremental behavior.
 
+### Dynamic leaf chunk tokens
+
+Dynamic leaf chunk sizing is disabled by default in v1. When enabled, incremental compaction uses the configured static `leafChunkTokens` as the floor, then steps up the working leaf chunk target for busier sessions so incremental compaction fires less often.
+
+Plugin config:
+
+```json
+{
+  "dynamicLeafChunkTokens": {
+    "enabled": true,
+    "max": 40000
+  }
+}
+```
+
+Environment overrides:
+
+- `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED` (default `false`)
+- `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX` (default `2x leafChunkTokens`)
+
+Behavior:
+
+- **Low activity**: use the static `leafChunkTokens` floor.
+- **Medium/high activity**: step the working chunk target up internally.
+- **Cold cache with cache-aware compaction enabled**: use the bounded max working chunk for incremental passes.
+- **Provider/model token-limit failure**: retry incremental compaction with a smaller working chunk target.
+
 ### Maximum assembly token budget
 
 `LCM_MAX_ASSEMBLY_TOKEN_BUDGET` (default: none) caps the token budget used for context assembly and compaction threshold evaluation. When set, this takes precedence over both the 128k fallback and runtime-provided budgets.

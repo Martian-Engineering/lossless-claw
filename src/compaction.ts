@@ -436,13 +436,13 @@ export class CompactionEngine {
    * `leafChunkTokens`. This lets callers trigger a soft incremental leaf pass
    * before the full context threshold is breached.
    */
-  async evaluateLeafTrigger(conversationId: number): Promise<{
+  async evaluateLeafTrigger(conversationId: number, leafChunkTokensOverride?: number): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
     const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId);
-    const threshold = this.resolveLeafChunkTokens();
+    const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
     return {
       shouldCompact: rawTokensOutsideTail >= threshold,
       rawTokensOutsideTail,
@@ -474,6 +474,7 @@ export class CompactionEngine {
     conversationId: number;
     tokenBudget: number;
     summarize: CompactionSummarizeFn;
+    leafChunkTokens?: number;
     force?: boolean;
     previousSummaryContent?: string;
     summaryModel?: string;
@@ -485,6 +486,7 @@ export class CompactionEngine {
     conversationId: number;
     tokenBudget: number;
     summarize: CompactionSummarizeFn;
+    leafChunkTokens?: number;
     force?: boolean;
     previousSummaryContent?: string;
     summaryModel?: string;
@@ -493,7 +495,7 @@ export class CompactionEngine {
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    const leafTrigger = await this.evaluateLeafTrigger(conversationId, input.leafChunkTokens);
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {
@@ -504,7 +506,7 @@ export class CompactionEngine {
       };
     }
 
-    const leafChunk = await this.selectOldestLeafChunk(conversationId);
+    const leafChunk = await this.selectOldestLeafChunk(conversationId, input.leafChunkTokens);
     if (leafChunk.items.length === 0) {
       return {
         actionTaken: false,
@@ -858,7 +860,14 @@ export class CompactionEngine {
   // ── Private helpers ──────────────────────────────────────────────────────
 
   /** Normalize configured leaf chunk size to a safe positive integer. */
-  private resolveLeafChunkTokens(): number {
+  private resolveLeafChunkTokens(leafChunkTokensOverride?: number): number {
+    if (
+      typeof leafChunkTokensOverride === "number" &&
+      Number.isFinite(leafChunkTokensOverride) &&
+      leafChunkTokensOverride > 0
+    ) {
+      return Math.floor(leafChunkTokensOverride);
+    }
     if (
       typeof this.config.leafChunkTokens === "number" &&
       Number.isFinite(this.config.leafChunkTokens) &&
@@ -944,10 +953,13 @@ export class CompactionEngine {
    * The selected chunk size is capped by `leafChunkTokens`, but we always pick
    * at least one message when any compactable message exists.
    */
-  private async selectOldestLeafChunk(conversationId: number): Promise<LeafChunkSelection> {
+  private async selectOldestLeafChunk(
+    conversationId: number,
+    leafChunkTokensOverride?: number,
+  ): Promise<LeafChunkSelection> {
     const contextItems = await this.getContextItemsCached(conversationId);
     const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
-    const threshold = this.resolveLeafChunkTokens();
+    const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
 
     let rawTokensOutsideTail = 0;
     for (const item of contextItems) {

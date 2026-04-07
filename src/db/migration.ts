@@ -78,6 +78,35 @@ function ensureSummaryModelColumn(db: DatabaseSync): void {
   }
 }
 
+function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
+  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
+  const hasLastLeafCompactionAt = telemetryColumns.some((col) => col.name === "last_leaf_compaction_at");
+  const hasTurnsSinceLeafCompaction = telemetryColumns.some((col) => col.name === "turns_since_leaf_compaction");
+  const hasTokensAccumulatedSinceLeafCompaction = telemetryColumns.some(
+    (col) => col.name === "tokens_accumulated_since_leaf_compaction",
+  );
+  const hasLastActivityBand = telemetryColumns.some((col) => col.name === "last_activity_band");
+
+  if (!hasLastLeafCompactionAt) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_leaf_compaction_at TEXT`);
+  }
+  if (!hasTurnsSinceLeafCompaction) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+  if (!hasTokensAccumulatedSinceLeafCompaction) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+  if (!hasLastActivityBand) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_activity_band TEXT NOT NULL DEFAULT 'low' CHECK (last_activity_band IN ('low', 'medium', 'high'))`,
+    );
+  }
+}
+
 function backfillSummaryDepths(db: DatabaseSync): void {
   // Leaves are always depth 0, even if legacy rows had malformed values.
   db.exec(`UPDATE summaries SET depth = 0 WHERE kind = 'leaf'`);
@@ -555,6 +584,11 @@ export function runLcmMigrations(
       cache_state TEXT NOT NULL DEFAULT 'unknown'
         CHECK (cache_state IN ('hot', 'cold', 'unknown')),
       retention TEXT,
+      last_leaf_compaction_at TEXT,
+      turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
+      tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
+      last_activity_band TEXT NOT NULL DEFAULT 'low'
+        CHECK (last_activity_band IN ('low', 'medium', 'high')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -614,6 +648,7 @@ export function runLcmMigrations(
   ensureSummaryDepthColumn(db);
   ensureSummaryMetadataColumns(db);
   ensureSummaryModelColumn(db);
+  ensureCompactionTelemetryColumns(db);
   backfillSummaryDepths(db);
   // Index on depth — created AFTER backfillSummaryDepths to avoid index
   // maintenance overhead during bulk depth updates on large existing DBs.

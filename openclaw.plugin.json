@@ -108,6 +108,14 @@
       "label": "Cold Cache Catch-Up Passes",
       "help": "Maximum incremental leaf passes allowed in one maintenance cycle when prompt cache is cold"
     },
+    "dynamicLeafChunkTokens.enabled": {
+      "label": "Dynamic Leaf Chunk Tokens",
+      "help": "When enabled, incremental compaction uses a larger working leaf chunk in busy sessions and keeps the static floor in quieter sessions"
+    },
+    "dynamicLeafChunkTokens.max": {
+      "label": "Dynamic Leaf Chunk Max",
+      "help": "Maximum working leaf chunk target for dynamic incremental compaction. The static leafChunkTokens value remains the floor."
+    },
     "timezone": {
       "label": "Timezone",
       "help": "IANA timezone used for summary timestamps"
@@ -244,6 +252,19 @@
             "type": "boolean"
           },
           "maxColdCacheCatchupPasses": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "dynamicLeafChunkTokens": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "max": {
             "type": "integer",
             "minimum": 1
           }
