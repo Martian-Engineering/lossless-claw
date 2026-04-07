@@ -19,4 +19,5 @@
 
 - Whenever you add, rename, or remove a plugin config option in the runtime config loader or docs, update [`openclaw.plugin.json`](./openclaw.plugin.json) in the same change.
 - Keep the manifest `configSchema` and `uiHints` aligned with every supported `plugins.entries.lossless-claw.config` field so OpenClaw accepts documented config keys.
+- Keep [`docs/configuration.md`](./docs/configuration.md) exhaustive and current. When config keys, aliases, defaults, or precedence rules change, update the reference tables and the full example `plugins.entries.lossless-claw.config` block at the top of that file in the same change.
 - Add or update a regression test when changing config options so schema drift is caught before release.
