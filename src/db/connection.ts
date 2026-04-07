@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 type ConnectionKey = string;
-const SQLITE_BUSY_TIMEOUT_MS = 30_000;
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
 const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
 const connectionIndex = new Map<DatabaseSync, ConnectionKey>();
