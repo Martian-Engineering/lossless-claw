@@ -81,6 +81,24 @@ Guidance:
 - Pick a cheaper model only if it remains reliably structured and faithful.
 - `summaryProvider` only matters when `summaryModel` is a bare model name rather than a canonical provider/model ref.
 
+### `leafSkipReductionThreshold`
+
+Controls the cache-aware compaction skip. Minimum per-pass reduction as a fraction of total assembled tokens to justify leaf compaction. Default `0.05` (5%).
+
+- Lower (0.02): more aggressive compaction — good for Opus/expensive models
+- Higher (0.10): more conservative — good for short sessions/cheap models
+- Set to `0` to disable the cache-aware skip
+
+### `leafBudgetHeadroomFactor`
+
+Controls the budget headroom compaction skip. Skip leaf compaction when assembled tokens are below `factor x contextThreshold x tokenBudget`. Default `0.8`.
+
+- Lower (0.45): start compacting earlier — important for expensive models
+- Higher (0.90): delay compaction — acceptable for cheap models
+- Set to `0` to disable headroom check (also disables budget pressure detection)
+
+When assembled tokens reach or exceed the headroom ceiling, budget pressure overrides cache-aware skip — compaction fires unconditionally.
+
 ### `expansionModel` and `expansionProvider`
 
 Override the model used by delegated recall flows such as `lcm_expand_query`.

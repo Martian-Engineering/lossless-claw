@@ -45,7 +45,7 @@ For most use cases, 0.75 is a good balance.
 
 ### Fresh tail count
 
-`LCM_FRESH_TAIL_COUNT` (default `32`) is the number of most recent messages that are never compacted. These raw messages give the model immediate conversational continuity.
+`LCM_FRESH_TAIL_COUNT` (default `64`) is the number of most recent messages that are never compacted. These raw messages give the model immediate conversational continuity.
 
 - **Smaller values** (e.g., 8–16) save context space for summaries but may lose recent nuance.
 - **Larger values** (e.g., 32–64) give better continuity at the cost of a larger mandatory context floor.
@@ -80,7 +80,7 @@ For coding conversations with tool calls (which generate many messages per logic
 
 ### Incremental max depth
 
-`LCM_INCREMENTAL_MAX_DEPTH` (default `0`) controls whether condensation happens automatically after leaf passes.
+`LCM_INCREMENTAL_MAX_DEPTH` (default `1`) controls whether condensation happens automatically after leaf passes.
 
 - **0** — Only leaf summaries are created incrementally. Condensation only happens during manual `/compact` or overflow.
 - **1** — After each leaf pass, attempt to condense d0 summaries into d1.
@@ -89,7 +89,7 @@ For coding conversations with tool calls (which generate many messages per logic
 
 ### Summary target tokens
 
-`LCM_LEAF_TARGET_TOKENS` (default `1200`) and `LCM_CONDENSED_TARGET_TOKENS` (default `2000`) control the target size of generated summaries.
+`LCM_LEAF_TARGET_TOKENS` (default `2400`) and `LCM_CONDENSED_TARGET_TOKENS` (default `2000`) control the target size of generated summaries.
 
 - Larger targets preserve more detail but consume more context space.
 - Smaller targets are more aggressive, losing detail faster.
@@ -279,3 +279,51 @@ To fall back to OpenClaw's built-in compaction:
 ```
 
 Or set `LCM_ENABLED=false` to disable the plugin while keeping it registered.
+
+## Cache-aware compaction tuning
+
+Two settings control when leaf compaction skips to preserve prompt cache stability:
+
+### Skip reduction threshold
+
+`LCM_LEAF_SKIP_REDUCTION_THRESHOLD` (default `0.05`, plugin config: `leafSkipReductionThreshold`)
+
+Minimum estimated per-pass token reduction as a fraction of total assembled context. When the reduction is too small relative to total context, compaction is skipped because the prompt cache invalidation cost exceeds the token savings.
+
+- **Lower values** (e.g., 0.02) allow more compaction events — good for expensive models (Opus) where carrying extra tokens is costly.
+- **Higher values** (e.g., 0.10) are more conservative — good for short sessions or cheap models where cache stability matters more.
+- **Set to 0** to disable the cache-aware skip entirely.
+
+### Budget headroom factor
+
+`LCM_LEAF_BUDGET_HEADROOM_FACTOR` (default `0.8`, plugin config: `leafBudgetHeadroomFactor`)
+
+Skip leaf compaction when assembled tokens are below `factor x contextThreshold x tokenBudget`. When there is ample budget headroom, compaction provides no urgency and only risks cache instability.
+
+- **Lower values** (e.g., 0.45) start compacting earlier — important for expensive models where every token costs more.
+- **Higher values** (e.g., 0.90) delay compaction longer — good for cheap models where carrying extra context is acceptable.
+- **Set to 0** to disable headroom check entirely. Note: this also disables budget pressure detection, so the cache-aware skip becomes the only guard.
+
+When assembled tokens reach or exceed the headroom ceiling, **budget pressure** is detected and compaction fires unconditionally, overriding the cache-aware skip.
+
+### Compaction model selection
+
+`LCM_SUMMARY_MODEL` / `LCM_SUMMARY_PROVIDER` — The model used for summarization during compaction.
+
+**Use fast, non-thinking models.** Compaction runs synchronously during full sweeps and can stall the gateway. Recommended:
+
+| Model | Cost/call | Context | Notes |
+|-------|-----------|---------|-------|
+| `gpt-4o-mini` | ~$0.004 | 128K | Cheapest, auto caching |
+| `mistral-small-4` | ~$0.004 | 256K | Same price, bigger context |
+| `deepseek-v3` | ~$0.007 | 164K | 90% auto cache |
+| `gemini-2.5-flash` | ~$0.012 | 1M | Fastest, 90% cache |
+| `claude-haiku-4-5` | ~$0.032 | 200K | Best Anthropic option |
+
+> The compaction model only processes the chunk (~20-35K tokens), not the full conversation. A 128K model works fine at default settings.
+
+**Never use** Opus, o3, or thinking models for compaction — they add 3-30s per call with no summary quality benefit, and can cause 2-minute typing timeouts.
+
+### Per-model-tier presets
+
+See the [Compaction Tuning Guide](compaction-tuning.md) for detailed per-tier configurations with economics analysis.

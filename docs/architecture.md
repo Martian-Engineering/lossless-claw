@@ -25,7 +25,7 @@ Summaries form a directed acyclic graph with two node types:
 - Created from a chunk of raw messages
 - Linked to source messages via `summary_messages`
 - Contain a narrative summary with timestamps
-- Typically 800–1200 tokens
+- Typically 1200–2400 tokens (target: `leafTargetTokens`, default 2400)
 
 **Condensed summaries** (depth 1+, kind `"condensed"`):
 - Created from a chunk of summaries at the same depth
@@ -99,6 +99,30 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 - Runs up to `maxRounds` (default 10) of full sweeps
 - Stops when context is under the target token count
 - Used by the overflow recovery path
+
+### Cache-aware compaction guards
+
+The incremental leaf trigger evaluates skip guards before compacting, to avoid unnecessary prompt cache invalidation:
+
+```mermaid
+flowchart TD
+    A["raw tokens >= leafChunkTokens?"] -->|No| Z["Skip"]
+    A -->|Yes| B["assembled < headroom ceiling?"]
+    B -->|Yes| Y["Skip: budget headroom"]
+    B -->|No| C["budget pressure?"]
+    C -->|Yes| E["COMPACT: budget wins"]
+    C -->|No| D["reduction < 5% of total?"]
+    D -->|Yes| X["Skip: cache-aware"]
+    D -->|No| G["COMPACT"]
+```
+
+**Budget pressure priority:** When assembled tokens reach or exceed the headroom ceiling (default 80% of `contextThreshold x tokenBudget`), compaction fires unconditionally — budget pressure overrides cache concerns. This prevents compaction starvation in large contexts.
+
+**Cache-aware skip:** When there is no budget pressure, compaction is skipped if the estimated per-pass token reduction is less than `leafSkipReductionThreshold` (default 5%) of total assembled tokens. This preserves prompt cache stability when the compression gain is negligible.
+
+**Prompt cache impact:** Every compaction pass replaces messages with a summary and resequences all ordinals to maintain contiguity. This changes the assembled prompt structure, invalidating the API prompt cache prefix. On expensive models (Opus 4.6 at $5/MTok input, $0.50/MTok cached), a single cache miss on 150K cached tokens costs ~$0.68.
+
+See [Compaction Tuning Guide](compaction-tuning.md) for per-model-tier configuration recommendations and economics analysis.
 
 ### Three-level escalation
 
