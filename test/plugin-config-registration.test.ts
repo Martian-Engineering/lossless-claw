@@ -13,7 +13,7 @@ type RegisteredEngineFactory = (() => unknown) | undefined;
 type HookHandler = (event: unknown, context: unknown) => unknown;
 
 function buildApi(
-  pluginConfig: Record<string, unknown>,
+  pluginConfig: unknown,
   options?: { includeModelAuth?: boolean; agentDir?: string },
 ): {
   api: OpenClawPluginApi;
@@ -217,6 +217,46 @@ describe("lcm plugin registration", () => {
     expect(api.on).toHaveBeenCalledWith("before_reset", expect.any(Function));
     expect(api.on).toHaveBeenCalledWith("session_end", expect.any(Function));
   });
+
+  it.each([
+    ["missing", undefined],
+    ["invalid", ["not-a-plugin-config"]],
+  ])(
+    "falls back to root plugin config when api.pluginConfig is %s",
+    (_label, pluginConfig) => {
+      const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+      dbPaths.add(dbPath);
+
+      const { api, getFactory } = buildApi(pluginConfig);
+      api.config = {
+        plugins: {
+          entries: {
+            "lossless-claw": {
+              config: {
+                enabled: true,
+                contextThreshold: 0.42,
+                freshTailCount: 9,
+                dbPath,
+              },
+            },
+          },
+        },
+      } as OpenClawPluginApi["config"];
+
+      lcmPlugin.register(api);
+
+      const factory = getFactory();
+      expect(factory).toBeTypeOf("function");
+
+      const engine = factory!() as { config: Record<string, unknown> };
+      expect(engine.config).toMatchObject({
+        enabled: true,
+        contextThreshold: 0.42,
+        freshTailCount: 9,
+        databasePath: dbPath,
+      });
+    },
+  );
 
   it("inherits OpenClaw's default model for summarization when no LCM model override is set", { timeout: 20000 }, () => {
     const { api, getFactory } = buildApi({

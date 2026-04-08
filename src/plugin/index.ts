@@ -172,6 +172,27 @@ function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnaps
   };
 }
 
+/** Coerce a plugin-config-like value into a plain object when possible. */
+function toPluginConfig(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/** Resolve plugin config from direct runtime injection or the root OpenClaw config fallback. */
+function resolvePluginConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {
+  const directPluginConfig = toPluginConfig(api.pluginConfig);
+  if (directPluginConfig) {
+    return directPluginConfig;
+  }
+
+  const rootConfig = toPluginConfig(api.config);
+  const plugins = toPluginConfig(rootConfig?.plugins);
+  const entries = toPluginConfig(plugins?.entries);
+  const pluginEntry = toPluginConfig(entries?.["lossless-claw"]);
+  return toPluginConfig(pluginEntry?.config);
+}
+
 function truncateErrorMessage(message: string, maxChars = 240): string {
   return message.length <= maxChars ? message : `${message.slice(0, maxChars)}...`;
 }
@@ -1107,10 +1128,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(api.config);
   const modelAuth = getRuntimeModelAuth(api);
   const readEnv: ReadEnvFn = (key) => process.env[key];
-  const pluginConfig =
-    api.pluginConfig && typeof api.pluginConfig === "object" && !Array.isArray(api.pluginConfig)
-      ? api.pluginConfig
-      : undefined;
+  const pluginConfig = resolvePluginConfig(api);
   const config = resolveLcmConfig(process.env, pluginConfig);
 
   // Read model overrides from plugin config
