@@ -881,10 +881,13 @@ function extractCanonicalBootstrapMessage(value: unknown): AgentMessage | null {
     return null;
   }
   const entry = value as { type?: unknown; message?: unknown };
-  if (entry.type !== "message") {
-    return null;
+  if ("message" in entry) {
+    if (entry.type !== undefined && entry.type !== "message") {
+      return null;
+    }
+    return isBootstrapMessage(entry.message) ? entry.message : null;
   }
-  return isBootstrapMessage(entry.message) ? entry.message : null;
+  return null;
 }
 
 function extractBootstrapMessageCandidate(value: unknown): AgentMessage | null {
@@ -3258,15 +3261,21 @@ export class LcmContextEngine implements ContextEngine {
         if (conversation) {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
-            await this.refreshBootstrapState({
-              conversationId: conversation.conversationId,
-              sessionFile: params.sessionFile,
-            });
             const sessionContext = this.formatSessionLogContext({
               conversationId: conversation.conversationId,
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
             });
+            try {
+              await this.refreshBootstrapState({
+                conversationId: conversation.conversationId,
+                sessionFile: params.sessionFile,
+              });
+            } catch (err) {
+              this.deps.log.warn(
+                `[lcm] afterTurn: heartbeat pruning checkpoint refresh failed for ${sessionContext}: ${describeLogError(err)}`,
+              );
+            }
             this.deps.log.info(
               `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
             );
