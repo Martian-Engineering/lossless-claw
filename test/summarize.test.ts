@@ -920,6 +920,152 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(vi.mocked(deps.log.warn)).not.toHaveBeenCalled();
     });
 
+    it("preserves first-pass credential resolution but skips direct-credential retry for runtime-managed auth providers", async () => {
+      const deps = makeDeps({
+        config: { summaryTimeoutMs: 60_000 },
+        resolveModel: vi.fn(() => ({
+          provider: "openai-codex",
+          model: "gpt-5.4",
+        })),
+        getApiKey: vi.fn(async () => "should-not-be-used"),
+        isRuntimeManagedAuthProvider: vi.fn(() => true),
+        complete: vi.fn(async () => ({
+          content: [],
+          error: {
+            kind: "provider_auth",
+            statusCode: 401,
+            message: "Missing required scope: model.request",
+          },
+        })),
+      });
+
+      const result = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: { provider: "openai-codex", model: "gpt-5.4" },
+      });
+
+      await expect(result!.fn("R".repeat(8_000), false)).rejects.toBeInstanceOf(
+        LcmProviderAuthError,
+      );
+      expect(vi.mocked(deps.getApiKey)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(deps.getApiKey)).toHaveBeenCalledWith("openai-codex", "gpt-5.4", {
+        profileId: undefined,
+        agentDir: undefined,
+        runtimeConfig: undefined,
+      });
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+
+      const diagnostics = getDepsLogText(deps);
+      expect(diagnostics).not.toContain("summarizer auth retry");
+    });
+
+    it("retries custom providers without runtime.modelAuth when scope auth failures occur", async () => {
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "codex-gateway",
+          model: "gpt-5.4",
+        })),
+        complete: vi
+          .fn()
+          .mockRejectedValueOnce({
+            statusCode: 401,
+            error: {
+              code: "insufficient_scope",
+              message: "Missing required scope: model.request",
+            },
+          })
+          .mockResolvedValueOnce({
+            content: [{ type: "text", text: "summary from direct credentials" }],
+          }),
+      });
+
+      const result = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: { provider: "codex-gateway", model: "gpt-5.4" },
+      });
+
+      await expect(result!.fn("B".repeat(8_000), false)).resolves.toBe(
+        "summary from direct credentials",
+      );
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
+        provider: "codex-gateway",
+        model: "gpt-5.4",
+        skipModelAuth: true,
+      });
+
+      const diagnostics = getDepsLogText(deps);
+      expect(diagnostics).toContain("provider auth error (401 / missing model.request scope)");
+      expect(diagnostics).toContain("Current: codex-gateway/gpt-5.4");
+      expect(diagnostics).toContain("summarizer auth retry");
+      expect(diagnostics).toContain("summarizer auth retry succeeded");
+      expect(diagnostics).not.toContain("retrying with conservative settings");
+    });
+
+    it("does not enter conservative retry/fallback when the completion call throws an auth error", async () => {
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "openai-codex",
+          model: "gpt-5.4",
+        })),
+        complete: vi.fn(async () => {
+          throw {
+            statusCode: 401,
+            error: {
+              code: "insufficient_scope",
+              message: "Missing required scope: model.request",
+            },
+          };
+        }),
+      });
+
+      const result = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: { provider: "openai-codex", model: "gpt-5.4" },
+      });
+
+      await expect(result!.fn("B".repeat(8_000), false)).rejects.toBeInstanceOf(
+        LcmProviderAuthError,
+      );
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+
+      const diagnostics = getDepsLogText(deps);
+      expect(diagnostics).toContain("provider auth error (401 / missing model.request scope)");
+      expect(diagnostics).toContain("Current: openai-codex/gpt-5.4");
+      expect(diagnostics).toContain("summarizer auth retry");
+      expect(diagnostics).not.toContain("summarizer call failed");
+      expect(diagnostics).not.toContain("retrying with conservative settings");
+    });
+
+    it("still detects auth failures nested under a top-level data envelope", async () => {
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "openai-codex",
+          model: "gpt-5.4",
+        })),
+        complete: vi.fn(async () => ({
+          content: [],
+          data: {
+            statusCode: 401,
+            message: "Missing required scope: model.request",
+          },
+        })),
+      });
+
+      const result = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: { provider: "openai-codex", model: "gpt-5.4" },
+      });
+
+      await expect(result!.fn("C".repeat(8_000), false)).rejects.toBeInstanceOf(
+        LcmProviderAuthError,
+      );
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+
+      const diagnostics = getDepsLogText(deps);
+      expect(diagnostics).toContain("provider auth error (401 / missing model.request scope)");
+    });
+
     it("does not misclassify message-envelope summary text as an auth error", async () => {
       const deps = makeDeps({
         complete: vi.fn(async () => ({

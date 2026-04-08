@@ -143,6 +143,7 @@ type RuntimeModelAuth = {
 const MODEL_AUTH_PR_URL = "https://github.com/openclaw/openclaw/pull/41090";
 const MODEL_AUTH_MERGE_COMMIT = "4790e40";
 const MODEL_AUTH_REQUIRED_RELEASE = "the first OpenClaw release after 2026.3.8";
+const PROVIDER_API_RESOLUTION_ERROR_PREFIX = "[lcm] unable to resolve API family for provider ";
 const AUTH_ERROR_TEXT_PATTERN =
   /\b401\b|unauthorized|unauthorised|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|authentication failed|authorization failed|missing scope|insufficient scope|model\.request\b/i;
 const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
@@ -514,7 +515,7 @@ function normalizeProviderId(provider: string): string {
 }
 
 /** Resolve known provider API defaults when model lookup misses. */
-function inferApiFromProvider(provider: string): string {
+function inferApiFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
   const map: Record<string, string> = {
     anthropic: "anthropic-messages",
@@ -527,7 +528,7 @@ function inferApiFromProvider(provider: string): string {
     "google-vertex": "google-vertex",
     "amazon-bedrock": "bedrock-converse-stream",
   };
-  return map[normalized] ?? "openai-responses";
+  return map[normalized];
 }
 
 /** Codex Responses rejects `temperature`; omit it for that API family. */
@@ -622,7 +623,7 @@ function buildModelAuthLookupModel(params: {
     id: params.model,
     name: params.model,
     provider: params.provider,
-    api: params.api?.trim() || inferApiFromProvider(params.provider),
+    api: params.api?.trim() || inferApiFromProvider(params.provider) || "",
     reasoning: false,
     input: ["text"],
     cost: {
@@ -1359,6 +1360,9 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         const knownModel =
           typeof mod.getModel === "function" ? mod.getModel(providerId, modelId) : undefined;
         const fallbackApi =
+          (isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
+            ? knownModel.api.trim()
+            : undefined) ||
           providerApi?.trim() ||
           resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
           (() => {
@@ -1373,6 +1377,11 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             return first.api.trim();
           })() ||
           inferApiFromProvider(providerId);
+        if (!fallbackApi) {
+          throw new Error(
+            `[lcm] unable to resolve API family for provider ${providerId}; set models.providers.${providerId}.api explicitly instead of falling back implicitly.`,
+          );
+        }
         const modelAuthConfig = resolveModelAuthConfig(effectiveRuntimeConfig);
 
         // Resolve provider-level config (baseUrl, headers, etc.) from runtime config.
@@ -1606,9 +1615,19 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       } catch (err) {
         log.error(`[lcm] completeSimple error: ${describeLogError(err)}`);
         const authError = detectProviderAuthError(err);
+        const configError =
+          !authError &&
+          err instanceof Error &&
+          err.message.startsWith(PROVIDER_API_RESOLUTION_ERROR_PREFIX)
+            ? {
+                kind: "provider_config",
+                message: err.message,
+              }
+            : undefined;
         return {
           content: [],
           ...(authError ? { error: authError } : {}),
+          ...(configError ? { error: configError } : {}),
         };
       }
     },
