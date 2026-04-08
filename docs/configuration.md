@@ -176,6 +176,15 @@ Compaction summarization resolves candidates in this order:
 
 If `summaryModel` already contains a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that candidate.
 
+Runtime-managed OAuth providers are supported here too. In particular, `openai-codex` and `github-copilot` auth profiles can be used for summary and expansion calls without a separate API key.
+
+A practical starting point for cost-sensitive setups is:
+
+```env
+LCM_SUMMARY_MODEL=openai/gpt-5.4-mini
+LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
+```
+
 ### Session pattern matching
 
 `ignoreSessionPatterns` and `statelessSessionPatterns` use full session keys.
