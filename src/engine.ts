@@ -1742,7 +1742,7 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
-  /** Emit a compact debug trace for the incremental compaction policy decision. */
+  /** Emit an operational trace for the incremental compaction policy decision. */
   private logIncrementalCompactionDecision(params: {
     conversationId: number;
     cacheState: CacheState;
@@ -1756,7 +1756,7 @@ export class LcmContextEngine implements ContextEngine {
     maxPasses: number;
     reason: string;
   }): IncrementalCompactionDecision {
-    this.deps.log.debug(
+    this.deps.log.info(
       `[lcm] incremental compaction decision: conversation=${params.conversationId} cacheState=${params.cacheState} activityBand=${params.activityBand} triggerLeafChunkTokens=${params.triggerLeafChunkTokens} preferredLeafChunkTokens=${params.preferredLeafChunkTokens} fallbackLeafChunkTokens=${params.fallbackLeafChunkTokens.join(",")} rawTokensOutsideTail=${params.rawTokensOutsideTail} threshold=${params.threshold} shouldCompact=${params.shouldCompact} maxPasses=${params.maxPasses} reason=${params.reason}`,
     );
     return {
@@ -3458,7 +3458,7 @@ export class LcmContextEngine implements ContextEngine {
           params.leafChunkTokens > 0
             ? Math.floor(params.leafChunkTokens)
             : fallbackLeafChunkTokens[0];
-        this.deps.log.debug(
+        this.deps.log.info(
           `[lcm] compactLeafAsync start: conversation=${conversation.conversationId} session=${params.sessionId} leafChunkTokens=${activeLeafChunkTokens ?? "null"} fallbackLeafChunkTokens=${fallbackLeafChunkTokens.join(",")} maxPasses=${maxPasses} activityBand=${params.activityBand ?? "unknown"}`,
         );
 

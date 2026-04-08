@@ -4046,15 +4046,15 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn defers incremental compaction when prompt cache is hot and pressure is modest", async () => {
-    const debugLog = vi.fn();
+    const infoLog = vi.fn();
     const engine = createEngineWithDeps(
       {},
       {
         log: {
-          info: vi.fn(),
+          info: infoLog,
           warn: vi.fn(),
           error: vi.fn(),
-          debug: debugLog,
+          debug: vi.fn(),
         },
       },
     );
@@ -4112,7 +4112,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
         compactionTarget: "threshold",
       }),
     );
-    expect(debugLog).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       expect.stringContaining("reason=hot-cache-defer"),
     );
   });
@@ -4192,7 +4192,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn increases the working leaf chunk target for busy sessions when dynamic sizing is enabled", async () => {
-    const debugLog = vi.fn();
+    const infoLog = vi.fn();
     const engine = createEngineWithDeps(
       {
         dynamicLeafChunkTokens: {
@@ -4202,10 +4202,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
       },
       {
         log: {
-          info: vi.fn(),
+          info: infoLog,
           warn: vi.fn(),
           error: vi.fn(),
-          debug: debugLog,
+          debug: vi.fn(),
         },
       },
     );
@@ -4261,10 +4261,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
         activityBand: "high",
       }),
     );
-    expect(debugLog).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       expect.stringContaining("activityBand=high"),
     );
-    expect(debugLog).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       expect.stringContaining("preferredLeafChunkTokens=40000"),
     );
   });
@@ -4863,6 +4863,66 @@ describe("LcmContextEngine compaction telemetry", () => {
       }),
     );
     expect(compactLeafSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("compactLeafAsync logs cache-aware start details at info", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: {
+          info: infoLog,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactLeaf: (input: { leafChunkTokens?: number }) => Promise<unknown>;
+      };
+    };
+    const sessionId = "compact-leaf-start-log-info";
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed" }),
+    });
+
+    vi.spyOn(privateEngine.compaction, "compactLeaf").mockResolvedValue({
+      actionTaken: true,
+      tokensBefore: 900,
+      tokensAfter: 520,
+      condensed: false,
+    });
+
+    const result = await engine.compactLeafAsync({
+      sessionId,
+      sessionFile: createSessionFilePath("compact-leaf-start-log-info"),
+      tokenBudget: 4096,
+      maxPasses: 2,
+      leafChunkTokens: 40_000,
+      fallbackLeafChunkTokens: [40_000, 30_000, 20_000],
+      activityBand: "medium",
+      legacyParams: {
+        summarize: async () => "short summary",
+      },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] compactLeafAsync start:"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("leafChunkTokens=40000"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("fallbackLeafChunkTokens=40000,30000,20000"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("activityBand=medium"),
+    );
   });
 
   it("compactLeafAsync retries with a smaller leaf chunk target after a provider token-limit error", async () => {
