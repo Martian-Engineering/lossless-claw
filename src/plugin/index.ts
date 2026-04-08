@@ -11,6 +11,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
+import { createLcmLogger, describeLogError } from "../lcm-log.js";
 import { logStartupBannerOnce } from "../startup-banner-log.js";
 import { getSharedInit, setSharedInit, removeSharedInit } from "./shared-init.js";
 import type { SharedLcmInit } from "./shared-init.js";
@@ -169,7 +170,7 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "Recall order for compacted conversation history:",
   "1. `lcm_grep` — search by regex or full-text across messages and summaries",
   "2. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
-  "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, returns answer with cited summary IDs (~120s, don't ration it)",
+  "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
   "",
   "**`lcm_grep` routing guidance:**",
   '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for literal patterns.',
@@ -182,6 +183,7 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "- With IDs: `lcm_expand_query(summaryIds: [\"sum_xxx\"], prompt: \"What config changes were discussed?\")`",
   "- With search: `lcm_expand_query(query: \"database migration\", prompt: \"What strategy was decided?\")`",
   "- Optional: `maxTokens` (default 2000), `conversationId`, `allConversations: true`",
+  "- Keep raw summary IDs out of normal user-facing prose unless the user explicitly asks for sources or IDs.",
   "",
   "These precedence rules apply only to compacted conversation history. Lossless-claw does not supersede memory tools globally.",
   "",
@@ -1214,6 +1216,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       ? api.pluginConfig
       : undefined;
   const config = resolveLcmConfig(process.env, pluginConfig);
+  const log = createLcmLogger(api);
 
   // Read model overrides from plugin config
   if (pluginConfig) {
@@ -1228,7 +1231,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   }
 
   if (!modelAuth) {
-    api.logger.warn(buildLegacyAuthFallbackWarning());
+    log.warn(buildLegacyAuthFallbackWarning());
   }
 
   /** Resolve the best config object to hand to runtime.modelAuth for this lookup. */
@@ -1479,10 +1482,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
               }),
             );
           } catch (err) {
-            console.error(
-              `[lcm] modelAuth.getApiKeyForModel FAILED:`,
-              err instanceof Error ? err.message : err,
-            );
+            log.warn(`[lcm] modelAuth.getApiKeyForModel FAILED: ${describeLogError(err)}`);
           }
         }
         if (!resolvedApiKey && modelAuth && skipModelAuth !== true) {
@@ -1495,10 +1495,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
               }),
             );
           } catch (err) {
-            console.error(
-              `[lcm] modelAuth.resolveApiKeyForProvider FAILED:`,
-              err instanceof Error ? err.message : err,
-            );
+            log.warn(`[lcm] modelAuth.resolveApiKeyForProvider FAILED: ${describeLogError(err)}`);
           }
         }
         if (!resolvedApiKey) {
@@ -1583,7 +1580,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           ...requestMetadata,
         };
       } catch (err) {
-        console.error(`[lcm] completeSimple error:`, err instanceof Error ? err.message : err);
+        log.error(`[lcm] completeSimple error: ${describeLogError(err)}`);
         const authError = detectProviderAuthError(err);
         return {
           content: [],
@@ -1693,12 +1690,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       }
     },
     agentLaneSubagent: "subagent",
-    log: {
-      info: (msg) => console.error(msg),
-      warn: (msg) => console.error(msg),
-      error: (msg) => console.error(msg),
-      debug: (msg) => api.logger.debug?.(msg),
-    },
+    log,
   };
 }
 
@@ -1875,7 +1867,7 @@ const lcmPlugin = {
           throw normalized;
         }
 
-        console.error("[lcm] DB locked during eager init, deferring to gateway_start");
+        deps.log.warn("[lcm] DB locked during eager init, deferring to gateway_start");
         return ensureDeferredInitPromise();
       }
     }
@@ -1899,7 +1891,7 @@ const lcmPlugin = {
         throw normalized;
       }
 
-      console.error("[lcm] DB locked during eager init, deferring to gateway_start");
+      deps.log.warn("[lcm] DB locked during eager init, deferring to gateway_start");
       ensureDeferredInitPromise();
       api.on("gateway_start", async () => {
         if (stopped || lcm || initError) {
@@ -1912,7 +1904,7 @@ const lcmPlugin = {
         } catch (retryError) {
           const normalizedRetryError = toInitError(retryError);
           rejectDeferredEngine(normalizedRetryError);
-          console.error(`[lcm] Deferred DB init failed: ${normalizedRetryError.message}`);
+          deps.log.error(`[lcm] Deferred DB init failed: ${normalizedRetryError.message}`);
         }
       });
     }
@@ -1943,12 +1935,12 @@ const lcmPlugin = {
 
     logStartupBannerOnce({
       key: "plugin-loaded",
-      log: (message) => console.error(message),
+      log: (message) => deps.log.info(message),
       message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
     });
     logStartupBannerOnce({
       key: "compaction-model",
-      log: (message) => console.error(message),
+      log: (message) => deps.log.info(message),
       message: buildCompactionModelLog({
         config: deps.config,
         openClawConfig: api.config,
@@ -1958,7 +1950,7 @@ const lcmPlugin = {
     if (deps.config.fallbackProviders.length > 0) {
       logStartupBannerOnce({
         key: "fallback-providers",
-        log: (message) => console.error(message),
+        log: (message) => deps.log.info(message),
         message: `[lcm] Fallback providers: ${deps.config.fallbackProviders.map((fp) => `${fp.provider}/${fp.model}`).join(", ")}`,
       });
     }

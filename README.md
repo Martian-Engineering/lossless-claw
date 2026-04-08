@@ -30,11 +30,23 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 ## Commands And Skill
 
-The plugin now ships a bundled `lossless-claw` skill plus a small native command surface:
+The plugin now ships a bundled `lossless-claw` skill plus a small plugin command surface for supported OpenClaw chat/native command providers:
 
 - `/lcm` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
 - `/lcm doctor` scans for broken or truncated summaries
-- `/lossless` is an alias for `/lcm` on native command surfaces
+- `/lossless` is an alias for `/lcm` on supported native command surfaces
+
+These are plugin slash/native commands, not root shell CLI subcommands. Supported examples:
+
+- `/lcm`
+- `/lcm doctor`
+- `/lossless`
+
+Not currently supported as root CLI commands:
+
+- `openclaw lcm`
+- `openclaw lossless`
+- `openclaw /lcm`
 
 The bundled skill focuses on configuration, diagnostics, architecture, and recall-tool usage. Its reference set lives under `skills/lossless-claw/references/`.
 
@@ -70,7 +82,7 @@ openclaw plugins install --link /path/to/lossless-claw
 
 The install command records the plugin, enables it, and applies compatible slot selection (including `contextEngine` when applicable).
 
-> **Note:** If your OpenClaw config uses `plugins.allow`, make sure both `lossless-claw` and any active plugins you rely on remain allowlisted. In some setups, narrowing the allowlist can prevent plugin-backed integrations from loading, even if `lossless-claw` itself is installed correctly. Restart the gateway after plugin config changes.
+> **Note:** If your OpenClaw config uses `plugins.allow`, allowlist the plugin id `lossless-claw` plus any other active plugins you rely on. Do not add command tokens or aliases like `lossless` or `/lcm` to `plugins.allow`; that setting only accepts plugin ids. In some setups, narrowing the allowlist can prevent plugin-backed integrations from loading, even if `lossless-claw` itself is installed correctly. Restart the gateway after plugin config changes.
 
 ### Configure OpenClaw
 

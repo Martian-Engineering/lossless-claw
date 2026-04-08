@@ -721,6 +721,15 @@ describe("lcm command", () => {
     expect(dbFn).toHaveBeenCalled();
     expect(result.text).toContain("**🦀 Lossless Claw");
   });
+
+  it("registers a Telegram native progress placeholder", () => {
+    const config = resolveLcmConfig({}, { dbPath: "/tmp/unused.db" });
+    const command = createLcmCommand({ db: vi.fn(), config });
+
+    expect(command.nativeProgressMessages).toEqual({
+      telegram: "Lossless Claw is working...",
+    });
+  });
 });
 
 describe("lcm command helpers", () => {

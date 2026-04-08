@@ -50,10 +50,12 @@ Most installations only need to override a handful of keys. If you want a comple
   "fallbackProviders": [],
   "cacheAwareCompaction": {
     "enabled": true,
-    "maxColdCacheCatchupPasses": 2
+    "maxColdCacheCatchupPasses": 2,
+    "hotCachePressureFactor": 4,
+    "hotCacheBudgetHeadroomRatio": 0.2
   },
   "dynamicLeafChunkTokens": {
-    "enabled": false,
+    "enabled": true,
     "max": 40000
   }
 }
@@ -154,13 +156,26 @@ openclaw plugins install --link /path/to/lossless-claw
 | --- | --- | --- | --- | --- |
 | `cacheAwareCompaction.enabled` | `boolean` | `true` | `LCM_CACHE_AWARE_COMPACTION_ENABLED` | Defers incremental leaf compaction more aggressively when prompt-cache telemetry indicates a hot cache. |
 | `cacheAwareCompaction.maxColdCacheCatchupPasses` | `integer` | `2` | `LCM_MAX_COLD_CACHE_CATCHUP_PASSES` | Maximum bounded catch-up passes allowed in one maintenance cycle when cache telemetry is cold. |
+| `cacheAwareCompaction.hotCachePressureFactor` | `number` | `4` | `LCM_HOT_CACHE_PRESSURE_FACTOR` | Multiplier applied to the hot-cache leaf trigger before raw-history pressure overrides cache preservation. |
+| `cacheAwareCompaction.hotCacheBudgetHeadroomRatio` | `number` | `0.2` | `LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO` | Minimum fraction of the real token budget that must remain free before hot-cache incremental compaction is skipped entirely. |
 
 #### `dynamicLeafChunkTokens`
 
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
-| `dynamicLeafChunkTokens.enabled` | `boolean` | `false` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED` | Enables dynamic working leaf chunk sizes for busier sessions. |
+| `dynamicLeafChunkTokens.enabled` | `boolean` | `true` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED` | Enables dynamic working leaf chunk sizes for busier sessions. |
 | `dynamicLeafChunkTokens.max` | `integer` | `max(leafChunkTokens, floor(leafChunkTokens * 2))` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX` | Upper bound for the dynamic working chunk size. With the default `leafChunkTokens=20000`, this resolves to `40000`. |
+
+### Cache-aware incremental compaction
+
+When cache-aware compaction is enabled:
+
+- hot cache stretches the incremental leaf trigger to `dynamicLeafChunkTokens.max`
+- hot cache skips incremental maintenance entirely when the assembled context is still comfortably below the real token budget
+- hot cache also gets a short hysteresis window so one ambiguous turn does not immediately discard a recently healthy cache signal
+- cold cache still allows bounded catch-up passes via `cacheAwareCompaction.maxColdCacheCatchupPasses`
+
+When incremental leaf compaction still runs on a hot cache, follow-on condensed passes are suppressed so the maintenance cycle only pays for the leaf pass that was explicitly justified.
 
 ## Behavior notes
 

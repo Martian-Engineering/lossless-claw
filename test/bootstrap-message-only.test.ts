@@ -36,8 +36,10 @@ const assistantMessage = JSON.stringify({ role: "assistant", content: "hi there"
 const cacheTtl = JSON.stringify({ type: "openclaw.cache-ttl", ttl: 300 });
 const toolResult = JSON.stringify({ type: "openclaw.tool-result", result: "ok" });
 const customMeta = JSON.stringify({ type: "openclaw.session-meta", version: 2 });
-// Message wrapped in { message: ... } envelope
-const envelopedMessage = JSON.stringify({ message: { role: "user", content: "wrapped" } });
+// Canonical SessionManager message envelope
+const envelopedMessage = JSON.stringify({ type: "message", message: { role: "user", content: "wrapped" } });
+// Noncanonical entry that happens to carry a nested message payload
+const commentaryEnvelope = JSON.stringify({ type: "commentary", message: { role: "assistant", content: "ignore me" } });
 
 describe("readLastJsonlEntryBeforeOffset with messageOnly", () => {
   it("messageOnly=true skips trailing cache-ttl entries and returns last message", () => {
@@ -100,7 +102,7 @@ describe("readLastJsonlEntryBeforeOffset with messageOnly", () => {
     expect(parsed.type).toBe("openclaw.cache-ttl");
   });
 
-  it("handles enveloped message format { message: { role, content } }", () => {
+  it("handles canonical SessionManager message envelopes", () => {
     const file = makeTmpJsonl([envelopedMessage, cacheTtl]);
     const offset = fileSize(file);
 
@@ -109,6 +111,17 @@ describe("readLastJsonlEntryBeforeOffset with messageOnly", () => {
     const parsed = JSON.parse(result!);
     expect(parsed.message.role).toBe("user");
     expect(parsed.message.content).toBe("wrapped");
+  });
+
+  it("skips non-message envelopes even when they contain nested message-shaped data", () => {
+    const file = makeTmpJsonl([userMessage, commentaryEnvelope]);
+    const offset = fileSize(file);
+
+    const result = readLastJsonlEntryBeforeOffset(file, offset, true);
+    expect(result).not.toBeNull();
+    const parsed = JSON.parse(result!);
+    expect(parsed.role).toBe("user");
+    expect(parsed.content).toBe("hello");
   });
 
   it("returns null for empty file", () => {

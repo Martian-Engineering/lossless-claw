@@ -1103,6 +1103,67 @@ describe("LCM integration: compaction", () => {
     expect(sumStore._summaries.filter((summary) => summary.kind === "condensed")).toHaveLength(0);
   });
 
+  it("compactLeaf suppresses follow-on condensed passes when cache-aware policy disallows them", async () => {
+    const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      condensedMinFanout: 2,
+      leafChunkTokens: 500,
+      condensedTargetTokens: 10,
+      incrementalMaxDepth: 2,
+    });
+
+    await convStore.createConversation({ sessionId: "incremental-no-condensed-when-hot" });
+
+    await sumStore.insertSummary({
+      summaryId: "sum_no_condensed_leaf_a",
+      conversationId: CONV_ID,
+      kind: "leaf",
+      depth: 0,
+      content: "Depth zero leaf A",
+      tokenCount: 60,
+    });
+    await sumStore.insertSummary({
+      summaryId: "sum_no_condensed_leaf_b",
+      conversationId: CONV_ID,
+      kind: "leaf",
+      depth: 0,
+      content: "Depth zero leaf B",
+      tokenCount: 60,
+    });
+    await sumStore.appendContextSummary(CONV_ID, "sum_no_condensed_leaf_a");
+    await sumStore.appendContextSummary(CONV_ID, "sum_no_condensed_leaf_b");
+
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => `Leaf source turn ${i}: ${"h".repeat(160)}`,
+      tokenCountFn: () => 120,
+    });
+
+    const summarize = vi.fn(
+      async (
+        _text: string,
+        _aggressive?: boolean,
+        options?: { isCondensed?: boolean; depth?: number },
+      ) => {
+        return options?.isCondensed ? "Condensed summary" : "Leaf summary";
+      },
+    );
+    const result = await incrementalEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 1_200,
+      summarize,
+      force: true,
+      allowCondensedPasses: false,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.condensed).toBe(false);
+    expect(
+      summarize.mock.calls.some((call) => call[2]?.isCondensed === true),
+    ).toBe(false);
+    expect(sumStore._summaries.filter((summary) => summary.kind === "condensed")).toHaveLength(0);
+  });
+
   it("compactLeaf performs one depth-zero condensation pass when incrementalMaxDepth is one", async () => {
     const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
@@ -3109,12 +3170,17 @@ describe("LCM integration: summary size cap", () => {
   });
 
   it("warns when summary exceeds 1.5x target but stays under hard cap", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warnSpy = vi.fn();
 
     const compactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       leafTargetTokens: 100,
       summaryMaxOverageFactor: 5,
+    }, {
+      info: vi.fn(),
+      warn: warnSpy,
+      error: vi.fn(),
+      debug: vi.fn(),
     });
 
     await ingestMessages(convStore, sumStore, 12, {
@@ -3136,8 +3202,6 @@ describe("LCM integration: summary size cap", () => {
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("[lcm] summary exceeds target"),
     );
-
-    warnSpy.mockRestore();
   });
 });
 

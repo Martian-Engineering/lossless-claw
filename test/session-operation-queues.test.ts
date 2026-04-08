@@ -59,9 +59,11 @@ function createTestConfig(databasePath: string): LcmConfig {
     cacheAwareCompaction: {
       enabled: true,
       maxColdCacheCatchupPasses: 2,
+      hotCachePressureFactor: 4,
+      hotCacheBudgetHeadroomRatio: 0.2,
     },
     dynamicLeafChunkTokens: {
-      enabled: false,
+      enabled: true,
       max: 40_000,
     },
   };

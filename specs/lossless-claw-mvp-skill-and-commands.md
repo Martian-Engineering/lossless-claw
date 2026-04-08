@@ -34,10 +34,12 @@ The skill should not depend on the Go TUI binary for the MVP.
 
 ### Native plugin command surface
 
-Add a native plugin command centered on:
+Add a plugin command surface for supported OpenClaw chat/native command providers centered on:
 
 - `/lcm`
 - `/lossless` as an alias
+
+This scope is intentionally limited to plugin slash/native commands. It does not include a root shell CLI subcommand such as `openclaw lossless` or `openclaw lcm`.
 
 MVP command behaviors:
 
@@ -77,7 +79,8 @@ Do not expose or ship these as MVP plugin commands:
 
 - Create a small plugin command module dedicated to `/lcm`.
 - Keep parsing intentionally narrow: default status view plus `doctor`.
-- Register the command from `src/plugin/index.ts` with `/lossless` as the native alias.
+- Register the command from `src/plugin/index.ts` with `/lossless` as the native alias on supported native command surfaces.
+- Do not add a root CLI command via `registerCli(...)` as part of this MVP.
 
 ### 3. Implement status reporting
 
