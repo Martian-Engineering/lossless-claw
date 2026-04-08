@@ -1399,18 +1399,29 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 ...knownModel,
                 id: knownModel.id,
                 provider: knownModel.provider,
-                api: knownModel.api,
-                // Merge baseUrl/headers from provider config if not already on the model.
+                api:
+                  typeof providerLevelConfig.api === "string" && providerLevelConfig.api.trim()
+                    ? providerLevelConfig.api.trim()
+                    : knownModel.api,
+                // Provider config must be able to override built-in transport defaults.
+                // Otherwise built-in providers like `openai` keep their catalog baseUrl
+                // (`https://api.openai.com/v1`) even when OpenClaw runtime config points
+                // that provider id at a custom proxy.
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
                 baseUrl:
-                  typeof knownModel.baseUrl === "string"
-                    ? knownModel.baseUrl
-                    : typeof providerLevelConfig.baseUrl === "string"
-                      ? providerLevelConfig.baseUrl
+                  typeof providerLevelConfig.baseUrl === "string"
+                    ? providerLevelConfig.baseUrl
+                    : typeof knownModel.baseUrl === "string"
+                      ? knownModel.baseUrl
                       : "",
-                ...(knownModel.headers == null && isRecord(providerLevelConfig.headers)
-                  ? { headers: providerLevelConfig.headers }
+                ...(isRecord(providerLevelConfig.headers)
+                  ? {
+                      headers: {
+                        ...(isRecord(knownModel.headers) ? knownModel.headers : {}),
+                        ...providerLevelConfig.headers,
+                      },
+                    }
                   : {}),
               }
             : {
