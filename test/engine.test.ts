@@ -3258,7 +3258,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(promptAddition).toContain("Default recall flow for precision work:");
     expect(promptAddition).toContain("1) `lcm_grep` to locate relevant summary/message IDs");
     expect(promptAddition).toContain("2) `lcm_expand_query` with a focused prompt");
-    expect(promptAddition).toContain("3) Answer with citations to summary IDs used");
+    expect(promptAddition).toContain("3) Answer directly from the retrieved evidence");
+    expect(promptAddition).toContain("Keep raw summary IDs in tool context for follow-up");
     expect(promptAddition).toContain("prefer `mode: \"full_text\"` for keyword/topic lookup");
     expect(promptAddition).toContain("quote exact multi-word phrases");
     expect(promptAddition).toContain("use `sort: \"relevance\"` for older-topic retrieval");

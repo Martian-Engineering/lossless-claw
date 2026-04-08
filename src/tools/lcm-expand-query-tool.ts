@@ -463,7 +463,7 @@ export function createLcmExpandQueryTool(input: {
     description:
       "Answer a focused question using delegated LCM expansion. " +
       "Find candidate summaries (by IDs or query), expand them in a delegated sub-agent, " +
-      "and return a compact prompt-focused answer with cited summary IDs.",
+      "and return a compact prompt-focused answer. Tool output includes cited summary IDs for follow-up.",
     parameters: LcmExpandQuerySchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
