@@ -1203,20 +1203,21 @@ describe("createLcmSummarizeFromLegacyParams", () => {
               model: "anthropic/claude-sonnet-4-6",
             },
           },
-          skipModelAuth: true,
-        });
-        expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
-        expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
-          provider: "openai-codex",
-          model: "gpt-5.4",
-          apiKey: "scoped-token",
-        });
-        expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
-          provider: "openai-codex",
-          model: "gpt-5.4",
-          apiKey: "direct-key",
-          skipModelAuth: true,
-        });
+        },
+        skipModelAuth: true,
+      });
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
+        provider: "openai-codex",
+        model: "gpt-5.4",
+        apiKey: "scoped-token",
+      });
+      expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
+        provider: "openai-codex",
+        model: "gpt-5.4",
+        apiKey: "direct-key",
+        skipModelAuth: true,
+      });
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("summarizer auth retry");
