@@ -28,9 +28,11 @@ describe("resolveLcmConfig", () => {
     expect(config.cacheAwareCompaction).toEqual({
       enabled: true,
       maxColdCacheCatchupPasses: 2,
+      hotCachePressureFactor: 4,
+      hotCacheBudgetHeadroomRatio: 0.2,
     });
     expect(config.dynamicLeafChunkTokens).toEqual({
-      enabled: false,
+      enabled: true,
       max: 40000,
     });
   });
@@ -52,6 +54,8 @@ describe("resolveLcmConfig", () => {
       cacheAwareCompaction: {
         enabled: false,
         maxColdCacheCatchupPasses: 3,
+        hotCachePressureFactor: 6,
+        hotCacheBudgetHeadroomRatio: 0.35,
       },
       dynamicLeafChunkTokens: {
         enabled: true,
@@ -76,6 +80,8 @@ describe("resolveLcmConfig", () => {
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
       maxColdCacheCatchupPasses: 3,
+      hotCachePressureFactor: 6,
+      hotCacheBudgetHeadroomRatio: 0.35,
     });
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
@@ -95,6 +101,8 @@ describe("resolveLcmConfig", () => {
       LCM_SKIP_STATELESS_SESSIONS: "false",
       LCM_CACHE_AWARE_COMPACTION_ENABLED: "false",
       LCM_MAX_COLD_CACHE_CATCHUP_PASSES: "4",
+      LCM_HOT_CACHE_PRESSURE_FACTOR: "5.5",
+      LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO: "0.25",
       LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED: "true",
       LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX: "60000",
     } as NodeJS.ProcessEnv;
@@ -109,6 +117,8 @@ describe("resolveLcmConfig", () => {
       cacheAwareCompaction: {
         enabled: true,
         maxColdCacheCatchupPasses: 2,
+        hotCachePressureFactor: 3,
+        hotCacheBudgetHeadroomRatio: 0.1,
       },
       dynamicLeafChunkTokens: {
         enabled: false,
@@ -133,6 +143,8 @@ describe("resolveLcmConfig", () => {
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
       maxColdCacheCatchupPasses: 4,
+      hotCachePressureFactor: 5.5,
+      hotCacheBudgetHeadroomRatio: 0.25,
     });
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
@@ -246,12 +258,16 @@ describe("resolveLcmConfig", () => {
       cacheAwareCompaction: {
         enabled: false,
         maxColdCacheCatchupPasses: 3,
+        hotCachePressureFactor: 6,
+        hotCacheBudgetHeadroomRatio: 0.35,
       },
     });
 
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
       maxColdCacheCatchupPasses: 3,
+      hotCachePressureFactor: 6,
+      hotCacheBudgetHeadroomRatio: 0.35,
     });
   });
 
@@ -276,7 +292,7 @@ describe("resolveLcmConfig", () => {
     });
 
     expect(config.dynamicLeafChunkTokens).toEqual({
-      enabled: false,
+      enabled: true,
       max: 48_000,
     });
   });
@@ -437,6 +453,31 @@ describe("resolveLcmConfig", () => {
         max: {
           type: "integer",
           minimum: 1,
+        },
+      },
+    });
+  });
+
+  it("ships a manifest with cacheAwareCompaction in schema", () => {
+    expect(manifest.configSchema.properties.cacheAwareCompaction).toEqual({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: {
+          type: "boolean",
+        },
+        maxColdCacheCatchupPasses: {
+          type: "integer",
+          minimum: 1,
+        },
+        hotCachePressureFactor: {
+          type: "number",
+          minimum: 1,
+        },
+        hotCacheBudgetHeadroomRatio: {
+          type: "number",
+          minimum: 0,
+          maximum: 0.95,
         },
       },
     });

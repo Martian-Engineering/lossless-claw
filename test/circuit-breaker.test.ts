@@ -53,9 +53,11 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     cacheAwareCompaction: {
       enabled: true,
       maxColdCacheCatchupPasses: 2,
+      hotCachePressureFactor: 4,
+      hotCacheBudgetHeadroomRatio: 0.2,
     },
     dynamicLeafChunkTokens: {
-      enabled: false,
+      enabled: true,
       max: 4_000,
     },
     ...overrides,

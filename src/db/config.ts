@@ -4,6 +4,8 @@ import { join } from "path";
 export type CacheAwareCompactionConfig = {
   enabled: boolean;
   maxColdCacheCatchupPasses: number;
+  hotCachePressureFactor: number;
+  hotCacheBudgetHeadroomRatio: number;
 };
 
 export type DynamicLeafChunkTokensConfig = {
@@ -201,6 +203,21 @@ export function resolveLcmConfig(
       ?? toNumber(dynamicLeafChunkTokens?.max)
       ?? Math.floor(resolvedLeafChunkTokens * 2),
   );
+  const resolvedHotCachePressureFactor = Math.max(
+    1,
+    parseFiniteNumber(env.LCM_HOT_CACHE_PRESSURE_FACTOR)
+      ?? toNumber(cacheAwareCompaction?.hotCachePressureFactor)
+      ?? 4,
+  );
+  const resolvedHotCacheBudgetHeadroomRatio = Math.min(
+    0.95,
+    Math.max(
+      0,
+      parseFiniteNumber(env.LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO)
+        ?? toNumber(cacheAwareCompaction?.hotCacheBudgetHeadroomRatio)
+        ?? 0.2,
+    ),
+  );
 
   return {
     enabled:
@@ -314,12 +331,14 @@ export function resolveLcmConfig(
         parseFiniteInt(env.LCM_MAX_COLD_CACHE_CATCHUP_PASSES)
           ?? toNumber(cacheAwareCompaction?.maxColdCacheCatchupPasses)
           ?? 2,
+      hotCachePressureFactor: resolvedHotCachePressureFactor,
+      hotCacheBudgetHeadroomRatio: resolvedHotCacheBudgetHeadroomRatio,
     },
     dynamicLeafChunkTokens: {
       enabled:
         env.LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED !== undefined
           ? env.LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED === "true"
-          : toBool(dynamicLeafChunkTokens?.enabled) ?? false,
+          : toBool(dynamicLeafChunkTokens?.enabled) ?? true,
       max: resolvedDynamicLeafChunkMax,
     },
   };

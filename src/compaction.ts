@@ -478,6 +478,7 @@ export class CompactionEngine {
     force?: boolean;
     previousSummaryContent?: string;
     summaryModel?: string;
+    allowCondensedPasses?: boolean;
   }): Promise<CompactionResult> {
     return this.withContextCache(() => this._compactLeafImpl(input));
   }
@@ -556,7 +557,7 @@ export class CompactionEngine {
     const incrementalMaxDepth = this.resolveIncrementalMaxDepth();
     const condensedMinChunkTokens = this.resolveCondensedMinChunkTokens();
     let runningTokens = tokensAfterLeaf;
-    if (incrementalMaxDepth > 0) {
+    if (incrementalMaxDepth > 0 && input.allowCondensedPasses !== false) {
       for (let targetDepth = 0; targetDepth < incrementalMaxDepth; targetDepth++) {
         const fanout = this.resolveFanoutForDepth(targetDepth, false);
         const chunk = await this.selectOldestChunkAtDepth(conversationId, targetDepth);

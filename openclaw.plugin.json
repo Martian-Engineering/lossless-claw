@@ -144,6 +144,14 @@
       "label": "Cold Cache Catch-Up Passes",
       "help": "Maximum incremental leaf passes allowed in one maintenance cycle when prompt cache is cold"
     },
+    "cacheAwareCompaction.hotCachePressureFactor": {
+      "label": "Hot Cache Pressure Factor",
+      "help": "Multiplier applied to the hot-cache leaf trigger before raw-history pressure overrides cache preservation"
+    },
+    "cacheAwareCompaction.hotCacheBudgetHeadroomRatio": {
+      "label": "Hot Cache Budget Headroom",
+      "help": "Fraction of the real token budget that must remain free before hot-cache incremental compaction is skipped entirely"
+    },
     "dynamicLeafChunkTokens.enabled": {
       "label": "Dynamic Leaf Chunk Tokens",
       "help": "When enabled, incremental compaction uses a larger working leaf chunk in busy sessions and keeps the static floor in quieter sessions"
@@ -302,6 +310,15 @@
           "maxColdCacheCatchupPasses": {
             "type": "integer",
             "minimum": 1
+          },
+          "hotCachePressureFactor": {
+            "type": "number",
+            "minimum": 1
+          },
+          "hotCacheBudgetHeadroomRatio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.95
           }
         }
       },

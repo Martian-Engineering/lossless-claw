@@ -85,6 +85,7 @@ type IncrementalCompactionDecision = {
   leafChunkTokens: number;
   fallbackLeafChunkTokens: number[];
   activityBand: ActivityBand;
+  allowCondensedPasses: boolean;
 };
 type DynamicLeafChunkBounds = {
   floor: number;
@@ -112,7 +113,7 @@ type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
 };
 
 const TRANSCRIPT_GC_BATCH_SIZE = 12;
-const HOT_CACHE_RAW_HISTORY_PRESSURE_FACTOR = 1.5;
+const HOT_CACHE_HYSTERESIS_TURNS = 2;
 const DYNAMIC_LEAF_CHUNK_MEDIUM_MULTIPLIER = 1.5;
 const DYNAMIC_LEAF_CHUNK_HIGH_MULTIPLIER = 2;
 const DYNAMIC_ACTIVITY_MEDIUM_UPSHIFT_FACTOR = 0.5;
@@ -1511,6 +1512,57 @@ export class LcmContextEngine implements ContextEngine {
     return Math.floor(value);
   }
 
+  /** Treat a recent cache hit as still-hot for a couple of turns unless telemetry observed a later break. */
+  private shouldApplyHotCacheHysteresis(
+    telemetry: ConversationCompactionTelemetryRecord | null,
+  ): boolean {
+    if (!telemetry?.lastObservedCacheHitAt) {
+      return false;
+    }
+    if (
+      telemetry.lastObservedCacheBreakAt
+      && telemetry.lastObservedCacheBreakAt >= telemetry.lastObservedCacheHitAt
+    ) {
+      return false;
+    }
+    return telemetry.turnsSinceLeafCompaction <= HOT_CACHE_HYSTERESIS_TURNS;
+  }
+
+  /** Resolve the effective cache state the incremental compaction policy should react to. */
+  private resolveCacheAwareState(
+    telemetry: ConversationCompactionTelemetryRecord | null,
+  ): CacheState {
+    if (!telemetry) {
+      return "unknown";
+    }
+    if (telemetry.cacheState === "hot") {
+      return "hot";
+    }
+    if (this.shouldApplyHotCacheHysteresis(telemetry)) {
+      return "hot";
+    }
+    return telemetry.cacheState;
+  }
+
+  /** Decide whether a hot cache still has enough real token-budget headroom to skip incremental maintenance. */
+  private isComfortablyUnderTokenBudget(params: {
+    currentTokenCount?: number;
+    tokenBudget: number;
+  }): boolean {
+    if (
+      typeof params.currentTokenCount !== "number"
+      || !Number.isFinite(params.currentTokenCount)
+      || params.currentTokenCount < 0
+    ) {
+      return false;
+    }
+    const budget = Math.max(1, Math.floor(params.tokenBudget));
+    const safeBudget = Math.floor(
+      budget * (1 - this.config.cacheAwareCompaction.hotCacheBudgetHeadroomRatio),
+    );
+    return params.currentTokenCount <= safeBudget;
+  }
+
   /** Resolve bounded dynamic leaf chunk sizes from config and the active token budget. */
   private resolveDynamicLeafChunkBounds(tokenBudget?: number): DynamicLeafChunkBounds {
     const floor = Math.max(1, Math.floor(this.config.leafChunkTokens));
@@ -1766,10 +1818,11 @@ export class LcmContextEngine implements ContextEngine {
     threshold: number;
     shouldCompact: boolean;
     maxPasses: number;
+    allowCondensedPasses: boolean;
     reason: string;
   }): IncrementalCompactionDecision {
     this.deps.log.info(
-      `[lcm] incremental compaction decision: conversation=${params.conversationId} cacheState=${params.cacheState} activityBand=${params.activityBand} triggerLeafChunkTokens=${params.triggerLeafChunkTokens} preferredLeafChunkTokens=${params.preferredLeafChunkTokens} fallbackLeafChunkTokens=${params.fallbackLeafChunkTokens.join(",")} rawTokensOutsideTail=${params.rawTokensOutsideTail} threshold=${params.threshold} shouldCompact=${params.shouldCompact} maxPasses=${params.maxPasses} reason=${params.reason}`,
+      `[lcm] incremental compaction decision: conversation=${params.conversationId} cacheState=${params.cacheState} activityBand=${params.activityBand} triggerLeafChunkTokens=${params.triggerLeafChunkTokens} preferredLeafChunkTokens=${params.preferredLeafChunkTokens} fallbackLeafChunkTokens=${params.fallbackLeafChunkTokens.join(",")} rawTokensOutsideTail=${params.rawTokensOutsideTail} threshold=${params.threshold} shouldCompact=${params.shouldCompact} maxPasses=${params.maxPasses} allowCondensedPasses=${params.allowCondensedPasses} reason=${params.reason}`,
     );
     return {
       shouldCompact: params.shouldCompact,
@@ -1780,6 +1833,7 @@ export class LcmContextEngine implements ContextEngine {
       leafChunkTokens: params.preferredLeafChunkTokens,
       fallbackLeafChunkTokens: params.fallbackLeafChunkTokens,
       activityBand: params.activityBand,
+      allowCondensedPasses: params.allowCondensedPasses,
     };
   }
 
@@ -1794,7 +1848,7 @@ export class LcmContextEngine implements ContextEngine {
     );
     const cacheState =
       this.config.cacheAwareCompaction.enabled
-        ? (telemetry?.cacheState ?? "unknown")
+        ? this.resolveCacheAwareState(telemetry)
         : "unknown";
     const bounds = this.resolveDynamicLeafChunkBounds(params.tokenBudget);
     const activityBand =
@@ -1808,11 +1862,13 @@ export class LcmContextEngine implements ContextEngine {
         })
         : "low";
     const triggerLeafChunkTokens =
-      this.config.dynamicLeafChunkTokens.enabled
-        ? this.resolveLeafChunkTokensForBand(activityBand, bounds)
-        : bounds.floor;
+      this.config.dynamicLeafChunkTokens.enabled && cacheState === "hot"
+        ? bounds.max
+        : this.config.dynamicLeafChunkTokens.enabled
+          ? this.resolveLeafChunkTokensForBand(activityBand, bounds)
+          : bounds.floor;
     const preferredLeafChunkTokens =
-      this.config.cacheAwareCompaction.enabled && cacheState === "cold"
+      this.config.cacheAwareCompaction.enabled && (cacheState === "cold" || cacheState === "hot")
         ? bounds.max
         : triggerLeafChunkTokens;
     const fallbackLeafChunkTokens = this.buildLeafChunkFallbacks({
@@ -1835,6 +1891,7 @@ export class LcmContextEngine implements ContextEngine {
         threshold: leafTrigger.threshold,
         shouldCompact: false,
         maxPasses: 1,
+        allowCondensedPasses: false,
         reason: "below-leaf-trigger",
       });
     }
@@ -1856,14 +1913,17 @@ export class LcmContextEngine implements ContextEngine {
         threshold: leafTrigger.threshold,
         shouldCompact: true,
         maxPasses: 1,
+        allowCondensedPasses: true,
         reason: "budget-trigger",
       });
     }
 
     if (
       cacheState === "hot"
-      && leafTrigger.rawTokensOutsideTail
-        < Math.floor(leafTrigger.threshold * HOT_CACHE_RAW_HISTORY_PRESSURE_FACTOR)
+      && this.isComfortablyUnderTokenBudget({
+        currentTokenCount: params.currentTokenCount,
+        tokenBudget: params.tokenBudget,
+      })
     ) {
       return this.logIncrementalCompactionDecision({
         conversationId: params.conversationId,
@@ -1876,6 +1936,30 @@ export class LcmContextEngine implements ContextEngine {
         threshold: leafTrigger.threshold,
         shouldCompact: false,
         maxPasses: 1,
+        allowCondensedPasses: false,
+        reason: "hot-cache-budget-headroom",
+      });
+    }
+
+    if (
+      cacheState === "hot"
+      && leafTrigger.rawTokensOutsideTail
+        < Math.floor(
+          leafTrigger.threshold * this.config.cacheAwareCompaction.hotCachePressureFactor,
+        )
+    ) {
+      return this.logIncrementalCompactionDecision({
+        conversationId: params.conversationId,
+        cacheState,
+        activityBand,
+        triggerLeafChunkTokens,
+        preferredLeafChunkTokens,
+        fallbackLeafChunkTokens,
+        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
+        threshold: leafTrigger.threshold,
+        shouldCompact: false,
+        maxPasses: 1,
+        allowCondensedPasses: false,
         reason: "hot-cache-defer",
       });
     }
@@ -1895,6 +1979,7 @@ export class LcmContextEngine implements ContextEngine {
       threshold: leafTrigger.threshold,
       shouldCompact: true,
       maxPasses,
+      allowCondensedPasses: cacheState !== "hot",
       reason: cacheState === "cold" ? "cold-cache-catchup" : "leaf-trigger",
     });
   }
@@ -3248,6 +3333,7 @@ export class LcmContextEngine implements ContextEngine {
           leafChunkTokens: leafDecision.leafChunkTokens,
           fallbackLeafChunkTokens: leafDecision.fallbackLeafChunkTokens,
           activityBand: leafDecision.activityBand,
+          allowCondensedPasses: leafDecision.allowCondensedPasses,
         }).catch(() => {
           // Leaf compaction is best-effort and should not fail the caller.
         });
@@ -3403,6 +3489,7 @@ export class LcmContextEngine implements ContextEngine {
     leafChunkTokens?: number;
     fallbackLeafChunkTokens?: number[];
     activityBand?: ActivityBand;
+    allowCondensedPasses?: boolean;
   }): Promise<CompactResult> {
     if (this.isStatelessSession(params.sessionKey)) {
       return {
@@ -3488,7 +3575,7 @@ export class LcmContextEngine implements ContextEngine {
             ? Math.floor(params.leafChunkTokens)
             : fallbackLeafChunkTokens[0];
         this.deps.log.info(
-          `[lcm] compactLeafAsync start: conversation=${conversation.conversationId} session=${params.sessionId} leafChunkTokens=${activeLeafChunkTokens ?? "null"} fallbackLeafChunkTokens=${fallbackLeafChunkTokens.join(",")} maxPasses=${maxPasses} activityBand=${params.activityBand ?? "unknown"}`,
+          `[lcm] compactLeafAsync start: conversation=${conversation.conversationId} session=${params.sessionId} leafChunkTokens=${activeLeafChunkTokens ?? "null"} fallbackLeafChunkTokens=${fallbackLeafChunkTokens.join(",")} maxPasses=${maxPasses} activityBand=${params.activityBand ?? "unknown"} allowCondensedPasses=${params.allowCondensedPasses !== false}`,
         );
 
         let rounds = 0;
@@ -3507,6 +3594,7 @@ export class LcmContextEngine implements ContextEngine {
                 force: params.force,
                 previousSummaryContent: pass === 0 ? params.previousSummaryContent : undefined,
                 summaryModel,
+                allowCondensedPasses: params.allowCondensedPasses,
               });
               break;
             } catch (err) {
