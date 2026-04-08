@@ -1,5 +1,37 @@
 # @martian-engineering/lossless-claw
 
+## 0.7.0
+
+### Minor Changes
+
+- [#318](https://github.com/Martian-Engineering/lossless-claw/pull/318) [`b7078df`](https://github.com/Martian-Engineering/lossless-claw/commit/b7078df9c4466c6249a8c0f11424a6e75ea7be4c) Thanks [@jalehman](https://github.com/jalehman)! - Add optional dynamic leaf chunk sizing for incremental compaction, including bounded activity-based chunk growth, cold-cache max bumping, and automatic retry with smaller chunk targets when a provider rejects an oversized compaction request.
+
+- [#296](https://github.com/Martian-Engineering/lossless-claw/pull/296) [`4906c62`](https://github.com/Martian-Engineering/lossless-claw/commit/4906c6283a4033f34397bf527ae4a5c40adccdfc) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Improve `lcm_grep` full-text recall with phrase-preserving queries and `sort` modes (`recency`, `relevance`, and `hybrid`) that rank results before `limit` is applied.
+
+- [#285](https://github.com/Martian-Engineering/lossless-claw/pull/285) [`aac2668`](https://github.com/Martian-Engineering/lossless-claw/commit/aac266834b075f9adae95c86ccf9be9b91161275) Thanks [@mvanhorn](https://github.com/mvanhorn)! - Add conversation prune function for bulk data retention, allowing deletion of conversations where all messages are older than a configurable threshold.
+
+### Patch Changes
+
+- [#295](https://github.com/Martian-Engineering/lossless-claw/pull/295) [`1ef1b29`](https://github.com/Martian-Engineering/lossless-claw/commit/1ef1b297c5d3dead44cc4460cdf60ef6191395ea) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Reduce compaction database work by caching per-phase context reads, skipping redundant ordinal resequencing, and tracking token-count deltas instead of re-querying after each pass.
+
+- [#318](https://github.com/Martian-Engineering/lossless-claw/pull/318) [`b7078df`](https://github.com/Martian-Engineering/lossless-claw/commit/b7078df9c4466c6249a8c0f11424a6e75ea7be4c) Thanks [@jalehman](https://github.com/jalehman)! - Make incremental leaf compaction cache-aware by deferring extra passes while prompt caching is hot, allowing bounded catch-up when the cache goes cold, and adding `cacheAwareCompaction` config controls for the behavior.
+
+- [#319](https://github.com/Martian-Engineering/lossless-claw/pull/319) [`3bc5bde`](https://github.com/Martian-Engineering/lossless-claw/commit/3bc5bde7a52b163ee2fe7f22302e97e3e8295b11) Thanks [@jalehman](https://github.com/jalehman)! - Document the full lossless-claw configuration surface and align the plugin manifest schema and UI hints with the runtime-supported config keys.
+
+- [#288](https://github.com/Martian-Engineering/lossless-claw/pull/288) [`d74ad07`](https://github.com/Martian-Engineering/lossless-claw/commit/d74ad070888e7be5e4e1730ddc6506708075317e) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Wait for deferred LCM database initialization after lock-contended gateway restarts, and surface the real retry failure when deferred startup cannot recover.
+
+- [#294](https://github.com/Martian-Engineering/lossless-claw/pull/294) [`43342d9`](https://github.com/Martian-Engineering/lossless-claw/commit/43342d9fea5c62ea4320a7bca60732bad09122d2) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Tune SQLite defaults for large lossless-claw databases by increasing the page cache, keeping temporary structures in memory, and using WAL-friendly synchronous settings.
+
+  Add missing indexes for `summary_messages(message_id)` and `summaries(conversation_id, depth, kind)` so summary cleanup and depth-filtered queries avoid full table scans on existing databases.
+
+- [#302](https://github.com/Martian-Engineering/lossless-claw/pull/302) [`558183d`](https://github.com/Martian-Engineering/lossless-claw/commit/558183d9ead262d06d58bbfc801e172781c278b8) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Fix compaction summarizer exhaustion handling so multi-provider non-auth failures log the terminal exhaustion path and fall back to deterministic truncation instead of returning an empty summary.
+
+- [#322](https://github.com/Martian-Engineering/lossless-claw/pull/322) [`d0dacc9`](https://github.com/Martian-Engineering/lossless-claw/commit/d0dacc929f317bc7470fc935f6338461603f4039) Thanks [@jalehman](https://github.com/jalehman)! - Use OpenClaw runtime-ready model auth for summarization requests so managed auth providers work correctly.
+
+- [#329](https://github.com/Martian-Engineering/lossless-claw/pull/329) [`6579b91`](https://github.com/Martian-Engineering/lossless-claw/commit/6579b913adcc3a88610d873f7eacefbaa663c3d2) Thanks [@jalehman](https://github.com/jalehman)! - Improve lossless-claw reliability around cache-aware compaction and transcript replay, including heartbeat-turn pruning, bootstrap compatibility for legacy JSONL message envelopes, and updated runtime logging/docs alignment.
+
+- [#300](https://github.com/Martian-Engineering/lossless-claw/pull/300) [`a42f422`](https://github.com/Martian-Engineering/lossless-claw/commit/a42f422c1bc6c386c31e098d0b865dd3fedcbe9f) Thanks [@jalehman](https://github.com/jalehman)! - Fix `lcm-tui` Telegram topic session lookups so topic-backed sessions show the correct conversation metadata, summary counts, and file counts when browsing session keys.
+
 ## 0.6.3
 
 ### Patch Changes
