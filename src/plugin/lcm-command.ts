@@ -723,6 +723,9 @@ export function createLcmCommand(params: {
     nativeNames: {
       default: "lossless",
     },
+    nativeProgressMessages: {
+      telegram: "Lossless Claw is working...",
+    },
     description: "Show Lossless Claw health, scan broken summaries, and repair scoped doctor issues.",
     acceptsArgs: true,
     handler: async (ctx) => {
