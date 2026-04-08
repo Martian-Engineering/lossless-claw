@@ -43,6 +43,7 @@ import {
   generateExplorationSummary,
   parseFileBlocks,
 } from "./large-files.js";
+import { describeLogError } from "./lcm-log.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
@@ -1320,6 +1321,7 @@ export class LcmContextEngine implements ContextEngine {
       this.conversationStore,
       this.summaryStore,
       compactionConfig,
+      this.deps.log,
     );
 
     this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore);
@@ -1388,14 +1390,14 @@ export class LcmContextEngine implements ContextEngine {
     state.failures++;
     const halfThreshold = Math.ceil(this.config.circuitBreakerThreshold / 2);
     if (state.failures === halfThreshold && state.failures < this.config.circuitBreakerThreshold) {
-      console.error(
+      this.deps.log.warn(
         `[lcm] WARNING: compaction degraded — ${state.failures}/${this.config.circuitBreakerThreshold} consecutive auth failures for ${key}`,
       );
     }
     if (state.failures >= this.config.circuitBreakerThreshold) {
       state.openSince = Date.now();
       const cooldownMin = Math.round(this.config.circuitBreakerCooldownMs / 60000);
-      console.error(
+      this.deps.log.warn(
         `[lcm] CIRCUIT BREAKER OPEN: compaction disabled for ${key}. Auto-retry in ${cooldownMin}m. LCM is operating in degraded mode.`,
       );
     }
@@ -1407,7 +1409,7 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
     if (state.failures > 0 || state.openSince !== null) {
-      console.error(
+      this.deps.log.info(
         `[lcm] compaction circuit breaker CLOSED: successful compaction for ${key} after ${state.failures} prior failures.`,
       );
     }
@@ -2065,11 +2067,13 @@ export class LcmContextEngine implements ContextEngine {
           breakerKey: runtimeSummarizer.breakerKey,
         };
       }
-      console.error(`[lcm] resolveSummarize: createLcmSummarizeFromLegacyParams returned undefined`);
+      this.deps.log.error(`[lcm] resolveSummarize: createLcmSummarizeFromLegacyParams returned undefined`);
     } catch (err) {
-      console.error(`[lcm] resolveSummarize failed, using emergency fallback:`, err instanceof Error ? err.message : err);
+      this.deps.log.error(
+        `[lcm] resolveSummarize failed, using emergency fallback: ${describeLogError(err)}`,
+      );
     }
-    console.error(`[lcm] resolveSummarize: FALLING BACK TO EMERGENCY TRUNCATION`);
+    this.deps.log.error(`[lcm] resolveSummarize: FALLING BACK TO EMERGENCY TRUNCATION`);
     return { summarize: createEmergencyFallbackSummarize(), summaryModel: "unknown" };
   }
 
@@ -2507,7 +2511,7 @@ export class LcmContextEngine implements ContextEngine {
         sessionId,
         sessionKey: params.sessionKey,
       });
-      console.error(
+      this.deps.log.warn(
         `[lcm] reconcileSessionTail: import cap exceeded for ${sessionContext} — would import ${missingTail.length} messages (existing: ${existingDbCount}). Aborting to prevent flood.`,
       );
       return { blockedByImportCap: true, importedMessages: 0, hasOverlap: true };
@@ -2739,7 +2743,7 @@ export class LcmContextEngine implements ContextEngine {
             if (this.config.pruneHeartbeatOk) {
               const pruned = await this.pruneHeartbeatOkTurns(conversationId);
               if (pruned > 0) {
-                console.error(
+                this.deps.log.info(
                   `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
                 );
               }
@@ -2820,15 +2824,14 @@ export class LcmContextEngine implements ContextEngine {
               conversationId: conversation.conversationId,
               sessionFile: params.sessionFile,
             });
-            console.error(
+            this.deps.log.info(
               `[lcm] bootstrap: retroactively pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversation.conversationId}`,
             );
           }
         }
       } catch (err) {
-        console.error(
-          `[lcm] bootstrap: heartbeat pruning failed:`,
-          err instanceof Error ? err.message : err,
+        this.deps.log.warn(
+          `[lcm] bootstrap: heartbeat pruning failed: ${describeLogError(err)}`,
         );
       }
     }
@@ -3047,7 +3050,9 @@ export class LcmContextEngine implements ContextEngine {
               sessionFile: params.sessionFile,
             });
           } catch (e) {
-            console.error("[lcm] Failed to update bootstrap checkpoint after maintain:", e);
+            this.deps.log.warn(
+              `[lcm] Failed to update bootstrap checkpoint after maintain: ${describeLogError(e)}`,
+            );
           }
         }
 
@@ -3238,9 +3243,8 @@ export class LcmContextEngine implements ContextEngine {
       });
     } catch (err) {
       // Never compact a stale or partially ingested frontier.
-      console.error(
-        `[lcm] afterTurn: ingest failed, skipping compaction:`,
-        err instanceof Error ? err.message : err,
+      this.deps.log.error(
+        `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(err)}`,
       );
       return;
     }
@@ -3263,16 +3267,15 @@ export class LcmContextEngine implements ContextEngine {
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
             });
-            console.error(
+            this.deps.log.info(
               `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
             );
             return;
           }
         }
       } catch (err) {
-        console.error(
-          `[lcm] afterTurn: heartbeat pruning failed:`,
-          err instanceof Error ? err.message : err,
+        this.deps.log.warn(
+          `[lcm] afterTurn: heartbeat pruning failed: ${describeLogError(err)}`,
         );
       }
     }
@@ -3286,7 +3289,7 @@ export class LcmContextEngine implements ContextEngine {
     });
     const tokenBudget = this.applyAssemblyBudgetCap(resolvedTokenBudget ?? DEFAULT_AFTER_TURN_TOKEN_BUDGET);
     if (resolvedTokenBudget === undefined) {
-      console.warn(
+      this.deps.log.warn(
         `[lcm] afterTurn: tokenBudget not provided; using default ${DEFAULT_AFTER_TURN_TOKEN_BUDGET}`,
       );
     }
@@ -3309,9 +3312,8 @@ export class LcmContextEngine implements ContextEngine {
         rawTokensOutsideTail: rawLeafTrigger.rawTokensOutsideTail,
       });
     } catch (err) {
-      console.warn(
-        `[lcm] afterTurn: compaction telemetry update failed:`,
-        err instanceof Error ? err.message : err,
+      this.deps.log.warn(
+        `[lcm] afterTurn: compaction telemetry update failed: ${describeLogError(err)}`,
       );
     }
 
@@ -3604,7 +3606,7 @@ export class LcmContextEngine implements ContextEngine {
               if (!this.isRecoverableLeafChunkOverflowError(err) || nextLeafChunkTokens === undefined) {
                 throw err;
               }
-              console.warn(
+              this.deps.log.warn(
                 `[lcm] compactLeafAsync: retrying with smaller leafChunkTokens=${nextLeafChunkTokens} after provider token-limit error: ${err instanceof Error ? err.message : String(err)}`,
               );
               activeLeafChunkTokens = nextLeafChunkTokens;

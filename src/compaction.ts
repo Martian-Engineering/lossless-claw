@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { ConversationStore, CreateMessagePartInput } from "./store/conversation-store.js";
 import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
 import { extractFileIdsFromContent } from "./large-files.js";
+import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
 import { LcmProviderAuthError } from "./summarize.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -359,6 +360,7 @@ export class CompactionEngine {
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
     private config: CompactionConfig,
+    private log: LcmLogger = NOOP_LCM_LOGGER,
   ) {}
 
   /** Read context items, using per-phase cache when active. */
@@ -1360,7 +1362,7 @@ export class CompactionEngine {
     const maxTokens = Math.ceil(params.targetTokens * this.config.summaryMaxOverageFactor);
 
     if (summaryTokens > Math.ceil(params.targetTokens * 1.5)) {
-      console.warn(
+      this.log.warn(
         `[lcm] summary exceeds target by ${Math.round((summaryTokens / params.targetTokens - 1) * 100)}%: ${summaryTokens} tokens vs target ${params.targetTokens}`,
       );
     }
@@ -1465,7 +1467,7 @@ export class CompactionEngine {
       targetTokens: this.config.leafTargetTokens,
     });
     if (!summary) {
-      console.warn(
+      this.log.warn(
         `[lcm] leaf compaction skipped summary write; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
       );
       return null;
@@ -1583,7 +1585,7 @@ export class CompactionEngine {
       targetTokens: this.config.condensedTargetTokens,
     });
     if (!condensed) {
-      console.warn(
+      this.log.warn(
         `[lcm] condensed compaction skipped summary write; conversationId=${conversationId}; depth=${targetDepth}; chunkSummaries=${summaryRecords.length}`,
       );
       return null;
@@ -1747,7 +1749,7 @@ export class CompactionEngine {
     condensedPassOccurred: boolean;
   }): Promise<void> {
     const content = `LCM compaction ${input.pass} pass (${input.level}): ${input.tokensBefore} -> ${input.tokensAfter}`;
-    console.info(
+    this.log.info(
       `[lcm] ${content} conversation=${input.conversationId} summary=${input.createdSummaryId}`,
     );
   }

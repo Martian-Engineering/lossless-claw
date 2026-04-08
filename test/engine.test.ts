@@ -2526,6 +2526,7 @@ describe("LcmContextEngine.bootstrap", () => {
   });
 
   it("does not advance the bootstrap checkpoint when reconcile aborts at the import cap", async () => {
+    const warnLog = vi.fn();
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "lcm.db");
@@ -2540,7 +2541,19 @@ describe("LcmContextEngine.bootstrap", () => {
       content: [{ type: "text", text: "seed assistant" }],
     } as AgentMessage);
 
-    const engine = createEngineAtDatabasePath(dbPath);
+    const config = createTestConfig(dbPath);
+    const db = createLcmDatabaseConnection(config.databasePath);
+    const engine = new LcmContextEngine(
+      createTestDeps(config, {
+        log: {
+          info: vi.fn(),
+          warn: warnLog,
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      }),
+      db,
+    );
     const sessionId = "bootstrap-reconcile-import-cap";
     const sessionKey = "agent:main:test:bootstrap-reconcile-import-cap";
 
@@ -2582,14 +2595,13 @@ describe("LcmContextEngine.bootstrap", () => {
       } as AgentMessage);
     }
 
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const second = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
     expect(second).toEqual({
       bootstrapped: false,
       importedMessages: 0,
       reason: "reconcile import capped",
     });
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(warnLog).toHaveBeenCalledWith(
       `[lcm] reconcileSessionTail: import cap exceeded for conversation=${conversation!.conversationId} session=${sessionId} sessionKey=${sessionKey} — would import 60 messages (existing: 2). Aborting to prevent flood.`,
     );
 
@@ -2609,7 +2621,6 @@ describe("LcmContextEngine.bootstrap", () => {
       reason: "reconcile import capped",
     });
     expect(reconcileSpy).toHaveBeenCalledTimes(1);
-    consoleErrorSpy.mockRestore();
   });
 
   it("uses the bulk import path for initial bootstrap", async () => {
@@ -2624,7 +2635,15 @@ describe("LcmContextEngine.bootstrap", () => {
       content: [{ type: "text", text: "bulk two" }],
     } as AgentMessage);
 
-    const engine = createEngine();
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
     const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
     const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
 
@@ -4015,9 +4034,16 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn falls back to the default token budget when no budget is provided", async () => {
-    const engine = createEngine();
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
     const sessionId = "after-turn-default-token-budget";
-    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const privateEngine = engine as unknown as {
       compaction: {
         evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
@@ -4060,15 +4086,21 @@ describe("LcmContextEngine fidelity and token budget", () => {
         compactionTarget: "threshold",
       }),
     );
-    expect(consoleWarnSpy).toHaveBeenCalledWith(
+    expect(warnLog).toHaveBeenCalledWith(
       "[lcm] afterTurn: tokenBudget not provided; using default 128000",
     );
-
-    consoleWarnSpy.mockRestore();
   });
 
   it("afterTurn falls back to legacyCompactionParams when runtimeContext is missing", async () => {
-    const engine = createEngine();
+    const errorLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: errorLog,
+        debug: vi.fn(),
+      },
+    });
     const sessionId = "after-turn-legacy-compaction-params";
     const legacyCompactionParams = { provider: "anthropic", model: "claude-opus-4-5" };
     const privateEngine = engine as unknown as {
@@ -4723,7 +4755,15 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn skips compaction when ingest fails", async () => {
-    const engine = createEngine();
+    const errorLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: errorLog,
+        debug: vi.fn(),
+      },
+    });
     const sessionId = "after-turn-ingest-failure";
 
     const ingestBatchSpy = vi
@@ -4732,8 +4772,6 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
     const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
     const compactSpy = vi.spyOn(engine, "compact");
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("after-turn-ingest-failure"),
@@ -4746,24 +4784,27 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(evaluateLeafTriggerSpy).not.toHaveBeenCalled();
     expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
     expect(compactSpy).not.toHaveBeenCalled();
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
-      "[lcm] afterTurn: ingest failed, skipping compaction:",
-      "ingest exploded",
+    expect(errorLog).toHaveBeenCalledWith(
+      "[lcm] afterTurn: ingest failed, skipping compaction: ingest exploded",
     );
-
-    consoleErrorSpy.mockRestore();
   });
 
   it("afterTurn prunes heartbeat-shaped ACK turns before compaction even without the heartbeat flag", async () => {
-    const engine = createEngine();
+    const infoLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: infoLog,
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
     const sessionId = "after-turn-heartbeat-prune";
     const sessionKey = "agent:main:test:after-turn-heartbeat-prune";
 
     const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
     const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
     const compactSpy = vi.spyOn(engine, "compact");
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
     await engine.afterTurn({
       sessionId,
       sessionKey,
@@ -4796,13 +4837,11 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(evaluateLeafTriggerSpy).not.toHaveBeenCalled();
     expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
     expect(compactSpy).not.toHaveBeenCalled();
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       expect.stringContaining(
         `heartbeat ack messages for conversation=${conversation!.conversationId} session=${sessionId} sessionKey=${sessionKey}`,
       ),
     );
-
-    consoleErrorSpy.mockRestore();
   });
 });
 
@@ -4810,7 +4849,15 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
 describe("LcmContextEngine afterTurn dedup guard", () => {
   it("ingests all messages when no prior conversation exists (new session)", async () => {
-    const engine = createEngine();
+    const infoLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: infoLog,
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
     const sessionId = "dedup-new-session";
 
     await engine.afterTurn({
@@ -5131,12 +5178,31 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
 
 describe("LcmContextEngine compaction telemetry", () => {
   it("does not append synthetic system messages for compaction passes", async () => {
-    const engine = createEngineWithConfig({
-      freshTailCount: 1,
-      leafMinFanout: 2,
-      leafChunkTokens: 1,
-      incrementalMaxDepth: 0,
-    });
+    const infoLog = vi.fn();
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const config = createTestConfig(join(tempDir, "lcm.db"));
+    const db = createLcmDatabaseConnection(config.databasePath);
+    const engine = new LcmContextEngine(
+      createTestDeps(
+        {
+          ...config,
+          freshTailCount: 1,
+          leafMinFanout: 2,
+          leafChunkTokens: 1,
+          incrementalMaxDepth: 0,
+        },
+        {
+          log: {
+            info: infoLog,
+            warn: vi.fn(),
+            error: vi.fn(),
+            debug: vi.fn(),
+          },
+        },
+      ),
+      db,
+    );
     const sessionId = "compact-leaf-no-telemetry";
 
     await engine.ingestBatch({
@@ -5153,8 +5219,6 @@ describe("LcmContextEngine compaction telemetry", () => {
     expect(conversation).not.toBeNull();
 
     const before = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    const consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
-
     const result = await engine.compactLeafAsync({
       sessionId,
       sessionFile: createSessionFilePath("compact-leaf-no-telemetry"),
@@ -5170,11 +5234,9 @@ describe("LcmContextEngine compaction telemetry", () => {
     const after = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(after).toHaveLength(before.length);
     expect(after.some((message) => message.role === "system")).toBe(false);
-    expect(consoleInfoSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       expect.stringContaining("[lcm] LCM compaction leaf pass"),
     );
-
-    consoleInfoSpy.mockRestore();
   });
 
   it("compactLeafAsync can perform multiple bounded catch-up passes", async () => {

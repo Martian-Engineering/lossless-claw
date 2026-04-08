@@ -3170,12 +3170,17 @@ describe("LCM integration: summary size cap", () => {
   });
 
   it("warns when summary exceeds 1.5x target but stays under hard cap", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warnSpy = vi.fn();
 
     const compactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       leafTargetTokens: 100,
       summaryMaxOverageFactor: 5,
+    }, {
+      info: vi.fn(),
+      warn: warnSpy,
+      error: vi.fn(),
+      debug: vi.fn(),
     });
 
     await ingestMessages(convStore, sumStore, 12, {
@@ -3197,8 +3202,6 @@ describe("LCM integration: summary size cap", () => {
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("[lcm] summary exceeds target"),
     );
-
-    warnSpy.mockRestore();
   });
 });
 

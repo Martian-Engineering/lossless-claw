@@ -21,13 +21,19 @@ function buildApi(
   getHook: (hookName: string) => HookHandler | undefined;
   infoLog: ReturnType<typeof vi.fn>;
   warnLog: ReturnType<typeof vi.fn>;
+  errorLog: ReturnType<typeof vi.fn>;
   debugLog: ReturnType<typeof vi.fn>;
+  sessionInfoLog: ReturnType<typeof vi.fn>;
+  sessionWarnLog: ReturnType<typeof vi.fn>;
 } {
   let factory: RegisteredEngineFactory;
   const hooks = new Map<string, HookHandler[]>();
   const infoLog = vi.fn();
   const warnLog = vi.fn();
+  const errorLog = vi.fn();
   const debugLog = vi.fn();
+  const sessionInfoLog = vi.fn();
+  const sessionWarnLog = vi.fn();
   const agentDir = options?.agentDir ?? "/tmp/fake-agent";
 
   const api = {
@@ -54,6 +60,14 @@ function buildApi(
       config: {
         loadConfig: vi.fn(() => ({})),
       },
+      logging: {
+        getChildLogger: vi.fn(() => ({
+          info: infoLog,
+          warn: warnLog,
+          error: errorLog,
+          debug: debugLog,
+        })),
+      },
       channel: {
         session: {
           resolveStorePath: vi.fn(() => "/tmp/nonexistent-session-store.json"),
@@ -61,10 +75,10 @@ function buildApi(
       },
     },
     logger: {
-      info: infoLog,
-      warn: warnLog,
+      info: sessionInfoLog,
+      warn: sessionWarnLog,
       error: vi.fn(),
-      debug: debugLog,
+      debug: vi.fn(),
     },
     registerContextEngine: vi.fn((_id: string, nextFactory: () => unknown) => {
       factory = nextFactory;
@@ -93,7 +107,10 @@ function buildApi(
     getHook: (hookName: string) => hooks.get(hookName)?.[0],
     infoLog,
     warnLog,
+    errorLog,
     debugLog,
+    sessionInfoLog,
+    sessionWarnLog,
   };
 }
 
@@ -158,7 +175,7 @@ describe("lcm plugin registration", () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
 
-    const { api, getFactory, debugLog } = buildApi({
+    const { api, getFactory, debugLog, infoLog, sessionInfoLog } = buildApi({
       enabled: true,
       contextThreshold: 0.33,
       incrementalMaxDepth: -1,
@@ -171,14 +188,15 @@ describe("lcm plugin registration", () => {
       skipStatelessSessions: true,
       largeFileThresholdTokens: 12345,
     });
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
     lcmPlugin.register(api);
     expect(api.registerCommand).toHaveBeenCalledWith(
       expect.objectContaining({
         name: "lcm",
         nativeNames: expect.objectContaining({
           default: "lossless",
+        }),
+        nativeProgressMessages: expect.objectContaining({
+          telegram: "Lossless Claw is working...",
         }),
       }),
     );
@@ -200,20 +218,20 @@ describe("lcm plugin registration", () => {
       skipStatelessSessions: true,
       largeFileTokenThreshold: 12345,
     });
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
     );
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
     );
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
     );
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: (unconfigured)",
     );
+    expect(sessionInfoLog).not.toHaveBeenCalled();
     expect(debugLog).toHaveBeenCalledWith(expect.stringContaining("[lcm] Migration successful"));
-    consoleErrorSpy.mockRestore();
     expect(api.on).toHaveBeenCalledWith("before_reset", expect.any(Function));
     expect(api.on).toHaveBeenCalledWith("session_end", expect.any(Function));
   });
@@ -403,58 +421,51 @@ describe("lcm plugin registration", () => {
   });
 
   it("logs compaction summarization overrides at startup", () => {
-    const { api } = buildApi({
+    const { api, infoLog, sessionInfoLog } = buildApi({
       enabled: true,
       summaryModel: "gpt-5.4",
       summaryProvider: "openai-resp",
     });
     api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     lcmPlugin.register(api);
 
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: openai-resp/gpt-5.4 (override)",
     );
-    consoleErrorSpy.mockRestore();
+    expect(sessionInfoLog).not.toHaveBeenCalled();
   });
 
   it("logs the OpenClaw compaction model at startup when no plugin override is set", () => {
-    const { api } = buildApi({
+    const { api, infoLog } = buildApi({
       enabled: true,
     });
     api.config = compactionAndDefaultModelConfig({
       compactionModel: "anthropic/claude-opus-4-6",
       defaultModel: "openai-codex/gpt-5.4",
     }) as OpenClawPluginApi["config"];
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
     lcmPlugin.register(api);
 
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: anthropic/claude-opus-4-6 (override)",
     );
-    consoleErrorSpy.mockRestore();
   });
 
   it("prefers env summary overrides over the OpenClaw compaction model in the startup banner", () => {
     vi.stubEnv("LCM_SUMMARY_PROVIDER", "openai-codex");
     vi.stubEnv("LCM_SUMMARY_MODEL", "gpt-5.4");
-    const { api } = buildApi({
+    const { api, infoLog } = buildApi({
       enabled: true,
     });
     api.config = compactionAndDefaultModelConfig({
       compactionModel: "anthropic/claude-opus-4-6",
       defaultModel: "openai-codex/gpt-5.3-codex",
     }) as OpenClawPluginApi["config"];
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
     lcmPlugin.register(api);
 
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: openai-codex/gpt-5.4 (override)",
     );
-    consoleErrorSpy.mockRestore();
   });
 
   it("dedupes startup banner logs across repeated registration and engine construction", () => {
@@ -471,8 +482,6 @@ describe("lcm plugin registration", () => {
     };
     const first = buildApi(pluginConfig);
     const second = buildApi(pluginConfig);
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
     lcmPlugin.register(first.api);
     lcmPlugin.register(second.api);
 
@@ -487,24 +496,24 @@ describe("lcm plugin registration", () => {
 
     const firstMessages = first.infoLog.mock.calls.map(([message]) => message);
     const secondMessages = second.infoLog.mock.calls.map(([message]) => message);
-    const errorMessages = consoleErrorSpy.mock.calls.map(([message]) => message);
+    const firstSessionMessages = first.sessionInfoLog.mock.calls.map(([message]) => message);
+    const secondSessionMessages = second.sessionInfoLog.mock.calls.map(([message]) => message);
     const debugMessages = first.debugLog.mock.calls.map(([message]) => message);
 
-    expect(firstMessages).toEqual([]);
-    expect(secondMessages).toEqual([]);
-    expect([...errorMessages].sort()).toEqual([
+    expect([...firstMessages, ...secondMessages].sort()).toEqual([
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
       "[lcm] Compaction summarization model: (unconfigured)",
       "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
       "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
     ].sort());
+    expect(firstSessionMessages).toEqual([]);
+    expect(secondSessionMessages).toEqual([]);
     expect(debugMessages).toEqual(
       expect.arrayContaining([expect.stringContaining("[lcm] Migration successful")]),
     );
-    expect(errorMessages).toEqual(
+    expect(firstMessages).toEqual(
       expect.not.arrayContaining([expect.stringContaining("[lcm] Migration successful")]),
     );
-    consoleErrorSpy.mockRestore();
   });
   it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {
     const { api, getFactory, warnLog } = buildApi(
