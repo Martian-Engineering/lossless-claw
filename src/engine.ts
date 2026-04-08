@@ -871,12 +871,22 @@ function isBootstrapMessage(value: unknown): value is AgentMessage {
   return "content" in msg || ("command" in msg && "output" in msg);
 }
 
+function extractCanonicalBootstrapMessage(value: unknown): AgentMessage | null {
+  if (isBootstrapMessage(value)) {
+    return value;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const entry = value as { type?: unknown; message?: unknown };
+  if (entry.type !== "message") {
+    return null;
+  }
+  return isBootstrapMessage(entry.message) ? entry.message : null;
+}
+
 function extractBootstrapMessageCandidate(value: unknown): AgentMessage | null {
-  const candidate =
-    value && typeof value === "object" && "message" in value
-      ? (value as { message?: unknown }).message
-      : value;
-  return isBootstrapMessage(candidate) ? candidate : null;
+  return extractCanonicalBootstrapMessage(value);
 }
 
 function parseBootstrapJsonl(raw: string, options?: {
@@ -898,9 +908,6 @@ function parseBootstrapJsonl(raw: string, options?: {
       if (candidate) {
         messages.push(candidate);
         continue;
-      }
-      if (options?.strict) {
-        hadMalformedLine = true;
       }
     } catch {
       if (options?.strict) {
@@ -1054,7 +1061,12 @@ function readFileSegment(sessionFile: string, offset: number): string | null {
   }
 }
 
-function readLastJsonlEntryBeforeOffset(sessionFile: string, offset: number, messageOnly = false): string | null {
+function readLastJsonlEntryBeforeOffset(
+  sessionFile: string,
+  offset: number,
+  messageOnly = false,
+  matcher?: (message: AgentMessage) => boolean,
+): string | null {
   const chunkSize = 16_384;
   let fd: number | null = null;
   try {
@@ -1092,11 +1104,11 @@ function readLastJsonlEntryBeforeOffset(sessionFile: string, offset: number, mes
         const candidate = trimmedEnd.slice(newlineIndex + 1).trim();
         if (candidate) {
           if (messageOnly) {
-            let isMessage = false;
+            let matchedMessage: AgentMessage | null = null;
             try {
-              isMessage = extractBootstrapMessageCandidate(JSON.parse(candidate)) != null;
+              matchedMessage = extractBootstrapMessageCandidate(JSON.parse(candidate));
             } catch { /* not valid JSON, skip */ }
-            if (!isMessage) {
+            if (!matchedMessage || (matcher && !matcher(matchedMessage))) {
               carry = trimmedEnd.slice(0, newlineIndex);
               continue;
             }
@@ -1111,11 +1123,11 @@ function readLastJsonlEntryBeforeOffset(sessionFile: string, offset: number, mes
       if (reachedStart) {
         const firstLine = trimmedEnd.trim() || null;
         if (firstLine && messageOnly) {
-          let isMessage = false;
+          let matchedMessage: AgentMessage | null = null;
           try {
-            isMessage = extractBootstrapMessageCandidate(JSON.parse(firstLine)) != null;
+            matchedMessage = extractBootstrapMessageCandidate(JSON.parse(firstLine));
           } catch { /* not valid JSON */ }
-          if (!isMessage) return null;
+          if (!matchedMessage || (matcher && !matcher(matchedMessage))) return null;
         }
         return firstLine;
       }
@@ -2427,6 +2439,37 @@ export class LcmContextEngine implements ContextEngine {
     return { blockedByImportCap: false, importedMessages, hasOverlap: true };
   }
 
+  /**
+   * Persist bootstrap checkpoint metadata anchored to the current DB frontier.
+   *
+   * We intentionally checkpoint the session file's current EOF while hashing the
+   * latest persisted DB message. This keeps append-only recovery aligned with the
+   * canonical LCM frontier even when trailing transcript entries are pruned or
+   * otherwise noncanonical.
+   */
+  private async refreshBootstrapState(params: {
+    conversationId: number;
+    sessionFile: string;
+    fileStats?: { size: number; mtimeMs: number };
+  }): Promise<void> {
+    const latestDbMessage = await this.conversationStore.getLastMessage(params.conversationId);
+    const fileStats = params.fileStats ?? statSync(params.sessionFile);
+    await this.summaryStore.upsertConversationBootstrapState({
+      conversationId: params.conversationId,
+      sessionFilePath: params.sessionFile,
+      lastSeenSize: fileStats.size,
+      lastSeenMtimeMs: Math.trunc(fileStats.mtimeMs),
+      lastProcessedOffset: fileStats.size,
+      lastProcessedEntryHash: latestDbMessage
+        ? createBootstrapEntryHash({
+            role: latestDbMessage.role,
+            content: latestDbMessage.content,
+            tokenCount: latestDbMessage.tokenCount,
+          })
+        : null,
+    });
+  }
+
   async bootstrap(params: {
     sessionId: string;
     sessionFile: string;
@@ -2457,19 +2500,14 @@ export class LcmContextEngine implements ContextEngine {
         this.conversationStore.withTransaction(async () => {
           const persistBootstrapState = async (
             conversationId: number,
-            historicalMessages: AgentMessage[],
           ): Promise<void> => {
-            const lastMessage =
-              historicalMessages.length > 0
-                ? toStoredMessage(historicalMessages[historicalMessages.length - 1]!)
-                : null;
-            await this.summaryStore.upsertConversationBootstrapState({
+            await this.refreshBootstrapState({
               conversationId,
-              sessionFilePath: params.sessionFile,
-              lastSeenSize: sessionFileSize,
-              lastSeenMtimeMs: sessionFileMtimeMs,
-              lastProcessedOffset: sessionFileSize,
-              lastProcessedEntryHash: createBootstrapEntryHash(lastMessage),
+              sessionFile: params.sessionFile,
+              fileStats: {
+                size: sessionFileSize,
+                mtimeMs: sessionFileMtimeMs,
+              },
             });
           };
 
@@ -2520,6 +2558,7 @@ export class LcmContextEngine implements ContextEngine {
               params.sessionFile,
               bootstrapState.lastProcessedOffset,
               true,
+              (message) => createBootstrapEntryHash(toStoredMessage(message)) === latestDbHash,
             );
             const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
             const tailEntryHash = tailEntryMessage
@@ -2553,14 +2592,7 @@ export class LcmContextEngine implements ContextEngine {
                   }
                 }
 
-                const lastAppendedMessage =
-                  appended.messages.length > 0
-                    ? appended.messages[appended.messages.length - 1]!
-                    : tailEntryMessage;
-                await persistBootstrapState(
-                  conversationId,
-                  lastAppendedMessage ? [lastAppendedMessage] : [],
-                );
+                await persistBootstrapState(conversationId);
 
                 if (importedMessages > 0) {
                   return {
@@ -2591,7 +2623,7 @@ export class LcmContextEngine implements ContextEngine {
 
             if (bootstrapMessages.length === 0) {
               await this.conversationStore.markConversationBootstrapped(conversationId);
-              await persistBootstrapState(conversationId, historicalMessages);
+              await persistBootstrapState(conversationId);
               return {
                 bootstrapped: false,
                 importedMessages: 0,
@@ -2617,7 +2649,6 @@ export class LcmContextEngine implements ContextEngine {
               inserted.map((record) => record.messageId),
             );
             await this.conversationStore.markConversationBootstrapped(conversationId);
-            await persistBootstrapState(conversationId, historicalMessages);
 
             // Prune HEARTBEAT_OK turns from the freshly imported data
             if (this.config.pruneHeartbeatOk) {
@@ -2628,6 +2659,8 @@ export class LcmContextEngine implements ContextEngine {
                 );
               }
             }
+
+            await persistBootstrapState(conversationId);
 
             return {
               bootstrapped: true,
@@ -2657,7 +2690,7 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           if (reconcile.importedMessages > 0) {
-            await persistBootstrapState(conversationId, historicalMessages);
+            await persistBootstrapState(conversationId);
             return {
               bootstrapped: true,
               importedMessages: reconcile.importedMessages,
@@ -2666,7 +2699,7 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           if (reconcile.hasOverlap) {
-            await persistBootstrapState(conversationId, historicalMessages);
+            await persistBootstrapState(conversationId);
           }
 
           if (conversation.bootstrappedAt) {
@@ -2698,6 +2731,10 @@ export class LcmContextEngine implements ContextEngine {
         if (conversation) {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
+            await this.refreshBootstrapState({
+              conversationId: conversation.conversationId,
+              sessionFile: params.sessionFile,
+            });
             console.error(
               `[lcm] bootstrap: retroactively pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversation.conversationId}`,
             );
@@ -2920,22 +2957,10 @@ export class LcmContextEngine implements ContextEngine {
 
         if (result.changed) {
           try {
-            const fileStat = statSync(params.sessionFile);
-            const newSize = fileStat.size;
-            const newMtimeMs = Math.trunc(fileStat.mtimeMs);
-            const lastEntryRaw = readLastJsonlEntryBeforeOffset(params.sessionFile, newSize, true);
-            const lastEntryMsg = readBootstrapMessageFromJsonLine(lastEntryRaw);
-            const lastEntryHash = lastEntryMsg ? createBootstrapEntryHash(toStoredMessage(lastEntryMsg)) : null;
-            if (lastEntryHash) {
-              await this.summaryStore.upsertConversationBootstrapState({
-                conversationId: conversation.conversationId,
-                sessionFilePath: params.sessionFile,
-                lastSeenSize: newSize,
-                lastSeenMtimeMs: newMtimeMs,
-                lastProcessedOffset: newSize,
-                lastProcessedEntryHash: lastEntryHash,
-              });
-            }
+            await this.refreshBootstrapState({
+              conversationId: conversation.conversationId,
+              sessionFile: params.sessionFile,
+            });
           } catch (e) {
             console.error("[lcm] Failed to update bootstrap checkpoint after maintain:", e);
           }
@@ -3144,6 +3169,10 @@ export class LcmContextEngine implements ContextEngine {
         if (conversation) {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
+            await this.refreshBootstrapState({
+              conversationId: conversation.conversationId,
+              sessionFile: params.sessionFile,
+            });
             const sessionContext = this.formatSessionLogContext({
               conversationId: conversation.conversationId,
               sessionId: params.sessionId,

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
@@ -2159,6 +2159,218 @@ describe("LcmContextEngine.bootstrap", () => {
     } as AgentMessage);
 
     const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps the append-only fast path after heartbeat pruning changes the DB frontier", async () => {
+    const sessionFile = createSessionFilePath("append-only-heartbeat-prune");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly." }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "tool",
+      content: "# HEARTBEAT.md\n\n## Worker heartbeat (minimal)",
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "HEARTBEAT_OK" }],
+    } as AgentMessage);
+
+    const engine = createEngineWithConfig({ pruneHeartbeatOk: true });
+    const sessionId = "bootstrap-append-only-heartbeat-prune";
+    const sessionKey = "agent:main:test:bootstrap-append-only-heartbeat-prune";
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedAfterPrune = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(storedAfterPrune.map((message) => message.content)).toEqual(["seed user", "seed assistant"]);
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "tail assistant" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).not.toHaveBeenCalled();
+
+    const storedAfterAppend = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(storedAfterAppend.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "tail user",
+      "tail assistant",
+    ]);
+  });
+
+  it("ignores non-message envelopes in appended transcript tails without forcing reconcile", async () => {
+    const sessionFile = createSessionFilePath("append-only-noncanonical-envelope");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-append-only-noncanonical-envelope";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({ type: "commentary", message: { role: "assistant", content: "ignore me" } })}\n`,
+      "utf8",
+    );
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "tail assistant" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).not.toHaveBeenCalled();
+  });
+
+  it("tolerates custom bootstrap sidecar entries in append-only suffixes", async () => {
+    const sessionFile = createSessionFilePath("append-only-bootstrap-sidecar");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-append-only-bootstrap-sidecar";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({ type: "custom", customType: "openclaw:bootstrap-context:full", data: { ok: true } })}\n`,
+      "utf8",
+    );
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the bootstrap checkpoint after afterTurn heartbeat pruning", async () => {
+    const sessionFile = createSessionFilePath("append-only-after-turn-heartbeat-prune");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngineWithConfig({ pruneHeartbeatOk: true });
+    const sessionId = "bootstrap-append-only-after-turn-heartbeat-prune";
+    const sessionKey = "agent:main:test:bootstrap-append-only-after-turn-heartbeat-prune";
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const heartbeatBatch = [
+      makeMessage({
+        role: "user",
+        content: "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+      }),
+      makeMessage({
+        role: "tool",
+        content: "# HEARTBEAT.md\n\n## Worker heartbeat (minimal)",
+      }),
+      makeMessage({
+        role: "assistant",
+        content: "HEARTBEAT_OK",
+      }),
+    ];
+    for (const message of heartbeatBatch) {
+      sm.appendMessage(message as AgentMessage);
+    }
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: heartbeatBatch,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "tail assistant" }],
+    } as AgentMessage);
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+    const second = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
     expect(second).toEqual({
       bootstrapped: true,
       importedMessages: 2,
