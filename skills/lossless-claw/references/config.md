@@ -1,6 +1,6 @@
 # Configuration
 
-This reference covers the current `lossless-claw` config surface on `main`, based on `openclaw.plugin.json`.
+This reference covers the current `lossless-claw` config surface on `main`, based on `openclaw.plugin.json`, [`docs/configuration.md`](../../../docs/configuration.md), and the runtime defaults in [`src/db/config.ts`](../../../src/db/config.ts).
 
 `lossless-claw` is most effective when the operator understands which settings change compaction behavior and why.
 
@@ -57,6 +57,49 @@ Use this when:
 - Your summarizer is rate-limited or expensive.
 - You want fewer but broader leaf summaries.
 
+### `cacheAwareCompaction`
+
+Controls how strongly lossless-claw preserves a healthy prompt cache during incremental maintenance.
+
+Why it matters:
+
+- Hot cache now prefers to keep the cache intact instead of eagerly compacting old raw history.
+- Cold cache still allows bounded catch-up passes so stale sessions can converge.
+- The new defaults are intentionally more aggressive about preserving cache than earlier builds.
+
+Good defaults:
+
+- `enabled: true`
+- `maxColdCacheCatchupPasses: 2`
+- `hotCachePressureFactor: 4`
+- `hotCacheBudgetHeadroomRatio: 0.2`
+
+Operationally:
+
+- hot cache stretches the incremental leaf trigger to `dynamicLeafChunkTokens.max`
+- hot cache skips incremental maintenance entirely when the assembled context is comfortably below the real token budget
+- hot cache gets a short hysteresis window so a recent cache hit stays "hot" briefly unless telemetry shows a break
+- if hot-cache maintenance still runs, it stays leaf-only and suppresses follow-on condensed passes
+
+### `dynamicLeafChunkTokens`
+
+Controls the working leaf-trigger size used by incremental compaction.
+
+Why it matters:
+
+- dynamic sizing is now enabled by default
+- busier sessions can use a larger working chunk without changing the static floor
+- hot cache uses the dynamic max as the working leaf trigger
+
+Good defaults:
+
+- `enabled: true`
+- `max: 2 * leafChunkTokens`
+
+With the default `leafChunkTokens=20000`, that means:
+
+- `dynamicLeafChunkTokens.max = 40000`
+
 ### `incrementalMaxDepth`
 
 Controls how far automatic condensation cascades after leaf compaction.
@@ -112,6 +155,15 @@ Why it matters:
 - useful for custom deployments, testing, or isolating environments
 - wrong path selection is a common reason operators think LCM is empty or not growing
 
+### `databasePath`
+
+Preferred alias of `dbPath`.
+
+Why it matters:
+
+- this is the documented key new config should use
+- `dbPath` is still accepted for compatibility
+
 ### `largeFileThresholdTokens`
 
 Threshold for externalizing oversized tool/file payloads out of the main transcript into large-file storage.
@@ -165,6 +217,16 @@ Why it matters:
 ### `incrementalMaxDepth`
 
 See high-impact settings above.
+
+### `bootstrapMaxTokens`
+
+Maximum raw parent-history tokens imported when a brand-new LCM conversation bootstraps.
+
+Why it matters:
+
+- keeps first-time bootstrap from flooding the conversation with too much old transcript material
+- defaults to `max(6000, floor(leafChunkTokens * 0.3))`
+- only affects the first import path, not ordinary steady-state turns
 
 ## Session-selection controls
 
@@ -223,6 +285,62 @@ Why it matters:
 - useful when the runtime model window is smaller than the surrounding system assumes
 - can prevent oversized assembly on smaller-context models
 
+## Nested objects
+
+### `cacheAwareCompaction`
+
+#### `cacheAwareCompaction.enabled`
+
+Defers incremental leaf compaction more aggressively when prompt-cache telemetry indicates a hot cache.
+
+#### `cacheAwareCompaction.maxColdCacheCatchupPasses`
+
+Maximum bounded catch-up passes allowed in one maintenance cycle when cache telemetry is cold.
+
+#### `cacheAwareCompaction.hotCachePressureFactor`
+
+Multiplier applied to the hot-cache leaf trigger before raw-history pressure overrides cache preservation.
+
+Why it matters:
+
+- higher values preserve hot cache longer
+- lower values revert toward more eager incremental compaction
+
+Default:
+
+- `4`
+
+#### `cacheAwareCompaction.hotCacheBudgetHeadroomRatio`
+
+Minimum fraction of the real token budget that must remain free before hot-cache incremental compaction is skipped entirely.
+
+Why it matters:
+
+- higher values make hot-cache skip behavior stricter
+- lower values allow more hot-cache maintenance before real budget pressure exists
+
+Default:
+
+- `0.2`
+
+### `dynamicLeafChunkTokens`
+
+#### `dynamicLeafChunkTokens.enabled`
+
+Enables dynamic working leaf chunk sizes for busier sessions.
+
+Default:
+
+- `true`
+
+#### `dynamicLeafChunkTokens.max`
+
+Upper bound for the dynamic working chunk size. The static `leafChunkTokens` value remains the floor.
+
+Default:
+
+- `max(leafChunkTokens, floor(leafChunkTokens * 2))`
+
 ## Summary quality and prompt controls
 
 ### `summaryMaxOverageFactor`
@@ -249,8 +367,12 @@ Why it matters:
 2. Set the context-engine slot to `lossless-claw`.
 3. Start with conservative defaults.
 4. Run `/lossless` after startup to confirm path, size, and summary health.
-5. If recall feels weak, revisit `freshTailCount`, `leafChunkTokens`, and summarizer model quality before changing anything else.
-6. Touch advanced knobs like fanout, large-file thresholds, custom instructions, and assembly caps only after a concrete symptom appears.
+5. If hot-cache turns still compact too often, inspect the decision logs before changing anything else:
+   - `reason=hot-cache-budget-headroom` means the new skip path is working.
+   - `reason=hot-cache-defer` means raw-history pressure is below the configured hot-cache factor.
+   - `allowCondensedPasses=false` on hot-cache turns is expected.
+6. If recall feels weak, revisit `freshTailCount`, `leafChunkTokens`, and summarizer model quality before changing anything else.
+7. Touch advanced knobs like fanout, large-file thresholds, custom instructions, and assembly caps only after a concrete symptom appears.
 
 ## Reading the status output
 
@@ -261,3 +383,13 @@ Useful interpretation notes:
 - `tokens in context` is the current LCM frontier token count in the live LCM state.
 - `compression ratio` is shown as a rounded `1:N`, which is easier to read than a tiny percentage for heavily compacted conversations.
 - `/status` may still show a different context number because it reflects the runtime prompt that was actually assembled and sent on the last turn.
+
+## Keep this reference aligned
+
+This file should stay consistent with:
+
+- [`docs/configuration.md`](../../../docs/configuration.md)
+- [`openclaw.plugin.json`](../../../openclaw.plugin.json)
+- [`src/db/config.ts`](../../../src/db/config.ts)
+
+When config keys, aliases, defaults, or precedence rules change, update all of them together.
