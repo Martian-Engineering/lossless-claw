@@ -39,6 +39,7 @@ export type CompleteFn = (params: {
   authProfileId?: string;
   agentDir?: string;
   runtimeConfig?: unknown;
+  skipModelAuth?: boolean;
   messages: Array<{ role: string; content: unknown }>;
   system?: string;
   maxTokens: number;

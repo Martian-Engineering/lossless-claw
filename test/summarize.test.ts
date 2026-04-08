@@ -1283,6 +1283,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
           provider: "openai-codex",
           model: "gpt-5.4",
           apiKey: "direct-key",
+          skipModelAuth: true,
         });
 
         const warningText = consoleWarn.mock.calls.flatMap((call) => call.map(String)).join(" ");

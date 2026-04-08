@@ -67,6 +67,29 @@ type CompleteSimpleOptions = {
 
 type RuntimeModelAuthResult = {
   apiKey?: string;
+  baseUrl?: string;
+  request?: RuntimeModelRequestTransportOverrides;
+  expiresAt?: number;
+};
+
+type RuntimeModelRequestAuthOverride =
+  | {
+      mode: "provider-default";
+    }
+  | {
+      mode: "authorization-bearer";
+      token: string;
+    }
+  | {
+      mode: "header";
+      headerName: string;
+      value: string;
+      prefix?: string;
+    };
+
+type RuntimeModelRequestTransportOverrides = {
+  headers?: Record<string, string>;
+  auth?: RuntimeModelRequestAuthOverride;
 };
 
 type SessionEndLifecycleEvent = {
@@ -106,6 +129,13 @@ type RuntimeModelAuth = {
     cfg?: OpenClawPluginApi["config"];
     profileId?: string;
     preferredProfile?: string;
+  }) => Promise<RuntimeModelAuthResult | undefined>;
+  getRuntimeAuthForModel?: (params: {
+    model: RuntimeModelAuthModel;
+    cfg?: OpenClawPluginApi["config"];
+    profileId?: string;
+    preferredProfile?: string;
+    workspaceDir?: string;
   }) => Promise<RuntimeModelAuthResult | undefined>;
 };
 
@@ -595,6 +625,78 @@ function buildModelAuthLookupModel(params: {
 function resolveApiKeyFromAuthResult(auth: RuntimeModelAuthResult | undefined): string | undefined {
   const apiKey = auth?.apiKey?.trim();
   return apiKey ? apiKey : undefined;
+}
+
+/** Normalize a runtime auth override base URL when present. */
+function resolveBaseUrlFromAuthResult(auth: RuntimeModelAuthResult | undefined): string | undefined {
+  const baseUrl = auth?.baseUrl?.trim();
+  return baseUrl ? baseUrl : undefined;
+}
+
+/** Normalize raw runtime auth headers into plain string headers. */
+function resolveRuntimeAuthHeaders(
+  request: RuntimeModelRequestTransportOverrides | undefined,
+): Record<string, string> | undefined {
+  if (!request) {
+    return undefined;
+  }
+
+  const headers: Record<string, string> = {};
+  if (isRecord(request.headers)) {
+    for (const [key, value] of Object.entries(request.headers)) {
+      if (typeof value !== "string") {
+        continue;
+      }
+      const headerName = key.trim();
+      const headerValue = value.trim();
+      if (headerName && headerValue) {
+        headers[headerName] = headerValue;
+      }
+    }
+  }
+
+  const auth = request.auth;
+  if (auth?.mode === "authorization-bearer") {
+    const token = auth.token.trim();
+    if (token) {
+      for (const key of Object.keys(headers)) {
+        if (key.toLowerCase() === "authorization") {
+          delete headers[key];
+        }
+      }
+      headers.Authorization = `Bearer ${token}`;
+    }
+  } else if (auth?.mode === "header") {
+    const headerName = auth.headerName.trim();
+    const value = auth.value.trim();
+    if (headerName && value) {
+      const normalizedHeader = headerName.toLowerCase();
+      for (const key of Object.keys(headers)) {
+        if (
+          key.toLowerCase() === normalizedHeader ||
+          (normalizedHeader !== "authorization" && key.toLowerCase() === "authorization")
+        ) {
+          delete headers[key];
+        }
+      }
+      headers[headerName] = `${auth.prefix?.trim() ?? ""}${value}`;
+    }
+  }
+
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+/** Attach OpenClaw transport overrides to a model for runtimes that inspect the shared symbol. */
+function attachRuntimeAuthRequestTransport<TModel extends object>(
+  model: TModel,
+  request: RuntimeModelRequestTransportOverrides | undefined,
+): TModel {
+  if (!request) {
+    return model;
+  }
+  const next = { ...model } as TModel & Record<symbol, unknown>;
+  next[Symbol.for("openclaw.modelProviderRequestTransport")] = request;
+  return next;
 }
 
 function buildLegacyAuthFallbackWarning(): string {
@@ -1204,6 +1306,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       authProfileId,
       agentDir,
       runtimeConfig,
+      skipModelAuth,
       messages,
       system,
       maxTokens,
@@ -1223,6 +1326,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         if (!providerId || !modelId) {
           return { content: [] };
         }
+        const workspaceDir = agentDir?.trim() || api.resolvePath(".");
 
         // When runtimeConfig is undefined (e.g. resolveLargeFileTextSummarizer
         // passes legacyParams without config), fall back to the plugin API so
@@ -1253,6 +1357,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             return first.api.trim();
           })() ||
           inferApiFromProvider(providerId);
+        const modelAuthConfig = resolveModelAuthConfig(effectiveRuntimeConfig);
 
         // Resolve provider-level config (baseUrl, headers, etc.) from runtime config.
         // Custom/proxy providers (e.g. bailian, local proxies) store their baseUrl and
@@ -1269,7 +1374,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           return isRecord(cfg) ? cfg : {};
         })();
 
-        const resolvedModel =
+        let resolvedModel =
           isRecord(knownModel) &&
           typeof knownModel.api === "string" &&
           typeof knownModel.provider === "string" &&
@@ -1317,8 +1422,50 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                   : {}),
               };
 
+        let runtimeAuth: RuntimeModelAuthResult | undefined;
+        if (modelAuth && skipModelAuth !== true && typeof modelAuth.getRuntimeAuthForModel === "function") {
+          try {
+            runtimeAuth = await modelAuth.getRuntimeAuthForModel({
+              model: buildModelAuthLookupModel({
+                provider: providerId,
+                model: modelId,
+                api: resolvedModel.api,
+              }),
+              cfg: modelAuthConfig,
+              ...(authProfileId ? { profileId: authProfileId } : {}),
+              workspaceDir,
+            });
+          } catch (err) {
+            console.error(
+              `[lcm] modelAuth.getRuntimeAuthForModel FAILED:`,
+              err instanceof Error ? err.message : err,
+            );
+          }
+        }
+
+        const runtimeAuthBaseUrl = resolveBaseUrlFromAuthResult(runtimeAuth);
+        const runtimeAuthHeaders = resolveRuntimeAuthHeaders(runtimeAuth?.request);
+        resolvedModel = attachRuntimeAuthRequestTransport(
+          {
+            ...resolvedModel,
+            ...(runtimeAuthBaseUrl ? { baseUrl: runtimeAuthBaseUrl } : {}),
+            ...(runtimeAuthHeaders
+              ? {
+                  headers: {
+                    ...(isRecord(resolvedModel.headers) ? resolvedModel.headers : {}),
+                    ...runtimeAuthHeaders,
+                  },
+                }
+              : {}),
+          },
+          runtimeAuth?.request,
+        );
+
         let resolvedApiKey = apiKey?.trim();
-        if (!resolvedApiKey && modelAuth) {
+        if (!resolvedApiKey) {
+          resolvedApiKey = resolveApiKeyFromAuthResult(runtimeAuth);
+        }
+        if (!resolvedApiKey && modelAuth && skipModelAuth !== true) {
           try {
             resolvedApiKey = resolveApiKeyFromAuthResult(
               await modelAuth.getApiKeyForModel({
@@ -1327,7 +1474,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                   model: modelId,
                   api: resolvedModel.api,
                 }),
-                cfg: api.config,
+                cfg: modelAuthConfig,
                 ...(authProfileId ? { profileId: authProfileId } : {}),
               }),
             );
@@ -1338,12 +1485,12 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             );
           }
         }
-        if (!resolvedApiKey && modelAuth) {
+        if (!resolvedApiKey && modelAuth && skipModelAuth !== true) {
           try {
             resolvedApiKey = resolveApiKeyFromAuthResult(
               await modelAuth.resolveApiKeyForProvider({
                 provider: providerId,
-                cfg: api.config,
+                cfg: modelAuthConfig,
                 ...(authProfileId ? { profileId: authProfileId } : {}),
               }),
             );

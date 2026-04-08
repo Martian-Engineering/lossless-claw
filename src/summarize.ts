@@ -1208,6 +1208,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         requestApiKey: string | undefined,
         label: string,
         reasoning?: string,
+        options?: { skipModelAuth?: boolean },
       ) =>
         withTimeout(params.deps.complete({
           provider,
@@ -1226,6 +1227,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           ],
           maxTokens: targetTokens,
           ...(reasoning ? { reasoning } : {}),
+          ...(options?.skipModelAuth === true ? { skipModelAuth: true } : {}),
         }), summarizerTimeoutMs, label);
 
       const retryWithoutModelAuth = async (
@@ -1254,7 +1256,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         }
 
         try {
-          const directResult = await runSummarizerCall(directApiKey, "auth-retry", reasoning);
+          const directResult = await runSummarizerCall(directApiKey, "auth-retry", reasoning, {
+            skipModelAuth: true,
+          });
           // Use requireStructuralSignal on the retry success path too — the
           // summary text may legitimately contain auth-error phrases.
           const directFailure = extractProviderAuthFailure(directResult, {
