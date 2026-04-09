@@ -1956,7 +1956,12 @@ export class LcmContextEngine implements ContextEngine {
     // that continues to fail.
     if (message.role === "assistant") {
       const topLevel = message as unknown as Record<string, unknown>;
-      const stopReason = topLevel.stopReason;
+      const stopReason =
+        typeof topLevel.stopReason === "string"
+          ? topLevel.stopReason
+          : typeof topLevel.stop_reason === "string"
+            ? topLevel.stop_reason
+            : undefined;
       if (stopReason === "error" || stopReason === "aborted") {
         const content = topLevel.content;
         const isEmpty =

@@ -644,7 +644,7 @@ describe("LcmContextEngine stateless sessions", () => {
     ).toBe(1);
   });
 
-  it("skips ingest for assistant messages with stopReason error and empty content", async () => {
+  it("skips ingest for assistant messages with error/aborted stop reasons and empty content", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();
     const sessionKey = "agent:poppy:main";
@@ -683,6 +683,19 @@ describe("LcmContextEngine stateless sessions", () => {
     });
     expect(errorResult2).toEqual({ ingested: false });
 
+    // Ingest an error assistant message using snake_case stop_reason
+    const errorResult3 = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: {
+        role: "assistant" as AgentMessage["role"],
+        content: [],
+        stop_reason: "error",
+        timestamp: Date.now(),
+      } as AgentMessage,
+    });
+    expect(errorResult3).toEqual({ ingested: false });
+
     // Ingest an aborted assistant message with no content
     const abortedResult = await engine.ingest({
       sessionId,
@@ -717,7 +730,7 @@ describe("LcmContextEngine stateless sessions", () => {
     });
     expect(errorWithContentResult).toEqual({ ingested: true });
 
-    // Verify only the 3 valid messages were stored (user + normal assistant + error-with-content)
+    // Verify only the 3 valid messages were stored despite rejected empty error turns.
     const conversation = await engine
       .getConversationStore()
       .getConversationBySessionId(sessionId);
