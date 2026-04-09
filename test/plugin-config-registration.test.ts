@@ -552,6 +552,41 @@ describe("lcm plugin registration", () => {
     consoleErrorSpy.mockRestore();
   });
 
+  it("uses runtime OpenClaw defaults when api.pluginConfig is ready before api.config", () => {
+    const { api, getFactory } = buildApi(
+      {
+        enabled: true,
+      },
+      {
+        runtimeConfig: compactionAndDefaultModelConfig({
+          defaultModel: "anthropic/claude-sonnet-4-6",
+        }),
+      },
+    );
+    api.config = {} as OpenClawPluginApi["config"];
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    lcmPlugin.register(api);
+
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      "[lcm] Compaction summarization model: anthropic/claude-sonnet-4-6 (default)",
+    );
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown } };
+    const resolved = engine.deps?.resolveModel(undefined, undefined) as
+      | { provider: string; model: string }
+      | undefined;
+
+    expect(resolved).toEqual({
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+    });
+    consoleErrorSpy.mockRestore();
+  });
+
   it("logs the OpenClaw compaction model at startup when no plugin override is set", () => {
     const { api, infoLog } = buildApi({
       enabled: true,

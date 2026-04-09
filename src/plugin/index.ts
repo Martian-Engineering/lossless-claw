@@ -394,16 +394,16 @@ function resolveRegistrationConfig(api: OpenClawPluginApi): {
   openClawConfig: unknown;
   pluginConfig?: Record<string, unknown>;
 } {
+  const openClawConfig = loadEffectiveOpenClawConfig(api);
   const apiPluginConfig =
     api.pluginConfig && typeof api.pluginConfig === "object" && !Array.isArray(api.pluginConfig)
       ? api.pluginConfig
       : undefined;
 
   if (apiPluginConfig && Object.keys(apiPluginConfig).length > 0) {
-    return { openClawConfig: api.config, pluginConfig: apiPluginConfig };
+    return { openClawConfig, pluginConfig: apiPluginConfig };
   }
 
-  const openClawConfig = loadEffectiveOpenClawConfig(api);
   return {
     openClawConfig,
     pluginConfig: readPluginConfigFromOpenClawConfig(openClawConfig, api.id),

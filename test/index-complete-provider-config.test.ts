@@ -157,7 +157,7 @@ describe("createLcmDependencies.complete provider config resolution", () => {
       model: "unit-model",
     });
 
-    expect(loadConfig).toHaveBeenCalledTimes(1);
+    expect(loadConfig).toHaveBeenCalled();
     expect(piAiMock.completeSimple).toHaveBeenCalledTimes(1);
     expect(piAiMock.completeSimple).toHaveBeenCalledWith(
       expect.objectContaining({
