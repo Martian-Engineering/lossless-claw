@@ -4020,11 +4020,21 @@ export class LcmContextEngine implements ContextEngine {
             ? decision.threshold
             : tokenBudget;
 
+        // When forced (overflow recovery) and the caller did not supply an
+        // observed token count, assume we are at least at the token budget so
+        // compactUntilUnder does not bail with "already under target" while the
+        // live context is actually overflowing.
+        const effectiveCurrentTokens =
+          observedTokens !== undefined
+            ? observedTokens
+            : forceCompaction
+              ? tokenBudget
+              : undefined;
         const compactResult = await this.compaction.compactUntilUnder({
           conversationId,
           tokenBudget,
           targetTokens: convergenceTargetTokens,
-          ...(observedTokens !== undefined ? { currentTokens: observedTokens } : {}),
+          ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
           summarize,
           summaryModel,
         });
