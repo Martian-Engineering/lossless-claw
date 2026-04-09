@@ -165,7 +165,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return {
         kind: "help",
         error:
-          "`/lcm doctor` accepts no arguments, `cleaners` for global high-confidence junk diagnostics, or `apply` for the scoped repair path.",
+          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`cleaners\` for global high-confidence junk diagnostics, or \`apply\` for the scoped repair path.`,
       };
     case "help":
       return { kind: "help" };

@@ -40,7 +40,7 @@ It should help confirm:
 - whether NULL-key orphaned subagent conversations are present
 - which high-confidence filters match the most conversations and messages
 
-This command is read-only. It is the discovery step before `/lossless doctor cleaners apply`.
+This command is read-only. Use it to identify likely cleanup candidates before taking any separate cleanup action.
 
 ## Interpreting common states
 

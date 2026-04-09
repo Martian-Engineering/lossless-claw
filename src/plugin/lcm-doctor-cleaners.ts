@@ -31,6 +31,7 @@ type CleanerDefinition = {
   id: DoctorCleanerId;
   label: string;
   description: string;
+  candidatePredicateSql: string;
   predicateSql: string;
   needsFirstMessage?: boolean;
 };
@@ -56,12 +57,14 @@ const CLEANER_DEFINITIONS: CleanerDefinition[] = [
     id: "archived_subagents",
     label: "Archived subagents",
     description: "Archived subagent conversations keyed as agent:main:subagent:*.",
+    candidatePredicateSql: "(c.active = 0 AND c.session_key LIKE 'agent:main:subagent:%')",
     predicateSql: "(c.active = 0 AND c.session_key LIKE 'agent:main:subagent:%')",
   },
   {
     id: "cron_sessions",
     label: "Cron sessions",
     description: "Background cron conversations keyed as agent:main:cron:*.",
+    candidatePredicateSql: "(c.session_key LIKE 'agent:main:cron:%')",
     predicateSql: "(c.session_key LIKE 'agent:main:cron:%')",
   },
   {
@@ -69,6 +72,7 @@ const CLEANER_DEFINITIONS: CleanerDefinition[] = [
     label: "NULL-key subagent context",
     description:
       "Conversations with NULL session_key whose first stored message begins with [Subagent Context].",
+    candidatePredicateSql: "(c.session_key IS NULL)",
     predicateSql:
       "(c.session_key IS NULL AND message_stats.first_message_preview LIKE '[Subagent Context]%')",
     needsFirstMessage: true,
@@ -122,9 +126,23 @@ function buildMatchedConversationsSql(params: {
     .join(`\nUNION ALL\n`);
 }
 
+function buildCandidateConversationsSql(definitions: CleanerDefinition[]): string {
+  if (definitions.length === 0) {
+    return `SELECT NULL AS conversation_id WHERE 0`;
+  }
+  return definitions
+    .map(
+      (definition) => `SELECT c.conversation_id
+              FROM conversations c
+              WHERE ${definition.candidatePredicateSql}`,
+    )
+    .join(`\nUNION\n`);
+}
+
 function dropTempCleanerScanTables(db: DatabaseSync): void {
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_scan_matches`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_scan_message_stats`);
+  db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_candidate_conversations`);
 }
 
 function stageCleanerScanTables(db: DatabaseSync, definitions: CleanerDefinition[]): void {
@@ -133,36 +151,65 @@ function stageCleanerScanTables(db: DatabaseSync, definitions: CleanerDefinition
     return;
   }
   db.exec(`
+    CREATE TEMP TABLE doctor_cleaner_candidate_conversations (
+      conversation_id INTEGER PRIMARY KEY
+    ) WITHOUT ROWID
+  `);
+  db.exec(`
+    INSERT INTO temp.doctor_cleaner_candidate_conversations (conversation_id)
+    ${buildCandidateConversationsSql(definitions)}
+  `);
+  db.exec(`
     CREATE TEMP TABLE doctor_cleaner_scan_message_stats (
       conversation_id INTEGER PRIMARY KEY,
       first_message_preview TEXT,
       message_count INTEGER NOT NULL
     )
   `);
-  db.exec(`
-    WITH ranked_messages AS (
+  if (definitions.some((definition) => definition.needsFirstMessage)) {
+    db.exec(`
+      WITH ranked_messages AS (
+        SELECT
+          m.conversation_id,
+          m.content,
+          ROW_NUMBER() OVER (
+            PARTITION BY m.conversation_id
+            ORDER BY m.seq ASC, m.created_at ASC, m.message_id ASC
+          ) AS row_num,
+          COUNT(*) OVER (PARTITION BY m.conversation_id) AS message_count
+        FROM messages m
+        JOIN temp.doctor_cleaner_candidate_conversations candidates
+          ON candidates.conversation_id = m.conversation_id
+      )
+      INSERT INTO temp.doctor_cleaner_scan_message_stats (
+        conversation_id,
+        first_message_preview,
+        message_count
+      )
+      SELECT
+        conversation_id,
+        MAX(CASE WHEN row_num = 1 THEN substr(content, 1, ${SCAN_FIRST_MESSAGE_PREVIEW_LIMIT}) END) AS first_message_preview,
+        MAX(message_count) AS message_count
+      FROM ranked_messages
+      GROUP BY conversation_id
+    `);
+  } else {
+    db.exec(`
+      INSERT INTO temp.doctor_cleaner_scan_message_stats (
+        conversation_id,
+        first_message_preview,
+        message_count
+      )
       SELECT
         m.conversation_id,
-        m.content,
-        ROW_NUMBER() OVER (
-          PARTITION BY m.conversation_id
-          ORDER BY m.seq ASC, m.created_at ASC, m.message_id ASC
-        ) AS row_num,
-        COUNT(*) OVER (PARTITION BY m.conversation_id) AS message_count
+        NULL AS first_message_preview,
+        COUNT(*) AS message_count
       FROM messages m
-    )
-    INSERT INTO temp.doctor_cleaner_scan_message_stats (
-      conversation_id,
-      first_message_preview,
-      message_count
-    )
-    SELECT
-      conversation_id,
-      MAX(CASE WHEN row_num = 1 THEN substr(content, 1, ${SCAN_FIRST_MESSAGE_PREVIEW_LIMIT}) END) AS first_message_preview,
-      MAX(message_count) AS message_count
-    FROM ranked_messages
-    GROUP BY conversation_id
-  `);
+      JOIN temp.doctor_cleaner_candidate_conversations candidates
+        ON candidates.conversation_id = m.conversation_id
+      GROUP BY m.conversation_id
+    `);
+  }
   db.exec(`
     CREATE TEMP TABLE doctor_cleaner_scan_matches (
       filter_id TEXT NOT NULL,
