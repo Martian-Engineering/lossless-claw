@@ -1,5 +1,6 @@
 import { describeLogError } from "./lcm-log.js";
 import type { LcmDependencies } from "./types.js";
+import { estimateTokens } from "./estimate-tokens.js";
 
 export type LcmSummarizeOptions = {
   previousSummary?: string;
@@ -174,10 +175,6 @@ function resolveProviderApiFromLegacyConfig(
   return undefined;
 }
 
-/** Approximate token estimate used for target-sizing prompts. */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
 
 /** Narrow unknown values to plain object records. */
 function isRecord(value: unknown): value is Record<string, unknown> {

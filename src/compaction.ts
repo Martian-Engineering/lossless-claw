@@ -4,6 +4,7 @@ import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/sum
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
 import { LcmProviderAuthError } from "./summarize.js";
+import { estimateTokens } from "./estimate-tokens.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -93,10 +94,6 @@ type CondensedPhaseCandidate = {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Estimate token count from character length (~4 chars per token). */
-function estimateTokens(content: string): number {
-  return Math.ceil(content.length / 4);
-}
 
 /** Deterministically cap summary text so the persisted output stays within maxTokens. */
 function capSummaryText(

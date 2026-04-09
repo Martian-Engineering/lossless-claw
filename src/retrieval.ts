@@ -10,6 +10,7 @@ import type {
   LargeFileRecord,
 } from "./store/summary-store.js";
 import type { SearchSort } from "./store/full-text-sort.js";
+import { estimateTokens } from "./estimate-tokens.js";
 
 // ── Public interfaces ────────────────────────────────────────────────────────
 
@@ -114,10 +115,6 @@ export interface ExpandResult {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Rough token estimate: ~4 chars per token. */
-function estimateTokens(content: string): number {
-  return Math.ceil(content.length / 4);
-}
 
 // ── RetrievalEngine ──────────────────────────────────────────────────────────
 
