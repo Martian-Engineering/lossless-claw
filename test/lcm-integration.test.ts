@@ -2023,6 +2023,30 @@ describe("LCM integration: compaction", () => {
     expect(leafSummary!.content).toContain("tokens]");
   });
 
+  it("compaction keeps deterministic fallback within budget for CJK-heavy content", async () => {
+    await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) => `消息 ${i}: ${"你".repeat(600)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarize = vi.fn(async (text: string) => `${text} (not actually summarized)`);
+
+    const result = await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.level).toBe("fallback");
+
+    const leafSummary = sumStore._summaries.find((s) => s.kind === "leaf");
+    expect(leafSummary).toBeDefined();
+    expect(leafSummary!.content).toContain("[Truncated from");
+    expect(leafSummary!.tokenCount).toBeLessThanOrEqual(512);
+  });
+
   it("skips summary persistence when the summarizer hits a provider auth failure", async () => {
     await ingestMessages(convStore, sumStore, 8, {
       contentFn: (i) => `Content ${i}: ${"d".repeat(200)}`,
@@ -3167,6 +3191,39 @@ describe("LCM integration: summary size cap", () => {
     const summaryItem = contextItems.find((ci) => ci.itemType === "summary");
     const summaryRecord = await sumStore.getSummary(summaryItem!.summaryId!);
     expect(summaryRecord!.content).not.toContain("[Capped from");
+  });
+
+  it("caps CJK-heavy summaries within summaryMaxOverageFactor", async () => {
+    const compactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      leafTargetTokens: 100,
+      summaryMaxOverageFactor: 2,
+    });
+
+    await ingestMessages(convStore, sumStore, 12, {
+      contentFn: (i) => `消息 ${i}: ${"你".repeat(2000)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarize = vi.fn(async () => "你".repeat(400));
+
+    const result = await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 100_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.level).toBe("capped");
+
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    const summaryItem = contextItems.find((ci) => ci.itemType === "summary");
+    expect(summaryItem).toBeDefined();
+    const summaryRecord = await sumStore.getSummary(summaryItem!.summaryId!);
+    expect(summaryRecord).toBeDefined();
+    expect(summaryRecord!.content).toContain("[Capped from");
+    expect(summaryRecord!.tokenCount).toBeLessThanOrEqual(200);
   });
 
   it("warns when summary exceeds 1.5x target but stays under hard cap", async () => {

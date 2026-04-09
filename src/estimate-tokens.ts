@@ -31,17 +31,50 @@ function isCjkCodePoint(cp: number): boolean {
   );
 }
 
+/** Estimate token cost for a single Unicode code point. */
+function estimateCodePointTokens(cp: number): number {
+  if (isCjkCodePoint(cp)) {
+    return 1.5;
+  }
+  if (cp > 0xffff) {
+    return 2;
+  }
+  return 0.25;
+}
+
+/** Estimate text tokens using Unicode-aware character weighting. */
 export function estimateTokens(text: string): number {
   let tokens = 0;
   for (const char of text) {
     const cp = char.codePointAt(0) ?? 0;
-    if (isCjkCodePoint(cp)) {
-      tokens += 1.5;   // CJK: ~1.5 tokens per character
-    } else if (cp > 0xffff) {
-      tokens += 2;     // Emoji / Supplementary Plane
-    } else {
-      tokens += 0.25;  // ASCII / Latin: ~4 chars per token
-    }
+    tokens += estimateCodePointTokens(cp);
   }
   return Math.ceil(tokens);
+}
+
+/**
+ * Truncate text so the estimated token count stays within `maxTokens`.
+ *
+ * Iterates by Unicode code point to avoid splitting surrogate pairs while
+ * preserving the same weighting model as `estimateTokens()`.
+ */
+export function truncateTextToEstimatedTokens(text: string, maxTokens: number): string {
+  if (maxTokens <= 0 || !text) {
+    return "";
+  }
+
+  let tokens = 0;
+  let end = 0;
+
+  for (const char of text) {
+    const cp = char.codePointAt(0) ?? 0;
+    const nextTokens = tokens + estimateCodePointTokens(cp);
+    if (Math.ceil(nextTokens) > maxTokens) {
+      break;
+    }
+    tokens = nextTokens;
+    end += char.length;
+  }
+
+  return text.slice(0, end);
 }
