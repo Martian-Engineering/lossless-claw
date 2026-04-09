@@ -6064,6 +6064,64 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
       }),
     );
   });
+
+  it("uses tokenBudget as currentTokens for forced recovery when observed tokens are unavailable", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 150_000,
+      threshold: 120_000,
+    });
+    const compactFullSweepSpy = vi.spyOn(privateEngine.compaction, "compactFullSweep");
+    const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder").mockResolvedValue({
+      success: true,
+      rounds: 1,
+      finalTokens: 118_000,
+    });
+
+    await engine.ingest({
+      sessionId: "forced-sweep-unknown-observed-tokens",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "forced-sweep-unknown-observed-tokens",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 120_000,
+      force: true,
+      compactionTarget: "budget",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(result.reason).toBe("compacted");
+    expect(result.result?.tokensBefore).toBe(150_000);
+    expect(result.result?.tokensAfter).toBe(118_000);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 120_000);
+    expect(compactFullSweepSpy).not.toHaveBeenCalled();
+    expect(compactUntilUnderSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 120_000,
+        targetTokens: 120_000,
+        currentTokens: 120_000,
+        summarize: expect.any(Function),
+      }),
+    );
+  });
 });
 
 describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
