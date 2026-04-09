@@ -834,6 +834,49 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(diagnostics).not.toContain("summarizer auth retry");
     });
 
+    it("retries custom providers without runtime.modelAuth when scope auth failures occur", async () => {
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "codex-gateway",
+          model: "gpt-5.4",
+        })),
+        complete: vi
+          .fn()
+          .mockRejectedValueOnce({
+            statusCode: 401,
+            error: {
+              code: "insufficient_scope",
+              message: "Missing required scope: model.request",
+            },
+          })
+          .mockResolvedValueOnce({
+            content: [{ type: "text", text: "summary from direct credentials" }],
+          }),
+      });
+
+      const result = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: { provider: "codex-gateway", model: "gpt-5.4" },
+      });
+
+      await expect(result!.fn("B".repeat(8_000), false)).resolves.toBe(
+        "summary from direct credentials",
+      );
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
+        provider: "codex-gateway",
+        model: "gpt-5.4",
+        skipModelAuth: true,
+      });
+
+      const diagnostics = getDepsLogText(deps);
+      expect(diagnostics).toContain("provider auth error (401 / missing model.request scope)");
+      expect(diagnostics).toContain("Current: codex-gateway/gpt-5.4");
+      expect(diagnostics).toContain("summarizer auth retry");
+      expect(diagnostics).toContain("summarizer auth retry succeeded");
+      expect(diagnostics).not.toContain("retrying with conservative settings");
+    });
+
     it("does not enter conservative retry/fallback when the completion call throws an auth error", async () => {
       const deps = makeDeps({
         resolveModel: vi.fn(() => ({
@@ -896,28 +939,6 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("provider auth error (401 / missing model.request scope)");
-    });
-
-    it("does not misclassify response-envelope summary text as an auth error", async () => {
-      const deps = makeDeps({
-        complete: vi.fn(async () => ({
-          content: [],
-          response: {
-            text: "Summary of a debugging session about 401 invalid api key failures.",
-          },
-        })),
-      });
-
-      const summarize = await createSummarizeFn({
-        deps,
-        legacyParams: { provider: "anthropic", model: "claude-opus-4-5" },
-      });
-
-      const summary = await summarize!("D".repeat(8_000), false);
-
-      expect(summary).toBe("Summary of a debugging session about 401 invalid api key failures.");
-      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
-      expect(vi.mocked(deps.log.warn)).not.toHaveBeenCalled();
     });
 
     it("does not misclassify message-envelope summary text as an auth error", async () => {

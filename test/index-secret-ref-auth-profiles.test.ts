@@ -47,7 +47,7 @@ function buildApi(params?: {
         deleteSession: vi.fn(),
       },
       config: {
-        loadConfig: vi.fn(() => ({})),
+        loadConfig: vi.fn(() => (params?.config ?? {})),
       },
       channel: {
         session: {
@@ -85,6 +85,30 @@ function buildApi(params?: {
   };
 }
 
+function buildTestRuntimeConfig(
+  provider: string,
+  config?: Record<string, unknown>,
+): Record<string, unknown> {
+  const providerApi = provider === "openai-codex" ? "openai-codex-responses" : "openai-responses";
+  const models = (config?.models as Record<string, unknown> | undefined) ?? {};
+  const providers = (models.providers as Record<string, unknown> | undefined) ?? {};
+  const providerConfig = (providers[provider] as Record<string, unknown> | undefined) ?? {};
+
+  return {
+    ...(config ?? {}),
+    models: {
+      ...models,
+      providers: {
+        ...providers,
+        [provider]: {
+          api: providerApi,
+          ...providerConfig,
+        },
+      },
+    },
+  };
+}
+
 async function callComplete(params: {
   agentDir: string;
   config?: Record<string, unknown>;
@@ -93,7 +117,8 @@ async function callComplete(params: {
 }) {
   const provider = params.provider ?? "lossless-test-provider";
   const model = params.model ?? "test-model";
-  const { api, getFactory, dbPath } = buildApi({ config: params.config });
+  const runtimeConfig = buildTestRuntimeConfig(provider, params.config);
+  const { api, getFactory, dbPath } = buildApi({ config: runtimeConfig });
 
   lcmPlugin.register(api);
   const factory = getFactory();
