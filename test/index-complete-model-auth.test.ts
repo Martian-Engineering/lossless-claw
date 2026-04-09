@@ -212,4 +212,59 @@ describe("createLcmDependencies.complete modelAuth lookup order", () => {
       closeLcmConnection(engine.config.databasePath);
     }
   });
+
+  it("uses a 1M context window fallback when model metadata is unresolved", async () => {
+    const { api, getFactory } = buildApi();
+    const runtime = api.runtime as typeof api.runtime & {
+      modelAuth: {
+        getRuntimeAuthForModel: ReturnType<typeof vi.fn>;
+        getApiKeyForModel: ReturnType<typeof vi.fn>;
+      };
+    };
+    runtime.modelAuth.getRuntimeAuthForModel.mockResolvedValue(undefined);
+
+    lcmPlugin.register(api);
+    const factory = getFactory();
+    if (!factory) {
+      throw new Error("Expected LCM engine factory to be registered.");
+    }
+
+    const engine = factory() as {
+      deps: {
+        complete: (input: {
+          provider: string;
+          model: string;
+          messages: Array<{ role: string; content: string }>;
+          maxTokens: number;
+        }) => Promise<unknown>;
+      };
+      config: { databasePath: string };
+    };
+
+    try {
+      await engine.deps.complete({
+        provider: "openai-codex",
+        model: "gpt-5.4",
+        messages: [{ role: "user", content: "Summarize this." }],
+        maxTokens: 256,
+      });
+
+      expect(runtime.modelAuth.getRuntimeAuthForModel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: expect.objectContaining({
+            contextWindow: 1_000_000,
+          }),
+        }),
+      );
+      expect(runtime.modelAuth.getApiKeyForModel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: expect.objectContaining({
+            contextWindow: 1_000_000,
+          }),
+        }),
+      );
+    } finally {
+      closeLcmConnection(engine.config.databasePath);
+    }
+  });
 });
