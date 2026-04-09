@@ -492,6 +492,30 @@ describe("resolveLcmConfig", () => {
     });
   });
 
+  it("ships a manifest with sessionBifurcation in schema", () => {
+    expect(manifest.configSchema.properties.sessionBifurcation).toEqual({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: {
+          type: "boolean",
+        },
+        maxConversationMessages: {
+          type: "integer",
+          minimum: 1,
+        },
+        maxConversationAgeHours: {
+          type: "integer",
+          minimum: 1,
+        },
+        minMessagesBeforeAgeSplit: {
+          type: "integer",
+          minimum: 1,
+        },
+      },
+    });
+  });
+
   it("ships a manifest with cacheAwareCompaction in schema", () => {
     expect(manifest.configSchema.properties.cacheAwareCompaction).toEqual({
       type: "object",

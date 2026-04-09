@@ -3363,21 +3363,7 @@ export class LcmContextEngine implements ContextEngine {
     }
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () => {
-        let ingestedCount = 0;
-        for (const message of params.messages) {
-          const result = await this.ingestSingle({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            message,
-            isHeartbeat: params.isHeartbeat,
-          });
-          if (result.ingested) {
-            ingestedCount += 1;
-          }
-        }
-        return { ingestedCount };
-      },
+      () => this.ingestBatchLocked(params),
       {
         operationName: "ingestBatch",
         context: [
@@ -3387,6 +3373,27 @@ export class LcmContextEngine implements ContextEngine {
         ].join(" "),
       },
     );
+  }
+
+  private async ingestBatchLocked(params: {
+    sessionId: string;
+    sessionKey?: string;
+    messages: AgentMessage[];
+    isHeartbeat?: boolean;
+  }): Promise<IngestBatchResult> {
+    let ingestedCount = 0;
+    for (const message of params.messages) {
+      const result = await this.ingestSingle({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        message,
+        isHeartbeat: params.isHeartbeat,
+      });
+      if (result.ingested) {
+        ingestedCount += 1;
+      }
+    }
+    return { ingestedCount };
   }
 
   async afterTurn(params: {
@@ -3416,49 +3423,64 @@ export class LcmContextEngine implements ContextEngine {
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
 
-    // Dedup guard: prevent duplicate ingestion when gateway restart replays
-    // full history. Run on newMessages BEFORE prepending autoCompactionSummary
-    // so synthetic summaries cannot interfere with replay detection.
-    const newMessages = params.messages.slice(params.prePromptMessageCount);
-    const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
-      params.sessionId,
-      params.sessionKey,
-      newMessages,
+    let ingestBatch: AgentMessage[] = [];
+    let ingestError: unknown = null;
+    await this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () => {
+        // Dedup guard: prevent duplicate ingestion when gateway restart replays
+        // full history. Run on newMessages BEFORE prepending autoCompactionSummary
+        // so synthetic summaries cannot interfere with replay detection.
+        const newMessages = params.messages.slice(params.prePromptMessageCount);
+        const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
+          params.sessionId,
+          params.sessionKey,
+          newMessages,
+        );
+
+        const nextIngestBatch: AgentMessage[] = [];
+        if (params.autoCompactionSummary) {
+          nextIngestBatch.push({
+            role: "user",
+            content: params.autoCompactionSummary,
+          } as AgentMessage);
+        }
+
+        nextIngestBatch.push(...dedupedNewMessages);
+        ingestBatch = nextIngestBatch;
+        if (ingestBatch.length === 0) {
+          return;
+        }
+
+        await this.maybeRotateSessionConversation({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          pendingMessageCount: ingestBatch.length,
+        });
+
+        try {
+          await this.ingestBatchLocked({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            messages: ingestBatch,
+            isHeartbeat: params.isHeartbeat === true,
+          });
+        } catch (error) {
+          ingestError = error;
+        }
+      },
     );
 
-    const ingestBatch: AgentMessage[] = [];
-    if (params.autoCompactionSummary) {
-      ingestBatch.push({
-        role: "user",
-        content: params.autoCompactionSummary,
-      } as AgentMessage);
-    }
-
-    ingestBatch.push(...dedupedNewMessages);
     if (ingestBatch.length === 0) {
       this.deps.log.info(
         `[lcm] afterTurn: nothing to ingest ${sessionLabel} newMessages=${newMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
       return;
     }
-
-    await this.maybeRotateSessionConversation({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-      pendingMessageCount: ingestBatch.length,
-    });
-
-    try {
-      await this.ingestBatch({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        messages: ingestBatch,
-        isHeartbeat: params.isHeartbeat === true,
-      });
-    } catch (err) {
+    if (ingestError) {
       // Never compact a stale or partially ingested frontier.
       this.deps.log.error(
-        `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(err)}`,
+        `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(ingestError)}`,
       );
       return;
     }

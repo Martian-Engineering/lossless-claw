@@ -335,6 +335,27 @@
           }
         }
       },
+      "sessionBifurcation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxConversationMessages": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "maxConversationAgeHours": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "minMessagesBeforeAgeSplit": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
       "timezone": {
         "type": "string"
       },

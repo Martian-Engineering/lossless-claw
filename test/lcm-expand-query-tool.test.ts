@@ -1805,6 +1805,122 @@ describe("createLcmExpandQueryTool", () => {
     });
   });
 
+  it("maps multi-segment fallback message hits back to leaf summaries in each conversation", async () => {
+    const retrieval = makeRetrieval();
+    const summaryStore = makeSummaryStore();
+    retrieval.grep
+      .mockResolvedValueOnce({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            messageId: 701,
+            conversationId: 7,
+            role: "user",
+            snippet: "older segment fact",
+            createdAt: new Date("2026-01-01T00:02:00.000Z"),
+          },
+          {
+            messageId: 801,
+            conversationId: 8,
+            role: "assistant",
+            snippet: "newer segment fact",
+            createdAt: new Date("2026-01-02T00:02:00.000Z"),
+          },
+        ],
+        summaries: [],
+        totalMatches: 2,
+      });
+    summaryStore.getConversationMaxSummaryDepth
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(1);
+    summaryStore.getLeafSummaryLinksForMessageIds
+      .mockResolvedValueOnce([
+        {
+          messageId: 701,
+          summaryId: "sum_old",
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          messageId: 801,
+          summaryId: "sum_new",
+        },
+      ]);
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        return { runId: "run-multi-segment-fallback" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Both segments contributed fallback evidence.",
+                    citedIds: ["sum_old", "sum_new"],
+                    expandedSummaryCount: 2,
+                    totalSourceTokens: 1000,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({
+        retrieval,
+        summaryStore,
+        conversationId: 8,
+        conversationFamilyIds: [7, 8],
+      }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-multi-segment-fallback", {
+      query: "segment fact",
+      prompt: "What facts are present?",
+    });
+
+    expect(retrieval.grep).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        scope: "messages",
+        conversationIds: [7, 8],
+      }),
+    );
+    expect(summaryStore.getConversationMaxSummaryDepth).toHaveBeenCalledWith(7);
+    expect(summaryStore.getConversationMaxSummaryDepth).toHaveBeenCalledWith(8);
+    expect(summaryStore.getLeafSummaryLinksForMessageIds).toHaveBeenNthCalledWith(1, 7, [701]);
+    expect(summaryStore.getLeafSummaryLinksForMessageIds).toHaveBeenNthCalledWith(2, 8, [801]);
+
+    expect(result.details).toMatchObject({
+      answer: "Both segments contributed fallback evidence.",
+      citedIds: ["sum_old", "sum_new"],
+      expandedSummaryCount: 2,
+    });
+  });
+
   it("does not fall back to message grep for deep trees", async () => {
     const retrieval = makeRetrieval();
     const summaryStore = makeSummaryStore();

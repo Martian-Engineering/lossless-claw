@@ -701,55 +701,49 @@ async function resolveSummaryCandidates(params: {
     }
 
     if (grepResult.summaries.length === 0 && fallbackConversationIds.length > 0) {
-      const maxDepths = await Promise.all(
-        fallbackConversationIds.map(async (conversationId) => ({
-          conversationId,
-          maxDepth: await summaryStore.getConversationMaxSummaryDepth(conversationId),
-        })),
-      );
-      const allowMessageFallback = maxDepths.every(
-        ({ maxDepth }) => typeof maxDepth === "number" && maxDepth <= 1,
-      );
-      if (allowMessageFallback) {
+      const shallowConversationIds: number[] = [];
+      for (const conversationId of fallbackConversationIds) {
+        const maxDepth = await summaryStore.getConversationMaxSummaryDepth(conversationId);
+        if (typeof maxDepth === "number" && maxDepth <= 1) {
+          shallowConversationIds.push(conversationId);
+        }
+      }
+
+      if (shallowConversationIds.length > 0) {
         const messageResult = await retrieval.grep({
           query: params.query,
           mode: "full_text",
           scope: "messages",
-          conversationId: params.conversationId,
-          conversationIds: params.conversationIds,
+          conversationId: shallowConversationIds.length === 1 ? shallowConversationIds[0] : undefined,
+          conversationIds: shallowConversationIds.length > 1 ? shallowConversationIds : undefined,
         });
+        const summaryIdsByMessageId = new Map<number, string[]>();
         const messageIdsByConversationId = new Map<number, number[]>();
         for (const message of messageResult.messages) {
           const messageIds = messageIdsByConversationId.get(message.conversationId) ?? [];
           messageIds.push(message.messageId);
           messageIdsByConversationId.set(message.conversationId, messageIds);
         }
-        const leafLinksPerConversation = await Promise.all(
-          Array.from(messageIdsByConversationId.entries()).map(async ([conversationId, messageIds]) =>
-            summaryStore.getLeafSummaryLinksForMessageIds(conversationId, messageIds),
-          ),
-        );
-        const leafLinks = leafLinksPerConversation.flat();
-        const messageConversationById = new Map(
-          messageResult.messages.map((message) => [message.messageId, message.conversationId]),
-        );
-        const summaryIdsByMessageId = new Map<number, string[]>();
-        for (const link of leafLinks) {
-          const linkedSummaryIds = summaryIdsByMessageId.get(link.messageId) ?? [];
-          if (!linkedSummaryIds.includes(link.summaryId)) {
-            linkedSummaryIds.push(link.summaryId);
-            summaryIdsByMessageId.set(link.messageId, linkedSummaryIds);
+
+        for (const [conversationId, messageIds] of messageIdsByConversationId) {
+          const leafLinks = await summaryStore.getLeafSummaryLinksForMessageIds(
+            conversationId,
+            messageIds,
+          );
+          for (const link of leafLinks) {
+            const linkedSummaryIds = summaryIdsByMessageId.get(link.messageId) ?? [];
+            if (!linkedSummaryIds.includes(link.summaryId)) {
+              linkedSummaryIds.push(link.summaryId);
+              summaryIdsByMessageId.set(link.messageId, linkedSummaryIds);
+            }
           }
         }
+
         for (const message of messageResult.messages) {
           for (const summaryId of summaryIdsByMessageId.get(message.messageId) ?? []) {
-            const linkedConversationId = messageConversationById.get(message.messageId);
-            if (typeof linkedConversationId !== "number") {
-              continue;
-            }
             upsertSummaryCandidate(candidates, {
               summaryId,
-              conversationId: linkedConversationId,
+              conversationId: message.conversationId,
               requiresMessageExpansion: true,
               isExplicit: false,
               matchedAt: message.createdAt,

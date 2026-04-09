@@ -4966,8 +4966,8 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
     const sessionId = "after-turn-ingest-failure";
 
-    const ingestBatchSpy = vi
-      .spyOn(engine, "ingestBatch")
+    const ingestSingleSpy = vi
+      .spyOn(engine as never, "ingestSingle" as never)
       .mockRejectedValue(new Error("ingest exploded"));
     const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
     const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
@@ -4980,7 +4980,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       tokenBudget: 4096,
     });
 
-    expect(ingestBatchSpy).toHaveBeenCalled();
+    expect(ingestSingleSpy).toHaveBeenCalled();
     expect(evaluateLeafTriggerSpy).not.toHaveBeenCalled();
     expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
     expect(compactSpy).not.toHaveBeenCalled();
