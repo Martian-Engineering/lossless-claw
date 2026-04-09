@@ -124,6 +124,21 @@ describe("LCM tools session scoping", () => {
     resetDelegatedExpansionGrantsForTests();
   });
 
+  it("lcm_grep metadata explains focused FTS5 query construction", () => {
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+    });
+
+    expect(tool.description).toContain("queries use FTS5 AND semantics by default");
+    const patternDescription = (
+      tool.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties.pattern?.description;
+    expect(patternDescription).toContain("FTS5 defaults to AND matching");
+    expect(patternDescription).toContain("prefer 1-3 distinctive terms or one quoted multi-word phrase");
+  });
+
   it("lcm_expand query mode infers conversationId from delegated grant", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({

@@ -25,7 +25,7 @@ function formatDisplayTime(
 const LcmGrepSchema = Type.Object({
   pattern: Type.String({
     description:
-      'Search pattern. Interpreted as regex when mode is "regex", or as a text query for "full_text" mode. In full_text mode, wrap exact multi-word phrases in quotes to preserve phrase matching.',
+      'Search pattern. Interpreted as regex when mode is "regex", or as an FTS5 text query when mode is "full_text". In full_text mode, FTS5 defaults to AND matching, so prefer 1-3 distinctive terms or one quoted multi-word phrase instead of padding with synonyms or extra keywords.',
   }),
   mode: Type.Optional(
     Type.String({
@@ -101,7 +101,7 @@ export function createLcmGrepTool(input: {
       "Search compacted conversation history using regex or full-text search. " +
       "Searches across messages and/or summaries stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
-      "active context. In full_text mode, quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. Returns matching snippets with their summary/message IDs " +
+      "active context. In full_text mode, queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. Returns matching snippets with their summary/message IDs " +
       "for follow-up with lcm_expand or lcm_describe.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {

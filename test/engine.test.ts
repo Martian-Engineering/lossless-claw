@@ -3285,6 +3285,9 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(promptAddition).toContain("quote exact multi-word phrases");
     expect(promptAddition).toContain("use `sort: \"relevance\"` for older-topic retrieval");
     expect(promptAddition).toContain("use `sort: \"hybrid\"` when recency should still influence ranking");
+    expect(promptAddition).toContain("uses the same FTS5 full-text search rules as `lcm_grep`");
+    expect(promptAddition).toContain("terms are ANDed by default");
+    expect(promptAddition).toContain("put the natural-language question in `prompt`");
     expect(promptAddition).toContain("Uncertainty checklist");
     expect(promptAddition).toContain("Am I making an exact factual claim from a compressed or condensed summary?");
     expect(promptAddition).toContain("Could compaction have omitted a crucial detail?");

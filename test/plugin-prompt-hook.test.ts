@@ -128,6 +128,8 @@ describe("lcm plugin prompt hook", () => {
     expect(result.prependSystemContext).toContain("1. `lcm_grep` — search by regex or full-text");
     expect(result.prependSystemContext).toContain("`lcm_grep` routing guidance");
     expect(result.prependSystemContext).toContain('Prefer `mode: "full_text"` for keyword or topical recall');
+    expect(result.prependSystemContext).toContain("FTS5 defaults to AND matching");
+    expect(result.prependSystemContext).toContain("Prefer 1-3 distinctive full-text terms or one quoted phrase");
     expect(result.prependSystemContext).toContain('Wrap exact multi-word phrases in quotes');
     expect(result.prependSystemContext).toContain('Use `sort: "relevance"` when hunting for the best older match');
     expect(result.prependSystemContext).toContain('Use `sort: "hybrid"` when relevance matters but newer context should still get a boost');
@@ -140,6 +142,15 @@ describe("lcm plugin prompt hook", () => {
     );
     expect(result.prependSystemContext).toContain(
       "lcm_expand_query(summaryIds: [\"sum_xxx\"], prompt: \"What config changes were discussed?\")",
+    );
+    expect(result.prependSystemContext).toContain(
+      "`query` uses the same FTS5 full-text search path as `lcm_grep`",
+    );
+    expect(result.prependSystemContext).toContain(
+      "`query` is for matching candidate summaries; `prompt` is the natural-language question or task",
+    );
+    expect(result.prependSystemContext).toContain(
+      "For `query`, use 1-3 distinctive terms or a quoted phrase",
     );
     expect(result.prependSystemContext).toContain(
       "Lossless-claw does not supersede memory tools globally",

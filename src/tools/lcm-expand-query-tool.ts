@@ -36,11 +36,12 @@ const LcmExpandQuerySchema = Type.Object({
   query: Type.Optional(
     Type.String({
       description:
-        "Text query used to find summaries via grep before expansion. Required when summaryIds is not provided.",
+        "FTS5 query used to find summaries via the same full-text search path as lcm_grep before expansion. Use 1-3 distinctive terms or a quoted phrase; FTS5 defaults to AND matching, so extra terms make matches stricter. Required when summaryIds is not provided.",
     }),
   ),
   prompt: Type.String({
-    description: "Question to answer using expanded context.",
+    description:
+      "Natural-language question or task to answer using expanded context. Put the answer request here, not in query.",
   }),
   conversationId: Type.Optional(
     Type.Number({
@@ -461,8 +462,8 @@ export function createLcmExpandQueryTool(input: {
     name: "lcm_expand_query",
     label: "LCM Expand Query",
     description:
-      "Answer a focused question using delegated LCM expansion. " +
-      "Find candidate summaries (by IDs or query), expand them in a delegated sub-agent, " +
+      "Answer a focused natural-language question using delegated LCM expansion. " +
+      "Find candidate summaries (by IDs or a short FTS5 query that follows the same full-text rules as lcm_grep), expand them in a delegated sub-agent, " +
       "and return a compact prompt-focused answer. Tool output includes cited summary IDs for follow-up.",
     parameters: LcmExpandQuerySchema,
     async execute(_toolCallId, params) {

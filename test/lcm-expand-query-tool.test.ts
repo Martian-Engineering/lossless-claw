@@ -159,6 +159,24 @@ describe("createLcmExpandQueryTool", () => {
     resetExpansionDelegationGuardForTests();
   });
 
+  it("describes query and prompt roles for focused FTS expansion", () => {
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+    });
+
+    expect(tool.description).toContain("focused natural-language question");
+    expect(tool.description).toContain("same full-text rules as lcm_grep");
+    const properties = (
+      tool.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties;
+    expect(properties.query?.description).toContain("same full-text search path as lcm_grep");
+    expect(properties.query?.description).toContain("FTS5 defaults to AND matching");
+    expect(properties.query?.description).toContain("Use 1-3 distinctive terms or a quoted phrase");
+    expect(properties.prompt?.description).toContain("Put the answer request here, not in query");
+  });
+
   it("returns a focused delegated answer for explicit summaryIds", async () => {
     const retrieval = makeRetrieval();
     retrieval.describe.mockResolvedValue({

@@ -98,6 +98,7 @@ function buildSystemPromptAddition(summarySignals: SummaryPromptSignal[]): strin
       "Keep raw summary IDs in tool context for follow-up; do not include them in the user-facing answer unless the user asks for sources or IDs.",
       "",
       "`lcm_grep` tips: prefer `mode: \"full_text\"` for keyword/topic lookup, quote exact multi-word phrases, use `sort: \"relevance\"` for older-topic retrieval, and use `sort: \"hybrid\"` when recency should still influence ranking.",
+      "`lcm_expand_query(query: ...)` uses the same FTS5 full-text search rules as `lcm_grep`: terms are ANDed by default, so extra query words narrow results. Keep `query` to 1-3 distinctive terms or a quoted phrase, and put the natural-language question in `prompt`.",
       "",
       "**Uncertainty checklist (run before answering):**",
       "- Am I making an exact factual claim from a compressed or condensed summary?",
