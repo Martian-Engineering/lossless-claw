@@ -127,8 +127,8 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
           "ignoreSessionPatterns": [
             "agent:*:cron:**"
           ],
-          "summaryModel": "anthropic/claude-haiku-4-5",
-          "expansionModel": "anthropic/claude-haiku-4-5",
+          "summaryModel": "openai/gpt-5.4-mini",
+          "expansionModel": "openai/gpt-5.4-mini",
           "delegationTimeoutMs": 300000,
           "summaryTimeoutMs": 60000
         }
@@ -166,7 +166,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_SUMMARY_MODEL` | `""` | Model override for compaction summarization; falls back to OpenClaw's default model when unset |
 | `LCM_SUMMARY_PROVIDER` | `""` | Provider override for compaction summarization; falls back to `OPENCLAW_PROVIDER` or the provider embedded in the model ref |
 | `LCM_SUMMARY_BASE_URL` | *(from OpenClaw / provider default)* | Base URL override for summarization API calls |
-| `LCM_EXPANSION_MODEL` | *(from OpenClaw)* | Model override for `lcm_expand_query` sub-agent (e.g. `anthropic/claude-haiku-4-5`) |
+| `LCM_EXPANSION_MODEL` | *(from OpenClaw)* | Model override for `lcm_expand_query` sub-agent (e.g. `openai/gpt-5.4-mini`) |
 | `LCM_EXPANSION_PROVIDER` | *(from OpenClaw)* | Provider override for `lcm_expand_query` sub-agent |
 | `LCM_DELEGATION_TIMEOUT_MS` | `120000` | Max time to wait for delegated `lcm_expand_query` sub-agent completion |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Max time to wait for a single model-backed LCM summarizer call |
@@ -175,6 +175,8 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 ### Expansion model override requirements
 
 If you want `lcm_expand_query` to run on a dedicated model via `expansionModel` or `LCM_EXPANSION_MODEL`, OpenClaw must explicitly trust the plugin to request sub-agent model overrides.
+
+For most setups, `openai/gpt-5.4-mini` is a better starting point than Anthropic Haiku because it is cheap, fast, and does not depend on Anthropic quota remaining.
 
 Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the canonical `provider/model` target you want the plugin to use:
 
@@ -229,6 +231,8 @@ For compaction summarization, lossless-claw resolves the model in this order:
 
 If `summaryModel` already includes a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that choice. Otherwise, the provider falls back to the matching override, then `OPENCLAW_PROVIDER`, then the provider inferred by the caller.
 
+Runtime-managed OAuth providers are supported here too. In particular, `openai-codex` and `github-copilot` auth profiles can be used for summary and expansion calls without a separate API key.
+
 ### Recommended starting configuration
 
 ```
@@ -236,6 +240,8 @@ LCM_FRESH_TAIL_COUNT=64
 LCM_LEAF_CHUNK_TOKENS=20000
 LCM_INCREMENTAL_MAX_DEPTH=1
 LCM_CONTEXT_THRESHOLD=0.75
+LCM_SUMMARY_MODEL=openai/gpt-5.4-mini
+LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
 ```
 
 - **freshTailCount=64** protects the last 64 messages from compaction, giving the model more recent context for continuity.
