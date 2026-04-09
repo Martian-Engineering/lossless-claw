@@ -546,7 +546,6 @@ describe("runLcmMigrations summary depth backfill", () => {
       },
     ]);
   });
-
   it("creates conversation bootstrap state storage", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
     tempDirs.push(tempDir);

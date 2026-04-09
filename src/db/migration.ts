@@ -809,5 +809,11 @@ export function runLcmMigrations(
       `,
       expectedColumns: ["summary_id", "content"],
     });
+  } else {
+    try {
+      db.exec(`DROP TABLE IF EXISTS summaries_fts_cjk`);
+    } catch {
+      // Best effort only. A stale virtual table should not block core migration.
+    }
   }
 }
