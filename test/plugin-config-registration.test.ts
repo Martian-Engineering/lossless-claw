@@ -499,8 +499,16 @@ describe("lcm plugin registration", () => {
     const firstSessionMessages = first.sessionInfoLog.mock.calls.map(([message]) => message);
     const secondSessionMessages = second.sessionInfoLog.mock.calls.map(([message]) => message);
     const debugMessages = first.debugLog.mock.calls.map(([message]) => message);
+    const startupBannerMessages = [...firstMessages, ...secondMessages].filter((message) =>
+      [
+        "[lcm] Plugin loaded (enabled=true, db=",
+        "[lcm] Compaction summarization model:",
+        "[lcm] Ignoring sessions matching ",
+        "[lcm] Stateless session patterns:",
+      ].some((prefix) => message.startsWith(prefix)),
+    );
 
-    expect([...firstMessages, ...secondMessages].sort()).toEqual([
+    expect(startupBannerMessages.sort()).toEqual([
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
       "[lcm] Compaction summarization model: (unconfigured)",
       "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",

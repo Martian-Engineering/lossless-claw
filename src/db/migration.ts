@@ -2,6 +2,10 @@ import type { DatabaseSync } from "node:sqlite";
 import { getLcmDbFeatures } from "./features.js";
 import { parseUtcTimestampOrNull } from "../store/parse-utc-timestamp.js";
 
+type MigrationLogger = {
+  info?: (message: string) => void;
+};
+
 type SummaryColumnInfo = {
   name?: string;
 };
@@ -116,6 +120,29 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
     db.exec(
       `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_activity_band TEXT NOT NULL DEFAULT 'low' CHECK (last_activity_band IN ('low', 'medium', 'high'))`,
     );
+  }
+}
+
+function describeMigrationError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function runMigrationStep(
+  name: string,
+  log: MigrationLogger | undefined,
+  step: () => void,
+): void {
+  const startedAt = Date.now();
+  try {
+    step();
+    log?.info?.(
+      `[lcm] migration step complete: step=${name} durationMs=${Date.now() - startedAt}`,
+    );
+  } catch (error) {
+    log?.info?.(
+      `[lcm] migration step failed: step=${name} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
+    );
+    throw error;
   }
 }
 
@@ -536,8 +563,9 @@ function ensureStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec): void {
 
 export function runLcmMigrations(
   db: DatabaseSync,
-  options?: { fts5Available?: boolean },
+  options?: { fts5Available?: boolean; log?: MigrationLogger },
 ): void {
+  const log = options?.log;
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -735,16 +763,24 @@ export function runLcmMigrations(
     ON conversations (session_key, active, created_at)
   `);
   db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
-  ensureSummaryDepthColumn(db);
-  ensureSummaryMetadataColumns(db);
-  ensureSummaryModelColumn(db);
-  ensureCompactionTelemetryColumns(db);
-  backfillSummaryDepths(db);
+  runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
+  runMigrationStep("ensureSummaryMetadataColumns", log, () =>
+    ensureSummaryMetadataColumns(db),
+  );
+  runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
+  runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
+    ensureCompactionTelemetryColumns(db),
+  );
+  runMigrationStep("backfillSummaryDepths", log, () => backfillSummaryDepths(db));
   // Index on depth — created AFTER backfillSummaryDepths to avoid index
   // maintenance overhead during bulk depth updates on large existing DBs.
-  db.exec(`CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`);
-  backfillSummaryMetadata(db);
-  backfillToolCallColumns(db);
+  runMigrationStep("createSummariesDepthIndex", log, () =>
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
+    ),
+  );
+  runMigrationStep("backfillSummaryMetadata", log, () => backfillSummaryMetadata(db));
+  runMigrationStep("backfillToolCallColumns", log, () => backfillToolCallColumns(db));
 
   const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
   const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
@@ -761,40 +797,45 @@ export function runLcmMigrations(
     }
   }
 
-  ensureStandaloneFtsTable(db, {
-    tableName: "messages_fts",
-    createSql: `
-      CREATE VIRTUAL TABLE messages_fts USING fts5(
-        content,
-        tokenize='porter unicode61'
-      )
-    `,
-    seedSql: `
-      INSERT INTO messages_fts(rowid, content)
-      SELECT message_id, content FROM messages
-    `,
-    expectedColumns: ["content"],
-    staleSchemaPatterns: ["content_rowid"],
+  // FTS5 virtual tables for full-text search (cannot use IF NOT EXISTS, so check manually)
+  runMigrationStep("ensureMessagesFts", log, () => {
+    ensureStandaloneFtsTable(db, {
+      tableName: "messages_fts",
+      createSql: `
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+          content,
+          tokenize='porter unicode61'
+        )
+      `,
+      seedSql: `
+        INSERT INTO messages_fts(rowid, content)
+        SELECT message_id, content FROM messages
+      `,
+      expectedColumns: ["content"],
+      staleSchemaPatterns: ["content_rowid"],
+    });
   });
 
-  ensureStandaloneFtsTable(db, {
-    tableName: "summaries_fts",
-    createSql: `
-      CREATE VIRTUAL TABLE summaries_fts USING fts5(
-        summary_id UNINDEXED,
-        content,
-        tokenize='porter unicode61'
-      )
-    `,
-    seedSql: `
-      INSERT INTO summaries_fts(summary_id, content)
-      SELECT summary_id, content FROM summaries
-    `,
-    expectedColumns: ["summary_id", "content"],
-    staleSchemaPatterns: [
-      "content_rowid='summary_id'",
-      'content_rowid="summary_id"',
-    ],
+  runMigrationStep("ensureSummariesFts", log, () => {
+    ensureStandaloneFtsTable(db, {
+      tableName: "summaries_fts",
+      createSql: `
+        CREATE VIRTUAL TABLE summaries_fts USING fts5(
+          summary_id UNINDEXED,
+          content,
+          tokenize='porter unicode61'
+        )
+      `,
+      seedSql: `
+        INSERT INTO summaries_fts(summary_id, content)
+        SELECT summary_id, content FROM summaries
+      `,
+      expectedColumns: ["summary_id", "content"],
+      staleSchemaPatterns: [
+        "content_rowid='summary_id'",
+        'content_rowid="summary_id"',
+      ],
+    });
   });
 
   // ── CJK trigram FTS table ────────────────────────────────────────────────
@@ -805,27 +846,23 @@ export function runLcmMigrations(
   //
   // A trigram-tokenized table indexes every 3-character substring, enabling
   // native CJK substring matching via FTS5 MATCH with OR semantics.
-  if (trigramTokenizerAvailable) {
-    ensureStandaloneFtsTable(db, {
-      tableName: "summaries_fts_cjk",
-      createSql: `
-        CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
-          summary_id UNINDEXED,
-          content,
-          tokenize='trigram'
-        )
-      `,
-      seedSql: `
-        INSERT INTO summaries_fts_cjk(summary_id, content)
-        SELECT summary_id, content FROM summaries
-      `,
-      expectedColumns: ["summary_id", "content"],
-    });
-  } else {
-    try {
-      db.exec(`DROP TABLE IF EXISTS summaries_fts_cjk`);
-    } catch {
-      // Best effort only. A stale virtual table should not block core migration.
+  runMigrationStep("ensureSummariesFtsCjk", log, () => {
+    if (trigramTokenizerAvailable) {
+      ensureStandaloneFtsTable(db, {
+        tableName: "summaries_fts_cjk",
+        createSql: `
+          CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
+            summary_id UNINDEXED,
+            content,
+            tokenize='trigram'
+          )
+        `,
+        seedSql: `
+          INSERT INTO summaries_fts_cjk(summary_id, content)
+          SELECT summary_id, content FROM summaries
+        `,
+        expectedColumns: ["summary_id", "content"],
+      });
     }
-  }
+  });
 }
