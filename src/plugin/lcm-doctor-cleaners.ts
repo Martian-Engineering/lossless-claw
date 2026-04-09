@@ -49,6 +49,8 @@ type CleanerExampleRow = {
   first_message_preview: string | null;
 };
 
+const SCAN_FIRST_MESSAGE_PREVIEW_LIMIT = 256;
+
 const CLEANER_DEFINITIONS: CleanerDefinition[] = [
   {
     id: "archived_subagents",
@@ -127,6 +129,9 @@ function dropTempCleanerScanTables(db: DatabaseSync): void {
 
 function stageCleanerScanTables(db: DatabaseSync, definitions: CleanerDefinition[]): void {
   dropTempCleanerScanTables(db);
+  if (definitions.length === 0) {
+    return;
+  }
   db.exec(`
     CREATE TEMP TABLE doctor_cleaner_scan_message_stats (
       conversation_id INTEGER PRIMARY KEY,
@@ -138,7 +143,7 @@ function stageCleanerScanTables(db: DatabaseSync, definitions: CleanerDefinition
     WITH ranked_messages AS (
       SELECT
         m.conversation_id,
-        m.content,
+        substr(m.content, 1, ${SCAN_FIRST_MESSAGE_PREVIEW_LIMIT}) AS content,
         ROW_NUMBER() OVER (
           PARTITION BY m.conversation_id
           ORDER BY m.seq ASC, m.created_at ASC, m.message_id ASC
@@ -165,9 +170,6 @@ function stageCleanerScanTables(db: DatabaseSync, definitions: CleanerDefinition
       PRIMARY KEY (filter_id, conversation_id)
     ) WITHOUT ROWID
   `);
-  if (definitions.length === 0) {
-    return;
-  }
   const matchedConversationsSql = buildMatchedConversationsSql({
     definitions,
     includeFilterId: true,
@@ -192,8 +194,15 @@ export function scanDoctorCleaners(
   filterIds?: DoctorCleanerId[],
 ): DoctorCleanerScan {
   const definitions = getCleanerDefinitions(filterIds);
-  stageCleanerScanTables(db, definitions);
+  if (definitions.length === 0) {
+    return {
+      filters: [],
+      totalDistinctConversations: 0,
+      totalDistinctMessages: 0,
+    };
+  }
   try {
+    stageCleanerScanTables(db, definitions);
     const counts = db
       .prepare(
         `WITH filter_counts AS (
