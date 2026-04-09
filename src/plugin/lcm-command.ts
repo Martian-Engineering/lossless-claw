@@ -452,7 +452,7 @@ function buildDoctorCleanerExampleLine(params: {
   firstMessagePreview: string | null;
 }): string {
   const sessionKey = params.sessionKey ? formatCommand(truncateMiddle(params.sessionKey, 44)) : "missing";
-  const preview = params.firstMessagePreview ? ` · first: "${params.firstMessagePreview}"` : "";
+  const preview = params.firstMessagePreview ? ` · first: ${JSON.stringify(params.firstMessagePreview)}` : "";
   return `conv ${formatNumber(params.conversationId)} · session key ${sessionKey} · messages ${formatNumber(params.messageCount)}${preview}`;
 }
 
