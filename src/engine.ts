@@ -1227,6 +1227,7 @@ export class LcmContextEngine implements ContextEngine {
 
   // ── Circuit breaker for compaction auth failures ──
   private circuitBreakerStates = new Map<string, CircuitBreakerState>();
+  private bifurcationMessageCountCache = new Map<number, number>();
 
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
@@ -2051,22 +2052,43 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  private async getConversationMessageCountForBifurcation(
+    conversationId: number,
+  ): Promise<number> {
+    const cached = this.bifurcationMessageCountCache.get(conversationId);
+    if (typeof cached === "number") {
+      return cached;
+    }
+
+    const stats = await this.conversationStore.getConversationSegmentStats(conversationId);
+    this.bifurcationMessageCountCache.set(conversationId, stats.messageCount);
+    return stats.messageCount;
+  }
+
+  private primeBifurcationMessageCount(conversationId: number, messageCount: number): void {
+    this.bifurcationMessageCountCache.set(conversationId, Math.max(0, Math.trunc(messageCount)));
+  }
+
+  private clearBifurcationMessageCount(conversationId: number): void {
+    this.bifurcationMessageCountCache.delete(conversationId);
+  }
+
   private async maybeRotateSessionConversation(params: {
     sessionId: string;
     sessionKey?: string;
     pendingMessageCount: number;
-  }): Promise<void> {
+  }): Promise<{ conversationId: number; messageCountBeforeIngest: number } | null> {
     const bifurcation = this.config.sessionBifurcation;
     if (!bifurcation.enabled) {
-      return;
+      return null;
     }
     if (params.pendingMessageCount <= 0) {
-      return;
+      return null;
     }
 
     const normalizedSessionKey = params.sessionKey?.trim();
     if (!normalizedSessionKey || this.shouldSkipSessionBifurcation(normalizedSessionKey)) {
-      return;
+      return null;
     }
 
     const activeConversation = await this.conversationStore.getConversationForSession({
@@ -2074,40 +2096,52 @@ export class LcmContextEngine implements ContextEngine {
       sessionKey: normalizedSessionKey,
     });
     if (!activeConversation?.active) {
-      return;
+      return null;
     }
 
-    const stats = await this.conversationStore.getConversationSegmentStats(
+    const currentMessageCount = await this.getConversationMessageCountForBifurcation(
       activeConversation.conversationId,
     );
-    if (stats.messageCount <= 0) {
-      return;
+    if (currentMessageCount <= 0) {
+      return {
+        conversationId: activeConversation.conversationId,
+        messageCountBeforeIngest: 0,
+      };
     }
 
     const ageHours = Math.max(
       0,
       (Date.now() - activeConversation.createdAt.getTime()) / (60 * 60 * 1000),
     );
-    const projectedMessageCount = stats.messageCount + params.pendingMessageCount;
+    const projectedMessageCount = currentMessageCount + params.pendingMessageCount;
     const hitMessageLimit = projectedMessageCount > bifurcation.maxConversationMessages;
     const hitAgeLimit =
       projectedMessageCount >= bifurcation.minMessagesBeforeAgeSplit &&
       ageHours >= bifurcation.maxConversationAgeHours;
 
     if (!hitMessageLimit && !hitAgeLimit) {
-      return;
+      return {
+        conversationId: activeConversation.conversationId,
+        messageCountBeforeIngest: currentMessageCount,
+      };
     }
 
     await this.conversationStore.archiveConversation(activeConversation.conversationId);
-    await this.conversationStore.createConversation({
+    this.clearBifurcationMessageCount(activeConversation.conversationId);
+    const nextConversation = await this.conversationStore.createConversation({
       sessionId: params.sessionId,
       sessionKey: normalizedSessionKey,
       title: activeConversation.title ?? undefined,
     });
+    this.primeBifurcationMessageCount(nextConversation.conversationId, 0);
 
     this.deps.log.info(
-      `[lcm] session bifurcation: archived conversation=${activeConversation.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} messageCount=${stats.messageCount} projectedMessageCount=${projectedMessageCount} ageHours=${ageHours.toFixed(1)} reason=${hitMessageLimit ? "message-threshold" : "age-threshold"}`,
+      `[lcm] session bifurcation: archived conversation=${activeConversation.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} messageCount=${currentMessageCount} projectedMessageCount=${projectedMessageCount} ageHours=${ageHours.toFixed(1)} reason=${hitMessageLimit ? "message-threshold" : "age-threshold"}`,
     );
+    return {
+      conversationId: nextConversation.conversationId,
+      messageCountBeforeIngest: 0,
+    };
   }
 
   /** Format stable session identifiers for LCM diagnostic logs. */
@@ -3452,7 +3486,7 @@ export class LcmContextEngine implements ContextEngine {
           return;
         }
 
-        await this.maybeRotateSessionConversation({
+        const bifurcationPlan = await this.maybeRotateSessionConversation({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
           pendingMessageCount: ingestBatch.length,
@@ -3465,6 +3499,12 @@ export class LcmContextEngine implements ContextEngine {
             messages: ingestBatch,
             isHeartbeat: params.isHeartbeat === true,
           });
+          if (bifurcationPlan) {
+            this.primeBifurcationMessageCount(
+              bifurcationPlan.conversationId,
+              bifurcationPlan.messageCountBeforeIngest + ingestBatch.length,
+            );
+          }
         } catch (error) {
           ingestError = error;
         }

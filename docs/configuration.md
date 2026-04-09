@@ -57,6 +57,12 @@ Most installations only need to override a handful of keys. If you want a comple
   "dynamicLeafChunkTokens": {
     "enabled": true,
     "max": 40000
+  },
+  "sessionBifurcation": {
+    "enabled": false,
+    "maxConversationMessages": 50000,
+    "maxConversationAgeHours": 168,
+    "minMessagesBeforeAgeSplit": 2000
   }
 }
 ```
@@ -166,6 +172,15 @@ openclaw plugins install --link /path/to/lossless-claw
 | `dynamicLeafChunkTokens.enabled` | `boolean` | `true` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED` | Enables dynamic working leaf chunk sizes for busier sessions. |
 | `dynamicLeafChunkTokens.max` | `integer` | `max(leafChunkTokens, floor(leafChunkTokens * 2))` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX` | Upper bound for the dynamic working chunk size. With the default `leafChunkTokens=20000`, this resolves to `40000`. |
 
+#### `sessionBifurcation`
+
+| Key | Type | Default | Env override | Purpose |
+| --- | --- | --- | --- | --- |
+| `sessionBifurcation.enabled` | `boolean` | `false` | `LCM_SESSION_BIFURCATION_ENABLED` | Enables optional rotation for very long-lived sessions while keeping the same user-facing session key active. |
+| `sessionBifurcation.maxConversationMessages` | `integer` | `50000` | `LCM_SESSION_BIFURCATION_MAX_MESSAGES` | Hard message-count ceiling for one physical conversation segment before LCM archives it and starts a fresh segment. |
+| `sessionBifurcation.maxConversationAgeHours` | `integer` | `168` | `LCM_SESSION_BIFURCATION_MAX_AGE_HOURS` | Age ceiling, in hours, for one physical segment before LCM can rotate it. The default is seven days. |
+| `sessionBifurcation.minMessagesBeforeAgeSplit` | `integer` | `2000` | `LCM_SESSION_BIFURCATION_MIN_MESSAGES` | Minimum projected message count required before the age-based rotation path is allowed to split a session. |
+
 ### Cache-aware incremental compaction
 
 When cache-aware compaction is enabled:
@@ -176,6 +191,16 @@ When cache-aware compaction is enabled:
 - cold cache still allows bounded catch-up passes via `cacheAwareCompaction.maxColdCacheCatchupPasses`
 
 When incremental leaf compaction still runs on a hot cache, follow-on condensed passes are suppressed so the maintenance cycle only pays for the leaf pass that was explicitly justified.
+
+### Session bifurcation
+
+When `sessionBifurcation.enabled` is on, LCM evaluates rotation during `afterTurn` before new messages are persisted.
+
+- Message threshold: if the active segment would exceed `maxConversationMessages` after the current turn, LCM archives that segment and creates a fresh active one under the same session key.
+- Age threshold: if the active segment is older than `maxConversationAgeHours` and the projected message count is at least `minMessagesBeforeAgeSplit`, LCM rotates before ingesting the new turn.
+- Exclusions: cron and main-subagent session keys are intentionally skipped so maintenance workers and delegated child runs do not fragment unexpectedly.
+
+This setting is off by default because it changes storage layout. When enabled, session-family-aware retrieval treats archived and active segments as one logical session for tools that support family scope.
 
 ## Behavior notes
 

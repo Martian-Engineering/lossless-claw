@@ -100,6 +100,11 @@ export type MessageSearchInput = {
   sort?: SearchSort;
 };
 
+export type ConversationSegmentStats = {
+  messageCount: number;
+  latestMessageAt: Date | null;
+};
+
 export type MessageSearchResult = {
   messageId: MessageId;
   conversationId: ConversationId;
@@ -164,6 +169,10 @@ interface MaxSeqRow {
   max_seq: number;
 }
 
+interface ConversationSegmentStatsRow {
+  message_count: number | null;
+  latest_message_at: string | null;
+}
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
 function toConversationRecord(row: ConversationRow): ConversationRecord {
@@ -715,6 +724,24 @@ export class ConversationStore {
     return row?.count ?? 0;
   }
 
+  async getConversationSegmentStats(
+    conversationId: ConversationId,
+  ): Promise<ConversationSegmentStats> {
+    const row = this.db
+      .prepare(
+        `SELECT
+           COUNT(*) AS message_count,
+           MAX(created_at) AS latest_message_at
+         FROM messages
+         WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as unknown as ConversationSegmentStatsRow | undefined;
+
+    return {
+      messageCount: row?.message_count ?? 0,
+      latestMessageAt: parseUtcTimestampOrNull(row?.latest_message_at),
+    };
+  }
   async getMaxSeq(conversationId: ConversationId): Promise<number> {
     const row = this.db
       .prepare(

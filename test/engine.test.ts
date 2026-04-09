@@ -1351,6 +1351,55 @@ describe("LcmContextEngine session bifurcation", () => {
     expect(currentConversation?.conversationId).toBe(originalConversation?.conversationId);
     expect(currentMessages.map((message) => message.content)).toEqual(["cron A", "cron B"]);
   });
+
+  it("reuses cached segment counts between turns when bifurcation stays on the same conversation", async () => {
+    const engine = createEngineWithConfig({
+      sessionBifurcation: {
+        enabled: true,
+        maxConversationMessages: 100,
+        maxConversationAgeHours: 168,
+        minMessagesBeforeAgeSplit: 2,
+      },
+    });
+    const store = engine.getConversationStore();
+    const statsSpy = vi.spyOn(store, "getConversationSegmentStats");
+    const sessionKey = "agent:main:main";
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-cache",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-cache-a"),
+      messages: [
+        makeMessage({ role: "user", content: "cache A" }),
+        makeMessage({ role: "assistant", content: "cache B" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-cache",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-cache-b"),
+      messages: [
+        makeMessage({ role: "user", content: "cache A" }),
+        makeMessage({ role: "assistant", content: "cache B" }),
+        makeMessage({ role: "user", content: "cache C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const currentConversation = await store.getConversationBySessionKey(sessionKey);
+    const currentMessages = await store.getMessages(currentConversation!.conversationId);
+
+    expect(statsSpy).toHaveBeenCalledTimes(1);
+    expect(currentMessages.map((message) => message.content)).toEqual([
+      "cache A",
+      "cache B",
+      "cache C",
+    ]);
+  });
 });
 
 describe("LcmContextEngine delegated session continuity", () => {
