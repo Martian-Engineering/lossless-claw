@@ -708,7 +708,7 @@ async function resolveSummaryCandidates(params: {
         })),
       );
       const allowMessageFallback = maxDepths.every(
-        ({ maxDepth }) => typeof maxDepth !== "number" || maxDepth <= 1,
+        ({ maxDepth }) => typeof maxDepth === "number" && maxDepth <= 1,
       );
       if (allowMessageFallback) {
         const messageResult = await retrieval.grep({
