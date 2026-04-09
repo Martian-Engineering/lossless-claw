@@ -221,6 +221,7 @@ describe("lcm plugin registration", () => {
   it.each([
     ["missing", undefined],
     ["invalid", ["not-a-plugin-config"]],
+    ["empty", {}],
   ])(
     "falls back to root plugin config when api.pluginConfig is %s",
     (_label, pluginConfig) => {

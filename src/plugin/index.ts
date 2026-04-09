@@ -182,7 +182,7 @@ function toPluginConfig(value: unknown): Record<string, unknown> | undefined {
 /** Resolve plugin config from direct runtime injection or the root OpenClaw config fallback. */
 function resolvePluginConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {
   const directPluginConfig = toPluginConfig(api.pluginConfig);
-  if (directPluginConfig) {
+  if (directPluginConfig && Object.keys(directPluginConfig).length > 0) {
     return directPluginConfig;
   }
 
