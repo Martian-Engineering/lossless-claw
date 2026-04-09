@@ -316,7 +316,7 @@ describe("runLcmMigrations summary depth backfill", () => {
 
     const dbWithBrokenSummariesProbe = {
       prepare(sql: string) {
-        if (sql === "PRAGMA table_info(summaries_fts)") {
+        if (sql.startsWith("PRAGMA table_info(") && sql.includes("summaries_fts")) {
           throw new Error("malformed database schema (1)");
         }
         return db.prepare(sql);
@@ -440,8 +440,6 @@ describe("runLcmMigrations summary depth backfill", () => {
 
     expect(row).toBeUndefined();
   });
-
-<<<<<<< HEAD
   it("drops stale summaries_fts_cjk before probing other standalone FTS tables", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
     tempDirs.push(tempDir);
