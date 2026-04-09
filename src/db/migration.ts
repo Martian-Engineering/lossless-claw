@@ -789,6 +789,14 @@ export function runLcmMigrations(
   }
 
   const trigramTokenizerAvailable = detectedFeatures?.trigramTokenizerAvailable ?? false;
+  if (!trigramTokenizerAvailable) {
+    try {
+      db.exec(`DROP TABLE IF EXISTS summaries_fts_cjk`);
+    } catch {
+      // Best effort only. A stale virtual table should not block core migration.
+    }
+  }
+
   // FTS5 virtual tables for full-text search (cannot use IF NOT EXISTS, so check manually)
   runMigrationStep("ensureMessagesFts", log, () => {
     ensureStandaloneFtsTable(db, {
@@ -855,12 +863,6 @@ export function runLcmMigrations(
         `,
         expectedColumns: ["summary_id", "content"],
       });
-    } else {
-      try {
-        db.exec(`DROP TABLE IF EXISTS summaries_fts_cjk`);
-      } catch {
-        // Best effort only. A stale virtual table should not block core migration.
-      }
     }
   });
 }
