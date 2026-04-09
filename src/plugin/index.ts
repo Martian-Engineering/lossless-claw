@@ -604,7 +604,13 @@ function buildModelAuthLookupModel(params: {
   provider: string;
   model: string;
   api?: string;
+  contextWindow?: number;
 }): RuntimeModelAuthModel {
+  const contextWindow =
+    typeof params.contextWindow === "number" && Number.isFinite(params.contextWindow) && params.contextWindow > 0
+      ? params.contextWindow
+      : 1_000_000;
+
   return {
     id: params.model,
     name: params.model,
@@ -618,7 +624,7 @@ function buildModelAuthLookupModel(params: {
       cacheRead: 0,
       cacheWrite: 0,
     },
-    contextWindow: 200_000,
+    contextWindow,
     maxTokens: 8_000,
   };
 }
@@ -1260,7 +1266,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       try {
         const modelAuthKey = resolveApiKeyFromAuthResult(
           await modelAuth.getApiKeyForModel({
-            model: buildModelAuthLookupModel({ provider, model }),
+            model: buildModelAuthLookupModel({ provider, model, contextWindow: 1_000_000 }),
             cfg: modelAuthConfig,
             ...(options?.profileId ? { profileId: options.profileId } : {}),
             ...(options?.preferredProfile ? { preferredProfile: options.preferredProfile } : {}),
@@ -1413,7 +1419,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                   cacheRead: 0,
                   cacheWrite: 0,
                 },
-                contextWindow: 200_000,
+                contextWindow: 1_000_000,
                 maxTokens: 8_000,
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
@@ -1433,6 +1439,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 provider: providerId,
                 model: modelId,
                 api: resolvedModel.api,
+                contextWindow: resolvedModel.contextWindow,
               }),
               cfg: modelAuthConfig,
               ...(authProfileId ? { profileId: authProfileId } : {}),
@@ -1476,6 +1483,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                   provider: providerId,
                   model: modelId,
                   api: resolvedModel.api,
+                  contextWindow: resolvedModel.contextWindow,
                 }),
                 cfg: modelAuthConfig,
                 ...(authProfileId ? { profileId: authProfileId } : {}),
