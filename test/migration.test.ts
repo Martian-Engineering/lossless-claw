@@ -294,6 +294,59 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(ftsTables).toEqual([]);
   });
 
+  it("recreates summaries_fts when the schema probe throws", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "malformed-summaries-fts.db");
+    const db = getLcmConnection(dbPath);
+
+    runLcmMigrations(db, { fts5Available: true });
+
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id, title) VALUES (?, ?, ?)`).run(
+      1,
+      "legacy-session",
+      "Legacy",
+    );
+    db.prepare(
+      `INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, file_ids)
+       VALUES (?, ?, ?, ?, ?, '[]')`,
+    ).run("sum-1", 1, "leaf", "recover this summary", 5);
+
+    const dbWithBrokenSummariesProbe = {
+      prepare(sql: string) {
+        if (sql === "PRAGMA table_info(summaries_fts)") {
+          throw new Error("malformed database schema (1)");
+        }
+        return db.prepare(sql);
+      },
+      exec(sql: string) {
+        return db.exec(sql);
+      },
+    } as unknown as Parameters<typeof runLcmMigrations>[0];
+
+    expect(() =>
+      runLcmMigrations(dbWithBrokenSummariesProbe, { fts5Available: true }),
+    ).not.toThrow();
+
+    const summariesFtsColumns = db.prepare(`PRAGMA table_info(summaries_fts)`).all() as Array<{
+      name?: string;
+    }>;
+    expect(summariesFtsColumns.map((column) => column.name)).toEqual(["summary_id", "content"]);
+
+    const summariesFtsRows = db
+      .prepare(`SELECT summary_id, content FROM summaries_fts ORDER BY summary_id`)
+      .all() as Array<{
+      summary_id: string;
+      content: string;
+    }>;
+    expect(summariesFtsRows).toEqual([
+      {
+        summary_id: "sum-1",
+        content: "recover this summary",
+      },
+    ]);
+  });
+
   it("creates conversation bootstrap state storage", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
     tempDirs.push(tempDir);

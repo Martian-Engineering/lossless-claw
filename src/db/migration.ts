@@ -697,12 +697,20 @@ export function runLcmMigrations(
     .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='summaries_fts'")
     .get() as { sql?: string } | undefined;
   const summariesFtsSql = summariesFtsInfo?.sql ?? "";
-  const summariesFtsColumns = db.prepare(`PRAGMA table_info(summaries_fts)`).all() as Array<{
-    name?: string;
-  }>;
-  const hasSummaryIdColumn = summariesFtsColumns.some((col) => col.name === "summary_id");
+  let summariesFtsColumns: Array<{ name?: string }> | null = null;
+  try {
+    summariesFtsColumns = db.prepare(`PRAGMA table_info(summaries_fts)`).all() as Array<{
+      name?: string;
+    }>;
+  } catch {
+    // Corrupt legacy FTS tables can throw during schema introspection. Force a
+    // drop/recreate so the existing self-heal path can repair the table.
+    summariesFtsColumns = null;
+  }
+  const hasSummaryIdColumn = summariesFtsColumns?.some((col) => col.name === "summary_id") ?? false;
   const shouldRecreateSummariesFts =
     !summariesFtsInfo ||
+    !summariesFtsColumns ||
     !hasSummaryIdColumn ||
     summariesFtsSql.includes("content_rowid='summary_id'") ||
     summariesFtsSql.includes('content_rowid="summary_id"');
