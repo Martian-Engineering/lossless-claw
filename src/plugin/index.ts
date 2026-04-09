@@ -1828,6 +1828,7 @@ const lcmPlugin = {
     // when the same DB path is already initialized.
     const existingInit = getSharedInit(normalizedDbPath);
     if (existingInit && !existingInit.stopped) {
+      deps.log.info(`[lcm] Reusing shared engine init for db=${normalizedDbPath}`);
       wirePluginHandlers(api, deps, existingInit);
       return;
     }
@@ -1848,15 +1849,22 @@ const lcmPlugin = {
 
     /** Build a live DB+engine pair and roll back the DB handle if engine init fails. */
     function initializeEngine(): LcmContextEngine {
+      const startedAt = Date.now();
       const nextDatabase = createLcmDatabaseConnection(dbPath);
       try {
         const nextEngine = new LcmContextEngine(deps, nextDatabase);
         database = nextDatabase;
         lcm = nextEngine;
         initError = null;
+        deps.log.info(
+          `[lcm] Engine initialized for db=${normalizedDbPath} duration=${Date.now() - startedAt}ms`,
+        );
         return nextEngine;
       } catch (error) {
         closeLcmConnection(nextDatabase);
+        deps.log.info(
+          `[lcm] Engine init failed for db=${normalizedDbPath} duration=${Date.now() - startedAt}ms error=${toInitError(error).message}`,
+        );
         throw error;
       }
     }
