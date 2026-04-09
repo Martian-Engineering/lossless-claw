@@ -71,10 +71,10 @@ const CLEANER_DEFINITIONS: CleanerDefinition[] = [
     id: "null_subagent_context",
     label: "NULL-key subagent context",
     description:
-      "Conversations with NULL session_key whose first stored message begins with [Subagent Context].",
-    candidatePredicateSql: "(c.session_key IS NULL)",
+      "Archived conversations with NULL session_key whose first stored message begins with [Subagent Context].",
+    candidatePredicateSql: "(c.session_key IS NULL AND c.active = 0 AND c.archived_at IS NOT NULL)",
     predicateSql:
-      "(c.session_key IS NULL AND message_stats.first_message_preview LIKE '[Subagent Context]%')",
+      "(c.session_key IS NULL AND c.active = 0 AND c.archived_at IS NOT NULL AND message_stats.first_message_preview LIKE '[Subagent Context]%')",
     needsFirstMessage: true,
   },
 ];

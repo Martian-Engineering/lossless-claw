@@ -477,6 +477,27 @@ describe("lcm command", () => {
         tokenCount: 7,
       },
     ]);
+    await fixture.conversationStore.archiveConversation(nullSubagent.conversationId);
+
+    const liveNullSubagent = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-cleaner-live-null-subagent",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: liveNullSubagent.conversationId,
+        seq: 0,
+        role: "user",
+        content: "[Subagent Context] Live child session still in progress.",
+        tokenCount: 8,
+      },
+      {
+        conversationId: liveNullSubagent.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "Still active and should not be treated as junk.",
+        tokenCount: 10,
+      },
+    ]);
 
     const normalConversation = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-normal",
@@ -505,6 +526,7 @@ describe("lcm command", () => {
     expect(result.text).toContain("agent:main:cron:nightly");
     expect(result.text).toContain("\"[Subagent Context] Inspect the repo and summarize the issue.\"");
     expect(result.text).toContain("Cleaner apply is intentionally not included in this build");
+    expect(result.text).not.toContain("\"[Subagent Context] Live child session still in progress.\"");
     expect(result.text).not.toContain("doctor-cleaner-normal");
     expect(result.text).not.toContain("ordinary conversation");
   });
