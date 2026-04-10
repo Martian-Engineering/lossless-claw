@@ -51,6 +51,8 @@ export type LcmConfig = {
   skipStatelessSessions: boolean;
   contextThreshold: number;
   freshTailCount: number;
+  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  freshTailMaxTokens?: number;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -332,6 +334,9 @@ export function resolveLcmConfigWithDiagnostics(
       freshTailCount:
         parseFiniteInt(env.LCM_FRESH_TAIL_COUNT)
           ?? toNumber(pc.freshTailCount) ?? 64,
+      freshTailMaxTokens:
+        parseFiniteInt(env.LCM_FRESH_TAIL_MAX_TOKENS)
+          ?? toNumber(pc.freshTailMaxTokens) ?? undefined,
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,

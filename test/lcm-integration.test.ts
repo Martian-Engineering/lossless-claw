@@ -828,6 +828,40 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(result.messages).toHaveLength(3);
   });
 
+  it("fresh tail token cap drops older oversized tail messages from assembly", async () => {
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `M${i} ${"z".repeat(396)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 150,
+      freshTailCount: 4,
+      freshTailMaxTokens: 110,
+    });
+
+    expect(result.messages).toHaveLength(1);
+    expect(extractMessageText(result.messages[0]?.content)).toContain("M3");
+  });
+
+  it("fresh tail token cap still preserves the newest message when it alone exceeds the cap", async () => {
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => (i === 1 ? `Huge tail ${"q".repeat(796)}` : `Older ${"q".repeat(196)}`),
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 100,
+      freshTailCount: 2,
+      freshTailMaxTokens: 50,
+    });
+
+    const contents = result.messages.map((message) => extractMessageText(message.content));
+    expect(contents.some((text) => text.includes("Huge tail"))).toBe(true);
+  });
+
   it("pulls matching tool results into the protected tail when the tail contains their tool call", async () => {
     await convStore.createConversation({ sessionId: "session-tail-tool-pair" });
 
@@ -984,6 +1018,25 @@ describe("LCM integration: compaction", () => {
 
     // Total context items should be fewer than the original 10
     expect(contextItems.length).toBeLessThan(10);
+  });
+
+  it("leaf-trigger accounting respects fresh tail token caps", async () => {
+    const tokenAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 4,
+      freshTailMaxTokens: 150,
+      leafChunkTokens: 200,
+    });
+
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Turn ${i}: ${"r".repeat(396)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const trigger = await tokenAwareEngine.evaluateLeafTrigger(CONV_ID);
+
+    expect(trigger.rawTokensOutsideTail).toBeGreaterThanOrEqual(250);
+    expect(trigger.shouldCompact).toBe(true);
   });
 
   it("compactLeaf uses preceding summary context for soft leaf continuity", async () => {

@@ -20,6 +20,10 @@
       "label": "Fresh Tail Count",
       "help": "Number of recent messages protected from compaction"
     },
+    "freshTailMaxTokens": {
+      "label": "Fresh Tail Max Tokens",
+      "help": "Optional token cap for the protected fresh tail; the newest message is always preserved"
+    },
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",
       "help": "Maximum source tokens per leaf compaction chunk before summarization"
@@ -200,6 +204,10 @@
       "freshTailCount": {
         "type": "integer",
         "minimum": 1
+      },
+      "freshTailMaxTokens": {
+        "type": "integer",
+        "minimum": 0
       },
       "leafChunkTokens": {
         "type": "integer",

@@ -1328,6 +1328,7 @@ export class LcmContextEngine implements ContextEngine {
     const compactionConfig: CompactionConfig = {
       contextThreshold: this.config.contextThreshold,
       freshTailCount: this.config.freshTailCount,
+      freshTailMaxTokens: this.config.freshTailMaxTokens,
       leafMinFanout: this.config.leafMinFanout,
       condensedMinFanout: this.config.condensedMinFanout,
       condensedMinFanoutHard: this.config.condensedMinFanoutHard,
@@ -3677,6 +3678,7 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: conversation.conversationId,
         tokenBudget,
         freshTailCount: this.config.freshTailCount,
+        freshTailMaxTokens: this.config.freshTailMaxTokens,
         prompt: params.prompt,
       });
 

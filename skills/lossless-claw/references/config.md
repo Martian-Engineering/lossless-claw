@@ -43,6 +43,20 @@ Good starting range:
 
 - `32` to `64`
 
+### `freshTailMaxTokens`
+
+Optional token cap for the protected fresh tail.
+
+Why it matters:
+
+- Prevents a few huge tool results from making the "fresh" suffix effectively uncompactable.
+- Still preserves the newest message even if that single message exceeds the cap.
+
+Good starting range:
+
+- Leave unset unless large tool outputs are forcing avoidable cost or overflow.
+- Start around `12000` to `32000` when you want a softer, size-aware fresh tail.
+
 ### `leafChunkTokens`
 
 Caps how much raw material gets summarized into one leaf summary.
@@ -199,6 +213,10 @@ Why it matters:
 See high-impact settings above.
 
 ### `freshTailCount`
+
+See high-impact settings above.
+
+### `freshTailMaxTokens`
 
 See high-impact settings above.
 

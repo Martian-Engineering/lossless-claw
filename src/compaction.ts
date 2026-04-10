@@ -36,6 +36,8 @@ export interface CompactionConfig {
   contextThreshold: number;
   /** Number of fresh tail turns to protect (default 8) */
   freshTailCount: number;
+  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  freshTailMaxTokens?: number;
   /** Minimum number of depth-0 summaries needed for condensation. */
   leafMinFanout: number;
   /** Minimum number of depth>=1 summaries needed for condensation. */
@@ -890,16 +892,29 @@ export class CompactionEngine {
     return 0;
   }
 
+  /** Normalize configured fresh tail token cap to a safe non-negative integer. */
+  private resolveFreshTailMaxTokens(): number | undefined {
+    if (
+      typeof this.config.freshTailMaxTokens === "number" &&
+      Number.isFinite(this.config.freshTailMaxTokens) &&
+      this.config.freshTailMaxTokens >= 0
+    ) {
+      return Math.floor(this.config.freshTailMaxTokens);
+    }
+    return undefined;
+  }
+
   /**
    * Compute the ordinal boundary for protected fresh messages.
    *
    * Messages with ordinal >= returned value are preserved as fresh tail.
    */
-  private resolveFreshTailOrdinal(contextItems: ContextItemRecord[]): number {
+  private async resolveFreshTailOrdinal(contextItems: ContextItemRecord[]): Promise<number> {
     const freshTailCount = this.resolveFreshTailCount();
     if (freshTailCount <= 0) {
       return Infinity;
     }
+    const freshTailMaxTokens = this.resolveFreshTailMaxTokens();
 
     const rawMessageItems = contextItems.filter(
       (item) => item.itemType === "message" && item.messageId != null,
@@ -908,8 +923,35 @@ export class CompactionEngine {
       return Infinity;
     }
 
-    const tailStartIdx = Math.max(0, rawMessageItems.length - freshTailCount);
-    return rawMessageItems[tailStartIdx]?.ordinal ?? Infinity;
+    let protectedCount = 0;
+    let protectedTokens = 0;
+    let tailStartOrdinal = Infinity;
+
+    for (let idx = rawMessageItems.length - 1; idx >= 0; idx--) {
+      if (protectedCount >= freshTailCount) {
+        break;
+      }
+
+      const item = rawMessageItems[idx];
+      if (!item || item.messageId == null) {
+        continue;
+      }
+
+      const messageTokens = await this.getMessageTokenCount(item.messageId);
+      const wouldExceedBudget =
+        protectedCount > 0 &&
+        typeof freshTailMaxTokens === "number" &&
+        protectedTokens + messageTokens > freshTailMaxTokens;
+      if (wouldExceedBudget) {
+        break;
+      }
+
+      tailStartOrdinal = item.ordinal;
+      protectedCount++;
+      protectedTokens += messageTokens;
+    }
+
+    return tailStartOrdinal;
   }
 
   /** Resolve message token count with a content-length fallback. */
@@ -931,7 +973,7 @@ export class CompactionEngine {
   /** Sum raw message tokens outside the protected fresh tail. */
   private async countRawTokensOutsideFreshTail(conversationId: number): Promise<number> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
     let rawTokens = 0;
 
     for (const item of contextItems) {
@@ -958,7 +1000,7 @@ export class CompactionEngine {
     leafChunkTokensOverride?: number,
   ): Promise<LeafChunkSelection> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
     const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
 
     let rawTokensOutsideTail = 0;
@@ -1147,7 +1189,7 @@ export class CompactionEngine {
   }): Promise<CondensedPhaseCandidate | null> {
     const { conversationId, hardTrigger } = params;
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
     const minChunkTokens = this.resolveCondensedMinChunkTokens();
     const depthLevels = await this.summaryStore.getDistinctDepthsInContext(conversationId, {
       maxOrdinalExclusive: freshTailOrdinal,
@@ -1187,7 +1229,7 @@ export class CompactionEngine {
     const freshTailOrdinal =
       typeof freshTailOrdinalOverride === "number"
         ? freshTailOrdinalOverride
-        : this.resolveFreshTailOrdinal(contextItems);
+        : await this.resolveFreshTailOrdinal(contextItems);
     const chunkTokenBudget = this.resolveLeafChunkTokens();
 
     const chunk: ContextItemRecord[] = [];

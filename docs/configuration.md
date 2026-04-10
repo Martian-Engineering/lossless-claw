@@ -22,6 +22,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "skipStatelessSessions": true,
   "contextThreshold": 0.75,
   "freshTailCount": 64,
+  "freshTailMaxTokens": 24000,
   "newSessionRetainDepth": 2,
   "leafMinFanout": 8,
   "condensedMinFanout": 4,
@@ -119,6 +120,7 @@ openclaw plugins install --link /path/to/lossless-claw
 | --- | --- | --- | --- | --- |
 | `contextThreshold` | `number` | `0.75` | `LCM_CONTEXT_THRESHOLD` | Fraction of the active model context window that triggers compaction. |
 | `freshTailCount` | `integer` | `64` | `LCM_FRESH_TAIL_COUNT` | Number of newest messages always kept raw. |
+| `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. The newest message is always preserved even if it exceeds the cap. |
 | `leafMinFanout` | `integer` | `8` | `LCM_LEAF_MIN_FANOUT` | Minimum number of raw messages required before a leaf pass runs. |
 | `condensedMinFanout` | `integer` | `4` | `LCM_CONDENSED_MIN_FANOUT` | Number of same-depth summaries needed before condensation is attempted. |
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |

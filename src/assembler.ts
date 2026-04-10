@@ -26,6 +26,8 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
+  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  freshTailMaxTokens?: number;
   /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
   prompt?: string;
 }
@@ -831,6 +833,57 @@ interface ResolvedItem {
   summarySignal?: SummaryPromptSignal;
 }
 
+function resolveFreshTailOrdinal(
+  resolved: ResolvedItem[],
+  freshTailCount: number,
+  freshTailMaxTokens?: number,
+): number {
+  if (!Number.isFinite(freshTailCount) || freshTailCount <= 0) {
+    return Infinity;
+  }
+
+  const rawMessages = resolved.filter((item) => item.isMessage);
+  if (rawMessages.length === 0) {
+    return Infinity;
+  }
+
+  const tokenCap =
+    typeof freshTailMaxTokens === "number" &&
+    Number.isFinite(freshTailMaxTokens) &&
+    freshTailMaxTokens >= 0
+      ? Math.floor(freshTailMaxTokens)
+      : undefined;
+
+  let protectedCount = 0;
+  let protectedTokens = 0;
+  let tailStartOrdinal = Infinity;
+
+  for (let idx = rawMessages.length - 1; idx >= 0; idx--) {
+    if (protectedCount >= freshTailCount) {
+      break;
+    }
+
+    const item = rawMessages[idx];
+    if (!item) {
+      continue;
+    }
+
+    const wouldExceedBudget =
+      protectedCount > 0 &&
+      typeof tokenCap === "number" &&
+      protectedTokens + item.tokens > tokenCap;
+    if (wouldExceedBudget) {
+      break;
+    }
+
+    tailStartOrdinal = item.ordinal;
+    protectedCount++;
+    protectedTokens += item.tokens;
+  }
+
+  return tailStartOrdinal;
+}
+
 // ── BM25-lite relevance scorer ────────────────────────────────────────────────
 
 /** @internal Exported for testing only. Tokenize text into lowercase alphanumeric terms. */
@@ -894,7 +947,8 @@ export class ContextAssembler {
    * 1. Fetch all context items for the conversation (ordered by ordinal).
    * 2. Resolve each item into an AgentMessage (fetching the underlying
    *    message or summary record).
-   * 3. Protect the "fresh tail" (last N items) from truncation.
+   * 3. Protect the "fresh tail" (last N raw messages, optionally token-capped)
+   *    from truncation.
    * 4. If over budget, drop oldest non-fresh items until we fit.
    * 5. Return the final ordered messages in chronological order.
    */
@@ -934,9 +988,13 @@ export class ContextAssembler {
     const systemPromptAddition = buildSystemPromptAddition(summarySignals);
 
     // Step 3: Split into evictable prefix and protected fresh tail
-    const tailStart = Math.max(0, resolved.length - freshTailCount);
-    const baseFreshTail = resolved.slice(tailStart);
-    const initialEvictable = resolved.slice(0, tailStart);
+    const freshTailOrdinal = resolveFreshTailOrdinal(
+      resolved,
+      freshTailCount,
+      input.freshTailMaxTokens,
+    );
+    const baseFreshTail = resolved.filter((item) => item.ordinal >= freshTailOrdinal);
+    const initialEvictable = resolved.filter((item) => item.ordinal < freshTailOrdinal);
     const freshTailOrdinals = new Set(baseFreshTail.map((item) => item.ordinal));
     const tailToolCallIds = collectAssistantToolCallIds(baseFreshTail);
     const tailPairToolResults = initialEvictable.filter((item) => {
