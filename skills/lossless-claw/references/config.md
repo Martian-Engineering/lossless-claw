@@ -187,7 +187,6 @@ Why it matters:
 
 - defaults to `${OPENCLAW_STATE_DIR}/lcm-files`; on multi-profile hosts each profile stores files in its own state directory automatically
 - override with `LCM_LARGE_FILES_DIR` or set `largeFilesDir` in plugin config when you want an explicit path
-
 ### `largeFileThresholdTokens`
 
 Threshold for externalizing oversized tool/file payloads out of the main transcript into large-file storage.

@@ -1446,6 +1446,46 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("stores externalized inline images under largeFilesDir", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+    const sessionId = randomUUID();
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({
+        role: "user",
+        content: `[media attached: screenshot.png]\n${base64Image}\n`,
+      }),
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("[User image: screenshot.png");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+
+    const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+    expect(fileIdMatch).not.toBeNull();
+    const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+    expect(storedFile).not.toBeNull();
+    expect(storedFile!.mimeType).toBe("image/png");
+    expect(storedFile!.storageUri).toContain(
+      `${largeFilesDir}/${conversation!.conversationId}/`,
+    );
+  });
+
   it("externalizes oversized tool-result payloads into large_files", async () => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
@@ -1650,6 +1690,163 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(typeof block?.text).toBe("string");
       expect(String(block?.text)).toContain(fileId);
       expect(block).not.toHaveProperty("output");
+    });
+  });
+
+  it("externalizes structured tool-result image payloads before text externalization", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+    const sessionId = randomUUID();
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_structured_image",
+            name: "capture",
+            input: { cmd: "screenshot" },
+          },
+        ],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_structured_image",
+        toolName: "capture",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_structured_image",
+            name: "capture",
+            content: [{ type: "text", text: base64Image }],
+          },
+        ],
+      } as AgentMessage,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(2);
+    expect(storedMessages[1].content).toBe("");
+
+    const parts = await engine.getConversationStore().getMessageParts(storedMessages[1].messageId);
+    expect(parts).toHaveLength(1);
+    expect(parts[0].partType).toBe("tool");
+    expect(parts[0].toolOutput).toBeNull();
+    const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
+    const raw = metadata.raw as {
+      type: string;
+      content: Array<{ type: string; text: string }>;
+    };
+    const imageReference = raw.content[0]?.text ?? "";
+    expect(imageReference).toContain("[Tool image: tool-image.png");
+    expect(imageReference).not.toContain(base64Image.slice(0, 32));
+
+    const fileIdMatch = imageReference.match(/file_[a-f0-9]{16}/);
+    expect(fileIdMatch).not.toBeNull();
+    const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+    expect(storedFile).not.toBeNull();
+    expect(storedFile!.mimeType).toBe("image/png");
+    expect(storedFile!.fileName).toBe("tool-image.png");
+
+    expect(metadata.raw).toMatchObject({
+      type: "tool_result",
+      content: [{ type: "text", text: expect.stringContaining("[Tool image: tool-image.png") }],
+    });
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+    const assembledToolResult = assembled.messages[1] as {
+      role: string;
+      content?: Array<{ content?: Array<{ text?: string }> }>;
+    };
+    expect(assembledToolResult.role).toBe("toolResult");
+    expect(assembledToolResult.content?.[0]?.content?.[0]?.text).toContain("[Tool image: tool-image.png");
+  });
+
+  it("externalizes string-content tool-result images without converting them to text files", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+    const sessionId = randomUUID();
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_text_image",
+            name: "capture",
+            input: { cmd: "screenshot" },
+          },
+        ],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_text_image",
+        toolName: "capture",
+        isError: false,
+        content: base64Image,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(2);
+    expect(storedMessages[1].content).toContain("[Tool image: tool-image.png");
+    expect(storedMessages[1].content).not.toContain("[LCM Tool Output:");
+
+    const fileIdMatch = storedMessages[1].content.match(/file_[a-f0-9]{16}/);
+    expect(fileIdMatch).not.toBeNull();
+    const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+    expect(storedFile).not.toBeNull();
+    expect(storedFile!.mimeType).toBe("image/png");
+    expect(storedFile!.fileName).toBe("tool-image.png");
+    expect(storedFile!.storageUri.endsWith(".png")).toBe(true);
+
+    const parts = await engine.getConversationStore().getMessageParts(storedMessages[1].messageId);
+    expect(parts).toHaveLength(1);
+    expect(parts[0].partType).toBe("text");
+    expect(JSON.parse(parts[0].metadata ?? "{}")).toMatchObject({
+      toolCallId: "call_text_image",
+      toolName: "capture",
+      isError: false,
     });
   });
 

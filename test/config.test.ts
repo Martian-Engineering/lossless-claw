@@ -20,6 +20,8 @@ describe("resolveLcmConfig", () => {
   it("uses hardcoded defaults when no env or plugin config", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.enabled).toBe(true);
+    expect(config.databasePath).toBe(join(homedir(), ".openclaw", "lcm.db"));
+    expect(config.largeFilesDir).toBe(join(homedir(), ".openclaw", "lcm-files"));
     expect(config.ignoreSessionPatterns).toEqual([]);
     expect(config.statelessSessionPatterns).toEqual([]);
     expect(config.skipStatelessSessions).toBe(true);
@@ -279,6 +281,21 @@ describe("resolveLcmConfig", () => {
       { databasePath: "/plugin/path/lcm.db" },
     );
     expect(config.databasePath).toBe("/env/path/lcm.db");
+  });
+
+  it("handles largeFilesDir from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      largeFilesDir: "/custom/path/lcm-files",
+    });
+    expect(config.largeFilesDir).toBe("/custom/path/lcm-files");
+  });
+
+  it("env largeFilesDir overrides plugin config", () => {
+    const config = resolveLcmConfig(
+      { LCM_LARGE_FILES_DIR: "/env/path/lcm-files" } as NodeJS.ProcessEnv,
+      { largeFilesDir: "/plugin/path/lcm-files" },
+    );
+    expect(config.largeFilesDir).toBe("/env/path/lcm-files");
   });
 
   it("accepts manifest largeFileThresholdTokens from plugin config", () => {

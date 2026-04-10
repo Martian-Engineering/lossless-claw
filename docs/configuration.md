@@ -103,7 +103,7 @@ openclaw plugins install --link /path/to/lossless-claw
 | `enabled` | `boolean` | `true` | `LCM_ENABLED` | Enables or disables lossless-claw without uninstalling it. |
 | `databasePath` | `string` | `${OPENCLAW_STATE_DIR}/lcm.db` | `LCM_DATABASE_PATH` | Preferred path for the SQLite database. |
 | `dbPath` | `string` | alias of `databasePath` | `LCM_DATABASE_PATH` | Legacy alias for `databasePath`. Prefer `databasePath` in new config. |
-| `largeFilesDir` | `string` | `${OPENCLAW_STATE_DIR}/lcm-files` | `LCM_LARGE_FILES_DIR` | Directory where large-file text payloads are persisted. Automatically follows the active state directory. |
+| `largeFilesDir` | `string` | `${OPENCLAW_STATE_DIR}/lcm-files` | `LCM_LARGE_FILES_DIR` | Directory where externalized large files and inline images are persisted. Automatically follows the active state directory. |
 | `ignoreSessionPatterns` | `string[]` | `[]` | `LCM_IGNORE_SESSION_PATTERNS` | Session-key glob patterns that skip LCM entirely. |
 | `statelessSessionPatterns` | `string[]` | `[]` | `LCM_STATELESS_SESSION_PATTERNS` | Session-key glob patterns that may read from LCM but never write to it. |
 | `skipStatelessSessions` | `boolean` | `true` | `LCM_SKIP_STATELESS_SESSIONS` | Enforces `statelessSessionPatterns` when enabled. |
