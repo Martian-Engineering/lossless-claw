@@ -1221,6 +1221,7 @@ export class LcmContextEngine implements ContextEngine {
     string,
     { promise: Promise<void>; refCount: number }
   >();
+  private backgroundThresholdCompactions = new Map<string, Promise<void>>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
@@ -1495,6 +1496,52 @@ export class LcmContextEngine implements ContextEngine {
     const normalizedSessionKey = sessionKey?.trim();
     const normalizedSessionId = sessionId?.trim();
     return normalizedSessionKey || normalizedSessionId || "__lcm__";
+  }
+
+  /** Queue proactive threshold compaction without blocking reply delivery. */
+  private scheduleBackgroundThresholdCompaction(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    tokenBudget: number;
+    currentTokenCount?: number;
+    legacyParams?: Record<string, unknown>;
+  }): void {
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    if (this.backgroundThresholdCompactions.has(queueKey)) {
+      this.deps.log.info(
+        `[lcm] afterTurn: threshold compaction already scheduled queueKey=${queueKey}`,
+      );
+      return;
+    }
+
+    const task = (async () => {
+      try {
+        await this.compact({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          sessionFile: params.sessionFile,
+          tokenBudget: params.tokenBudget,
+          currentTokenCount: params.currentTokenCount,
+          compactionTarget: "threshold",
+          legacyParams: params.legacyParams,
+        });
+      } catch (err) {
+        this.deps.log.warn(
+          `[lcm] afterTurn: background threshold compaction failed: ${describeLogError(err)}`,
+        );
+      }
+    })();
+
+    this.backgroundThresholdCompactions.set(queueKey, task);
+    task.finally(() => {
+      const active = this.backgroundThresholdCompactions.get(queueKey);
+      if (active === task) {
+        this.backgroundThresholdCompactions.delete(queueKey);
+      }
+    }).catch(() => {
+      // The task handles its own errors; this only silences finally-chain noise.
+    });
   }
 
   /** Normalize optional live token estimates supplied by runtime callers. */
@@ -3529,19 +3576,14 @@ export class LcmContextEngine implements ContextEngine {
       // Leaf trigger checks are best-effort.
     }
 
-    try {
-      await this.compact({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-        tokenBudget,
-        currentTokenCount: liveContextTokens,
-        compactionTarget: "threshold",
-        legacyParams,
-      });
-    } catch {
-      // Proactive compaction is best-effort in the post-turn lifecycle.
-    }
+    this.scheduleBackgroundThresholdCompaction({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      sessionFile: params.sessionFile,
+      tokenBudget,
+      currentTokenCount: liveContextTokens,
+      legacyParams,
+    });
 
     this.deps.log.info(
       `[lcm] afterTurn: done conversation=${conversation.conversationId} ${sessionLabel} newMessages=${newMessages.length} dedupedMessages=${dedupedNewMessages.length} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,

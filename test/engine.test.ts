@@ -5177,6 +5177,104 @@ describe("LcmContextEngine fidelity and token budget", () => {
       ),
     );
   });
+
+  it("afterTurn returns before proactive threshold compaction finishes", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-background-threshold";
+    let resolveCompact!: (value: { ok: boolean; compacted: boolean; reason: string }) => void;
+    const compactPromise = new Promise<{ ok: boolean; compacted: boolean; reason: string }>((resolve) => {
+      resolveCompact = resolve;
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockReturnValue(compactPromise);
+
+    const afterTurnPromise = engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-background-threshold"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const winner = await Promise.race([
+      afterTurnPromise.then(() => "afterTurn-finished"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 50)),
+    ]);
+
+    expect(winner).toBe("afterTurn-finished");
+    expect(compactSpy).toHaveBeenCalledTimes(1);
+
+    resolveCompact({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+    await compactPromise;
+  });
+
+  it("afterTurn coalesces duplicate background threshold compaction requests per session", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-background-threshold-coalesce";
+    let resolveCompact!: (value: { ok: boolean; compacted: boolean; reason: string }) => void;
+    const compactPromise = new Promise<{ ok: boolean; compacted: boolean; reason: string }>((resolve) => {
+      resolveCompact = resolve;
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockReturnValue(compactPromise);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-background-threshold-coalesce-1"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-background-threshold-coalesce-2"),
+      messages: [
+        makeMessage({ role: "assistant", content: "fresh turn content" }),
+        makeMessage({ role: "user", content: "follow up" }),
+      ],
+      prePromptMessageCount: 1,
+      tokenBudget: 4096,
+    });
+
+    expect(compactSpy).toHaveBeenCalledTimes(1);
+
+    resolveCompact({
+      ok: true,
+      compacted: false,
+      reason: "below threshold",
+    });
+    await compactPromise;
+  });
+
+  it("afterTurn ignores background threshold compaction failures", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "after-turn-background-threshold-failure";
+    vi.spyOn(engine, "compact").mockRejectedValue(new Error("background compact failed"));
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-background-threshold-failure"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(warnLog).toHaveBeenCalledWith(
+      "[lcm] afterTurn: background threshold compaction failed: background compact failed",
+    );
+  });
 });
 
 // ── afterTurn dedup guard ────────────────────────────────────────────────────
