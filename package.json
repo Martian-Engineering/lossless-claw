@@ -3,7 +3,7 @@
   "version": "0.8.0",
   "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with incremental compaction",
   "type": "module",
-  "main": "index.ts",
+  "main": "dist/index.js",
   "license": "MIT",
   "author": "Josh Lehman <josh@martian.engineering>",
   "keywords": [
@@ -16,14 +16,14 @@
     "dag"
   ],
   "scripts": {
+    "build": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@mariozechner/*\"",
     "changeset": "changeset",
-    "release:verify": "npm test && npm pack --dry-run",
+    "release:verify": "npm run build && npm test && npm pack --dry-run",
     "test": "vitest run --dir test",
     "version-packages": "changeset version"
   },
   "files": [
-    "index.ts",
-    "src/**/*.ts",
+    "dist/",
     "skills/",
     "openclaw.plugin.json",
     "docs/",
@@ -38,6 +38,7 @@
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",
     "@changesets/cli": "^2.30.0",
+    "esbuild": "^0.28.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
@@ -49,7 +50,7 @@
   },
   "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ]
   },
   "repository": {

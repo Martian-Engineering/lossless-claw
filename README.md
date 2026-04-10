@@ -400,6 +400,9 @@ For most long-lived LCM setups, a good starting point is:
 ## Development
 
 ```bash
+# Build (bundles TypeScript to dist/index.js)
+npm run build
+
 # Run tests
 npx vitest
 
