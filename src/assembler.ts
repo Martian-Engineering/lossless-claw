@@ -637,12 +637,24 @@ function collectAssistantToolCallIds(items: ResolvedItem[]): Set<string> {
   return ids;
 }
 
+function normalizeFreshTailTokenCap(freshTailMaxTokens?: number): number | undefined {
+  if (
+    typeof freshTailMaxTokens === "number" &&
+    Number.isFinite(freshTailMaxTokens) &&
+    freshTailMaxTokens >= 0
+  ) {
+    return Math.floor(freshTailMaxTokens);
+  }
+  return undefined;
+}
+
 function mergeFreshTailWithMatchingToolResults(
   freshTail: ResolvedItem[],
   matchingToolResults: ResolvedItem[],
-): ResolvedItem[] {
+  freshTailMaxTokens?: number,
+): { items: ResolvedItem[]; promotedOrdinals: Set<number> } {
   if (matchingToolResults.length === 0) {
-    return freshTail;
+    return { items: freshTail, promotedOrdinals: new Set<number>() };
   }
 
   const resultsById = new Map<string, ResolvedItem[]>();
@@ -660,7 +672,9 @@ function mergeFreshTailWithMatchingToolResults(
   }
 
   const merged: ResolvedItem[] = [];
-  const usedOrdinals = new Set<number>();
+  const promotedOrdinals = new Set<number>();
+  const tokenCap = normalizeFreshTailTokenCap(freshTailMaxTokens);
+  let mergedTokens = freshTail.reduce((sum, item) => sum + item.tokens, 0);
 
   for (const item of freshTail) {
     merged.push(item);
@@ -676,27 +690,37 @@ function mergeFreshTailWithMatchingToolResults(
         continue;
       }
       for (const match of matches) {
-        if (usedOrdinals.has(match.ordinal)) {
+        if (promotedOrdinals.has(match.ordinal)) {
+          continue;
+        }
+        if (
+          typeof tokenCap === "number" &&
+          mergedTokens + match.tokens > tokenCap
+        ) {
           continue;
         }
         merged.push(match);
-        usedOrdinals.add(match.ordinal);
+        promotedOrdinals.add(match.ordinal);
+        mergedTokens += match.tokens;
       }
     }
   }
 
-  for (const item of matchingToolResults) {
-    if (!usedOrdinals.has(item.ordinal)) {
-      merged.push(item);
+  if (typeof tokenCap !== "number") {
+    for (const item of matchingToolResults) {
+      if (!promotedOrdinals.has(item.ordinal)) {
+        merged.push(item);
+      }
     }
   }
 
-  return merged;
+  return { items: merged, promotedOrdinals };
 }
 
 function filterNonFreshAssistantToolCalls(
   items: ResolvedItem[],
   freshTailOrdinals: Set<number>,
+  preserveFreshTailToolCalls = true,
 ): AgentMessage[] {
   const availableToolResultIds = new Set<string>();
   for (const item of items) {
@@ -708,7 +732,10 @@ function filterNonFreshAssistantToolCalls(
 
   const filteredMessages: AgentMessage[] = [];
   for (const item of items) {
-    if (item.message?.role !== "assistant" || freshTailOrdinals.has(item.ordinal)) {
+    if (
+      item.message?.role !== "assistant" ||
+      (preserveFreshTailToolCalls && freshTailOrdinals.has(item.ordinal))
+    ) {
       filteredMessages.push(item.message);
       continue;
     }
@@ -1001,9 +1028,15 @@ export class ContextAssembler {
       const toolResultId = extractToolResultIdFromMessage(item.message);
       return toolResultId !== null && tailToolCallIds.has(toolResultId);
     });
-    const protectedEvictableOrdinals = new Set(tailPairToolResults.map((item) => item.ordinal));
-    const evictable = initialEvictable.filter((item) => !protectedEvictableOrdinals.has(item.ordinal));
-    const freshTail = mergeFreshTailWithMatchingToolResults(baseFreshTail, tailPairToolResults);
+    const mergedFreshTail = mergeFreshTailWithMatchingToolResults(
+      baseFreshTail,
+      tailPairToolResults,
+      input.freshTailMaxTokens,
+    );
+    const evictable = initialEvictable.filter(
+      (item) => !mergedFreshTail.promotedOrdinals.has(item.ordinal),
+    );
+    const freshTail = mergedFreshTail.items;
 
     // Step 4: Budget-aware selection
     // First, compute the token cost of the fresh tail (always included).
@@ -1081,7 +1114,11 @@ export class ContextAssembler {
 
     // Normalize assistant string content to array blocks (some providers return
     // content as a plain string; Anthropic expects content block arrays).
-    const rawMessages = filterNonFreshAssistantToolCalls(selected, freshTailOrdinals);
+    const rawMessages = filterNonFreshAssistantToolCalls(
+      selected,
+      freshTailOrdinals,
+      normalizeFreshTailTokenCap(input.freshTailMaxTokens) === undefined,
+    );
     for (let i = 0; i < rawMessages.length; i++) {
       const msg = rawMessages[i];
       if (msg?.role === "assistant" && typeof msg.content === "string") {
