@@ -3,7 +3,8 @@ type StartupBannerKey =
   | "compaction-model"
   | "fallback-providers"
   | "ignore-session-patterns"
-  | "stateless-session-patterns";
+  | "stateless-session-patterns"
+  | "state-dir";
 
 type StartupBannerLogState = {
   emitted: Set<StartupBannerKey>;

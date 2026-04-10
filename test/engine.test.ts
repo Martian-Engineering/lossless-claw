@@ -21,9 +21,11 @@ import type { LcmDependencies } from "../src/types.js";
 const tempDirs: string[] = [];
 
 function createTestConfig(databasePath: string): LcmConfig {
+  const tempDir = join(databasePath, "..", "lcm-files");
   return {
     enabled: true,
     databasePath,
+    largeFilesDir: tempDir,
     ignoreSessionPatterns: [],
     statelessSessionPatterns: [],
     skipStatelessSessions: true,
@@ -1403,7 +1405,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(storedFile!.fileName).toBe("lcm-paper.md");
       expect(storedFile!.mimeType).toBe("text/markdown");
       expect(storedFile!.storageUri).toContain(
-        `.openclaw/lcm-files/${conversation!.conversationId}/`,
+        `lcm-files/${conversation!.conversationId}/`,
       );
       expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(fileText);
 

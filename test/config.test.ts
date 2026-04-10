@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
-import { resolveLcmConfig } from "../src/db/config.js";
+import { resolveLcmConfig, resolveOpenclawStateDir } from "../src/db/config.js";
 
 describe("resolveLcmConfig", () => {
   it("ships the bundled lossless-claw skill path in the manifest", () => {
@@ -576,5 +578,95 @@ describe("resolveLcmConfig", () => {
     });
     expect(config.summaryMaxOverageFactor).toBe(2.5);
     expect(config.maxAssemblyTokenBudget).toBe(16000);
+  });
+});
+
+describe("resolveOpenclawStateDir", () => {
+  it("falls back to ~/.openclaw when OPENCLAW_STATE_DIR is unset", () => {
+    const result = resolveOpenclawStateDir({});
+    expect(result).toBe(join(homedir(), ".openclaw"));
+  });
+
+  it("returns OPENCLAW_STATE_DIR when set", () => {
+    const result = resolveOpenclawStateDir({ OPENCLAW_STATE_DIR: "/custom/state" });
+    expect(result).toBe("/custom/state");
+  });
+
+  it("trims whitespace from OPENCLAW_STATE_DIR", () => {
+    const result = resolveOpenclawStateDir({ OPENCLAW_STATE_DIR: "  /custom/state  " });
+    expect(result).toBe("/custom/state");
+  });
+
+  it("falls back to ~/.openclaw when OPENCLAW_STATE_DIR is an empty string", () => {
+    const result = resolveOpenclawStateDir({ OPENCLAW_STATE_DIR: "" });
+    expect(result).toBe(join(homedir(), ".openclaw"));
+  });
+
+  it("falls back to ~/.openclaw when OPENCLAW_STATE_DIR is whitespace only", () => {
+    const result = resolveOpenclawStateDir({ OPENCLAW_STATE_DIR: "   " });
+    expect(result).toBe(join(homedir(), ".openclaw"));
+  });
+});
+
+describe("resolveLcmConfig largeFilesDir", () => {
+  it("defaults largeFilesDir to ~/.openclaw/lcm-files when OPENCLAW_STATE_DIR is unset", () => {
+    const config = resolveLcmConfig({}, {});
+    expect(config.largeFilesDir).toBe(join(homedir(), ".openclaw", "lcm-files"));
+  });
+
+  it("uses OPENCLAW_STATE_DIR for largeFilesDir when set", () => {
+    const config = resolveLcmConfig(
+      { OPENCLAW_STATE_DIR: "/custom/state" } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.largeFilesDir).toBe("/custom/state/lcm-files");
+  });
+
+  it("LCM_LARGE_FILES_DIR env var overrides OPENCLAW_STATE_DIR for largeFilesDir", () => {
+    const config = resolveLcmConfig(
+      {
+        OPENCLAW_STATE_DIR: "/custom/state",
+        LCM_LARGE_FILES_DIR: "/explicit/files",
+      } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.largeFilesDir).toBe("/explicit/files");
+  });
+
+  it("largeFilesDir plugin config overrides OPENCLAW_STATE_DIR", () => {
+    const config = resolveLcmConfig(
+      { OPENCLAW_STATE_DIR: "/custom/state" } as NodeJS.ProcessEnv,
+      { largeFilesDir: "/plugin/files" },
+    );
+    expect(config.largeFilesDir).toBe("/plugin/files");
+  });
+
+  it("LCM_LARGE_FILES_DIR env var overrides largeFilesDir plugin config", () => {
+    const config = resolveLcmConfig(
+      { LCM_LARGE_FILES_DIR: "/env/files" } as NodeJS.ProcessEnv,
+      { largeFilesDir: "/plugin/files" },
+    );
+    expect(config.largeFilesDir).toBe("/env/files");
+  });
+});
+
+describe("resolveLcmConfig databasePath uses OPENCLAW_STATE_DIR", () => {
+  it("uses OPENCLAW_STATE_DIR for default databasePath", () => {
+    const config = resolveLcmConfig(
+      { OPENCLAW_STATE_DIR: "/custom/state" } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.databasePath).toBe("/custom/state/lcm.db");
+  });
+
+  it("LCM_DATABASE_PATH still overrides OPENCLAW_STATE_DIR", () => {
+    const config = resolveLcmConfig(
+      {
+        OPENCLAW_STATE_DIR: "/custom/state",
+        LCM_DATABASE_PATH: "/explicit/db.sqlite",
+      } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.databasePath).toBe("/explicit/db.sqlite");
   });
 });

@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, createReadStream, openSync, readSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline";
@@ -2158,14 +2157,14 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
-  /** Persist intercepted large-file text payloads to ~/.openclaw/lcm-files. */
+  /** Persist intercepted large-file text payloads to the configured lcm-files directory. */
   private async storeLargeFileContent(params: {
     conversationId: number;
     fileId: string;
     extension: string;
     content: string;
   }): Promise<string> {
-    const dir = join(homedir(), ".openclaw", "lcm-files", String(params.conversationId));
+    const dir = join(this.config.largeFilesDir, String(params.conversationId));
     await mkdir(dir, { recursive: true });
 
     const normalizedExtension = params.extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "txt";

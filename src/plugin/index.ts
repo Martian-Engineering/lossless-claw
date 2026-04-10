@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { resolveLcmConfig } from "../db/config.js";
+import { resolveLcmConfig, resolveOpenclawStateDir } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
@@ -55,6 +55,8 @@ type PluginEnvSnapshot = {
   openclawDefaultModel: string;
   agentDir: string;
   home: string;
+  /** Active OpenClaw state directory — respects OPENCLAW_STATE_DIR for multi-profile hosts. */
+  stateDir: string;
 };
 
 type ReadEnvFn = (key: string) => string | undefined;
@@ -215,6 +217,7 @@ function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnaps
     openclawDefaultModel: "",
     agentDir: env.OPENCLAW_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
     home: env.HOME?.trim() ?? "",
+    stateDir: resolveOpenclawStateDir(env),
   };
 }
 
@@ -825,9 +828,9 @@ function resolveAuthStorePaths(params: { agentDir?: string; envSnapshot: PluginE
     paths.push(join(envAgentDir, "auth-profiles.json"));
   }
 
-  const home = params.envSnapshot.home;
-  if (home) {
-    paths.push(join(home, ".openclaw", "agents", "main", "agent", "auth-profiles.json"));
+  const stateDir = params.envSnapshot.stateDir;
+  if (stateDir) {
+    paths.push(join(stateDir, "agents", "main", "agent", "auth-profiles.json"));
   }
 
   return [...new Set(paths)];
@@ -905,6 +908,7 @@ function resolveAuthProfileCandidates(params: {
 function resolveSecretRef(params: {
   ref: SecretRef | undefined;
   home: string;
+  stateDir: string;
   config?: unknown;
 }): string | undefined {
   const ref = params.ref;
@@ -957,9 +961,9 @@ function resolveSecretRef(params: {
     // Fall through to the legacy secrets.json lookup below.
   }
 
-  // Legacy file fallback (source: "file" or unset) — read from ~/.openclaw/secrets.json
+  // Legacy file fallback (source: "file" or unset) — read from secrets.json in the active state dir
   try {
-    const secretsPath = join(params.home, ".openclaw", "secrets.json");
+    const secretsPath = join(params.stateDir, "secrets.json");
     const raw = readFileSync(secretsPath, "utf8");
     const secrets = JSON.parse(raw) as Record<string, unknown>;
     const parts = ref.id.replace(/^\//, "").split("/");
@@ -1045,6 +1049,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
         resolveSecretRef({
           ref: credential.keyRef,
           home: params.envSnapshot.home,
+          stateDir: params.envSnapshot.stateDir,
           config: secretConfig,
         });
       if (key) {
@@ -1059,6 +1064,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
         resolveSecretRef({
           ref: credential.tokenRef,
           home: params.envSnapshot.home,
+          stateDir: params.envSnapshot.stateDir,
           config: secretConfig,
         });
       if (!token) {
@@ -2014,6 +2020,11 @@ const lcmPlugin = {
       key: "plugin-loaded",
       log: (message) => deps.log.info(message),
       message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
+    });
+    logStartupBannerOnce({
+      key: "state-dir",
+      log: (message) => deps.log.info(message),
+      message: `[lcm] State dir: ${resolveOpenclawStateDir(process.env)}`,
     });
     logStartupBannerOnce({
       key: "compaction-model",

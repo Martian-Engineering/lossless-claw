@@ -1,6 +1,22 @@
 import { homedir } from "os";
 import { join } from "path";
 
+/**
+ * Resolve the active OpenClaw state directory.
+ *
+ * Precedence:
+ *   1. `OPENCLAW_STATE_DIR` environment variable (set by the host gateway for
+ *      non-default profiles, e.g. `~/.openclaw-vesper`)
+ *   2. `~/.openclaw` (the historic single-profile default)
+ *
+ * All paths that used to hardcode `~/.openclaw` should call this helper so
+ * that multi-profile hosts don't bleed state across profiles.
+ */
+export function resolveOpenclawStateDir(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = env.OPENCLAW_STATE_DIR?.trim();
+  return explicit || join(homedir(), ".openclaw");
+}
+
 export type CacheAwareCompactionConfig = {
   enabled: boolean;
   maxColdCacheCatchupPasses: number;
@@ -16,6 +32,8 @@ export type DynamicLeafChunkTokensConfig = {
 export type LcmConfig = {
   enabled: boolean;
   databasePath: string;
+  /** Directory for persisting large-file text payloads. */
+  largeFilesDir: string;
   /** Glob patterns for session keys to exclude from LCM storage entirely. */
   ignoreSessionPatterns: string[];
   /** Glob patterns for session keys that may read from LCM but never write to it. */
@@ -228,7 +246,11 @@ export function resolveLcmConfig(
       env.LCM_DATABASE_PATH
       ?? toStr(pc.dbPath)
       ?? toStr(pc.databasePath)
-      ?? join(homedir(), ".openclaw", "lcm.db"),
+      ?? join(resolveOpenclawStateDir(env), "lcm.db"),
+    largeFilesDir:
+      env.LCM_LARGE_FILES_DIR?.trim()
+      ?? toStr(pc.largeFilesDir)
+      ?? join(resolveOpenclawStateDir(env), "lcm-files"),
     ignoreSessionPatterns:
       env.LCM_IGNORE_SESSION_PATTERNS !== undefined
         ? env.LCM_IGNORE_SESSION_PATTERNS

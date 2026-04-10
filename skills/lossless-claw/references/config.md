@@ -154,6 +154,7 @@ Why it matters:
 
 - useful for custom deployments, testing, or isolating environments
 - wrong path selection is a common reason operators think LCM is empty or not growing
+- the default resolves to `${OPENCLAW_STATE_DIR}/lcm.db` (falls back to `~/.openclaw/lcm.db`)
 
 ### `databasePath`
 
@@ -163,6 +164,15 @@ Why it matters:
 
 - this is the documented key new config should use
 - `dbPath` is still accepted for compatibility
+
+### `largeFilesDir`
+
+Directory for persisting large-file text payloads externalised from the transcript.
+
+Why it matters:
+
+- defaults to `${OPENCLAW_STATE_DIR}/lcm-files`; on multi-profile hosts each profile stores files in its own state directory automatically
+- override with `LCM_LARGE_FILES_DIR` or set `largeFilesDir` in plugin config when you want an explicit path
 
 ### `largeFileThresholdTokens`
 
