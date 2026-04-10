@@ -12,6 +12,7 @@ export type ConversationCompactionTelemetryRecord = {
   lastObservedCacheHitAt: Date | null;
   lastObservedCacheBreakAt: Date | null;
   cacheState: CacheState;
+  consecutiveColdObservations: number;
   retention: string | null;
   lastLeafCompactionAt: Date | null;
   turnsSinceLeafCompaction: number;
@@ -31,6 +32,7 @@ export type UpsertConversationCompactionTelemetryInput = {
   lastObservedCacheHitAt?: Date | null;
   lastObservedCacheBreakAt?: Date | null;
   cacheState: CacheState;
+  consecutiveColdObservations?: number;
   retention?: string | null;
   lastLeafCompactionAt?: Date | null;
   turnsSinceLeafCompaction?: number;
@@ -49,6 +51,7 @@ type ConversationCompactionTelemetryRow = {
   last_observed_cache_hit_at: string | null;
   last_observed_cache_break_at: string | null;
   cache_state: CacheState;
+  consecutive_cold_observations: number | null;
   retention: string | null;
   last_leaf_compaction_at: string | null;
   turns_since_leaf_compaction: number | null;
@@ -71,6 +74,7 @@ function toConversationCompactionTelemetryRecord(
     lastObservedCacheHitAt: parseUtcTimestampOrNull(row.last_observed_cache_hit_at),
     lastObservedCacheBreakAt: parseUtcTimestampOrNull(row.last_observed_cache_break_at),
     cacheState: row.cache_state,
+    consecutiveColdObservations: row.consecutive_cold_observations ?? 0,
     retention: row.retention,
     lastLeafCompactionAt: parseUtcTimestampOrNull(row.last_leaf_compaction_at),
     turnsSinceLeafCompaction: row.turns_since_leaf_compaction ?? 0,
@@ -109,6 +113,7 @@ export class CompactionTelemetryStore {
            last_observed_cache_hit_at,
            last_observed_cache_break_at,
            cache_state,
+           consecutive_cold_observations,
            retention,
            last_leaf_compaction_at,
            turns_since_leaf_compaction,
@@ -139,6 +144,7 @@ export class CompactionTelemetryStore {
            last_observed_cache_hit_at,
            last_observed_cache_break_at,
            cache_state,
+           consecutive_cold_observations,
            retention,
            last_leaf_compaction_at,
            turns_since_leaf_compaction,
@@ -149,13 +155,14 @@ export class CompactionTelemetryStore {
            provider,
            model,
            updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(conversation_id) DO UPDATE SET
            last_observed_cache_read = excluded.last_observed_cache_read,
            last_observed_cache_write = excluded.last_observed_cache_write,
            last_observed_cache_hit_at = excluded.last_observed_cache_hit_at,
            last_observed_cache_break_at = excluded.last_observed_cache_break_at,
            cache_state = excluded.cache_state,
+           consecutive_cold_observations = excluded.consecutive_cold_observations,
            retention = excluded.retention,
            last_leaf_compaction_at = excluded.last_leaf_compaction_at,
            turns_since_leaf_compaction = excluded.turns_since_leaf_compaction,
@@ -174,6 +181,7 @@ export class CompactionTelemetryStore {
         input.lastObservedCacheHitAt?.toISOString() ?? null,
         input.lastObservedCacheBreakAt?.toISOString() ?? null,
         input.cacheState,
+        input.consecutiveColdObservations ?? 0,
         input.retention ?? null,
         input.lastLeafCompactionAt?.toISOString() ?? null,
         input.turnsSinceLeafCompaction ?? 0,

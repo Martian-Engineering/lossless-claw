@@ -170,6 +170,7 @@ openclaw plugins install --link /path/to/lossless-claw
 | `cacheAwareCompaction.maxColdCacheCatchupPasses` | `integer` | `2` | `LCM_MAX_COLD_CACHE_CATCHUP_PASSES` | Maximum bounded catch-up passes allowed in one maintenance cycle when cache telemetry is cold. |
 | `cacheAwareCompaction.hotCachePressureFactor` | `number` | `4` | `LCM_HOT_CACHE_PRESSURE_FACTOR` | Multiplier applied to the hot-cache leaf trigger before raw-history pressure overrides cache preservation. |
 | `cacheAwareCompaction.hotCacheBudgetHeadroomRatio` | `number` | `0.2` | `LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO` | Minimum fraction of the real token budget that must remain free before hot-cache incremental compaction is skipped entirely. |
+| `cacheAwareCompaction.coldCacheObservationThreshold` | `integer` | `3` | `LCM_COLD_CACHE_OBSERVATION_THRESHOLD` | Consecutive cold observations required before non-explicit cache misses are treated as truly cold. This dampens one-off routing noise and provider failover blips. |
 
 #### `dynamicLeafChunkTokens`
 

@@ -57,6 +57,7 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
       maxColdCacheCatchupPasses: 2,
       hotCachePressureFactor: 4,
       hotCacheBudgetHeadroomRatio: 0.2,
+      coldCacheObservationThreshold: 3,
     },
     dynamicLeafChunkTokens: {
       enabled: true,

@@ -23,6 +23,7 @@ export type CacheAwareCompactionConfig = {
   maxColdCacheCatchupPasses: number;
   hotCachePressureFactor: number;
   hotCacheBudgetHeadroomRatio: number;
+  coldCacheObservationThreshold: number;
 };
 
 export type DynamicLeafChunkTokensConfig = {
@@ -315,6 +316,14 @@ export function resolveLcmConfigWithDiagnostics(
         ?? 0.2,
     ),
   );
+  const resolvedColdCacheObservationThreshold = Math.max(
+    1,
+    Math.floor(
+      parseFiniteNumber(env.LCM_COLD_CACHE_OBSERVATION_THRESHOLD)
+        ?? toNumber(cacheAwareCompaction?.coldCacheObservationThreshold)
+        ?? 3,
+    ),
+  );
 
   const ignoreSessionPatterns = resolvePatternArray({
     envValue: env.LCM_IGNORE_SESSION_PATTERNS,
@@ -444,6 +453,7 @@ export function resolveLcmConfigWithDiagnostics(
             ?? 2,
         hotCachePressureFactor: resolvedHotCachePressureFactor,
         hotCacheBudgetHeadroomRatio: resolvedHotCacheBudgetHeadroomRatio,
+        coldCacheObservationThreshold: resolvedColdCacheObservationThreshold,
       },
       dynamicLeafChunkTokens: {
         enabled:

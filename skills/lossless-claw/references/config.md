@@ -384,6 +384,19 @@ Default:
 
 - `0.2`
 
+#### `cacheAwareCompaction.coldCacheObservationThreshold`
+
+Consecutive cold observations required before non-explicit cache misses are treated as truly cold.
+
+Why it matters:
+
+- prevents a single OpenRouter routing miss or provider failover blip from immediately triggering cold-cache catch-up
+- explicit cache breaks still count as cold immediately
+
+Default:
+
+- `3`
+
 ### `dynamicLeafChunkTokens`
 
 #### `dynamicLeafChunkTokens.enabled`
