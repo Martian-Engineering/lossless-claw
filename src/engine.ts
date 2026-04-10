@@ -1949,56 +1949,6 @@ export class LcmContextEngine implements ContextEngine {
       });
     }
 
-    if (
-      cacheState === "hot"
-      && this.isComfortablyUnderTokenBudget({
-        currentTokenCount: params.currentTokenCount,
-        tokenBudget: params.tokenBudget,
-      })
-    ) {
-      return this.logIncrementalCompactionDecision({
-        conversationId: params.conversationId,
-        cacheState,
-        activityBand,
-        triggerLeafChunkTokens,
-        preferredLeafChunkTokens,
-        fallbackLeafChunkTokens,
-        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
-        threshold: leafTrigger.threshold,
-        shouldCompact: false,
-        maxPasses: 1,
-        allowCondensedPasses: false,
-        reason: "hot-cache-budget-headroom",
-      });
-    }
-
-    if (
-      cacheState === "hot"
-      && leafTrigger.rawTokensOutsideTail
-        < Math.floor(
-          leafTrigger.threshold * this.config.cacheAwareCompaction.hotCachePressureFactor,
-        )
-    ) {
-      return this.logIncrementalCompactionDecision({
-        conversationId: params.conversationId,
-        cacheState,
-        activityBand,
-        triggerLeafChunkTokens,
-        preferredLeafChunkTokens,
-        fallbackLeafChunkTokens,
-        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
-        threshold: leafTrigger.threshold,
-        shouldCompact: false,
-        maxPasses: 1,
-        allowCondensedPasses: false,
-        reason: "hot-cache-defer",
-      });
-    }
-
-    const maxPasses =
-      cacheState === "cold"
-        ? Math.max(1, this.config.cacheAwareCompaction.maxColdCacheCatchupPasses)
-        : 1;
     return this.logIncrementalCompactionDecision({
       conversationId: params.conversationId,
       cacheState,
@@ -2009,9 +1959,9 @@ export class LcmContextEngine implements ContextEngine {
       rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
       threshold: leafTrigger.threshold,
       shouldCompact: true,
-      maxPasses,
-      allowCondensedPasses: cacheState !== "hot",
-      reason: cacheState === "cold" ? "cold-cache-catchup" : "leaf-trigger",
+      maxPasses: 1,
+      allowCondensedPasses: false,
+      reason: "leaf-trigger",
     });
   }
 
