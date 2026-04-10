@@ -43,6 +43,14 @@ type FtsTableSpec = {
   staleSchemaPatterns?: string[];
 };
 
+const VERSIONED_BACKFILL_STEPS = {
+  backfillSummaryDepths: 1,
+  backfillSummaryMetadata: 1,
+  backfillToolCallColumns: 1,
+} as const;
+
+type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
+
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
   const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
   const hasDepth = summaryColumns.some((col) => col.name === "depth");
@@ -141,6 +149,82 @@ function runMigrationStep(
   } catch (error) {
     log?.info?.(
       `[lcm] migration step failed: step=${name} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
+    );
+    throw error;
+  }
+}
+
+function getVersionedBackfillSavepointName(stepName: VersionedBackfillStepName): string {
+  return `lcm_backfill_${stepName}`;
+}
+
+function hasCompletedVersionedBackfill(
+  db: DatabaseSync,
+  stepName: VersionedBackfillStepName,
+  algorithmVersion: number,
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1
+       FROM lcm_migration_state
+       WHERE step_name = ? AND algorithm_version = ?
+       LIMIT 1`,
+    )
+    .get(stepName, algorithmVersion) as { 1?: number } | undefined;
+  return row != null;
+}
+
+function markVersionedBackfillComplete(
+  db: DatabaseSync,
+  stepName: VersionedBackfillStepName,
+  algorithmVersion: number,
+): void {
+  db.prepare(
+    `INSERT INTO lcm_migration_state (step_name, algorithm_version, completed_at)
+     VALUES (?, ?, datetime('now'))
+     ON CONFLICT(step_name, algorithm_version)
+     DO UPDATE SET completed_at = excluded.completed_at`,
+  ).run(stepName, algorithmVersion);
+}
+
+function rollbackSavepoint(db: DatabaseSync, savepointName: string): void {
+  try {
+    db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+  } finally {
+    db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+  }
+}
+
+function runVersionedBackfillStep(
+  db: DatabaseSync,
+  stepName: VersionedBackfillStepName,
+  log: MigrationLogger | undefined,
+  step: () => void,
+): void {
+  const algorithmVersion = VERSIONED_BACKFILL_STEPS[stepName];
+  if (hasCompletedVersionedBackfill(db, stepName, algorithmVersion)) {
+    log?.info?.(
+      `[lcm] migration step skipped: step=${stepName} algorithmVersion=${algorithmVersion} reason=already-complete`,
+    );
+    return;
+  }
+
+  const startedAt = Date.now();
+  const savepointName = getVersionedBackfillSavepointName(stepName);
+
+  db.exec(`SAVEPOINT ${savepointName}`);
+
+  try {
+    step();
+    markVersionedBackfillComplete(db, stepName, algorithmVersion);
+    db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+    log?.info?.(
+      `[lcm] migration step complete: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${Date.now() - startedAt}`,
+    );
+  } catch (error) {
+    rollbackSavepoint(db, savepointName);
+    log?.info?.(
+      `[lcm] migration step failed: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
     );
     throw error;
   }
@@ -710,6 +794,13 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS lcm_migration_state (
+      step_name TEXT NOT NULL,
+      algorithm_version INTEGER NOT NULL,
+      completed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (step_name, algorithm_version)
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
@@ -771,7 +862,7 @@ export function runLcmMigrations(
   runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
     ensureCompactionTelemetryColumns(db),
   );
-  runMigrationStep("backfillSummaryDepths", log, () => backfillSummaryDepths(db));
+  runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));
   // Index on depth — created AFTER backfillSummaryDepths to avoid index
   // maintenance overhead during bulk depth updates on large existing DBs.
   runMigrationStep("createSummariesDepthIndex", log, () =>
@@ -779,8 +870,12 @@ export function runLcmMigrations(
       `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
     ),
   );
-  runMigrationStep("backfillSummaryMetadata", log, () => backfillSummaryMetadata(db));
-  runMigrationStep("backfillToolCallColumns", log, () => backfillToolCallColumns(db));
+  runVersionedBackfillStep(db, "backfillSummaryMetadata", log, () =>
+    backfillSummaryMetadata(db),
+  );
+  runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
+    backfillToolCallColumns(db),
+  );
 
   const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
   const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
