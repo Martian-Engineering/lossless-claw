@@ -585,6 +585,30 @@ export function buildCompleteSimpleOptions(params: {
   return options;
 }
 
+/**
+ * Prefer an explicit reasoning setting, otherwise apply a caller-provided
+ * default only when the resolved model advertises reasoning support.
+ */
+export function resolveEffectiveReasoning(params: {
+  reasoning: string | undefined;
+  reasoningIfSupported: string | undefined;
+  modelSupportsReasoning: boolean | undefined;
+}): string | undefined {
+  if (typeof params.reasoning === "string" && params.reasoning.trim()) {
+    return params.reasoning.trim();
+  }
+
+  if (
+    params.modelSupportsReasoning === true &&
+    typeof params.reasoningIfSupported === "string" &&
+    params.reasoningIfSupported.trim()
+  ) {
+    return params.reasoningIfSupported.trim();
+  }
+
+  return undefined;
+}
+
 /** Select provider-specific config values with case-insensitive provider keys. */
 function findProviderConfigValue<T>(
   map: Record<string, T> | undefined,
@@ -1353,6 +1377,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       maxTokens,
       temperature,
       reasoning,
+      reasoningIfSupported,
     }) => {
       try {
         const piAiModuleId = "@mariozechner/pi-ai";
@@ -1590,19 +1615,24 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           }
         }
 
+        const effectiveReasoning = resolveEffectiveReasoning({
+          reasoning,
+          reasoningIfSupported,
+          modelSupportsReasoning: resolvedModel.reasoning,
+        });
+
         const completeOptions = buildCompleteSimpleOptions({
           api: resolvedModel.api,
           apiKey: resolvedApiKey,
           maxTokens,
           temperature,
-          reasoning,
+          reasoning: effectiveReasoning,
         });
         const requestMetadata = {
           request_provider: providerId,
           request_model: modelId,
           request_api: resolvedModel.api,
-          request_reasoning:
-            typeof reasoning === "string" && reasoning.trim() ? reasoning.trim() : "(none)",
+          request_reasoning: effectiveReasoning ?? "(none)",
           request_has_system: typeof system === "string" && system.trim().length > 0 ? "true" : "false",
           request_temperature:
             typeof completeOptions.temperature === "number"

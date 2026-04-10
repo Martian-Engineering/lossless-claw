@@ -45,6 +45,7 @@ export type CompleteFn = (params: {
   maxTokens: number;
   temperature?: number;
   reasoning?: string;
+  reasoningIfSupported?: string;
 }) => Promise<CompletionResult>;
 
 /**

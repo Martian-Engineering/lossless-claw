@@ -1223,6 +1223,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             },
           ],
           maxTokens: targetTokens,
+          reasoningIfSupported: "low",
           ...(reasoning ? { reasoning } : {}),
           ...(options?.skipModelAuth === true ? { skipModelAuth: true } : {}),
         }), summarizerTimeoutMs, label);
