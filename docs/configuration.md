@@ -252,7 +252,7 @@ The SQLite database lives at `databasePath` or `LCM_DATABASE_PATH`. The default 
 Inspect it with:
 
 ```bash
-sqlite3 ~/.openclaw/lcm.db
+sqlite3 "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db"
 
 SELECT COUNT(*) FROM conversations;
 SELECT * FROM context_items WHERE conversation_id = 1 ORDER BY ordinal;
@@ -263,8 +263,8 @@ SELECT summary_id, depth, token_count FROM summaries ORDER BY token_count DESC L
 Back it up with:
 
 ```bash
-cp ~/.openclaw/lcm.db ~/.openclaw/lcm.db.backup
-sqlite3 ~/.openclaw/lcm.db ".backup ~/.openclaw/lcm.db.backup"
+cp "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db" "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db.backup"
+sqlite3 "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db" ".backup ${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db.backup"
 ```
 
 ## Disabling lossless-claw

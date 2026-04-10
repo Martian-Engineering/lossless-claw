@@ -58,11 +58,11 @@
     },
     "dbPath": {
       "label": "Database Path",
-      "help": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
+      "help": "Path to LCM SQLite database (default: <OPENCLAW_STATE_DIR>/lcm.db; falls back to ~/.openclaw/lcm.db)"
     },
     "databasePath": {
       "label": "Database Path",
-      "help": "Path to LCM SQLite database (preferred key; alias of dbPath)"
+      "help": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)"
     },
     "largeFilesDir": {
       "label": "Large Files Directory",
@@ -346,7 +346,7 @@
         "type": "boolean"
       },
       "databasePath": {
-        "description": "Path to LCM SQLite database (alias for dbPath)",
+        "description": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)",
         "type": "string"
       },
       "largeFilesDir": {
