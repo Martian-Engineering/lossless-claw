@@ -5,6 +5,8 @@ type StartupBannerKey =
   | "transcript-gc-enabled"
   | "ignore-session-patterns"
   | "stateless-session-patterns"
+  | "ignore-session-patterns-env-override"
+  | "stateless-session-patterns-env-override"
   | "state-dir";
 
 type StartupBannerLogState = {

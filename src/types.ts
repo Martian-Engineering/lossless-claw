@@ -6,6 +6,7 @@
  */
 
 import type { LcmConfig } from "./db/config.js";
+import type { LcmConfigDiagnostics } from "./db/config.js";
 
 /**
  * Minimal LLM completion interface needed by LCM for summarization.
@@ -106,6 +107,9 @@ export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 export interface LcmDependencies {
   /** LCM configuration (from env vars + plugin config) */
   config: LcmConfig;
+
+  /** Optional config resolution metadata for startup diagnostics. */
+  configDiagnostics?: LcmConfigDiagnostics;
 
   /** LLM completion function for summarization */
   complete: CompleteFn;

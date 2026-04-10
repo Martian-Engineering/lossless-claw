@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { resolveLcmConfig, resolveOpenclawStateDir } from "../db/config.js";
+import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
@@ -1283,8 +1283,25 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   const modelAuth = getRuntimeModelAuth(api);
   const readEnv: ReadEnvFn = (key) => process.env[key];
   const pluginConfig = resolvePluginConfig(api);
-  const config = resolveLcmConfig(process.env, pluginConfig);
   const log = createLcmLogger(api);
+  const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
+
+  if (diagnostics.ignoreSessionPatternsEnvOverridesPluginConfig) {
+    logStartupBannerOnce({
+      key: "ignore-session-patterns-env-override",
+      log: (message) => log.warn(message),
+      message:
+        "[lcm] LCM_IGNORE_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.ignoreSessionPatterns; plugin config array will be ignored",
+    });
+  }
+  if (diagnostics.statelessSessionPatternsEnvOverridesPluginConfig) {
+    logStartupBannerOnce({
+      key: "stateless-session-patterns-env-override",
+      log: (message) => log.warn(message),
+      message:
+        "[lcm] LCM_STATELESS_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.statelessSessionPatterns; plugin config array will be ignored",
+    });
+  }
 
   // Read model overrides from plugin config
   if (pluginConfig) {
@@ -1368,6 +1385,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 
   return {
     config,
+    configDiagnostics: diagnostics,
     isRuntimeManagedAuthProvider: (provider: string, providerApi?: string) => {
       const normalizedProvider = normalizeProviderId(provider);
       if (normalizedProvider === "openai-codex" || normalizedProvider === "github-copilot") {
@@ -1873,7 +1891,7 @@ const lcmPlugin = {
         value && typeof value === "object" && !Array.isArray(value)
           ? (value as Record<string, unknown>)
           : {};
-      return resolveLcmConfig(process.env, raw);
+      return resolveLcmConfigWithDiagnostics(process.env, raw).config;
     },
   },
 

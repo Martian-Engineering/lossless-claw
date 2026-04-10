@@ -43,6 +43,7 @@ import {
   parseFileBlocks,
 } from "./large-files.js";
 import { describeLogError } from "./lcm-log.js";
+import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
@@ -1298,17 +1299,24 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
     if (this.config.ignoreSessionPatterns.length > 0) {
+      const source = describeLcmConfigSource(
+        this.deps.configDiagnostics?.ignoreSessionPatternsSource ?? "default",
+      );
       logStartupBannerOnce({
         key: "ignore-session-patterns",
         log: (message) => this.deps.log.info(message),
-        message: `[lcm] Ignoring sessions matching ${this.config.ignoreSessionPatterns.length} pattern(s): ${this.config.ignoreSessionPatterns.join(", ")}`,
+        message: `[lcm] Ignoring sessions matching ${this.config.ignoreSessionPatterns.length} pattern(s) from ${source}: ${this.config.ignoreSessionPatterns.join(", ")}`,
       });
     }
-    if (this.config.skipStatelessSessions && this.config.statelessSessionPatterns.length > 0) {
+    if (this.config.statelessSessionPatterns.length > 0) {
+      const source = describeLcmConfigSource(
+        this.deps.configDiagnostics?.statelessSessionPatternsSource ?? "default",
+      );
+      const enforcement = this.config.skipStatelessSessions ? "" : " (skipStatelessSessions=false)";
       logStartupBannerOnce({
         key: "stateless-session-patterns",
         log: (message) => this.deps.log.info(message),
-        message: `[lcm] Stateless session patterns: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
+        message: `[lcm] Stateless session patterns${enforcement} from ${source}: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
       });
     }
     this.assembler = new ContextAssembler(

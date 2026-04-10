@@ -225,12 +225,45 @@ describe("lcm plugin registration", () => {
     );
     expect(infoLog).toHaveBeenCalledWith("[lcm] Transcript GC enabled (default false)");
     expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Ignoring sessions matching 2 pattern(s) from plugin config: agent:*:cron:**, agent:main:subagent:**",
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Stateless session patterns from plugin config: 1 pattern(s): agent:*:subagent:**",
+    );
+    expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: (unconfigured)",
     );
     expect(sessionInfoLog).not.toHaveBeenCalled();
     expect(debugLog).toHaveBeenCalledWith(expect.stringContaining("[lcm] Migration successful"));
     expect(api.on).toHaveBeenCalledWith("before_reset", expect.any(Function));
     expect(api.on).toHaveBeenCalledWith("session_end", expect.any(Function));
+  });
+
+  it("logs env-backed pattern sources and override warnings during register", () => {
+    vi.stubEnv("LCM_IGNORE_SESSION_PATTERNS", "agent:*:cron:*, agent:main:subagent:**");
+    vi.stubEnv("LCM_STATELESS_SESSION_PATTERNS", "agent:*:ephemeral:**");
+
+    const { api, infoLog, warnLog } = buildApi({
+      enabled: true,
+      ignoreSessionPatterns: ["agent:*:test:*"],
+      statelessSessionPatterns: ["agent:*:preview:*"],
+      skipStatelessSessions: true,
+    });
+
+    lcmPlugin.register(api);
+
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Ignoring sessions matching 2 pattern(s) from env: agent:*:cron:*, agent:main:subagent:**",
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Stateless session patterns from env: 1 pattern(s): agent:*:ephemeral:**",
+    );
+    expect(warnLog).toHaveBeenCalledWith(
+      "[lcm] LCM_IGNORE_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.ignoreSessionPatterns; plugin config array will be ignored",
+    );
+    expect(warnLog).toHaveBeenCalledWith(
+      "[lcm] LCM_STATELESS_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.statelessSessionPatterns; plugin config array will be ignored",
+    );
   });
 
   it.each([
@@ -542,8 +575,8 @@ describe("lcm plugin registration", () => {
         "[lcm] Plugin loaded (enabled=true, db=",
         "[lcm] Transcript GC ",
         "[lcm] Compaction summarization model:",
-        "[lcm] Ignoring sessions matching",
-        "[lcm] Stateless session patterns:",
+        "[lcm] Ignoring sessions matching ",
+        "[lcm] Stateless session patterns",
       ].some((prefix) => message.startsWith(prefix)),
     );
 
@@ -551,8 +584,8 @@ describe("lcm plugin registration", () => {
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
       "[lcm] Transcript GC disabled (default false)",
       "[lcm] Compaction summarization model: (unconfigured)",
-      "[lcm] Ignoring sessions matching 2 pattern(s): agent:*:cron:**, agent:main:subagent:**",
-      "[lcm] Stateless session patterns: 1 pattern(s): agent:*:subagent:**",
+      "[lcm] Ignoring sessions matching 2 pattern(s) from plugin config: agent:*:cron:**, agent:main:subagent:**",
+      "[lcm] Stateless session patterns from plugin config: 1 pattern(s): agent:*:subagent:**",
     ].sort());
     expect(firstSessionMessages).toEqual([]);
     expect(secondSessionMessages).toEqual([]);

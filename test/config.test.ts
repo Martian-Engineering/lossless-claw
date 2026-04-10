@@ -2,7 +2,11 @@ import { describe, it, expect } from "vitest";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
-import { resolveLcmConfig, resolveOpenclawStateDir } from "../src/db/config.js";
+import {
+  resolveLcmConfig,
+  resolveLcmConfigWithDiagnostics,
+  resolveOpenclawStateDir,
+} from "../src/db/config.js";
 
 describe("resolveLcmConfig", () => {
   it("ships the bundled lossless-claw skill path in the manifest", () => {
@@ -157,6 +161,31 @@ describe("resolveLcmConfig", () => {
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
       max: 60000,
+    });
+  });
+
+  it("reports session pattern sources and env override diagnostics", () => {
+    const { config, diagnostics } = resolveLcmConfigWithDiagnostics(
+      {
+        LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
+        LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**",
+      } as NodeJS.ProcessEnv,
+      {
+        ignoreSessionPatterns: ["agent:*:test:*"],
+        statelessSessionPatterns: ["agent:*:preview:*"],
+      },
+    );
+
+    expect(config.ignoreSessionPatterns).toEqual([
+      "agent:*:cron:*",
+      "agent:main:subagent:**",
+    ]);
+    expect(config.statelessSessionPatterns).toEqual(["agent:*:ephemeral:**"]);
+    expect(diagnostics).toEqual({
+      ignoreSessionPatternsSource: "env",
+      statelessSessionPatternsSource: "env",
+      ignoreSessionPatternsEnvOverridesPluginConfig: true,
+      statelessSessionPatternsEnvOverridesPluginConfig: true,
     });
   });
 
