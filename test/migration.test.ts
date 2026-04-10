@@ -273,7 +273,7 @@ describe("runLcmMigrations summary depth backfill", () => {
     const queryPlanRows = db
       .prepare(
         `EXPLAIN QUERY PLAN
-         SELECT conversation_id
+         SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
          FROM conversations
          WHERE session_id = ?
          ORDER BY active DESC, created_at DESC
@@ -285,7 +285,7 @@ describe("runLcmMigrations summary depth backfill", () => {
     const queryPlanDetails = queryPlanRows.map((row) => row.detail);
     expect(
       queryPlanDetails.some((detail) =>
-        detail.includes("USING COVERING INDEX conversations_session_id_active_created_idx"),
+        detail.includes("USING INDEX conversations_session_id_active_created_idx"),
       ),
     ).toBe(true);
     expect(queryPlanDetails.some((detail) => detail.includes("USE TEMP B-TREE FOR ORDER BY"))).toBe(false);
