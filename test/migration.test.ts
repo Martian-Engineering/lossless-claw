@@ -266,8 +266,29 @@ describe("runLcmMigrations summary depth backfill", () => {
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`)
       .all() as Array<{ name: string }>;
     const allIndexNames = new Set(allIndexRows.map((r) => r.name));
+    expect(allIndexNames.has("conversations_session_id_active_created_idx")).toBe(true);
     expect(allIndexNames.has("summary_messages_message_idx")).toBe(true);
     expect(allIndexNames.has("summaries_conv_depth_kind_idx")).toBe(true);
+
+    const queryPlanRows = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT conversation_id
+         FROM conversations
+         WHERE session_id = ?
+         ORDER BY active DESC, created_at DESC
+         LIMIT 1`,
+      )
+      .all("legacy-session") as Array<{
+      detail: string;
+    }>;
+    const queryPlanDetails = queryPlanRows.map((row) => row.detail);
+    expect(
+      queryPlanDetails.some((detail) =>
+        detail.includes("USING COVERING INDEX conversations_session_id_active_created_idx"),
+      ),
+    ).toBe(true);
+    expect(queryPlanDetails.some((detail) => detail.includes("USE TEMP B-TREE FOR ORDER BY"))).toBe(false);
 
     db.prepare(
       `INSERT INTO conversations (session_id, session_key, active, archived_at)

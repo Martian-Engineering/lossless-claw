@@ -762,6 +762,10 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS conversations_session_key_active_created_idx
     ON conversations (session_key, active, created_at)
   `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS conversations_session_id_active_created_idx
+    ON conversations (session_id, active, created_at)
+  `);
   db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
   runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
   runMigrationStep("ensureSummaryMetadataColumns", log, () =>
