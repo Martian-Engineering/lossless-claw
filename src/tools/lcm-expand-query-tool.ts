@@ -1131,6 +1131,7 @@ export function createLcmExpandQueryTool(input: {
         if (!conversationScope.allConversations) {
           const sourceConversationId = resolveSourceConversationId({
             scopedConversationId,
+            allowedConversationIds: conversationScope.conversationIds,
             allConversations: conversationScope.allConversations,
             candidates,
           });
