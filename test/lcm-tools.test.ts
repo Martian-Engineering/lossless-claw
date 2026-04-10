@@ -83,6 +83,7 @@ function buildLcmEngine(params: {
   };
   conversationId?: number;
   conversationIdBySessionKey?: number;
+  conversationFamilyIds?: number[];
   timezone?: string;
 }) {
   return {
@@ -115,6 +116,18 @@ function buildLcmEngine(params: {
               updatedAt: new Date("2026-01-01T00:00:00.000Z"),
             },
       ),
+      getConversationFamilyIds: vi.fn(async () => {
+        if (params.conversationFamilyIds && params.conversationFamilyIds.length > 0) {
+          return params.conversationFamilyIds;
+        }
+        if (typeof params.conversationIdBySessionKey === "number") {
+          return [params.conversationIdBySessionKey];
+        }
+        if (typeof params.conversationId === "number") {
+          return [params.conversationId];
+        }
+        return [];
+      }),
     }),
   };
 }
@@ -286,8 +299,43 @@ describe("LCM tools session scoping", () => {
     expect(retrieval.grep).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: 42,
+        conversationIds: [42],
       }),
     );
+  });
+
+  it("lcm_grep searches across a resolved session family", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps({
+        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
+      }),
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationIdBySessionKey: 42,
+        conversationFamilyIds: [42, 21, 7],
+      }) as never,
+      sessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-family", { pattern: "deployment" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        conversationIds: [42, 21, 7],
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("session family rooted at 42 (3 segments)");
   });
 
   it("lcm_describe blocks cross-conversation lookup unless allConversations=true", async () => {
@@ -341,7 +389,7 @@ describe("LCM tools session scoping", () => {
       sessionId: "session-1",
     });
     const scoped = await tool.execute("call-3", { id: "sum_foreign" });
-    expect((scoped.details as { error?: string }).error).toContain("Not found in conversation 42");
+    expect((scoped.details as { error?: string }).error).toContain("Not found in this session scope");
 
     const cross = await tool.execute("call-4", {
       id: "sum_foreign",

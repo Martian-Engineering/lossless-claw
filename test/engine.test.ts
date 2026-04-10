@@ -64,6 +64,12 @@ function createTestConfig(databasePath: string): LcmConfig {
       enabled: true,
       max: 40_000,
     },
+    sessionBifurcation: {
+      enabled: false,
+      maxConversationMessages: 50_000,
+      maxConversationAgeHours: 168,
+      minMessagesBeforeAgeSplit: 2_000,
+    },
   };
 }
 
@@ -1249,6 +1255,209 @@ describe("LcmContextEngine session_end lifecycle", () => {
 
     expect(firstFresh?.conversationId).not.toBe(original.conversationId);
     expect(secondFresh?.conversationId).toBe(firstFresh?.conversationId);
+  });
+});
+
+describe("LcmContextEngine session bifurcation", () => {
+  it("rotates to a fresh active conversation when a session segment exceeds the message threshold", async () => {
+    const engine = createEngineWithConfig({
+      sessionBifurcation: {
+        enabled: true,
+        maxConversationMessages: 2,
+        maxConversationAgeHours: 168,
+        minMessagesBeforeAgeSplit: 2,
+      },
+    });
+    const store = engine.getConversationStore();
+    const sessionKey = "agent:main:main";
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-threshold",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-threshold-a"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const firstConversation = await store.getConversationBySessionKey(sessionKey);
+    expect(firstConversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-threshold",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-threshold-b"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "user", content: "new C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const activeConversation = await store.getConversationBySessionKey(sessionKey);
+    const archivedConversation = await store.getConversation(firstConversation!.conversationId);
+    const activeMessages = await store.getMessages(activeConversation!.conversationId);
+
+    expect(activeConversation).not.toBeNull();
+    expect(activeConversation!.conversationId).not.toBe(firstConversation!.conversationId);
+    expect(archivedConversation?.active).toBe(false);
+    expect(activeMessages.map((message) => message.content)).toEqual(["new C"]);
+  });
+
+  it("does not bifurcate excluded cron sessions", async () => {
+    const engine = createEngineWithConfig({
+      sessionBifurcation: {
+        enabled: true,
+        maxConversationMessages: 1,
+        maxConversationAgeHours: 168,
+        minMessagesBeforeAgeSplit: 1,
+      },
+    });
+    const store = engine.getConversationStore();
+    const sessionKey = "agent:main:cron:nightly";
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-cron",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-cron-a"),
+      messages: [makeMessage({ role: "assistant", content: "cron A" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const originalConversation = await store.getConversationBySessionKey(sessionKey);
+    expect(originalConversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-cron",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-cron-b"),
+      messages: [
+        makeMessage({ role: "assistant", content: "cron A" }),
+        makeMessage({ role: "assistant", content: "cron B" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const currentConversation = await store.getConversationBySessionKey(sessionKey);
+    const currentMessages = await store.getMessages(currentConversation!.conversationId);
+
+    expect(currentConversation?.conversationId).toBe(originalConversation?.conversationId);
+    expect(currentMessages.map((message) => message.content)).toEqual(["cron A", "cron B"]);
+  });
+
+  it("reuses cached segment counts between turns when bifurcation stays on the same conversation", async () => {
+    const engine = createEngineWithConfig({
+      sessionBifurcation: {
+        enabled: true,
+        maxConversationMessages: 100,
+        maxConversationAgeHours: 168,
+        minMessagesBeforeAgeSplit: 2,
+      },
+    });
+    const store = engine.getConversationStore();
+    const statsSpy = vi.spyOn(store, "getConversationSegmentStats");
+    const sessionKey = "agent:main:main";
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-cache",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-cache-a"),
+      messages: [
+        makeMessage({ role: "user", content: "cache A" }),
+        makeMessage({ role: "assistant", content: "cache B" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-cache",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-cache-b"),
+      messages: [
+        makeMessage({ role: "user", content: "cache A" }),
+        makeMessage({ role: "assistant", content: "cache B" }),
+        makeMessage({ role: "user", content: "cache C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const currentConversation = await store.getConversationBySessionKey(sessionKey);
+    const currentMessages = await store.getMessages(currentConversation!.conversationId);
+
+    expect(statsSpy).toHaveBeenCalledTimes(1);
+    expect(currentMessages.map((message) => message.content)).toEqual([
+      "cache A",
+      "cache B",
+      "cache C",
+    ]);
+  });
+
+  it("does not advance bifurcation cache for heartbeat-only turns", async () => {
+    const engine = createEngineWithConfig({
+      sessionBifurcation: {
+        enabled: true,
+        maxConversationMessages: 2,
+        maxConversationAgeHours: 168,
+        minMessagesBeforeAgeSplit: 1,
+      },
+    });
+    const store = engine.getConversationStore();
+    const sessionKey = "agent:main:main";
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-heartbeat",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-heartbeat-a"),
+      messages: [makeMessage({ role: "user", content: "first real turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const firstConversation = await store.getConversationBySessionKey(sessionKey);
+    expect(firstConversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-heartbeat",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-heartbeat-b"),
+      messages: [
+        makeMessage({ role: "user", content: "first real turn" }),
+        makeMessage({ role: "assistant", content: "heartbeat noop" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+      isHeartbeat: true,
+    });
+
+    await engine.afterTurn({
+      sessionId: "bifurcation-heartbeat",
+      sessionKey,
+      sessionFile: createSessionFilePath("bifurcation-heartbeat-c"),
+      messages: [
+        makeMessage({ role: "user", content: "first real turn" }),
+        makeMessage({ role: "assistant", content: "second real turn" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const currentConversation = await store.getConversationBySessionKey(sessionKey);
+    const currentMessages = await store.getMessages(currentConversation!.conversationId);
+
+    expect(currentConversation?.conversationId).toBe(firstConversation?.conversationId);
+    expect(currentMessages.map((message) => message.content)).toEqual([
+      "first real turn",
+      "second real turn",
+    ]);
   });
 });
 
@@ -4865,8 +5074,8 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
     const sessionId = "after-turn-ingest-failure";
 
-    const ingestBatchSpy = vi
-      .spyOn(engine, "ingestBatch")
+    const ingestSingleSpy = vi
+      .spyOn(engine as never, "ingestSingle" as never)
       .mockRejectedValue(new Error("ingest exploded"));
     const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
     const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
@@ -4879,7 +5088,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       tokenBudget: 4096,
     });
 
-    expect(ingestBatchSpy).toHaveBeenCalled();
+    expect(ingestSingleSpy).toHaveBeenCalled();
     expect(evaluateLeafTriggerSpy).not.toHaveBeenCalled();
     expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
     expect(compactSpy).not.toHaveBeenCalled();

@@ -13,6 +13,13 @@ export type DynamicLeafChunkTokensConfig = {
   max: number;
 };
 
+export type SessionBifurcationConfig = {
+  enabled: boolean;
+  maxConversationMessages: number;
+  maxConversationAgeHours: number;
+  minMessagesBeforeAgeSplit: number;
+};
+
 export type LcmConfig = {
   enabled: boolean;
   databasePath: string;
@@ -72,6 +79,8 @@ export type LcmConfig = {
   cacheAwareCompaction: CacheAwareCompactionConfig;
   /** Dynamic step-band policy for incremental leaf chunk sizing. */
   dynamicLeafChunkTokens: DynamicLeafChunkTokensConfig;
+  /** Optional automatic rotation of long-running sessions into archived segments. */
+  sessionBifurcation: SessionBifurcationConfig;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -186,6 +195,7 @@ export function resolveLcmConfig(
   const pc = pluginConfig ?? {};
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
+  const sessionBifurcation = toRecord(pc.sessionBifurcation);
   const resolvedLeafChunkTokens =
     parseFiniteInt(env.LCM_LEAF_CHUNK_TOKENS)
       ?? toNumber(pc.leafChunkTokens) ?? 20000;
@@ -340,6 +350,30 @@ export function resolveLcmConfig(
           ? env.LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED === "true"
           : toBool(dynamicLeafChunkTokens?.enabled) ?? true,
       max: resolvedDynamicLeafChunkMax,
+    },
+    sessionBifurcation: {
+      enabled:
+        env.LCM_SESSION_BIFURCATION_ENABLED !== undefined
+          ? env.LCM_SESSION_BIFURCATION_ENABLED === "true"
+          : toBool(sessionBifurcation?.enabled) ?? false,
+      maxConversationMessages: Math.max(
+        1,
+        parseFiniteInt(env.LCM_SESSION_BIFURCATION_MAX_MESSAGES)
+          ?? toNumber(sessionBifurcation?.maxConversationMessages)
+          ?? 50000,
+      ),
+      maxConversationAgeHours: Math.max(
+        1,
+        parseFiniteInt(env.LCM_SESSION_BIFURCATION_MAX_AGE_HOURS)
+          ?? toNumber(sessionBifurcation?.maxConversationAgeHours)
+          ?? (24 * 7),
+      ),
+      minMessagesBeforeAgeSplit: Math.max(
+        1,
+        parseFiniteInt(env.LCM_SESSION_BIFURCATION_MIN_MESSAGES)
+          ?? toNumber(sessionBifurcation?.minMessagesBeforeAgeSplit)
+          ?? 2000,
+      ),
     },
   };
 }

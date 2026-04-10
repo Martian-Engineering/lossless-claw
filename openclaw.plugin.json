@@ -160,6 +160,22 @@
       "label": "Dynamic Leaf Chunk Max",
       "help": "Maximum working leaf chunk target for dynamic incremental compaction. The static leafChunkTokens value remains the floor."
     },
+    "sessionBifurcation.enabled": {
+      "label": "Session Bifurcation",
+      "help": "When enabled, very long-lived sessions rotate into archived segments while keeping the same active session key."
+    },
+    "sessionBifurcation.maxConversationMessages": {
+      "label": "Bifurcation Max Messages",
+      "help": "Hard message ceiling for one physical conversation segment before LCM rotates to a fresh active segment."
+    },
+    "sessionBifurcation.maxConversationAgeHours": {
+      "label": "Bifurcation Max Age (hours)",
+      "help": "Maximum age, in hours, for a physical conversation segment before age-based rotation is allowed."
+    },
+    "sessionBifurcation.minMessagesBeforeAgeSplit": {
+      "label": "Bifurcation Min Messages",
+      "help": "Minimum projected message count required before the age-based bifurcation path can rotate a session."
+    },
     "timezone": {
       "label": "Timezone",
       "help": "IANA timezone used for summary timestamps"
@@ -330,6 +346,27 @@
             "type": "boolean"
           },
           "max": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "sessionBifurcation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxConversationMessages": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "maxConversationAgeHours": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "minMessagesBeforeAgeSplit": {
             "type": "integer",
             "minimum": 1
           }

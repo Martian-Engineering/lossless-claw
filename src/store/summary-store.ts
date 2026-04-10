@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
+import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
@@ -64,6 +65,7 @@ export type ContextItemRecord = {
 
 export type SummarySearchInput = {
   conversationId?: number;
+  conversationIds?: number[];
   query: string;
   mode: "regex" | "full_text";
   since?: Date;
@@ -219,6 +221,36 @@ interface ConversationBootstrapStateRow {
   last_processed_offset: number;
   last_processed_entry_hash: string | null;
   updated_at: string;
+}
+
+function appendConversationScopeConstraint(params: {
+  where: string[];
+  args: Array<string | number>;
+  columnExpr: string;
+  conversationId?: number;
+  conversationIds?: number[];
+}): void {
+  const normalizedConversationIds = [...new Set(
+    (params.conversationIds ?? [])
+      .filter((value) => Number.isFinite(value))
+      .map((value) => Math.trunc(value)),
+  )];
+  if (normalizedConversationIds.length > 0) {
+    if (normalizedConversationIds.length === 1) {
+      params.where.push(`${params.columnExpr} = ?`);
+      params.args.push(normalizedConversationIds[0]!);
+      return;
+    }
+    params.where.push(
+      `${params.columnExpr} IN (${normalizedConversationIds.map(() => "?").join(", ")})`,
+    );
+    params.args.push(...normalizedConversationIds);
+    return;
+  }
+  if (params.conversationId != null) {
+    params.where.push(`${params.columnExpr} = ?`);
+    params.args.push(params.conversationId);
+  }
 }
 
 const CJK_QUERY_SEGMENT_RE =
@@ -1029,6 +1061,7 @@ export class SummaryStore {
               input.query,
               limit,
               input.conversationId,
+              input.conversationIds,
               input.since,
               input.before,
             );
@@ -1043,6 +1076,7 @@ export class SummaryStore {
           input.query,
           limit,
           input.conversationId,
+          input.conversationIds,
           input.since,
           input.before,
         );
@@ -1053,6 +1087,7 @@ export class SummaryStore {
             input.query,
             limit,
             input.conversationId,
+            input.conversationIds,
             input.since,
             input.before,
             input.sort,
@@ -1062,30 +1097,49 @@ export class SummaryStore {
             input.query,
             limit,
             input.conversationId,
+            input.conversationIds,
             input.since,
             input.before,
           );
         }
       }
-      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before);
+      return this.searchLike(
+        input.query,
+        limit,
+        input.conversationId,
+        input.conversationIds,
+        input.since,
+        input.before,
+      );
     }
-    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
+    return this.searchRegex(
+      input.query,
+      limit,
+      input.conversationId,
+      input.conversationIds,
+      input.since,
+      input.before,
+    );
   }
 
   private searchFullText(
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
     sort?: SearchSort,
   ): SummarySearchResult[] {
     const where: string[] = ["summaries_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
-    if (conversationId != null) {
-      where.push("s.conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "s.conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(s.created_at) >= julianday(?)");
       args.push(since.toISOString());
@@ -1117,6 +1171,7 @@ export class SummaryStore {
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
@@ -1127,10 +1182,13 @@ export class SummaryStore {
 
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(created_at) >= julianday(?)");
       args.push(since.toISOString());
@@ -1203,6 +1261,7 @@ export class SummaryStore {
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
@@ -1230,10 +1289,13 @@ export class SummaryStore {
       where.push("LOWER(s.content) LIKE ? ESCAPE '\\'");
       args.push(`%${this.escapeLikeTerm(token)}%`);
     }
-    if (conversationId != null) {
-      where.push("s.conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "s.conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(s.created_at) >= julianday(?)");
       args.push(since.toISOString());
@@ -1270,6 +1332,7 @@ export class SummaryStore {
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
@@ -1304,10 +1367,13 @@ export class SummaryStore {
 
     const where: string[] = [...cjkClauses, ...latinClauses];
     const args: Array<string | number> = [...cjkArgs, ...latinArgs];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(created_at) >= julianday(?)");
       args.push(since.toISOString());
@@ -1345,6 +1411,7 @@ export class SummaryStore {
     pattern: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
@@ -1361,10 +1428,13 @@ export class SummaryStore {
 
     const where: string[] = [];
     const args: Array<string | number> = [];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(created_at) >= julianday(?)");
       args.push(since.toISOString());

@@ -1227,6 +1227,7 @@ export class LcmContextEngine implements ContextEngine {
 
   // ── Circuit breaker for compaction auth failures ──
   private circuitBreakerStates = new Map<string, CircuitBreakerState>();
+  private bifurcationMessageCountCache = new Map<number, number>();
 
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
@@ -2042,6 +2043,105 @@ export class LcmContextEngine implements ContextEngine {
     } catch {
       return undefined;
     }
+  }
+
+  private shouldSkipSessionBifurcation(sessionKey: string): boolean {
+    return (
+      sessionKey.startsWith("agent:main:subagent:") ||
+      sessionKey.startsWith("agent:main:cron:")
+    );
+  }
+
+  private async getConversationMessageCountForBifurcation(
+    conversationId: number,
+  ): Promise<number> {
+    const cached = this.bifurcationMessageCountCache.get(conversationId);
+    if (typeof cached === "number") {
+      return cached;
+    }
+
+    const stats = await this.conversationStore.getConversationSegmentStats(conversationId);
+    this.bifurcationMessageCountCache.set(conversationId, stats.messageCount);
+    return stats.messageCount;
+  }
+
+  private primeBifurcationMessageCount(conversationId: number, messageCount: number): void {
+    this.bifurcationMessageCountCache.set(conversationId, Math.max(0, Math.trunc(messageCount)));
+  }
+
+  private clearBifurcationMessageCount(conversationId: number): void {
+    this.bifurcationMessageCountCache.delete(conversationId);
+  }
+
+  private async maybeRotateSessionConversation(params: {
+    sessionId: string;
+    sessionKey?: string;
+    pendingMessageCount: number;
+  }): Promise<{ conversationId: number; messageCountBeforeIngest: number } | null> {
+    const bifurcation = this.config.sessionBifurcation;
+    if (!bifurcation.enabled) {
+      return null;
+    }
+    if (params.pendingMessageCount <= 0) {
+      return null;
+    }
+
+    const normalizedSessionKey = params.sessionKey?.trim();
+    if (!normalizedSessionKey || this.shouldSkipSessionBifurcation(normalizedSessionKey)) {
+      return null;
+    }
+
+    const activeConversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: normalizedSessionKey,
+    });
+    if (!activeConversation?.active) {
+      return null;
+    }
+
+    const currentMessageCount = await this.getConversationMessageCountForBifurcation(
+      activeConversation.conversationId,
+    );
+    if (currentMessageCount <= 0) {
+      return {
+        conversationId: activeConversation.conversationId,
+        messageCountBeforeIngest: 0,
+      };
+    }
+
+    const ageHours = Math.max(
+      0,
+      (Date.now() - activeConversation.createdAt.getTime()) / (60 * 60 * 1000),
+    );
+    const projectedMessageCount = currentMessageCount + params.pendingMessageCount;
+    const hitMessageLimit = projectedMessageCount > bifurcation.maxConversationMessages;
+    const hitAgeLimit =
+      projectedMessageCount >= bifurcation.minMessagesBeforeAgeSplit &&
+      ageHours >= bifurcation.maxConversationAgeHours;
+
+    if (!hitMessageLimit && !hitAgeLimit) {
+      return {
+        conversationId: activeConversation.conversationId,
+        messageCountBeforeIngest: currentMessageCount,
+      };
+    }
+
+    await this.conversationStore.archiveConversation(activeConversation.conversationId);
+    this.clearBifurcationMessageCount(activeConversation.conversationId);
+    const nextConversation = await this.conversationStore.createConversation({
+      sessionId: params.sessionId,
+      sessionKey: normalizedSessionKey,
+      title: activeConversation.title ?? undefined,
+    });
+    this.primeBifurcationMessageCount(nextConversation.conversationId, 0);
+
+    this.deps.log.info(
+      `[lcm] session bifurcation: archived conversation=${activeConversation.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} messageCount=${currentMessageCount} projectedMessageCount=${projectedMessageCount} ageHours=${ageHours.toFixed(1)} reason=${hitMessageLimit ? "message-threshold" : "age-threshold"}`,
+    );
+    return {
+      conversationId: nextConversation.conversationId,
+      messageCountBeforeIngest: 0,
+    };
   }
 
   /** Format stable session identifiers for LCM diagnostic logs. */
@@ -3297,21 +3397,7 @@ export class LcmContextEngine implements ContextEngine {
     }
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () => {
-        let ingestedCount = 0;
-        for (const message of params.messages) {
-          const result = await this.ingestSingle({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            message,
-            isHeartbeat: params.isHeartbeat,
-          });
-          if (result.ingested) {
-            ingestedCount += 1;
-          }
-        }
-        return { ingestedCount };
-      },
+      () => this.ingestBatchLocked(params),
       {
         operationName: "ingestBatch",
         context: [
@@ -3321,6 +3407,27 @@ export class LcmContextEngine implements ContextEngine {
         ].join(" "),
       },
     );
+  }
+
+  private async ingestBatchLocked(params: {
+    sessionId: string;
+    sessionKey?: string;
+    messages: AgentMessage[];
+    isHeartbeat?: boolean;
+  }): Promise<IngestBatchResult> {
+    let ingestedCount = 0;
+    for (const message of params.messages) {
+      const result = await this.ingestSingle({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        message,
+        isHeartbeat: params.isHeartbeat,
+      });
+      if (result.ingested) {
+        ingestedCount += 1;
+      }
+    }
+    return { ingestedCount };
   }
 
   async afterTurn(params: {
@@ -3350,43 +3457,77 @@ export class LcmContextEngine implements ContextEngine {
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
 
-    // Dedup guard: prevent duplicate ingestion when gateway restart replays
-    // full history. Run on newMessages BEFORE prepending autoCompactionSummary
-    // so synthetic summaries cannot interfere with replay detection.
-    const newMessages = params.messages.slice(params.prePromptMessageCount);
-    const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
-      params.sessionId,
-      params.sessionKey,
-      newMessages,
+    let ingestBatch: AgentMessage[] = [];
+    let ingestError: unknown = null;
+    let newMessageCount = 0;
+    let dedupedNewMessageCount = 0;
+    await this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () => {
+        // Dedup guard: prevent duplicate ingestion when gateway restart replays
+        // full history. Run on newMessages BEFORE prepending autoCompactionSummary
+        // so synthetic summaries cannot interfere with replay detection.
+        const newMessages = params.messages.slice(params.prePromptMessageCount);
+        newMessageCount = newMessages.length;
+        const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
+          params.sessionId,
+          params.sessionKey,
+          newMessages,
+        );
+        dedupedNewMessageCount = dedupedNewMessages.length;
+
+        const nextIngestBatch: AgentMessage[] = [];
+        if (params.autoCompactionSummary) {
+          nextIngestBatch.push({
+            role: "user",
+            content: params.autoCompactionSummary,
+          } as AgentMessage);
+        }
+
+        nextIngestBatch.push(...dedupedNewMessages);
+        ingestBatch = nextIngestBatch;
+        if (ingestBatch.length === 0) {
+          return;
+        }
+
+        const isHeartbeatTurn = params.isHeartbeat === true;
+        const bifurcationPlan = isHeartbeatTurn
+          ? null
+          : await this.maybeRotateSessionConversation({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              pendingMessageCount: ingestBatch.length,
+            });
+
+        try {
+          const ingestResult = await this.ingestBatchLocked({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            messages: ingestBatch,
+            isHeartbeat: isHeartbeatTurn,
+          });
+          if (bifurcationPlan && ingestResult.ingestedCount > 0) {
+            this.primeBifurcationMessageCount(
+              bifurcationPlan.conversationId,
+              bifurcationPlan.messageCountBeforeIngest + ingestResult.ingestedCount,
+            );
+          }
+        } catch (error) {
+          ingestError = error;
+        }
+      },
     );
 
-    const ingestBatch: AgentMessage[] = [];
-    if (params.autoCompactionSummary) {
-      ingestBatch.push({
-        role: "user",
-        content: params.autoCompactionSummary,
-      } as AgentMessage);
-    }
-
-    ingestBatch.push(...dedupedNewMessages);
     if (ingestBatch.length === 0) {
       this.deps.log.info(
-        `[lcm] afterTurn: nothing to ingest ${sessionLabel} newMessages=${newMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        `[lcm] afterTurn: nothing to ingest ${sessionLabel} newMessages=${newMessageCount} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
       return;
     }
-
-    try {
-      await this.ingestBatch({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        messages: ingestBatch,
-        isHeartbeat: params.isHeartbeat === true,
-      });
-    } catch (err) {
+    if (ingestError) {
       // Never compact a stale or partially ingested frontier.
       this.deps.log.error(
-        `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(err)}`,
+        `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(ingestError)}`,
       );
       return;
     }
@@ -3510,7 +3651,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     this.deps.log.info(
-      `[lcm] afterTurn: done conversation=${conversation.conversationId} ${sessionLabel} newMessages=${newMessages.length} dedupedMessages=${dedupedNewMessages.length} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+      `[lcm] afterTurn: done conversation=${conversation.conversationId} ${sessionLabel} newMessages=${newMessageCount} dedupedMessages=${dedupedNewMessageCount} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
     );
   }
 
