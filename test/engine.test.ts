@@ -2454,6 +2454,56 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(reconcileSpy).not.toHaveBeenCalled();
   });
 
+  it("releases the write transaction before bootstrap planning scans transcript state", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-plan-outside-write-txn");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-plan-outside-write-txn";
+    let releasePlanner = () => {};
+    const plannerPaused = new Promise<void>((resolve) => {
+      releasePlanner = resolve;
+    });
+
+    const originalPlanner = (engine as any).planBootstrapWork.bind(engine);
+    const plannerSpy = vi
+      .spyOn(engine as any, "planBootstrapWork")
+      .mockImplementation(async (args: Parameters<typeof originalPlanner>[0]) => {
+        await plannerPaused;
+        return originalPlanner(args);
+      });
+
+    try {
+      const bootstrapPromise = engine.bootstrap({ sessionId, sessionFile });
+      await vi.waitFor(() => expect(plannerSpy).toHaveBeenCalledTimes(1));
+
+      let concurrentTxnRan = false;
+      const concurrentTxn = engine.getConversationStore().withTransaction(async () => {
+        concurrentTxnRan = true;
+        return "concurrent-ok";
+      });
+
+      await vi.waitFor(() => expect(concurrentTxnRan).toBe(true));
+      releasePlanner();
+
+      await expect(concurrentTxn).resolves.toBe("concurrent-ok");
+      await expect(bootstrapPromise).resolves.toEqual({
+        bootstrapped: true,
+        importedMessages: 2,
+      });
+    } finally {
+      plannerSpy.mockRestore();
+    }
+  });
+
   it("keeps the append-only fast path after heartbeat pruning changes the DB frontier", async () => {
     const sessionFile = createSessionFilePath("append-only-heartbeat-prune");
     const sm = SessionManager.open(sessionFile);

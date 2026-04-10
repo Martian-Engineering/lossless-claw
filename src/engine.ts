@@ -60,7 +60,10 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
-import { SummaryStore } from "./store/summary-store.js";
+import {
+  SummaryStore,
+  type ConversationBootstrapStateRecord,
+} from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
@@ -107,6 +110,37 @@ type ContextEngineMaintenanceResult = {
   bytesFreed: number;
   rewrittenEntries: number;
   reason?: string;
+};
+type BootstrapPlanningState = {
+  conversationId: number;
+  existingCount: number;
+  bootstrappedAt: Date | null;
+  bootstrapState: ConversationBootstrapStateRecord | null;
+  latestDbHash: string | null;
+  requiresRotationPurge: boolean;
+};
+type BootstrapPlan =
+  | {
+      kind: "checkpoint-hit";
+    }
+  | {
+      kind: "append-only";
+      appendedMessages: AgentMessage[];
+    }
+  | {
+      kind: "initial-import";
+      historicalMessageCount: number;
+      bootstrapMessages: AgentMessage[];
+    }
+  | {
+      kind: "reconcile";
+      historicalMessageCount: number;
+      reconcilePlan: ReconcileSessionTailPlan;
+    };
+type ReconcileSessionTailPlan = {
+  blockedByImportCap: boolean;
+  hasOverlap: boolean;
+  missingTail: AgentMessage[];
 };
 type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   rewriteTranscriptEntries?: (
@@ -2438,7 +2472,62 @@ export class LcmContextEngine implements ContextEngine {
   // ── ContextEngine interface ─────────────────────────────────────────────
 
   /**
-   * Reconcile session-file history with persisted messages and append only the
+   * Capture the bootstrap state we need while holding a short write
+   * transaction, then release it before any transcript parsing work.
+   */
+  private async captureBootstrapPlanningState(params: {
+    sessionId: string;
+    sessionFile: string;
+    sessionKey?: string;
+  }): Promise<BootstrapPlanningState> {
+    return this.conversationStore.withTransaction(async () => {
+      const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
+        sessionKey: params.sessionKey,
+      });
+      const conversationId = conversation.conversationId;
+      let existingCount = await this.conversationStore.getMessageCount(conversationId);
+      let bootstrapState =
+        existingCount > 0
+          ? await this.summaryStore.getConversationBootstrapState(conversationId)
+          : null;
+      let bootstrappedAt = conversation.bootstrappedAt;
+      let requiresRotationPurge = false;
+
+      if (bootstrapState && bootstrapState.sessionFilePath !== params.sessionFile) {
+        this.deps.log.warn(
+          `[lcm] bootstrap: session file rotated conversation=${conversationId} session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} oldFile=${bootstrapState.sessionFilePath} newFile=${params.sessionFile}`,
+        );
+        existingCount = 0;
+        bootstrapState = null;
+        bootstrappedAt = null;
+        requiresRotationPurge = true;
+      }
+
+      let latestDbHash: string | null = null;
+      if (existingCount > 0) {
+        const latestDbMessage = await this.conversationStore.getLastMessage(conversationId);
+        latestDbHash = latestDbMessage
+          ? createBootstrapEntryHash({
+              role: latestDbMessage.role,
+              content: latestDbMessage.content,
+              tokenCount: latestDbMessage.tokenCount,
+            })
+          : null;
+      }
+
+      return {
+        conversationId,
+        existingCount,
+        bootstrappedAt,
+        bootstrapState,
+        latestDbHash,
+        requiresRotationPurge,
+      };
+    });
+  }
+
+  /**
+   * Reconcile session-file history with persisted messages and plan only the
    * tail that is present in JSONL but missing from LCM.
    */
   private async reconcileSessionTail(params: {
@@ -2446,23 +2535,19 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     conversationId: number;
     historicalMessages: AgentMessage[];
-  }): Promise<{
-    blockedByImportCap: boolean;
-    importedMessages: number;
-    hasOverlap: boolean;
-  }> {
-    const { sessionId, conversationId, historicalMessages } = params;
+  }): Promise<ReconcileSessionTailPlan> {
+    const { conversationId, historicalMessages } = params;
     const startedAt = Date.now();
     const sessionContext = this.formatSessionLogContext({
       conversationId,
-      sessionId,
+      sessionId: params.sessionId,
       sessionKey: params.sessionKey,
     });
     if (historicalMessages.length === 0) {
       this.deps.log.info(
         `[lcm] reconcileSessionTail: skipped for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=0 reason=empty-history`,
       );
-      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
+      return { blockedByImportCap: false, hasOverlap: false, missingTail: [] };
     }
 
     const latestDbMessage = await this.conversationStore.getLastMessage(conversationId);
@@ -2470,7 +2555,7 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.info(
         `[lcm] reconcileSessionTail: skipped for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} reason=no-db-tail`,
       );
-      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
+      return { blockedByImportCap: false, hasOverlap: false, missingTail: [] };
     }
 
     const storedHistoricalMessages = historicalMessages.map((message) => toStoredMessage(message));
@@ -2494,7 +2579,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] reconcileSessionTail: fast path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=true`,
         );
-        return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
+        return { blockedByImportCap: false, hasOverlap: true, missingTail: [] };
       }
     }
 
@@ -2549,13 +2634,13 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.info(
         `[lcm] reconcileSessionTail: no anchor for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=false`,
       );
-      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
+      return { blockedByImportCap: false, hasOverlap: false, missingTail: [] };
     }
     if (anchorIndex >= historicalMessages.length - 1) {
       this.deps.log.info(
         `[lcm] reconcileSessionTail: anchor at tip for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=true`,
       );
-      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
+      return { blockedByImportCap: false, hasOverlap: true, missingTail: [] };
     }
 
     const missingTail = historicalMessages.slice(anchorIndex + 1);
@@ -2568,21 +2653,317 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.info(
         `[lcm] reconcileSessionTail: blocked for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} missingTail=${missingTail.length} existingDbCount=${existingDbCount}`,
       );
-      return { blockedByImportCap: true, importedMessages: 0, hasOverlap: true };
-    }
-
-    let importedMessages = 0;
-    for (const message of missingTail) {
-      const result = await this.ingestSingle({ sessionId, sessionKey: params.sessionKey, message });
-      if (result.ingested) {
-        importedMessages += 1;
-      }
+      return { blockedByImportCap: true, hasOverlap: true, missingTail: [] };
     }
 
     this.deps.log.info(
-      `[lcm] reconcileSessionTail: slow path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages}`,
+      `[lcm] reconcileSessionTail: slow path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=planned`,
     );
-    return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+    return { blockedByImportCap: false, hasOverlap: true, missingTail };
+  }
+
+  /**
+   * Build the bootstrap plan outside the write transaction so transcript I/O
+   * and reconcile analysis do not keep BEGIN IMMEDIATE open.
+   */
+  private async planBootstrapWork(params: {
+    sessionId: string;
+    sessionFile: string;
+    sessionKey?: string;
+    sessionLabel: string;
+    sessionFileSize: number;
+    sessionFileMtimeMs: number;
+    planningState: BootstrapPlanningState;
+    startedAt: number;
+  }): Promise<BootstrapPlan> {
+    const {
+      planningState,
+      sessionFile,
+      sessionId,
+      sessionKey,
+      sessionLabel,
+      sessionFileSize,
+      sessionFileMtimeMs,
+      startedAt,
+    } = params;
+
+    if (
+      planningState.bootstrapState &&
+      planningState.bootstrapState.sessionFilePath === sessionFile &&
+      planningState.bootstrapState.lastSeenSize === sessionFileSize &&
+      planningState.bootstrapState.lastSeenMtimeMs === sessionFileMtimeMs
+    ) {
+      this.deps.log.info(
+        `[lcm] bootstrap: checkpoint hit conversation=${planningState.conversationId} ${sessionLabel} existingCount=${planningState.existingCount} duration=${formatDurationMs(Date.now() - startedAt)}`,
+      );
+      return { kind: "checkpoint-hit" };
+    }
+
+    if (
+      planningState.existingCount > 0 &&
+      planningState.bootstrapState &&
+      planningState.bootstrapState.sessionFilePath === sessionFile &&
+      sessionFileSize > planningState.bootstrapState.lastSeenSize &&
+      sessionFileMtimeMs >= planningState.bootstrapState.lastSeenMtimeMs &&
+      planningState.latestDbHash &&
+      planningState.latestDbHash === planningState.bootstrapState.lastProcessedEntryHash
+    ) {
+      const tailEntryRaw = readLastJsonlEntryBeforeOffset(
+        sessionFile,
+        planningState.bootstrapState.lastProcessedOffset,
+        true,
+        (message) => createBootstrapEntryHash(toStoredMessage(message)) === planningState.latestDbHash,
+      );
+      const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
+      const tailEntryHash = tailEntryMessage
+        ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
+        : null;
+
+      if (tailEntryHash && tailEntryHash === planningState.bootstrapState.lastProcessedEntryHash) {
+        const appended = readAppendedLeafPathMessages({
+          sessionFile,
+          offset: planningState.bootstrapState.lastProcessedOffset,
+        });
+        if (appended.canUseAppendOnly) {
+          return {
+            kind: "append-only",
+            appendedMessages: appended.messages,
+          };
+        }
+      }
+    }
+
+    const historicalMessages = await readLeafPathMessages(sessionFile);
+    this.deps.log.info(
+      `[lcm] bootstrap: full transcript read conversation=${planningState.conversationId} ${sessionLabel} existingCount=${planningState.existingCount} historicalMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+    );
+
+    if (planningState.existingCount === 0) {
+      return {
+        kind: "initial-import",
+        historicalMessageCount: historicalMessages.length,
+        bootstrapMessages: trimBootstrapMessagesToBudget(
+          historicalMessages,
+          resolveBootstrapMaxTokens(this.config),
+        ),
+      };
+    }
+
+    return {
+      kind: "reconcile",
+      historicalMessageCount: historicalMessages.length,
+      reconcilePlan: await this.reconcileSessionTail({
+        sessionId,
+        sessionKey,
+        conversationId: planningState.conversationId,
+        historicalMessages,
+      }),
+    };
+  }
+
+  /**
+   * Apply a precomputed bootstrap plan while holding the shortest practical
+   * write transaction.
+   */
+  private async applyBootstrapPlan(params: {
+    sessionId: string;
+    sessionFile: string;
+    sessionKey?: string;
+    sessionLabel: string;
+    sessionFileSize: number;
+    sessionFileMtimeMs: number;
+    planningState: BootstrapPlanningState;
+    plan: BootstrapPlan;
+    startedAt: number;
+  }): Promise<BootstrapResult> {
+    const {
+      sessionId,
+      sessionFile,
+      sessionKey,
+      sessionLabel,
+      sessionFileSize,
+      sessionFileMtimeMs,
+      planningState,
+      plan,
+      startedAt,
+    } = params;
+    const conversationId = planningState.conversationId;
+
+    return this.conversationStore.withTransaction(async () => {
+      const persistBootstrapState = async (): Promise<void> => {
+        await this.refreshBootstrapState({
+          conversationId,
+          sessionFile,
+          fileStats: {
+            size: sessionFileSize,
+            mtimeMs: sessionFileMtimeMs,
+          },
+        });
+      };
+
+      if (planningState.requiresRotationPurge) {
+        this.purgeConversationForBootstrapRotation(conversationId);
+      }
+
+      if (plan.kind === "checkpoint-hit") {
+        if (!planningState.bootstrappedAt) {
+          await this.conversationStore.markConversationBootstrapped(conversationId);
+        }
+        return {
+          bootstrapped: false,
+          importedMessages: 0,
+          reason: planningState.bootstrappedAt
+            ? "already bootstrapped"
+            : "conversation already up to date",
+        };
+      }
+
+      if (plan.kind === "append-only") {
+        if (!planningState.bootstrappedAt) {
+          await this.conversationStore.markConversationBootstrapped(conversationId);
+        }
+
+        let importedMessages = 0;
+        for (const message of plan.appendedMessages) {
+          const ingestResult = await this.ingestSingle({
+            sessionId,
+            sessionKey,
+            message,
+          });
+          if (ingestResult.ingested) {
+            importedMessages += 1;
+          }
+        }
+
+        await persistBootstrapState();
+        this.deps.log.info(
+          `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${planningState.existingCount} appendedMessages=${plan.appendedMessages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        );
+
+        if (importedMessages > 0) {
+          return {
+            bootstrapped: true,
+            importedMessages,
+            reason: "reconciled missing session messages",
+          };
+        }
+
+        return {
+          bootstrapped: false,
+          importedMessages: 0,
+          reason: planningState.bootstrappedAt
+            ? "already bootstrapped"
+            : "conversation already up to date",
+        };
+      }
+
+      if (plan.kind === "initial-import") {
+        if (plan.bootstrapMessages.length === 0) {
+          await this.conversationStore.markConversationBootstrapped(conversationId);
+          await persistBootstrapState();
+          return {
+            bootstrapped: false,
+            importedMessages: 0,
+            reason: "no leaf-path messages in session",
+          };
+        }
+
+        const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
+        const bulkInput = plan.bootstrapMessages.map((message, index) => {
+          const stored = toStoredMessage(message);
+          return {
+            conversationId,
+            seq: nextSeq + index,
+            role: stored.role,
+            content: stored.content,
+            tokenCount: stored.tokenCount,
+          };
+        });
+
+        const inserted = await this.conversationStore.createMessagesBulk(bulkInput);
+        await this.summaryStore.appendContextMessages(
+          conversationId,
+          inserted.map((record) => record.messageId),
+        );
+        await this.conversationStore.markConversationBootstrapped(conversationId);
+
+        if (this.config.pruneHeartbeatOk) {
+          const pruned = await this.pruneHeartbeatOkTurns(conversationId);
+          if (pruned > 0) {
+            this.deps.log.info(
+              `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
+            );
+          }
+        }
+
+        await persistBootstrapState();
+        this.deps.log.info(
+          `[lcm] bootstrap: initial import conversation=${conversationId} ${sessionLabel} importedMessages=${inserted.length} sourceMessages=${plan.historicalMessageCount} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        );
+
+        return {
+          bootstrapped: true,
+          importedMessages: inserted.length,
+        };
+      }
+
+      const reconcile = plan.reconcilePlan;
+      if (reconcile.blockedByImportCap) {
+        this.deps.log.info(
+          `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${sessionLabel} importedMessages=0 overlap=${reconcile.hasOverlap} blockedByImportCap=true duration=${formatDurationMs(Date.now() - startedAt)}`,
+        );
+        return {
+          bootstrapped: false,
+          importedMessages: 0,
+          reason: "reconcile import capped",
+        };
+      }
+
+      if (!planningState.bootstrappedAt) {
+        await this.conversationStore.markConversationBootstrapped(conversationId);
+      }
+
+      let importedMessages = 0;
+      for (const message of reconcile.missingTail) {
+        const ingestResult = await this.ingestSingle({ sessionId, sessionKey, message });
+        if (ingestResult.ingested) {
+          importedMessages += 1;
+        }
+      }
+
+      this.deps.log.info(
+        `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${sessionLabel} importedMessages=${importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=false duration=${formatDurationMs(Date.now() - startedAt)}`,
+      );
+
+      if (importedMessages > 0) {
+        await persistBootstrapState();
+        return {
+          bootstrapped: true,
+          importedMessages,
+          reason: "reconciled missing session messages",
+        };
+      }
+
+      if (reconcile.hasOverlap) {
+        await persistBootstrapState();
+      }
+
+      if (planningState.bootstrappedAt) {
+        return {
+          bootstrapped: false,
+          importedMessages: 0,
+          reason: "already bootstrapped",
+        };
+      }
+
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: reconcile.hasOverlap
+          ? "conversation already up to date"
+          : "conversation already has messages",
+      };
+    });
   }
 
   /**
@@ -2703,256 +3084,35 @@ export class LcmContextEngine implements ContextEngine {
 
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () =>
-        this.conversationStore.withTransaction(async () => {
-          const persistBootstrapState = async (
-            conversationId: number,
-          ): Promise<void> => {
-            await this.refreshBootstrapState({
-              conversationId,
-              sessionFile: params.sessionFile,
-              fileStats: {
-                size: sessionFileSize,
-                mtimeMs: sessionFileMtimeMs,
-              },
-            });
-          };
+      async () => {
+        const planningState = await this.captureBootstrapPlanningState({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          sessionFile: params.sessionFile,
+        });
+        const plan = await this.planBootstrapWork({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          sessionFile: params.sessionFile,
+          sessionLabel,
+          sessionFileSize,
+          sessionFileMtimeMs,
+          planningState,
+          startedAt,
+        });
 
-          const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
-            sessionKey: params.sessionKey,
-          });
-          const conversationId = conversation.conversationId;
-          let existingCount = await this.conversationStore.getMessageCount(conversationId);
-          let bootstrapState =
-            existingCount > 0
-              ? await this.summaryStore.getConversationBootstrapState(conversationId)
-              : null;
-
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath !== params.sessionFile
-          ) {
-            this.deps.log.warn(
-              `[lcm] bootstrap: session file rotated conversation=${conversationId} ${sessionLabel} oldFile=${bootstrapState.sessionFilePath} newFile=${params.sessionFile}`,
-            );
-            this.purgeConversationForBootstrapRotation(conversationId);
-            bootstrapState = null;
-            existingCount = 0;
-            conversation.bootstrappedAt = null;
-          }
-
-          // If the transcript file is byte-for-byte unchanged from the last
-          // successful bootstrap checkpoint, skip reopening and reparsing it.
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath === params.sessionFile &&
-            bootstrapState.lastSeenSize === sessionFileSize &&
-            bootstrapState.lastSeenMtimeMs === sessionFileMtimeMs
-          ) {
-            if (!conversation.bootstrappedAt) {
-              await this.conversationStore.markConversationBootstrapped(conversationId);
-            }
-            this.deps.log.info(
-              `[lcm] bootstrap: checkpoint hit conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} duration=${formatDurationMs(Date.now() - startedAt)}`,
-            );
-            return {
-              bootstrapped: false,
-              importedMessages: 0,
-              reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
-            };
-          }
-
-          if (
-            existingCount > 0 &&
-            bootstrapState &&
-            bootstrapState.sessionFilePath === params.sessionFile &&
-            sessionFileSize > bootstrapState.lastSeenSize &&
-            sessionFileMtimeMs >= bootstrapState.lastSeenMtimeMs
-          ) {
-            const latestDbMessage = await this.conversationStore.getLastMessage(conversationId);
-            const latestDbHash = latestDbMessage
-              ? createBootstrapEntryHash({
-                  role: latestDbMessage.role,
-                  content: latestDbMessage.content,
-                  tokenCount: latestDbMessage.tokenCount,
-                })
-              : null;
-            const tailEntryRaw = readLastJsonlEntryBeforeOffset(
-              params.sessionFile,
-              bootstrapState.lastProcessedOffset,
-              true,
-              (message) => createBootstrapEntryHash(toStoredMessage(message)) === latestDbHash,
-            );
-            const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
-            const tailEntryHash = tailEntryMessage
-              ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
-              : null;
-
-            if (
-              latestDbHash &&
-              latestDbHash === bootstrapState.lastProcessedEntryHash &&
-              tailEntryHash &&
-              tailEntryHash === bootstrapState.lastProcessedEntryHash
-            ) {
-              const appended = readAppendedLeafPathMessages({
-                sessionFile: params.sessionFile,
-                offset: bootstrapState.lastProcessedOffset,
-              });
-              if (appended.canUseAppendOnly) {
-                if (!conversation.bootstrappedAt) {
-                  await this.conversationStore.markConversationBootstrapped(conversationId);
-                }
-
-                let importedMessages = 0;
-                for (const message of appended.messages) {
-                  const ingestResult = await this.ingestSingle({
-                    sessionId: params.sessionId,
-                    sessionKey: params.sessionKey,
-                    message,
-                  });
-                  if (ingestResult.ingested) {
-                    importedMessages += 1;
-                  }
-                }
-
-                await persistBootstrapState(conversationId);
-                this.deps.log.info(
-                  `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
-                );
-
-                if (importedMessages > 0) {
-                  return {
-                    bootstrapped: true,
-                    importedMessages,
-                    reason: "reconciled missing session messages",
-                  };
-                }
-
-                return {
-                  bootstrapped: false,
-                  importedMessages: 0,
-                  reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
-                };
-              }
-            }
-          }
-
-          const historicalMessages = await readLeafPathMessages(params.sessionFile);
-          this.deps.log.info(
-            `[lcm] bootstrap: full transcript read conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} historicalMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-
-          // First-time import path: no LCM rows yet, so seed directly from the
-          // active leaf context snapshot.
-          if (existingCount === 0) {
-            const bootstrapMessages = trimBootstrapMessagesToBudget(
-              historicalMessages,
-              resolveBootstrapMaxTokens(this.config),
-            );
-
-            if (bootstrapMessages.length === 0) {
-              await this.conversationStore.markConversationBootstrapped(conversationId);
-              await persistBootstrapState(conversationId);
-              return {
-                bootstrapped: false,
-                importedMessages: 0,
-                reason: "no leaf-path messages in session",
-              };
-            }
-
-            const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
-            const bulkInput = bootstrapMessages.map((message, index) => {
-              const stored = toStoredMessage(message);
-              return {
-                conversationId,
-                seq: nextSeq + index,
-                role: stored.role,
-                content: stored.content,
-                tokenCount: stored.tokenCount,
-              };
-            });
-
-            const inserted = await this.conversationStore.createMessagesBulk(bulkInput);
-            await this.summaryStore.appendContextMessages(
-              conversationId,
-              inserted.map((record) => record.messageId),
-            );
-            await this.conversationStore.markConversationBootstrapped(conversationId);
-
-            // Prune HEARTBEAT_OK turns from the freshly imported data
-            if (this.config.pruneHeartbeatOk) {
-              const pruned = await this.pruneHeartbeatOkTurns(conversationId);
-              if (pruned > 0) {
-                this.deps.log.info(
-                  `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
-                );
-              }
-            }
-
-            await persistBootstrapState(conversationId);
-            this.deps.log.info(
-              `[lcm] bootstrap: initial import conversation=${conversationId} ${sessionLabel} importedMessages=${inserted.length} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-            );
-
-            return {
-              bootstrapped: true,
-              importedMessages: inserted.length,
-            };
-          }
-
-          // Existing conversation path: reconcile crash gaps by appending JSONL
-          // messages that were never persisted to LCM.
-          const reconcile = await this.reconcileSessionTail({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            conversationId,
-            historicalMessages,
-          });
-          this.deps.log.info(
-            `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-
-          if (reconcile.blockedByImportCap) {
-            return {
-              bootstrapped: false,
-              importedMessages: 0,
-              reason: "reconcile import capped",
-            };
-          }
-
-          if (!conversation.bootstrappedAt) {
-            await this.conversationStore.markConversationBootstrapped(conversationId);
-          }
-
-          if (reconcile.importedMessages > 0) {
-            await persistBootstrapState(conversationId);
-            return {
-              bootstrapped: true,
-              importedMessages: reconcile.importedMessages,
-              reason: "reconciled missing session messages",
-            };
-          }
-
-          if (reconcile.hasOverlap) {
-            await persistBootstrapState(conversationId);
-          }
-
-          if (conversation.bootstrappedAt) {
-            return {
-              bootstrapped: false,
-              importedMessages: 0,
-              reason: "already bootstrapped",
-            };
-          }
-
-          return {
-            bootstrapped: false,
-            importedMessages: 0,
-            reason: reconcile.hasOverlap
-              ? "conversation already up to date"
-              : "conversation already has messages",
-          };
-        }),
+        return this.applyBootstrapPlan({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          sessionFile: params.sessionFile,
+          sessionLabel,
+          sessionFileSize,
+          sessionFileMtimeMs,
+          planningState,
+          plan,
+          startedAt,
+        });
+      },
       { operationName: "bootstrap", context: sessionLabel },
     );
 
