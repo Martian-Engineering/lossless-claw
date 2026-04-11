@@ -2668,6 +2668,65 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(reconcileSpy).not.toHaveBeenCalled();
   });
 
+  it("refreshes the bootstrap checkpoint after a normal afterTurn before the next append-only bootstrap", async () => {
+    const sessionFile = createSessionFilePath("append-only-after-turn-normal-ingest");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-append-only-after-turn-normal-ingest";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const realTurn = [
+      makeMessage({
+        role: "user",
+        content: "new user",
+      }),
+      makeMessage({
+        role: "assistant",
+        content: "new assistant",
+      }),
+    ];
+    for (const message of realTurn) {
+      sm.appendMessage(message as AgentMessage);
+    }
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: realTurn,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "tail assistant" }],
+    } as AgentMessage);
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).not.toHaveBeenCalled();
+  });
+
   it("falls back to full reconciliation when append-only checkpoint validation mismatches", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
     tempDirs.push(tempDir);
