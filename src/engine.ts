@@ -3003,6 +3003,42 @@ export class LcmContextEngine implements ContextEngine {
             });
           };
 
+          // Guard: when a sessionKey resumes on a new sessionId and the tracked
+          // transcript file has disappeared, treat it as a missed /reset and
+          // rotate the conversation before getOrCreate would re-attach to it.
+          const normalizedSessionKey = params.sessionKey?.trim();
+          if (normalizedSessionKey) {
+            const activeByKey = await this.conversationStore.getConversationBySessionKey(normalizedSessionKey);
+            if (activeByKey && activeByKey.sessionId !== params.sessionId) {
+              const activeBootstrapState = await this.summaryStore.getConversationBootstrapState(
+                activeByKey.conversationId,
+              );
+              const trackedSessionFile = activeBootstrapState?.sessionFilePath;
+              let trackedSessionFileMissing = false;
+              if (typeof trackedSessionFile === "string" && trackedSessionFile.length > 0) {
+                try { await stat(trackedSessionFile); } catch { trackedSessionFileMissing = true; }
+              }
+              const transcriptRotated =
+                typeof trackedSessionFile === "string" &&
+                trackedSessionFile.length > 0 &&
+                trackedSessionFile !== params.sessionFile;
+
+              if (transcriptRotated && trackedSessionFileMissing) {
+                this.deps.log.warn(
+                  `[lcm] bootstrap: detected reset/rollover without prior lifecycle split; rotating conversation=${activeByKey.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} oldSessionId=${activeByKey.sessionId} oldFile=${trackedSessionFile} newFile=${params.sessionFile}`,
+                );
+                await this.applySessionReplacement({
+                  reason: "bootstrap session-file rollover fallback",
+                  sessionId: activeByKey.sessionId,
+                  sessionKey: normalizedSessionKey,
+                  nextSessionId: params.sessionId,
+                  nextSessionKey: normalizedSessionKey,
+                  createReplacement: true,
+                });
+              }
+            }
+          }
+
           const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
             sessionKey: params.sessionKey,
           });
