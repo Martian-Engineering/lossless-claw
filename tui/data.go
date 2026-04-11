@@ -211,25 +211,87 @@ func discoverSessionFiles(agent agentEntry) ([]sessionFileEntry, error) {
 		return nil, fmt.Errorf("glob sessions for agent %q: %w", agent.name, err)
 	}
 
-	sessions := make([]sessionFileEntry, 0, len(paths))
+	sessionsByKey := make(map[string]sessionFileEntry, len(paths))
 	for _, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil {
 			continue
 		}
 		filename := filepath.Base(path)
-		sessions = append(sessions, sessionFileEntry{
+		entry := sessionFileEntry{
 			filename:  filename,
 			path:      path,
 			updatedAt: info.ModTime(),
 			byteSize:  info.Size(),
-		})
+		}
+		dedupKey := strings.TrimSuffix(filename, filepath.Ext(filename))
+		if canonicalID, err := readSessionHeaderID(path); err == nil && canonicalID != "" {
+			dedupKey = canonicalID
+		}
+		if existing, ok := sessionsByKey[dedupKey]; !ok || preferSessionFileEntry(entry, existing) {
+			sessionsByKey[dedupKey] = entry
+		}
+	}
+
+	sessions := make([]sessionFileEntry, 0, len(sessionsByKey))
+	for _, entry := range sessionsByKey {
+		sessions = append(sessions, entry)
 	}
 
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].updatedAt.After(sessions[j].updatedAt)
 	})
 	return sessions, nil
+}
+
+func readSessionHeaderID(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open session %q: %w", path, err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var header struct {
+			Type string `json:"type"`
+			ID   string `json:"id"`
+		}
+		if err := json.Unmarshal(line, &header); err != nil {
+			return "", fmt.Errorf("decode session header %q: %w", path, err)
+		}
+		if header.Type == "session" && strings.TrimSpace(header.ID) != "" {
+			return strings.TrimSpace(header.ID), nil
+		}
+		return "", nil
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("scan session %q: %w", path, err)
+	}
+	return "", nil
+}
+
+func preferSessionFileEntry(candidate, existing sessionFileEntry) bool {
+	candidateStem := strings.TrimSuffix(candidate.filename, filepath.Ext(candidate.filename))
+	existingStem := strings.TrimSuffix(existing.filename, filepath.Ext(existing.filename))
+	_, candidateIsTopic := trimTopicSessionSuffix(candidateStem)
+	_, existingIsTopic := trimTopicSessionSuffix(existingStem)
+	if candidateIsTopic != existingIsTopic {
+		return candidateIsTopic
+	}
+	if !candidate.updatedAt.Equal(existing.updatedAt) {
+		return candidate.updatedAt.After(existing.updatedAt)
+	}
+	if candidate.byteSize != existing.byteSize {
+		return candidate.byteSize > existing.byteSize
+	}
+	return candidate.filename < existing.filename
 }
 
 func loadSessionBatch(files []sessionFileEntry, offset, limit int, lcmDBPath string) ([]sessionEntry, int, error) {
