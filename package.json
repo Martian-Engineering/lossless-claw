@@ -16,7 +16,7 @@
     "dag"
   ],
   "scripts": {
-    "build": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@mariozechner/*\"",
+    "build": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@mariozechner/*\" --minify-whitespace",
     "changeset": "changeset",
     "release:verify": "npm run build && npm test && npm pack --dry-run",
     "test": "vitest run --dir test",
