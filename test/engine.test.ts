@@ -3658,6 +3658,157 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(preparation).toBeDefined();
     preparation?.rollback();
   });
+
+  it("skips full read when file is unchanged and conversation is already bootstrapped", async () => {
+    const infoLog = vi.fn();
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("cache-guard");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "one" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "two" }],
+    } as AgentMessage);
+
+    const config = createTestConfig(dbPath);
+    const db = createLcmDatabaseConnection(config.databasePath);
+    const engine = new LcmContextEngine(
+      createTestDeps(config, {
+        log: {
+          info: infoLog,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      }),
+      db,
+    );
+
+    const sessionId = "cache-guard";
+
+    // First bootstrap: full read
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    // Corrupt both the checkpoint stats and hash to force BOTH the checkpoint
+    // fast path and the append-only fast path to fail, exercising the file-level
+    // cache guard.
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE conversation_bootstrap_state
+           SET last_processed_entry_hash = ?,
+               last_seen_size = 0,
+               last_seen_mtime_ms = 0
+           WHERE conversation_id = ?`,
+        )
+        .run("corrupted", conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    // Second bootstrap: checkpoint path fails (stats corrupted), append-only
+    // path fails (hash corrupted + size condition), but file-level cache guard
+    // skips the full read because the file hasn't changed since the first read
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "already bootstrapped",
+    });
+
+    // Verify the cache guard fired (skipped full read)
+    const cacheGuardLogs = infoLog.mock.calls.filter(
+      (call: unknown[]) =>
+        typeof call[0] === "string" && call[0].includes("skipped full read (file unchanged)"),
+    );
+    expect(cacheGuardLogs).toHaveLength(1);
+
+    // Verify only one full transcript read occurred (the first bootstrap)
+    const fullReadLogs = infoLog.mock.calls.filter(
+      (call: unknown[]) => typeof call[0] === "string" && call[0].includes("full transcript read"),
+    );
+    expect(fullReadLogs).toHaveLength(1);
+  });
+
+  it("file-level cache guard allows full read when file changes", async () => {
+    const infoLog = vi.fn();
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionDir = mkdtempSync(join(tmpdir(), "lossless-claw-session-"));
+    tempDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, "cache-guard-grows.jsonl");
+
+    // Write initial JSONL directly (avoids SessionManager lifecycle issues)
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({ role: "user", content: [{ type: "text", text: "initial" }] })}\n`,
+    );
+
+    const config = createTestConfig(dbPath);
+    const db = createLcmDatabaseConnection(config.databasePath);
+    const engine = new LcmContextEngine(
+      createTestDeps(config, {
+        log: {
+          info: infoLog,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      }),
+      db,
+    );
+
+    const sessionId = "cache-guard-grows";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    // Corrupt checkpoint stats AND hash so both fast paths fail
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    db.prepare(
+      `UPDATE conversation_bootstrap_state
+       SET last_processed_entry_hash = ?,
+           last_seen_size = 0,
+           last_seen_mtime_ms = 0
+       WHERE conversation_id = ?`,
+    ).run("corrupted", conversation!.conversationId);
+
+    // Grow the file so the cache guard also sees a size change
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({ role: "assistant", content: [{ type: "text", text: "reply" }] })}\n`,
+    );
+
+    // Bootstrap should NOT use cache guard (file changed), should do full read
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    // The newly appended assistant message must be picked up by the full read —
+    // a vacuous `>= 0` assertion here would pass even if readLeafPathMessages
+    // silently returned no rows, which is exactly the failure mode this test
+    // is supposed to catch.
+    expect(second.importedMessages).toBeGreaterThanOrEqual(1);
+
+    // Two full reads should have occurred
+    const fullReadLogs = infoLog.mock.calls.filter(
+      (call: unknown[]) => typeof call[0] === "string" && call[0].includes("full transcript read"),
+    );
+    expect(fullReadLogs).toHaveLength(2);
+
+    // And the cache guard must not have fired after the file grew
+    const skippedLogs = infoLog.mock.calls.filter(
+      (call: unknown[]) =>
+        typeof call[0] === "string" && call[0].includes("skipped full read (file unchanged)"),
+    );
+    expect(skippedLogs).toHaveLength(0);
+  });
 });
 
 // ── Assemble canonical path with fallback ───────────────────────────────────

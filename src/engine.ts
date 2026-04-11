@@ -1308,6 +1308,14 @@ export class LcmContextEngine implements ContextEngine {
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
 
+  /**
+   * Tracks file metadata from the last successful full bootstrap read per
+   * conversation. When the session JSONL file has not changed since the last
+   * full read and the conversation is already bootstrapped, the expensive
+   * readLeafPathMessages() call can be skipped entirely.
+   */
+  private lastFullReadFileState = new Map<number, { size: number; mtimeMs: number }>();
+
   // ── Circuit breaker for compaction auth failures ──
   private circuitBreakerStates = new Map<string, CircuitBreakerState>();
 
@@ -3590,6 +3598,12 @@ export class LcmContextEngine implements ContextEngine {
                 mtimeMs: sessionFileMtimeMs,
               },
             });
+            // Update the file-level cache so subsequent bootstraps against an
+            // unchanged file can skip the full read via the cache guard.
+            this.lastFullReadFileState.set(conversationId, {
+              size: sessionFileSize,
+              mtimeMs: sessionFileMtimeMs,
+            });
           };
 
           const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
@@ -3606,6 +3620,12 @@ export class LcmContextEngine implements ContextEngine {
             this.deps.log.warn(
               `[lcm] bootstrap: session file rotated conversation=${conversationId} ${sessionLabel} oldFile=${bootstrapState.sessionFilePath} newFile=${params.sessionFile}`,
             );
+            // A rotated session file invalidates every piece of cached state
+            // keyed to the old path: the on-disk bootstrap checkpoint row, the
+            // in-memory file-level guard, and any counters derived from the
+            // old file's messages. Clear them all in one place so subsequent
+            // reads treat this conversation as unbootstrapped.
+            this.lastFullReadFileState.delete(conversationId);
             bootstrapState = null;
           }
 
@@ -3712,6 +3732,28 @@ export class LcmContextEngine implements ContextEngine {
                   reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
                 };
               }
+            }
+          }
+
+          // File-level cache guard: if the conversation is already bootstrapped
+          // and the JSONL file has not changed since the last successful full read,
+          // skip the expensive readLeafPathMessages entirely.
+          if (conversation.bootstrappedAt && existingCount > 0) {
+            const cached = this.lastFullReadFileState.get(conversationId);
+            if (
+              cached &&
+              cached.size === sessionFileSize &&
+              cached.mtimeMs === sessionFileMtimeMs
+            ) {
+              await persistBootstrapState(conversationId);
+              this.deps.log.info(
+                `[lcm] bootstrap: skipped full read (file unchanged) conversation=${conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
+              );
+              return {
+                bootstrapped: false,
+                importedMessages: 0,
+                reason: "already bootstrapped",
+              };
             }
           }
 
