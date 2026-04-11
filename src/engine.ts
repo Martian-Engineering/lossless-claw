@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, createReadStream, openSync, readSync, statSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { mkdir, open, stat, writeFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline";
@@ -1044,90 +1045,73 @@ function trimBootstrapMessagesToBudget(messages: AgentMessage[], maxTokens: numb
   return kept;
 }
 
-function readFileSegment(sessionFile: string, offset: number): string | null {
-  let fd: number | null = null;
+async function readFileSegment(sessionFile: string, offset: number): Promise<string | null> {
+  let fh: FileHandle | null = null;
   try {
-    fd = openSync(sessionFile, "r");
-    const stats = statSync(sessionFile);
+    fh = await open(sessionFile, "r");
+    const stats = await fh.stat();
     const safeOffset = Math.max(0, Math.min(Math.floor(offset), stats.size));
     const length = stats.size - safeOffset;
     if (length <= 0) {
       return "";
     }
     const buffer = Buffer.alloc(length);
-    readSync(fd, buffer, 0, length, safeOffset);
+    await fh.read(buffer, 0, length, safeOffset);
     return buffer.toString("utf8");
   } catch {
     return null;
   } finally {
-    if (fd != null) {
-      closeSync(fd);
-    }
+    await fh?.close();
   }
 }
 
-function readLastJsonlEntryBeforeOffset(
+async function readLastJsonlEntryBeforeOffset(
   sessionFile: string,
   offset: number,
   messageOnly = false,
   matcher?: (message: AgentMessage) => boolean,
-): string | null {
+): Promise<string | null> {
   const chunkSize = 16_384;
-  let fd: number | null = null;
-  try {
-    const safeOffset = Math.max(0, Math.floor(offset));
-    if (safeOffset <= 0) {
-      return null;
-    }
+  const safeOffset = Math.max(0, Math.floor(offset));
+  if (safeOffset <= 0) {
+    return null;
+  }
 
-    fd = openSync(sessionFile, "r");
+  let fh: FileHandle | null = null;
+  try {
+    fh = await open(sessionFile, "r");
     let cursor = safeOffset;
     let carry = "";
-    let reachedStart = false;
-    while (cursor > 0 || (reachedStart && carry.length > 0)) {
-      if (!reachedStart) {
-        const start = Math.max(0, cursor - chunkSize);
-        const length = cursor - start;
-        const buffer = Buffer.alloc(length);
-        readSync(fd, buffer, 0, length, start);
-        carry = buffer.toString("utf8") + carry;
-        cursor = start;
-        if (start === 0) {
-          reachedStart = true;
-        }
-      }
-
+    while (true) {
       const trimmedEnd = carry.replace(/\s+$/u, "");
-      if (!trimmedEnd) {
-        if (reachedStart) break;
-        carry = "";
-        continue;
-      }
-
-      const newlineIndex = Math.max(trimmedEnd.lastIndexOf("\n"), trimmedEnd.lastIndexOf("\r"));
-      if (newlineIndex >= 0) {
-        const candidate = trimmedEnd.slice(newlineIndex + 1).trim();
-        if (candidate) {
-          if (messageOnly) {
-            let matchedMessage: AgentMessage | null = null;
-            try {
-              matchedMessage = extractBootstrapMessageCandidate(JSON.parse(candidate));
-            } catch { /* not valid JSON, skip */ }
-            if (!matchedMessage || (matcher && !matcher(matchedMessage))) {
-              carry = trimmedEnd.slice(0, newlineIndex);
-              continue;
+      if (trimmedEnd) {
+        const newlineIndex = Math.max(trimmedEnd.lastIndexOf("\n"), trimmedEnd.lastIndexOf("\r"));
+        if (newlineIndex >= 0) {
+          const candidate = trimmedEnd.slice(newlineIndex + 1).trim();
+          if (candidate) {
+            if (messageOnly) {
+              let matchedMessage: AgentMessage | null = null;
+              try {
+                matchedMessage = extractBootstrapMessageCandidate(JSON.parse(candidate));
+              } catch { /* not valid JSON, skip */ }
+              if (!matchedMessage || (matcher && !matcher(matchedMessage))) {
+                carry = trimmedEnd.slice(0, newlineIndex);
+                continue;
+              }
             }
+            return candidate;
           }
-          return candidate;
+          carry = trimmedEnd.slice(0, newlineIndex);
+          continue;
         }
-        carry = trimmedEnd.slice(0, newlineIndex);
-        continue;
       }
 
-      // No newline found — entire trimmedEnd is one line
-      if (reachedStart) {
+      // No more newlines in current carry — need more data from earlier in the file.
+      if (cursor <= 0) {
+        // Reached start-of-file: whatever is left is the first line.
         const firstLine = trimmedEnd.trim() || null;
-        if (firstLine && messageOnly) {
+        if (!firstLine) return null;
+        if (messageOnly) {
           let matchedMessage: AgentMessage | null = null;
           try {
             matchedMessage = extractBootstrapMessageCandidate(JSON.parse(firstLine));
@@ -1136,24 +1120,26 @@ function readLastJsonlEntryBeforeOffset(
         }
         return firstLine;
       }
-      // Need more data from earlier in the file
-      continue;
+
+      const start = Math.max(0, cursor - chunkSize);
+      const length = cursor - start;
+      const buffer = Buffer.alloc(length);
+      await fh.read(buffer, 0, length, start);
+      carry = buffer.toString("utf8") + carry;
+      cursor = start;
     }
-    return null;
   } catch {
     return null;
   } finally {
-    if (fd != null) {
-      closeSync(fd);
-    }
+    await fh?.close();
   }
 }
 
-function readAppendedLeafPathMessages(params: {
+async function readAppendedLeafPathMessages(params: {
   sessionFile: string;
   offset: number;
-}): { messages: AgentMessage[]; canUseAppendOnly: boolean; sawNonWhitespace: boolean } {
-  const raw = readFileSegment(params.sessionFile, params.offset);
+}): Promise<{ messages: AgentMessage[]; canUseAppendOnly: boolean; sawNonWhitespace: boolean }> {
+  const raw = await readFileSegment(params.sessionFile, params.offset);
   if (raw == null) {
     return { messages: [], canUseAppendOnly: false, sawNonWhitespace: false };
   }
@@ -2600,7 +2586,7 @@ export class LcmContextEngine implements ContextEngine {
     fileStats?: { size: number; mtimeMs: number };
   }): Promise<void> {
     const latestDbMessage = await this.conversationStore.getLastMessage(params.conversationId);
-    const fileStats = params.fileStats ?? statSync(params.sessionFile);
+    const fileStats = params.fileStats ?? (await stat(params.sessionFile));
     await this.summaryStore.upsertConversationBootstrapState({
       conversationId: params.conversationId,
       sessionFilePath: params.sessionFile,
@@ -2642,7 +2628,7 @@ export class LcmContextEngine implements ContextEngine {
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
-    const sessionFileStats = statSync(params.sessionFile);
+    const sessionFileStats = await stat(params.sessionFile);
     const sessionFileSize = sessionFileStats.size;
     const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
 
@@ -2719,24 +2705,34 @@ export class LcmContextEngine implements ContextEngine {
                   tokenCount: latestDbMessage.tokenCount,
                 })
               : null;
-            const tailEntryRaw = readLastJsonlEntryBeforeOffset(
-              params.sessionFile,
-              bootstrapState.lastProcessedOffset,
-              true,
-              (message) => createBootstrapEntryHash(toStoredMessage(message)) === latestDbHash,
-            );
+
+            // Short-circuit before the expensive backward scan: the fast-path can
+            // only succeed when the DB's latest hash still matches the checkpoint.
+            // When messages have been ingested since the last bootstrap this check
+            // fails and we skip straight to the async full-read slow path below,
+            // avoiding a backward scan that could never find a matching tail entry.
+            const canTryAppendOnlyFastPath =
+              latestDbHash !== null && latestDbHash === bootstrapState.lastProcessedEntryHash;
+
+            const tailEntryRaw = canTryAppendOnlyFastPath
+              ? await readLastJsonlEntryBeforeOffset(
+                  params.sessionFile,
+                  bootstrapState.lastProcessedOffset,
+                  true,
+                  (message) => createBootstrapEntryHash(toStoredMessage(message)) === latestDbHash,
+                )
+              : null;
             const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
             const tailEntryHash = tailEntryMessage
               ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
               : null;
 
             if (
-              latestDbHash &&
-              latestDbHash === bootstrapState.lastProcessedEntryHash &&
+              canTryAppendOnlyFastPath &&
               tailEntryHash &&
               tailEntryHash === bootstrapState.lastProcessedEntryHash
             ) {
-              const appended = readAppendedLeafPathMessages({
+              const appended = await readAppendedLeafPathMessages({
                 sessionFile: params.sessionFile,
                 offset: bootstrapState.lastProcessedOffset,
               });
