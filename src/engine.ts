@@ -3546,6 +3546,17 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
+      await this.refreshBootstrapState({
+        conversationId: conversation.conversationId,
+        sessionFile: params.sessionFile,
+      });
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] afterTurn: bootstrap checkpoint refresh failed for ${sessionLabel}: ${describeLogError(err)}`,
+      );
+    }
+
+    try {
       const rawLeafTrigger = await this.compaction.evaluateLeafTrigger(conversation.conversationId);
       await this.updateCompactionTelemetry({
         conversationId: conversation.conversationId,
