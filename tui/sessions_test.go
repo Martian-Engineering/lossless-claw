@@ -171,6 +171,49 @@ func TestLoadSessionBatchResolvesTopicSessionFiles(t *testing.T) {
 	}
 }
 
+func TestDiscoverSessionFilesDedupesCanonicalSessionIDAndPrefersTopicTranscript(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "main")
+	sessionsDir := filepath.Join(agentDir, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("create sessions dir: %v", err)
+	}
+
+	const canonicalID = "fd9b66a7-ebbf-4a7b-8415-b5d366379cd2"
+	barePath := filepath.Join(sessionsDir, canonicalID+".jsonl")
+	topicPath := filepath.Join(sessionsDir, canonicalID+"-topic-47.jsonl")
+	bareContent := `{"type":"session","id":"` + canonicalID + `"}` + "\n" +
+		`{"type":"message","id":"1","message":{"role":"user","content":"bare"}}` + "\n"
+	topicContent := `{"type":"session","id":"` + canonicalID + `"}` + "\n" +
+		`{"type":"message","id":"1","message":{"role":"user","content":"topic"}}` + "\n"
+	if err := os.WriteFile(barePath, []byte(bareContent), 0o644); err != nil {
+		t.Fatalf("write bare session file: %v", err)
+	}
+	if err := os.WriteFile(topicPath, []byte(topicContent), 0o644); err != nil {
+		t.Fatalf("write topic session file: %v", err)
+	}
+	now := time.Now()
+	if err := os.Chtimes(barePath, now, now); err != nil {
+		t.Fatalf("set bare mtime: %v", err)
+	}
+	if err := os.Chtimes(topicPath, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatalf("set topic mtime: %v", err)
+	}
+
+	files, err := discoverSessionFiles(agentEntry{name: "main", path: agentDir})
+	if err != nil {
+		t.Fatalf("discover session files: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 deduped session file, got %d", len(files))
+	}
+	if files[0].filename != canonicalID+"-topic-47.jsonl" {
+		t.Fatalf("expected topic transcript to win, got %q", files[0].filename)
+	}
+}
+
 func TestLookupConversationIDResolvesTopicSessionFiles(t *testing.T) {
 	t.Parallel()
 

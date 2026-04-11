@@ -1,5 +1,11 @@
 # Repository Instructions
 
+## Principles
+
+- Lossless means lossless. Do not delete, purge, truncate, or otherwise discard persisted user data unless the user has explicitly invoked a command or approved an action whose purpose is to remove that data.
+- Automatic maintenance, bootstrap, repair, migration, compaction, cleanup, or rotation code must preserve user data. If continuity is uncertain, prefer degraded coverage, stale markers, warnings, or follow-up repair work over destructive recovery.
+- Backups are not a substitute for this rule. The live system must not rely on being able to restore user data after an automatic delete.
+
 ## PR Review And Merge
 
 - Before merging a PR, check whether it changes user-facing behavior or should appear in npm release notes.
