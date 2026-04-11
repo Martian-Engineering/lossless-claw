@@ -42,114 +42,114 @@ const envelopedMessage = JSON.stringify({ type: "message", message: { role: "use
 const commentaryEnvelope = JSON.stringify({ type: "commentary", message: { role: "assistant", content: "ignore me" } });
 
 describe("readLastJsonlEntryBeforeOffset with messageOnly", () => {
-  it("messageOnly=true skips trailing cache-ttl entries and returns last message", () => {
+  it("messageOnly=true skips trailing cache-ttl entries and returns last message", async () => {
     const file = makeTmpJsonl([userMessage, assistantMessage, cacheTtl, cacheTtl]);
     const offset = fileSize(file);
 
-    const result = readLastJsonlEntryBeforeOffset(file, offset, true);
+    const result = await readLastJsonlEntryBeforeOffset(file, offset, true);
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!);
     expect(parsed.role).toBe("assistant");
     expect(parsed.content).toBe("hi there");
   });
 
-  it("messageOnly=true skips multiple non-message types (cache-ttl, tool-result, meta)", () => {
+  it("messageOnly=true skips multiple non-message types (cache-ttl, tool-result, meta)", async () => {
     const file = makeTmpJsonl([userMessage, assistantMessage, cacheTtl, toolResult, customMeta]);
     const offset = fileSize(file);
 
-    const result = readLastJsonlEntryBeforeOffset(file, offset, true);
+    const result = await readLastJsonlEntryBeforeOffset(file, offset, true);
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!);
     expect(parsed.role).toBe("assistant");
     expect(parsed.content).toBe("hi there");
   });
 
-  it("returns null when JSONL has only non-message entries and messageOnly=true", () => {
+  it("returns null when JSONL has only non-message entries and messageOnly=true", async () => {
     const file = makeTmpJsonl([cacheTtl, toolResult, customMeta]);
     const offset = fileSize(file);
 
-    const result = readLastJsonlEntryBeforeOffset(file, offset, true);
+    const result = await readLastJsonlEntryBeforeOffset(file, offset, true);
     expect(result).toBeNull();
   });
 
-  it("messageOnly=true and messageOnly=false return same result when last entry is a message", () => {
+  it("messageOnly=true and messageOnly=false return same result when last entry is a message", async () => {
     const file = makeTmpJsonl([userMessage, assistantMessage]);
     const offset = fileSize(file);
 
-    const withFlag = readLastJsonlEntryBeforeOffset(file, offset, true);
-    const withoutFlag = readLastJsonlEntryBeforeOffset(file, offset, false);
+    const withFlag = await readLastJsonlEntryBeforeOffset(file, offset, true);
+    const withoutFlag = await readLastJsonlEntryBeforeOffset(file, offset, false);
     expect(withFlag).toBe(withoutFlag);
   });
 
-  it("messageOnly=false (default) returns non-message entries", () => {
+  it("messageOnly=false (default) returns non-message entries", async () => {
     const file = makeTmpJsonl([userMessage, cacheTtl]);
     const offset = fileSize(file);
 
-    const result = readLastJsonlEntryBeforeOffset(file, offset, false);
+    const result = await readLastJsonlEntryBeforeOffset(file, offset, false);
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!);
     expect(parsed.type).toBe("openclaw.cache-ttl");
   });
 
-  it("default messageOnly parameter returns non-message entries (backward compat)", () => {
+  it("default messageOnly parameter returns non-message entries (backward compat)", async () => {
     const file = makeTmpJsonl([userMessage, cacheTtl]);
     const offset = fileSize(file);
 
     // Call without third argument — should behave like messageOnly=false
-    const result = readLastJsonlEntryBeforeOffset(file, offset);
+    const result = await readLastJsonlEntryBeforeOffset(file, offset);
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!);
     expect(parsed.type).toBe("openclaw.cache-ttl");
   });
 
-  it("handles canonical SessionManager message envelopes", () => {
+  it("handles canonical SessionManager message envelopes", async () => {
     const file = makeTmpJsonl([envelopedMessage, cacheTtl]);
     const offset = fileSize(file);
 
-    const result = readLastJsonlEntryBeforeOffset(file, offset, true);
+    const result = await readLastJsonlEntryBeforeOffset(file, offset, true);
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!);
     expect(parsed.message.role).toBe("user");
     expect(parsed.message.content).toBe("wrapped");
   });
 
-  it("skips non-message envelopes even when they contain nested message-shaped data", () => {
+  it("skips non-message envelopes even when they contain nested message-shaped data", async () => {
     const file = makeTmpJsonl([userMessage, commentaryEnvelope]);
     const offset = fileSize(file);
 
-    const result = readLastJsonlEntryBeforeOffset(file, offset, true);
+    const result = await readLastJsonlEntryBeforeOffset(file, offset, true);
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!);
     expect(parsed.role).toBe("user");
     expect(parsed.content).toBe("hello");
   });
 
-  it("returns null for empty file", () => {
+  it("returns null for empty file", async () => {
     const file = makeTmpJsonl([]);
     const offset = fileSize(file);
-    expect(readLastJsonlEntryBeforeOffset(file, offset, true)).toBeNull();
+    await expect(readLastJsonlEntryBeforeOffset(file, offset, true)).resolves.toBeNull();
   });
 
-  it("returns null when offset is 0", () => {
+  it("returns null when offset is 0", async () => {
     const file = makeTmpJsonl([userMessage]);
-    expect(readLastJsonlEntryBeforeOffset(file, 0, true)).toBeNull();
+    await expect(readLastJsonlEntryBeforeOffset(file, 0, true)).resolves.toBeNull();
   });
 
-  it("finds message when it is the only entry (first line)", () => {
+  it("finds message when it is the only entry (first line)", async () => {
     const file = makeTmpJsonl([userMessage]);
     const offset = fileSize(file);
 
-    const result = readLastJsonlEntryBeforeOffset(file, offset, true);
+    const result = await readLastJsonlEntryBeforeOffset(file, offset, true);
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!);
     expect(parsed.role).toBe("user");
   });
 
-  it("returns null when only entry is non-message and messageOnly=true", () => {
+  it("returns null when only entry is non-message and messageOnly=true", async () => {
     const file = makeTmpJsonl([cacheTtl]);
     const offset = fileSize(file);
 
-    const result = readLastJsonlEntryBeforeOffset(file, offset, true);
+    const result = await readLastJsonlEntryBeforeOffset(file, offset, true);
     expect(result).toBeNull();
   });
 });
