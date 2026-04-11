@@ -13,6 +13,10 @@ describe("resolveLcmConfig", () => {
     expect(manifest.skills).toEqual(["skills/lossless-claw"]);
   });
 
+  it("declares context-engine kind so OpenClaw core binds the contextEngine slot on install", () => {
+    expect(manifest.kind).toBe("context-engine");
+  });
+
   it("uses hardcoded defaults when no env or plugin config", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.enabled).toBe(true);

@@ -1,5 +1,6 @@
 {
   "id": "lossless-claw",
+  "kind": "context-engine",
   "skills": [
     "skills/lossless-claw"
   ],
