@@ -1,5 +1,11 @@
 # @martian-engineering/lossless-claw
 
+## 0.8.2
+
+### Patch Changes
+
+- [#400](https://github.com/Martian-Engineering/lossless-claw/pull/400) [`1711957`](https://github.com/Martian-Engineering/lossless-claw/commit/17119577e847750f3c08ab84e47e0e6628bca9ed) Thanks [@jalehman](https://github.com/jalehman)! - Strip comments from the pre-bundled dist/index.js so the OpenClaw install-time code safety scanner no longer flags JSDoc prose (e.g. "Fetch all context items") as a network-send pattern and blocks installation with an `env-harvesting` false positive.
+
 ## 0.8.1
 
 ### Patch Changes
