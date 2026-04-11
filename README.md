@@ -33,6 +33,8 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 The plugin now ships a bundled `lossless-claw` skill plus a small plugin command surface for supported OpenClaw chat/native command providers:
 
 - `/lcm` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
+- `/lcm backup` creates a timestamped backup of the current LCM SQLite database
+- `/lcm rotate` archives the active LCM row for the current session and starts a fresh row without changing the live OpenClaw session identity
 - `/lcm doctor` scans for broken or truncated summaries
 - `/lcm doctor clean` shows read-only high-confidence junk diagnostics for archived subagents, cron sessions, and NULL-key orphaned subagent runs
 - `/lcm status` shows plugin, conversation, and maintenance state including deferred compaction debt
@@ -41,6 +43,8 @@ The plugin now ships a bundled `lossless-claw` skill plus a small plugin command
 These are plugin slash/native commands, not root shell CLI subcommands. Supported examples:
 
 - `/lcm`
+- `/lcm backup`
+- `/lcm rotate`
 - `/lcm doctor`
 - `/lcm doctor clean`
 - `/lossless`
@@ -271,6 +275,13 @@ Lossless-claw distinguishes OpenClaw's two session-reset commands:
 
 - `/new` keeps the active conversation row and all stored summaries, but prunes `context_items` so the next turn rebuilds context from retained summaries instead of the fresh tail.
 - `/reset` archives the active conversation row and creates a new active row for the same stable `sessionKey`, giving the next turn a clean LCM conversation while preserving prior history.
+
+For large sessions, neither command is a perfect “keep my live agent context, but stop writing into this giant active LCM row” tool:
+
+- `/new` keeps writing into the same active LCM conversation row.
+- `/reset` changes OpenClaw session flow, which is heavier than users often want when their real problem is just LCM row size.
+
+`/lcm rotate` fills that gap. It creates a backup, archives the current active LCM row, creates a fresh active row for the same `sessionKey`, and checkpoints the current transcript frontier so the new row starts from now forward instead of replaying old history. Older rows remain searchable, which pairs well with cross-session search and usually improves hot-path bootstrap and assemble performance for long-lived sessions.
 
 `newSessionRetainDepth` (or `LCM_NEW_SESSION_RETAIN_DEPTH`) controls how much summary structure survives `/new`:
 

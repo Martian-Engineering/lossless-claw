@@ -1188,6 +1188,19 @@ async function readAppendedLeafPathMessages(params: {
   };
 }
 
+export type RotateSessionStorageResult =
+  | {
+      kind: "rotated";
+      archivedConversationId: number;
+      activeConversationId: number;
+      archivedMessageCount: number;
+      checkpointSize: number;
+    }
+  | {
+      kind: "unavailable";
+      reason: string;
+    };
+
 function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | null {
   if (!line) {
     return null;
@@ -3490,10 +3503,7 @@ export class LcmContextEngine implements ContextEngine {
           });
           const conversationId = conversation.conversationId;
           let existingCount = await this.conversationStore.getMessageCount(conversationId);
-          let bootstrapState =
-            existingCount > 0
-              ? await this.summaryStore.getConversationBootstrapState(conversationId)
-              : null;
+          let bootstrapState = await this.summaryStore.getConversationBootstrapState(conversationId);
 
           if (
             bootstrapState &&
@@ -3527,7 +3537,6 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           if (
-            existingCount > 0 &&
             bootstrapState &&
             bootstrapState.sessionFilePath === params.sessionFile &&
             sessionFileSize > bootstrapState.lastSeenSize &&
@@ -3541,7 +3550,6 @@ export class LcmContextEngine implements ContextEngine {
                   tokenCount: latestDbMessage.tokenCount,
                 })
               : null;
-
             // Short-circuit before the expensive backward scan: the fast-path can
             // only succeed when the DB's latest hash still matches the checkpoint.
             // When messages have been ingested since the last bootstrap this check
@@ -5192,6 +5200,88 @@ export class LcmContextEngine implements ContextEngine {
             nextSessionKey: params.nextSessionKey,
             createReplacement,
           });
+        }),
+    );
+  }
+
+  async rotateSessionStorage(params: {
+    sessionId?: string;
+    sessionKey?: string;
+    sessionFile: string;
+  }): Promise<RotateSessionStorageResult> {
+    const sessionId = params.sessionId?.trim();
+    const sessionKey = params.sessionKey?.trim();
+    if (!sessionId || !sessionKey) {
+      return {
+        kind: "unavailable",
+        reason: "Lossless Claw needs both the current session id and session key to rotate storage safely.",
+      };
+    }
+    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
+      return {
+        kind: "unavailable",
+        reason: "The current session is excluded by ignoreSessionPatterns, so there is no active LCM conversation to rotate.",
+      };
+    }
+    if (this.isStatelessSession(sessionKey)) {
+      return {
+        kind: "unavailable",
+        reason: "The current session is stateless in Lossless Claw, so there is no writable active LCM conversation to rotate.",
+      };
+    }
+
+    this.ensureMigrated();
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(sessionId, sessionKey),
+      async () =>
+        this.conversationStore.withTransaction(async () => {
+          const current = await this.conversationStore.getConversationForSession({
+            sessionId,
+            sessionKey,
+          });
+          if (!current?.active) {
+            return {
+              kind: "unavailable",
+              reason: "No active Lossless Claw conversation is stored for the current session.",
+            };
+          }
+
+          const archivedMessageCount = await this.conversationStore.getMessageCount(current.conversationId);
+          const sessionFileStats = statSync(params.sessionFile);
+          const tailEntryRaw = readLastJsonlEntryBeforeOffset(
+            params.sessionFile,
+            sessionFileStats.size,
+            true,
+          );
+          const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
+          const tailEntryHash = tailEntryMessage
+            ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
+            : null;
+
+          await this.conversationStore.archiveConversation(current.conversationId);
+          const freshConversation = await this.conversationStore.createConversation({
+            sessionId,
+            sessionKey,
+            title: current.title ?? undefined,
+          });
+          await this.summaryStore.upsertConversationBootstrapState({
+            conversationId: freshConversation.conversationId,
+            sessionFilePath: params.sessionFile,
+            lastSeenSize: sessionFileStats.size,
+            lastSeenMtimeMs: Math.trunc(sessionFileStats.mtimeMs),
+            lastProcessedOffset: sessionFileStats.size,
+            lastProcessedEntryHash: tailEntryHash,
+          });
+          this.deps.log.info(
+            `[lcm] rotate: archived conversation=${current.conversationId} session=${sessionId} sessionKey=${sessionKey} and created fresh conversation=${freshConversation.conversationId} checkpointSize=${sessionFileStats.size}`,
+          );
+          return {
+            kind: "rotated",
+            archivedConversationId: current.conversationId,
+            activeConversationId: freshConversation.conversationId,
+            archivedMessageCount,
+            checkpointSize: sessionFileStats.size,
+          };
         }),
     );
   }

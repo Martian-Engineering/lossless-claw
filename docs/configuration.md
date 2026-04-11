@@ -255,6 +255,16 @@ Lossless-claw now defaults `proactiveThresholdCompactionMode` to `deferred`.
 - status output also surfaces the latest API/cache telemetry so operators can see whether a deferred debt item is being preserved for cache-safety reasons
 - set `proactiveThresholdCompactionMode` to `inline` only if you need the legacy inline proactive compaction behavior for compatibility
 
+### `/lcm rotate`
+
+`/lcm rotate` exists for a different use case than `/new` or `/reset`:
+
+- `/new` keeps the same active LCM conversation row and only prunes context.
+- `/reset` changes OpenClaw session flow, which is sometimes more disruptive than users want.
+- `/lcm rotate` keeps the live OpenClaw session identity, but archives the current active LCM row and starts a fresh row for the same session.
+
+Before rotating, Lossless-claw replaces one rolling `rotate-latest` SQLite backup. The new row is checkpointed at the current transcript frontier so bootstrap starts from now forward instead of replaying older transcript history into the fresh row. If you want additional timestamped snapshots, run `/lcm backup` explicitly before `/lcm rotate`.
+
 ## Environment-only knobs outside plugin config
 
 These settings are not part of `plugins.entries.lossless-claw.config`, but they still affect the system:
@@ -284,6 +294,12 @@ Back it up with:
 ```bash
 cp "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db" "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db.backup"
 sqlite3 "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db" ".backup ${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db.backup"
+```
+
+Or from a supported OpenClaw chat/native command surface:
+
+```text
+/lcm backup
 ```
 
 ## Disabling lossless-claw

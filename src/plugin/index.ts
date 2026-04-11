@@ -1812,13 +1812,49 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         const cfg = api.runtime.config.loadConfig();
         const parsed = parseAgentSessionKey(key);
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = api.runtime.channel.session.resolveStorePath(cfg.session?.store, {
+        const storePath = api.runtime.agent.session.resolveStorePath(cfg.session?.store, {
           agentId,
         });
-        const raw = readFileSync(storePath, "utf8");
-        const store = JSON.parse(raw) as Record<string, { sessionId?: string } | undefined>;
+        const store = api.runtime.agent.session.loadSessionStore(storePath) as Record<
+          string,
+          { sessionId?: string } | undefined
+        >;
         const sessionId = store[key]?.sessionId;
         return typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    resolveSessionTranscriptFile: async ({ sessionId, sessionKey }) => {
+      const normalizedSessionId = sessionId.trim();
+      if (!normalizedSessionId) {
+        return undefined;
+      }
+
+      try {
+        const cfg = api.runtime.config.loadConfig();
+        const normalizedSessionKey = sessionKey?.trim();
+        const parsed = normalizedSessionKey ? parseAgentSessionKey(normalizedSessionKey) : null;
+        const agentId = normalizeAgentId(parsed?.agentId);
+        const storePath = api.runtime.agent.session.resolveStorePath(cfg.session?.store, {
+          agentId,
+        });
+        const store = api.runtime.agent.session.loadSessionStore(storePath) as Record<
+          string,
+          { sessionId?: string; sessionFile?: string } | undefined
+        >;
+        const entry =
+          (normalizedSessionKey ? store[normalizedSessionKey] : undefined)
+          ?? Object.values(store).find((candidate) => candidate?.sessionId === normalizedSessionId);
+        const transcriptPath = api.runtime.agent.session.resolveSessionFilePath(
+          normalizedSessionId,
+          entry,
+          {
+            agentId,
+            storePath,
+          },
+        );
+        return transcriptPath.trim() || undefined;
       } catch {
         return undefined;
       }
@@ -1880,7 +1916,12 @@ function wirePluginHandlers(
   );
 
   api.registerCommand(
-    createLcmCommand({ db: shared.waitForDatabase, config: deps.config, deps }),
+    createLcmCommand({
+      db: shared.waitForDatabase,
+      config: deps.config,
+      deps,
+      getLcm: shared.waitForEngine,
+    }),
   );
 }
 

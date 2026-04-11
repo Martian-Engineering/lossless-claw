@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
-import { basename, dirname, join } from "node:path";
 import { getFileBackedDatabasePath } from "../db/connection.js";
+import { buildLcmDatabaseBackupPath, writeLcmDatabaseBackup } from "./lcm-db-backup.js";
 
 export type DoctorCleanerId =
   | "archived_subagents"
@@ -554,10 +554,6 @@ function deleteTempCleanerCandidates(db: DatabaseSync): number {
   );
 }
 
-function quoteSqlString(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
 export function getDoctorCleanerApplyUnavailableReason(databasePath: string): string | null {
   return getFileBackedDatabasePath(databasePath)
     ? null
@@ -565,17 +561,7 @@ export function getDoctorCleanerApplyUnavailableReason(databasePath: string): st
 }
 
 function buildCleanerBackupPath(databasePath: string): string | null {
-  const fileBackedDatabasePath = getFileBackedDatabasePath(databasePath);
-  if (!fileBackedDatabasePath) {
-    return null;
-  }
-
-  const timestamp = new Date().toISOString().replace(/[-:.]/g, "");
-  const suffix = Math.random().toString(36).slice(2, 8);
-  return join(
-    dirname(fileBackedDatabasePath),
-    `${basename(fileBackedDatabasePath)}.doctor-cleaners-${timestamp}-${suffix}.bak`,
-  );
+  return buildLcmDatabaseBackupPath(databasePath, "doctor-cleaners");
 }
 
 export function applyDoctorCleaners(
@@ -611,7 +597,7 @@ export function applyDoctorCleaners(
     };
   }
 
-  db.exec(`VACUUM INTO ${quoteSqlString(backupPath)}`);
+  writeLcmDatabaseBackup(db, backupPath);
 
   let deletedConversations = 0;
   let deletedMessages = 0;

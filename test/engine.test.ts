@@ -118,6 +118,7 @@ function createTestDeps(
     },
     resolveAgentDir: () => process.env.HOME ?? tmpdir(),
     resolveSessionIdFromSessionKey: async () => undefined,
+    resolveSessionTranscriptFile: async ({ sessionId }: { sessionId: string }) => sessionId,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),
@@ -2655,6 +2656,97 @@ describe("LcmContextEngine.bootstrap", () => {
         (message) => (message.content[0] as { text: string }).text,
       ),
     );
+  });
+
+  it("rotates LCM storage for the current session without replaying prior transcript history", async () => {
+    const sessionFile = createSessionFilePath("lcm-rotate-storage");
+    const sessionKey = "agent:main:main";
+    const sessionId = "rotate-storage-session";
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "old user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const original = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(original).not.toBeNull();
+
+    const rotate = await engine.rotateSessionStorage({
+      sessionId,
+      sessionKey,
+      sessionFile,
+    });
+    expect(rotate).toEqual({
+      kind: "rotated",
+      archivedConversationId: original!.conversationId,
+      activeConversationId: expect.any(Number),
+      archivedMessageCount: 2,
+      checkpointSize: statSync(sessionFile).size,
+    });
+
+    const archived = await engine.getConversationStore().getConversation(original!.conversationId);
+    const active = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(archived?.active).toBe(false);
+    expect(active).not.toBeNull();
+    expect(active?.conversationId).not.toBe(original!.conversationId);
+    expect(await engine.getConversationStore().getMessageCount(active!.conversationId)).toBe(0);
+
+    const rotatedBootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(active!.conversationId);
+    expect(rotatedBootstrapState?.sessionFilePath).toBe(sessionFile);
+    expect(rotatedBootstrapState?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+    expect(rotatedBootstrapState?.lastProcessedEntryHash).toMatch(/^[a-f0-9]{64}$/);
+
+    const checkpointHit = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(checkpointHit.bootstrapped).toBe(false);
+    expect(checkpointHit.importedMessages).toBe(0);
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "new user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "new assistant" }],
+    } as AgentMessage);
+
+    const appended = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(appended).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+
+    const archivedMessages = await engine.getConversationStore().getMessages(original!.conversationId);
+    const activeMessages = await engine.getConversationStore().getMessages(active!.conversationId);
+    expect(archivedMessages.map((message) => message.content)).toEqual(["old user", "old assistant"]);
+    expect(activeMessages.map((message) => message.content)).toEqual(["new user", "new assistant"]);
+
+    const searchResults = await engine.getConversationStore().searchMessages({
+      query: "old user",
+      mode: "regex",
+      limit: 5,
+    });
+    expect(searchResults.some((result) => result.conversationId === original!.conversationId)).toBe(true);
   });
 
   it("reconciles missing tail messages when JSONL advanced past LCM", async () => {

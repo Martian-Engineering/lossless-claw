@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,7 +12,13 @@ import { createLcmCommand, __testing } from "../src/plugin/lcm-command.js";
 import type { LcmSummarizeFn } from "../src/summarize.js";
 import type { LcmDependencies } from "../src/types.js";
 
-function createCommandFixture(options?: { summarize?: LcmSummarizeFn; deps?: LcmDependencies }) {
+function createCommandFixture(options?: {
+  summarize?: LcmSummarizeFn;
+  deps?: LcmDependencies;
+  getLcm?: () => Promise<{
+    rotateSessionStorage: (...args: unknown[]) => Promise<unknown>;
+  }>;
+}) {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-command-"));
   const dbPath = join(tempDir, "lcm.db");
   const db = createLcmDatabaseConnection(dbPath);
@@ -26,6 +32,7 @@ function createCommandFixture(options?: { summarize?: LcmSummarizeFn; deps?: Lcm
     config,
     summarize: options?.summarize,
     deps: options?.deps,
+    getLcm: options?.getLcm,
   });
   return { tempDir, dbPath, db, command, conversationStore, summaryStore };
 }
@@ -1031,6 +1038,7 @@ describe("lcm command", () => {
       readLatestAssistantReply: vi.fn(() => undefined) as LcmDependencies["readLatestAssistantReply"],
       resolveAgentDir: vi.fn(() => tmpdir()) as LcmDependencies["resolveAgentDir"],
       resolveSessionIdFromSessionKey: vi.fn(async () => undefined) as LcmDependencies["resolveSessionIdFromSessionKey"],
+      resolveSessionTranscriptFile: vi.fn(async () => undefined) as LcmDependencies["resolveSessionTranscriptFile"],
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -1100,6 +1108,124 @@ describe("lcm command", () => {
     expect(repaired?.content).not.toContain("[Truncated from 111 tokens]");
   });
 
+  it("creates a standalone database backup", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(createCommandContext("backup"));
+    const backupPath = result.text.match(/backup path: (.+)/)?.[1]?.trim();
+
+    expect(result.text).toContain("💾 Lossless Claw Backup");
+    expect(result.text).toContain("status: created");
+    expect(result.text).toContain(`db path: ${fixture.dbPath}`);
+    expect(backupPath).toBeTruthy();
+    expect(existsSync(backupPath!)).toBe(true);
+  });
+
+  it("rotates the current session with backup-first storage splitting", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
+    tempDirs.add(transcriptPath);
+
+    const rotateSessionStorage = vi.fn(async () => ({
+      kind: "rotated" as const,
+      archivedConversationId: 7,
+      activeConversationId: 8,
+      archivedMessageCount: 42,
+      checkpointSize: 1234,
+    }));
+    const deps = {
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const fixture = createCommandFixture({
+      deps,
+      getLcm: async () => ({
+        rotateSessionStorage,
+      }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "rotate-session",
+      sessionKey: "agent:main:main",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionId: "rotate-session",
+        sessionKey: "agent:main:main",
+      }),
+    );
+
+    const backupPath = result.text.match(/backup path: (.+)/)?.[1]?.trim();
+
+    expect(result.text).toContain("🪓 Lossless Claw Rotate");
+    expect(result.text).toContain("status: rotated");
+    expect(result.text).toContain("archived conversation id: 7");
+    expect(result.text).toContain("new active conversation id: 8");
+    expect(result.text).toContain("archived message count: 42");
+    expect(result.text).toContain("mode: start from now forward");
+    expect(backupPath).toBeTruthy();
+    expect(existsSync(backupPath!)).toBe(true);
+    expect(rotateSessionStorage).toHaveBeenCalledWith({
+      sessionId: "rotate-session",
+      sessionKey: "agent:main:main",
+      sessionFile: transcriptPath,
+    });
+  });
+
+  it("reports rotate as unavailable when OpenClaw does not expose a session key", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionId: "rotate-missing-session-key",
+      }),
+    );
+
+    expect(result.text).toContain("🪓 Lossless Claw Rotate");
+    expect(result.text).toContain("status: unavailable");
+    expect(result.text).toContain("OpenClaw must expose both the active session key and session id");
+  });
+
+  it("prefers the active conversation when multiple rows share the same session key", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "shared-key-old",
+      sessionKey: "agent:main:main",
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "shared-key-new",
+      sessionKey: "agent:main:main",
+    });
+
+    const result = await fixture.command.handler(
+      createCommandContext("status", {
+        sessionKey: "agent:main:main",
+      }),
+    );
+
+    expect(result.text).toContain(`conversation id: ${active.conversationId}`);
+    expect(result.text).not.toContain(`conversation id: ${archived.conversationId}`);
+  });
+
   it("falls back to help text for unsupported subcommands", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
@@ -1107,6 +1233,8 @@ describe("lcm command", () => {
 
     const result = await fixture.command.handler(createCommandContext("rewrite"));
     expect(result.text).toContain("⚠️ Unknown subcommand `rewrite`.");
+    expect(result.text).toContain("`/lossless backup`");
+    expect(result.text).toContain("`/lossless rotate`");
     expect(result.text).toContain("`/lossless help`");
     expect(result.text).toContain("`/lcm` is accepted as a shorter alias.");
   });
