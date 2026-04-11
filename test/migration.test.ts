@@ -650,3 +650,86 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(row.tool_input).toBe('{"cmd":"pwd"}');
   });
 });
+
+describe("runLcmMigrations skips completed backfills", () => {
+  it("skips depth backfill when all leaf summaries have depth 0 and all condensed summaries have depth > 0", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "skip-depth.db");
+    const db = getLcmConnection(dbPath);
+
+    // Run migrations once to get a fully-migrated DB
+    runLcmMigrations(db, { fts5Available: false });
+
+    // Now run migrations again — the skip logic should fire because
+    // all leaves have depth=0 and all condensed summaries have depth>0
+    const logMessages: string[] = [];
+    runLcmMigrations(db, {
+      fts5Available: false,
+      log: { info: (msg: string) => logMessages.push(msg) },
+    });
+
+    expect(logMessages).toContainEqual(
+      expect.stringContaining("skipping backfillSummaryDepths (already populated)"),
+    );
+  });
+
+  it("skips metadata backfill when all summaries have earliest_at populated", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "skip-metadata.db");
+    const db = getLcmConnection(dbPath);
+
+    // Run migrations once to populate metadata
+    runLcmMigrations(db, { fts5Available: false });
+
+    // Create a conversation + leaf summary to verify the sentinel query works
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      99,
+      "test-session-skip",
+    );
+    db.prepare(
+      `INSERT INTO messages (message_id, conversation_id, seq, role, content, token_count, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(999, 99, 1, "user", "hello", 5, "2026-04-11 10:00:00");
+    db.prepare(
+      `INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, depth, earliest_at, latest_at, source_message_token_count, file_ids)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]')`,
+    ).run("sum_skip_leaf", 99, "leaf", "test", 5, 0, "2026-04-11 10:00:00", "2026-04-11 10:00:00", 5);
+    db.prepare(
+      `INSERT INTO summary_messages (summary_id, message_id, ordinal) VALUES (?, ?, ?)`,
+    ).run("sum_skip_leaf", 999, 0);
+
+    // Run migrations again — should skip metadata backfill
+    const logMessages: string[] = [];
+    runLcmMigrations(db, {
+      fts5Available: false,
+      log: { info: (msg: string) => logMessages.push(msg) },
+    });
+
+    expect(logMessages).toContainEqual(
+      expect.stringContaining("skipping backfillSummaryMetadata (already populated)"),
+    );
+  });
+
+  it("skips tool call backfill when no rows need extraction", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "skip-toolcall.db");
+    const db = getLcmConnection(dbPath);
+
+    // Run migrations once (no legacy tool_call rows exist in a fresh DB)
+    runLcmMigrations(db, { fts5Available: false });
+
+    // Running again should skip the tool call backfill
+    const logMessages: string[] = [];
+    runLcmMigrations(db, {
+      fts5Available: false,
+      log: { info: (msg: string) => logMessages.push(msg) },
+    });
+
+    expect(logMessages).toContainEqual(
+      expect.stringContaining("skipping backfillToolCallColumns (already populated)"),
+    );
+  });
+});

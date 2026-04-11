@@ -775,7 +775,23 @@ export function runLcmMigrations(
   runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
     ensureCompactionTelemetryColumns(db),
   );
-  runMigrationStep("backfillSummaryDepths", log, () => backfillSummaryDepths(db));
+  // Skip expensive backfill migrations when the data is already populated.
+  // These backfills are O(conversations * summaries) and on large DBs (>2K conversations,
+  // >70K messages) they can take minutes, hold write locks, and cause the gateway to
+  // appear unresponsive. Check a cheap sentinel before running them.
+  const needsDepthBackfill = db
+    .prepare(`SELECT 1 FROM summaries WHERE kind = 'leaf' AND depth != 0 LIMIT 1`)
+    .get() != null
+    || db
+      .prepare(`SELECT 1 FROM summaries WHERE kind = 'condensed' AND depth = 0 LIMIT 1`)
+      .get() != null;
+
+  if (needsDepthBackfill) {
+    runMigrationStep("backfillSummaryDepths", log, () => backfillSummaryDepths(db));
+  } else {
+    log?.info?.(`[lcm] skipping backfillSummaryDepths (already populated)`);
+  }
+
   // Index on depth — created AFTER backfillSummaryDepths to avoid index
   // maintenance overhead during bulk depth updates on large existing DBs.
   runMigrationStep("createSummariesDepthIndex", log, () =>
@@ -783,8 +799,35 @@ export function runLcmMigrations(
       `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
     ),
   );
-  runMigrationStep("backfillSummaryMetadata", log, () => backfillSummaryMetadata(db));
-  runMigrationStep("backfillToolCallColumns", log, () => backfillToolCallColumns(db));
+
+  const needsMetadataBackfill = db
+    .prepare(`SELECT 1 FROM summaries WHERE earliest_at IS NULL LIMIT 1`)
+    .get() != null;
+
+  if (needsMetadataBackfill) {
+    runMigrationStep("backfillSummaryMetadata", log, () => backfillSummaryMetadata(db));
+  } else {
+    log?.info?.(`[lcm] skipping backfillSummaryMetadata (already populated)`);
+  }
+
+  const needsToolCallBackfill = db
+    .prepare(
+      `SELECT 1 FROM message_parts
+       WHERE tool_call_id IS NULL AND metadata IS NOT NULL
+       AND COALESCE(
+         json_extract(metadata, '$.toolCallId'),
+         json_extract(metadata, '$.raw.id'),
+         json_extract(metadata, '$.raw.call_id')
+       ) IS NOT NULL
+       LIMIT 1`,
+    )
+    .get() != null;
+
+  if (needsToolCallBackfill) {
+    runMigrationStep("backfillToolCallColumns", log, () => backfillToolCallColumns(db));
+  } else {
+    log?.info?.(`[lcm] skipping backfillToolCallColumns (already populated)`);
+  }
 
   const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
   const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
