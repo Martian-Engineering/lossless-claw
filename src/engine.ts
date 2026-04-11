@@ -2731,6 +2731,7 @@ export class LcmContextEngine implements ContextEngine {
           });
           const conversationId = conversation.conversationId;
           let existingCount = await this.conversationStore.getMessageCount(conversationId);
+          let reseedingAfterSessionFileRotation = false;
           let bootstrapState =
             existingCount > 0
               ? await this.summaryStore.getConversationBootstrapState(conversationId)
@@ -2746,6 +2747,7 @@ export class LcmContextEngine implements ContextEngine {
             this.purgeConversationForBootstrapRotation(conversationId);
             bootstrapState = null;
             existingCount = 0;
+            reseedingAfterSessionFileRotation = true;
             conversation.bootstrappedAt = null;
           }
 
@@ -2853,10 +2855,17 @@ export class LcmContextEngine implements ContextEngine {
           // First-time import path: no LCM rows yet, so seed directly from the
           // active leaf context snapshot.
           if (existingCount === 0) {
-            const bootstrapMessages = trimBootstrapMessagesToBudget(
-              historicalMessages,
-              resolveBootstrapMaxTokens(this.config),
-            );
+            const bootstrapMessages =
+              reseedingAfterSessionFileRotation
+                // A rotated transcript replaces the canonical session file for an
+                // existing conversation. Replay the full rotated history so LCM
+                // keeps coverage parity with the live session instead of
+                // reapplying the first-bootstrap suffix cap.
+                ? historicalMessages
+                : trimBootstrapMessagesToBudget(
+                    historicalMessages,
+                    resolveBootstrapMaxTokens(this.config),
+                  );
 
             if (bootstrapMessages.length === 0) {
               await this.conversationStore.markConversationBootstrapped(conversationId);

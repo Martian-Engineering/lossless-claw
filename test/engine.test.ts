@@ -2356,6 +2356,64 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(await engine.getSummaryStore().getSummary("sum_rotation_session_key_old")).toBeNull();
   });
 
+  it("replays the full rotated transcript instead of reapplying bootstrapMaxTokens", async () => {
+    const engine = createEngineWithConfig({ bootstrapMaxTokens: 250 });
+    const firstSessionId = "bootstrap-rotation-full-reseed-1";
+    const secondSessionId = "bootstrap-rotation-full-reseed-2";
+    const sessionKey = "agent:main:test:bootstrap-rotation-full-reseed";
+    const firstSessionFile = createSessionFilePath("rotation-full-reseed-old");
+    const firstManager = SessionManager.open(firstSessionFile);
+    firstManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "old seed user" }],
+    } as AgentMessage);
+    firstManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old seed assistant" }],
+    } as AgentMessage);
+
+    const first = await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: firstSessionFile,
+    });
+    expect(first).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const rotatedSessionFile = createSessionFilePath("rotation-full-reseed-new");
+    const rotatedManager = SessionManager.open(rotatedSessionFile);
+    const rotatedMessages = Array.from({ length: 5 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: [{ type: "text", text: `rotated turn ${index} ${"x".repeat(396)}` }],
+    })) as AgentMessage[];
+    for (const message of rotatedMessages) {
+      rotatedManager.appendMessage(message);
+    }
+
+    const second = await engine.bootstrap({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: rotatedSessionFile,
+    });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 5,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual(
+      rotatedMessages.map((message) => (message.content[0] as { text: string }).text),
+    );
+  });
+
   it("reconciles missing tail messages when JSONL advanced past LCM", async () => {
     const sessionFile = createSessionFilePath("reconcile-tail");
     const sm = SessionManager.open(sessionFile);
