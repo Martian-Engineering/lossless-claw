@@ -44,6 +44,7 @@ describe("resolveLcmConfig", () => {
       maxColdCacheCatchupPasses: 2,
       hotCachePressureFactor: 4,
       hotCacheBudgetHeadroomRatio: 0.2,
+      cacheTTLSeconds: 300,
     });
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
@@ -72,6 +73,7 @@ describe("resolveLcmConfig", () => {
         maxColdCacheCatchupPasses: 3,
         hotCachePressureFactor: 6,
         hotCacheBudgetHeadroomRatio: 0.35,
+      cacheTTLSeconds: 300,
       },
       dynamicLeafChunkTokens: {
         enabled: true,
@@ -100,6 +102,7 @@ describe("resolveLcmConfig", () => {
       maxColdCacheCatchupPasses: 3,
       hotCachePressureFactor: 6,
       hotCacheBudgetHeadroomRatio: 0.35,
+      cacheTTLSeconds: 300,
     });
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
@@ -141,6 +144,7 @@ describe("resolveLcmConfig", () => {
         maxColdCacheCatchupPasses: 2,
         hotCachePressureFactor: 3,
         hotCacheBudgetHeadroomRatio: 0.1,
+      cacheTTLSeconds: 300,
       },
       dynamicLeafChunkTokens: {
         enabled: false,
@@ -169,6 +173,7 @@ describe("resolveLcmConfig", () => {
       maxColdCacheCatchupPasses: 4,
       hotCachePressureFactor: 5.5,
       hotCacheBudgetHeadroomRatio: 0.25,
+      cacheTTLSeconds: 300,
     });
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
@@ -328,6 +333,7 @@ describe("resolveLcmConfig", () => {
         maxColdCacheCatchupPasses: 3,
         hotCachePressureFactor: 6,
         hotCacheBudgetHeadroomRatio: 0.35,
+      cacheTTLSeconds: 300,
       },
     });
 
@@ -336,6 +342,7 @@ describe("resolveLcmConfig", () => {
       maxColdCacheCatchupPasses: 3,
       hotCachePressureFactor: 6,
       hotCacheBudgetHeadroomRatio: 0.35,
+      cacheTTLSeconds: 300,
     });
   });
 
@@ -552,6 +559,10 @@ describe("resolveLcmConfig", () => {
           type: "number",
           minimum: 0,
           maximum: 0.95,
+        },
+        cacheTTLSeconds: {
+          type: "integer",
+          minimum: 0,
         },
       },
     });

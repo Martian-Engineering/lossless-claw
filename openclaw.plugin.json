@@ -11,7 +11,7 @@
     },
     "contextThreshold": {
       "label": "Context Threshold",
-      "help": "Fraction of context window that triggers compaction (0.0–1.0)"
+      "help": "Fraction of context window that triggers compaction (0.0\u20131.0)"
     },
     "incrementalMaxDepth": {
       "label": "Incremental Max Depth",
@@ -131,7 +131,7 @@
     },
     "maxAssemblyTokenBudget": {
       "label": "Max Assembly Token Budget",
-      "help": "Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
+      "help": "Hard ceiling for assembly token budget \u2014 caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
     },
     "summaryMaxOverageFactor": {
       "label": "Summary Max Overage Factor",
@@ -343,6 +343,10 @@
             "type": "number",
             "minimum": 0,
             "maximum": 0.95
+          },
+          "cacheTTLSeconds": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -381,10 +385,17 @@
         "items": {
           "type": "object",
           "properties": {
-            "provider": { "type": "string" },
-            "model": { "type": "string" }
+            "provider": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
           },
-          "required": ["provider", "model"],
+          "required": [
+            "provider",
+            "model"
+          ],
           "additionalProperties": false
         }
       }

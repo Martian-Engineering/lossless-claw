@@ -129,6 +129,13 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
       `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_activity_band TEXT NOT NULL DEFAULT 'low' CHECK (last_activity_band IN ('low', 'medium', 'high'))`,
     );
   }
+
+  const hasLastApiCallAt = telemetryColumns.some((col) => col.name === "last_api_call_at");
+  if (!hasLastApiCallAt) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_api_call_at INTEGER`,
+    );
+  }
 }
 
 function describeMigrationError(error: unknown): string {
@@ -791,6 +798,7 @@ export function runLcmMigrations(
       tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
       last_activity_band TEXT NOT NULL DEFAULT 'low'
         CHECK (last_activity_band IN ('low', 'medium', 'high')),
+      last_api_call_at INTEGER,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 

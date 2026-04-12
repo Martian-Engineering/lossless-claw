@@ -17,6 +17,7 @@ export type ConversationCompactionTelemetryRecord = {
   turnsSinceLeafCompaction: number;
   tokensAccumulatedSinceLeafCompaction: number;
   lastActivityBand: ActivityBand;
+  lastApiCallAt: number | null;
   updatedAt: Date;
 };
 
@@ -32,6 +33,7 @@ export type UpsertConversationCompactionTelemetryInput = {
   turnsSinceLeafCompaction?: number;
   tokensAccumulatedSinceLeafCompaction?: number;
   lastActivityBand?: ActivityBand;
+  lastApiCallAt?: number | null;
 };
 
 type ConversationCompactionTelemetryRow = {
@@ -46,6 +48,7 @@ type ConversationCompactionTelemetryRow = {
   turns_since_leaf_compaction: number | null;
   tokens_accumulated_since_leaf_compaction: number | null;
   last_activity_band: ActivityBand | null;
+  last_api_call_at: number | null;
   updated_at: string;
 };
 
@@ -64,6 +67,7 @@ function toConversationCompactionTelemetryRecord(
     turnsSinceLeafCompaction: row.turns_since_leaf_compaction ?? 0,
     tokensAccumulatedSinceLeafCompaction: row.tokens_accumulated_since_leaf_compaction ?? 0,
     lastActivityBand: row.last_activity_band ?? "low",
+    lastApiCallAt: row.last_api_call_at ?? null,
     updatedAt: parseUtcTimestampOrNull(row.updated_at) ?? new Date(0),
   };
 }
@@ -98,6 +102,7 @@ export class CompactionTelemetryStore {
            turns_since_leaf_compaction,
            tokens_accumulated_since_leaf_compaction,
            last_activity_band,
+           last_api_call_at,
            updated_at
          FROM conversation_compaction_telemetry
          WHERE conversation_id = ?`,
@@ -124,8 +129,9 @@ export class CompactionTelemetryStore {
            turns_since_leaf_compaction,
            tokens_accumulated_since_leaf_compaction,
            last_activity_band,
+           last_api_call_at,
            updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(conversation_id) DO UPDATE SET
            last_observed_cache_read = excluded.last_observed_cache_read,
            last_observed_cache_write = excluded.last_observed_cache_write,
@@ -137,6 +143,7 @@ export class CompactionTelemetryStore {
            turns_since_leaf_compaction = excluded.turns_since_leaf_compaction,
            tokens_accumulated_since_leaf_compaction = excluded.tokens_accumulated_since_leaf_compaction,
            last_activity_band = excluded.last_activity_band,
+           last_api_call_at = excluded.last_api_call_at,
            updated_at = datetime('now')`,
       )
       .run(
@@ -151,6 +158,7 @@ export class CompactionTelemetryStore {
         input.turnsSinceLeafCompaction ?? 0,
         input.tokensAccumulatedSinceLeafCompaction ?? 0,
         input.lastActivityBand ?? "low",
+        input.lastApiCallAt ?? null,
       );
   }
 }
