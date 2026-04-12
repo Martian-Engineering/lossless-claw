@@ -3724,7 +3724,15 @@ export class LcmContextEngine implements ContextEngine {
           });
         } else if (this.config.cacheAwareCompaction.enabled && telemetry?.lastApiCallAt) {
           // 2. Cache-TTL: compact if cache expired and there's material to compact
-          const cacheTTLMs = (this.config.cacheAwareCompaction.cacheTTLSeconds ?? 300) * 1000;
+          // Resolve per-agent cache TTL from OC config (cacheRetention: "long" → 3600s, "short" → 300s)
+          const agentId = params.sessionKey ? (() => {
+            const trimmed = params.sessionKey!.trim();
+            if (!trimmed.startsWith("agent:")) return undefined;
+            return trimmed.split(":")[1]?.trim();
+          })() : undefined;
+          const agentCacheTTL = this.deps.resolveCacheTTLSeconds?.(agentId);
+          const effectiveCacheTTL = agentCacheTTL ?? this.config.cacheAwareCompaction.cacheTTLSeconds ?? 300;
+          const cacheTTLMs = effectiveCacheTTL * 1000;
           const idleMs = Date.now() - telemetry.lastApiCallAt;
           if (idleMs > cacheTTLMs) {
             const leafTrigger = await this.compaction.evaluateLeafTrigger(
@@ -3733,7 +3741,7 @@ export class LcmContextEngine implements ContextEngine {
             );
             if (leafTrigger.shouldCompact) {
               this.deps.log.info(
-                `[lcm] assemble: pre-assembly compaction \u2014 cache expired (idle ${Math.round(idleMs / 1000)}s > TTL ${this.config.cacheAwareCompaction.cacheTTLSeconds ?? 300}s) conversation=${conversation.conversationId}`,
+                `[lcm] assemble: pre-assembly compaction \u2014 cache expired (idle ${Math.round(idleMs / 1000)}s > TTL ${effectiveCacheTTL}s) conversation=${conversation.conversationId}`,
               );
               await this.compactLeafAsync({
                 sessionId: params.sessionId,

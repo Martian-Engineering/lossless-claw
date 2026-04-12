@@ -154,6 +154,9 @@ export interface LcmDependencies {
   /** Resolve the OpenClaw agent directory */
   resolveAgentDir: () => string;
 
+  /** Resolve the effective prompt cache TTL in seconds for a given agent. Returns the agent's cacheRetention mapped to seconds, or undefined to use the LCM default. */
+  resolveCacheTTLSeconds?: (agentId?: string) => number | undefined;
+
   /** Resolve runtime session id from an agent session key */
   resolveSessionIdFromSessionKey: (sessionKey: string) => Promise<string | undefined>;
 

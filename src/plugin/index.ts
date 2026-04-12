@@ -1797,6 +1797,27 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     buildSubagentSystemPrompt,
     readLatestAssistantReply,
     resolveAgentDir: () => api.resolvePath("."),
+    resolveCacheTTLSeconds: (agentId?: string) => {
+      try {
+        const cfg = api.runtime.config.loadConfig() as Record<string, unknown>;
+        const agents = cfg.agents as Record<string, unknown> | undefined;
+        const id = normalizeAgentId(agentId);
+
+        const agentList = agents?.list as Array<Record<string, unknown>> | undefined;
+        if (Array.isArray(agentList)) {
+          const entry = agentList.find(
+            (a) => normalizeAgentId(a.id as string | undefined) === id,
+          );
+          const params = entry?.params as Record<string, unknown> | undefined;
+          const retention = params?.cacheRetention as string | undefined;
+          if (retention === "long") return 3600;
+          if (retention === "short") return 300;
+        }
+        return undefined;
+      } catch {
+        return undefined;
+      }
+    },
     resolveSessionIdFromSessionKey: async (sessionKey) => {
       const key = sessionKey.trim();
       if (!key) {
