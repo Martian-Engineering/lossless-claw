@@ -3,7 +3,12 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 type ConnectionKey = string;
-const SQLITE_BUSY_TIMEOUT_MS = 5_000;
+/**
+ * SQLite busy timeout in milliseconds.  30 s accommodates high-concurrency
+ * multi-agent setups where 10+ writers contend on the WAL.  The default 5 s
+ * proved insufficient in production with ≥13 concurrent lanes.
+ */
+const SQLITE_BUSY_TIMEOUT_MS = 30_000;
 
 const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
 const connectionIndex = new Map<DatabaseSync, ConnectionKey>();
