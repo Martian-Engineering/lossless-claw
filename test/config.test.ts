@@ -49,6 +49,7 @@ describe("resolveLcmConfig", () => {
       enabled: true,
       max: 40000,
     });
+    expect(config.budgetHeadroomRatio).toBe(0);
   });
 
   it("reads values from plugin config", () => {
@@ -77,6 +78,7 @@ describe("resolveLcmConfig", () => {
         enabled: true,
         max: 50000,
       },
+      budgetHeadroomRatio: 0.4,
     });
     expect(config.enabled).toBe(false);
     expect(config.ignoreSessionPatterns).toEqual([
@@ -105,6 +107,7 @@ describe("resolveLcmConfig", () => {
       enabled: true,
       max: 80000,
     });
+    expect(config.budgetHeadroomRatio).toBe(0.4);
   });
 
   it("env vars override plugin config", () => {
@@ -125,6 +128,7 @@ describe("resolveLcmConfig", () => {
       LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO: "0.25",
       LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED: "true",
       LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX: "60000",
+      LCM_BUDGET_HEADROOM_RATIO: "0.5",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
@@ -146,6 +150,7 @@ describe("resolveLcmConfig", () => {
         enabled: false,
         max: 50000,
       },
+      budgetHeadroomRatio: 0.3,
     };
     const config = resolveLcmConfig(env, pluginConfig);
     expect(config.enabled).toBe(false); // env wins
@@ -174,6 +179,7 @@ describe("resolveLcmConfig", () => {
       enabled: true,
       max: 60000,
     });
+    expect(config.budgetHeadroomRatio).toBe(0.5); // env wins
   });
 
   it("reports session pattern sources and env override diagnostics", () => {
@@ -585,6 +591,21 @@ describe("resolveLcmConfig", () => {
       minimum: 1,
     });
   });
+
+  it("ships a manifest with budgetHeadroomRatio in schema", () => {
+    expect(manifest.configSchema.properties.budgetHeadroomRatio).toEqual({
+      type: "number",
+      minimum: 0,
+      maximum: 0.95,
+    });
+  });
+
+  it("clamps budgetHeadroomRatio to [0, 0.95]", () => {
+    expect(resolveLcmConfig({}, { budgetHeadroomRatio: -0.5 }).budgetHeadroomRatio).toBe(0);
+    expect(resolveLcmConfig({}, { budgetHeadroomRatio: 1.0 }).budgetHeadroomRatio).toBe(0.95);
+    expect(resolveLcmConfig({}, { budgetHeadroomRatio: 0.5 }).budgetHeadroomRatio).toBe(0.5);
+  });
+
   it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.bootstrapMaxTokens).toBe(6000);

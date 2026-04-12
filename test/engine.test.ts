@@ -5017,6 +5017,143 @@ describe("LcmContextEngine fidelity and token budget", () => {
     );
   });
 
+  it("evaluateIncrementalCompaction defers when budgetHeadroomRatio is set and context is under threshold", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {
+        budgetHeadroomRatio: 0.5,
+      },
+      {
+        log: {
+          info: infoLog,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+    const sessionId = "incremental-budget-headroom-unknown";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: {
+        conversationId: number;
+        tokenBudget: number;
+        currentTokenCount?: number;
+      }) => Promise<{
+        shouldCompact: boolean;
+        cacheState: string;
+      }>;
+    };
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    // No telemetry upserted — cacheState stays "unknown"
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockImplementation(
+      async (_conversationId: number, leafChunkTokens?: number) => ({
+        shouldCompact: true,
+        rawTokensOutsideTail: 50_000,
+        threshold: leafChunkTokens ?? 20_000,
+      }),
+    );
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 10_000,
+      threshold: 75_000,
+    });
+
+    const decision = await privateEngine.evaluateIncrementalCompaction({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 100_000,
+      currentTokenCount: 10_000, // well under 50% of 100k
+    });
+
+    expect(decision.shouldCompact).toBe(false);
+    expect(decision.cacheState).toBe("unknown");
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("reason=budget-headroom"),
+    );
+  });
+
+  it("evaluateIncrementalCompaction compacts when budgetHeadroomRatio is 0 (default) even with headroom", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: {
+          info: infoLog,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+    const sessionId = "incremental-budget-headroom-default-off";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: {
+        conversationId: number;
+        tokenBudget: number;
+        currentTokenCount?: number;
+      }) => Promise<{
+        shouldCompact: boolean;
+        cacheState: string;
+      }>;
+    };
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockImplementation(
+      async (_conversationId: number, leafChunkTokens?: number) => ({
+        shouldCompact: true,
+        rawTokensOutsideTail: 50_000,
+        threshold: leafChunkTokens ?? 20_000,
+      }),
+    );
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 10_000,
+      threshold: 75_000,
+    });
+
+    const decision = await privateEngine.evaluateIncrementalCompaction({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 100_000,
+      currentTokenCount: 10_000,
+    });
+
+    expect(decision.shouldCompact).toBe(true);
+    expect(decision.cacheState).toBe("unknown");
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("reason=leaf-trigger"),
+    );
+  });
+
   it("evaluateIncrementalCompaction keeps hot-cache hysteresis for a recent cache hit", async () => {
     const infoLog = vi.fn();
     const engine = createEngineWithDeps(

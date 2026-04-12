@@ -1587,6 +1587,24 @@ export class LcmContextEngine implements ContextEngine {
     return params.currentTokenCount <= safeBudget;
   }
 
+  /** Decide whether the current token count is under the general budget headroom threshold. */
+  private isUnderBudgetHeadroom(params: {
+    currentTokenCount?: number;
+    tokenBudget: number;
+    ratio: number;
+  }): boolean {
+    if (
+      typeof params.currentTokenCount !== "number"
+      || !Number.isFinite(params.currentTokenCount)
+      || params.currentTokenCount < 0
+    ) {
+      return false;
+    }
+    const budget = Math.max(1, Math.floor(params.tokenBudget));
+    const safeBudget = Math.floor(budget * (1 - params.ratio));
+    return params.currentTokenCount <= safeBudget;
+  }
+
   /** Resolve bounded dynamic leaf chunk sizes from config and the active token budget. */
   private resolveDynamicLeafChunkBounds(tokenBudget?: number): DynamicLeafChunkBounds {
     const floor = Math.max(1, Math.floor(this.config.leafChunkTokens));
@@ -1985,6 +2003,30 @@ export class LcmContextEngine implements ContextEngine {
         maxPasses: 1,
         allowCondensedPasses: false,
         reason: "hot-cache-defer",
+      });
+    }
+
+    if (
+      this.config.budgetHeadroomRatio > 0
+      && this.isUnderBudgetHeadroom({
+        currentTokenCount: params.currentTokenCount,
+        tokenBudget: params.tokenBudget,
+        ratio: this.config.budgetHeadroomRatio,
+      })
+    ) {
+      return this.logIncrementalCompactionDecision({
+        conversationId: params.conversationId,
+        cacheState,
+        activityBand,
+        triggerLeafChunkTokens,
+        preferredLeafChunkTokens,
+        fallbackLeafChunkTokens,
+        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
+        threshold: leafTrigger.threshold,
+        shouldCompact: false,
+        maxPasses: 1,
+        allowCondensedPasses: false,
+        reason: "budget-headroom",
       });
     }
 

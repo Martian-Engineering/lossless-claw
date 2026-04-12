@@ -60,7 +60,8 @@ Most installations only need to override a handful of keys. If you want a comple
   "dynamicLeafChunkTokens": {
     "enabled": true,
     "max": 40000
-  }
+  },
+  "budgetHeadroomRatio": 0
 }
 ```
 
@@ -134,6 +135,7 @@ openclaw plugins install --link /path/to/lossless-claw
 | `largeFileTokenThreshold` | `integer` | alias of `largeFileThresholdTokens` | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | Legacy alias accepted by the runtime. Prefer `largeFileThresholdTokens` in new config. |
 | `maxAssemblyTokenBudget` | `integer` | unset | `LCM_MAX_ASSEMBLY_TOKEN_BUDGET` | Optional hard cap for assembly and threshold evaluation, useful with smaller-context models. |
 | `maxExpandTokens` | `integer` | `4000` | `LCM_MAX_EXPAND_TOKENS` | Default token cap for `lcm_expand_query` responses. |
+| `budgetHeadroomRatio` | `number` | `0` | `LCM_BUDGET_HEADROOM_RATIO` | Fraction of token budget that must be consumed before incremental compaction proceeds, regardless of cache state. `0` disables (default, preserving eager compaction). The hot-cache-specific `hotCacheBudgetHeadroomRatio` takes precedence when cache state is hot. Clamped to [0, 0.95]. |
 
 ### Model selection, execution, and prompts
 
@@ -185,6 +187,10 @@ When cache-aware compaction is enabled:
 - cold cache still allows bounded catch-up passes via `cacheAwareCompaction.maxColdCacheCatchupPasses`
 
 When incremental leaf compaction still runs on a hot cache, follow-on condensed passes are suppressed so the maintenance cycle only pays for the leaf pass that was explicitly justified.
+
+#### `budgetHeadroomRatio`
+
+When set to a value greater than `0`, incremental compaction is also deferred for `"unknown"` and `"cold"` cache states as long as the current token count stays below `tokenBudget × (1 - budgetHeadroomRatio)`. This is useful for non-Anthropic providers where cache telemetry is never reported (`cacheState` stays `"unknown"` permanently) and for large-context-window models where eager leaf creation wastes summarization LLM calls while ample headroom remains. The hot-cache-specific `hotCacheBudgetHeadroomRatio` takes precedence when cache state is `"hot"`. Default is `0` (disabled).
 
 ## Behavior notes
 

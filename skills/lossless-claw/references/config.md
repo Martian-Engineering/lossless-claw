@@ -377,6 +377,23 @@ Default:
 
 - `max(leafChunkTokens, floor(leafChunkTokens * 2))`
 
+### `budgetHeadroomRatio`
+
+Fraction of token budget that must be consumed before incremental compaction proceeds, regardless of cache state. When the current token count is at or below `tokenBudget × (1 - budgetHeadroomRatio)`, incremental leaf passes are deferred. The hot-cache-specific `hotCacheBudgetHeadroomRatio` takes precedence when cache state is `"hot"`.
+
+Why it matters:
+
+- useful for non-Anthropic providers where cache telemetry is never reported, leaving `cacheState` permanently `"unknown"` — without this, those providers always compact eagerly regardless of budget headroom
+- useful for large-context-window models where eager leaf creation at 20k tokens wastes summarization LLM calls while 95%+ of the budget is still free
+- set to `0` (default) to preserve the existing eager compaction behaviour
+
+Good starting range:
+
+- `0` (disabled, default) — opt-in only
+- `0.5` — defer until 50% of budget is consumed
+
+Env override: `LCM_BUDGET_HEADROOM_RATIO`
+
 ## Summary quality and prompt controls
 
 ### `summaryMaxOverageFactor`
@@ -406,6 +423,7 @@ Why it matters:
 5. If hot-cache turns still compact too often, inspect the decision logs before changing anything else:
    - `reason=hot-cache-budget-headroom` means the new skip path is working.
    - `reason=hot-cache-defer` means raw-history pressure is below the configured hot-cache factor.
+   - `reason=budget-headroom` means context is under the general `budgetHeadroomRatio` threshold (applies to any cache state).
    - `allowCondensedPasses=false` on hot-cache turns is expected.
 6. If recall feels weak, revisit `freshTailCount`, `leafChunkTokens`, and summarizer model quality before changing anything else.
 7. Touch advanced knobs like fanout, large-file thresholds, custom instructions, and assembly caps only after a concrete symptom appears.

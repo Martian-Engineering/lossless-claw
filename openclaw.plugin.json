@@ -188,6 +188,10 @@
     "fallbackProviders": {
       "label": "Fallback Providers",
       "help": "Explicit fallback provider/model pairs for compaction summarization (e.g., [{\"provider\": \"anthropic\", \"model\": \"claude-haiku-4-5\"}])"
+    },
+    "budgetHeadroomRatio": {
+      "label": "Budget Headroom Ratio",
+      "help": "Fraction of token budget that must be consumed before incremental compaction runs, regardless of cache state (0 disables, 0.5 means defer until 50% used)"
     }
   },
   "configSchema": {
@@ -387,6 +391,11 @@
           "required": ["provider", "model"],
           "additionalProperties": false
         }
+      },
+      "budgetHeadroomRatio": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 0.95
       }
     }
   }

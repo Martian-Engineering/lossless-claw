@@ -103,6 +103,15 @@ export type LcmConfig = {
   cacheAwareCompaction: CacheAwareCompactionConfig;
   /** Dynamic step-band policy for incremental leaf chunk sizing. */
   dynamicLeafChunkTokens: DynamicLeafChunkTokensConfig;
+  /**
+   * Fraction of token budget that must be consumed before incremental compaction
+   * proceeds, regardless of cache state.  When the current token count is at or
+   * below `tokenBudget * (1 - budgetHeadroomRatio)`, incremental leaf passes are
+   * deferred.  Set to 0 (the default) to disable — preserving the existing eager
+   * compaction behaviour.  The hot-cache-specific `hotCacheBudgetHeadroomRatio`
+   * takes precedence when cache state is "hot".
+   */
+  budgetHeadroomRatio: number;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -429,6 +438,14 @@ export function resolveLcmConfigWithDiagnostics(
             : toBool(dynamicLeafChunkTokens?.enabled) ?? true,
         max: resolvedDynamicLeafChunkMax,
       },
+      budgetHeadroomRatio: Math.min(
+        0.95,
+        Math.max(
+          0,
+          parseFiniteNumber(env.LCM_BUDGET_HEADROOM_RATIO)
+            ?? toNumber(pc.budgetHeadroomRatio) ?? 0,
+        ),
+      ),
     },
     diagnostics: {
       ignoreSessionPatternsSource: ignoreSessionPatterns.source,
