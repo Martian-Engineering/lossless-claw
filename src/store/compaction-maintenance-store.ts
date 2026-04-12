@@ -55,10 +55,10 @@ function mergeMaintenanceRecord(
 ): ConversationCompactionMaintenanceRecord {
   return {
     conversationId,
-    pending: patch.pending ?? existing?.pending ?? false,
+    pending: patch.pending !== undefined ? patch.pending : existing?.pending ?? false,
     requestedAt: patch.requestedAt !== undefined ? patch.requestedAt : existing?.requestedAt ?? null,
     reason: patch.reason !== undefined ? patch.reason : existing?.reason ?? null,
-    running: patch.running ?? existing?.running ?? false,
+    running: patch.running !== undefined ? patch.running : existing?.running ?? false,
     lastStartedAt:
       patch.lastStartedAt !== undefined ? patch.lastStartedAt : existing?.lastStartedAt ?? null,
     lastFinishedAt:
