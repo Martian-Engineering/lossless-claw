@@ -1285,6 +1285,15 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   const pluginConfig = resolvePluginConfig(api);
   const log = createLcmLogger(api);
   const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
+  const sessionAllowlistRaw = process.env.LCM_SESSION_ALLOWLIST ?? "";
+  const sessionAllowlistPatterns = sessionAllowlistRaw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const effectiveConfig = {
+    ...config,
+    sessionAllowlistPatterns,
+  };
 
   if (diagnostics.ignoreSessionPatternsEnvOverridesPluginConfig) {
     logStartupBannerOnce({
@@ -1322,7 +1331,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   logStartupBannerOnce({
     key: "transcript-gc-enabled",
     log: (message) => log.info(message),
-    message: `[lcm] Transcript GC ${config.transcriptGcEnabled ? "enabled" : "disabled"} (default false)`,
+    message: `[lcm] Transcript GC ${effectiveConfig.transcriptGcEnabled ? "enabled" : "disabled"} (default false)`,
   });
 
   /** Resolve the best config object to hand to runtime.modelAuth for this lookup. */
@@ -1384,7 +1393,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   };
 
   return {
-    config,
+    config: effectiveConfig,
     configDiagnostics: diagnostics,
     isRuntimeManagedAuthProvider: (provider: string, providerApi?: string) => {
       const normalizedProvider = normalizeProviderId(provider);
