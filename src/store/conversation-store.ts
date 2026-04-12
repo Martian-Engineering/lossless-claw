@@ -279,27 +279,43 @@ export class ConversationStore {
   // ── Conversation operations ───────────────────────────────────────────────
 
   async createConversation(input: CreateConversationInput): Promise<ConversationRecord> {
-    const result = this.db
-      .prepare(
-        `INSERT INTO conversations (session_id, session_key, active, archived_at, title)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(
-        input.sessionId,
-        input.sessionKey ?? null,
-        input.active === false ? 0 : 1,
-        input.archivedAt?.toISOString() ?? null,
-        input.title ?? null,
-      );
+    try {
+      const result = this.db
+        .prepare(
+          `INSERT INTO conversations (session_id, session_key, active, archived_at, title)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.sessionId,
+          input.sessionKey ?? null,
+          input.active === false ? 0 : 1,
+          input.archivedAt?.toISOString() ?? null,
+          input.title ?? null,
+        );
 
-    const row = this.db
-      .prepare(
-        `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
-       FROM conversations WHERE conversation_id = ?`,
-      )
-      .get(Number(result.lastInsertRowid)) as unknown as ConversationRow;
+      const row = this.db
+        .prepare(
+          `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
+         FROM conversations WHERE conversation_id = ?`,
+        )
+        .get(Number(result.lastInsertRowid)) as unknown as ConversationRow;
 
-    return toConversationRecord(row);
+      return toConversationRecord(row);
+    } catch (err: unknown) {
+      // Handle UNIQUE constraint race: another writer created the conversation first
+      if (
+        err instanceof Error &&
+        /UNIQUE constraint failed|SQLITE_CONSTRAINT_UNIQUE/i.test(err.message)
+      ) {
+        if (input.sessionKey) {
+          const existing = await this.getConversationBySessionKey(input.sessionKey);
+          if (existing) return existing;
+        }
+        const existing = await this.getConversationBySessionId(input.sessionId);
+        if (existing) return existing;
+      }
+      throw err;
+    }
   }
 
   async getConversation(conversationId: ConversationId): Promise<ConversationRecord | null> {
