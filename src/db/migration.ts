@@ -794,6 +794,20 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS conversation_compaction_maintenance (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      pending INTEGER NOT NULL DEFAULT 0,
+      requested_at TEXT,
+      reason TEXT,
+      running INTEGER NOT NULL DEFAULT 0,
+      last_started_at TEXT,
+      last_finished_at TEXT,
+      last_failure_summary TEXT,
+      token_budget INTEGER,
+      current_token_count INTEGER,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS lcm_migration_state (
       step_name TEXT NOT NULL,
       algorithm_version INTEGER NOT NULL,

@@ -1324,6 +1324,11 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
     log: (message) => log.info(message),
     message: `[lcm] Transcript GC ${config.transcriptGcEnabled ? "enabled" : "disabled"} (default false)`,
   });
+  logStartupBannerOnce({
+    key: "proactive-threshold-compaction-mode",
+    log: (message) => log.info(message),
+    message: `[lcm] Proactive threshold compaction mode: ${config.proactiveThresholdCompactionMode} (default deferred)`,
+  });
 
   /** Resolve the best config object to hand to runtime.modelAuth for this lookup. */
   const resolveModelAuthConfig = (runtimeConfig: unknown): OpenClawPluginApi["config"] => {
@@ -2073,7 +2078,7 @@ const lcmPlugin = {
     logStartupBannerOnce({
       key: "plugin-loaded",
       log: (message) => deps.log.info(message),
-      message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
+      message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold}, proactiveThresholdCompactionMode=${deps.config.proactiveThresholdCompactionMode})`,
     });
     logStartupBannerOnce({
       key: "state-dir",

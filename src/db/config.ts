@@ -29,6 +29,8 @@ export type DynamicLeafChunkTokensConfig = {
   max: number;
 };
 
+export type ProactiveThresholdCompactionMode = "deferred" | "inline";
+
 export type LcmConfigSource = "env" | "plugin-config" | "default";
 
 export type LcmConfigDiagnostics = {
@@ -87,6 +89,8 @@ export type LcmConfig = {
   pruneHeartbeatOk: boolean;
   /** When true, maintain() may rewrite transcript entries for transcript GC. */
   transcriptGcEnabled: boolean;
+  /** Controls whether proactive threshold compaction runs inline or is deferred. */
+  proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
   maxAssemblyTokenBudget?: number;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
@@ -180,6 +184,16 @@ function toStr(value: unknown): string | undefined {
   return undefined;
 }
 
+function toProactiveThresholdCompactionMode(
+  value: unknown,
+): ProactiveThresholdCompactionMode | undefined {
+  const normalized = toStr(value)?.toLowerCase();
+  if (normalized === "inline" || normalized === "deferred") {
+    return normalized;
+  }
+  return undefined;
+}
+
 /** Coerce a plugin config value into a trimmed string array when possible. */
 function toStrArray(value: unknown): string[] | undefined {
   if (Array.isArray(value)) {
@@ -265,6 +279,9 @@ export function resolveLcmConfigWithDiagnostics(
   const pc = pluginConfig ?? {};
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
+  const proactiveThresholdCompactionMode = toProactiveThresholdCompactionMode(
+    env.LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE,
+  ) ?? toProactiveThresholdCompactionMode(pc.proactiveThresholdCompactionMode) ?? "deferred";
   const resolvedLeafChunkTokens =
     parseFiniteInt(env.LCM_LEAF_CHUNK_TOKENS)
       ?? toNumber(pc.leafChunkTokens) ?? 20000;
@@ -393,6 +410,7 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
           ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"
           : toBool(pc.transcriptGcEnabled) ?? false,
+      proactiveThresholdCompactionMode,
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)
           ?? toNumber(pc.maxAssemblyTokenBudget) ?? undefined,

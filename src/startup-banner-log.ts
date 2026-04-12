@@ -1,6 +1,7 @@
 type StartupBannerKey =
   | "plugin-loaded"
   | "compaction-model"
+  | "proactive-threshold-compaction-mode"
   | "fallback-providers"
   | "transcript-gc-enabled"
   | "ignore-session-patterns"

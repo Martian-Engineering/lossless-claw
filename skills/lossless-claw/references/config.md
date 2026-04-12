@@ -205,6 +205,16 @@ Why it matters:
 - keep this off unless you want transcript GC to mutate the live session file during maintenance
 - the default is `false`
 
+### `proactiveThresholdCompactionMode`
+
+Controls whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior.
+
+Why it matters:
+
+- `deferred` is the default and avoids foreground turn stalls by recording one coalesced maintenance row per conversation
+- `inline` preserves the legacy foreground compaction path for hosts that do not yet support deferred execution
+- `/lossless status` and `/lcm status` surface pending/running/last-failure maintenance state so operators can see when compaction is queued
+
 ## Compaction timing and shape
 
 ### `contextThreshold`

@@ -187,6 +187,7 @@ describe("lcm plugin registration", () => {
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
       transcriptGcEnabled: true,
+      proactiveThresholdCompactionMode: "inline",
       largeFileThresholdTokens: 12345,
     });
     lcmPlugin.register(api);
@@ -205,7 +206,10 @@ describe("lcm plugin registration", () => {
     const factory = getFactory();
     expect(factory).toBeTypeOf("function");
 
-    const engine = factory!() as { config: Record<string, unknown> };
+    const engine = factory!() as {
+      config: Record<string, unknown>;
+      info?: Record<string, unknown>;
+    };
     expect(engine.config).toMatchObject({
       enabled: true,
       contextThreshold: 0.33,
@@ -218,12 +222,19 @@ describe("lcm plugin registration", () => {
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
       transcriptGcEnabled: true,
+      proactiveThresholdCompactionMode: "inline",
       largeFileTokenThreshold: 12345,
     });
+    expect(engine.info).toMatchObject({
+      turnMaintenanceMode: "background",
+    });
     expect(infoLog).toHaveBeenCalledWith(
-      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
+      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, proactiveThresholdCompactionMode=inline)`,
     );
     expect(infoLog).toHaveBeenCalledWith("[lcm] Transcript GC enabled (default false)");
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Proactive threshold compaction mode: inline (default deferred)",
+    );
     expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Ignoring sessions matching 2 pattern(s) from plugin config: agent:*:cron:**, agent:main:subagent:**",
     );
@@ -550,6 +561,7 @@ describe("lcm plugin registration", () => {
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
+      proactiveThresholdCompactionMode: "deferred",
     };
     const first = buildApi(pluginConfig);
     const second = buildApi(pluginConfig);
@@ -574,6 +586,7 @@ describe("lcm plugin registration", () => {
       [
         "[lcm] Plugin loaded (enabled=true, db=",
         "[lcm] Transcript GC ",
+        "[lcm] Proactive threshold compaction mode:",
         "[lcm] Compaction summarization model:",
         "[lcm] Ignoring sessions matching ",
         "[lcm] Stateless session patterns",
@@ -581,8 +594,9 @@ describe("lcm plugin registration", () => {
     );
 
     expect(startupBannerMessages.sort()).toEqual([
-      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
+      `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, proactiveThresholdCompactionMode=deferred)`,
       "[lcm] Transcript GC disabled (default false)",
+      "[lcm] Proactive threshold compaction mode: deferred (default deferred)",
       "[lcm] Compaction summarization model: (unconfigured)",
       "[lcm] Ignoring sessions matching 2 pattern(s) from plugin config: agent:*:cron:**, agent:main:subagent:**",
       "[lcm] Stateless session patterns from plugin config: 1 pattern(s): agent:*:subagent:**",

@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
+import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
@@ -18,6 +19,10 @@ import {
   getDoctorSummaryStats,
   type DoctorSummaryStats,
 } from "./lcm-doctor-shared.js";
+import {
+  type ConversationCompactionMaintenanceRecord,
+} from "../store/compaction-maintenance-store.js";
+import { parseUtcTimestampOrNull } from "../store/parse-utc-timestamp.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
@@ -342,7 +347,13 @@ function getConversationStatusBySessionKey(
   sessionKey: string,
 ): LcmConversationStatusStats | null {
   const row = db
-    .prepare(`SELECT conversation_id FROM conversations WHERE session_key = ? LIMIT 1`)
+    .prepare(
+      `SELECT conversation_id
+       FROM conversations
+       WHERE session_key = ?
+       ORDER BY active DESC, created_at DESC
+       LIMIT 1`,
+    )
     .get(sessionKey) as { conversation_id: number } | undefined;
 
   if (!row) {
@@ -361,7 +372,7 @@ function getConversationStatusBySessionId(
       `SELECT conversation_id
        FROM conversations
        WHERE session_id = ?
-       ORDER BY created_at DESC
+       ORDER BY active DESC, created_at DESC
        LIMIT 1`,
     )
     .get(sessionId) as { conversation_id: number } | undefined;
@@ -371,6 +382,62 @@ function getConversationStatusBySessionId(
   }
 
   return getConversationStatusStats(db, row.conversation_id);
+}
+
+function getConversationCompactionMaintenanceByConversationId(
+  db: DatabaseSync,
+  conversationId: number,
+): ConversationCompactionMaintenanceRecord | null {
+  const row = db
+    .prepare(
+      `SELECT
+         conversation_id,
+         pending,
+         requested_at,
+         reason,
+         running,
+         last_started_at,
+         last_finished_at,
+         last_failure_summary,
+         token_budget,
+         current_token_count,
+         updated_at
+       FROM conversation_compaction_maintenance
+       WHERE conversation_id = ?`,
+    )
+    .get(conversationId) as
+    | {
+        conversation_id: number;
+        pending: number;
+        requested_at: string | null;
+        reason: string | null;
+        running: number;
+        last_started_at: string | null;
+        last_finished_at: string | null;
+        last_failure_summary: string | null;
+        token_budget: number | null;
+        current_token_count: number | null;
+        updated_at: string;
+      }
+    | undefined;
+
+  if (!row) {
+    return null;
+  }
+
+  return {
+    conversationId: row.conversation_id,
+    pending: row.pending === 1,
+    requestedAt: parseUtcTimestampOrNull(row.requested_at),
+    reason: row.reason,
+    running: row.running === 1,
+    lastStartedAt: parseUtcTimestampOrNull(row.last_started_at),
+    lastFinishedAt: parseUtcTimestampOrNull(row.last_finished_at),
+    lastFailureSummary: row.last_failure_summary,
+    tokenBudget: row.token_budget,
+    currentTokenCount: row.current_token_count,
+    updatedAt: parseUtcTimestampOrNull(row.updated_at) ?? new Date(0),
+  };
 }
 
 async function resolveCurrentConversation(params: {
@@ -472,7 +539,10 @@ function buildHelpText(error?: string): string {
     "",
     buildSection("📘 Commands", [
       buildStatLine(formatCommand(VISIBLE_COMMAND), "Show compact status output."),
-      buildStatLine(formatCommand(`${VISIBLE_COMMAND} status`), "Show plugin, Global, and current-conversation status."),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} status`),
+        "Show plugin, Global, current-conversation, and compaction-maintenance status.",
+      ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} doctor clean`),
@@ -551,6 +621,12 @@ async function buildStatusText(params: {
         truncated: 0,
         fallback: 0,
       };
+    const maintenance = getConversationCompactionMaintenanceByConversationId(
+      params.db,
+      current.stats.conversationId,
+    );
+    const formatMaintenanceTime = (value: Date | null): string =>
+      value ? formatTimestamp(value, params.config.timezone) : "never";
     lines.push(
       buildSection("📍 Current conversation", [
         buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
@@ -575,6 +651,32 @@ async function buildStatusText(params: {
           conversationDoctor.total > 0
             ? `${formatNumber(conversationDoctor.total)} issue(s) in this conversation`
             : "clean",
+        ),
+      ]),
+    );
+    lines.push(
+      "",
+      buildSection("🛠️ Maintenance", [
+        buildStatLine(
+          "state",
+          maintenance?.pending
+            ? "pending"
+            : maintenance?.running
+              ? "running"
+              : "idle",
+        ),
+        buildStatLine("requested at", formatMaintenanceTime(maintenance?.requestedAt ?? null)),
+        buildStatLine("reason", maintenance?.reason ?? "none"),
+        buildStatLine("last started", formatMaintenanceTime(maintenance?.lastStartedAt ?? null)),
+        buildStatLine("last finished", formatMaintenanceTime(maintenance?.lastFinishedAt ?? null)),
+        buildStatLine("last failure", maintenance?.lastFailureSummary ?? "none"),
+        buildStatLine(
+          "requested token budget",
+          maintenance?.tokenBudget != null ? formatNumber(maintenance.tokenBudget) : "unknown",
+        ),
+        buildStatLine(
+          "observed token count",
+          maintenance?.currentTokenCount != null ? formatNumber(maintenance.currentTokenCount) : "unknown",
         ),
       ]),
     );

@@ -52,6 +52,7 @@ function createTestConfig(databasePath: string): LcmConfig {
     timezone: "UTC",
     pruneHeartbeatOk: false,
     transcriptGcEnabled: false,
+    proactiveThresholdCompactionMode: "deferred",
     summaryMaxOverageFactor: 3,
     customInstructions: "",
     circuitBreakerThreshold: 5,
@@ -4569,7 +4570,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn runs proactive threshold compaction when tokenBudget is provided", async () => {
-    const engine = createEngine();
+    const engine = createEngineWithConfig({
+      proactiveThresholdCompactionMode: "inline",
+    });
     const sessionId = "after-turn-proactive-compact";
     const privateEngine = engine as unknown as {
       compaction: {
@@ -4625,7 +4628,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn resolves tokenBudget from runtimeContext and forwards it as legacyParams", async () => {
-    const engine = createEngine();
+    const engine = createEngineWithConfig({
+      proactiveThresholdCompactionMode: "inline",
+    });
     const sessionId = "after-turn-runtime-context";
     const runtimeContext = { provider: "anthropic", model: "claude-opus-4-5", tokenBudget: 2048 };
     const privateEngine = engine as unknown as {
@@ -4683,14 +4688,19 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
   it("afterTurn falls back to the default token budget when no budget is provided", async () => {
     const warnLog = vi.fn();
-    const engine = createEngineWithDepsOverrides({
-      log: {
-        info: vi.fn(),
-        warn: warnLog,
-        error: vi.fn(),
-        debug: vi.fn(),
+    const engine = createEngineWithDeps(
+      {
+        proactiveThresholdCompactionMode: "inline",
       },
-    });
+      {
+        log: {
+          info: vi.fn(),
+          warn: warnLog,
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
     const sessionId = "after-turn-default-token-budget";
     const privateEngine = engine as unknown as {
       compaction: {
@@ -4741,14 +4751,19 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
   it("afterTurn falls back to legacyCompactionParams when runtimeContext is missing", async () => {
     const errorLog = vi.fn();
-    const engine = createEngineWithDepsOverrides({
-      log: {
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: errorLog,
-        debug: vi.fn(),
+    const engine = createEngineWithDeps(
+      {
+        proactiveThresholdCompactionMode: "inline",
       },
-    });
+      {
+        log: {
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: errorLog,
+          debug: vi.fn(),
+        },
+      },
+    );
     const sessionId = "after-turn-legacy-compaction-params";
     const legacyCompactionParams = { provider: "anthropic", model: "claude-opus-4-5" };
     const privateEngine = engine as unknown as {
@@ -4804,7 +4819,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn prefers runtimeContext when both runtimeContext and legacyCompactionParams are set", async () => {
-    const engine = createEngine();
+    const engine = createEngineWithConfig({
+      proactiveThresholdCompactionMode: "inline",
+    });
     const sessionId = "after-turn-runtime-context-priority";
     const runtimeContext = { provider: "anthropic", model: "claude-opus-4-5", source: "rt" };
     const legacyCompactionParams = {
@@ -4853,6 +4870,164 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect((compactSpy.mock.calls[0]?.[0] as { legacyParams?: unknown }).legacyParams).toBe(
       runtimeContext,
     );
+  });
+
+  it("afterTurn records deferred compaction debt instead of compacting inline by default", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-deferred-compaction-debt";
+    vi.spyOn(engine as unknown as { evaluateIncrementalCompaction: () => Promise<unknown> }, "evaluateIncrementalCompaction").mockResolvedValue({
+      shouldCompact: true,
+      reason: "leaf-trigger",
+      maxPasses: 1,
+      allowCondensedPasses: false,
+      activityBand: "high",
+      leafChunkTokens: 20_000,
+      fallbackLeafChunkTokens: [20_000, 15_000, 10_000],
+      triggerLeafChunkTokens: 20_000,
+      preferredLeafChunkTokens: 20_000,
+      rawTokensOutsideTail: 50_000,
+      threshold: 20_000,
+    } as unknown as Record<string, unknown>);
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
+    const compactSpy = vi.spyOn(engine, "compact");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-deferred-compaction-debt"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
+    expect(compactSpy).not.toHaveBeenCalled();
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance).not.toBeNull();
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenance?.reason).toBe("leaf-trigger");
+    expect(maintenance?.requestedAt).toBeInstanceOf(Date);
+  });
+
+  it("afterTurn records threshold debt even when the leaf trigger stays below threshold", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-threshold-deferred-compaction-debt";
+    vi.spyOn(
+      engine as unknown as { evaluateIncrementalCompaction: () => Promise<unknown> },
+      "evaluateIncrementalCompaction",
+    ).mockResolvedValue({
+      shouldCompact: false,
+      reason: "below-leaf-trigger",
+      maxPasses: 1,
+      allowCondensedPasses: false,
+      activityBand: "medium",
+      leafChunkTokens: 20_000,
+      fallbackLeafChunkTokens: [20_000, 15_000, 10_000],
+      triggerLeafChunkTokens: 20_000,
+      preferredLeafChunkTokens: 20_000,
+      rawTokensOutsideTail: 10_000,
+      threshold: 20_000,
+    } as unknown as Record<string, unknown>);
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 480,
+      threshold: 300,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-threshold-deferred-compaction-debt"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 400,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenance?.reason).toBe("threshold");
+    expect(maintenance?.tokenBudget).toBe(400);
+  });
+
+  it("maintain() leaves deferred compaction debt pending until the host opts in", async () => {
+    const engine = createEngine();
+    const sessionId = "maintain-deferred-compaction-disabled";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+
+    const compactSpy = vi.spyOn(engine, "compact");
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-disabled-maintain"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: false,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance).not.toBeNull();
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(compactSpy).not.toHaveBeenCalled();
+    expect(maintenanceResult.changed).toBe(false);
+  });
+
+  it("maintain() consumes deferred compaction debt only when the host opts in", async () => {
+    const engine = createEngine();
+    const sessionId = "maintain-deferred-compaction-enabled";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-enabled-maintain"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance).not.toBeNull();
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenanceResult.changed).toBe(false);
+    expect(maintenanceResult.reason).toBe("deferred compaction no longer needed");
   });
 
   it("afterTurn persists prompt-cache telemetry for hot sessions", async () => {
@@ -5094,7 +5269,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("afterTurn allows bounded catch-up passes when prompt cache is cold", async () => {
-    const engine = createEngine();
+    const engine = createEngineWithConfig({
+      proactiveThresholdCompactionMode: "inline",
+    });
     const sessionId = "after-turn-cold-cache-catchup";
     const privateEngine = engine as unknown as {
       compaction: {
@@ -5171,6 +5348,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const infoLog = vi.fn();
     const engine = createEngineWithDeps(
       {
+        proactiveThresholdCompactionMode: "inline",
         dynamicLeafChunkTokens: {
           enabled: true,
           max: 40_000,
@@ -5247,6 +5425,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
   it("afterTurn bumps to the max working leaf chunk when cache-aware compaction is cold", async () => {
     const engine = createEngineWithConfig({
+      proactiveThresholdCompactionMode: "inline",
       dynamicLeafChunkTokens: {
         enabled: true,
         max: 40_000,

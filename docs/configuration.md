@@ -51,6 +51,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "circuitBreakerThreshold": 5,
   "circuitBreakerCooldownMs": 1800000,
   "fallbackProviders": [],
+  "proactiveThresholdCompactionMode": "deferred",
   "cacheAwareCompaction": {
     "enabled": true,
     "maxColdCacheCatchupPasses": 2,
@@ -111,6 +112,7 @@ openclaw plugins install --link /path/to/lossless-claw
 | `timezone` | `string` | `TZ` or system timezone | `TZ` | IANA timezone used for timestamp rendering in summaries. |
 | `pruneHeartbeatOk` | `boolean` | `false` | `LCM_PRUNE_HEARTBEAT_OK` | Retroactively removes `HEARTBEAT_OK` turn cycles from persisted storage. |
 | `transcriptGcEnabled` | `boolean` | `false` | `LCM_TRANSCRIPT_GC_ENABLED` | Enables transcript rewrite GC during `maintain()`; disabled by default so transcript rewrites stay opt-in. |
+| `proactiveThresholdCompactionMode` | `"deferred" \| "inline"` | `"deferred"` | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | Controls whether proactive threshold compaction is deferred into maintenance debt by default or run inline for legacy behavior. |
 
 > **Multi-profile note:** `OPENCLAW_STATE_DIR` (set by the host OpenClaw gateway) controls where state is stored. When two gateways run on the same host (e.g. separate bot personas), each gateway sets its own `OPENCLAW_STATE_DIR` and lossless-claw automatically uses that directory for the database, large-file payloads, auth-profile lookups, and legacy secrets — no per-profile plugin config is needed.
 
@@ -239,6 +241,15 @@ Lossless-claw treats OpenClaw reset commands differently:
 - `/reset` archives the active conversation row and creates a fresh active row for the same stable `sessionKey`
 
 This keeps long-term history available while still giving users a real clean-slate reset.
+
+### Deferred proactive compaction
+
+Lossless-claw now defaults `proactiveThresholdCompactionMode` to `deferred`.
+
+- deferred mode records a single coalesced maintenance debt row per conversation
+- `maintain()` can consume that debt when the host explicitly opts in to deferred execution
+- `/lcm status` / `/lossless status` shows the current maintenance state, including pending/running/last-failure details
+- set `proactiveThresholdCompactionMode` to `inline` only if you need the legacy inline proactive compaction behavior for compatibility
 
 ## Environment-only knobs outside plugin config
 

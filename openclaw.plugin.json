@@ -185,6 +185,10 @@
       "label": "Transcript GC",
       "help": "Enable transcript rewrite GC during maintain(); disabled by default"
     },
+    "proactiveThresholdCompactionMode": {
+      "label": "Proactive Threshold Compaction Mode",
+      "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
+    },
     "fallbackProviders": {
       "label": "Fallback Providers",
       "help": "Explicit fallback provider/model pairs for compaction summarization (e.g., [{\"provider\": \"anthropic\", \"model\": \"claude-haiku-4-5\"}])"
@@ -367,6 +371,13 @@
       },
       "transcriptGcEnabled": {
         "type": "boolean"
+      },
+      "proactiveThresholdCompactionMode": {
+        "type": "string",
+        "enum": [
+          "deferred",
+          "inline"
+        ]
       },
       "databasePath": {
         "description": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)",

@@ -39,6 +39,7 @@ describe("resolveLcmConfig", () => {
     expect(config.summaryModel).toBe("");
     expect(config.pruneHeartbeatOk).toBe(false);
     expect(config.transcriptGcEnabled).toBe(false);
+    expect(config.proactiveThresholdCompactionMode).toBe("deferred");
     expect(config.cacheAwareCompaction).toEqual({
       enabled: true,
       maxColdCacheCatchupPasses: 2,
@@ -66,6 +67,7 @@ describe("resolveLcmConfig", () => {
       condensedMinFanout: 2,
       pruneHeartbeatOk: true,
       transcriptGcEnabled: true,
+      proactiveThresholdCompactionMode: "inline",
       enabled: false,
       cacheAwareCompaction: {
         enabled: false,
@@ -95,6 +97,7 @@ describe("resolveLcmConfig", () => {
     expect(config.condensedMinFanout).toBe(2);
     expect(config.pruneHeartbeatOk).toBe(true);
     expect(config.transcriptGcEnabled).toBe(true);
+    expect(config.proactiveThresholdCompactionMode).toBe("inline");
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
       maxColdCacheCatchupPasses: 3,
@@ -125,6 +128,7 @@ describe("resolveLcmConfig", () => {
       LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO: "0.25",
       LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED: "true",
       LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX: "60000",
+      LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE: "inline",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
@@ -135,6 +139,7 @@ describe("resolveLcmConfig", () => {
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
       transcriptGcEnabled: false,
+      proactiveThresholdCompactionMode: "deferred",
       enabled: true,
       cacheAwareCompaction: {
         enabled: true,
@@ -159,6 +164,7 @@ describe("resolveLcmConfig", () => {
     ]);
     expect(config.skipStatelessSessions).toBe(false);
     expect(config.transcriptGcEnabled).toBe(true);
+    expect(config.proactiveThresholdCompactionMode).toBe("inline");
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.freshTailMaxTokens).toBe(32000); // env wins
@@ -529,6 +535,13 @@ describe("resolveLcmConfig", () => {
   it("ships a manifest with transcriptGcEnabled in schema", () => {
     expect(manifest.configSchema.properties.transcriptGcEnabled).toEqual({
       type: "boolean",
+    });
+  });
+
+  it("ships a manifest with proactiveThresholdCompactionMode in schema", () => {
+    expect(manifest.configSchema.properties.proactiveThresholdCompactionMode).toEqual({
+      type: "string",
+      enum: ["deferred", "inline"],
     });
   });
 

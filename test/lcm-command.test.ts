@@ -220,6 +220,58 @@ describe("lcm command", () => {
     expect(result.text).toContain("doctor: 1 issue(s) in this conversation");
   });
 
+  it("reports deferred compaction maintenance state in status output", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "maintenance-status-session",
+      sessionKey: "agent:main:telegram:maintenance:1",
+      title: "Maintenance fixture",
+    });
+    fixture.db
+      .prepare(
+        `INSERT INTO conversation_compaction_maintenance (
+           conversation_id,
+           pending,
+           requested_at,
+           reason,
+           running,
+           last_started_at,
+           last_finished_at,
+           last_failure_summary,
+           token_budget,
+           current_token_count,
+           updated_at
+         ) VALUES (?, 1, ?, ?, 0, ?, ?, ?, ?, ?, datetime('now'))`,
+      )
+      .run(
+        conversation.conversationId,
+        "2026-04-12T00:00:00.000Z",
+        "budget-trigger",
+        "2026-04-12T00:05:00.000Z",
+        "2026-04-12T00:07:00.000Z",
+        "provider timeout",
+        128_000,
+        96_000,
+      );
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        sessionKey: "agent:main:telegram:maintenance:1",
+        sessionId: "maintenance-status-session",
+      }),
+    );
+
+    expect(result.text).toContain("**🛠️ Maintenance**");
+    expect(result.text).toContain("state: pending");
+    expect(result.text).toContain("reason: budget-trigger");
+    expect(result.text).toContain("last failure: provider timeout");
+    expect(result.text).toContain("requested token budget: 128,000");
+    expect(result.text).toContain("observed token count: 96,000");
+  });
+
   it("falls back to the active session id when the current session key is not stored yet", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
