@@ -174,14 +174,16 @@ function backfillMessageIdentityHashes(db: DatabaseSync): void {
   const selectStmt = db.prepare(
     `SELECT message_id, role, content
      FROM messages
-     WHERE identity_hash IS NULL OR identity_hash = ''
+     WHERE message_id > ?
+       AND (identity_hash IS NULL OR identity_hash = '')
      ORDER BY message_id
      LIMIT ?`,
   );
   const updateStmt = db.prepare(`UPDATE messages SET identity_hash = ? WHERE message_id = ?`);
+  let lastProcessedMessageId = 0;
 
   while (true) {
-    const rows = selectStmt.all(1_000) as MessageIdentityBackfillRow[];
+    const rows = selectStmt.all(lastProcessedMessageId, 1_000) as MessageIdentityBackfillRow[];
     if (rows.length === 0) {
       return;
     }
@@ -199,6 +201,7 @@ function backfillMessageIdentityHashes(db: DatabaseSync): void {
       }
       throw error;
     }
+    lastProcessedMessageId = rows[rows.length - 1]?.message_id ?? lastProcessedMessageId;
   }
 }
 

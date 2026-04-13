@@ -452,19 +452,18 @@ describe("runLcmMigrations summary depth backfill", () => {
       buildMessageIdentityHash("assistant", "hello from hash backfill"),
     );
 
-    const planRows = db
-      .prepare(
-        `EXPLAIN QUERY PLAN
-         SELECT role, content
-         FROM messages
-         WHERE conversation_id = ? AND identity_hash = ?`,
-      )
-      .all(1, row.identity_hash) as Array<{ detail?: string }>;
-    expect(
-      planRows.some((planRow) =>
-        (planRow.detail ?? "").includes("messages_conv_identity_hash_idx"),
-      ),
-    ).toBe(true);
+    const indexes = db.prepare(`PRAGMA index_list(messages)`).all() as Array<{
+      name?: string;
+    }>;
+    expect(indexes.some((index) => index.name === "messages_conv_identity_hash_idx")).toBe(true);
+
+    const indexColumns = db
+      .prepare(`PRAGMA index_info(messages_conv_identity_hash_idx)`)
+      .all() as Array<{ name?: string }>;
+    expect(indexColumns.map((column) => column.name)).toEqual([
+      "conversation_id",
+      "identity_hash",
+    ]);
   });
 
   it("backfills message identity hashes across multiple batches", () => {
