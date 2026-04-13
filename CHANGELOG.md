@@ -1,5 +1,27 @@
 # @martian-engineering/lossless-claw
 
+## 0.9.0
+
+### Minor Changes
+
+- [#408](https://github.com/Martian-Engineering/lossless-claw/pull/408) [`abf31da`](https://github.com/Martian-Engineering/lossless-claw/commit/abf31da5a5978fc40096699dbb1f52f97d766aaa) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Added deferred proactive compaction as the default mode, with explicit maintenance debt tracking and status visibility so foreground turns no longer run threshold compaction inline unless compatibility mode is enabled.
+
+- [#355](https://github.com/Martian-Engineering/lossless-claw/pull/355) [`6e9388c`](https://github.com/Martian-Engineering/lossless-claw/commit/6e9388c17036caa6021ab075e4d91ee928d73986) Thanks [@LanicBlue](https://github.com/LanicBlue)! - Externalize inline base64 images before large tool-result text compaction, and add `largeFilesDir` / `LCM_LARGE_FILES_DIR` so externalized payload storage can be configured explicitly.
+
+### Patch Changes
+
+- [#403](https://github.com/Martian-Engineering/lossless-claw/pull/403) [`ea7d532`](https://github.com/Martian-Engineering/lossless-claw/commit/ea7d5327d648790350724c15990b5c1ab98bf611) Thanks [@jetd1](https://github.com/jetd1)! - Convert bootstrap's file I/O off the Node.js event loop. `readFileSegment` and `readLastJsonlEntryBeforeOffset` previously used sync `openSync`/`readSync`/`statSync`, which could block the gateway for minutes while scanning multi-MB JSONL transcripts during the bootstrap append-only path. The bootstrap entry `statSync` and `refreshBootstrapState` helper are now async as well. The backward-scan loop now only reads new chunks when the current carry has no more newlines, and the fast path short-circuits before the backward scan when the DB's latest hash no longer matches the checkpoint (the common case during active sessions, where the scan can never succeed).
+
+- [#395](https://github.com/Martian-Engineering/lossless-claw/pull/395) [`2c05599`](https://github.com/Martian-Engineering/lossless-claw/commit/2c05599c7ac6977be47b3358589c8a43332b2d23) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Add `/lcm backup` and `/lcm rotate` plugin commands so users can snapshot the SQLite database on demand and split oversized active LCM conversations without changing their live OpenClaw session identity. Rotation now checkpoints the current transcript frontier so the fresh row starts from now forward instead of replaying older transcript history.
+
+- [#425](https://github.com/Martian-Engineering/lossless-claw/pull/425) [`3faa9bd`](https://github.com/Martian-Engineering/lossless-claw/commit/3faa9bdb04c5fc01833a2b64a478f224254793a0) Thanks [@jalehman](https://github.com/jalehman)! - Report the canonical `lossless-claw` context-engine id from the runtime engine metadata so newer OpenClaw builds accept the plugin's registered engine slot.
+
+- [#420](https://github.com/Martian-Engineering/lossless-claw/pull/420) [`e0fa375`](https://github.com/Martian-Engineering/lossless-claw/commit/e0fa375ae6fcd5964dae56cadf368e1718649128) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Fix `/lcm rotate` so it waits for the live database connection to become idle, takes a faithful pre-rotate backup on that connection, and then compacts the current session transcript without replacing the active LCM conversation. Rotation now preserves the existing conversation id, summaries, and context items while refreshing bootstrap state so dropped transcript history is not replayed.
+
+- [#415](https://github.com/Martian-Engineering/lossless-claw/pull/415) [`7668717`](https://github.com/Martian-Engineering/lossless-claw/commit/7668717ba3790c208baa8bcb9c4f2ae4f35d7910) Thanks [@ryanngit](https://github.com/ryanngit)! - Handle conversation creation races on active session keys without crashing the caller.
+
+- [#413](https://github.com/Martian-Engineering/lossless-claw/pull/413) [`347add7`](https://github.com/Martian-Engineering/lossless-claw/commit/347add70429ab64b81e2191afa354857e03fd16f) Thanks [@ryanngit](https://github.com/ryanngit)! - Increase the SQLite busy timeout to 30 seconds to better tolerate concurrent writer contention without spurious `SQLITE_BUSY` failures.
+
 ## 0.8.2
 
 ### Patch Changes
