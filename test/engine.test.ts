@@ -280,7 +280,7 @@ describe("LcmContextEngine metadata", () => {
     const busy = db.prepare("PRAGMA busy_timeout").get() as { timeout?: number };
 
     expect(journal.journal_mode).toBe("wal");
-    expect(busy.timeout).toBe(5000);
+    expect(busy.timeout).toBe(30000);
   });
 });
 
