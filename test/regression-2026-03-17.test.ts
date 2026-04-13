@@ -135,6 +135,45 @@ describe("Session key continuity", () => {
 
     expect(conv1.conversationId).toBe(conv2.conversationId);
   });
+
+  it("recovers when the sessionKey insert loses a unique-constraint race", async () => {
+    const db = createTestDb();
+    const { convStore } = createStores(db);
+
+    const winner = await convStore.createConversation({
+      sessionId: "uuid-winner",
+      sessionKey: "agent:main:main",
+    });
+
+    const getByKey = convStore.getConversationBySessionKey.bind(convStore);
+    const getBySessionId = convStore.getConversationBySessionId.bind(convStore);
+    let firstByKeyMiss = true;
+    let firstBySessionIdMiss = true;
+
+    vi.spyOn(convStore, "getConversationBySessionKey").mockImplementation(async (sessionKey) => {
+      if (firstByKeyMiss) {
+        firstByKeyMiss = false;
+        return null;
+      }
+      return getByKey(sessionKey);
+    });
+
+    vi.spyOn(convStore, "getConversationBySessionId").mockImplementation(async (sessionId) => {
+      if (firstBySessionIdMiss) {
+        firstBySessionIdMiss = false;
+        return null;
+      }
+      return getBySessionId(sessionId);
+    });
+
+    const recovered = await convStore.getOrCreateConversation("uuid-loser", {
+      sessionKey: "agent:main:main",
+    });
+
+    expect(recovered.conversationId).toBe(winner.conversationId);
+    expect(recovered.sessionKey).toBe("agent:main:main");
+    expect(await convStore.getConversationBySessionId("uuid-loser")).toBeNull();
+  });
 });
 
 // ── ReDoS Protection (#76) ──────────────────────────────────────────────────
