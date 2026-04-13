@@ -486,6 +486,29 @@ async function resolveCurrentConversation(params: {
   };
 }
 
+async function resolveRotateSessionId(params: {
+  ctx: PluginCommandContext;
+  deps: LcmDependencies;
+  current: Extract<CurrentConversationResolution, { kind: "resolved" }>;
+}): Promise<string | undefined> {
+  const directSessionId = normalizeIdentity(params.ctx.sessionId);
+  if (directSessionId) {
+    return directSessionId;
+  }
+
+  const sessionKey = normalizeIdentity(params.ctx.sessionKey);
+  if (sessionKey) {
+    const runtimeSessionId = normalizeIdentity(
+      await params.deps.resolveSessionIdFromSessionKey(sessionKey),
+    );
+    if (runtimeSessionId) {
+      return runtimeSessionId;
+    }
+  }
+
+  return normalizeIdentity(params.current.stats.sessionId);
+}
+
 function resolvePluginEnabled(config: unknown): boolean {
   const root = asRecord(config);
   const plugins = asRecord(root?.plugins);
@@ -922,14 +945,13 @@ async function buildRotateText(params: {
   ];
 
   const sessionKey = normalizeIdentity(params.ctx.sessionKey);
-  const sessionId = normalizeIdentity(params.ctx.sessionId);
-  if (!sessionKey || !sessionId) {
+  if (!sessionKey) {
     lines.push(
       buildSection("📍 Current conversation", [
         buildStatLine("status", "unavailable"),
         buildStatLine(
           "reason",
-          "OpenClaw must expose both the active session key and session id for Lossless Claw to rotate storage safely.",
+          "OpenClaw must expose the active session key for Lossless Claw to rotate storage safely.",
         ),
       ]),
     );
@@ -960,6 +982,30 @@ async function buildRotateText(params: {
     return lines.join("\n");
   }
 
+  const sessionId = await resolveRotateSessionId({
+    ctx: params.ctx,
+    deps: params.deps,
+    current,
+  });
+  if (!sessionId) {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
+        buildStatLine("session key", formatCommand(truncateMiddle(sessionKey, 44))),
+        buildStatLine("messages", formatNumber(current.stats.messageCount)),
+      ]),
+      "",
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine(
+          "reason",
+          "Lossless Claw resolved the active conversation, but OpenClaw did not expose or resolve a runtime session id, so rotate cannot locate the live transcript safely.",
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
   const transcriptPath = await params.deps.resolveSessionTranscriptFile({
     sessionId,
     sessionKey,
@@ -970,7 +1016,7 @@ async function buildRotateText(params: {
         buildStatLine("status", "unavailable"),
         buildStatLine(
           "reason",
-          "Lossless Claw could not resolve the active session transcript path, so it cannot checkpoint the new row safely.",
+          "Lossless Claw could not resolve the active session transcript path, so it cannot rotate the transcript safely.",
         ),
       ]),
     );
@@ -1072,16 +1118,15 @@ async function buildRotateText(params: {
   lines.push(
     buildSection("🛠️ Rotate", [
       buildStatLine("status", "rotated"),
-      buildStatLine("archived conversation id", formatNumber(result.archivedConversationId)),
-      buildStatLine("new active conversation id", formatNumber(result.activeConversationId)),
-      buildStatLine("archived message count", formatNumber(result.archivedMessageCount)),
+      buildStatLine("preserved tail messages", formatNumber(result.preservedTailMessageCount)),
       buildStatLine("checkpoint bytes", formatNumber(result.checkpointSize)),
+      buildStatLine("bytes removed", formatNumber(result.bytesRemoved)),
       buildStatLine("transcript", transcriptPath),
-      buildStatLine("mode", "start from now forward"),
+      buildStatLine("mode", "preserved current conversation and rotated transcript tail"),
     ]),
     "",
     buildSection("🧭 Notes", [
-      "Archived history remains searchable across conversations.",
+      "Current LCM conversation, summaries, and context items remain in place.",
       `${formatCommand("/new")} still prunes context only, and ${formatCommand("/reset")} still resets OpenClaw session flow.`,
     ]),
   );

@@ -115,6 +115,11 @@ type TranscriptRewriteReplacement = {
 type TranscriptRewriteRequest = {
   replacements: TranscriptRewriteReplacement[];
 };
+type RotateTranscriptRewriteResult = {
+  checkpointSize: number;
+  bytesRemoved: number;
+  preservedTailMessageCount: number;
+};
 type ContextEngineMaintenanceResult = {
   changed: boolean;
   bytesFreed: number;
@@ -240,6 +245,25 @@ function listTranscriptToolResultEntryIdsByCallId(sessionFile: string): Map<stri
   }
 
   return entryIdsByCallId;
+}
+
+function isRotatePreservedEntryType(type: string): boolean {
+  return (
+    type === "message" ||
+    type === "model_change" ||
+    type === "thinking_level_change" ||
+    type === "session_info"
+  );
+}
+
+function normalizeRotateTailMessageCount(value: number, branchMessageCount: number): number {
+  if (branchMessageCount <= 0) {
+    return 0;
+  }
+  if (!Number.isFinite(value)) {
+    return 1;
+  }
+  return Math.max(1, Math.min(branchMessageCount, Math.floor(value)));
 }
 
 function appendTextValue(value: unknown, out: string[]): void {
@@ -1196,10 +1220,10 @@ async function readAppendedLeafPathMessages(params: {
 export type RotateSessionStorageResult =
   | {
       kind: "rotated";
-      archivedConversationId: number;
-      activeConversationId: number;
-      archivedMessageCount: number;
+      conversationId: number;
+      preservedTailMessageCount: number;
       checkpointSize: number;
+      bytesRemoved: number;
     }
   | {
       kind: "unavailable";
@@ -1212,10 +1236,9 @@ export type RotateSessionStorageWithBackupResult =
       currentConversationId: number;
       currentMessageCount: number;
       backupPath: string;
-      archivedConversationId: number;
-      activeConversationId: number;
-      archivedMessageCount: number;
+      preservedTailMessageCount: number;
       checkpointSize: number;
+      bytesRemoved: number;
     }
   | {
       kind: "backup_failed";
@@ -5278,11 +5301,103 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
-   * Rotate the active session row while a write transaction is already open.
+   * Rewrite the active transcript into a compact suffix-preserving form.
    *
-   * This keeps the transcript checkpointing and row replacement logic in one
-   * place so the command path can reuse it after taking a faithful backup on
-   * the shared connection.
+   * Rotate is transcript maintenance, not conversation replacement. We keep the
+   * current conversation id and LCM context intact, then rebuild the transcript
+   * so only the latest raw tail plus current session settings remain on disk.
+   */
+  private async rewriteTranscriptForRotate(params: {
+    conversationId: number;
+    sessionFile: string;
+  }): Promise<RotateTranscriptRewriteResult> {
+    const sessionManager = SessionManager.open(params.sessionFile);
+    const header = sessionManager.getHeader();
+    const branch = sessionManager.getBranch();
+    const originalStats = await stat(params.sessionFile);
+
+    const messageIndices: number[] = [];
+    for (let index = 0; index < branch.length; index += 1) {
+      if (branch[index]?.type === "message") {
+        messageIndices.push(index);
+      }
+    }
+
+    const keepTailMessageCount = normalizeRotateTailMessageCount(
+      this.config.freshTailCount,
+      messageIndices.length,
+    );
+    const anchorIndex =
+      keepTailMessageCount > 0
+        ? (messageIndices[messageIndices.length - keepTailMessageCount] ?? branch.length)
+        : branch.length;
+
+    const latestPreludeEntries = new Map<string, (typeof branch)[number]>();
+    for (let index = 0; index < anchorIndex; index += 1) {
+      const entry = branch[index];
+      if (entry && isRotatePreservedEntryType(entry.type) && entry.type !== "message") {
+        latestPreludeEntries.set(entry.type, entry);
+      }
+    }
+
+    const entriesToKeep: Array<Record<string, unknown>> = [];
+    for (const type of ["session_info", "model_change", "thinking_level_change"] as const) {
+      const entry = latestPreludeEntries.get(type);
+      if (entry) {
+        entriesToKeep.push({ ...entry });
+      }
+    }
+
+    for (let index = anchorIndex; index < branch.length; index += 1) {
+      const entry = branch[index];
+      if (entry && isRotatePreservedEntryType(entry.type)) {
+        entriesToKeep.push({ ...entry });
+      }
+    }
+
+    while (entriesToKeep.length > 0 && entriesToKeep[entriesToKeep.length - 1]?.type !== "message") {
+      entriesToKeep.pop();
+    }
+
+    let previousEntryId: string | null = null;
+    const linearizedEntries = entriesToKeep.map((entry) => {
+      const nextEntry = {
+        ...entry,
+        parentId: previousEntryId,
+      };
+      previousEntryId = typeof nextEntry.id === "string" ? nextEntry.id : previousEntryId;
+      return nextEntry;
+    });
+
+    const serialized = [
+      JSON.stringify(header),
+      ...linearizedEntries.map((entry) => JSON.stringify(entry)),
+    ].join("\n") + "\n";
+    await writeFile(params.sessionFile, serialized, "utf8");
+
+    const rewrittenStats = await stat(params.sessionFile);
+    await this.refreshBootstrapState({
+      conversationId: params.conversationId,
+      sessionFile: params.sessionFile,
+      fileStats: {
+        size: rewrittenStats.size,
+        mtimeMs: rewrittenStats.mtimeMs,
+      },
+    });
+
+    return {
+      checkpointSize: rewrittenStats.size,
+      bytesRemoved: Math.max(0, originalStats.size - rewrittenStats.size),
+      preservedTailMessageCount: keepTailMessageCount,
+    };
+  }
+
+  /**
+   * Rotate the active session transcript while a write transaction is already open.
+   *
+   * This keeps the transcript rewrite and checkpoint update in one place so the
+   * command path can reuse it after taking a faithful backup on the shared
+   * connection.
    */
   private async rotateSessionStorageInActiveTransaction(params: {
     sessionId: string;
@@ -5301,51 +5416,27 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    const archivedMessageCount = await this.conversationStore.getMessageCount(current.conversationId);
-    let sessionFileStats: ReturnType<typeof statSync>;
-    let tailEntryHash: string | null;
     try {
-      sessionFileStats = statSync(params.sessionFile);
-      const tailEntryRaw = await readLastJsonlEntryBeforeOffset(
-        params.sessionFile,
-        sessionFileStats.size,
-        true,
+      const rewriteResult = await this.rewriteTranscriptForRotate({
+        conversationId: current.conversationId,
+        sessionFile: params.sessionFile,
+      });
+      this.deps.log.info(
+        `[lcm] rotate: rewrote transcript for conversation=${current.conversationId} session=${sessionId} sessionKey=${sessionKey} preservedTailMessages=${rewriteResult.preservedTailMessageCount} checkpointSize=${rewriteResult.checkpointSize} bytesRemoved=${rewriteResult.bytesRemoved}`,
       );
-      const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
-      tailEntryHash = tailEntryMessage
-        ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
-        : null;
+      return {
+        kind: "rotated",
+        conversationId: current.conversationId,
+        preservedTailMessageCount: rewriteResult.preservedTailMessageCount,
+        checkpointSize: rewriteResult.checkpointSize,
+        bytesRemoved: rewriteResult.bytesRemoved,
+      };
     } catch (error) {
       return {
         kind: "unavailable",
-        reason: `Lossless Claw could not read the current session transcript: ${describeLogError(error)}`,
+        reason: `Lossless Claw could not rotate the current session transcript: ${describeLogError(error)}`,
       };
     }
-
-    await this.conversationStore.archiveConversation(current.conversationId);
-    const freshConversation = await this.conversationStore.createConversation({
-      sessionId,
-      sessionKey,
-      title: current.title ?? undefined,
-    });
-    await this.summaryStore.upsertConversationBootstrapState({
-      conversationId: freshConversation.conversationId,
-      sessionFilePath: params.sessionFile,
-      lastSeenSize: sessionFileStats.size,
-      lastSeenMtimeMs: Math.trunc(sessionFileStats.mtimeMs),
-      lastProcessedOffset: sessionFileStats.size,
-      lastProcessedEntryHash: tailEntryHash,
-    });
-    this.deps.log.info(
-      `[lcm] rotate: archived conversation=${current.conversationId} session=${sessionId} sessionKey=${sessionKey} and created fresh conversation=${freshConversation.conversationId} checkpointSize=${sessionFileStats.size}`,
-    );
-    return {
-      kind: "rotated",
-      archivedConversationId: current.conversationId,
-      activeConversationId: freshConversation.conversationId,
-      archivedMessageCount,
-      checkpointSize: sessionFileStats.size,
-    };
   }
 
   async rotateSessionStorage(params: {
@@ -5569,10 +5660,9 @@ export class LcmContextEngine implements ContextEngine {
                 currentConversationId: current.conversationId,
                 currentMessageCount,
                 backupPath,
-                archivedConversationId: rotateResult.archivedConversationId,
-                activeConversationId: rotateResult.activeConversationId,
-                archivedMessageCount: rotateResult.archivedMessageCount,
+                preservedTailMessageCount: rotateResult.preservedTailMessageCount,
                 checkpointSize: rotateResult.checkpointSize,
+                bytesRemoved: rotateResult.bytesRemoved,
               };
             },
           );
