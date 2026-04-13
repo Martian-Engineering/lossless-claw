@@ -4501,16 +4501,33 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
-    try {
-      await this.refreshBootstrapState({
-        conversationId: conversation.conversationId,
-        sessionFile: params.sessionFile,
-      });
-    } catch (err) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: bootstrap checkpoint refresh failed for ${sessionLabel}: ${describeLogError(err)}`,
-      );
-    }
+    const refreshAfterTurnBootstrapState = async (): Promise<void> => {
+      try {
+        await this.refreshBootstrapState({
+          conversationId: conversation.conversationId,
+          sessionFile: params.sessionFile,
+        });
+      } catch (err) {
+        this.deps.log.warn(
+          `[lcm] afterTurn: bootstrap checkpoint refresh failed for ${sessionLabel}: ${describeLogError(err)}`,
+        );
+      }
+    };
+    const recordAfterTurnCompactionRetry = async (reason: string): Promise<void> => {
+      try {
+        await this.recordDeferredCompactionDebt({
+          conversationId: conversation.conversationId,
+          reason,
+          tokenBudget,
+          currentTokenCount: liveContextTokens,
+        });
+      } catch (err) {
+        this.deps.log.warn(
+          `[lcm] afterTurn: failed to persist deferred compaction retry for ${sessionLabel}: ${describeLogError(err)}`,
+        );
+      }
+    };
+    let shouldRefreshBootstrapState = true;
 
     try {
       const rawLeafTrigger = await this.compaction.evaluateLeafTrigger(conversation.conversationId);
@@ -4541,36 +4558,76 @@ export class LcmContextEngine implements ContextEngine {
         let leafCompactionScheduled = false;
         if (leafDecision.shouldCompact) {
           leafCompactionScheduled = true;
-          this.compactLeafAsync({
+          shouldRefreshBootstrapState = false;
+          void (async () => {
+            try {
+              const compactResult = await this.compactLeafAsync({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                sessionFile: params.sessionFile,
+                tokenBudget,
+                currentTokenCount: liveContextTokens,
+                legacyParams,
+                maxPasses: leafDecision.maxPasses,
+                leafChunkTokens: leafDecision.leafChunkTokens,
+                fallbackLeafChunkTokens: leafDecision.fallbackLeafChunkTokens,
+                activityBand: leafDecision.activityBand,
+                allowCondensedPasses: leafDecision.allowCondensedPasses,
+              });
+              await this.withSessionQueue(
+                this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+                async () => {
+                  if (compactResult.ok) {
+                    await refreshAfterTurnBootstrapState();
+                    return;
+                  }
+                  await recordAfterTurnCompactionRetry(leafDecision.reason);
+                },
+                {
+                  operationName: "afterTurnLeafCompactionFinalize",
+                  context: sessionLabel,
+                },
+              );
+            } catch (err) {
+              try {
+                await this.withSessionQueue(
+                  this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+                  async () => {
+                    await recordAfterTurnCompactionRetry(leafDecision.reason);
+                  },
+                  {
+                    operationName: "afterTurnLeafCompactionFinalize",
+                    context: sessionLabel,
+                  },
+                );
+              } catch (recordErr) {
+                this.deps.log.warn(
+                  `[lcm] afterTurn: failed to queue deferred compaction retry for ${sessionLabel}: ${describeLogError(recordErr)}`,
+                );
+              }
+              this.deps.log.warn(
+                `[lcm] afterTurn: inline leaf compaction failed for ${sessionLabel}: ${describeLogError(err)}`,
+              );
+            }
+          })();
+        } else {
+          shouldRefreshBootstrapState = true;
+        }
+
+        if (!leafCompactionScheduled) {
+          const compactResult = await this.compact({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             sessionFile: params.sessionFile,
             tokenBudget,
             currentTokenCount: liveContextTokens,
+            compactionTarget: "threshold",
             legacyParams,
-            maxPasses: leafDecision.maxPasses,
-            leafChunkTokens: leafDecision.leafChunkTokens,
-            fallbackLeafChunkTokens: leafDecision.fallbackLeafChunkTokens,
-            activityBand: leafDecision.activityBand,
-            allowCondensedPasses: leafDecision.allowCondensedPasses,
-          }).catch(() => {
-            // Leaf compaction is best-effort and should not fail the caller.
           });
-        }
-
-        if (!leafCompactionScheduled) {
-          try {
-            await this.compact({
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              sessionFile: params.sessionFile,
-              tokenBudget,
-              currentTokenCount: liveContextTokens,
-              compactionTarget: "threshold",
-              legacyParams,
-            });
-          } catch {
-            // Proactive compaction is best-effort in the post-turn lifecycle.
+          const retryReason = thresholdDecision.shouldCompact ? "threshold" : null;
+          if (!compactResult.ok && retryReason) {
+            shouldRefreshBootstrapState = false;
+            await recordAfterTurnCompactionRetry(retryReason);
           }
         }
       } else if (thresholdDecision.shouldCompact || leafDecision.shouldCompact) {
@@ -4585,6 +4642,10 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.warn(
         `[lcm] afterTurn: compaction policy check failed for ${sessionLabel}: ${describeLogError(err)}`,
       );
+    }
+
+    if (shouldRefreshBootstrapState) {
+      await refreshAfterTurnBootstrapState();
     }
 
     this.deps.log.info(

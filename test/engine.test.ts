@@ -4934,6 +4934,88 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(compactSpy).not.toHaveBeenCalled();
   });
 
+  it("afterTurn keeps the bootstrap checkpoint stale and records retry debt when inline leaf compaction fails", async () => {
+    const engine = createEngineWithConfig({
+      proactiveThresholdCompactionMode: "inline",
+    });
+    const sessionId = "after-turn-inline-leaf-compaction-failure";
+    const sessionFile = createSessionFilePath("after-turn-inline-leaf-compaction-failure");
+    writeFileSync(sessionFile, "0123456789\n");
+
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const sessionFileStats = statSync(sessionFile);
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 1,
+      lastSeenMtimeMs: Math.trunc(sessionFileStats.mtimeMs),
+      lastProcessedOffset: 1,
+      lastProcessedEntryHash: null,
+    });
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 20_000,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 500,
+      threshold: 3_072,
+    });
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync").mockResolvedValue({
+      ok: false,
+      compacted: false,
+      reason: "provider auth failure",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    await vi.waitFor(async () => {
+      const maintenance = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation.conversationId);
+      expect(maintenance?.pending).toBe(true);
+    });
+
+    const bootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation.conversationId);
+    expect(bootstrapState).not.toBeNull();
+    expect(bootstrapState?.lastSeenSize).toBe(1);
+    expect(bootstrapState?.lastProcessedOffset).toBe(1);
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance).not.toBeNull();
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenance?.reason).toBe("leaf-trigger");
+    expect(maintenance?.tokenBudget).toBe(4_096);
+    expect(compactLeafAsyncSpy).toHaveBeenCalled();
+  });
+
   it("afterTurn falls back to the default token budget when no budget is provided", async () => {
     const warnLog = vi.fn();
     const engine = createEngineWithDeps(
