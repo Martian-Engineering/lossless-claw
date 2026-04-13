@@ -4370,6 +4370,90 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  /**
+   * Run afterTurn inline leaf compaction and its state persistence in one queue slot.
+   *
+   * This preserves afterTurn's non-blocking behavior while ensuring later
+   * same-session work cannot observe stale bootstrap or retry-debt state between
+   * compaction completion and the follow-up persistence write.
+   */
+  private async runAfterTurnInlineLeafCompaction(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    tokenBudget: number;
+    currentTokenCount: number;
+    legacyParams?: Record<string, unknown>;
+    leafDecision: IncrementalCompactionDecision;
+    sessionLabel: string;
+  }): Promise<void> {
+    try {
+      await this.withSessionQueue(
+        this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+        async () => {
+          const recordAfterTurnCompactionRetry = async (): Promise<void> => {
+            try {
+              await this.recordDeferredCompactionDebt({
+                conversationId: params.conversationId,
+                reason: params.leafDecision.reason,
+                tokenBudget: params.tokenBudget,
+                currentTokenCount: params.currentTokenCount,
+              });
+            } catch (err) {
+              this.deps.log.warn(
+                `[lcm] afterTurn: failed to persist deferred compaction retry for ${params.sessionLabel}: ${describeLogError(err)}`,
+              );
+            }
+          };
+
+          try {
+            const compactResult = await this.executeLeafCompactionCore({
+              conversationId: params.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              tokenBudget: params.tokenBudget,
+              currentTokenCount: params.currentTokenCount,
+              legacyParams: params.legacyParams,
+              maxPasses: params.leafDecision.maxPasses,
+              leafChunkTokens: params.leafDecision.leafChunkTokens,
+              fallbackLeafChunkTokens: params.leafDecision.fallbackLeafChunkTokens,
+              activityBand: params.leafDecision.activityBand,
+              allowCondensedPasses: params.leafDecision.allowCondensedPasses,
+            });
+            if (compactResult.ok) {
+              try {
+                await this.refreshBootstrapState({
+                  conversationId: params.conversationId,
+                  sessionFile: params.sessionFile,
+                });
+              } catch (err) {
+                this.deps.log.warn(
+                  `[lcm] afterTurn: bootstrap checkpoint refresh failed for ${params.sessionLabel}: ${describeLogError(err)}`,
+                );
+              }
+              return;
+            }
+            await recordAfterTurnCompactionRetry();
+          } catch (err) {
+            await recordAfterTurnCompactionRetry();
+            this.deps.log.warn(
+              `[lcm] afterTurn: inline leaf compaction failed for ${params.sessionLabel}: ${describeLogError(err)}`,
+            );
+          }
+        },
+        {
+          operationName: "afterTurnLeafCompaction",
+          context: params.sessionLabel,
+        },
+      );
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] afterTurn: failed to queue inline leaf compaction for ${params.sessionLabel}: ${describeLogError(err)}`,
+      );
+    }
+  }
+
   async afterTurn(params: {
     sessionId: string;
     sessionKey?: string;
@@ -4559,57 +4643,17 @@ export class LcmContextEngine implements ContextEngine {
         if (leafDecision.shouldCompact) {
           leafCompactionScheduled = true;
           shouldRefreshBootstrapState = false;
-          void (async () => {
-            try {
-              const compactResult = await this.compactLeafAsync({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                sessionFile: params.sessionFile,
-                tokenBudget,
-                currentTokenCount: liveContextTokens,
-                legacyParams,
-                maxPasses: leafDecision.maxPasses,
-                leafChunkTokens: leafDecision.leafChunkTokens,
-                fallbackLeafChunkTokens: leafDecision.fallbackLeafChunkTokens,
-                activityBand: leafDecision.activityBand,
-                allowCondensedPasses: leafDecision.allowCondensedPasses,
-              });
-              await this.withSessionQueue(
-                this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-                async () => {
-                  if (compactResult.ok) {
-                    await refreshAfterTurnBootstrapState();
-                    return;
-                  }
-                  await recordAfterTurnCompactionRetry(leafDecision.reason);
-                },
-                {
-                  operationName: "afterTurnLeafCompactionFinalize",
-                  context: sessionLabel,
-                },
-              );
-            } catch (err) {
-              try {
-                await this.withSessionQueue(
-                  this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-                  async () => {
-                    await recordAfterTurnCompactionRetry(leafDecision.reason);
-                  },
-                  {
-                    operationName: "afterTurnLeafCompactionFinalize",
-                    context: sessionLabel,
-                  },
-                );
-              } catch (recordErr) {
-                this.deps.log.warn(
-                  `[lcm] afterTurn: failed to queue deferred compaction retry for ${sessionLabel}: ${describeLogError(recordErr)}`,
-                );
-              }
-              this.deps.log.warn(
-                `[lcm] afterTurn: inline leaf compaction failed for ${sessionLabel}: ${describeLogError(err)}`,
-              );
-            }
-          })();
+          void this.runAfterTurnInlineLeafCompaction({
+            conversationId: conversation.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            sessionFile: params.sessionFile,
+            tokenBudget,
+            currentTokenCount: liveContextTokens,
+            legacyParams,
+            leafDecision,
+            sessionLabel,
+          });
         } else {
           shouldRefreshBootstrapState = true;
         }
