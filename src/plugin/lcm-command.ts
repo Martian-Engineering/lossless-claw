@@ -561,7 +561,7 @@ function buildHelpText(error?: string): string {
       ),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} rotate`),
-        "Archive the current LCM conversation row and start fresh storage for this same live session.",
+        "Compact the current session transcript while preserving the same LCM conversation and live session identity.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
@@ -580,7 +580,7 @@ function buildHelpText(error?: string): string {
       buildStatLine("alias", `${formatCommand(HIDDEN_ALIAS)} is accepted as a shorter alias.`),
       buildStatLine("current conversation", "Uses the active LCM session when the host exposes session identity."),
       buildStatLine("`/new`", "Prunes context for the current LCM conversation. It does not split storage."),
-      buildStatLine("`/reset`", "Resets OpenClaw session flow. Use rotate when you only want a fresh LCM row."),
+      buildStatLine("`/reset`", "Resets OpenClaw session flow. Use rotate when you only want transcript compaction."),
     ]),
   ];
   return lines.join("\n");
@@ -1391,7 +1391,7 @@ export function createLcmCommand(params: {
       telegram: "Lossless Claw is working...",
     },
     description:
-      "Show Lossless Claw health, create DB backups, rotate the current LCM conversation row, inspect high-confidence junk candidates, and run scoped doctor actions.",
+      "Show Lossless Claw health, create DB backups, compact the current session transcript while preserving LCM context, inspect high-confidence junk candidates, and run scoped doctor actions.",
     acceptsArgs: true,
     handler: async (ctx) => {
       const parsed = parseLcmCommand(ctx.args);

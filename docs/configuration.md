@@ -262,9 +262,9 @@ Lossless-claw now defaults `proactiveThresholdCompactionMode` to `deferred`.
 
 - `/new` keeps the same active LCM conversation row and only prunes context.
 - `/reset` changes OpenClaw session flow, which is sometimes more disruptive than users want.
-- `/lcm rotate` keeps the live OpenClaw session identity, but archives the current active LCM row and starts a fresh row for the same session.
+- `/lcm rotate` keeps the live OpenClaw session identity and the same active LCM conversation row, but rewrites the backing transcript into a compact preserved-tail form.
 
-Before rotating, Lossless-claw replaces one rolling `rotate-latest` SQLite backup. The new row is checkpointed at the current transcript frontier so bootstrap starts from now forward instead of replaying older transcript history into the fresh row. If you want additional timestamped snapshots, run `/lcm backup` explicitly before `/lcm rotate`.
+Before rotating, Lossless-claw replaces one rolling `rotate-latest` SQLite backup. It then rewrites the current session transcript and checkpoints the same conversation at the new transcript frontier so bootstrap does not replay the dropped transcript history. Existing summaries, context items, and conversation identity stay in place. If you want additional timestamped snapshots, run `/lcm backup` explicitly before `/lcm rotate`.
 
 ## Environment-only knobs outside plugin config
 

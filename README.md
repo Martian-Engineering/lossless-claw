@@ -34,7 +34,7 @@ The plugin now ships a bundled `lossless-claw` skill plus a small plugin command
 
 - `/lcm` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
 - `/lcm backup` creates a timestamped backup of the current LCM SQLite database
-- `/lcm rotate` archives the active LCM row for the current session and starts a fresh row without changing the live OpenClaw session identity
+- `/lcm rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
 - `/lcm doctor` scans for broken or truncated summaries
 - `/lcm doctor clean` shows read-only high-confidence junk diagnostics for archived subagents, cron sessions, and NULL-key orphaned subagent runs
 - `/lcm status` shows plugin, conversation, and maintenance state including deferred compaction debt
@@ -281,7 +281,7 @@ For large sessions, neither command is a perfect “keep my live agent context, 
 - `/new` keeps writing into the same active LCM conversation row.
 - `/reset` changes OpenClaw session flow, which is heavier than users often want when their real problem is just LCM row size.
 
-`/lcm rotate` fills that gap. It replaces one rolling `rotate-latest` SQLite backup, archives the current active LCM row, creates a fresh active row for the same `sessionKey`, and checkpoints the current transcript frontier so the new row starts from now forward instead of replaying old history. Older rows remain searchable, which pairs well with cross-session search and usually improves hot-path bootstrap and assemble performance for long-lived sessions. If you want timestamped snapshots instead, run `/lcm backup`.
+`/lcm rotate` fills that gap. It replaces one rolling `rotate-latest` SQLite backup, rewrites the current session transcript down to the preserved live tail plus current session settings, and refreshes the bootstrap frontier on the same active LCM conversation so dropped transcript history is not replayed. Existing summaries, context items, and conversation identity stay in place; only the transcript backing is compacted. If you want additional timestamped snapshots instead, run `/lcm backup`.
 
 `newSessionRetainDepth` (or `LCM_NEW_SESSION_RETAIN_DEPTH`) controls how much summary structure survives `/new`:
 
