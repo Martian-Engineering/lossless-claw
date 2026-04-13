@@ -1297,7 +1297,7 @@ export class LcmContextEngine implements ContextEngine {
     // Without a working schema, ownsCompaction would disable the runtime's
     // built-in compaction safeguard and inflate the context budget.
     this.info = {
-      id: "lcm",
+      id: "lossless-claw",
       name: "Lossless Context Management Engine",
       version: "0.1.0",
       ownsCompaction: migrationOk,

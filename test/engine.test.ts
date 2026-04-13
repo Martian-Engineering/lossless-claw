@@ -270,6 +270,11 @@ afterEach(() => {
 });
 
 describe("LcmContextEngine metadata", () => {
+  it("reports the registered lossless-claw engine id", () => {
+    const engine = createEngine();
+    expect(engine.info.id).toBe("lossless-claw");
+  });
+
   it("advertises ownsCompaction capability", () => {
     const engine = createEngine();
     expect(engine.info.ownsCompaction).toBe(true);

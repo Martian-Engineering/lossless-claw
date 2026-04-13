@@ -226,6 +226,7 @@ describe("lcm plugin registration", () => {
       largeFileTokenThreshold: 12345,
     });
     expect(engine.info).toMatchObject({
+      id: "lossless-claw",
       turnMaintenanceMode: "background",
     });
     expect(infoLog).toHaveBeenCalledWith(
