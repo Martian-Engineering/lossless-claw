@@ -110,6 +110,10 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
     (col) => col.name === "tokens_accumulated_since_leaf_compaction",
   );
   const hasLastActivityBand = telemetryColumns.some((col) => col.name === "last_activity_band");
+  const hasLastApiCallAt = telemetryColumns.some((col) => col.name === "last_api_call_at");
+  const hasLastCacheTouchAt = telemetryColumns.some((col) => col.name === "last_cache_touch_at");
+  const hasProvider = telemetryColumns.some((col) => col.name === "provider");
+  const hasModel = telemetryColumns.some((col) => col.name === "model");
 
   if (!hasLastLeafCompactionAt) {
     db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_leaf_compaction_at TEXT`);
@@ -128,6 +132,18 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
     db.exec(
       `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_activity_band TEXT NOT NULL DEFAULT 'low' CHECK (last_activity_band IN ('low', 'medium', 'high'))`,
     );
+  }
+  if (!hasLastApiCallAt) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_api_call_at TEXT`);
+  }
+  if (!hasLastCacheTouchAt) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_cache_touch_at TEXT`);
+  }
+  if (!hasProvider) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN provider TEXT`);
+  }
+  if (!hasModel) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN model TEXT`);
   }
 }
 
@@ -791,6 +807,24 @@ export function runLcmMigrations(
       tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
       last_activity_band TEXT NOT NULL DEFAULT 'low'
         CHECK (last_activity_band IN ('low', 'medium', 'high')),
+      last_api_call_at TEXT,
+      last_cache_touch_at TEXT,
+      provider TEXT,
+      model TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS conversation_compaction_maintenance (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      pending INTEGER NOT NULL DEFAULT 0,
+      requested_at TEXT,
+      reason TEXT,
+      running INTEGER NOT NULL DEFAULT 0,
+      last_started_at TEXT,
+      last_finished_at TEXT,
+      last_failure_summary TEXT,
+      token_budget INTEGER,
+      current_token_count INTEGER,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 

@@ -35,6 +35,7 @@ The plugin now ships a bundled `lossless-claw` skill plus a small plugin command
 - `/lcm` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
 - `/lcm doctor` scans for broken or truncated summaries
 - `/lcm doctor clean` shows read-only high-confidence junk diagnostics for archived subagents, cron sessions, and NULL-key orphaned subagent runs
+- `/lcm status` shows plugin, conversation, and maintenance state including deferred compaction debt
 - `/lossless` is an alias for `/lcm` on supported native command surfaces
 
 These are plugin slash/native commands, not root shell CLI subcommands. Supported examples:
@@ -124,10 +125,15 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
           "newSessionRetainDepth": 2,
           "contextThreshold": 0.75,
           "incrementalMaxDepth": 1,
+          "cacheAwareCompaction": {
+            "enabled": true,
+            "cacheTTLSeconds": 300
+          },
           "ignoreSessionPatterns": [
             "agent:*:cron:**"
           ],
           "transcriptGcEnabled": false,
+          "proactiveThresholdCompactionMode": "deferred",
           "summaryModel": "openai/gpt-5.4-mini",
           "expansionModel": "openai/gpt-5.4-mini",
           "delegationTimeoutMs": 300000,
@@ -173,8 +179,11 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Max time to wait for a single model-backed LCM summarizer call |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
 | `LCM_TRANSCRIPT_GC_ENABLED` | `false` | Enable transcript rewrite GC during `maintain()` |
+| `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | `deferred` | Choose whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior |
+| `LCM_CACHE_TTL_SECONDS` | `300` | Cache TTL used by cache-aware deferred compaction when provider/runtime telemetry does not supply a more specific retention window |
 
 Transcript GC rewrites are disabled by default. Set `transcriptGcEnabled` or `LCM_TRANSCRIPT_GC_ENABLED` to turn them on explicitly.
+Deferred proactive compaction is also the default. Set `proactiveThresholdCompactionMode` or `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` to `inline` only if you need legacy foreground compaction behavior. In deferred mode, lossless-claw records one coalesced prompt-mutating debt item after the turn, leaves background `maintain()` to process only non-prompt-mutating work while Anthropic cache is still hot, and then consumes that debt pre-assembly once the cache is cold or the prompt is approaching overflow.
 
 ### Expansion model override requirements
 

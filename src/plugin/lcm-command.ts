@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
+import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
@@ -18,6 +19,11 @@ import {
   getDoctorSummaryStats,
   type DoctorSummaryStats,
 } from "./lcm-doctor-shared.js";
+import {
+  CompactionMaintenanceStore,
+  type ConversationCompactionMaintenanceRecord,
+} from "../store/compaction-maintenance-store.js";
+import { CompactionTelemetryStore } from "../store/compaction-telemetry-store.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
@@ -342,7 +348,13 @@ function getConversationStatusBySessionKey(
   sessionKey: string,
 ): LcmConversationStatusStats | null {
   const row = db
-    .prepare(`SELECT conversation_id FROM conversations WHERE session_key = ? LIMIT 1`)
+    .prepare(
+      `SELECT conversation_id
+       FROM conversations
+       WHERE session_key = ?
+       ORDER BY active DESC, created_at DESC
+       LIMIT 1`,
+    )
     .get(sessionKey) as { conversation_id: number } | undefined;
 
   if (!row) {
@@ -361,7 +373,7 @@ function getConversationStatusBySessionId(
       `SELECT conversation_id
        FROM conversations
        WHERE session_id = ?
-       ORDER BY created_at DESC
+       ORDER BY active DESC, created_at DESC
        LIMIT 1`,
     )
     .get(sessionId) as { conversation_id: number } | undefined;
@@ -371,6 +383,22 @@ function getConversationStatusBySessionId(
   }
 
   return getConversationStatusStats(db, row.conversation_id);
+}
+
+async function getConversationCompactionMaintenanceByConversationId(
+  db: DatabaseSync,
+  conversationId: number,
+): Promise<ConversationCompactionMaintenanceRecord | null> {
+  return await new CompactionMaintenanceStore(db).getConversationCompactionMaintenance(
+    conversationId,
+  );
+}
+
+async function getConversationCompactionTelemetryByConversationId(
+  db: DatabaseSync,
+  conversationId: number,
+) {
+  return await new CompactionTelemetryStore(db).getConversationCompactionTelemetry(conversationId);
 }
 
 async function resolveCurrentConversation(params: {
@@ -472,7 +500,10 @@ function buildHelpText(error?: string): string {
     "",
     buildSection("📘 Commands", [
       buildStatLine(formatCommand(VISIBLE_COMMAND), "Show compact status output."),
-      buildStatLine(formatCommand(`${VISIBLE_COMMAND} status`), "Show plugin, Global, and current-conversation status."),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} status`),
+        "Show plugin, Global, current-conversation, and compaction-maintenance status.",
+      ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} doctor clean`),
@@ -551,6 +582,16 @@ async function buildStatusText(params: {
         truncated: 0,
         fallback: 0,
       };
+    const maintenance = await getConversationCompactionMaintenanceByConversationId(
+      params.db,
+      current.stats.conversationId,
+    );
+    const telemetry = await getConversationCompactionTelemetryByConversationId(
+      params.db,
+      current.stats.conversationId,
+    );
+    const formatMaintenanceTime = (value: Date | null): string =>
+      value ? formatTimestamp(value, params.config.timezone) : "never";
     lines.push(
       buildSection("📍 Current conversation", [
         buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
@@ -576,6 +617,37 @@ async function buildStatusText(params: {
             ? `${formatNumber(conversationDoctor.total)} issue(s) in this conversation`
             : "clean",
         ),
+      ]),
+    );
+    lines.push(
+      "",
+      buildSection("🛠️ Maintenance", [
+        buildStatLine(
+          "state",
+          maintenance?.pending
+            ? "pending"
+            : maintenance?.running
+              ? "running"
+              : "idle",
+        ),
+        buildStatLine("requested at", formatMaintenanceTime(maintenance?.requestedAt ?? null)),
+        buildStatLine("reason", maintenance?.reason ?? "none"),
+        buildStatLine("last started", formatMaintenanceTime(maintenance?.lastStartedAt ?? null)),
+        buildStatLine("last finished", formatMaintenanceTime(maintenance?.lastFinishedAt ?? null)),
+        buildStatLine("last failure", maintenance?.lastFailureSummary ?? "none"),
+        buildStatLine(
+          "requested token budget",
+          maintenance?.tokenBudget != null ? formatNumber(maintenance.tokenBudget) : "unknown",
+        ),
+        buildStatLine(
+          "observed token count",
+          maintenance?.currentTokenCount != null ? formatNumber(maintenance.currentTokenCount) : "unknown",
+        ),
+        buildStatLine("last api call", formatMaintenanceTime(telemetry?.lastApiCallAt ?? null)),
+        buildStatLine("last cache touch", formatMaintenanceTime(telemetry?.lastCacheTouchAt ?? null)),
+        buildStatLine("cache retention", telemetry?.retention ?? "unknown"),
+        buildStatLine("cache state", telemetry?.cacheState ?? "unknown"),
+        buildStatLine("provider/model", [telemetry?.provider, telemetry?.model].filter(Boolean).join(" / ") || "unknown"),
       ]),
     );
   } else {

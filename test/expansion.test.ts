@@ -30,6 +30,7 @@ const BASE_CONFIG: LcmConfig = {
   timezone: "UTC",
   pruneHeartbeatOk: false,
   transcriptGcEnabled: false,
+  proactiveThresholdCompactionMode: "deferred",
   summaryMaxOverageFactor: 3,
   expansionProvider: "",
   expansionModel: "",

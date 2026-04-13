@@ -55,6 +55,9 @@ import {
   type ActivityBand,
 } from "./store/compaction-telemetry-store.js";
 import {
+  CompactionMaintenanceStore,
+} from "./store/compaction-maintenance-store.js";
+import {
   ConversationStore,
   type ConversationRecord,
   type CreateMessagePartInput,
@@ -78,6 +81,9 @@ type PromptCacheSnapshot = {
   cacheState: CacheState;
   retention?: string;
   sawExplicitBreak: boolean;
+  lastCacheTouchAt?: Date;
+  provider?: string;
+  model?: string;
 };
 type IncrementalCompactionDecision = {
   shouldCompact: boolean;
@@ -85,6 +91,7 @@ type IncrementalCompactionDecision = {
   maxPasses: number;
   rawTokensOutsideTail: number;
   threshold: number;
+  reason: string;
   leafChunkTokens: number;
   fallbackLeafChunkTokens: number[];
   activityBand: ActivityBand;
@@ -109,7 +116,23 @@ type ContextEngineMaintenanceResult = {
   rewrittenEntries: number;
   reason?: string;
 };
+type CompactionExecutionParams = {
+  conversationId: number;
+  sessionId: string;
+  sessionKey?: string;
+  tokenBudget: number;
+  currentTokenCount?: number;
+  compactionTarget?: "budget" | "threshold";
+  customInstructions?: string;
+  /** OpenClaw runtime param name (preferred). */
+  runtimeContext?: Record<string, unknown>;
+  /** Back-compat param name. */
+  legacyParams?: Record<string, unknown>;
+  /** Force compaction even if below threshold */
+  force?: boolean;
+};
 type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
+  allowDeferredCompactionExecution?: boolean;
   rewriteTranscriptEntries?: (
     request: TranscriptRewriteRequest,
   ) => Promise<ContextEngineMaintenanceResult>;
@@ -1195,6 +1218,7 @@ export class LcmContextEngine implements ContextEngine {
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
+  private compactionMaintenanceStore: CompactionMaintenanceStore;
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
@@ -1264,13 +1288,15 @@ export class LcmContextEngine implements ContextEngine {
       name: "Lossless Context Management Engine",
       version: "0.1.0",
       ownsCompaction: migrationOk,
-    };
+      turnMaintenanceMode: "background",
+    } as ContextEngineInfo;
 
     this.conversationStore = new ConversationStore(this.db, {
       fts5Available: this.fts5Available,
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
+    this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -1568,6 +1594,55 @@ export class LcmContextEngine implements ContextEngine {
     return telemetry.cacheState;
   }
 
+  /** Resolve the effective prompt-cache TTL in milliseconds for the stored retention class. */
+  private resolvePromptCacheTtlMs(retention?: string | null): number | null {
+    const normalized = retention?.trim().toLowerCase();
+    if (normalized === "none") {
+      return null;
+    }
+    if (normalized === "long" || normalized === "1h") {
+      return 60 * 60 * 1000;
+    }
+    return Math.max(1, this.config.cacheAwareCompaction.cacheTTLSeconds) * 1000;
+  }
+
+  /** Detect Anthropic-family sessions where local prompt rewrites can invalidate a hot prefix cache. */
+  private isAnthropicPromptCacheFamily(
+    telemetry: ConversationCompactionTelemetryRecord | null,
+  ): boolean {
+    const provider = telemetry?.provider?.trim().toLowerCase() ?? "";
+    const model = telemetry?.model?.trim().toLowerCase() ?? "";
+    return provider.includes("anthropic") || model.includes("claude");
+  }
+
+  /** Determine whether the last prompt-cache touch is still within the active TTL window. */
+  private isPromptCacheStillHot(
+    telemetry: ConversationCompactionTelemetryRecord | null,
+    now: Date = new Date(),
+  ): boolean {
+    const ttlMs = this.resolvePromptCacheTtlMs(telemetry?.retention ?? null);
+    if (!ttlMs) {
+      return false;
+    }
+    const touchAt =
+      telemetry?.lastCacheTouchAt
+      ?? telemetry?.lastObservedCacheHitAt
+      ?? telemetry?.lastApiCallAt
+      ?? null;
+    if (!touchAt) {
+      return false;
+    }
+    return now.getTime() - touchAt.getTime() < ttlMs;
+  }
+
+  /** Delay prompt-mutating deferred compaction while Anthropic's exact-prefix cache is still hot. */
+  private shouldDelayPromptMutatingDeferredCompaction(
+    telemetry: ConversationCompactionTelemetryRecord | null,
+    now: Date = new Date(),
+  ): boolean {
+    return this.isAnthropicPromptCacheFamily(telemetry) && this.isPromptCacheStillHot(telemetry, now);
+  }
+
   /** Decide whether a hot cache still has enough real token-budget headroom to skip incremental maintenance. */
   private isComfortablyUnderTokenBudget(params: {
     currentTokenCount?: number;
@@ -1712,16 +1787,25 @@ export class LcmContextEngine implements ContextEngine {
   /** Extract the current prompt-cache snapshot from runtime context, if present. */
   private readPromptCacheSnapshot(runtimeContext?: Record<string, unknown>): PromptCacheSnapshot | null {
     const promptCache = asRecord(runtimeContext?.promptCache);
-    if (!promptCache) {
+    const provider = safeString(runtimeContext?.provider)?.trim()
+      ?? safeString(runtimeContext?.providerId)?.trim();
+    const model = safeString(runtimeContext?.model)?.trim()
+      ?? safeString(runtimeContext?.modelId)?.trim();
+    if (!promptCache && !provider && !model) {
       return null;
     }
 
-    const lastCallUsage = asRecord(promptCache.lastCallUsage);
-    const observation = asRecord(promptCache.observation);
+    const lastCallUsage = asRecord(promptCache?.lastCallUsage);
+    const observation = asRecord(promptCache?.observation);
     const cacheRead = this.normalizeOptionalCount(lastCallUsage?.cacheRead);
     const cacheWrite = this.normalizeOptionalCount(lastCallUsage?.cacheWrite);
     const sawExplicitBreak = safeBoolean(observation?.broke) === true;
-    const retention = safeString(promptCache.retention)?.trim();
+    const retention = safeString(promptCache?.retention)?.trim();
+    const lastCacheTouchAtRaw = promptCache?.lastCacheTouchAt;
+    const lastCacheTouchAt =
+      typeof lastCacheTouchAtRaw === "number" && Number.isFinite(lastCacheTouchAtRaw)
+        ? new Date(lastCacheTouchAtRaw)
+        : undefined;
     const hasUsageSignal = cacheRead !== undefined || cacheWrite !== undefined;
     const hasObservationSignal =
       typeof observation?.cacheRead === "number"
@@ -1743,6 +1827,9 @@ export class LcmContextEngine implements ContextEngine {
       cacheState,
       ...(retention ? { retention } : {}),
       sawExplicitBreak,
+      ...(lastCacheTouchAt ? { lastCacheTouchAt } : {}),
+      ...(provider ? { provider } : {}),
+      ...(model ? { model } : {}),
     };
   }
 
@@ -1767,6 +1854,14 @@ export class LcmContextEngine implements ContextEngine {
       (existing?.turnsSinceLeafCompaction ?? 0) + 1;
     const tokensAccumulatedSinceLeafCompaction =
       params.rawTokensOutsideTail ?? existing?.tokensAccumulatedSinceLeafCompaction ?? 0;
+    const touchedPromptCache =
+      snapshot?.lastCacheTouchAt
+      ?? (
+        snapshot
+        && (snapshot.lastObservedCacheRead !== undefined || snapshot.lastObservedCacheWrite !== undefined)
+          ? now
+          : existing?.lastCacheTouchAt ?? null
+      );
     const lastActivityBand = this.classifyDynamicLeafActivityBand({
       lastActivityBand: existing?.lastActivityBand,
       tokensAccumulatedSinceLeafCompaction,
@@ -1792,13 +1887,17 @@ export class LcmContextEngine implements ContextEngine {
       turnsSinceLeafCompaction,
       tokensAccumulatedSinceLeafCompaction,
       lastActivityBand,
+      lastApiCallAt: now,
+      lastCacheTouchAt: touchedPromptCache,
+      provider: snapshot?.provider ?? existing?.provider ?? null,
+      model: snapshot?.model ?? existing?.model ?? null,
     });
     const updated = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
       params.conversationId,
     );
     if (updated) {
       this.deps.log.debug(
-        `[lcm] compaction telemetry updated: conversation=${params.conversationId} cacheState=${updated.cacheState} cacheRead=${updated.lastObservedCacheRead ?? "null"} cacheWrite=${updated.lastObservedCacheWrite ?? "null"} retention=${updated.retention ?? "null"} turnsSinceLeafCompaction=${updated.turnsSinceLeafCompaction} tokensSinceLeafCompaction=${updated.tokensAccumulatedSinceLeafCompaction} activityBand=${updated.lastActivityBand} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"} tokenBudget=${params.tokenBudget ?? "null"}`,
+        `[lcm] compaction telemetry updated: conversation=${params.conversationId} cacheState=${updated.cacheState} cacheRead=${updated.lastObservedCacheRead ?? "null"} cacheWrite=${updated.lastObservedCacheWrite ?? "null"} retention=${updated.retention ?? "null"} lastApiCallAt=${updated.lastApiCallAt?.toISOString() ?? "null"} lastCacheTouchAt=${updated.lastCacheTouchAt?.toISOString() ?? "null"} provider=${updated.provider ?? "null"} model=${updated.model ?? "null"} turnsSinceLeafCompaction=${updated.turnsSinceLeafCompaction} tokensSinceLeafCompaction=${updated.tokensAccumulatedSinceLeafCompaction} activityBand=${updated.lastActivityBand} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"} tokenBudget=${params.tokenBudget ?? "null"}`,
       );
     }
     return updated;
@@ -1824,6 +1923,10 @@ export class LcmContextEngine implements ContextEngine {
       turnsSinceLeafCompaction: 0,
       tokensAccumulatedSinceLeafCompaction: 0,
       lastActivityBand: params.activityBand ?? existing?.lastActivityBand ?? "low",
+      lastApiCallAt: existing?.lastApiCallAt ?? null,
+      lastCacheTouchAt: existing?.lastCacheTouchAt ?? null,
+      provider: existing?.provider ?? null,
+      model: existing?.model ?? null,
     });
     this.deps.log.debug(
       `[lcm] compaction telemetry reset after leaf compaction: conversation=${params.conversationId} cacheState=${existing?.cacheState ?? "unknown"} activityBand=${params.activityBand ?? existing?.lastActivityBand ?? "low"}`,
@@ -1854,6 +1957,7 @@ export class LcmContextEngine implements ContextEngine {
       maxPasses: params.maxPasses,
       rawTokensOutsideTail: params.rawTokensOutsideTail,
       threshold: params.threshold,
+      reason: params.reason,
       leafChunkTokens: params.preferredLeafChunkTokens,
       fallbackLeafChunkTokens: params.fallbackLeafChunkTokens,
       activityBand: params.activityBand,
@@ -2006,6 +2110,384 @@ export class LcmContextEngine implements ContextEngine {
       allowCondensedPasses: cacheState !== "hot",
       reason: cacheState === "cold" ? "cold-cache-catchup" : "leaf-trigger",
     });
+  }
+
+  /** Persist a coalesced proactive-compaction debt record for later maintenance. */
+  private async recordDeferredCompactionDebt(params: {
+    conversationId: number;
+    reason: string;
+    tokenBudget: number;
+    currentTokenCount?: number;
+  }): Promise<void> {
+    await this.compactionMaintenanceStore.requestProactiveCompactionDebt({
+      conversationId: params.conversationId,
+      reason: params.reason,
+      tokenBudget: params.tokenBudget,
+      currentTokenCount: params.currentTokenCount ?? null,
+    });
+    this.deps.log.info(
+      `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"}`,
+    );
+  }
+
+  /**
+   * Consume deferred proactive-compaction debt while the caller already holds
+   * the per-session queue.
+   */
+  private async consumeDeferredCompactionDebt(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    tokenBudget: number;
+    currentTokenCount?: number;
+    runtimeContext?: ContextEngineMaintenanceRuntimeContext;
+    legacyParams?: Record<string, unknown>;
+  }): Promise<ContextEngineMaintenanceResult | null> {
+    const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+      params.conversationId,
+    );
+    if (!maintenance?.pending && !maintenance?.running) {
+      return null;
+    }
+
+    const sessionLabel = [
+      `session=${params.sessionId}`,
+      ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
+    ].join(" ");
+
+    await this.compactionMaintenanceStore.markProactiveCompactionRunning({
+      conversationId: params.conversationId,
+      startedAt: new Date(),
+    });
+
+    try {
+      const recordedTokenBudget =
+        maintenance.tokenBudget && maintenance.tokenBudget > 0
+          ? maintenance.tokenBudget
+          : null;
+      const resolvedTokenBudget = this.applyAssemblyBudgetCap(
+        recordedTokenBudget != null
+          ? Math.min(params.tokenBudget, recordedTokenBudget)
+          : params.tokenBudget,
+      );
+      const resolvedCurrentTokenCount = this.normalizeObservedTokenCount(
+        params.currentTokenCount ?? maintenance.currentTokenCount ?? undefined,
+      );
+
+      const result =
+        maintenance.reason?.trim() === "threshold"
+          ? await this.executeCompactionCore({
+              conversationId: params.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              tokenBudget: resolvedTokenBudget,
+              currentTokenCount: resolvedCurrentTokenCount,
+              compactionTarget: "threshold",
+              runtimeContext: params.runtimeContext,
+              legacyParams: params.legacyParams,
+            })
+          : await (async (): Promise<CompactResult> => {
+              const leafDecision = await this.evaluateIncrementalCompaction({
+                conversationId: params.conversationId,
+                tokenBudget: resolvedTokenBudget,
+                currentTokenCount: resolvedCurrentTokenCount,
+              });
+              if (!leafDecision.shouldCompact) {
+                return {
+                  ok: true,
+                  compacted: false,
+                  reason: "deferred compaction no longer needed",
+                };
+              }
+              return this.executeLeafCompactionCore({
+                conversationId: params.conversationId,
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                tokenBudget: resolvedTokenBudget,
+                currentTokenCount: resolvedCurrentTokenCount,
+                runtimeContext: params.runtimeContext,
+                legacyParams: params.legacyParams,
+                maxPasses: leafDecision.maxPasses,
+                leafChunkTokens: leafDecision.leafChunkTokens,
+                fallbackLeafChunkTokens: leafDecision.fallbackLeafChunkTokens,
+                activityBand: leafDecision.activityBand,
+                allowCondensedPasses: leafDecision.allowCondensedPasses,
+              });
+            })();
+      await this.compactionMaintenanceStore.markProactiveCompactionFinished({
+        conversationId: params.conversationId,
+        finishedAt: new Date(),
+        failureSummary: result.ok ? null : result.reason ?? "deferred compaction failed",
+        keepPending: !result.ok,
+      });
+      this.deps.log.info(
+        `[lcm] maintain: deferred compaction ${result.compacted ? "completed" : "skipped"} conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} ok=${result.ok} reason=${result.reason ?? "none"}`,
+      );
+      return {
+        changed: result.compacted,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        ...(result.reason ? { reason: result.reason } : {}),
+      };
+    } catch (error) {
+      await this.compactionMaintenanceStore.markProactiveCompactionFinished({
+        conversationId: params.conversationId,
+        finishedAt: new Date(),
+        failureSummary: error instanceof Error ? error.message : String(error),
+        keepPending: true,
+      });
+      this.deps.log.warn(
+        `[lcm] maintain: deferred compaction failed conversation=${params.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
+      );
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: error instanceof Error ? error.message : "deferred compaction failed",
+      };
+    }
+  }
+
+  /**
+   * Re-check and consume deferred debt for assemble() while holding the
+   * session queue so pre-assembly writes cannot race queued maintenance.
+   */
+  private async maybeConsumeDeferredCompactionDebtForAssemble(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    tokenBudget: number;
+    currentTokenCount?: number;
+  }): Promise<void> {
+    const sessionLabel = [
+      `session=${params.sessionId}`,
+      ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
+    ].join(" ");
+    await this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () => {
+        const maintenance =
+          await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+            params.conversationId,
+          );
+        if (!maintenance?.pending && !maintenance?.running) {
+          return;
+        }
+
+        const telemetry =
+          await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+            params.conversationId,
+          );
+        const promptOverflowEmergency =
+          (params.currentTokenCount ?? 0) > params.tokenBudget;
+        if (
+          promptOverflowEmergency
+          || !this.shouldDelayPromptMutatingDeferredCompaction(telemetry)
+        ) {
+          const deferredLegacyParams =
+            telemetry?.provider || telemetry?.model
+              ? {
+                  ...(telemetry.provider ? { provider: telemetry.provider } : {}),
+                  ...(telemetry.model ? { model: telemetry.model } : {}),
+                }
+              : undefined;
+          await this.consumeDeferredCompactionDebt({
+            conversationId: params.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            tokenBudget: params.tokenBudget,
+            currentTokenCount: params.currentTokenCount,
+            legacyParams: deferredLegacyParams,
+          });
+          return;
+        }
+
+        this.deps.log.info(
+          `[lcm] assemble: deferred compaction still cache-hot for conversation=${params.conversationId} ${sessionLabel} retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"}`,
+        );
+      },
+      {
+        operationName: "assembleDeferredCompaction",
+        context: sessionLabel,
+      },
+    );
+  }
+
+  /** Run the actual compaction body without taking the per-session queue. */
+  private async executeCompactionCore(params: CompactionExecutionParams): Promise<CompactResult> {
+    const { force = false } = params;
+    const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
+    const lp = legacyParams ?? {};
+    const manualCompactionRequested =
+      (
+        lp as {
+          manualCompaction?: unknown;
+        }
+      ).manualCompaction === true;
+    const forceCompaction = force || manualCompactionRequested;
+    const resolvedTokenBudget = this.resolveTokenBudget({
+      tokenBudget: params.tokenBudget,
+      runtimeContext: params.runtimeContext,
+      legacyParams,
+    });
+    const tokenBudget = resolvedTokenBudget
+      ? this.applyAssemblyBudgetCap(resolvedTokenBudget)
+      : resolvedTokenBudget;
+    if (!tokenBudget) {
+      return {
+        ok: false,
+        compacted: false,
+        reason: "missing token budget in compact params",
+      };
+    }
+
+    const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
+      legacyParams,
+      customInstructions: params.customInstructions,
+      breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+    });
+    if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
+      return {
+        ok: true,
+        compacted: false,
+        reason: "circuit breaker open",
+      };
+    }
+
+    const conversationId = params.conversationId;
+    const observedTokens = this.normalizeObservedTokenCount(
+      params.currentTokenCount ??
+        (
+          lp as {
+            currentTokenCount?: unknown;
+          }
+        ).currentTokenCount,
+    );
+    const decision =
+      observedTokens !== undefined
+        ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
+        : await this.compaction.evaluate(conversationId, tokenBudget);
+    const targetTokens =
+      params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
+    const liveContextStillExceedsTarget =
+      observedTokens !== undefined && observedTokens >= targetTokens;
+
+    if (!forceCompaction && !decision.shouldCompact) {
+      return {
+        ok: true,
+        compacted: false,
+        reason: "below threshold",
+        result: {
+          tokensBefore: decision.currentTokens,
+        },
+      };
+    }
+
+    // Forced budget recovery should use the capped convergence loop so live
+    // overflow counts can drive recovery even when persisted context is already small.
+    const useSweep = manualCompactionRequested || params.compactionTarget === "threshold";
+    if (useSweep) {
+      const sweepResult = await this.compaction.compact({
+        conversationId,
+        tokenBudget,
+        summarize,
+        force: forceCompaction,
+        hardTrigger: false,
+        summaryModel,
+      });
+
+      if (sweepResult.authFailure && breakerKey) {
+        this.recordCompactionAuthFailure(breakerKey);
+      } else if (sweepResult.actionTaken && breakerKey) {
+        this.recordCompactionSuccess(breakerKey);
+      }
+      if (sweepResult.actionTaken) {
+        await this.markLeafCompactionTelemetrySuccess({ conversationId });
+      }
+
+      return {
+        ok: !sweepResult.authFailure && (sweepResult.actionTaken || !liveContextStillExceedsTarget),
+        compacted: sweepResult.actionTaken,
+        reason: sweepResult.authFailure
+          ? (sweepResult.actionTaken
+              ? "provider auth failure after partial compaction"
+              : "provider auth failure")
+          : sweepResult.actionTaken
+            ? "compacted"
+            : manualCompactionRequested
+              ? "nothing to compact"
+              : liveContextStillExceedsTarget
+                ? "live context still exceeds target"
+                : "already under target",
+        result: {
+          tokensBefore: decision.currentTokens,
+          tokensAfter: sweepResult.tokensAfter,
+          details: {
+            rounds: sweepResult.actionTaken ? 1 : 0,
+            targetTokens,
+          },
+        },
+      };
+    }
+
+    // When forced, use the token budget as target
+    const convergenceTargetTokens = forceCompaction
+      ? tokenBudget
+      : params.compactionTarget === "threshold"
+        ? decision.threshold
+        : tokenBudget;
+
+    // When forced (overflow recovery) and the caller did not supply an
+    // observed token count, assume we are at least at the token budget so
+    // compactUntilUnder does not bail with "already under target" while the
+    // live context is actually overflowing.
+    const effectiveCurrentTokens =
+      observedTokens !== undefined
+        ? observedTokens
+        : forceCompaction
+          ? tokenBudget
+          : undefined;
+    const compactResult = await this.compaction.compactUntilUnder({
+      conversationId,
+      tokenBudget,
+      targetTokens: convergenceTargetTokens,
+      ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
+      summarize,
+      summaryModel,
+    });
+
+    if (compactResult.authFailure && breakerKey) {
+      this.recordCompactionAuthFailure(breakerKey);
+    } else if (compactResult.rounds > 0 && breakerKey) {
+      this.recordCompactionSuccess(breakerKey);
+    }
+
+    const didCompact = compactResult.rounds > 0;
+    if (didCompact) {
+      await this.markLeafCompactionTelemetrySuccess({ conversationId });
+    }
+
+    return {
+      ok: compactResult.success,
+      compacted: didCompact,
+      reason: compactResult.authFailure
+        ? (didCompact
+            ? "provider auth failure after partial compaction"
+            : "provider auth failure")
+        : compactResult.success
+          ? didCompact
+            ? "compacted"
+            : "already under target"
+          : "could not reach target",
+      result: {
+        tokensBefore: decision.currentTokens,
+        tokensAfter: compactResult.finalTokens,
+        details: {
+          rounds: compactResult.rounds,
+          targetTokens: convergenceTargetTokens,
+        },
+      },
+    };
   }
 
   /** Resolve an LCM conversation id from a session key via the session store. */
@@ -3408,24 +3890,6 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
-    if (!this.config.transcriptGcEnabled) {
-      return {
-        changed: false,
-        bytesFreed: 0,
-        rewrittenEntries: 0,
-        reason: "transcript GC disabled",
-      };
-    }
-    if (typeof params.runtimeContext?.rewriteTranscriptEntries !== "function") {
-      return {
-        changed: false,
-        bytesFreed: 0,
-        rewrittenEntries: 0,
-        reason: "runtime rewrite helper unavailable",
-      };
-    }
-
-    const rewriteTranscriptEntries = params.runtimeContext.rewriteTranscriptEntries;
     const startedAt = Date.now();
     const sessionLabel = [
       `session=${params.sessionId}`,
@@ -3447,6 +3911,73 @@ export class LcmContextEngine implements ContextEngine {
           };
         }
 
+        let deferredCompactionResult: ContextEngineMaintenanceResult | null = null;
+        const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+          conversation.conversationId,
+        );
+        const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+          conversation.conversationId,
+        );
+        if (params.runtimeContext?.allowDeferredCompactionExecution === true) {
+          const runtimeTokenBudget = (() => {
+            const tokenBudget = asRecord(params.runtimeContext)?.tokenBudget;
+            if (
+              typeof tokenBudget === "number"
+              && Number.isFinite(tokenBudget)
+              && tokenBudget > 0
+            ) {
+              return Math.floor(tokenBudget);
+            }
+            return 128_000;
+          })();
+          if ((maintenance?.pending || maintenance?.running)
+            && this.shouldDelayPromptMutatingDeferredCompaction(telemetry)) {
+            this.deps.log.info(
+              `[lcm] maintain: deferred compaction debt still hot-cache deferred conversation=${conversation.conversationId} ${sessionLabel} retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"}`,
+            );
+          } else {
+            deferredCompactionResult = await this.consumeDeferredCompactionDebt({
+              conversationId: conversation.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              tokenBudget: this.applyAssemblyBudgetCap(runtimeTokenBudget),
+              currentTokenCount:
+                typeof params.runtimeContext?.currentTokenCount === "number"
+                  ? Math.floor(params.runtimeContext.currentTokenCount as number)
+                  : undefined,
+              runtimeContext: params.runtimeContext,
+              legacyParams: asRecord(params.runtimeContext),
+            });
+          }
+        } else if (maintenance?.pending || maintenance?.running) {
+          this.deps.log.info(
+            `[lcm] maintain: deferred compaction debt pending conversation=${conversation.conversationId} ${sessionLabel} but host runtimeContext.allowDeferredCompactionExecution is disabled`,
+          );
+        }
+
+        if (!this.config.transcriptGcEnabled) {
+          return (
+            deferredCompactionResult ?? {
+              changed: false,
+              bytesFreed: 0,
+              rewrittenEntries: 0,
+              reason: "transcript GC disabled",
+            }
+          );
+        }
+
+        if (typeof params.runtimeContext?.rewriteTranscriptEntries !== "function") {
+          return (
+            deferredCompactionResult ?? {
+              changed: false,
+              bytesFreed: 0,
+              rewrittenEntries: 0,
+              reason: "runtime rewrite helper unavailable",
+            }
+          );
+        }
+
+        const rewriteTranscriptEntries = params.runtimeContext.rewriteTranscriptEntries;
         const candidates = await this.summaryStore.listTranscriptGcCandidates(
           conversation.conversationId,
           { limit: TRANSCRIPT_GC_BATCH_SIZE },
@@ -3455,7 +3986,7 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.info(
             `[lcm] maintain: no transcript GC candidates conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
-          return {
+          return deferredCompactionResult ?? {
             changed: false,
             bytesFreed: 0,
             rewrittenEntries: 0,
@@ -3493,7 +4024,7 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.info(
             `[lcm] maintain: no matching transcript entries conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
-          return {
+          return deferredCompactionResult ?? {
             changed: false,
             bytesFreed: 0,
             rewrittenEntries: 0,
@@ -3518,10 +4049,19 @@ export class LcmContextEngine implements ContextEngine {
           }
         }
 
+        const combinedResult = deferredCompactionResult
+          ? {
+              changed: deferredCompactionResult.changed || result.changed,
+              bytesFreed: result.bytesFreed,
+              rewrittenEntries: result.rewrittenEntries,
+              reason: result.reason ?? deferredCompactionResult.reason,
+            }
+          : result;
+
         this.deps.log.info(
-          `[lcm] maintain: done conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} replacements=${replacements.length} changed=${result.changed} rewrittenEntries=${result.rewrittenEntries} bytesFreed=${result.bytesFreed} duration=${formatDurationMs(Date.now() - startedAt)}`,
+          `[lcm] maintain: done conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} replacements=${replacements.length} changed=${combinedResult.changed} rewrittenEntries=${combinedResult.rewrittenEntries} bytesFreed=${combinedResult.bytesFreed} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return result;
+        return combinedResult;
       },
       { operationName: "maintain", context: sessionLabel },
     );
@@ -3872,7 +4412,7 @@ export class LcmContextEngine implements ContextEngine {
       const rawLeafTrigger = await this.compaction.evaluateLeafTrigger(conversation.conversationId);
       await this.updateCompactionTelemetry({
         conversationId: conversation.conversationId,
-        runtimeContext: asRecord(params.runtimeContext),
+        runtimeContext: legacyParams,
         tokenBudget,
         rawTokensOutsideTail: rawLeafTrigger.rawTokensOutsideTail,
       });
@@ -3888,39 +4428,59 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget,
         currentTokenCount: liveContextTokens,
       });
-      if (leafDecision.shouldCompact) {
-        this.compactLeafAsync({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          sessionFile: params.sessionFile,
+      const thresholdDecision = await this.compaction.evaluate(
+        conversation.conversationId,
+        tokenBudget,
+        liveContextTokens,
+      );
+      if (this.config.proactiveThresholdCompactionMode === "inline") {
+        let leafCompactionScheduled = false;
+        if (leafDecision.shouldCompact) {
+          leafCompactionScheduled = true;
+          this.compactLeafAsync({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            sessionFile: params.sessionFile,
+            tokenBudget,
+            currentTokenCount: liveContextTokens,
+            legacyParams,
+            maxPasses: leafDecision.maxPasses,
+            leafChunkTokens: leafDecision.leafChunkTokens,
+            fallbackLeafChunkTokens: leafDecision.fallbackLeafChunkTokens,
+            activityBand: leafDecision.activityBand,
+            allowCondensedPasses: leafDecision.allowCondensedPasses,
+          }).catch(() => {
+            // Leaf compaction is best-effort and should not fail the caller.
+          });
+        }
+
+        if (!leafCompactionScheduled) {
+          try {
+            await this.compact({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              sessionFile: params.sessionFile,
+              tokenBudget,
+              currentTokenCount: liveContextTokens,
+              compactionTarget: "threshold",
+              legacyParams,
+            });
+          } catch {
+            // Proactive compaction is best-effort in the post-turn lifecycle.
+          }
+        }
+      } else if (thresholdDecision.shouldCompact || leafDecision.shouldCompact) {
+        await this.recordDeferredCompactionDebt({
+          conversationId: conversation.conversationId,
+          reason: thresholdDecision.shouldCompact ? "threshold" : leafDecision.reason,
           tokenBudget,
           currentTokenCount: liveContextTokens,
-          legacyParams,
-          maxPasses: leafDecision.maxPasses,
-          leafChunkTokens: leafDecision.leafChunkTokens,
-          fallbackLeafChunkTokens: leafDecision.fallbackLeafChunkTokens,
-          activityBand: leafDecision.activityBand,
-          allowCondensedPasses: leafDecision.allowCondensedPasses,
-        }).catch(() => {
-          // Leaf compaction is best-effort and should not fail the caller.
         });
       }
-    } catch {
-      // Leaf trigger checks are best-effort.
-    }
-
-    try {
-      await this.compact({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-        tokenBudget,
-        currentTokenCount: liveContextTokens,
-        compactionTarget: "threshold",
-        legacyParams,
-      });
-    } catch {
-      // Proactive compaction is best-effort in the post-turn lifecycle.
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] afterTurn: compaction policy check failed for ${sessionLabel}: ${describeLogError(err)}`,
+      );
     }
 
     this.deps.log.info(
@@ -3964,6 +4524,33 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
+      const tokenBudget = this.applyAssemblyBudgetCap(
+        typeof params.tokenBudget === "number" &&
+        Number.isFinite(params.tokenBudget) &&
+        params.tokenBudget > 0
+          ? Math.floor(params.tokenBudget)
+          : 128_000,
+      );
+      const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
+      const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+        conversation.conversationId,
+      );
+      if (maintenance?.pending || maintenance?.running) {
+        try {
+          await this.maybeConsumeDeferredCompactionDebtForAssemble({
+            conversationId: conversation.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            tokenBudget,
+            currentTokenCount: liveContextTokens,
+          });
+        } catch (error) {
+          this.deps.log.warn(
+            `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
+          );
+        }
+      }
+
       const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       if (contextItems.length === 0) {
         this.deps.log.info(
@@ -3988,14 +4575,6 @@ export class LcmContextEngine implements ContextEngine {
           estimatedTokens: 0,
         };
       }
-
-      const tokenBudget = this.applyAssemblyBudgetCap(
-        typeof params.tokenBudget === "number" &&
-        Number.isFinite(params.tokenBudget) &&
-        params.tokenBudget > 0
-          ? Math.floor(params.tokenBudget)
-          : 128_000,
-      );
 
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,
@@ -4067,6 +4646,158 @@ export class LcmContextEngine implements ContextEngine {
     return this.compaction.evaluateLeafTrigger(conversation.conversationId);
   }
 
+  /** Run one or more incremental leaf compaction passes without taking the per-session queue. */
+  private async executeLeafCompactionCore(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    tokenBudget: number;
+    currentTokenCount?: number;
+    customInstructions?: string;
+    /** OpenClaw runtime param name (preferred). */
+    runtimeContext?: Record<string, unknown>;
+    /** Back-compat param name. */
+    legacyParams?: Record<string, unknown>;
+    force?: boolean;
+    previousSummaryContent?: string;
+    maxPasses?: number;
+    leafChunkTokens?: number;
+    fallbackLeafChunkTokens?: number[];
+    activityBand?: ActivityBand;
+    allowCondensedPasses?: boolean;
+  }): Promise<CompactResult> {
+    const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
+    const observedTokens = this.normalizeObservedTokenCount(
+      params.currentTokenCount ??
+        (
+          (legacyParams ?? {}) as {
+            currentTokenCount?: unknown;
+          }
+        ).currentTokenCount,
+    );
+    const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
+      legacyParams,
+      customInstructions: params.customInstructions,
+      breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+    });
+    if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
+      return {
+        ok: true,
+        compacted: false,
+        reason: "circuit breaker open",
+      };
+    }
+
+    const storedTokensBefore = await this.summaryStore.getContextTokenCount(params.conversationId);
+    const maxPasses =
+      typeof params.maxPasses === "number" && Number.isFinite(params.maxPasses) && params.maxPasses > 0
+        ? Math.floor(params.maxPasses)
+        : 1;
+    const fallbackLeafChunkTokens = Array.isArray(params.fallbackLeafChunkTokens)
+      ? [...new Set(
+        params.fallbackLeafChunkTokens
+          .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0)
+          .map((value) => Math.floor(value)),
+      )].sort((a, b) => b - a)
+      : [];
+    let activeLeafChunkTokens =
+      typeof params.leafChunkTokens === "number"
+        && Number.isFinite(params.leafChunkTokens)
+        && params.leafChunkTokens > 0
+        ? Math.floor(params.leafChunkTokens)
+        : fallbackLeafChunkTokens[0];
+    this.deps.log.info(
+      `[lcm] compactLeafAsync start: conversation=${params.conversationId} session=${params.sessionId} leafChunkTokens=${activeLeafChunkTokens ?? "null"} fallbackLeafChunkTokens=${fallbackLeafChunkTokens.join(",")} maxPasses=${maxPasses} activityBand=${params.activityBand ?? "unknown"} allowCondensedPasses=${params.allowCondensedPasses !== false}`,
+    );
+
+    let rounds = 0;
+    let finalTokens = observedTokens ?? storedTokensBefore;
+    let authFailure = false;
+
+    for (let pass = 0; pass < maxPasses; pass += 1) {
+      let leafResult: Awaited<ReturnType<typeof this.compaction.compactLeaf>> | undefined;
+      while (true) {
+        try {
+          leafResult = await this.compaction.compactLeaf({
+            conversationId: params.conversationId,
+            tokenBudget: params.tokenBudget,
+            summarize,
+            ...(activeLeafChunkTokens !== undefined ? { leafChunkTokens: activeLeafChunkTokens } : {}),
+            force: params.force,
+            previousSummaryContent: pass === 0 ? params.previousSummaryContent : undefined,
+            summaryModel,
+            allowCondensedPasses: params.allowCondensedPasses,
+          });
+          break;
+        } catch (err) {
+          const nextLeafChunkTokens = fallbackLeafChunkTokens.find(
+            (value) => activeLeafChunkTokens !== undefined && value < activeLeafChunkTokens,
+          );
+          if (!this.isRecoverableLeafChunkOverflowError(err) || nextLeafChunkTokens === undefined) {
+            throw err;
+          }
+          this.deps.log.warn(
+            `[lcm] compactLeafAsync: retrying with smaller leafChunkTokens=${nextLeafChunkTokens} after provider token-limit error: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          activeLeafChunkTokens = nextLeafChunkTokens;
+        }
+      }
+      if (!leafResult) {
+        break;
+      }
+      finalTokens = leafResult.tokensAfter;
+
+      if (leafResult.authFailure) {
+        authFailure = true;
+        break;
+      }
+      if (!leafResult.actionTaken) {
+        break;
+      }
+      rounds += 1;
+      if (leafResult.tokensAfter >= leafResult.tokensBefore) {
+        break;
+      }
+    }
+
+    if (authFailure && breakerKey) {
+      this.recordCompactionAuthFailure(breakerKey);
+    } else if (rounds > 0 && breakerKey) {
+      this.recordCompactionSuccess(breakerKey);
+    }
+    if (rounds > 0) {
+      await this.markLeafCompactionTelemetrySuccess({
+        conversationId: params.conversationId,
+        activityBand: params.activityBand,
+      });
+    }
+
+    const tokensBefore = observedTokens ?? storedTokensBefore;
+    this.deps.log.debug(
+      `[lcm] compactLeafAsync result: conversation=${params.conversationId} session=${params.sessionId} rounds=${rounds} compacted=${rounds > 0} authFailure=${authFailure} finalLeafChunkTokens=${activeLeafChunkTokens ?? "null"} finalTokens=${finalTokens}`,
+    );
+
+    return {
+      ok: !authFailure,
+      compacted: rounds > 0,
+      reason: authFailure
+        ? "provider auth failure"
+        : rounds > 0
+          ? "compacted"
+          : "below threshold",
+      result: {
+        tokensBefore,
+        tokensAfter: finalTokens,
+        details: {
+          rounds,
+          targetTokens: params.tokenBudget,
+          mode: "leaf",
+          maxPasses,
+        },
+      },
+    };
+  }
+
   /** Run one or more incremental leaf compaction passes in the per-session queue. */
   async compactLeafAsync(params: {
     sessionId: string;
@@ -4109,7 +4840,6 @@ export class LcmContextEngine implements ContextEngine {
             reason: "no conversation found for session",
           };
         }
-
         const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
         const resolvedTokenBudget = this.resolveTokenBudget({
           tokenBudget: params.tokenBudget,
@@ -4126,140 +4856,23 @@ export class LcmContextEngine implements ContextEngine {
             reason: "missing token budget in compact params",
           };
         }
-
-        const lp = legacyParams ?? {};
-        const observedTokens = this.normalizeObservedTokenCount(
-          params.currentTokenCount ??
-            (
-              lp as {
-                currentTokenCount?: unknown;
-              }
-            ).currentTokenCount,
-        );
-        const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
-          legacyParams,
+        return this.executeLeafCompactionCore({
+          conversationId: conversation.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget,
+          currentTokenCount: params.currentTokenCount,
           customInstructions: params.customInstructions,
-          breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+          runtimeContext: params.runtimeContext,
+          legacyParams: params.legacyParams,
+          force: params.force,
+          previousSummaryContent: params.previousSummaryContent,
+          maxPasses: params.maxPasses,
+          leafChunkTokens: params.leafChunkTokens,
+          fallbackLeafChunkTokens: params.fallbackLeafChunkTokens,
+          activityBand: params.activityBand,
+          allowCondensedPasses: params.allowCondensedPasses,
         });
-        if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
-          return {
-            ok: true,
-            compacted: false,
-            reason: "circuit breaker open",
-          };
-        }
-
-        const storedTokensBefore = await this.summaryStore.getContextTokenCount(
-          conversation.conversationId,
-        );
-        const maxPasses =
-          typeof params.maxPasses === "number" &&
-          Number.isFinite(params.maxPasses) &&
-          params.maxPasses > 0
-            ? Math.floor(params.maxPasses)
-            : 1;
-        const fallbackLeafChunkTokens = Array.isArray(params.fallbackLeafChunkTokens)
-          ? [...new Set(params.fallbackLeafChunkTokens
-            .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0)
-            .map((value) => Math.floor(value)))]
-              .sort((a, b) => b - a)
-          : [];
-        let activeLeafChunkTokens =
-          typeof params.leafChunkTokens === "number" &&
-          Number.isFinite(params.leafChunkTokens) &&
-          params.leafChunkTokens > 0
-            ? Math.floor(params.leafChunkTokens)
-            : fallbackLeafChunkTokens[0];
-        this.deps.log.info(
-          `[lcm] compactLeafAsync start: conversation=${conversation.conversationId} session=${params.sessionId} leafChunkTokens=${activeLeafChunkTokens ?? "null"} fallbackLeafChunkTokens=${fallbackLeafChunkTokens.join(",")} maxPasses=${maxPasses} activityBand=${params.activityBand ?? "unknown"} allowCondensedPasses=${params.allowCondensedPasses !== false}`,
-        );
-
-        let rounds = 0;
-        let finalTokens = observedTokens ?? storedTokensBefore;
-        let authFailure = false;
-
-        for (let pass = 0; pass < maxPasses; pass += 1) {
-          let leafResult: Awaited<ReturnType<typeof this.compaction.compactLeaf>> | undefined;
-          while (true) {
-            try {
-              leafResult = await this.compaction.compactLeaf({
-                conversationId: conversation.conversationId,
-                tokenBudget,
-                summarize,
-                ...(activeLeafChunkTokens !== undefined ? { leafChunkTokens: activeLeafChunkTokens } : {}),
-                force: params.force,
-                previousSummaryContent: pass === 0 ? params.previousSummaryContent : undefined,
-                summaryModel,
-                allowCondensedPasses: params.allowCondensedPasses,
-              });
-              break;
-            } catch (err) {
-              const nextLeafChunkTokens = fallbackLeafChunkTokens.find(
-                (value) => activeLeafChunkTokens !== undefined && value < activeLeafChunkTokens,
-              );
-              if (!this.isRecoverableLeafChunkOverflowError(err) || nextLeafChunkTokens === undefined) {
-                throw err;
-              }
-              this.deps.log.warn(
-                `[lcm] compactLeafAsync: retrying with smaller leafChunkTokens=${nextLeafChunkTokens} after provider token-limit error: ${err instanceof Error ? err.message : String(err)}`,
-              );
-              activeLeafChunkTokens = nextLeafChunkTokens;
-            }
-          }
-          if (!leafResult) {
-            break;
-          }
-          finalTokens = leafResult.tokensAfter;
-
-          if (leafResult.authFailure) {
-            authFailure = true;
-            break;
-          }
-          if (!leafResult.actionTaken) {
-            break;
-          }
-          rounds += 1;
-          if (leafResult.tokensAfter >= leafResult.tokensBefore) {
-            break;
-          }
-        }
-
-        if (authFailure && breakerKey) {
-          this.recordCompactionAuthFailure(breakerKey);
-        } else if (rounds > 0 && breakerKey) {
-          this.recordCompactionSuccess(breakerKey);
-        }
-        if (rounds > 0) {
-          await this.markLeafCompactionTelemetrySuccess({
-            conversationId: conversation.conversationId,
-            activityBand: params.activityBand,
-          });
-        }
-
-        const tokensBefore = observedTokens ?? storedTokensBefore;
-        this.deps.log.debug(
-          `[lcm] compactLeafAsync result: conversation=${conversation.conversationId} session=${params.sessionId} rounds=${rounds} compacted=${rounds > 0} authFailure=${authFailure} finalLeafChunkTokens=${activeLeafChunkTokens ?? "null"} finalTokens=${finalTokens}`,
-        );
-
-        return {
-          ok: true,
-          compacted: rounds > 0,
-          reason: authFailure
-            ? "provider auth failure"
-            : rounds > 0
-              ? "compacted"
-              : "below threshold",
-          result: {
-            tokensBefore,
-            tokensAfter: finalTokens,
-            details: {
-              rounds,
-              targetTokens: tokenBudget,
-              mode: "leaf",
-              maxPasses,
-            },
-          },
-        };
       },
     );
   }
@@ -4297,11 +4910,8 @@ export class LcmContextEngine implements ContextEngine {
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
-        const { sessionId, force = false } = params;
-
-        // Look up conversation
         const conversation = await this.conversationStore.getConversationForSession({
-          sessionId,
+          sessionId: params.sessionId,
           sessionKey: params.sessionKey,
         });
         if (!conversation) {
@@ -4311,181 +4921,18 @@ export class LcmContextEngine implements ContextEngine {
             reason: "no conversation found for session",
           };
         }
-
-        const conversationId = conversation.conversationId;
-
-        const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
-        const lp = legacyParams ?? {};
-        const manualCompactionRequested =
-          (
-            lp as {
-              manualCompaction?: unknown;
-            }
-          ).manualCompaction === true;
-        const forceCompaction = force || manualCompactionRequested;
-        const resolvedTokenBudget = this.resolveTokenBudget({
+        return this.executeCompactionCore({
+          conversationId: conversation.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
           tokenBudget: params.tokenBudget,
-          runtimeContext: params.runtimeContext,
-          legacyParams,
-        });
-        const tokenBudget = resolvedTokenBudget
-          ? this.applyAssemblyBudgetCap(resolvedTokenBudget)
-          : resolvedTokenBudget;
-        if (!tokenBudget) {
-          return {
-            ok: false,
-            compacted: false,
-            reason: "missing token budget in compact params",
-          };
-        }
-
-        const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
-          legacyParams,
+          currentTokenCount: params.currentTokenCount,
+          compactionTarget: params.compactionTarget,
           customInstructions: params.customInstructions,
-          breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+          runtimeContext: params.runtimeContext,
+          legacyParams: params.legacyParams,
+          force: params.force,
         });
-        if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
-          return {
-            ok: true,
-            compacted: false,
-            reason: "circuit breaker open",
-          };
-        }
-
-        // Evaluate whether compaction is needed (unless forced)
-        const observedTokens = this.normalizeObservedTokenCount(
-          params.currentTokenCount ??
-            (
-              lp as {
-                currentTokenCount?: unknown;
-              }
-            ).currentTokenCount,
-        );
-        const decision =
-          observedTokens !== undefined
-            ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
-            : await this.compaction.evaluate(conversationId, tokenBudget);
-        const targetTokens =
-          params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
-        const liveContextStillExceedsTarget =
-          observedTokens !== undefined && observedTokens >= targetTokens;
-
-        if (!forceCompaction && !decision.shouldCompact) {
-          return {
-            ok: true,
-            compacted: false,
-            reason: "below threshold",
-            result: {
-              tokensBefore: decision.currentTokens,
-            },
-          };
-        }
-
-        // Forced budget recovery should use the capped convergence loop so live
-        // overflow counts can drive recovery even when persisted context is already small.
-        const useSweep = manualCompactionRequested || params.compactionTarget === "threshold";
-        if (useSweep) {
-          const sweepResult = await this.compaction.compact({
-            conversationId,
-            tokenBudget,
-            summarize,
-            force: forceCompaction,
-            hardTrigger: false,
-            summaryModel,
-          });
-
-          if (sweepResult.authFailure && breakerKey) {
-            this.recordCompactionAuthFailure(breakerKey);
-          } else if (sweepResult.actionTaken && breakerKey) {
-            this.recordCompactionSuccess(breakerKey);
-          }
-          if (sweepResult.actionTaken) {
-            await this.markLeafCompactionTelemetrySuccess({ conversationId });
-          }
-
-          return {
-            ok: !sweepResult.authFailure && (sweepResult.actionTaken || !liveContextStillExceedsTarget),
-            compacted: sweepResult.actionTaken,
-            reason: sweepResult.authFailure
-              ? (sweepResult.actionTaken
-                  ? "provider auth failure after partial compaction"
-                  : "provider auth failure")
-              : sweepResult.actionTaken
-                ? "compacted"
-                : manualCompactionRequested
-                  ? "nothing to compact"
-                  : liveContextStillExceedsTarget
-                    ? "live context still exceeds target"
-                    : "already under target",
-            result: {
-              tokensBefore: decision.currentTokens,
-              tokensAfter: sweepResult.tokensAfter,
-              details: {
-                rounds: sweepResult.actionTaken ? 1 : 0,
-                targetTokens,
-              },
-            },
-          };
-        }
-
-        // When forced, use the token budget as target
-        const convergenceTargetTokens = forceCompaction
-          ? tokenBudget
-          : params.compactionTarget === "threshold"
-            ? decision.threshold
-            : tokenBudget;
-
-        // When forced (overflow recovery) and the caller did not supply an
-        // observed token count, assume we are at least at the token budget so
-        // compactUntilUnder does not bail with "already under target" while the
-        // live context is actually overflowing.
-        const effectiveCurrentTokens =
-          observedTokens !== undefined
-            ? observedTokens
-            : forceCompaction
-              ? tokenBudget
-              : undefined;
-        const compactResult = await this.compaction.compactUntilUnder({
-          conversationId,
-          tokenBudget,
-          targetTokens: convergenceTargetTokens,
-          ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
-          summarize,
-          summaryModel,
-        });
-
-        if (compactResult.authFailure && breakerKey) {
-          this.recordCompactionAuthFailure(breakerKey);
-        } else if (compactResult.rounds > 0 && breakerKey) {
-          this.recordCompactionSuccess(breakerKey);
-        }
-
-        const didCompact = compactResult.rounds > 0;
-        if (didCompact) {
-          await this.markLeafCompactionTelemetrySuccess({ conversationId });
-        }
-
-        return {
-          ok: compactResult.success,
-          compacted: didCompact,
-          reason: compactResult.authFailure
-            ? (didCompact
-                ? "provider auth failure after partial compaction"
-                : "provider auth failure")
-            : compactResult.success
-              ? didCompact
-                ? "compacted"
-                : "already under target"
-              : "could not reach target",
-          result: {
-            tokensBefore: decision.currentTokens,
-            tokensAfter: compactResult.finalTokens,
-            details: {
-              rounds: compactResult.rounds,
-              targetTokens: convergenceTargetTokens,
-            },
-          },
-        };
       },
     );
   }
@@ -4765,6 +5212,10 @@ export class LcmContextEngine implements ContextEngine {
 
   getCompactionTelemetryStore(): CompactionTelemetryStore {
     return this.compactionTelemetryStore;
+  }
+
+  getCompactionMaintenanceStore(): CompactionMaintenanceStore {
+    return this.compactionMaintenanceStore;
   }
 
   // ── Heartbeat pruning ──────────────────────────────────────────────────

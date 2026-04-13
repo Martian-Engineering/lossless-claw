@@ -205,6 +205,18 @@ Why it matters:
 - keep this off unless you want transcript GC to mutate the live session file during maintenance
 - the default is `false`
 
+### `proactiveThresholdCompactionMode`
+
+Controls whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior.
+
+Why it matters:
+
+- `deferred` is the default and avoids foreground turn stalls by recording one coalesced maintenance row per conversation
+- `deferred` also stores provider/model/cache telemetry so Anthropic-family sessions can avoid rewriting a still-hot prompt cache
+- `inline` preserves the legacy foreground compaction path for hosts that do not yet support deferred execution
+- `/lossless status` and `/lcm status` surface pending/running/last-failure maintenance state so operators can see when compaction is queued
+- background `maintain()` can still do non-prompt-mutating work, but prompt-mutating debt is consumed pre-assembly once cache is cold or the next turn is already approaching overflow
+
 ## Compaction timing and shape
 
 ### `contextThreshold`
@@ -328,6 +340,19 @@ Why it matters:
 #### `cacheAwareCompaction.enabled`
 
 Defers incremental leaf compaction more aggressively when prompt-cache telemetry indicates a hot cache.
+
+#### `cacheAwareCompaction.cacheTTLSeconds`
+
+Fallback cache TTL used when deferred Anthropic compaction has provider/model telemetry but no explicit runtime cache-retention window.
+
+Why it matters:
+
+- lets cache-safe deferred compaction stay conservative even when the host only knows that the turn was Anthropic-family, not the exact retention tier
+- keeps prompt-mutating debt pending until the cached prefix is likely cold
+
+Default:
+
+- `300`
 
 #### `cacheAwareCompaction.maxColdCacheCatchupPasses`
 

@@ -153,6 +153,10 @@
       "label": "Cache-Aware Compaction",
       "help": "When enabled, hot prompt cache defers incremental compaction while cold cache allows bounded catch-up passes"
     },
+    "cacheAwareCompaction.cacheTTLSeconds": {
+      "label": "Short Cache TTL (seconds)",
+      "help": "Treat short-lived prompt-cache entries as hot for this many seconds before deferred compaction may rewrite the prompt"
+    },
     "cacheAwareCompaction.maxColdCacheCatchupPasses": {
       "label": "Cold Cache Catch-Up Passes",
       "help": "Maximum incremental leaf passes allowed in one maintenance cycle when prompt cache is cold"
@@ -184,6 +188,10 @@
     "transcriptGcEnabled": {
       "label": "Transcript GC",
       "help": "Enable transcript rewrite GC during maintain(); disabled by default"
+    },
+    "proactiveThresholdCompactionMode": {
+      "label": "Proactive Threshold Compaction Mode",
+      "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
     },
     "fallbackProviders": {
       "label": "Fallback Providers",
@@ -331,6 +339,10 @@
           "enabled": {
             "type": "boolean"
           },
+          "cacheTTLSeconds": {
+            "type": "integer",
+            "minimum": 1
+          },
           "maxColdCacheCatchupPasses": {
             "type": "integer",
             "minimum": 1
@@ -367,6 +379,13 @@
       },
       "transcriptGcEnabled": {
         "type": "boolean"
+      },
+      "proactiveThresholdCompactionMode": {
+        "type": "string",
+        "enum": [
+          "deferred",
+          "inline"
+        ]
       },
       "databasePath": {
         "description": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)",
