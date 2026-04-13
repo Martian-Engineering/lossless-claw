@@ -87,6 +87,7 @@ Good defaults:
 - `maxColdCacheCatchupPasses: 2`
 - `hotCachePressureFactor: 4`
 - `hotCacheBudgetHeadroomRatio: 0.2`
+- `coldCacheObservationThreshold: 3`
 
 Operationally:
 
