@@ -1139,6 +1139,46 @@ describe("lcm command", () => {
     expect(result.text).toContain("reason: disk full");
   });
 
+  it("lists exact restore target commands for available backups", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const latestPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
+    const timestampedPath = join(fixture.tempDir, "lcm.db.backup-20260413t010203z-abcd12.bak");
+    writeFileSync(latestPath, "latest");
+    writeFileSync(timestampedPath, "timestamped");
+
+    const result = await fixture.command.handler(createCommandContext("restore"));
+
+    expect(result.text).toContain("🧯 Lossless Claw Restore");
+    expect(result.text).toContain("`/lossless restore latest`");
+    expect(result.text).toContain("`/lossless restore backup-20260413t010203z-abcd12`");
+    expect(result.text).toContain(latestPath);
+    expect(result.text).toContain(timestampedPath);
+    expect(result.text).toContain("restore-pending");
+  });
+
+  it("renders a safe restore shell recipe for a selected target", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const latestPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
+    writeFileSync(latestPath, "latest");
+
+    const result = await fixture.command.handler(createCommandContext("restore latest"));
+
+    expect(result.text).toContain("🧯 Lossless Claw Restore");
+    expect(result.text).toContain("status: ready");
+    expect(result.text).toContain(`snapshot: ${latestPath}`);
+    expect(result.text).toContain("Stop OpenClaw before running this shell recipe");
+    expect(result.text).toContain("mv \"$DB-wal\" \"$WAL_ARCHIVE\"");
+    expect(result.text).toContain("mv \"$DB-shm\" \"$SHM_ARCHIVE\"");
+    expect(result.text).toContain("cp -p \"$BACKUP\" \"$DB\"");
+    expect(result.text).toContain("restore_guard_pending = 1");
+  });
+
   it("rotates the current session and replaces the latest rotate backup", async () => {
     const transcriptPath = join(tmpdir(), `lossless-claw-rotate-${Date.now()}.jsonl`);
     writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
@@ -1657,6 +1697,7 @@ describe("lcm command", () => {
     const result = await fixture.command.handler(createCommandContext("rewrite"));
     expect(result.text).toContain("⚠️ Unknown subcommand `rewrite`.");
     expect(result.text).toContain("`/lossless backup`");
+    expect(result.text).toContain("`/lossless restore`");
     expect(result.text).toContain("`/lossless rotate`");
     expect(result.text).toContain("`/lossless help`");
     expect(result.text).toContain("`/lcm` is accepted as a shorter alias.");

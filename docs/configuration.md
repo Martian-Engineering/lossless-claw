@@ -266,6 +266,22 @@ Lossless-claw now defaults `proactiveThresholdCompactionMode` to `deferred`.
 
 Before rotating, Lossless-claw replaces one rolling `rotate-latest` SQLite backup. It then rewrites the current session transcript and checkpoints the same conversation at the new transcript frontier so bootstrap does not replay the dropped transcript history. Existing summaries, context items, and conversation identity stay in place. If you want additional timestamped snapshots, run `/lcm backup` explicitly before `/lcm rotate`.
 
+### `/lcm restore`
+
+`/lcm restore` is a guided operator surface for restoring one of those SQLite snapshots safely.
+
+- `/lcm restore` with no target lists the currently available restore targets.
+- `latest` maps to the rolling `rotate-latest` backup when it exists.
+- timestamped/manual snapshots use the stable target name derived from the `.bak` filename.
+- `/lcm restore <target>` prints the exact shell recipe to run after OpenClaw is stopped.
+
+The emitted restore recipe is intentionally conservative:
+
+- it archives the current `lcm.db` before overwriting it
+- it archives stale `lcm.db-wal` and `lcm.db-shm` sidecars instead of leaving them behind
+- it copies the chosen backup into place as the new main database file
+- it marks bootstrap checkpoints as restore-pending so the next startup trusts the restored DB snapshot and does not replay transcript history that was written after the backup was taken
+
 ## Environment-only knobs outside plugin config
 
 These settings are not part of `plugins.entries.lossless-claw.config`, but they still affect the system:

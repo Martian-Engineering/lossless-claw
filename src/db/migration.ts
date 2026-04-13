@@ -162,6 +162,17 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   }
 }
 
+function ensureBootstrapStateColumns(db: DatabaseSync): void {
+  const bootstrapColumns = db.prepare(`PRAGMA table_info(conversation_bootstrap_state)`).all() as SummaryColumnInfo[];
+  const hasRestoreGuardPending = bootstrapColumns.some((col) => col.name === "restore_guard_pending");
+
+  if (!hasRestoreGuardPending) {
+    db.exec(
+      `ALTER TABLE conversation_bootstrap_state ADD COLUMN restore_guard_pending INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+}
+
 function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
   const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
   const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
@@ -849,6 +860,7 @@ export function runLcmMigrations(
       last_seen_mtime_ms INTEGER NOT NULL,
       last_processed_offset INTEGER NOT NULL,
       last_processed_entry_hash TEXT,
+      restore_guard_pending INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -970,6 +982,9 @@ export function runLcmMigrations(
   );
   runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
     ensureCompactionTelemetryColumns(db),
+  );
+  runMigrationStep("ensureBootstrapStateColumns", log, () =>
+    ensureBootstrapStateColumns(db),
   );
   runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));
   // Index on depth — created AFTER backfillSummaryDepths to avoid index

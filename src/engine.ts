@@ -3609,6 +3609,29 @@ export class LcmContextEngine implements ContextEngine {
             bootstrapState = null;
           }
 
+          // Guided restore marks checkpoints as restore-pending after a DB
+          // snapshot is copied back into place. On the next startup, trust the
+          // restored DB as the source of truth and advance the checkpoint to the
+          // live transcript EOF without replaying any transcript history.
+          if (
+            bootstrapState &&
+            bootstrapState.sessionFilePath === params.sessionFile &&
+            bootstrapState.restoreGuardPending
+          ) {
+            if (!conversation.bootstrappedAt) {
+              await this.conversationStore.markConversationBootstrapped(conversationId);
+            }
+            await persistBootstrapState(conversationId);
+            this.deps.log.info(
+              `[lcm] bootstrap: restore guard consumed conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} duration=${formatDurationMs(Date.now() - startedAt)}`,
+            );
+            return {
+              bootstrapped: false,
+              importedMessages: 0,
+              reason: "restore guard skipped transcript replay",
+            };
+          }
+
           // If the transcript file is byte-for-byte unchanged from the last
           // successful bootstrap checkpoint, skip reopening and reparsing it.
           if (

@@ -2368,6 +2368,85 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(second.reason).toBe("already bootstrapped");
   });
 
+  it("consumes restore guards without replaying transcript history and resumes future tail imports", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("restore-guard");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "first" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "second" }],
+    } as AgentMessage);
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "bootstrap-restore-guard";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "restored tail user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "restored tail assistant" }],
+    } as AgentMessage);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE conversation_bootstrap_state
+           SET restore_guard_pending = 1
+           WHERE conversation_id = ?`,
+        )
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "restore guard skipped transcript replay",
+    });
+    expect(await engine.getConversationStore().getMessageCount(conversation!.conversationId)).toBe(2);
+
+    const bootstrapStateAfterGuard = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(bootstrapStateAfterGuard?.restoreGuardPending).toBe(false);
+    expect(bootstrapStateAfterGuard?.lastSeenSize).toBe(statSync(sessionFile).size);
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "fresh tail user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "fresh tail assistant" }],
+    } as AgentMessage);
+
+    const third = await engine.bootstrap({ sessionId, sessionFile });
+    expect(third).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+    expect(await engine.getConversationStore().getMessageCount(conversation!.conversationId)).toBe(4);
+  });
+
   it("preserves ordinary bootstrap behavior when no checkpoint exists", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
     tempDirs.push(tempDir);
