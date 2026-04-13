@@ -86,6 +86,72 @@ export function acquireTransactionLock(db: DatabaseSync): Promise<() => void> {
   return waitOn.then(() => releaseResolve);
 }
 
+/** Raised when exclusive DB access does not become available before the deadline. */
+export class DatabaseTransactionTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Timed out after ${timeoutMs}ms waiting for exclusive database access.`);
+    this.name = "DatabaseTransactionTimeoutError";
+  }
+}
+
+/**
+ * Acquire exclusive DB access, but give up after the provided timeout.
+ *
+ * If acquisition completes after the timeout fires, this helper releases the
+ * late-acquired slot immediately so the mutex queue does not get stuck behind
+ * an abandoned waiter.
+ */
+export async function acquireTransactionLockWithTimeout(
+  db: DatabaseSync,
+  timeoutMs: number,
+): Promise<() => void> {
+  const normalizedTimeoutMs = Math.floor(timeoutMs);
+  const acquisition = acquireTransactionLock(db);
+
+  if (!Number.isFinite(normalizedTimeoutMs) || normalizedTimeoutMs < 0) {
+    return acquisition;
+  }
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      acquisition,
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new DatabaseTransactionTimeoutError(normalizedTimeoutMs));
+        }, normalizedTimeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    acquisition.then((release) => release(), () => {});
+    throw error;
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+}
+
+/**
+ * Run work while holding the per-database mutex, without opening a transaction.
+ *
+ * Use this when the caller must wait for all in-flight transactions to finish
+ * before performing work on the shared connection, but needs to control the
+ * exact transaction boundaries manually.
+ */
+export async function withExclusiveDatabaseLock<T>(
+  db: DatabaseSync,
+  options: { timeoutMs: number },
+  operation: () => Promise<T> | T,
+): Promise<T> {
+  const release = await acquireTransactionLockWithTimeout(db, options.timeoutMs);
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
 export type BeginTransactionStatement = "BEGIN" | "BEGIN IMMEDIATE";
 
 /**

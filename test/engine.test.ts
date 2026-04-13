@@ -2756,6 +2756,94 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(searchResults.some((result) => result.conversationId === original!.conversationId)).toBe(true);
   });
 
+  it("waits for an in-flight managed transaction before backing up and rotating", async () => {
+    const sessionFile = createSessionFilePath("lcm-rotate-storage-wait");
+    writeFileSync(
+      sessionFile,
+      "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n",
+    );
+    const engine = createEngine();
+    const sessionId = "rotate-storage-wait-session";
+    const sessionKey = "agent:main:main";
+
+    const current = await engine.getConversationStore().createConversation({
+      sessionId,
+      sessionKey,
+    });
+    await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: current.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    let releaseTransaction!: () => void;
+    let notifyTransactionStarted!: () => void;
+    const transactionStarted = new Promise<void>((resolve) => {
+      notifyTransactionStarted = resolve;
+    });
+    const transactionGate = new Promise<void>((resolve) => {
+      releaseTransaction = resolve;
+    });
+
+    const pendingTransaction = engine.getConversationStore().withTransaction(async () => {
+      await engine.getConversationStore().createMessage({
+        conversationId: current.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "queued rotate message",
+        tokenCount: 3,
+      });
+      notifyTransactionStarted();
+      await transactionGate;
+    });
+
+    await transactionStarted;
+
+    let rotateResolved = false;
+    const rotatePromise = engine
+      .rotateSessionStorageWithBackup({
+        sessionId,
+        sessionKey,
+        sessionFile,
+        lockTimeoutMs: 1_000,
+      })
+      .then((result) => {
+        rotateResolved = true;
+        return result;
+      });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(rotateResolved).toBe(false);
+
+    releaseTransaction();
+    await pendingTransaction;
+
+    const rotate = await rotatePromise;
+    expect(rotate).toMatchObject({
+      kind: "rotated",
+      currentConversationId: current.conversationId,
+      currentMessageCount: 2,
+      archivedConversationId: current.conversationId,
+    });
+    if (rotate.kind !== "rotated") {
+      throw new Error(`Expected rotate to succeed, received ${rotate.kind}`);
+    }
+
+    const backupDb = createLcmDatabaseConnection(rotate.backupPath);
+    try {
+      const backedUpMessageCount = backupDb
+        .prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`)
+        .get(current.conversationId) as { count: number };
+      expect(backedUpMessageCount.count).toBe(2);
+    } finally {
+      closeLcmConnection(backupDb);
+    }
+  });
+
   it("reports rotate as unavailable when the session transcript cannot be read", async () => {
     const engine = createEngine();
 

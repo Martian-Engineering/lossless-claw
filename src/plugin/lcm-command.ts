@@ -3,15 +3,12 @@ import type { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
-import type { RotateSessionStorageResult } from "../engine.js";
+import type { RotateSessionStorageWithBackupResult } from "../engine.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
 import type { OpenClawPluginCommandDefinition, PluginCommandContext } from "openclaw/plugin-sdk";
 import { applyScopedDoctorRepair } from "./lcm-doctor-apply.js";
-import {
-  createLcmDatabaseBackup,
-  createLcmDatabaseBackupFromSecondaryConnection,
-} from "./lcm-db-backup.js";
+import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
 import { describeLogError } from "../lcm-log.js";
 import {
   applyDoctorCleaners,
@@ -33,6 +30,7 @@ import { CompactionTelemetryStore } from "../store/compaction-telemetry-store.js
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
+const ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 
 type LcmStatusStats = {
   conversationCount: number;
@@ -77,11 +75,12 @@ type ParsedLcmCommand =
   | { kind: "help"; error?: string };
 
 type RotateCommandEngine = {
-  rotateSessionStorage(params: {
+  rotateSessionStorageWithBackup(params: {
     sessionId?: string;
     sessionKey?: string;
     sessionFile: string;
-  }): Promise<RotateSessionStorageResult>;
+    lockTimeoutMs: number;
+  }): Promise<RotateSessionStorageWithBackupResult>;
 };
 
 const DOCTOR_CLEANER_IDS = new Set<DoctorCleanerId>(getDoctorCleanerFilterIds());
@@ -989,36 +988,54 @@ async function buildRotateText(params: {
     return lines.join("\n");
   }
 
-  lines.push(
-    buildSection("📍 Current conversation", [
-      buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
-      buildStatLine("session key", formatCommand(truncateMiddle(sessionKey, 44))),
-      buildStatLine("messages", formatNumber(current.stats.messageCount)),
-    ]),
-    "",
-  );
-
-  let backupPath: string | null;
+  let result: RotateSessionStorageWithBackupResult;
   try {
-    backupPath = await createLcmDatabaseBackupFromSecondaryConnection({
-      databasePath: params.config.databasePath,
-      label: "rotate",
-      replaceLatest: true,
+    result = await (await params.getLcm()).rotateSessionStorageWithBackup({
+      sessionId,
+      sessionKey,
+      sessionFile: transcriptPath,
+      lockTimeoutMs: ROTATE_DATABASE_LOCK_TIMEOUT_MS,
     });
   } catch (error) {
     lines.push(
-      buildSection("💾 Backup", [
+      buildSection("🛠️ Rotate", [
         buildStatLine("status", "failed"),
         buildStatLine("reason", formatFailureReason(error)),
       ]),
     );
     return lines.join("\n");
   }
-  if (!backupPath) {
+
+  lines.push(
+    buildSection("📍 Current conversation", [
+      buildStatLine(
+        "conversation id",
+        formatNumber(result.currentConversationId ?? current.stats.conversationId),
+      ),
+      buildStatLine("session key", formatCommand(truncateMiddle(sessionKey, 44))),
+      buildStatLine(
+        "messages",
+        formatNumber(result.currentMessageCount ?? current.stats.messageCount),
+      ),
+    ]),
+    "",
+  );
+
+  if (result.kind === "backup_failed") {
+    lines.push(
+      buildSection("💾 Backup", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", result.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  if (result.kind === "unavailable" && !result.backupPath) {
     lines.push(
       buildSection("🛠️ Rotate", [
         buildStatLine("status", "unavailable"),
-        buildStatLine("reason", "Lossless Claw could not create the rotate backup."),
+        buildStatLine("reason", result.reason),
       ]),
     );
     return lines.join("\n");
@@ -1027,23 +1044,16 @@ async function buildRotateText(params: {
   lines.push(
     buildSection("💾 Backup", [
       buildStatLine("status", "replaced latest"),
-      buildStatLine("backup path", backupPath),
+      buildStatLine("backup path", result.backupPath!),
     ]),
     "",
   );
 
-  let result: RotateSessionStorageResult;
-  try {
-    result = await (await params.getLcm()).rotateSessionStorage({
-      sessionId,
-      sessionKey,
-      sessionFile: transcriptPath,
-    });
-  } catch (error) {
+  if (result.kind === "rotate_failed") {
     lines.push(
       buildSection("🛠️ Rotate", [
         buildStatLine("status", "failed"),
-        buildStatLine("reason", formatFailureReason(error)),
+        buildStatLine("reason", result.reason),
       ]),
     );
     return lines.join("\n");

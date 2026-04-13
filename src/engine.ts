@@ -68,6 +68,11 @@ import { SummaryStore } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
+import {
+  DatabaseTransactionTimeoutError,
+  withExclusiveDatabaseLock,
+} from "./transaction-mutex.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
@@ -1199,6 +1204,38 @@ export type RotateSessionStorageResult =
   | {
       kind: "unavailable";
       reason: string;
+    };
+
+export type RotateSessionStorageWithBackupResult =
+  | {
+      kind: "rotated";
+      currentConversationId: number;
+      currentMessageCount: number;
+      backupPath: string;
+      archivedConversationId: number;
+      activeConversationId: number;
+      archivedMessageCount: number;
+      checkpointSize: number;
+    }
+  | {
+      kind: "backup_failed";
+      currentConversationId: number;
+      currentMessageCount: number;
+      reason: string;
+    }
+  | {
+      kind: "rotate_failed";
+      currentConversationId: number;
+      currentMessageCount: number;
+      backupPath: string;
+      reason: string;
+    }
+  | {
+      kind: "unavailable";
+      reason: string;
+      currentConversationId?: number;
+      currentMessageCount?: number;
+      backupPath?: string;
     };
 
 function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | null {
@@ -5240,6 +5277,77 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  /**
+   * Rotate the active session row while a write transaction is already open.
+   *
+   * This keeps the transcript checkpointing and row replacement logic in one
+   * place so the command path can reuse it after taking a faithful backup on
+   * the shared connection.
+   */
+  private async rotateSessionStorageInActiveTransaction(params: {
+    sessionId: string;
+    sessionKey: string;
+    sessionFile: string;
+  }): Promise<RotateSessionStorageResult> {
+    const { sessionId, sessionKey } = params;
+    const current = await this.conversationStore.getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    if (!current?.active) {
+      return {
+        kind: "unavailable",
+        reason: "No active Lossless Claw conversation is stored for the current session.",
+      };
+    }
+
+    const archivedMessageCount = await this.conversationStore.getMessageCount(current.conversationId);
+    let sessionFileStats: ReturnType<typeof statSync>;
+    let tailEntryHash: string | null;
+    try {
+      sessionFileStats = statSync(params.sessionFile);
+      const tailEntryRaw = await readLastJsonlEntryBeforeOffset(
+        params.sessionFile,
+        sessionFileStats.size,
+        true,
+      );
+      const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
+      tailEntryHash = tailEntryMessage
+        ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
+        : null;
+    } catch (error) {
+      return {
+        kind: "unavailable",
+        reason: `Lossless Claw could not read the current session transcript: ${describeLogError(error)}`,
+      };
+    }
+
+    await this.conversationStore.archiveConversation(current.conversationId);
+    const freshConversation = await this.conversationStore.createConversation({
+      sessionId,
+      sessionKey,
+      title: current.title ?? undefined,
+    });
+    await this.summaryStore.upsertConversationBootstrapState({
+      conversationId: freshConversation.conversationId,
+      sessionFilePath: params.sessionFile,
+      lastSeenSize: sessionFileStats.size,
+      lastSeenMtimeMs: Math.trunc(sessionFileStats.mtimeMs),
+      lastProcessedOffset: sessionFileStats.size,
+      lastProcessedEntryHash: tailEntryHash,
+    });
+    this.deps.log.info(
+      `[lcm] rotate: archived conversation=${current.conversationId} session=${sessionId} sessionKey=${sessionKey} and created fresh conversation=${freshConversation.conversationId} checkpointSize=${sessionFileStats.size}`,
+    );
+    return {
+      kind: "rotated",
+      archivedConversationId: current.conversationId,
+      activeConversationId: freshConversation.conversationId,
+      archivedMessageCount,
+      checkpointSize: sessionFileStats.size,
+    };
+  }
+
   async rotateSessionStorage(params: {
     sessionId?: string;
     sessionKey?: string;
@@ -5270,64 +5378,214 @@ export class LcmContextEngine implements ContextEngine {
     return this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),
       async () =>
-        this.conversationStore.withTransaction(async () => {
-          const current = await this.conversationStore.getConversationForSession({
+        this.conversationStore.withTransaction(() =>
+          this.rotateSessionStorageInActiveTransaction({
             sessionId,
             sessionKey,
-          });
-          if (!current?.active) {
-            return {
-              kind: "unavailable",
-              reason: "No active Lossless Claw conversation is stored for the current session.",
-            };
-          }
+            sessionFile: params.sessionFile,
+          })
+        ),
+    );
+  }
 
-          const archivedMessageCount = await this.conversationStore.getMessageCount(current.conversationId);
-          let sessionFileStats: ReturnType<typeof statSync>;
-          let tailEntryHash: string | null;
-          try {
-            sessionFileStats = statSync(params.sessionFile);
-            const tailEntryRaw = await readLastJsonlEntryBeforeOffset(
-              params.sessionFile,
-              sessionFileStats.size,
-              true,
-            );
-            const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
-            tailEntryHash = tailEntryMessage
-              ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
-              : null;
-          } catch (error) {
-            return {
-              kind: "unavailable",
-              reason: `Lossless Claw could not read the current session transcript: ${describeLogError(error)}`,
-            };
-          }
+  /**
+   * Rotate session storage while the caller already holds exclusive DB access.
+   *
+   * The caller is responsible for ordering any higher-level queues before
+   * entering this helper. This method only manages the rotate write
+   * transaction on the shared connection.
+   */
+  async rotateSessionStorageWhileHoldingDatabaseLock(params: {
+    sessionId?: string;
+    sessionKey?: string;
+    sessionFile: string;
+  }): Promise<RotateSessionStorageResult> {
+    const sessionId = params.sessionId?.trim();
+    const sessionKey = params.sessionKey?.trim();
+    if (!sessionId || !sessionKey) {
+      return {
+        kind: "unavailable",
+        reason: "Lossless Claw needs both the current session id and session key to rotate storage safely.",
+      };
+    }
+    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
+      return {
+        kind: "unavailable",
+        reason: "The current session is excluded by ignoreSessionPatterns, so there is no active LCM conversation to rotate.",
+      };
+    }
+    if (this.isStatelessSession(sessionKey)) {
+      return {
+        kind: "unavailable",
+        reason: "The current session is stateless in Lossless Claw, so there is no writable active LCM conversation to rotate.",
+      };
+    }
 
-          await this.conversationStore.archiveConversation(current.conversationId);
-          const freshConversation = await this.conversationStore.createConversation({
-            sessionId,
-            sessionKey,
-            title: current.title ?? undefined,
-          });
-          await this.summaryStore.upsertConversationBootstrapState({
-            conversationId: freshConversation.conversationId,
-            sessionFilePath: params.sessionFile,
-            lastSeenSize: sessionFileStats.size,
-            lastSeenMtimeMs: Math.trunc(sessionFileStats.mtimeMs),
-            lastProcessedOffset: sessionFileStats.size,
-            lastProcessedEntryHash: tailEntryHash,
-          });
-          this.deps.log.info(
-            `[lcm] rotate: archived conversation=${current.conversationId} session=${sessionId} sessionKey=${sessionKey} and created fresh conversation=${freshConversation.conversationId} checkpointSize=${sessionFileStats.size}`,
+    this.ensureMigrated();
+    if (this.db.isTransaction) {
+      return {
+        kind: "unavailable",
+        reason:
+          "Lossless Claw obtained exclusive rotate access, but the shared database connection is still inside another transaction.",
+      };
+    }
+
+    let transactionActive = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionActive = true;
+      const result = await this.rotateSessionStorageInActiveTransaction({
+        sessionId,
+        sessionKey,
+        sessionFile: params.sessionFile,
+      });
+      this.db.exec("COMMIT");
+      transactionActive = false;
+      return result;
+    } catch (error) {
+      if (transactionActive) {
+        this.db.exec("ROLLBACK");
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Wait for same-session work and DB transactions to drain, then back up and rotate.
+   *
+   * This is the safe command path: it preserves session ordering, waits for the
+   * shared connection to become idle, takes the pre-rotate backup on that live
+   * connection, and only then opens the rotate write transaction.
+   */
+  async rotateSessionStorageWithBackup(params: {
+    sessionId?: string;
+    sessionKey?: string;
+    sessionFile: string;
+    lockTimeoutMs: number;
+  }): Promise<RotateSessionStorageWithBackupResult> {
+    const sessionId = params.sessionId?.trim();
+    const sessionKey = params.sessionKey?.trim();
+    if (!sessionId || !sessionKey) {
+      return {
+        kind: "unavailable",
+        reason: "Lossless Claw needs both the current session id and session key to rotate storage safely.",
+      };
+    }
+    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
+      return {
+        kind: "unavailable",
+        reason: "The current session is excluded by ignoreSessionPatterns, so there is no active LCM conversation to rotate.",
+      };
+    }
+    if (this.isStatelessSession(sessionKey)) {
+      return {
+        kind: "unavailable",
+        reason: "The current session is stateless in Lossless Claw, so there is no writable active LCM conversation to rotate.",
+      };
+    }
+
+    this.ensureMigrated();
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(sessionId, sessionKey),
+      async () => {
+        try {
+          return await withExclusiveDatabaseLock(
+            this.db,
+            { timeoutMs: params.lockTimeoutMs },
+            async () => {
+              if (this.db.isTransaction) {
+                return {
+                  kind: "unavailable" as const,
+                  reason:
+                    "Lossless Claw obtained exclusive rotate access, but the shared database connection is still inside another transaction.",
+                };
+              }
+
+              const current = await this.conversationStore.getConversationForSession({
+                sessionId,
+                sessionKey,
+              });
+              if (!current?.active) {
+                return {
+                  kind: "unavailable" as const,
+                  reason: "No active Lossless Claw conversation is stored for the current session.",
+                };
+              }
+
+              const currentMessageCount = await this.conversationStore.getMessageCount(current.conversationId);
+              let backupPath: string | null = null;
+              try {
+                backupPath = createLcmDatabaseBackup(this.db, {
+                  databasePath: this.config.databasePath,
+                  label: "rotate",
+                  replaceLatest: true,
+                });
+              } catch (error) {
+                return {
+                  kind: "backup_failed" as const,
+                  currentConversationId: current.conversationId,
+                  currentMessageCount,
+                  reason: describeLogError(error),
+                };
+              }
+
+              if (!backupPath) {
+                return {
+                  kind: "unavailable" as const,
+                  currentConversationId: current.conversationId,
+                  currentMessageCount,
+                  reason: "Lossless Claw could not create the rotate backup.",
+                };
+              }
+
+              let rotateResult: RotateSessionStorageResult;
+              try {
+                rotateResult = await this.rotateSessionStorageWhileHoldingDatabaseLock({
+                  sessionId,
+                  sessionKey,
+                  sessionFile: params.sessionFile,
+                });
+              } catch (error) {
+                return {
+                  kind: "rotate_failed" as const,
+                  currentConversationId: current.conversationId,
+                  currentMessageCount,
+                  backupPath,
+                  reason: describeLogError(error),
+                };
+              }
+              if (rotateResult.kind === "unavailable") {
+                return {
+                  kind: "unavailable" as const,
+                  currentConversationId: current.conversationId,
+                  currentMessageCount,
+                  backupPath,
+                  reason: rotateResult.reason,
+                };
+              }
+
+              return {
+                kind: "rotated" as const,
+                currentConversationId: current.conversationId,
+                currentMessageCount,
+                backupPath,
+                archivedConversationId: rotateResult.archivedConversationId,
+                activeConversationId: rotateResult.activeConversationId,
+                archivedMessageCount: rotateResult.archivedMessageCount,
+                checkpointSize: rotateResult.checkpointSize,
+              };
+            },
           );
-          return {
-            kind: "rotated",
-            archivedConversationId: current.conversationId,
-            activeConversationId: freshConversation.conversationId,
-            archivedMessageCount,
-            checkpointSize: sessionFileStats.size,
-          };
-        }),
+        } catch (error) {
+          if (error instanceof DatabaseTransactionTimeoutError) {
+            return {
+              kind: "unavailable",
+              reason: `Lossless Claw waited ${Math.floor(params.lockTimeoutMs / 1000)}s for the database to become idle, but another transaction never finished.`,
+            };
+          }
+          throw error;
+        }
+      },
     );
   }
 

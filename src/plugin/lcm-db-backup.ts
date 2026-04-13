@@ -1,6 +1,6 @@
 import { rmSync, renameSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { backup, DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import { getFileBackedDatabasePath } from "../db/connection.js";
 
 function quoteSqlString(value: string): string {
@@ -78,53 +78,5 @@ export function createLcmDatabaseBackup(
   }
 
   writeLcmDatabaseBackup(db, backupPath);
-  return backupPath;
-}
-
-export async function createLcmDatabaseBackupFromSecondaryConnection(
-  options: {
-    databasePath: string;
-    label: string;
-    replaceLatest?: boolean;
-  },
-): Promise<string | null> {
-  const fileBackedDatabasePath = getFileBackedDatabasePath(options.databasePath);
-  if (!fileBackedDatabasePath) {
-    return null;
-  }
-
-  const copyBackupFromSecondaryConnection = async (targetPath: string): Promise<void> => {
-    const sourceDb = new DatabaseSync(fileBackedDatabasePath);
-    try {
-      await backup(sourceDb, targetPath);
-    } finally {
-      sourceDb.close();
-    }
-  };
-
-  if (options.replaceLatest) {
-    const latestBackupPath = buildLcmDatabaseLatestBackupPath(options.databasePath, options.label);
-    const tempBackupPath = buildLcmDatabaseBackupPath(options.databasePath, `${options.label}-tmp`);
-    if (!latestBackupPath || !tempBackupPath) {
-      return null;
-    }
-
-    try {
-      await copyBackupFromSecondaryConnection(tempBackupPath);
-      rmSync(latestBackupPath, { force: true });
-      renameSync(tempBackupPath, latestBackupPath);
-      return latestBackupPath;
-    } catch (error) {
-      rmSync(tempBackupPath, { force: true });
-      throw error;
-    }
-  }
-
-  const backupPath = buildLcmDatabaseBackupPath(options.databasePath, options.label);
-  if (!backupPath) {
-    return null;
-  }
-
-  await copyBackupFromSecondaryConnection(backupPath);
   return backupPath;
 }
