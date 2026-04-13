@@ -6,6 +6,7 @@ import type { LcmSummarizeFn } from "../summarize.js";
 import { createLcmSummarizeFromLegacyParams } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
 import { detectDoctorMarker, loadDoctorTargets, type DoctorTargetRecord } from "./lcm-doctor-shared.js";
+import { estimateTokens } from "../estimate-tokens.js";
 
 type SummaryOverride = {
   content: string;
@@ -524,9 +525,6 @@ function parseSqliteTimestamp(value: string | null | undefined): Date | null {
   return null;
 }
 
-function estimateTokens(text: string): number {
-  return Math.max(1, Math.ceil(text.length / 4));
-}
 
 function updateSummaryFts(db: DatabaseSync, summaryId: string, content: string): void {
   try {

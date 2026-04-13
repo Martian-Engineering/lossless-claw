@@ -53,4 +53,24 @@ describe("sanitizeFts5Query", () => {
   it("handles caret (initial token)", () => {
     expect(sanitizeFts5Query("^start")).toBe('"^start"');
   });
+
+  it("preserves multi-word quoted phrases", () => {
+    expect(sanitizeFts5Query('"error handling" debug')).toBe('"error handling" "debug"');
+  });
+
+  it("preserves multiple quoted phrases", () => {
+    expect(sanitizeFts5Query('"error handling" OR "crash report"')).toBe(
+      '"error handling" "OR" "crash report"',
+    );
+  });
+
+  it("handles mixed quoted and unquoted terms", () => {
+    expect(sanitizeFts5Query('find "database migration" in code')).toBe(
+      '"find" "database migration" "in" "code"',
+    );
+  });
+
+  it("handles empty quoted phrase", () => {
+    expect(sanitizeFts5Query('""')).toBe('""');
+  });
 });

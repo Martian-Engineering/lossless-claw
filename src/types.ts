@@ -6,6 +6,7 @@
  */
 
 import type { LcmConfig } from "./db/config.js";
+import type { LcmConfigDiagnostics } from "./db/config.js";
 
 /**
  * Minimal LLM completion interface needed by LCM for summarization.
@@ -39,11 +40,13 @@ export type CompleteFn = (params: {
   authProfileId?: string;
   agentDir?: string;
   runtimeConfig?: unknown;
+  skipModelAuth?: boolean;
   messages: Array<{ role: string; content: unknown }>;
   system?: string;
   maxTokens: number;
   temperature?: number;
   reasoning?: string;
+  reasoningIfSupported?: string;
 }) => Promise<CompletionResult>;
 
 /**
@@ -105,6 +108,9 @@ export interface LcmDependencies {
   /** LCM configuration (from env vars + plugin config) */
   config: LcmConfig;
 
+  /** Optional config resolution metadata for startup diagnostics. */
+  configDiagnostics?: LcmConfigDiagnostics;
+
   /** LLM completion function for summarization */
   complete: CompleteFn;
 
@@ -150,6 +156,12 @@ export interface LcmDependencies {
 
   /** Resolve runtime session id from an agent session key */
   resolveSessionIdFromSessionKey: (sessionKey: string) => Promise<string | undefined>;
+
+  /** Resolve the current transcript file path for a session identity */
+  resolveSessionTranscriptFile: (params: {
+    sessionId: string;
+    sessionKey?: string;
+  }) => Promise<string | undefined>;
 
   /** Agent lane constant for subagents */
   agentLaneSubagent: string;

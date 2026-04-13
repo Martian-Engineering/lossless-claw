@@ -36,6 +36,7 @@ func TestBackfillImportCreatesConversationMessagesAndContext(t *testing.T) {
 
 	assertCount(t, db, `SELECT COUNT(*) FROM conversations WHERE session_id = 'session-import'`, 1)
 	assertCountQuery(t, db, `SELECT COUNT(*) FROM messages WHERE conversation_id = ?`, len(input.messages), result.conversationID)
+	assertCountQuery(t, db, `SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND identity_hash IS NOT NULL AND identity_hash != ''`, len(input.messages), result.conversationID)
 	assertCountQuery(t, db, `SELECT COUNT(*) FROM context_items WHERE conversation_id = ? AND item_type = 'message'`, len(input.messages), result.conversationID)
 	assertCountQuery(t, db, `SELECT COUNT(*) FROM message_parts mp JOIN messages m ON m.message_id = mp.message_id WHERE m.conversation_id = ?`, len(input.messages), result.conversationID)
 }
@@ -449,6 +450,7 @@ func setupBackfillTestSchema(t *testing.T, db *sql.DB) {
 			role TEXT NOT NULL,
 			content TEXT NOT NULL,
 			token_count INTEGER NOT NULL,
+			identity_hash TEXT,
 			created_at TEXT NOT NULL,
 			UNIQUE (conversation_id, seq)
 		);

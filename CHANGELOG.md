@@ -1,5 +1,91 @@
 # @martian-engineering/lossless-claw
 
+## 0.8.2
+
+### Patch Changes
+
+- [#400](https://github.com/Martian-Engineering/lossless-claw/pull/400) [`1711957`](https://github.com/Martian-Engineering/lossless-claw/commit/17119577e847750f3c08ab84e47e0e6628bca9ed) Thanks [@jalehman](https://github.com/jalehman)! - Strip comments from the pre-bundled dist/index.js so the OpenClaw install-time code safety scanner no longer flags JSDoc prose (e.g. "Fetch all context items") as a network-send pattern and blocks installation with an `env-harvesting` false positive.
+
+## 0.8.1
+
+### Patch Changes
+
+- [#379](https://github.com/Martian-Engineering/lossless-claw/pull/379) [`7f42703`](https://github.com/Martian-Engineering/lossless-claw/commit/7f4270327ac22cc9028ff4261d44b53561d93a50) Thanks [@jalehman](https://github.com/jalehman)! - Improve the `session_id` fallback conversation lookup by adding the matching composite index so SQLite can satisfy the latest-conversation query without a scan and temp sort.
+
+- [#366](https://github.com/Martian-Engineering/lossless-claw/pull/366) [`f4177ec`](https://github.com/Martian-Engineering/lossless-claw/commit/f4177ec9f06af3dbc9da5241288f62e61bcd26c0) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Fix bootstrap recovery when a session rotates to a new transcript file so stale summaries and checkpoints are cleared before re-importing the replacement session history.
+
+- [#376](https://github.com/Martian-Engineering/lossless-claw/pull/376) [`06a05e5`](https://github.com/Martian-Engineering/lossless-claw/commit/06a05e515828cc99c4bbd1ceb4edfaa40f869264) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Add startup diagnostics that attribute resolved ignore/stateless pattern sources, and warn when env-backed pattern arrays override plugin config arrays.
+
+- [#353](https://github.com/Martian-Engineering/lossless-claw/pull/353) [`6fa2829`](https://github.com/Martian-Engineering/lossless-claw/commit/6fa2829929c14f0c3175efd59a4df68c0e5b8d45) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Pre-bundle the plugin to `dist/index.js` using esbuild before publishing. This eliminates the per-invocation TypeScript compilation overhead caused by OpenClaw's JITI loader recursively transpiling every `.ts` source file, reducing CLI startup latency from 15–25 s to near-instant.
+
+- [#354](https://github.com/Martian-Engineering/lossless-claw/pull/354) [`b0ad788`](https://github.com/Martian-Engineering/lossless-claw/commit/b0ad78872e3f51fe6b1b1bed0a9c93e8e439554e) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Honor `OPENCLAW_STATE_DIR` for the default database, large-file storage, auth-profile, and legacy secret paths so multi-profile OpenClaw gateways do not read and write each other's state.
+
+- [#380](https://github.com/Martian-Engineering/lossless-claw/pull/380) [`33ecb88`](https://github.com/Martian-Engineering/lossless-claw/commit/33ecb8828b6f6258b6884da15e5750af07a0f846) Thanks [@jalehman](https://github.com/jalehman)! - Stop rerunning startup summary and tool-call backfills after they complete successfully, while still retrying the same backfill version cleanly if startup fails before the completion marker is written.
+
+- [#371](https://github.com/Martian-Engineering/lossless-claw/pull/371) [`597ec70`](https://github.com/Martian-Engineering/lossless-claw/commit/597ec700f09660aa58899ef6ef3f37d19112e0df) Thanks [@holgergruenhagen](https://github.com/holgergruenhagen)! - Avoid treating omitted LCM summarizer reasoning settings like reasoning-disabled requests for reasoning-capable models by applying a low default only when the resolved model supports reasoning.
+
+- [#377](https://github.com/Martian-Engineering/lossless-claw/pull/377) [`3b2d34c`](https://github.com/Martian-Engineering/lossless-claw/commit/3b2d34c4e68601e37ce3b012bb38ae4ca5e977af) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Add an opt-in `transcriptGcEnabled` config flag, defaulting it to `false`, and skip transcript-GC rewrites during `maintain()` unless the flag is enabled. Also add startup diagnostics and documentation for the new setting.
+
+- [#387](https://github.com/Martian-Engineering/lossless-claw/pull/387) [`5113044`](https://github.com/Martian-Engineering/lossless-claw/commit/5113044bbbea5af36324e2a546c5adc40b8aabb2) Thanks [@oguzbilgic](https://github.com/oguzbilgic)! - Refresh the bootstrap checkpoint after normal `afterTurn()` ingestion so persistent sessions can keep using the append-only bootstrap fast path after real conversation turns.
+
+## 0.8.0
+
+### Minor Changes
+
+- [#337](https://github.com/Martian-Engineering/lossless-claw/pull/337) [`0c139a2`](https://github.com/Martian-Engineering/lossless-claw/commit/0c139a2991350a062c59a0a9781f314ebb75af45) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Add `/lossless doctor clean apply` for backup-first cleanup of approved high-confidence junk conversations, while preserving archived-only handling for NULL-key subagent rows and surfacing integrity-check warnings after apply.
+
+- [#323](https://github.com/Martian-Engineering/lossless-claw/pull/323) [`e781980`](https://github.com/Martian-Engineering/lossless-claw/commit/e781980ee706f5d67c902b903a003eaf7665c8e4) Thanks [@jalehman](https://github.com/jalehman)! - Allow `lcm_expand_query(allConversations: true)` to synthesize bounded answers across multiple conversations, including per-conversation diagnostics for partial or truncated results.
+
+### Patch Changes
+
+- [#332](https://github.com/Martian-Engineering/lossless-claw/pull/332) [`98cb02a`](https://github.com/Martian-Engineering/lossless-claw/commit/98cb02a2acddf177a4989e68887e4bbccf06292a) Thanks [@jalehman](https://github.com/jalehman)! - Clarify `lcm_grep` and `lcm_expand_query` guidance so agents use shorter FTS5 queries, keep natural-language instructions in `prompt`, and avoid over-constraining recall with extra keywords.
+
+- [#344](https://github.com/Martian-Engineering/lossless-claw/pull/344) [`897a953`](https://github.com/Martian-Engineering/lossless-claw/commit/897a953300b35208b894050ac73bc8160a03b0da) Thanks [@jetd1](https://github.com/jetd1)! - Keep compaction summary caps and deterministic fallback truncation within budget for CJK-heavy and emoji-heavy content.
+
+- [#331](https://github.com/Martian-Engineering/lossless-claw/pull/331) [`d7a57c5`](https://github.com/Martian-Engineering/lossless-claw/commit/d7a57c51361307fa27818d14c2c7b426609c9ee8) Thanks [@jalehman](https://github.com/jalehman)! - Recover from malformed legacy `summaries_fts` tables during migration instead of crashing plugin startup.
+
+- [#334](https://github.com/Martian-Engineering/lossless-claw/pull/334) [`71d6d9c`](https://github.com/Martian-Engineering/lossless-claw/commit/71d6d9ce1a0846f85cefd92e6895c7cfaee2350a) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Harden malformed FTS migration recovery so stale trigram tables are cleaned up before other FTS schema probes and startup migrations no longer skip recovery by reusing a cached FTS5 capability check.
+
+- [#172](https://github.com/Martian-Engineering/lossless-claw/pull/172) [`8bf5e7f`](https://github.com/Martian-Engineering/lossless-claw/commit/8bf5e7fb73b02d75350aae7cc47df46f9b425f1a) Thanks [@craigamcw](https://github.com/craigamcw)! - Skip ingesting empty assistant messages from errored or aborted provider responses so they do not accumulate in assembled context and trigger retry loops.
+
+- [#330](https://github.com/Martian-Engineering/lossless-claw/pull/330) [`acf1e02`](https://github.com/Martian-Engineering/lossless-claw/commit/acf1e02ef43efc8f8187d51e37493f152fb9d06b) Thanks [@little-jax](https://github.com/little-jax)! - Restore direct-credential summarizer retries for custom provider aliases and avoid misreporting transient provider failures as `provider_config` errors.
+
+- [#351](https://github.com/Martian-Engineering/lossless-claw/pull/351) [`ea1f80d`](https://github.com/Martian-Engineering/lossless-claw/commit/ea1f80d80111f9dafd3d527bf98976e38b6ea694) Thanks [@kitcommerce](https://github.com/kitcommerce)! - Ensure forced overflow recovery still runs compaction when live observed token counts are unavailable.
+
+- [#328](https://github.com/Martian-Engineering/lossless-claw/pull/328) [`3de1f9e`](https://github.com/Martian-Engineering/lossless-claw/commit/3de1f9e8393970af9a170333becf7a3050cb066a) Thanks [@jalehman](https://github.com/jalehman)! - Fall back to `plugins.entries["lossless-claw"].config` when older or otherwise incompatible OpenClaw runtimes do not provide a usable `api.pluginConfig`.
+
+## 0.7.0
+
+### Minor Changes
+
+- [#318](https://github.com/Martian-Engineering/lossless-claw/pull/318) [`b7078df`](https://github.com/Martian-Engineering/lossless-claw/commit/b7078df9c4466c6249a8c0f11424a6e75ea7be4c) Thanks [@jalehman](https://github.com/jalehman)! - Add optional dynamic leaf chunk sizing for incremental compaction, including bounded activity-based chunk growth, cold-cache max bumping, and automatic retry with smaller chunk targets when a provider rejects an oversized compaction request.
+
+- [#296](https://github.com/Martian-Engineering/lossless-claw/pull/296) [`4906c62`](https://github.com/Martian-Engineering/lossless-claw/commit/4906c6283a4033f34397bf527ae4a5c40adccdfc) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Improve `lcm_grep` full-text recall with phrase-preserving queries and `sort` modes (`recency`, `relevance`, and `hybrid`) that rank results before `limit` is applied.
+
+- [#285](https://github.com/Martian-Engineering/lossless-claw/pull/285) [`aac2668`](https://github.com/Martian-Engineering/lossless-claw/commit/aac266834b075f9adae95c86ccf9be9b91161275) Thanks [@mvanhorn](https://github.com/mvanhorn)! - Add conversation prune function for bulk data retention, allowing deletion of conversations where all messages are older than a configurable threshold.
+
+### Patch Changes
+
+- [#295](https://github.com/Martian-Engineering/lossless-claw/pull/295) [`1ef1b29`](https://github.com/Martian-Engineering/lossless-claw/commit/1ef1b297c5d3dead44cc4460cdf60ef6191395ea) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Reduce compaction database work by caching per-phase context reads, skipping redundant ordinal resequencing, and tracking token-count deltas instead of re-querying after each pass.
+
+- [#318](https://github.com/Martian-Engineering/lossless-claw/pull/318) [`b7078df`](https://github.com/Martian-Engineering/lossless-claw/commit/b7078df9c4466c6249a8c0f11424a6e75ea7be4c) Thanks [@jalehman](https://github.com/jalehman)! - Make incremental leaf compaction cache-aware by deferring extra passes while prompt caching is hot, allowing bounded catch-up when the cache goes cold, and adding `cacheAwareCompaction` config controls for the behavior.
+
+- [#319](https://github.com/Martian-Engineering/lossless-claw/pull/319) [`3bc5bde`](https://github.com/Martian-Engineering/lossless-claw/commit/3bc5bde7a52b163ee2fe7f22302e97e3e8295b11) Thanks [@jalehman](https://github.com/jalehman)! - Document the full lossless-claw configuration surface and align the plugin manifest schema and UI hints with the runtime-supported config keys.
+
+- [#288](https://github.com/Martian-Engineering/lossless-claw/pull/288) [`d74ad07`](https://github.com/Martian-Engineering/lossless-claw/commit/d74ad070888e7be5e4e1730ddc6506708075317e) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Wait for deferred LCM database initialization after lock-contended gateway restarts, and surface the real retry failure when deferred startup cannot recover.
+
+- [#294](https://github.com/Martian-Engineering/lossless-claw/pull/294) [`43342d9`](https://github.com/Martian-Engineering/lossless-claw/commit/43342d9fea5c62ea4320a7bca60732bad09122d2) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Tune SQLite defaults for large lossless-claw databases by increasing the page cache, keeping temporary structures in memory, and using WAL-friendly synchronous settings.
+
+  Add missing indexes for `summary_messages(message_id)` and `summaries(conversation_id, depth, kind)` so summary cleanup and depth-filtered queries avoid full table scans on existing databases.
+
+- [#302](https://github.com/Martian-Engineering/lossless-claw/pull/302) [`558183d`](https://github.com/Martian-Engineering/lossless-claw/commit/558183d9ead262d06d58bbfc801e172781c278b8) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Fix compaction summarizer exhaustion handling so multi-provider non-auth failures log the terminal exhaustion path and fall back to deterministic truncation instead of returning an empty summary.
+
+- [#322](https://github.com/Martian-Engineering/lossless-claw/pull/322) [`d0dacc9`](https://github.com/Martian-Engineering/lossless-claw/commit/d0dacc929f317bc7470fc935f6338461603f4039) Thanks [@jalehman](https://github.com/jalehman)! - Use OpenClaw runtime-ready model auth for summarization requests so managed auth providers work correctly.
+
+- [#329](https://github.com/Martian-Engineering/lossless-claw/pull/329) [`6579b91`](https://github.com/Martian-Engineering/lossless-claw/commit/6579b913adcc3a88610d873f7eacefbaa663c3d2) Thanks [@jalehman](https://github.com/jalehman)! - Improve lossless-claw reliability around cache-aware compaction and transcript replay, including heartbeat-turn pruning, bootstrap compatibility for legacy JSONL message envelopes, and updated runtime logging/docs alignment.
+
+- [#300](https://github.com/Martian-Engineering/lossless-claw/pull/300) [`a42f422`](https://github.com/Martian-Engineering/lossless-claw/commit/a42f422c1bc6c386c31e098d0b865dd3fedcbe9f) Thanks [@jalehman](https://github.com/jalehman)! - Fix `lcm-tui` Telegram topic session lookups so topic-backed sessions show the correct conversation metadata, summary counts, and file counts when browsing session keys.
+
 ## 0.6.3
 
 ### Patch Changes

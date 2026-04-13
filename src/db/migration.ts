@@ -1,6 +1,11 @@
 import type { DatabaseSync } from "node:sqlite";
 import { getLcmDbFeatures } from "./features.js";
+import { buildMessageIdentityHash } from "../store/message-identity.js";
 import { parseUtcTimestampOrNull } from "../store/parse-utc-timestamp.js";
+
+type MigrationLogger = {
+  info?: (message: string) => void;
+};
 
 type SummaryColumnInfo = {
   name?: string;
@@ -26,6 +31,32 @@ type SummaryParentEdgeRow = {
   summary_id: string;
   parent_summary_id: string;
 };
+
+type TableNameRow = {
+  name?: string;
+};
+
+type MessageIdentityBackfillRow = {
+  message_id: number;
+  role: string;
+  content: string;
+};
+
+type FtsTableSpec = {
+  tableName: string;
+  createSql: string;
+  seedSql: string;
+  expectedColumns: string[];
+  staleSchemaPatterns?: string[];
+};
+
+const VERSIONED_BACKFILL_STEPS = {
+  backfillSummaryDepths: 1,
+  backfillSummaryMetadata: 1,
+  backfillToolCallColumns: 1,
+} as const;
+
+type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
 
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
   const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
@@ -75,6 +106,187 @@ function ensureSummaryModelColumn(db: DatabaseSync): void {
   const hasModel = summaryColumns.some((col) => col.name === "model");
   if (!hasModel) {
     db.exec(`ALTER TABLE summaries ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`);
+  }
+}
+
+function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
+  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
+  const hasConsecutiveColdObservations = telemetryColumns.some(
+    (col) => col.name === "consecutive_cold_observations",
+  );
+  const hasLastLeafCompactionAt = telemetryColumns.some((col) => col.name === "last_leaf_compaction_at");
+  const hasTurnsSinceLeafCompaction = telemetryColumns.some((col) => col.name === "turns_since_leaf_compaction");
+  const hasTokensAccumulatedSinceLeafCompaction = telemetryColumns.some(
+    (col) => col.name === "tokens_accumulated_since_leaf_compaction",
+  );
+  const hasLastActivityBand = telemetryColumns.some((col) => col.name === "last_activity_band");
+  const hasLastApiCallAt = telemetryColumns.some((col) => col.name === "last_api_call_at");
+  const hasLastCacheTouchAt = telemetryColumns.some((col) => col.name === "last_cache_touch_at");
+  const hasProvider = telemetryColumns.some((col) => col.name === "provider");
+  const hasModel = telemetryColumns.some((col) => col.name === "model");
+
+  if (!hasConsecutiveColdObservations) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN consecutive_cold_observations INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+  if (!hasLastLeafCompactionAt) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_leaf_compaction_at TEXT`);
+  }
+  if (!hasTurnsSinceLeafCompaction) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+  if (!hasTokensAccumulatedSinceLeafCompaction) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+  if (!hasLastActivityBand) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_activity_band TEXT NOT NULL DEFAULT 'low' CHECK (last_activity_band IN ('low', 'medium', 'high'))`,
+    );
+  }
+  if (!hasLastApiCallAt) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_api_call_at TEXT`);
+  }
+  if (!hasLastCacheTouchAt) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_cache_touch_at TEXT`);
+  }
+  if (!hasProvider) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN provider TEXT`);
+  }
+  if (!hasModel) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN model TEXT`);
+  }
+}
+
+function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
+  if (!hasIdentityHash) {
+    db.exec(`ALTER TABLE messages ADD COLUMN identity_hash TEXT`);
+  }
+}
+
+function backfillMessageIdentityHashes(db: DatabaseSync): void {
+  const selectStmt = db.prepare(
+    `SELECT message_id, role, content
+     FROM messages
+     WHERE identity_hash IS NULL OR identity_hash = ''
+     ORDER BY message_id
+     LIMIT ?`,
+  );
+  const updateStmt = db.prepare(`UPDATE messages SET identity_hash = ? WHERE message_id = ?`);
+
+  while (true) {
+    const rows = selectStmt.all(1_000) as MessageIdentityBackfillRow[];
+    if (rows.length === 0) {
+      return;
+    }
+    for (const row of rows) {
+      updateStmt.run(buildMessageIdentityHash(row.role, row.content), row.message_id);
+    }
+  }
+}
+
+function describeMigrationError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function runMigrationStep(
+  name: string,
+  log: MigrationLogger | undefined,
+  step: () => void,
+): void {
+  const startedAt = Date.now();
+  try {
+    step();
+    log?.info?.(
+      `[lcm] migration step complete: step=${name} durationMs=${Date.now() - startedAt}`,
+    );
+  } catch (error) {
+    log?.info?.(
+      `[lcm] migration step failed: step=${name} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
+    );
+    throw error;
+  }
+}
+
+function getVersionedBackfillSavepointName(stepName: VersionedBackfillStepName): string {
+  return `lcm_backfill_${stepName}`;
+}
+
+function hasCompletedVersionedBackfill(
+  db: DatabaseSync,
+  stepName: VersionedBackfillStepName,
+  algorithmVersion: number,
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1
+       FROM lcm_migration_state
+       WHERE step_name = ? AND algorithm_version = ?
+       LIMIT 1`,
+    )
+    .get(stepName, algorithmVersion) as { 1?: number } | undefined;
+  return row != null;
+}
+
+function markVersionedBackfillComplete(
+  db: DatabaseSync,
+  stepName: VersionedBackfillStepName,
+  algorithmVersion: number,
+): void {
+  db.prepare(
+    `INSERT INTO lcm_migration_state (step_name, algorithm_version, completed_at)
+     VALUES (?, ?, datetime('now'))
+     ON CONFLICT(step_name, algorithm_version)
+     DO UPDATE SET completed_at = excluded.completed_at`,
+  ).run(stepName, algorithmVersion);
+}
+
+function rollbackSavepoint(db: DatabaseSync, savepointName: string): void {
+  try {
+    db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+  } finally {
+    db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+  }
+}
+
+function runVersionedBackfillStep(
+  db: DatabaseSync,
+  stepName: VersionedBackfillStepName,
+  log: MigrationLogger | undefined,
+  step: () => void,
+): void {
+  const algorithmVersion = VERSIONED_BACKFILL_STEPS[stepName];
+  if (hasCompletedVersionedBackfill(db, stepName, algorithmVersion)) {
+    log?.info?.(
+      `[lcm] migration step skipped: step=${stepName} algorithmVersion=${algorithmVersion} reason=already-complete`,
+    );
+    return;
+  }
+
+  const startedAt = Date.now();
+  const savepointName = getVersionedBackfillSavepointName(stepName);
+
+  db.exec(`SAVEPOINT ${savepointName}`);
+
+  try {
+    step();
+    markVersionedBackfillComplete(db, stepName, algorithmVersion);
+    db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+    log?.info?.(
+      `[lcm] migration step complete: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${Date.now() - startedAt}`,
+    );
+  } catch (error) {
+    rollbackSavepoint(db, savepointName);
+    log?.info?.(
+      `[lcm] migration step failed: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
+    );
+    throw error;
   }
 }
 
@@ -415,10 +627,89 @@ function backfillToolCallColumns(db: DatabaseSync): void {
   );
 }
 
+function getExistingTableNames(db: DatabaseSync, names: string[]): Set<string> {
+  if (names.length === 0) {
+    return new Set();
+  }
+  const placeholders = names.map(() => "?").join(", ");
+  const rows = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`)
+    .all(...names) as TableNameRow[];
+  return new Set(
+    rows
+      .map((row) => row.name)
+      .filter((name): name is string => typeof name === "string" && name.length > 0),
+  );
+}
+
+function getFtsShadowTableNames(tableName: string): string[] {
+  return [
+    `${tableName}_data`,
+    `${tableName}_idx`,
+    `${tableName}_content`,
+    `${tableName}_docsize`,
+    `${tableName}_config`,
+  ];
+}
+
+function quoteSqlIdentifier(identifier: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
+    throw new Error(`Invalid SQL identifier: ${identifier}`);
+  }
+  return `"${identifier.replaceAll(`"`, `""`)}"`;
+}
+
+function shouldRecreateStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec): boolean {
+  const shadowTables = getFtsShadowTableNames(spec.tableName);
+  const existingTables = getExistingTableNames(db, [spec.tableName, ...shadowTables]);
+  if (!existingTables.has(spec.tableName)) {
+    return true;
+  }
+  if (shadowTables.some((name) => !existingTables.has(name))) {
+    return true;
+  }
+
+  try {
+    const info = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name = ?")
+      .get(spec.tableName) as { sql?: string } | undefined;
+    const sql = info?.sql ?? "";
+    if (spec.staleSchemaPatterns?.some((pattern) => sql.includes(pattern))) {
+      return true;
+    }
+
+    const columns = db
+      .prepare(`PRAGMA table_info(${quoteSqlIdentifier(spec.tableName)})`)
+      .all() as SummaryColumnInfo[];
+    const columnNames = new Set(
+      columns
+        .map((col) => col.name)
+        .filter((name): name is string => typeof name === "string" && name.length > 0),
+    );
+    return spec.expectedColumns.some((column) => !columnNames.has(column));
+  } catch {
+    return true;
+  }
+}
+
+function ensureStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec): void {
+  if (!shouldRecreateStandaloneFtsTable(db, spec)) {
+    return;
+  }
+
+  db.exec(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(spec.tableName)}`);
+  for (const shadowTableName of getFtsShadowTableNames(spec.tableName)) {
+    db.exec(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(shadowTableName)}`);
+  }
+  db.exec(spec.createSql);
+  db.exec(spec.seedSql);
+}
+
 export function runLcmMigrations(
   db: DatabaseSync,
-  options?: { fts5Available?: boolean },
+  options?: { fts5Available?: boolean; log?: MigrationLogger },
 ): void {
+  const log = options?.log;
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -439,6 +730,7 @@ export function runLcmMigrations(
       role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
       content TEXT NOT NULL,
       token_count INTEGER NOT NULL,
+      identity_hash TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (conversation_id, seq)
     );
@@ -546,15 +838,65 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS conversation_compaction_telemetry (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      last_observed_cache_read INTEGER,
+      last_observed_cache_write INTEGER,
+      last_observed_cache_hit_at TEXT,
+      last_observed_cache_break_at TEXT,
+      cache_state TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (cache_state IN ('hot', 'cold', 'unknown')),
+      consecutive_cold_observations INTEGER NOT NULL DEFAULT 0,
+      retention TEXT,
+      last_leaf_compaction_at TEXT,
+      turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
+      tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
+      last_activity_band TEXT NOT NULL DEFAULT 'low'
+        CHECK (last_activity_band IN ('low', 'medium', 'high')),
+      last_api_call_at TEXT,
+      last_cache_touch_at TEXT,
+      provider TEXT,
+      model TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS conversation_compaction_maintenance (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      pending INTEGER NOT NULL DEFAULT 0,
+      requested_at TEXT,
+      reason TEXT,
+      running INTEGER NOT NULL DEFAULT 0,
+      last_started_at TEXT,
+      last_finished_at TEXT,
+      last_failure_summary TEXT,
+      token_budget INTEGER,
+      current_token_count INTEGER,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS lcm_migration_state (
+      step_name TEXT NOT NULL,
+      algorithm_version INTEGER NOT NULL,
+      completed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (step_name, algorithm_version)
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
+    CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
+    CREATE INDEX IF NOT EXISTS summary_parents_parent_summary_idx ON summary_parents (parent_summary_id);
     CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts (message_id);
     CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type);
     CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal);
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
       ON conversation_bootstrap_state (session_file_path, updated_at);
+    CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
+      ON conversation_compaction_telemetry (cache_state, updated_at);
+
+    -- Speed up summary_messages lookups by message_id (PK is summary_id,message_id)
+    CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
   `);
 
   // Forward-compatible conversations migration for existing DBs.
@@ -591,76 +933,100 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS conversations_session_key_active_created_idx
     ON conversations (session_key, active, created_at)
   `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS conversations_session_id_active_created_idx
+    ON conversations (session_id, active, created_at)
+  `);
   db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
-  ensureSummaryDepthColumn(db);
-  ensureSummaryMetadataColumns(db);
-  ensureSummaryModelColumn(db);
-  backfillSummaryDepths(db);
-  backfillSummaryMetadata(db);
-  backfillToolCallColumns(db);
+  runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
+  runMigrationStep("ensureSummaryMetadataColumns", log, () =>
+    ensureSummaryMetadataColumns(db),
+  );
+  runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
+  runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
+    ensureMessageIdentityHashColumn(db),
+  );
+  runMigrationStep("backfillMessageIdentityHashes", log, () =>
+    backfillMessageIdentityHashes(db),
+  );
+  runMigrationStep("createMessagesIdentityHashIndex", log, () =>
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS messages_conv_identity_hash_idx ON messages (conversation_id, identity_hash)`,
+    ),
+  );
+  runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
+    ensureCompactionTelemetryColumns(db),
+  );
+  runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));
+  // Index on depth — created AFTER backfillSummaryDepths to avoid index
+  // maintenance overhead during bulk depth updates on large existing DBs.
+  runMigrationStep("createSummariesDepthIndex", log, () =>
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
+    ),
+  );
+  runVersionedBackfillStep(db, "backfillSummaryMetadata", log, () =>
+    backfillSummaryMetadata(db),
+  );
+  runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
+    backfillToolCallColumns(db),
+  );
 
-  const fts5Available = options?.fts5Available ?? getLcmDbFeatures(db).fts5Available;
+  const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
+  const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
   if (!fts5Available) {
     return;
   }
 
-  // FTS5 virtual tables for full-text search (cannot use IF NOT EXISTS, so check manually)
-  const hasFts = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'")
-    .get();
+  const trigramTokenizerAvailable = detectedFeatures?.trigramTokenizerAvailable ?? false;
+  if (!trigramTokenizerAvailable) {
+    try {
+      db.exec(`DROP TABLE IF EXISTS summaries_fts_cjk`);
+    } catch {
+      // Best effort only. A stale virtual table should not block core migration.
+    }
+  }
 
-  if (hasFts) {
-    // Check for stale schema: external-content FTS tables with content_rowid cause errors.
-    // Drop and recreate as standalone FTS if the old schema is detected.
-    const ftsSchema = (
-      db
-        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'")
-        .get() as { sql: string } | undefined
-    )?.sql;
-    if (ftsSchema && ftsSchema.includes("content_rowid")) {
-      db.exec("DROP TABLE messages_fts");
-      db.exec(`
+  // FTS5 virtual tables for full-text search (cannot use IF NOT EXISTS, so check manually)
+  runMigrationStep("ensureMessagesFts", log, () => {
+    ensureStandaloneFtsTable(db, {
+      tableName: "messages_fts",
+      createSql: `
         CREATE VIRTUAL TABLE messages_fts USING fts5(
           content,
           tokenize='porter unicode61'
-        );
-        INSERT INTO messages_fts(rowid, content) SELECT message_id, content FROM messages;
-      `);
-    }
-  } else {
-    db.exec(`
-      CREATE VIRTUAL TABLE messages_fts USING fts5(
-        content,
-        tokenize='porter unicode61'
-      );
-    `);
-  }
+        )
+      `,
+      seedSql: `
+        INSERT INTO messages_fts(rowid, content)
+        SELECT message_id, content FROM messages
+      `,
+      expectedColumns: ["content"],
+      staleSchemaPatterns: ["content_rowid"],
+    });
+  });
 
-  const summariesFtsInfo = db
-    .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='summaries_fts'")
-    .get() as { sql?: string } | undefined;
-  const summariesFtsSql = summariesFtsInfo?.sql ?? "";
-  const summariesFtsColumns = db.prepare(`PRAGMA table_info(summaries_fts)`).all() as Array<{
-    name?: string;
-  }>;
-  const hasSummaryIdColumn = summariesFtsColumns.some((col) => col.name === "summary_id");
-  const shouldRecreateSummariesFts =
-    !summariesFtsInfo ||
-    !hasSummaryIdColumn ||
-    summariesFtsSql.includes("content_rowid='summary_id'") ||
-    summariesFtsSql.includes('content_rowid="summary_id"');
-  if (shouldRecreateSummariesFts) {
-    db.exec(`
-      DROP TABLE IF EXISTS summaries_fts;
-      CREATE VIRTUAL TABLE summaries_fts USING fts5(
-        summary_id UNINDEXED,
-        content,
-        tokenize='porter unicode61'
-      );
-      INSERT INTO summaries_fts(summary_id, content)
-      SELECT summary_id, content FROM summaries;
-    `);
-  }
+  runMigrationStep("ensureSummariesFts", log, () => {
+    ensureStandaloneFtsTable(db, {
+      tableName: "summaries_fts",
+      createSql: `
+        CREATE VIRTUAL TABLE summaries_fts USING fts5(
+          summary_id UNINDEXED,
+          content,
+          tokenize='porter unicode61'
+        )
+      `,
+      seedSql: `
+        INSERT INTO summaries_fts(summary_id, content)
+        SELECT summary_id, content FROM summaries
+      `,
+      expectedColumns: ["summary_id", "content"],
+      staleSchemaPatterns: [
+        "content_rowid='summary_id'",
+        'content_rowid="summary_id"',
+      ],
+    });
+  });
 
   // ── CJK trigram FTS table ────────────────────────────────────────────────
   // FTS5 unicode61 (porter) tokenizer cannot segment CJK ideographs, so CJK
@@ -670,20 +1036,23 @@ export function runLcmMigrations(
   //
   // A trigram-tokenized table indexes every 3-character substring, enabling
   // native CJK substring matching via FTS5 MATCH with OR semantics.
-  const cjkTableExists = db
-    .prepare(
-      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summaries_fts_cjk'",
-    )
-    .get();
-  if (!cjkTableExists) {
-    db.exec(`
-      CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
-        summary_id UNINDEXED,
-        content,
-        tokenize='trigram'
-      );
-      INSERT INTO summaries_fts_cjk(summary_id, content)
-      SELECT summary_id, content FROM summaries;
-    `);
-  }
+  runMigrationStep("ensureSummariesFtsCjk", log, () => {
+    if (trigramTokenizerAvailable) {
+      ensureStandaloneFtsTable(db, {
+        tableName: "summaries_fts_cjk",
+        createSql: `
+          CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
+            summary_id UNINDEXED,
+            content,
+            tokenize='trigram'
+          )
+        `,
+        seedSql: `
+          INSERT INTO summaries_fts_cjk(summary_id, content)
+          SELECT summary_id, content FROM summaries
+        `,
+        expectedColumns: ["summary_id", "content"],
+      });
+    }
+  });
 }

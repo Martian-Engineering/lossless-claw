@@ -137,7 +137,7 @@ export function createLcmExpandTool(input: {
       "Use this to drill into previously-compacted context when you need detail " +
       "that was summarised away. Provide either summaryIds (direct expansion) or " +
       "query (grep-first, then expand top matches). Returns a compact text payload " +
-      "with cited IDs for follow-up.",
+      "plus cited IDs in tool output for follow-up.",
     parameters: LcmExpandSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());

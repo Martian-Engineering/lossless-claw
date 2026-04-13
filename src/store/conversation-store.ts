@@ -3,7 +3,9 @@ import { randomUUID } from "node:crypto";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
+import { buildMessageIdentityHash } from "./message-identity.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
+import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -29,6 +31,7 @@ export type CreateMessageInput = {
   role: MessageRole;
   content: string;
   tokenCount: number;
+  identityHash?: string;
 };
 
 export type MessageRecord = {
@@ -94,6 +97,7 @@ export type MessageSearchInput = {
   since?: Date;
   before?: Date;
   limit?: number;
+  sort?: SearchSort;
 };
 
 export type MessageSearchResult = {
@@ -136,6 +140,11 @@ interface MessageSearchRow {
   snippet: string;
   rank: number;
   created_at: string;
+}
+
+interface MessageIdentityRow {
+  role: MessageRole;
+  content: string;
 }
 
 interface MessagePartRow {
@@ -432,10 +441,17 @@ export class ConversationStore {
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
     const result = this.db
       .prepare(
-        `INSERT INTO messages (conversation_id, seq, role, content, token_count)
-       VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
+       VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(input.conversationId, input.seq, input.role, input.content, input.tokenCount);
+      .run(
+        input.conversationId,
+        input.seq,
+        input.role,
+        input.content,
+        input.tokenCount,
+        input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
+      );
 
     const messageId = Number(result.lastInsertRowid);
 
@@ -456,8 +472,8 @@ export class ConversationStore {
       return [];
     }
     const insertStmt = this.db.prepare(
-      `INSERT INTO messages (conversation_id, seq, role, content, token_count)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
+       VALUES (?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
       `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
@@ -472,6 +488,7 @@ export class ConversationStore {
         input.role,
         input.content,
         input.tokenCount,
+        input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
       );
 
       const messageId = Number(result.lastInsertRowid);
@@ -533,16 +550,18 @@ export class ConversationStore {
     role: MessageRole,
     content: string,
   ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
     const row = this.db
       .prepare(
-        `SELECT 1 AS count
+        `SELECT role, content
        FROM messages
-       WHERE conversation_id = ? AND role = ? AND content = ?
-       LIMIT 1`,
+       WHERE conversation_id = ? AND identity_hash = ?
+       LIMIT 8`,
       )
-      .get(conversationId, role, content) as unknown as CountRow | undefined;
+      .all(conversationId, identityHash) as unknown as MessageIdentityRow[];
 
-    return row?.count === 1;
+    // The hash narrows candidates quickly; the raw-content check preserves exact identity.
+    return row.some((candidate) => candidate.role === role && candidate.content === content);
   }
 
   async countMessagesByIdentity(
@@ -550,15 +569,23 @@ export class ConversationStore {
     role: MessageRole,
     content: string,
   ): Promise<number> {
-    const row = this.db
+    const identityHash = buildMessageIdentityHash(role, content);
+    const rows = this.db
       .prepare(
-        `SELECT COUNT(*) AS count
+       `SELECT role, content
        FROM messages
-       WHERE conversation_id = ? AND role = ? AND content = ?`,
+       WHERE conversation_id = ? AND identity_hash = ?`,
       )
-      .get(conversationId, role, content) as unknown as CountRow | undefined;
+      .all(conversationId, identityHash) as unknown as MessageIdentityRow[];
 
-    return row?.count ?? 0;
+    // Count only verified matches so the hash stays a performance hint, not the source of truth.
+    let count = 0;
+    for (const candidate of rows) {
+      if (candidate.role === role && candidate.content === content) {
+        count += 1;
+      }
+    }
+    return count;
   }
 
   async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
@@ -714,6 +741,7 @@ export class ConversationStore {
             input.conversationId,
             input.since,
             input.before,
+            input.sort,
           );
         } catch {
           return this.searchLike(
@@ -764,6 +792,7 @@ export class ConversationStore {
     conversationId?: ConversationId,
     since?: Date,
     before?: Date,
+    sort?: SearchSort,
   ): MessageSearchResult[] {
     const where: string[] = ["messages_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
@@ -780,6 +809,7 @@ export class ConversationStore {
       args.push(before.toISOString());
     }
     args.push(limit);
+    const orderBy = buildFtsOrderBy(sort, "m.created_at");
 
     const sql = `SELECT
          m.message_id,
@@ -791,7 +821,7 @@ export class ConversationStore {
        FROM messages_fts
        JOIN messages m ON m.message_id = messages_fts.rowid
        WHERE ${where.join(" AND ")}
-       ORDER BY m.created_at DESC
+       ORDER BY ${orderBy}
        LIMIT ?`;
     const rows = this.db.prepare(sql).all(...args) as unknown as MessageSearchRow[];
     return rows.map(toSearchResult);

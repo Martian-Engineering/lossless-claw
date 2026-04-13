@@ -44,11 +44,25 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    transcriptGcEnabled: false,
+    proactiveThresholdCompactionMode: "deferred",
     summaryMaxOverageFactor: 3,
     delegationTimeoutMs: 120000,
     customInstructions: "",
     circuitBreakerThreshold: 3, // Low threshold for testing
     circuitBreakerCooldownMs: 5000, // 5 seconds for testing
+    fallbackProviders: [],
+    cacheAwareCompaction: {
+      enabled: true,
+      maxColdCacheCatchupPasses: 2,
+      hotCachePressureFactor: 4,
+      hotCacheBudgetHeadroomRatio: 0.2,
+      coldCacheObservationThreshold: 3,
+    },
+    dynamicLeafChunkTokens: {
+      enabled: true,
+      max: 4_000,
+    },
     ...overrides,
   };
 }

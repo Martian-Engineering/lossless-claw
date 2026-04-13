@@ -50,6 +50,8 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileSummaryModel: "",
       timezone: "UTC",
       pruneHeartbeatOk: false,
+      transcriptGcEnabled: false,
+      proactiveThresholdCompactionMode: "deferred",
       summaryMaxOverageFactor: 3,
     },
     complete: vi.fn(),
@@ -122,6 +124,21 @@ function buildLcmEngine(params: {
 describe("LCM tools session scoping", () => {
   beforeEach(() => {
     resetDelegatedExpansionGrantsForTests();
+  });
+
+  it("lcm_grep metadata explains focused FTS5 query construction", () => {
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+    });
+
+    expect(tool.description).toContain("queries use FTS5 AND semantics by default");
+    const patternDescription = (
+      tool.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties.pattern?.description;
+    expect(patternDescription).toContain("FTS5 defaults to AND matching");
+    expect(patternDescription).toContain("prefer 1-3 distinctive terms or one quoted multi-word phrase");
   });
 
   it("lcm_expand query mode infers conversationId from delegated grant", async () => {
@@ -213,6 +230,39 @@ describe("LCM tools session scoping", () => {
     expect(text).toContain(formatTimestamp(new Date("2026-01-01T00:00:00.000Z"), timezone));
     expect(text).toContain(formatTimestamp(new Date("2026-01-04T00:00:00.000Z"), timezone));
     expect(text).toContain("deployment timeline");
+  });
+
+  it("lcm_grep forwards full-text sort mode and reports it in output", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-sort", {
+      pattern: '"error handling" retries',
+      mode: "full_text",
+      sort: "relevance",
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        mode: "full_text",
+        sort: "relevance",
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("**Mode:** full_text | **Scope:** both | **Sort:** relevance");
   });
 
   it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {

@@ -9,6 +9,8 @@ import type {
   SummarySearchResult,
   LargeFileRecord,
 } from "./store/summary-store.js";
+import type { SearchSort } from "./store/full-text-sort.js";
+import { estimateTokens } from "./estimate-tokens.js";
 
 // ── Public interfaces ────────────────────────────────────────────────────────
 
@@ -68,6 +70,10 @@ export interface GrepInput {
   since?: Date;
   before?: Date;
   limit?: number;
+  /** Sort order for results. Default "recency" (newest first).
+   *  "relevance" sorts by FTS5 BM25 rank (full_text mode only).
+   *  "hybrid" blends relevance with recency. */
+  sort?: SearchSort;
 }
 
 export interface GrepResult {
@@ -109,10 +115,6 @@ export interface ExpandResult {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Rough token estimate: ~4 chars per token. */
-function estimateTokens(content: string): number {
-  return Math.ceil(content.length / 4);
-}
 
 // ── RetrievalEngine ──────────────────────────────────────────────────────────
 
@@ -222,9 +224,9 @@ export class RetrievalEngine {
    * Depending on `scope`, searches messages, summaries, or both (in parallel).
    */
   async grep(input: GrepInput): Promise<GrepResult> {
-    const { query, mode, scope, conversationId, since, before, limit } = input;
+    const { query, mode, scope, conversationId, since, before, limit, sort } = input;
 
-    const searchInput = { query, mode, conversationId, since, before, limit };
+    const searchInput = { query, mode, conversationId, since, before, limit, sort };
 
     let messages: MessageSearchResult[] = [];
     let summaries: SummarySearchResult[] = [];
@@ -240,9 +242,6 @@ export class RetrievalEngine {
         this.summaryStore.searchSummaries(searchInput),
       ]);
     }
-
-    messages.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-    summaries.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
 
     return {
       messages,

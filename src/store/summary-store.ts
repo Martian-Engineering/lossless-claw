@@ -3,6 +3,7 @@ import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
+import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -68,6 +69,7 @@ export type SummarySearchInput = {
   since?: Date;
   before?: Date;
   limit?: number;
+  sort?: SearchSort;
 };
 
 export type SummarySearchResult = {
@@ -958,7 +960,10 @@ export class SummaryStore {
       .run(conversationId, startOrdinal, summaryId);
 
     // 3. Resequence all ordinals to maintain contiguity (no gaps).
-    //    Fetch current items, then update ordinals in order.
+    //    Pre-compute ranks from a SELECT (safe snapshot), then apply
+    //    via 2-pass UPDATE loop using negative temps to avoid UNIQUE
+    //    constraint violations. The SELECT reads post-delete/insert
+    //    state and provides a consistent snapshot for resequencing.
     const items = this.db
       .prepare(
         `SELECT ordinal FROM context_items
@@ -967,18 +972,17 @@ export class SummaryStore {
       )
       .all(conversationId) as unknown as { ordinal: number }[];
 
-    const updateStmt = this.db.prepare(
-      `UPDATE context_items
-       SET ordinal = ?
-       WHERE conversation_id = ? AND ordinal = ?`,
-    );
-
-    // Use negative temp ordinals first to avoid unique constraint conflicts.
-    for (let i = 0; i < items.length; i++) {
-      updateStmt.run(-(i + 1), conversationId, items[i].ordinal);
-    }
-    for (let i = 0; i < items.length; i++) {
-      updateStmt.run(i, conversationId, -(i + 1));
+    if (items.length > 0 && items.some((item, i) => item.ordinal !== i)) {
+      const updateStmt = this.db.prepare(
+        `UPDATE context_items SET ordinal = ?
+         WHERE conversation_id = ? AND ordinal = ?`,
+      );
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(-(i + 1), conversationId, items[i].ordinal);
+      }
+      for (let i = 0; i < items.length; i++) {
+        updateStmt.run(i, conversationId, -(i + 1));
+      }
     }
   }
 
@@ -1051,6 +1055,7 @@ export class SummaryStore {
             input.conversationId,
             input.since,
             input.before,
+            input.sort,
           );
         } catch {
           return this.searchLike(
@@ -1073,6 +1078,7 @@ export class SummaryStore {
     conversationId?: number,
     since?: Date,
     before?: Date,
+    sort?: SearchSort,
   ): SummarySearchResult[] {
     const where: string[] = ["summaries_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
@@ -1089,6 +1095,7 @@ export class SummaryStore {
       args.push(before.toISOString());
     }
     args.push(limit);
+    const orderBy = buildFtsOrderBy(sort, "s.created_at");
 
     const sql = `SELECT
          summaries_fts.summary_id,
@@ -1100,7 +1107,7 @@ export class SummaryStore {
        FROM summaries_fts
        JOIN summaries s ON s.summary_id = summaries_fts.summary_id
        WHERE ${where.join(" AND ")}
-       ORDER BY s.created_at DESC
+       ORDER BY ${orderBy}
        LIMIT ?`;
     const rows = this.db.prepare(sql).all(...args) as unknown as SummarySearchRow[];
     return rows.map(toSearchResult);

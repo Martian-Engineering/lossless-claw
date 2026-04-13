@@ -6,6 +6,7 @@ import type {
   MessageRole,
 } from "./store/conversation-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
+import { estimateTokens } from "./estimate-tokens.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 
@@ -25,6 +26,8 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
+  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  freshTailMaxTokens?: number;
   /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
   prompt?: string;
 }
@@ -46,10 +49,6 @@ export interface AssembleContextResult {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Simple token estimate: ~4 chars per token, same as VoltCode's Token.estimate */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
 
 type SummaryPromptSignal = Pick<SummaryRecord, "kind" | "depth" | "descendantCount">;
 
@@ -93,7 +92,12 @@ function buildSystemPromptAddition(summarySignals: SummaryPromptSignal[]): strin
       "Default recall flow for precision work:",
       "1) `lcm_grep` to locate relevant summary/message IDs",
       "2) `lcm_expand_query` with a focused prompt",
-      "3) Answer with citations to summary IDs used",
+      "3) Answer directly from the retrieved evidence",
+      "",
+      "Keep raw summary IDs in tool context for follow-up; do not include them in the user-facing answer unless the user asks for sources or IDs.",
+      "",
+      "`lcm_grep` tips: prefer `mode: \"full_text\"` for keyword/topic lookup, quote exact multi-word phrases, use `sort: \"relevance\"` for older-topic retrieval, and use `sort: \"hybrid\"` when recency should still influence ranking.",
+      "`lcm_expand_query(query: ...)` uses the same FTS5 full-text search rules as `lcm_grep`: terms are ANDed by default, so extra query words narrow results. Keep `query` to 1-3 distinctive terms or a quoted phrase, and put the natural-language question in `prompt`.",
       "",
       "**Uncertainty checklist (run before answering):**",
       "- Am I making an exact factual claim from a compressed or condensed summary?",
@@ -633,12 +637,24 @@ function collectAssistantToolCallIds(items: ResolvedItem[]): Set<string> {
   return ids;
 }
 
+function normalizeFreshTailTokenCap(freshTailMaxTokens?: number): number | undefined {
+  if (
+    typeof freshTailMaxTokens === "number" &&
+    Number.isFinite(freshTailMaxTokens) &&
+    freshTailMaxTokens >= 0
+  ) {
+    return Math.floor(freshTailMaxTokens);
+  }
+  return undefined;
+}
+
 function mergeFreshTailWithMatchingToolResults(
   freshTail: ResolvedItem[],
   matchingToolResults: ResolvedItem[],
-): ResolvedItem[] {
+  freshTailMaxTokens?: number,
+): { items: ResolvedItem[]; promotedOrdinals: Set<number> } {
   if (matchingToolResults.length === 0) {
-    return freshTail;
+    return { items: freshTail, promotedOrdinals: new Set<number>() };
   }
 
   const resultsById = new Map<string, ResolvedItem[]>();
@@ -656,7 +672,9 @@ function mergeFreshTailWithMatchingToolResults(
   }
 
   const merged: ResolvedItem[] = [];
-  const usedOrdinals = new Set<number>();
+  const promotedOrdinals = new Set<number>();
+  const tokenCap = normalizeFreshTailTokenCap(freshTailMaxTokens);
+  let mergedTokens = freshTail.reduce((sum, item) => sum + item.tokens, 0);
 
   for (const item of freshTail) {
     merged.push(item);
@@ -672,27 +690,37 @@ function mergeFreshTailWithMatchingToolResults(
         continue;
       }
       for (const match of matches) {
-        if (usedOrdinals.has(match.ordinal)) {
+        if (promotedOrdinals.has(match.ordinal)) {
+          continue;
+        }
+        if (
+          typeof tokenCap === "number" &&
+          mergedTokens + match.tokens > tokenCap
+        ) {
           continue;
         }
         merged.push(match);
-        usedOrdinals.add(match.ordinal);
+        promotedOrdinals.add(match.ordinal);
+        mergedTokens += match.tokens;
       }
     }
   }
 
-  for (const item of matchingToolResults) {
-    if (!usedOrdinals.has(item.ordinal)) {
-      merged.push(item);
+  if (typeof tokenCap !== "number") {
+    for (const item of matchingToolResults) {
+      if (!promotedOrdinals.has(item.ordinal)) {
+        merged.push(item);
+      }
     }
   }
 
-  return merged;
+  return { items: merged, promotedOrdinals };
 }
 
 function filterNonFreshAssistantToolCalls(
   items: ResolvedItem[],
   freshTailOrdinals: Set<number>,
+  preserveFreshTailToolCalls = true,
 ): AgentMessage[] {
   const availableToolResultIds = new Set<string>();
   for (const item of items) {
@@ -704,7 +732,10 @@ function filterNonFreshAssistantToolCalls(
 
   const filteredMessages: AgentMessage[] = [];
   for (const item of items) {
-    if (item.message?.role !== "assistant" || freshTailOrdinals.has(item.ordinal)) {
+    if (
+      item.message?.role !== "assistant" ||
+      (preserveFreshTailToolCalls && freshTailOrdinals.has(item.ordinal))
+    ) {
       filteredMessages.push(item.message);
       continue;
     }
@@ -829,6 +860,57 @@ interface ResolvedItem {
   summarySignal?: SummaryPromptSignal;
 }
 
+function resolveFreshTailOrdinal(
+  resolved: ResolvedItem[],
+  freshTailCount: number,
+  freshTailMaxTokens?: number,
+): number {
+  if (!Number.isFinite(freshTailCount) || freshTailCount <= 0) {
+    return Infinity;
+  }
+
+  const rawMessages = resolved.filter((item) => item.isMessage);
+  if (rawMessages.length === 0) {
+    return Infinity;
+  }
+
+  const tokenCap =
+    typeof freshTailMaxTokens === "number" &&
+    Number.isFinite(freshTailMaxTokens) &&
+    freshTailMaxTokens >= 0
+      ? Math.floor(freshTailMaxTokens)
+      : undefined;
+
+  let protectedCount = 0;
+  let protectedTokens = 0;
+  let tailStartOrdinal = Infinity;
+
+  for (let idx = rawMessages.length - 1; idx >= 0; idx--) {
+    if (protectedCount >= freshTailCount) {
+      break;
+    }
+
+    const item = rawMessages[idx];
+    if (!item) {
+      continue;
+    }
+
+    const wouldExceedBudget =
+      protectedCount > 0 &&
+      typeof tokenCap === "number" &&
+      protectedTokens + item.tokens > tokenCap;
+    if (wouldExceedBudget) {
+      break;
+    }
+
+    tailStartOrdinal = item.ordinal;
+    protectedCount++;
+    protectedTokens += item.tokens;
+  }
+
+  return tailStartOrdinal;
+}
+
 // ── BM25-lite relevance scorer ────────────────────────────────────────────────
 
 /** @internal Exported for testing only. Tokenize text into lowercase alphanumeric terms. */
@@ -892,7 +974,8 @@ export class ContextAssembler {
    * 1. Fetch all context items for the conversation (ordered by ordinal).
    * 2. Resolve each item into an AgentMessage (fetching the underlying
    *    message or summary record).
-   * 3. Protect the "fresh tail" (last N items) from truncation.
+   * 3. Protect the "fresh tail" (last N raw messages, optionally token-capped)
+   *    from truncation.
    * 4. If over budget, drop oldest non-fresh items until we fit.
    * 5. Return the final ordered messages in chronological order.
    */
@@ -932,18 +1015,28 @@ export class ContextAssembler {
     const systemPromptAddition = buildSystemPromptAddition(summarySignals);
 
     // Step 3: Split into evictable prefix and protected fresh tail
-    const tailStart = Math.max(0, resolved.length - freshTailCount);
-    const baseFreshTail = resolved.slice(tailStart);
-    const initialEvictable = resolved.slice(0, tailStart);
+    const freshTailOrdinal = resolveFreshTailOrdinal(
+      resolved,
+      freshTailCount,
+      input.freshTailMaxTokens,
+    );
+    const baseFreshTail = resolved.filter((item) => item.ordinal >= freshTailOrdinal);
+    const initialEvictable = resolved.filter((item) => item.ordinal < freshTailOrdinal);
     const freshTailOrdinals = new Set(baseFreshTail.map((item) => item.ordinal));
     const tailToolCallIds = collectAssistantToolCallIds(baseFreshTail);
     const tailPairToolResults = initialEvictable.filter((item) => {
       const toolResultId = extractToolResultIdFromMessage(item.message);
       return toolResultId !== null && tailToolCallIds.has(toolResultId);
     });
-    const protectedEvictableOrdinals = new Set(tailPairToolResults.map((item) => item.ordinal));
-    const evictable = initialEvictable.filter((item) => !protectedEvictableOrdinals.has(item.ordinal));
-    const freshTail = mergeFreshTailWithMatchingToolResults(baseFreshTail, tailPairToolResults);
+    const mergedFreshTail = mergeFreshTailWithMatchingToolResults(
+      baseFreshTail,
+      tailPairToolResults,
+      input.freshTailMaxTokens,
+    );
+    const evictable = initialEvictable.filter(
+      (item) => !mergedFreshTail.promotedOrdinals.has(item.ordinal),
+    );
+    const freshTail = mergedFreshTail.items;
 
     // Step 4: Budget-aware selection
     // First, compute the token cost of the fresh tail (always included).
@@ -1021,7 +1114,11 @@ export class ContextAssembler {
 
     // Normalize assistant string content to array blocks (some providers return
     // content as a plain string; Anthropic expects content block arrays).
-    const rawMessages = filterNonFreshAssistantToolCalls(selected, freshTailOrdinals);
+    const rawMessages = filterNonFreshAssistantToolCalls(
+      selected,
+      freshTailOrdinals,
+      normalizeFreshTailTokenCap(input.freshTailMaxTokens) === undefined,
+    );
     for (let i = 0; i < rawMessages.length; i++) {
       const msg = rawMessages[i];
       if (msg?.role === "assistant" && typeof msg.content === "string") {
@@ -1102,6 +1199,16 @@ export class ContextAssembler {
     }
 
     const parts = await this.conversationStore.getMessageParts(msg.messageId);
+
+    // Skip empty assistant messages left by error/aborted responses.
+    // These waste context tokens and can confuse models that reject
+    // consecutive empty assistant turns.  Only skip when both the stored
+    // content text AND the message_parts table are empty — assistant
+    // messages that contain tool calls have empty text content but
+    // non-empty parts and must be preserved.
+    if (msg.role === "assistant" && !msg.content.trim() && parts.length === 0) {
+      return null;
+    }
     const roleFromStore = toRuntimeRole(msg.role, parts);
     const isToolResult = roleFromStore === "toolResult";
     const toolCallId = isToolResult ? pickToolCallId(parts) : undefined;

@@ -1,9 +1,14 @@
 {
   "id": "lossless-claw",
+  "kind": "context-engine",
   "skills": [
     "skills/lossless-claw"
   ],
   "uiHints": {
+    "enabled": {
+      "label": "Enabled",
+      "help": "Enable or disable lossless-claw without uninstalling it"
+    },
     "contextThreshold": {
       "label": "Context Threshold",
       "help": "Fraction of context window that triggers compaction (0.0–1.0)"
@@ -15,6 +20,10 @@
     "freshTailCount": {
       "label": "Fresh Tail Count",
       "help": "Number of recent messages protected from compaction"
+    },
+    "freshTailMaxTokens": {
+      "label": "Fresh Tail Max Tokens",
+      "help": "Optional token cap for the protected fresh tail; the newest message is always preserved"
     },
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",
@@ -40,9 +49,33 @@
       "label": "Max Expand Tokens",
       "help": "Token cap for lcm_expand_query expansion calls"
     },
+    "leafMinFanout": {
+      "label": "Leaf Min Fanout",
+      "help": "Minimum number of raw messages required before a leaf compaction pass runs"
+    },
+    "condensedMinFanout": {
+      "label": "Condensed Min Fanout",
+      "help": "Number of same-depth summaries required before condensation is attempted"
+    },
+    "condensedMinFanoutHard": {
+      "label": "Condensed Min Fanout Hard",
+      "help": "Hard floor for condensation grouping during maintenance and repair flows"
+    },
     "dbPath": {
       "label": "Database Path",
-      "help": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
+      "help": "Path to LCM SQLite database (default: <OPENCLAW_STATE_DIR>/lcm.db; falls back to ~/.openclaw/lcm.db)"
+    },
+    "databasePath": {
+      "label": "Database Path",
+      "help": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)"
+    },
+    "largeFilesDir": {
+      "label": "Large Files Directory",
+      "help": "Directory for persisting large-file text payloads (default: <stateDir>/lcm-files). Uses OPENCLAW_STATE_DIR when set."
+    },
+    "largeFilesDir": {
+      "label": "Large Files Directory",
+      "help": "Directory for externalized large files and inline-image payloads (default: ~/.openclaw/lcm-files)"
     },
     "ignoreSessionPatterns": {
       "label": "Ignored Sessions",
@@ -55,6 +88,14 @@
     "skipStatelessSessions": {
       "label": "Skip Stateless Sessions",
       "help": "When enabled, matching stateless session keys skip LCM persistence and grant writes"
+    },
+    "largeFileThresholdTokens": {
+      "label": "Large File Threshold Tokens",
+      "help": "Token threshold that routes text attachments into large-file summarization"
+    },
+    "largeFileTokenThreshold": {
+      "label": "Large File Threshold Tokens",
+      "help": "Legacy alias of largeFileThresholdTokens"
     },
     "summaryModel": {
       "label": "Summary Model",
@@ -100,6 +141,46 @@
       "label": "Custom Instructions",
       "help": "Natural language instructions injected into all summarization prompts (e.g., formatting rules, tone control)"
     },
+    "circuitBreakerThreshold": {
+      "label": "Circuit Breaker Threshold",
+      "help": "Consecutive auth failures before the summarization circuit breaker trips"
+    },
+    "circuitBreakerCooldownMs": {
+      "label": "Circuit Breaker Cooldown (ms)",
+      "help": "Cooldown before the summarization circuit breaker auto-resets"
+    },
+    "cacheAwareCompaction.enabled": {
+      "label": "Cache-Aware Compaction",
+      "help": "When enabled, hot prompt cache defers incremental compaction while cold cache allows bounded catch-up passes"
+    },
+    "cacheAwareCompaction.cacheTTLSeconds": {
+      "label": "Short Cache TTL (seconds)",
+      "help": "Treat short-lived prompt-cache entries as hot for this many seconds before deferred compaction may rewrite the prompt"
+    },
+    "cacheAwareCompaction.maxColdCacheCatchupPasses": {
+      "label": "Cold Cache Catch-Up Passes",
+      "help": "Maximum incremental leaf passes allowed in one maintenance cycle when prompt cache is cold"
+    },
+    "cacheAwareCompaction.hotCachePressureFactor": {
+      "label": "Hot Cache Pressure Factor",
+      "help": "Multiplier applied to the hot-cache leaf trigger before raw-history pressure overrides cache preservation"
+    },
+    "cacheAwareCompaction.hotCacheBudgetHeadroomRatio": {
+      "label": "Hot Cache Budget Headroom",
+      "help": "Fraction of the real token budget that must remain free before hot-cache incremental compaction is skipped entirely"
+    },
+    "cacheAwareCompaction.coldCacheObservationThreshold": {
+      "label": "Cold Cache Observation Threshold",
+      "help": "Consecutive cold observations required before non-explicit cache misses are treated as truly cold"
+    },
+    "dynamicLeafChunkTokens.enabled": {
+      "label": "Dynamic Leaf Chunk Tokens",
+      "help": "When enabled, incremental compaction uses a larger working leaf chunk in busy sessions and keeps the static floor in quieter sessions"
+    },
+    "dynamicLeafChunkTokens.max": {
+      "label": "Dynamic Leaf Chunk Max",
+      "help": "Maximum working leaf chunk target for dynamic incremental compaction. The static leafChunkTokens value remains the floor."
+    },
     "timezone": {
       "label": "Timezone",
       "help": "IANA timezone used for summary timestamps"
@@ -107,6 +188,18 @@
     "pruneHeartbeatOk": {
       "label": "Prune HEARTBEAT_OK",
       "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
+    },
+    "transcriptGcEnabled": {
+      "label": "Transcript GC",
+      "help": "Enable transcript rewrite GC during maintain(); disabled by default"
+    },
+    "proactiveThresholdCompactionMode": {
+      "label": "Proactive Threshold Compaction Mode",
+      "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
+    },
+    "fallbackProviders": {
+      "label": "Fallback Providers",
+      "help": "Explicit fallback provider/model pairs for compaction summarization (e.g., [{\"provider\": \"anthropic\", \"model\": \"claude-haiku-4-5\"}])"
     }
   },
   "configSchema": {
@@ -128,6 +221,10 @@
       "freshTailCount": {
         "type": "integer",
         "minimum": 1
+      },
+      "freshTailMaxTokens": {
+        "type": "integer",
+        "minimum": 0
       },
       "leafChunkTokens": {
         "type": "integer",
@@ -168,6 +265,9 @@
       "dbPath": {
         "type": "string"
       },
+      "largeFilesDir": {
+        "type": "string"
+      },
       "ignoreSessionPatterns": {
         "type": "array",
         "items": {
@@ -184,6 +284,10 @@
         "type": "boolean"
       },
       "largeFileThresholdTokens": {
+        "type": "integer",
+        "minimum": 1000
+      },
+      "largeFileTokenThreshold": {
         "type": "integer",
         "minimum": 1000
       },
@@ -224,15 +328,92 @@
       "customInstructions": {
         "type": "string"
       },
+      "circuitBreakerThreshold": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "circuitBreakerCooldownMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "cacheAwareCompaction": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "cacheTTLSeconds": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "maxColdCacheCatchupPasses": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "hotCachePressureFactor": {
+            "type": "number",
+            "minimum": 1
+          },
+          "hotCacheBudgetHeadroomRatio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.95
+          },
+          "coldCacheObservationThreshold": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "dynamicLeafChunkTokens": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "max": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
       "timezone": {
         "type": "string"
       },
       "pruneHeartbeatOk": {
         "type": "boolean"
       },
+      "transcriptGcEnabled": {
+        "type": "boolean"
+      },
+      "proactiveThresholdCompactionMode": {
+        "type": "string",
+        "enum": [
+          "deferred",
+          "inline"
+        ]
+      },
       "databasePath": {
-        "description": "Path to LCM SQLite database (alias for dbPath)",
+        "description": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)",
         "type": "string"
+      },
+      "largeFilesDir": {
+        "description": "Directory for persisting large-file text payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)",
+        "type": "string"
+      },
+      "fallbackProviders": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "provider": { "type": "string" },
+            "model": { "type": "string" }
+          },
+          "required": ["provider", "model"],
+          "additionalProperties": false
+        }
       }
     }
   }

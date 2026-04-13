@@ -622,9 +622,9 @@ func applyBackfillImport(ctx context.Context, db *sql.DB, input backfillSessionI
 
 	for idx, msg := range input.messages {
 		result, err := tx.ExecContext(ctx, `
-			INSERT INTO messages (conversation_id, seq, role, content, token_count, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, conversationID, idx, msg.role, msg.content, estimateTokenCount(msg.content), msg.createdAt)
+			INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, conversationID, idx, msg.role, msg.content, estimateTokenCount(msg.content), messageIdentityHash(msg.role, msg.content), msg.createdAt)
 		if err != nil {
 			return backfillImportResult{}, fmt.Errorf("insert backfill message seq=%d: %w", idx, err)
 		}

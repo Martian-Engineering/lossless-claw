@@ -1,20 +1,33 @@
 import { describe, it, expect } from "vitest";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
-import { resolveLcmConfig } from "../src/db/config.js";
+import {
+  resolveLcmConfig,
+  resolveLcmConfigWithDiagnostics,
+  resolveOpenclawStateDir,
+} from "../src/db/config.js";
 
 describe("resolveLcmConfig", () => {
   it("ships the bundled lossless-claw skill path in the manifest", () => {
     expect(manifest.skills).toEqual(["skills/lossless-claw"]);
   });
 
+  it("declares context-engine kind so OpenClaw core binds the contextEngine slot on install", () => {
+    expect(manifest.kind).toBe("context-engine");
+  });
+
   it("uses hardcoded defaults when no env or plugin config", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.enabled).toBe(true);
+    expect(config.databasePath).toBe(join(homedir(), ".openclaw", "lcm.db"));
+    expect(config.largeFilesDir).toBe(join(homedir(), ".openclaw", "lcm-files"));
     expect(config.ignoreSessionPatterns).toEqual([]);
     expect(config.statelessSessionPatterns).toEqual([]);
     expect(config.skipStatelessSessions).toBe(true);
     expect(config.contextThreshold).toBe(0.75);
     expect(config.freshTailCount).toBe(64);
+    expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.newSessionRetainDepth).toBe(2);
     expect(config.incrementalMaxDepth).toBe(1);
     expect(config.leafChunkTokens).toBe(20000);
@@ -25,12 +38,27 @@ describe("resolveLcmConfig", () => {
     expect(config.summaryProvider).toBe("");
     expect(config.summaryModel).toBe("");
     expect(config.pruneHeartbeatOk).toBe(false);
+    expect(config.transcriptGcEnabled).toBe(false);
+    expect(config.proactiveThresholdCompactionMode).toBe("deferred");
+    expect(config.cacheAwareCompaction).toEqual({
+      enabled: true,
+      cacheTTLSeconds: 300,
+      maxColdCacheCatchupPasses: 2,
+      hotCachePressureFactor: 4,
+      hotCacheBudgetHeadroomRatio: 0.2,
+      coldCacheObservationThreshold: 3,
+    });
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: true,
+      max: 40000,
+    });
   });
 
   it("reads values from plugin config", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: 0.5,
       freshTailCount: 16,
+      freshTailMaxTokens: 12000,
       leafChunkTokens: 80000,
       newSessionRetainDepth: 3,
       incrementalMaxDepth: -1,
@@ -40,7 +68,21 @@ describe("resolveLcmConfig", () => {
       leafMinFanout: 4,
       condensedMinFanout: 2,
       pruneHeartbeatOk: true,
+      transcriptGcEnabled: true,
+      proactiveThresholdCompactionMode: "inline",
       enabled: false,
+      cacheAwareCompaction: {
+        enabled: false,
+        cacheTTLSeconds: 900,
+        maxColdCacheCatchupPasses: 3,
+        hotCachePressureFactor: 6,
+        hotCacheBudgetHeadroomRatio: 0.35,
+        coldCacheObservationThreshold: 4,
+      },
+      dynamicLeafChunkTokens: {
+        enabled: true,
+        max: 50000,
+      },
     });
     expect(config.enabled).toBe(false);
     expect(config.ignoreSessionPatterns).toEqual([
@@ -51,33 +93,74 @@ describe("resolveLcmConfig", () => {
     expect(config.skipStatelessSessions).toBe(false);
     expect(config.contextThreshold).toBe(0.5);
     expect(config.freshTailCount).toBe(16);
+    expect(config.freshTailMaxTokens).toBe(12000);
     expect(config.newSessionRetainDepth).toBe(3);
     expect(config.leafChunkTokens).toBe(80000);
     expect(config.incrementalMaxDepth).toBe(-1);
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
     expect(config.pruneHeartbeatOk).toBe(true);
+    expect(config.transcriptGcEnabled).toBe(true);
+    expect(config.proactiveThresholdCompactionMode).toBe("inline");
+    expect(config.cacheAwareCompaction).toEqual({
+      enabled: false,
+      cacheTTLSeconds: 900,
+      maxColdCacheCatchupPasses: 3,
+      hotCachePressureFactor: 6,
+      hotCacheBudgetHeadroomRatio: 0.35,
+      coldCacheObservationThreshold: 4,
+    });
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: true,
+      max: 80000,
+    });
   });
 
   it("env vars override plugin config", () => {
     const env = {
       LCM_CONTEXT_THRESHOLD: "0.9",
       LCM_FRESH_TAIL_COUNT: "64",
+      LCM_FRESH_TAIL_MAX_TOKENS: "32000",
       LCM_NEW_SESSION_RETAIN_DEPTH: "5",
       LCM_INCREMENTAL_MAX_DEPTH: "3",
       LCM_ENABLED: "false",
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
       LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
       LCM_SKIP_STATELESS_SESSIONS: "false",
+      LCM_TRANSCRIPT_GC_ENABLED: "true",
+      LCM_CACHE_AWARE_COMPACTION_ENABLED: "false",
+      LCM_CACHE_TTL_SECONDS: "600",
+      LCM_MAX_COLD_CACHE_CATCHUP_PASSES: "4",
+      LCM_HOT_CACHE_PRESSURE_FACTOR: "5.5",
+      LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO: "0.25",
+      LCM_COLD_CACHE_OBSERVATION_THRESHOLD: "5",
+      LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED: "true",
+      LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX: "60000",
+      LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE: "inline",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
       freshTailCount: 16,
+      freshTailMaxTokens: 12000,
       incrementalMaxDepth: -1,
       ignoreSessionPatterns: ["agent:*:test:*"],
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
+      transcriptGcEnabled: false,
+      proactiveThresholdCompactionMode: "deferred",
       enabled: true,
+      cacheAwareCompaction: {
+        enabled: true,
+        cacheTTLSeconds: 120,
+        maxColdCacheCatchupPasses: 2,
+        hotCachePressureFactor: 3,
+        hotCacheBudgetHeadroomRatio: 0.1,
+        coldCacheObservationThreshold: 2,
+      },
+      dynamicLeafChunkTokens: {
+        enabled: false,
+        max: 50000,
+      },
     };
     const config = resolveLcmConfig(env, pluginConfig);
     expect(config.enabled).toBe(false); // env wins
@@ -90,10 +173,50 @@ describe("resolveLcmConfig", () => {
       "agent:main:preview:*",
     ]);
     expect(config.skipStatelessSessions).toBe(false);
+    expect(config.transcriptGcEnabled).toBe(true);
+    expect(config.proactiveThresholdCompactionMode).toBe("inline");
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(64); // env wins
+    expect(config.freshTailMaxTokens).toBe(32000); // env wins
     expect(config.newSessionRetainDepth).toBe(5); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
+    expect(config.cacheAwareCompaction).toEqual({
+      enabled: false,
+      cacheTTLSeconds: 600,
+      maxColdCacheCatchupPasses: 4,
+      hotCachePressureFactor: 5.5,
+      hotCacheBudgetHeadroomRatio: 0.25,
+      coldCacheObservationThreshold: 5,
+    });
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: true,
+      max: 60000,
+    });
+  });
+
+  it("reports session pattern sources and env override diagnostics", () => {
+    const { config, diagnostics } = resolveLcmConfigWithDiagnostics(
+      {
+        LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
+        LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**",
+      } as NodeJS.ProcessEnv,
+      {
+        ignoreSessionPatterns: ["agent:*:test:*"],
+        statelessSessionPatterns: ["agent:*:preview:*"],
+      },
+    );
+
+    expect(config.ignoreSessionPatterns).toEqual([
+      "agent:*:cron:*",
+      "agent:main:subagent:**",
+    ]);
+    expect(config.statelessSessionPatterns).toEqual(["agent:*:ephemeral:**"]);
+    expect(diagnostics).toEqual({
+      ignoreSessionPatternsSource: "env",
+      statelessSessionPatternsSource: "env",
+      ignoreSessionPatternsEnvOverridesPluginConfig: true,
+      statelessSessionPatternsEnvOverridesPluginConfig: true,
+    });
   });
 
   it("plugin config fills gaps when env vars are absent", () => {
@@ -118,6 +241,7 @@ describe("resolveLcmConfig", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: "0.6",
       freshTailCount: "24",
+      freshTailMaxTokens: "4800",
       leafChunkTokens: "64000",
       newSessionRetainDepth: "6",
       ignoreSessionPatterns: "agent:*:cron:*, agent:main:subagent:**",
@@ -126,6 +250,7 @@ describe("resolveLcmConfig", () => {
     });
     expect(config.contextThreshold).toBe(0.6);
     expect(config.freshTailCount).toBe(24);
+    expect(config.freshTailMaxTokens).toBe(4800);
     expect(config.newSessionRetainDepth).toBe(6);
     expect(config.leafChunkTokens).toBe(64000);
     expect(config.ignoreSessionPatterns).toEqual([
@@ -143,11 +268,13 @@ describe("resolveLcmConfig", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: "not-a-number",
       freshTailCount: null,
+      freshTailMaxTokens: "not-a-number",
       newSessionRetainDepth: "nope",
       enabled: "maybe",
     });
     expect(config.contextThreshold).toBe(0.75); // falls through to default
     expect(config.freshTailCount).toBe(64); // falls through to default
+    expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.newSessionRetainDepth).toBe(2); // falls through to default
     expect(config.enabled).toBe(true); // falls through to default
   });
@@ -174,6 +301,21 @@ describe("resolveLcmConfig", () => {
     expect(config.databasePath).toBe("/env/path/lcm.db");
   });
 
+  it("handles largeFilesDir from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      largeFilesDir: "/custom/path/lcm-files",
+    });
+    expect(config.largeFilesDir).toBe("/custom/path/lcm-files");
+  });
+
+  it("env largeFilesDir overrides plugin config", () => {
+    const config = resolveLcmConfig(
+      { LCM_LARGE_FILES_DIR: "/env/path/lcm-files" } as NodeJS.ProcessEnv,
+      { largeFilesDir: "/plugin/path/lcm-files" },
+    );
+    expect(config.largeFilesDir).toBe("/env/path/lcm-files");
+  });
+
   it("accepts manifest largeFileThresholdTokens from plugin config", () => {
     const config = resolveLcmConfig({}, {
       largeFileThresholdTokens: 12345,
@@ -195,6 +337,69 @@ describe("resolveLcmConfig", () => {
       delegationTimeoutMs: 300000,
     });
     expect(config.delegationTimeoutMs).toBe(300000);
+  });
+
+  it("reads cache-aware compaction settings from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      cacheAwareCompaction: {
+        enabled: false,
+        cacheTTLSeconds: 900,
+        maxColdCacheCatchupPasses: 3,
+        hotCachePressureFactor: 6,
+        hotCacheBudgetHeadroomRatio: 0.35,
+        coldCacheObservationThreshold: 4,
+      },
+    });
+
+    expect(config.cacheAwareCompaction).toEqual({
+      enabled: false,
+      cacheTTLSeconds: 900,
+      maxColdCacheCatchupPasses: 3,
+      hotCachePressureFactor: 6,
+      hotCacheBudgetHeadroomRatio: 0.35,
+      coldCacheObservationThreshold: 4,
+    });
+  });
+
+  it("reads dynamic leaf chunk token settings from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      leafChunkTokens: 24_000,
+      dynamicLeafChunkTokens: {
+        enabled: true,
+        max: 42_000,
+      },
+    });
+
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: true,
+      max: 42_000,
+    });
+  });
+
+  it("defaults dynamic leaf chunk token max to 2x the static floor", () => {
+    const config = resolveLcmConfig({}, {
+      leafChunkTokens: 24_000,
+    });
+
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: true,
+      max: 48_000,
+    });
+  });
+
+  it("clamps dynamic leaf chunk token max so it never drops below the static floor", () => {
+    const config = resolveLcmConfig({}, {
+      leafChunkTokens: 24_000,
+      dynamicLeafChunkTokens: {
+        enabled: true,
+        max: 12_000,
+      },
+    });
+
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: true,
+      max: 24_000,
+    });
   });
 
   it("defaults expansionModel and expansionProvider to empty string", () => {
@@ -327,6 +532,68 @@ describe("resolveLcmConfig", () => {
     });
   });
 
+  it("ships a manifest with dynamicLeafChunkTokens in schema", () => {
+    expect(manifest.configSchema.properties.dynamicLeafChunkTokens).toEqual({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: {
+          type: "boolean",
+        },
+        max: {
+          type: "integer",
+          minimum: 1,
+        },
+      },
+    });
+  });
+
+  it("ships a manifest with transcriptGcEnabled in schema", () => {
+    expect(manifest.configSchema.properties.transcriptGcEnabled).toEqual({
+      type: "boolean",
+    });
+  });
+
+  it("ships a manifest with proactiveThresholdCompactionMode in schema", () => {
+    expect(manifest.configSchema.properties.proactiveThresholdCompactionMode).toEqual({
+      type: "string",
+      enum: ["deferred", "inline"],
+    });
+  });
+
+  it("ships a manifest with cacheAwareCompaction in schema", () => {
+    expect(manifest.configSchema.properties.cacheAwareCompaction).toEqual({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: {
+          type: "boolean",
+        },
+        cacheTTLSeconds: {
+          type: "integer",
+          minimum: 1,
+        },
+        maxColdCacheCatchupPasses: {
+          type: "integer",
+          minimum: 1,
+        },
+        hotCachePressureFactor: {
+          type: "number",
+          minimum: 1,
+        },
+        hotCacheBudgetHeadroomRatio: {
+          type: "number",
+          minimum: 0,
+          maximum: 0.95,
+        },
+        coldCacheObservationThreshold: {
+          type: "integer",
+          minimum: 1,
+        },
+      },
+    });
+  });
+
   it("ships a manifest with plugin-config schema entries for runtime token controls", () => {
     expect(manifest.configSchema.properties.leafTargetTokens).toEqual({
       type: "integer",
@@ -420,5 +687,95 @@ describe("resolveLcmConfig", () => {
     });
     expect(config.summaryMaxOverageFactor).toBe(2.5);
     expect(config.maxAssemblyTokenBudget).toBe(16000);
+  });
+});
+
+describe("resolveOpenclawStateDir", () => {
+  it("falls back to ~/.openclaw when OPENCLAW_STATE_DIR is unset", () => {
+    const result = resolveOpenclawStateDir({});
+    expect(result).toBe(join(homedir(), ".openclaw"));
+  });
+
+  it("returns OPENCLAW_STATE_DIR when set", () => {
+    const result = resolveOpenclawStateDir({ OPENCLAW_STATE_DIR: "/custom/state" });
+    expect(result).toBe("/custom/state");
+  });
+
+  it("trims whitespace from OPENCLAW_STATE_DIR", () => {
+    const result = resolveOpenclawStateDir({ OPENCLAW_STATE_DIR: "  /custom/state  " });
+    expect(result).toBe("/custom/state");
+  });
+
+  it("falls back to ~/.openclaw when OPENCLAW_STATE_DIR is an empty string", () => {
+    const result = resolveOpenclawStateDir({ OPENCLAW_STATE_DIR: "" });
+    expect(result).toBe(join(homedir(), ".openclaw"));
+  });
+
+  it("falls back to ~/.openclaw when OPENCLAW_STATE_DIR is whitespace only", () => {
+    const result = resolveOpenclawStateDir({ OPENCLAW_STATE_DIR: "   " });
+    expect(result).toBe(join(homedir(), ".openclaw"));
+  });
+});
+
+describe("resolveLcmConfig largeFilesDir", () => {
+  it("defaults largeFilesDir to ~/.openclaw/lcm-files when OPENCLAW_STATE_DIR is unset", () => {
+    const config = resolveLcmConfig({}, {});
+    expect(config.largeFilesDir).toBe(join(homedir(), ".openclaw", "lcm-files"));
+  });
+
+  it("uses OPENCLAW_STATE_DIR for largeFilesDir when set", () => {
+    const config = resolveLcmConfig(
+      { OPENCLAW_STATE_DIR: "/custom/state" } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.largeFilesDir).toBe("/custom/state/lcm-files");
+  });
+
+  it("LCM_LARGE_FILES_DIR env var overrides OPENCLAW_STATE_DIR for largeFilesDir", () => {
+    const config = resolveLcmConfig(
+      {
+        OPENCLAW_STATE_DIR: "/custom/state",
+        LCM_LARGE_FILES_DIR: "/explicit/files",
+      } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.largeFilesDir).toBe("/explicit/files");
+  });
+
+  it("largeFilesDir plugin config overrides OPENCLAW_STATE_DIR", () => {
+    const config = resolveLcmConfig(
+      { OPENCLAW_STATE_DIR: "/custom/state" } as NodeJS.ProcessEnv,
+      { largeFilesDir: "/plugin/files" },
+    );
+    expect(config.largeFilesDir).toBe("/plugin/files");
+  });
+
+  it("LCM_LARGE_FILES_DIR env var overrides largeFilesDir plugin config", () => {
+    const config = resolveLcmConfig(
+      { LCM_LARGE_FILES_DIR: "/env/files" } as NodeJS.ProcessEnv,
+      { largeFilesDir: "/plugin/files" },
+    );
+    expect(config.largeFilesDir).toBe("/env/files");
+  });
+});
+
+describe("resolveLcmConfig databasePath uses OPENCLAW_STATE_DIR", () => {
+  it("uses OPENCLAW_STATE_DIR for default databasePath", () => {
+    const config = resolveLcmConfig(
+      { OPENCLAW_STATE_DIR: "/custom/state" } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.databasePath).toBe("/custom/state/lcm.db");
+  });
+
+  it("LCM_DATABASE_PATH still overrides OPENCLAW_STATE_DIR", () => {
+    const config = resolveLcmConfig(
+      {
+        OPENCLAW_STATE_DIR: "/custom/state",
+        LCM_DATABASE_PATH: "/explicit/db.sqlite",
+      } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.databasePath).toBe("/explicit/db.sqlite");
   });
 });

@@ -45,6 +45,7 @@ func TestApplyTransplantDeepCopiesMessages(t *testing.T) {
 			role TEXT NOT NULL,
 			content TEXT NOT NULL,
 			token_count INTEGER NOT NULL,
+			identity_hash TEXT,
 			created_at TEXT NOT NULL,
 			UNIQUE (conversation_id, seq)
 		);
@@ -162,6 +163,14 @@ func TestApplyTransplantDeepCopiesMessages(t *testing.T) {
 		FROM messages
 		WHERE conversation_id = 2
 		  AND content IN ('source one', 'source two')
+	`, 2)
+	assertCount(t, db, `
+		SELECT COUNT(*)
+		FROM messages
+		WHERE conversation_id = 2
+		  AND content IN ('source one', 'source two')
+		  AND identity_hash IS NOT NULL
+		  AND identity_hash != ''
 	`, 2)
 	assertCount(t, db, `
 		SELECT COUNT(*)

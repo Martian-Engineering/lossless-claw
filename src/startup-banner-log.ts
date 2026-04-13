@@ -1,8 +1,14 @@
 type StartupBannerKey =
   | "plugin-loaded"
   | "compaction-model"
+  | "proactive-threshold-compaction-mode"
+  | "fallback-providers"
+  | "transcript-gc-enabled"
   | "ignore-session-patterns"
-  | "stateless-session-patterns";
+  | "stateless-session-patterns"
+  | "ignore-session-patterns-env-override"
+  | "stateless-session-patterns-env-override"
+  | "state-dir";
 
 type StartupBannerLogState = {
   emitted: Set<StartupBannerKey>;

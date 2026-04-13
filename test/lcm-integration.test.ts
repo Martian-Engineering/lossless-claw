@@ -828,6 +828,40 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(result.messages).toHaveLength(3);
   });
 
+  it("fresh tail token cap drops older oversized tail messages from assembly", async () => {
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `M${i} ${"z".repeat(396)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 150,
+      freshTailCount: 4,
+      freshTailMaxTokens: 110,
+    });
+
+    expect(result.messages).toHaveLength(1);
+    expect(extractMessageText(result.messages[0]?.content)).toContain("M3");
+  });
+
+  it("fresh tail token cap still preserves the newest message when it alone exceeds the cap", async () => {
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => (i === 1 ? `Huge tail ${"q".repeat(796)}` : `Older ${"q".repeat(196)}`),
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 100,
+      freshTailCount: 2,
+      freshTailMaxTokens: 50,
+    });
+
+    const contents = result.messages.map((message) => extractMessageText(message.content));
+    expect(contents.some((text) => text.includes("Huge tail"))).toBe(true);
+  });
+
   it("pulls matching tool results into the protected tail when the tail contains their tool call", async () => {
     await convStore.createConversation({ sessionId: "session-tail-tool-pair" });
 
@@ -907,6 +941,98 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(extractMessageText(result.messages[2].content)).toBe("tail marker");
   });
 
+  it("does not let paired tool results bypass fresh tail token caps", async () => {
+    await convStore.createConversation({ sessionId: "session-tail-tool-pair-capped" });
+
+    const hugeToolResult = `huge tool result ${"x".repeat(4096)}`;
+    const toolResultMsg = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 1,
+      role: "tool",
+      content: hugeToolResult,
+      tokenCount: estimateTokens(hugeToolResult),
+    });
+    await convStore.createMessageParts(toolResultMsg.messageId, [
+      {
+        sessionId: "session-tail-tool-pair-capped",
+        partType: "tool",
+        ordinal: 0,
+        textContent: hugeToolResult,
+        toolCallId: "call_tail_capped",
+        toolName: "read",
+        metadata: JSON.stringify({
+          originalRole: "toolResult",
+          rawType: "tool_result",
+          toolCallId: "call_tail_capped",
+          toolName: "read",
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, toolResultMsg.messageId);
+
+    const assistantMsg = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 2,
+      role: "assistant",
+      content: "tail tool call",
+      tokenCount: estimateTokens("tail tool call"),
+    });
+    await convStore.createMessageParts(assistantMsg.messageId, [
+      {
+        sessionId: "session-tail-tool-pair-capped",
+        partType: "text",
+        ordinal: 0,
+        textContent: "tail tool call",
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "text",
+        }),
+      },
+      {
+        sessionId: "session-tail-tool-pair-capped",
+        partType: "tool",
+        ordinal: 1,
+        toolCallId: "call_tail_capped",
+        toolName: "read",
+        toolInput: JSON.stringify({ path: "foo.txt" }),
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "toolCall",
+          raw: {
+            type: "toolCall",
+            id: "call_tail_capped",
+            name: "read",
+            input: { path: "foo.txt" },
+          },
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, assistantMsg.messageId);
+
+    const trailingUser = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 3,
+      role: "user",
+      content: "tail marker",
+      tokenCount: estimateTokens("tail marker"),
+    });
+    await sumStore.appendContextMessage(CONV_ID, trailingUser.messageId);
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 120,
+      freshTailCount: 2,
+      freshTailMaxTokens: 80,
+    });
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages.some((message) => message.role === "toolResult")).toBe(false);
+    expect(result.messages[0]?.role).toBe("assistant");
+    expect(extractMessageText(result.messages[0]?.content)).toContain("tail tool call");
+    expect(result.messages[1]?.role).toBe("user");
+    expect(extractMessageText(result.messages[1]?.content)).toBe("tail marker");
+  });
+
   it("degrades tool rows without toolCallId to assistant text", async () => {
     await ingestMessages(convStore, sumStore, 1, {
       roleFn: () => "tool",
@@ -984,6 +1110,25 @@ describe("LCM integration: compaction", () => {
 
     // Total context items should be fewer than the original 10
     expect(contextItems.length).toBeLessThan(10);
+  });
+
+  it("leaf-trigger accounting respects fresh tail token caps", async () => {
+    const tokenAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 4,
+      freshTailMaxTokens: 150,
+      leafChunkTokens: 200,
+    });
+
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Turn ${i}: ${"r".repeat(396)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const trigger = await tokenAwareEngine.evaluateLeafTrigger(CONV_ID);
+
+    expect(trigger.rawTokensOutsideTail).toBeGreaterThanOrEqual(250);
+    expect(trigger.shouldCompact).toBe(true);
   });
 
   it("compactLeaf uses preceding summary context for soft leaf continuity", async () => {
@@ -1100,6 +1245,67 @@ describe("LCM integration: compaction", () => {
 
     expect(result.actionTaken).toBe(true);
     expect(result.condensed).toBe(false);
+    expect(sumStore._summaries.filter((summary) => summary.kind === "condensed")).toHaveLength(0);
+  });
+
+  it("compactLeaf suppresses follow-on condensed passes when cache-aware policy disallows them", async () => {
+    const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      condensedMinFanout: 2,
+      leafChunkTokens: 500,
+      condensedTargetTokens: 10,
+      incrementalMaxDepth: 2,
+    });
+
+    await convStore.createConversation({ sessionId: "incremental-no-condensed-when-hot" });
+
+    await sumStore.insertSummary({
+      summaryId: "sum_no_condensed_leaf_a",
+      conversationId: CONV_ID,
+      kind: "leaf",
+      depth: 0,
+      content: "Depth zero leaf A",
+      tokenCount: 60,
+    });
+    await sumStore.insertSummary({
+      summaryId: "sum_no_condensed_leaf_b",
+      conversationId: CONV_ID,
+      kind: "leaf",
+      depth: 0,
+      content: "Depth zero leaf B",
+      tokenCount: 60,
+    });
+    await sumStore.appendContextSummary(CONV_ID, "sum_no_condensed_leaf_a");
+    await sumStore.appendContextSummary(CONV_ID, "sum_no_condensed_leaf_b");
+
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => `Leaf source turn ${i}: ${"h".repeat(160)}`,
+      tokenCountFn: () => 120,
+    });
+
+    const summarize = vi.fn(
+      async (
+        _text: string,
+        _aggressive?: boolean,
+        options?: { isCondensed?: boolean; depth?: number },
+      ) => {
+        return options?.isCondensed ? "Condensed summary" : "Leaf summary";
+      },
+    );
+    const result = await incrementalEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 1_200,
+      summarize,
+      force: true,
+      allowCondensedPasses: false,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.condensed).toBe(false);
+    expect(
+      summarize.mock.calls.some((call) => call[2]?.isCondensed === true),
+    ).toBe(false);
     expect(sumStore._summaries.filter((summary) => summary.kind === "condensed")).toHaveLength(0);
   });
 
@@ -1962,6 +2168,30 @@ describe("LCM integration: compaction", () => {
     expect(leafSummary!.content).toContain("tokens]");
   });
 
+  it("compaction keeps deterministic fallback within budget for CJK-heavy content", async () => {
+    await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) => `消息 ${i}: ${"你".repeat(600)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarize = vi.fn(async (text: string) => `${text} (not actually summarized)`);
+
+    const result = await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.level).toBe("fallback");
+
+    const leafSummary = sumStore._summaries.find((s) => s.kind === "leaf");
+    expect(leafSummary).toBeDefined();
+    expect(leafSummary!.content).toContain("[Truncated from");
+    expect(leafSummary!.tokenCount).toBeLessThanOrEqual(512);
+  });
+
   it("skips summary persistence when the summarizer hits a provider auth failure", async () => {
     await ingestMessages(convStore, sumStore, 8, {
       contentFn: (i) => `Content ${i}: ${"d".repeat(200)}`,
@@ -2527,6 +2757,70 @@ describe("LCM integration: retrieval", () => {
   });
 });
 
+describe("LCM integration: dynamic leaf chunk sizing", () => {
+  let convStore: ReturnType<typeof createMockConversationStore>;
+  let sumStore: ReturnType<typeof createMockSummaryStore>;
+  let compactionEngine: CompactionEngine;
+
+  beforeEach(() => {
+    convStore = createMockConversationStore();
+    sumStore = createMockSummaryStore();
+    wireStores(convStore, sumStore);
+    compactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 2,
+      leafChunkTokens: 200,
+      leafTargetTokens: 40,
+      incrementalMaxDepth: 0,
+    });
+  });
+
+  it("evaluateLeafTrigger respects an overridden working leaf chunk threshold", async () => {
+    await ingestMessages(convStore, sumStore, 5, {
+      tokenCountFn: () => 100,
+      contentFn: (i) => `trigger message ${i}`,
+    });
+
+    const baseline = await compactionEngine.evaluateLeafTrigger(CONV_ID);
+    expect(baseline).toEqual({
+      shouldCompact: true,
+      rawTokensOutsideTail: 300,
+      threshold: 200,
+    });
+
+    const overridden = await compactionEngine.evaluateLeafTrigger(CONV_ID, 400);
+    expect(overridden).toEqual({
+      shouldCompact: false,
+      rawTokensOutsideTail: 300,
+      threshold: 400,
+    });
+  });
+
+  it("compactLeaf uses the overridden working leaf chunk size when selecting the oldest raw chunk", async () => {
+    await ingestMessages(convStore, sumStore, 5, {
+      tokenCountFn: () => 100,
+      contentFn: (i) => `dynamic chunk message ${i}`,
+    });
+
+    const summarize = vi.fn(async (text: string) => `summary ${text.length}`);
+
+    await compactionEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 8_000,
+      leafChunkTokens: 300,
+      summarize,
+      force: true,
+    });
+
+    expect(summarize).toHaveBeenCalledTimes(1);
+    const compactedText = summarize.mock.calls[0]?.[0] ?? "";
+    expect(compactedText).toContain("dynamic chunk message 0");
+    expect(compactedText).toContain("dynamic chunk message 1");
+    expect(compactedText).toContain("dynamic chunk message 2");
+    expect(compactedText).not.toContain("dynamic chunk message 3");
+  });
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Test Suite: Full Round-Trip (ingest -> compact -> assemble -> retrieve)
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3044,13 +3338,51 @@ describe("LCM integration: summary size cap", () => {
     expect(summaryRecord!.content).not.toContain("[Capped from");
   });
 
+  it("caps CJK-heavy summaries within summaryMaxOverageFactor", async () => {
+    const compactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      leafTargetTokens: 100,
+      summaryMaxOverageFactor: 2,
+    });
+
+    await ingestMessages(convStore, sumStore, 12, {
+      contentFn: (i) => `消息 ${i}: ${"你".repeat(2000)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarize = vi.fn(async () => "你".repeat(400));
+
+    const result = await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 100_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.level).toBe("capped");
+
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    const summaryItem = contextItems.find((ci) => ci.itemType === "summary");
+    expect(summaryItem).toBeDefined();
+    const summaryRecord = await sumStore.getSummary(summaryItem!.summaryId!);
+    expect(summaryRecord).toBeDefined();
+    expect(summaryRecord!.content).toContain("[Capped from");
+    expect(summaryRecord!.tokenCount).toBeLessThanOrEqual(200);
+  });
+
   it("warns when summary exceeds 1.5x target but stays under hard cap", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warnSpy = vi.fn();
 
     const compactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       leafTargetTokens: 100,
       summaryMaxOverageFactor: 5,
+    }, {
+      info: vi.fn(),
+      warn: warnSpy,
+      error: vi.fn(),
+      debug: vi.fn(),
     });
 
     await ingestMessages(convStore, sumStore, 12, {
@@ -3072,8 +3404,6 @@ describe("LCM integration: summary size cap", () => {
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("[lcm] summary exceeds target"),
     );
-
-    warnSpy.mockRestore();
   });
 });
 

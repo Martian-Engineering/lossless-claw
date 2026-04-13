@@ -190,7 +190,7 @@ Files embedded in user messages (typically via `<file>` blocks from tool output)
 1. Parse file blocks from message content.
 2. For each block exceeding `largeFileTokenThreshold` (default 25k tokens):
    - Generate a unique file ID (`file_` prefix)
-   - Store the content to `~/.openclaw/lcm-files/<conversation_id>/<file_id>.<ext>`
+   - Store the content to `largeFilesDir/<conversation_id>/<file_id>.<ext>` (default `~/.openclaw/lcm-files/...`)
    - Generate a ~200 token exploration summary (structural analysis, key sections, etc.)
    - Insert a `large_files` record with metadata
    - Replace the file block in the message with a compact reference

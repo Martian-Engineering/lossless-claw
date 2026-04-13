@@ -24,6 +24,15 @@ function buildApi(): {
   const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
   const modelAuth = {
     getApiKeyForModel: vi.fn(async () => ({ apiKey: "model-auth-key" })),
+    getRuntimeAuthForModel: vi.fn(async () => ({
+      apiKey: "runtime-auth-key",
+      baseUrl: "https://runtime-auth.example.test/v1",
+      request: {
+        headers: {
+          "X-Runtime-Header": "enabled",
+        },
+      },
+    })),
     resolveApiKeyForProvider: vi.fn(async () => ({ apiKey: "provider-auth-key" })),
   };
 
@@ -97,8 +106,7 @@ describe("createLcmDependencies.complete modelAuth lookup order", () => {
     vi.clearAllMocks();
   });
 
-
-  it("prefers runtime.modelAuth.getApiKeyForModel over provider-only auth resolution", async () => {
+  it("prefers runtime.modelAuth.getRuntimeAuthForModel when available", async () => {
     const { api, getFactory } = buildApi();
     lcmPlugin.register(api);
     const factory = getFactory();
@@ -128,10 +136,69 @@ describe("createLcmDependencies.complete modelAuth lookup order", () => {
 
       const runtime = api.runtime as typeof api.runtime & {
         modelAuth: {
+          getRuntimeAuthForModel: ReturnType<typeof vi.fn>;
           getApiKeyForModel: ReturnType<typeof vi.fn>;
           resolveApiKeyForProvider: ReturnType<typeof vi.fn>;
         };
       };
+      expect(runtime.modelAuth.getRuntimeAuthForModel).toHaveBeenCalledTimes(1);
+      expect(runtime.modelAuth.getApiKeyForModel).not.toHaveBeenCalled();
+      expect(runtime.modelAuth.resolveApiKeyForProvider).not.toHaveBeenCalled();
+      expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+        expect.objectContaining({
+          baseUrl: "https://runtime-auth.example.test/v1",
+          headers: expect.objectContaining({
+            "X-Runtime-Header": "enabled",
+          }),
+        }),
+        expect.any(Object),
+        expect.objectContaining({
+          apiKey: "runtime-auth-key",
+        }),
+      );
+    } finally {
+      closeLcmConnection(engine.config.databasePath);
+    }
+  });
+
+  it("falls back to getApiKeyForModel when runtime-ready auth is unavailable", async () => {
+    const { api, getFactory } = buildApi();
+    const runtime = api.runtime as typeof api.runtime & {
+      modelAuth: {
+        getRuntimeAuthForModel: ReturnType<typeof vi.fn>;
+        getApiKeyForModel: ReturnType<typeof vi.fn>;
+        resolveApiKeyForProvider: ReturnType<typeof vi.fn>;
+      };
+    };
+    runtime.modelAuth.getRuntimeAuthForModel.mockResolvedValue(undefined);
+
+    lcmPlugin.register(api);
+    const factory = getFactory();
+    if (!factory) {
+      throw new Error("Expected LCM engine factory to be registered.");
+    }
+
+    const engine = factory() as {
+      deps: {
+        complete: (input: {
+          provider: string;
+          model: string;
+          messages: Array<{ role: string; content: string }>;
+          maxTokens: number;
+        }) => Promise<unknown>;
+      };
+      config: { databasePath: string };
+    };
+
+    try {
+      await engine.deps.complete({
+        provider: "openai-codex",
+        model: "gpt-5.4",
+        messages: [{ role: "user", content: "Summarize this." }],
+        maxTokens: 256,
+      });
+
+      expect(runtime.modelAuth.getRuntimeAuthForModel).toHaveBeenCalledTimes(1);
       expect(runtime.modelAuth.getApiKeyForModel).toHaveBeenCalledTimes(1);
       expect(runtime.modelAuth.resolveApiKeyForProvider).not.toHaveBeenCalled();
       expect(piAiMock.completeSimple).toHaveBeenCalledWith(

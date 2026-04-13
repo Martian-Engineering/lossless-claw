@@ -50,3 +50,15 @@ It looks for known summary-health markers that indicate:
 - truncated summary artifacts near the end of stored content
 
 This gives users one place to answer the question “is my summary graph healthy?” without introducing a broader mutation surface.
+
+## What `/lcm doctor clean` tells you
+
+The cleaners flow is also diagnostic first.
+
+It reports high-confidence junk patterns that are structurally safe to review as standalone cleanup candidates, including:
+
+- archived subagent sessions
+- cron sessions
+- NULL-key orphaned subagent context conversations
+
+This keeps cleanup discovery separate from summary-health diagnostics while still using the same native command surface.

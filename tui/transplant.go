@@ -884,9 +884,9 @@ func nextConversationMessageSeq(ctx context.Context, q sqlQueryer, conversationI
 
 func insertCopiedMessage(ctx context.Context, q sqlQueryer, targetConversationID, seq int64, source transplantMessage) (int64, error) {
 	result, err := q.ExecContext(ctx, `
-		INSERT INTO messages (conversation_id, seq, role, content, token_count, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, targetConversationID, seq, source.role, source.content, source.tokenCount, source.createdAt)
+		INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, targetConversationID, seq, source.role, source.content, source.tokenCount, messageIdentityHash(source.role, source.content), source.createdAt)
 	if err != nil {
 		return 0, fmt.Errorf("insert copied message from %d: %w", source.messageID, err)
 	}

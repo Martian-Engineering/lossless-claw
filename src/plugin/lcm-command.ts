@@ -1,16 +1,32 @@
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
+import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
+import type { RotateSessionStorageResult } from "../engine.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
 import type { OpenClawPluginCommandDefinition, PluginCommandContext } from "openclaw/plugin-sdk";
 import { applyScopedDoctorRepair } from "./lcm-doctor-apply.js";
+import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
+import { describeLogError } from "../lcm-log.js";
+import {
+  applyDoctorCleaners,
+  getDoctorCleanerApplyUnavailableReason,
+  getDoctorCleanerFilterIds,
+  scanDoctorCleaners,
+  type DoctorCleanerId,
+} from "./lcm-doctor-cleaners.js";
 import {
   detectDoctorMarker,
   getDoctorSummaryStats,
   type DoctorSummaryStats,
 } from "./lcm-doctor-shared.js";
+import {
+  CompactionMaintenanceStore,
+  type ConversationCompactionMaintenanceRecord,
+} from "../store/compaction-maintenance-store.js";
+import { CompactionTelemetryStore } from "../store/compaction-telemetry-store.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
@@ -51,8 +67,21 @@ type CurrentConversationResolution =
 
 type ParsedLcmCommand =
   | { kind: "status" }
+  | { kind: "backup" }
+  | { kind: "rotate" }
   | { kind: "doctor"; apply: boolean }
+  | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "help"; error?: string };
+
+type RotateCommandEngine = {
+  rotateSessionStorage(params: {
+    sessionId?: string;
+    sessionKey?: string;
+    sessionFile: string;
+  }): Promise<RotateSessionStorageResult>;
+};
+
+const DOCTOR_CLEANER_IDS = new Set<DoctorCleanerId>(getDoctorCleanerFilterIds());
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -105,6 +134,11 @@ function buildStatLine(label: string, value: string): string {
   return `${label}: ${value}`;
 }
 
+function formatFailureReason(error: unknown): string {
+  const message = describeLogError(error).trim();
+  return message || "Unknown error";
+}
+
 function formatCompressionRatio(contextTokens: number, compressedTokens: number): string {
   if (
     !Number.isFinite(contextTokens) ||
@@ -138,6 +172,32 @@ function splitArgs(rawArgs: string | undefined): string[] {
     .filter(Boolean);
 }
 
+function parseDoctorCleanerApplyArgs(tokens: string[]):
+  | { ok: true; filterId?: DoctorCleanerId; vacuum: boolean }
+  | { ok: false; error: string } {
+  let filterId: DoctorCleanerId | undefined;
+  let vacuum = false;
+
+  for (const token of tokens) {
+    const normalized = token.toLowerCase();
+    if (normalized === "vacuum") {
+      vacuum = true;
+      continue;
+    }
+    if (DOCTOR_CLEANER_IDS.has(normalized as DoctorCleanerId) && !filterId) {
+      filterId = normalized as DoctorCleanerId;
+      continue;
+    }
+    return {
+      ok: false,
+      error:
+        `\`${VISIBLE_COMMAND} doctor clean apply\` accepts at most one filter id (\`${getDoctorCleanerFilterIds().join("`, `")}\`) plus optional \`vacuum\`.`,
+    };
+  }
+
+  return { ok: true, filterId, vacuum };
+}
+
 function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
   const tokens = splitArgs(rawArgs);
   if (tokens.length === 0) {
@@ -150,23 +210,46 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return rest.length === 0
         ? { kind: "status" }
         : { kind: "help", error: "`/lcm status` does not accept extra arguments." };
+    case "backup":
+      return rest.length === 0
+        ? { kind: "backup" }
+        : { kind: "help", error: "`/lcm backup` does not accept extra arguments." };
+    case "rotate":
+      return rest.length === 0
+        ? { kind: "rotate" }
+        : { kind: "help", error: "`/lcm rotate` does not accept extra arguments." };
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
+      }
+      if (rest.length === 1 && rest[0]?.toLowerCase() === "clean") {
+        return { kind: "doctor_cleaners", apply: false, vacuum: false };
+      }
+      if (rest[0]?.toLowerCase() === "clean" && rest[1]?.toLowerCase() === "apply") {
+        const parsedApply = parseDoctorCleanerApplyArgs(rest.slice(2));
+        return parsedApply.ok
+          ? {
+              kind: "doctor_cleaners",
+              apply: true,
+              filterId: parsedApply.filterId,
+              vacuum: parsedApply.vacuum,
+            }
+          : { kind: "help", error: parsedApply.error };
       }
       if (rest.length === 1 && rest[0]?.toLowerCase() === "apply") {
         return { kind: "doctor", apply: true };
       }
       return {
         kind: "help",
-        error: "`/lcm doctor` accepts no arguments, or `apply` for the scoped repair path.",
+        error:
+          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, or \`apply\` for the scoped summary repair path.`,
       };
     case "help":
       return { kind: "help" };
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, doctor, doctor apply.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -291,7 +374,13 @@ function getConversationStatusBySessionKey(
   sessionKey: string,
 ): LcmConversationStatusStats | null {
   const row = db
-    .prepare(`SELECT conversation_id FROM conversations WHERE session_key = ? LIMIT 1`)
+    .prepare(
+      `SELECT conversation_id
+       FROM conversations
+       WHERE session_key = ?
+       ORDER BY active DESC, created_at DESC
+       LIMIT 1`,
+    )
     .get(sessionKey) as { conversation_id: number } | undefined;
 
   if (!row) {
@@ -310,7 +399,7 @@ function getConversationStatusBySessionId(
       `SELECT conversation_id
        FROM conversations
        WHERE session_id = ?
-       ORDER BY created_at DESC
+       ORDER BY active DESC, created_at DESC
        LIMIT 1`,
     )
     .get(sessionId) as { conversation_id: number } | undefined;
@@ -320,6 +409,22 @@ function getConversationStatusBySessionId(
   }
 
   return getConversationStatusStats(db, row.conversation_id);
+}
+
+async function getConversationCompactionMaintenanceByConversationId(
+  db: DatabaseSync,
+  conversationId: number,
+): Promise<ConversationCompactionMaintenanceRecord | null> {
+  return await new CompactionMaintenanceStore(db).getConversationCompactionMaintenance(
+    conversationId,
+  );
+}
+
+async function getConversationCompactionTelemetryByConversationId(
+  db: DatabaseSync,
+  conversationId: number,
+) {
+  return await new CompactionTelemetryStore(db).getConversationCompactionTelemetry(conversationId);
 }
 
 async function resolveCurrentConversation(params: {
@@ -421,8 +526,27 @@ function buildHelpText(error?: string): string {
     "",
     buildSection("📘 Commands", [
       buildStatLine(formatCommand(VISIBLE_COMMAND), "Show compact status output."),
-      buildStatLine(formatCommand(`${VISIBLE_COMMAND} status`), "Show plugin, Global, and current-conversation status."),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} status`),
+        "Show plugin, Global, current-conversation, and compaction-maintenance status.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} backup`),
+        "Create a timestamped backup of the current LCM database.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} rotate`),
+        "Archive the current LCM conversation row and start fresh storage for this same live session.",
+      ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} doctor clean`),
+        "Report global high-confidence junk candidates without deleting anything.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} doctor clean apply`),
+        "Delete approved high-confidence cleaner matches after creating a DB backup.",
+      ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor apply`), "Repair broken summaries in the current conversation."),
     ]),
     "",
@@ -430,9 +554,22 @@ function buildHelpText(error?: string): string {
       buildStatLine("subcommands", `Discover them with ${formatCommand(`${VISIBLE_COMMAND} help`)}.`),
       buildStatLine("alias", `${formatCommand(HIDDEN_ALIAS)} is accepted as a shorter alias.`),
       buildStatLine("current conversation", "Uses the active LCM session when the host exposes session identity."),
+      buildStatLine("`/new`", "Prunes context for the current LCM conversation. It does not split storage."),
+      buildStatLine("`/reset`", "Resets OpenClaw session flow. Use rotate when you only want a fresh LCM row."),
     ]),
   ];
   return lines.join("\n");
+}
+
+function buildDoctorCleanerExampleLine(params: {
+  conversationId: number;
+  sessionKey: string | null;
+  messageCount: number;
+  firstMessagePreview: string | null;
+}): string {
+  const sessionKey = params.sessionKey ? formatCommand(truncateMiddle(params.sessionKey, 44)) : "missing";
+  const preview = params.firstMessagePreview ? ` · first: ${JSON.stringify(params.firstMessagePreview)}` : "";
+  return `conv ${formatNumber(params.conversationId)} · session key ${sessionKey} · messages ${formatNumber(params.messageCount)}${preview}`;
 }
 
 async function buildStatusText(params: {
@@ -481,6 +618,16 @@ async function buildStatusText(params: {
         truncated: 0,
         fallback: 0,
       };
+    const maintenance = await getConversationCompactionMaintenanceByConversationId(
+      params.db,
+      current.stats.conversationId,
+    );
+    const telemetry = await getConversationCompactionTelemetryByConversationId(
+      params.db,
+      current.stats.conversationId,
+    );
+    const formatMaintenanceTime = (value: Date | null): string =>
+      value ? formatTimestamp(value, params.config.timezone) : "never";
     lines.push(
       buildSection("📍 Current conversation", [
         buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
@@ -506,6 +653,37 @@ async function buildStatusText(params: {
             ? `${formatNumber(conversationDoctor.total)} issue(s) in this conversation`
             : "clean",
         ),
+      ]),
+    );
+    lines.push(
+      "",
+      buildSection("🛠️ Maintenance", [
+        buildStatLine(
+          "state",
+          maintenance?.pending
+            ? "pending"
+            : maintenance?.running
+              ? "running"
+              : "idle",
+        ),
+        buildStatLine("requested at", formatMaintenanceTime(maintenance?.requestedAt ?? null)),
+        buildStatLine("reason", maintenance?.reason ?? "none"),
+        buildStatLine("last started", formatMaintenanceTime(maintenance?.lastStartedAt ?? null)),
+        buildStatLine("last finished", formatMaintenanceTime(maintenance?.lastFinishedAt ?? null)),
+        buildStatLine("last failure", maintenance?.lastFailureSummary ?? "none"),
+        buildStatLine(
+          "requested token budget",
+          maintenance?.tokenBudget != null ? formatNumber(maintenance.tokenBudget) : "unknown",
+        ),
+        buildStatLine(
+          "observed token count",
+          maintenance?.currentTokenCount != null ? formatNumber(maintenance.currentTokenCount) : "unknown",
+        ),
+        buildStatLine("last api call", formatMaintenanceTime(telemetry?.lastApiCallAt ?? null)),
+        buildStatLine("last cache touch", formatMaintenanceTime(telemetry?.lastCacheTouchAt ?? null)),
+        buildStatLine("cache retention", telemetry?.retention ?? "unknown"),
+        buildStatLine("cache state", telemetry?.cacheState ?? "unknown"),
+        buildStatLine("provider/model", [telemetry?.provider, telemetry?.model].filter(Boolean).join(" / ") || "unknown"),
       ]),
     );
   } else {
@@ -580,6 +758,433 @@ async function buildDoctorText(params: {
       ]),
     );
   }
+
+  return lines.join("\n");
+}
+
+async function buildDoctorCleanersText(params: {
+  db: DatabaseSync;
+}): Promise<string> {
+  const scan = scanDoctorCleaners(params.db);
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🩺 Lossless Claw Doctor Clean",
+    "",
+    buildSection("🌐 Global scan", [
+      buildStatLine("filters", formatNumber(scan.filters.length)),
+      buildStatLine("matched conversations", formatNumber(scan.totalDistinctConversations)),
+      buildStatLine("matched messages", formatNumber(scan.totalDistinctMessages)),
+      buildStatLine("mode", "read-only diagnostics"),
+    ]),
+  ];
+
+  if (scan.filters.every((filter) => filter.conversationCount === 0)) {
+    lines.push(
+      "",
+      buildSection("✅ Result", ["No high-confidence cleaner candidates detected."]),
+    );
+    return lines.join("\n");
+  }
+
+  for (const filter of scan.filters) {
+    lines.push(
+      "",
+      buildSection(`🧹 ${filter.label}`, [
+        buildStatLine("filter id", formatCommand(filter.id)),
+        buildStatLine("description", filter.description),
+        buildStatLine("matched conversations", formatNumber(filter.conversationCount)),
+        buildStatLine("matched messages", formatNumber(filter.messageCount)),
+      ]),
+    );
+
+    if (filter.examples.length > 0) {
+      lines.push(
+        "",
+        buildSection(
+          "🧷 Examples",
+          filter.examples.map((example) => buildDoctorCleanerExampleLine(example)),
+        ),
+      );
+    }
+  }
+
+  lines.push(
+    "",
+    buildSection("🛠️ Next step", [
+      `Review the examples, then run ${formatCommand(`${VISIBLE_COMMAND} doctor clean apply`)} to delete approved matches after Lossless Claw creates a backup.`,
+    ]),
+  );
+
+  return lines.join("\n");
+}
+
+function runQuickCheck(db: DatabaseSync): string {
+  const rows = db.prepare(`PRAGMA quick_check`).all() as Array<{ quick_check?: string }>;
+  const results = rows
+    .map((row) => row.quick_check)
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+
+  if (results.length === 0) {
+    return "unknown";
+  }
+
+  if (results.length === 1 && results[0] === "ok") {
+    return "ok";
+  }
+
+  return results.join("; ");
+}
+
+function isPassingQuickCheck(result: string): boolean {
+  return result === "ok";
+}
+
+function getLcmBackupUnavailableReason(databasePath: string): string | null {
+  const trimmed = databasePath.trim();
+  if (!trimmed || trimmed === ":memory:" || trimmed.startsWith("file::memory:")) {
+    return "Backup requires a file-backed SQLite database.";
+  }
+  return null;
+}
+
+async function buildBackupText(params: {
+  db: DatabaseSync;
+  config: LcmConfig;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "💾 Lossless Claw Backup",
+    "",
+  ];
+
+  const unavailableReason = getLcmBackupUnavailableReason(params.config.databasePath);
+  if (unavailableReason) {
+    lines.push(
+      buildSection("🛠️ Backup", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", unavailableReason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  let backupPath: string | null;
+  try {
+    backupPath = createLcmDatabaseBackup(params.db, {
+      databasePath: params.config.databasePath,
+      label: "backup",
+    });
+  } catch (error) {
+    lines.push(
+      buildSection("🛠️ Backup", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(error)),
+      ]),
+    );
+    return lines.join("\n");
+  }
+  if (!backupPath) {
+    lines.push(
+      buildSection("🛠️ Backup", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", "Lossless Claw could not determine a backup path."),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    buildSection("🛠️ Backup", [
+      buildStatLine("status", "created"),
+      buildStatLine("db path", params.config.databasePath),
+      buildStatLine("backup path", backupPath),
+    ]),
+  );
+  return lines.join("\n");
+}
+
+async function buildRotateText(params: {
+  ctx: PluginCommandContext;
+  db: DatabaseSync;
+  config: LcmConfig;
+  deps?: LcmDependencies;
+  getLcm?: () => Promise<RotateCommandEngine>;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🪓 Lossless Claw Rotate",
+    "",
+  ];
+
+  const sessionKey = normalizeIdentity(params.ctx.sessionKey);
+  const sessionId = normalizeIdentity(params.ctx.sessionId);
+  if (!sessionKey || !sessionId) {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine(
+          "reason",
+          "OpenClaw must expose both the active session key and session id for Lossless Claw to rotate storage safely.",
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const current = await resolveCurrentConversation({
+    ctx: params.ctx,
+    db: params.db,
+  });
+  if (current.kind === "unavailable") {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", current.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  if (!params.deps || !params.getLcm) {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", "Rotate requires the runtime-backed LCM engine to be available."),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const transcriptPath = await params.deps.resolveSessionTranscriptFile({
+    sessionId,
+    sessionKey,
+  });
+  if (!transcriptPath || !existsSync(transcriptPath)) {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine(
+          "reason",
+          "Lossless Claw could not resolve the active session transcript path, so it cannot checkpoint the new row safely.",
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const unavailableReason = getLcmBackupUnavailableReason(params.config.databasePath);
+  if (unavailableReason) {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", unavailableReason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    buildSection("📍 Current conversation", [
+      buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
+      buildStatLine("session key", formatCommand(truncateMiddle(sessionKey, 44))),
+      buildStatLine("messages", formatNumber(current.stats.messageCount)),
+    ]),
+    "",
+  );
+
+  let backupPath: string | null;
+  try {
+    backupPath = createLcmDatabaseBackup(params.db, {
+      databasePath: params.config.databasePath,
+      label: "rotate",
+      replaceLatest: true,
+    });
+  } catch (error) {
+    lines.push(
+      buildSection("💾 Backup", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(error)),
+      ]),
+    );
+    return lines.join("\n");
+  }
+  if (!backupPath) {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", "Lossless Claw could not create the rotate backup."),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    buildSection("💾 Backup", [
+      buildStatLine("status", "replaced latest"),
+      buildStatLine("backup path", backupPath),
+    ]),
+    "",
+  );
+
+  let result: RotateSessionStorageResult;
+  try {
+    result = await (await params.getLcm()).rotateSessionStorage({
+      sessionId,
+      sessionKey,
+      sessionFile: transcriptPath,
+    });
+  } catch (error) {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(error)),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  if (result.kind === "unavailable") {
+    lines.push(
+      buildSection("🛠️ Rotate", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", result.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    buildSection("🛠️ Rotate", [
+      buildStatLine("status", "rotated"),
+      buildStatLine("archived conversation id", formatNumber(result.archivedConversationId)),
+      buildStatLine("new active conversation id", formatNumber(result.activeConversationId)),
+      buildStatLine("archived message count", formatNumber(result.archivedMessageCount)),
+      buildStatLine("checkpoint bytes", formatNumber(result.checkpointSize)),
+      buildStatLine("transcript", transcriptPath),
+      buildStatLine("mode", "start from now forward"),
+    ]),
+    "",
+    buildSection("🧭 Notes", [
+      "Archived history remains searchable across conversations.",
+      `${formatCommand("/new")} still prunes context only, and ${formatCommand("/reset")} still resets OpenClaw session flow.`,
+    ]),
+  );
+  return lines.join("\n");
+}
+
+async function buildDoctorCleanersApplyText(params: {
+  db: DatabaseSync;
+  config: LcmConfig;
+  filterId?: DoctorCleanerId;
+  vacuum: boolean;
+}): Promise<string> {
+  const filterIds = params.filterId ? [params.filterId] : undefined;
+  const unavailableReason = getDoctorCleanerApplyUnavailableReason(params.config.databasePath);
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🩺 Lossless Claw Doctor Clean Apply",
+    "",
+    buildSection("🌐 Cleaner scope", [
+      buildStatLine(
+        "filters",
+        filterIds && filterIds.length > 0
+          ? filterIds.map((filter) => formatCommand(filter)).join(", ")
+          : "all approved cleaner filters",
+      ),
+      buildStatLine("vacuum requested", formatBoolean(params.vacuum)),
+    ]),
+    "",
+  ];
+  if (unavailableReason) {
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", unavailableReason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const before = scanDoctorCleaners(params.db, filterIds);
+  lines.splice(
+    lines.length - 1,
+    0,
+    buildSection("📊 Current matches", [
+      buildStatLine("matched conversations before apply", formatNumber(before.totalDistinctConversations)),
+      buildStatLine("matched messages before apply", formatNumber(before.totalDistinctMessages)),
+    ]),
+    "",
+  );
+
+  if (before.totalDistinctConversations === 0) {
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "completed"),
+        buildStatLine("backup path", "skipped (no matches)"),
+        buildStatLine("deleted conversations", "0"),
+        buildStatLine("deleted messages", "0"),
+        buildStatLine("vacuumed", "no"),
+        buildStatLine("quick_check", "not run (no writes)"),
+        buildStatLine("result", "clean; no deletes ran"),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  let result: ReturnType<typeof applyDoctorCleaners>;
+  try {
+    result = applyDoctorCleaners(params.db, {
+      databasePath: params.config.databasePath,
+      filterIds,
+      vacuum: params.vacuum,
+    });
+  } catch (error) {
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "failed"),
+        buildStatLine(
+          "reason",
+          error instanceof Error ? error.message : "unknown cleaner apply failure",
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  if (result.kind === "unavailable") {
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", result.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const quickCheck = runQuickCheck(params.db);
+  const quickCheckPassed = isPassingQuickCheck(quickCheck);
+  lines.push(
+    buildSection("🛠️ Apply", [
+      buildStatLine("status", quickCheckPassed ? "completed" : "warning"),
+      buildStatLine("backup path", result.backupPath),
+      buildStatLine("deleted conversations", formatNumber(result.deletedConversations)),
+      buildStatLine("deleted messages", formatNumber(result.deletedMessages)),
+      buildStatLine("vacuumed", formatBoolean(result.vacuumed)),
+      buildStatLine("quick_check", quickCheck),
+      buildStatLine(
+        "result",
+        quickCheckPassed
+          ? result.deletedConversations > 0
+            ? `removed ${formatNumber(result.deletedConversations)} conversation(s)`
+            : "clean; no deletes ran"
+          : "writes committed, but SQLite integrity verification reported problems; inspect the database or restore from the backup before continuing",
+      ),
+    ]),
+  );
 
   return lines.join("\n");
 }
@@ -714,6 +1319,7 @@ export function createLcmCommand(params: {
   config: LcmConfig;
   deps?: LcmDependencies;
   summarize?: LcmSummarizeFn;
+  getLcm?: () => Promise<RotateCommandEngine>;
 }): OpenClawPluginCommandDefinition {
   const getDb = async (): Promise<DatabaseSync> =>
     typeof params.db === "function" ? await params.db() : params.db;
@@ -723,13 +1329,34 @@ export function createLcmCommand(params: {
     nativeNames: {
       default: "lossless",
     },
-    description: "Show Lossless Claw health, scan broken summaries, and repair scoped doctor issues.",
+    nativeProgressMessages: {
+      telegram: "Lossless Claw is working...",
+    },
+    description:
+      "Show Lossless Claw health, create DB backups, rotate the current LCM conversation row, inspect high-confidence junk candidates, and run scoped doctor actions.",
     acceptsArgs: true,
     handler: async (ctx) => {
       const parsed = parseLcmCommand(ctx.args);
       switch (parsed.kind) {
         case "status":
           return { text: await buildStatusText({ ctx, db: await getDb(), config: params.config }) };
+        case "backup":
+          return {
+            text: await buildBackupText({
+              db: await getDb(),
+              config: params.config,
+            }),
+          };
+        case "rotate":
+          return {
+            text: await buildRotateText({
+              ctx,
+              db: await getDb(),
+              config: params.config,
+              deps: params.deps,
+              getLcm: params.getLcm,
+            }),
+          };
         case "doctor":
           return parsed.apply
             ? {
@@ -742,6 +1369,17 @@ export function createLcmCommand(params: {
                 }),
               }
             : { text: await buildDoctorText({ ctx, db: await getDb() }) };
+        case "doctor_cleaners":
+          return parsed.apply
+            ? {
+                text: await buildDoctorCleanersApplyText({
+                  db: await getDb(),
+                  config: params.config,
+                  filterId: parsed.filterId,
+                  vacuum: parsed.vacuum,
+                }),
+              }
+            : { text: await buildDoctorCleanersText({ db: await getDb() }) };
         case "help":
           return { text: buildHelpText(parsed.error) };
       }
@@ -755,6 +1393,7 @@ export const __testing = {
   getDoctorSummaryStats,
   getLcmStatusStats,
   getConversationStatusStats,
+  scanDoctorCleaners,
   resolveCurrentConversation,
   resolveContextEngineSlot,
   resolvePluginEnabled,

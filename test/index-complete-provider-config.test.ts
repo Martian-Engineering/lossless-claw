@@ -229,6 +229,65 @@ describe("createLcmDependencies.complete provider config resolution", () => {
     );
   });
 
+  it("overrides built-in transport defaults for known providers with runtime provider config", async () => {
+    piAiMock.getModel.mockReturnValue({
+      id: "gpt-5.4",
+      provider: "openai",
+      api: "openai-responses",
+      name: "GPT-5.4",
+      baseUrl: "https://api.openai.com/v1",
+      headers: {
+        "X-Builtin": "1",
+      },
+    });
+
+    await callComplete({
+      loadConfigResult: {
+        models: {
+          providers: {
+            openai: {
+              api: "openai-responses",
+              baseUrl: "http://proxy.example.test/v1",
+              headers: {
+                "X-Proxy": "yes",
+              },
+            },
+          },
+        },
+      },
+      provider: "openai",
+      model: "gpt-5.4",
+      runtimeConfig: {
+        models: {
+          providers: {
+            openai: {
+              api: "openai-responses",
+              baseUrl: "http://proxy.example.test/v1",
+              headers: {
+                "X-Proxy": "yes",
+              },
+            },
+          },
+        },
+      },
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "gpt-5.4",
+        provider: "openai",
+        api: "openai-responses",
+        baseUrl: "http://proxy.example.test/v1",
+        headers: {
+          "X-Builtin": "1",
+          "X-Proxy": "yes",
+        },
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
   it("always passes baseUrl as a string for known models", async () => {
     piAiMock.getModel.mockReturnValue({
       id: "known-model",
@@ -242,6 +301,7 @@ describe("createLcmDependencies.complete provider config resolution", () => {
         models: {
           providers: {
             "unit-proxy": {
+              api: "openai-completions",
               apiKey: "provider-level-key",
             },
           },
@@ -259,6 +319,40 @@ describe("createLcmDependencies.complete provider config resolution", () => {
       expect.any(Object),
       expect.any(Object),
     );
+  });
+
+  it("returns a clear error when a custom provider has no resolvable api family", async () => {
+    const { result } = await callComplete({
+      loadConfigResult: {
+        models: {
+          providers: {
+            "codex-gateway": {
+              baseUrl: "http://proxy.example.test/v1",
+            },
+          },
+        },
+      },
+      provider: "codex-gateway",
+      model: "gpt-5.4",
+      runtimeConfig: {
+        models: {
+          providers: {
+            "codex-gateway": {
+              baseUrl: "http://proxy.example.test/v1",
+            },
+          },
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      content: [],
+      error: {
+        kind: "provider_config",
+        message: expect.stringMatching(/unable to resolve API family for provider codex-gateway/i),
+      },
+    });
+    expect(piAiMock.completeSimple).not.toHaveBeenCalled();
   });
 
   it("preserves provider auth error metadata when completeSimple throws a 401 scope error", async () => {
@@ -285,5 +379,37 @@ describe("createLcmDependencies.complete provider config resolution", () => {
         code: "insufficient_scope",
       },
     });
+  });
+
+  it("does not mislabel non-config provider errors as provider_config", async () => {
+    piAiMock.completeSimple.mockRejectedValue(new Error("gateway timed out"));
+
+    const { result } = await callComplete({
+      loadConfigResult: {
+        models: {
+          providers: {
+            "unit-proxy": {
+              api: "openai-completions",
+            },
+          },
+        },
+      },
+      provider: "unit-proxy",
+      model: "unit-model",
+      runtimeConfig: {
+        models: {
+          providers: {
+            "unit-proxy": {
+              api: "openai-completions",
+            },
+          },
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      content: [],
+    });
+    expect(result).not.toHaveProperty("error");
   });
 });

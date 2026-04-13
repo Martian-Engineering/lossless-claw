@@ -8,10 +8,13 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { resolveLcmConfig } from "../db/config.js";
-import { closeLcmConnection, createLcmDatabaseConnection } from "../db/connection.js";
+import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
+import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
+import { createLcmLogger, describeLogError } from "../lcm-log.js";
 import { logStartupBannerOnce } from "../startup-banner-log.js";
+import { getSharedInit, setSharedInit, removeSharedInit } from "./shared-init.js";
+import type { SharedLcmInit } from "./shared-init.js";
 import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
@@ -52,6 +55,8 @@ type PluginEnvSnapshot = {
   openclawDefaultModel: string;
   agentDir: string;
   home: string;
+  /** Active OpenClaw state directory — respects OPENCLAW_STATE_DIR for multi-profile hosts. */
+  stateDir: string;
 };
 
 type ReadEnvFn = (key: string) => string | undefined;
@@ -65,6 +70,29 @@ type CompleteSimpleOptions = {
 
 type RuntimeModelAuthResult = {
   apiKey?: string;
+  baseUrl?: string;
+  request?: RuntimeModelRequestTransportOverrides;
+  expiresAt?: number;
+};
+
+type RuntimeModelRequestAuthOverride =
+  | {
+      mode: "provider-default";
+    }
+  | {
+      mode: "authorization-bearer";
+      token: string;
+    }
+  | {
+      mode: "header";
+      headerName: string;
+      value: string;
+      prefix?: string;
+    };
+
+type RuntimeModelRequestTransportOverrides = {
+  headers?: Record<string, string>;
+  auth?: RuntimeModelRequestAuthOverride;
 };
 
 type SessionEndLifecycleEvent = {
@@ -105,11 +133,19 @@ type RuntimeModelAuth = {
     profileId?: string;
     preferredProfile?: string;
   }) => Promise<RuntimeModelAuthResult | undefined>;
+  getRuntimeAuthForModel?: (params: {
+    model: RuntimeModelAuthModel;
+    cfg?: OpenClawPluginApi["config"];
+    profileId?: string;
+    preferredProfile?: string;
+    workspaceDir?: string;
+  }) => Promise<RuntimeModelAuthResult | undefined>;
 };
 
 const MODEL_AUTH_PR_URL = "https://github.com/openclaw/openclaw/pull/41090";
 const MODEL_AUTH_MERGE_COMMIT = "4790e40";
 const MODEL_AUTH_REQUIRED_RELEASE = "the first OpenClaw release after 2026.3.8";
+const PROVIDER_API_RESOLUTION_ERROR_PREFIX = "[lcm] unable to resolve API family for provider ";
 const AUTH_ERROR_TEXT_PATTERN =
   /\b401\b|unauthorized|unauthorised|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|authentication failed|authorization failed|missing scope|insufficient scope|model\.request\b/i;
 const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
@@ -137,12 +173,33 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "Recall order for compacted conversation history:",
   "1. `lcm_grep` — search by regex or full-text across messages and summaries",
   "2. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
-  "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, returns answer with cited summary IDs (~120s, don't ration it)",
+  "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
+  "",
+  "**`lcm_grep` routing guidance:**",
+  '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for literal patterns.',
+  '- Full-text queries use FTS5 semantics, and FTS5 defaults to AND matching, so extra terms make matching stricter rather than broader.',
+  '- Prefer 1-3 distinctive full-text terms or one quoted phrase. Do not pad queries with synonyms or extra keywords.',
+  '- Wrap exact multi-word phrases in quotes, for example `"error handling"`.',
+  '- Keep the default `sort: "recency"` for "what just happened?" lookups.',
+  '- Use `sort: "relevance"` when hunting for the best older match on a topic.',
+  '- Use `sort: "hybrid"` when relevance matters but newer context should still get a boost.',
   "",
   "**`lcm_expand_query` usage** — two patterns (always requires `prompt`):",
   "- With IDs: `lcm_expand_query(summaryIds: [\"sum_xxx\"], prompt: \"What config changes were discussed?\")`",
   "- With search: `lcm_expand_query(query: \"database migration\", prompt: \"What strategy was decided?\")`",
+  "- `query` uses the same FTS5 full-text search path as `lcm_grep`, so the same query-construction rules apply.",
+  "- `query` is for matching candidate summaries; `prompt` is the natural-language question or task to answer after expansion.",
+  "- FTS5 defaults to AND matching, so more query terms narrow results instead of broadening them.",
+  "- For `query`, use 1-3 distinctive terms or a quoted phrase. Do not stuff synonyms or extra keywords into it.",
+  "**Scope selection rule:**",
+  "- Start with the current conversation scope.",
+  "- If the in-context summaries already look relevant to the user's question, prefer `lcm_grep` or `lcm_expand_query` without `allConversations`.",
+  "- Use `allConversations: true` only when the current summaries do not appear sufficient, the question seems outside the current conversation, or the user is explicitly asking about work across sessions.",
+  "- For global discovery, prefer `lcm_grep(..., allConversations: true)` first.",
+  "- If global matches are found and the user needs one synthesized answer, use `lcm_expand_query(..., allConversations: true)`; this is bounded synthesis, not exhaustive expansion.",
+  "- If you already know the exact target conversation, prefer explicit `conversationId` instead of `allConversations`.",
   "- Optional: `maxTokens` (default 2000), `conversationId`, `allConversations: true`",
+  "- Keep raw summary IDs out of normal user-facing prose unless the user explicitly asks for sources or IDs.",
   "",
   "These precedence rules apply only to compacted conversation history. Lossless-claw does not supersede memory tools globally.",
   "",
@@ -160,7 +217,29 @@ function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnaps
     openclawDefaultModel: "",
     agentDir: env.OPENCLAW_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
     home: env.HOME?.trim() ?? "",
+    stateDir: resolveOpenclawStateDir(env),
   };
+}
+
+/** Coerce a plugin-config-like value into a plain object when possible. */
+function toPluginConfig(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/** Resolve plugin config from direct runtime injection or the root OpenClaw config fallback. */
+function resolvePluginConfig(api: OpenClawPluginApi): Record<string, unknown> | undefined {
+  const directPluginConfig = toPluginConfig(api.pluginConfig);
+  if (directPluginConfig && Object.keys(directPluginConfig).length > 0) {
+    return directPluginConfig;
+  }
+
+  const rootConfig = toPluginConfig(api.config);
+  const plugins = toPluginConfig(rootConfig?.plugins);
+  const entries = toPluginConfig(plugins?.entries);
+  const pluginEntry = toPluginConfig(entries?.["lossless-claw"]);
+  return toPluginConfig(pluginEntry?.config);
 }
 
 function truncateErrorMessage(message: string, maxChars = 240): string {
@@ -460,7 +539,7 @@ function normalizeProviderId(provider: string): string {
 }
 
 /** Resolve known provider API defaults when model lookup misses. */
-function inferApiFromProvider(provider: string): string {
+function inferApiFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
   const map: Record<string, string> = {
     anthropic: "anthropic-messages",
@@ -473,7 +552,7 @@ function inferApiFromProvider(provider: string): string {
     "google-vertex": "google-vertex",
     "amazon-bedrock": "bedrock-converse-stream",
   };
-  return map[normalized] ?? "openai-responses";
+  return map[normalized];
 }
 
 /** Codex Responses rejects `temperature`; omit it for that API family. */
@@ -507,6 +586,30 @@ export function buildCompleteSimpleOptions(params: {
   }
 
   return options;
+}
+
+/**
+ * Prefer an explicit reasoning setting, otherwise apply a caller-provided
+ * default only when the resolved model advertises reasoning support.
+ */
+export function resolveEffectiveReasoning(params: {
+  reasoning: string | undefined;
+  reasoningIfSupported: string | undefined;
+  modelSupportsReasoning: boolean | undefined;
+}): string | undefined {
+  if (typeof params.reasoning === "string" && params.reasoning.trim()) {
+    return params.reasoning.trim();
+  }
+
+  if (
+    params.modelSupportsReasoning === true &&
+    typeof params.reasoningIfSupported === "string" &&
+    params.reasoningIfSupported.trim()
+  ) {
+    return params.reasoningIfSupported.trim();
+  }
+
+  return undefined;
 }
 
 /** Select provider-specific config values with case-insensitive provider keys. */
@@ -563,12 +666,18 @@ function buildModelAuthLookupModel(params: {
   provider: string;
   model: string;
   api?: string;
+  contextWindow?: number;
 }): RuntimeModelAuthModel {
+  const contextWindow =
+    typeof params.contextWindow === "number" && Number.isFinite(params.contextWindow) && params.contextWindow > 0
+      ? params.contextWindow
+      : 1_000_000;
+
   return {
     id: params.model,
     name: params.model,
     provider: params.provider,
-    api: params.api?.trim() || inferApiFromProvider(params.provider),
+    api: params.api?.trim() || inferApiFromProvider(params.provider) || "",
     reasoning: false,
     input: ["text"],
     cost: {
@@ -577,7 +686,7 @@ function buildModelAuthLookupModel(params: {
       cacheRead: 0,
       cacheWrite: 0,
     },
-    contextWindow: 200_000,
+    contextWindow,
     maxTokens: 8_000,
   };
 }
@@ -586,6 +695,78 @@ function buildModelAuthLookupModel(params: {
 function resolveApiKeyFromAuthResult(auth: RuntimeModelAuthResult | undefined): string | undefined {
   const apiKey = auth?.apiKey?.trim();
   return apiKey ? apiKey : undefined;
+}
+
+/** Normalize a runtime auth override base URL when present. */
+function resolveBaseUrlFromAuthResult(auth: RuntimeModelAuthResult | undefined): string | undefined {
+  const baseUrl = auth?.baseUrl?.trim();
+  return baseUrl ? baseUrl : undefined;
+}
+
+/** Normalize raw runtime auth headers into plain string headers. */
+function resolveRuntimeAuthHeaders(
+  request: RuntimeModelRequestTransportOverrides | undefined,
+): Record<string, string> | undefined {
+  if (!request) {
+    return undefined;
+  }
+
+  const headers: Record<string, string> = {};
+  if (isRecord(request.headers)) {
+    for (const [key, value] of Object.entries(request.headers)) {
+      if (typeof value !== "string") {
+        continue;
+      }
+      const headerName = key.trim();
+      const headerValue = value.trim();
+      if (headerName && headerValue) {
+        headers[headerName] = headerValue;
+      }
+    }
+  }
+
+  const auth = request.auth;
+  if (auth?.mode === "authorization-bearer") {
+    const token = auth.token.trim();
+    if (token) {
+      for (const key of Object.keys(headers)) {
+        if (key.toLowerCase() === "authorization") {
+          delete headers[key];
+        }
+      }
+      headers.Authorization = `Bearer ${token}`;
+    }
+  } else if (auth?.mode === "header") {
+    const headerName = auth.headerName.trim();
+    const value = auth.value.trim();
+    if (headerName && value) {
+      const normalizedHeader = headerName.toLowerCase();
+      for (const key of Object.keys(headers)) {
+        if (
+          key.toLowerCase() === normalizedHeader ||
+          (normalizedHeader !== "authorization" && key.toLowerCase() === "authorization")
+        ) {
+          delete headers[key];
+        }
+      }
+      headers[headerName] = `${auth.prefix?.trim() ?? ""}${value}`;
+    }
+  }
+
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+/** Attach OpenClaw transport overrides to a model for runtimes that inspect the shared symbol. */
+function attachRuntimeAuthRequestTransport<TModel extends object>(
+  model: TModel,
+  request: RuntimeModelRequestTransportOverrides | undefined,
+): TModel {
+  if (!request) {
+    return model;
+  }
+  const next = { ...model } as TModel & Record<symbol, unknown>;
+  next[Symbol.for("openclaw.modelProviderRequestTransport")] = request;
+  return next;
 }
 
 function buildLegacyAuthFallbackWarning(): string {
@@ -671,9 +852,9 @@ function resolveAuthStorePaths(params: { agentDir?: string; envSnapshot: PluginE
     paths.push(join(envAgentDir, "auth-profiles.json"));
   }
 
-  const home = params.envSnapshot.home;
-  if (home) {
-    paths.push(join(home, ".openclaw", "agents", "main", "agent", "auth-profiles.json"));
+  const stateDir = params.envSnapshot.stateDir;
+  if (stateDir) {
+    paths.push(join(stateDir, "agents", "main", "agent", "auth-profiles.json"));
   }
 
   return [...new Set(paths)];
@@ -751,6 +932,7 @@ function resolveAuthProfileCandidates(params: {
 function resolveSecretRef(params: {
   ref: SecretRef | undefined;
   home: string;
+  stateDir: string;
   config?: unknown;
 }): string | undefined {
   const ref = params.ref;
@@ -803,9 +985,9 @@ function resolveSecretRef(params: {
     // Fall through to the legacy secrets.json lookup below.
   }
 
-  // Legacy file fallback (source: "file" or unset) — read from ~/.openclaw/secrets.json
+  // Legacy file fallback (source: "file" or unset) — read from secrets.json in the active state dir
   try {
-    const secretsPath = join(params.home, ".openclaw", "secrets.json");
+    const secretsPath = join(params.stateDir, "secrets.json");
     const raw = readFileSync(secretsPath, "utf8");
     const secrets = JSON.parse(raw) as Record<string, unknown>;
     const parts = ref.id.replace(/^\//, "").split("/");
@@ -891,6 +1073,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
         resolveSecretRef({
           ref: credential.keyRef,
           home: params.envSnapshot.home,
+          stateDir: params.envSnapshot.stateDir,
           config: secretConfig,
         });
       if (key) {
@@ -905,6 +1088,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
         resolveSecretRef({
           ref: credential.tokenRef,
           home: params.envSnapshot.home,
+          stateDir: params.envSnapshot.stateDir,
           config: secretConfig,
         });
       if (!token) {
@@ -1098,11 +1282,26 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(api.config);
   const modelAuth = getRuntimeModelAuth(api);
   const readEnv: ReadEnvFn = (key) => process.env[key];
-  const pluginConfig =
-    api.pluginConfig && typeof api.pluginConfig === "object" && !Array.isArray(api.pluginConfig)
-      ? api.pluginConfig
-      : undefined;
-  const config = resolveLcmConfig(process.env, pluginConfig);
+  const pluginConfig = resolvePluginConfig(api);
+  const log = createLcmLogger(api);
+  const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
+
+  if (diagnostics.ignoreSessionPatternsEnvOverridesPluginConfig) {
+    logStartupBannerOnce({
+      key: "ignore-session-patterns-env-override",
+      log: (message) => log.warn(message),
+      message:
+        "[lcm] LCM_IGNORE_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.ignoreSessionPatterns; plugin config array will be ignored",
+    });
+  }
+  if (diagnostics.statelessSessionPatternsEnvOverridesPluginConfig) {
+    logStartupBannerOnce({
+      key: "stateless-session-patterns-env-override",
+      log: (message) => log.warn(message),
+      message:
+        "[lcm] LCM_STATELESS_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.statelessSessionPatterns; plugin config array will be ignored",
+    });
+  }
 
   // Read model overrides from plugin config
   if (pluginConfig) {
@@ -1117,8 +1316,19 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
   }
 
   if (!modelAuth) {
-    api.logger.warn(buildLegacyAuthFallbackWarning());
+    log.warn(buildLegacyAuthFallbackWarning());
   }
+
+  logStartupBannerOnce({
+    key: "transcript-gc-enabled",
+    log: (message) => log.info(message),
+    message: `[lcm] Transcript GC ${config.transcriptGcEnabled ? "enabled" : "disabled"} (default false)`,
+  });
+  logStartupBannerOnce({
+    key: "proactive-threshold-compaction-mode",
+    log: (message) => log.info(message),
+    message: `[lcm] Proactive threshold compaction mode: ${config.proactiveThresholdCompactionMode} (default deferred)`,
+  });
 
   /** Resolve the best config object to hand to runtime.modelAuth for this lookup. */
   const resolveModelAuthConfig = (runtimeConfig: unknown): OpenClawPluginApi["config"] => {
@@ -1146,7 +1356,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       try {
         const modelAuthKey = resolveApiKeyFromAuthResult(
           await modelAuth.getApiKeyForModel({
-            model: buildModelAuthLookupModel({ provider, model }),
+            model: buildModelAuthLookupModel({ provider, model, contextWindow: 1_000_000 }),
             cfg: modelAuthConfig,
             ...(options?.profileId ? { profileId: options.profileId } : {}),
             ...(options?.preferredProfile ? { preferredProfile: options.preferredProfile } : {}),
@@ -1180,6 +1390,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
 
   return {
     config,
+    configDiagnostics: diagnostics,
     isRuntimeManagedAuthProvider: (provider: string, providerApi?: string) => {
       const normalizedProvider = normalizeProviderId(provider);
       if (normalizedProvider === "openai-codex" || normalizedProvider === "github-copilot") {
@@ -1195,11 +1406,13 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
       authProfileId,
       agentDir,
       runtimeConfig,
+      skipModelAuth,
       messages,
       system,
       maxTokens,
       temperature,
       reasoning,
+      reasoningIfSupported,
     }) => {
       try {
         const piAiModuleId = "@mariozechner/pi-ai";
@@ -1214,6 +1427,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         if (!providerId || !modelId) {
           return { content: [] };
         }
+        const workspaceDir = agentDir?.trim() || api.resolvePath(".");
 
         // When runtimeConfig is undefined (e.g. resolveLargeFileTextSummarizer
         // passes legacyParams without config), fall back to the plugin API so
@@ -1230,6 +1444,9 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         const knownModel =
           typeof mod.getModel === "function" ? mod.getModel(providerId, modelId) : undefined;
         const fallbackApi =
+          (isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
+            ? knownModel.api.trim()
+            : undefined) ||
           providerApi?.trim() ||
           resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
           (() => {
@@ -1244,6 +1461,12 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
             return first.api.trim();
           })() ||
           inferApiFromProvider(providerId);
+        if (!fallbackApi) {
+          throw new Error(
+            `[lcm] unable to resolve API family for provider ${providerId}; set models.providers.${providerId}.api explicitly instead of falling back implicitly.`,
+          );
+        }
+        const modelAuthConfig = resolveModelAuthConfig(effectiveRuntimeConfig);
 
         // Resolve provider-level config (baseUrl, headers, etc.) from runtime config.
         // Custom/proxy providers (e.g. bailian, local proxies) store their baseUrl and
@@ -1260,7 +1483,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           return isRecord(cfg) ? cfg : {};
         })();
 
-        const resolvedModel =
+        let resolvedModel =
           isRecord(knownModel) &&
           typeof knownModel.api === "string" &&
           typeof knownModel.provider === "string" &&
@@ -1269,18 +1492,29 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                 ...knownModel,
                 id: knownModel.id,
                 provider: knownModel.provider,
-                api: knownModel.api,
-                // Merge baseUrl/headers from provider config if not already on the model.
+                api:
+                  typeof providerLevelConfig.api === "string" && providerLevelConfig.api.trim()
+                    ? providerLevelConfig.api.trim()
+                    : knownModel.api,
+                // Provider config must be able to override built-in transport defaults.
+                // Otherwise built-in providers like `openai` keep their catalog baseUrl
+                // (`https://api.openai.com/v1`) even when OpenClaw runtime config points
+                // that provider id at a custom proxy.
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
                 baseUrl:
-                  typeof knownModel.baseUrl === "string"
-                    ? knownModel.baseUrl
-                    : typeof providerLevelConfig.baseUrl === "string"
-                      ? providerLevelConfig.baseUrl
+                  typeof providerLevelConfig.baseUrl === "string"
+                    ? providerLevelConfig.baseUrl
+                    : typeof knownModel.baseUrl === "string"
+                      ? knownModel.baseUrl
                       : "",
-                ...(knownModel.headers == null && isRecord(providerLevelConfig.headers)
-                  ? { headers: providerLevelConfig.headers }
+                ...(isRecord(providerLevelConfig.headers)
+                  ? {
+                      headers: {
+                        ...(isRecord(knownModel.headers) ? knownModel.headers : {}),
+                        ...providerLevelConfig.headers,
+                      },
+                    }
                   : {}),
               }
             : {
@@ -1296,7 +1530,7 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                   cacheRead: 0,
                   cacheWrite: 0,
                 },
-                contextWindow: 200_000,
+                contextWindow: 1_000_000,
                 maxTokens: 8_000,
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
@@ -1308,8 +1542,51 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                   : {}),
               };
 
+        let runtimeAuth: RuntimeModelAuthResult | undefined;
+        if (modelAuth && skipModelAuth !== true && typeof modelAuth.getRuntimeAuthForModel === "function") {
+          try {
+            runtimeAuth = await modelAuth.getRuntimeAuthForModel({
+              model: buildModelAuthLookupModel({
+                provider: providerId,
+                model: modelId,
+                api: resolvedModel.api,
+                contextWindow: resolvedModel.contextWindow,
+              }),
+              cfg: modelAuthConfig,
+              ...(authProfileId ? { profileId: authProfileId } : {}),
+              workspaceDir,
+            });
+          } catch (err) {
+            console.error(
+              `[lcm] modelAuth.getRuntimeAuthForModel FAILED:`,
+              err instanceof Error ? err.message : err,
+            );
+          }
+        }
+
+        const runtimeAuthBaseUrl = resolveBaseUrlFromAuthResult(runtimeAuth);
+        const runtimeAuthHeaders = resolveRuntimeAuthHeaders(runtimeAuth?.request);
+        resolvedModel = attachRuntimeAuthRequestTransport(
+          {
+            ...resolvedModel,
+            ...(runtimeAuthBaseUrl ? { baseUrl: runtimeAuthBaseUrl } : {}),
+            ...(runtimeAuthHeaders
+              ? {
+                  headers: {
+                    ...(isRecord(resolvedModel.headers) ? resolvedModel.headers : {}),
+                    ...runtimeAuthHeaders,
+                  },
+                }
+              : {}),
+          },
+          runtimeAuth?.request,
+        );
+
         let resolvedApiKey = apiKey?.trim();
-        if (!resolvedApiKey && modelAuth) {
+        if (!resolvedApiKey) {
+          resolvedApiKey = resolveApiKeyFromAuthResult(runtimeAuth);
+        }
+        if (!resolvedApiKey && modelAuth && skipModelAuth !== true) {
           try {
             resolvedApiKey = resolveApiKeyFromAuthResult(
               await modelAuth.getApiKeyForModel({
@@ -1317,32 +1594,27 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
                   provider: providerId,
                   model: modelId,
                   api: resolvedModel.api,
+                  contextWindow: resolvedModel.contextWindow,
                 }),
-                cfg: api.config,
+                cfg: modelAuthConfig,
                 ...(authProfileId ? { profileId: authProfileId } : {}),
               }),
             );
           } catch (err) {
-            console.error(
-              `[lcm] modelAuth.getApiKeyForModel FAILED:`,
-              err instanceof Error ? err.message : err,
-            );
+            log.warn(`[lcm] modelAuth.getApiKeyForModel FAILED: ${describeLogError(err)}`);
           }
         }
-        if (!resolvedApiKey && modelAuth) {
+        if (!resolvedApiKey && modelAuth && skipModelAuth !== true) {
           try {
             resolvedApiKey = resolveApiKeyFromAuthResult(
               await modelAuth.resolveApiKeyForProvider({
                 provider: providerId,
-                cfg: api.config,
+                cfg: modelAuthConfig,
                 ...(authProfileId ? { profileId: authProfileId } : {}),
               }),
             );
           } catch (err) {
-            console.error(
-              `[lcm] modelAuth.resolveApiKeyForProvider FAILED:`,
-              err instanceof Error ? err.message : err,
-            );
+            log.warn(`[lcm] modelAuth.resolveApiKeyForProvider FAILED: ${describeLogError(err)}`);
           }
         }
         if (!resolvedApiKey) {
@@ -1378,19 +1650,24 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           }
         }
 
+        const effectiveReasoning = resolveEffectiveReasoning({
+          reasoning,
+          reasoningIfSupported,
+          modelSupportsReasoning: resolvedModel.reasoning,
+        });
+
         const completeOptions = buildCompleteSimpleOptions({
           api: resolvedModel.api,
           apiKey: resolvedApiKey,
           maxTokens,
           temperature,
-          reasoning,
+          reasoning: effectiveReasoning,
         });
         const requestMetadata = {
           request_provider: providerId,
           request_model: modelId,
           request_api: resolvedModel.api,
-          request_reasoning:
-            typeof reasoning === "string" && reasoning.trim() ? reasoning.trim() : "(none)",
+          request_reasoning: effectiveReasoning ?? "(none)",
           request_has_system: typeof system === "string" && system.trim().length > 0 ? "true" : "false",
           request_temperature:
             typeof completeOptions.temperature === "number"
@@ -1427,11 +1704,21 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
           ...requestMetadata,
         };
       } catch (err) {
-        console.error(`[lcm] completeSimple error:`, err instanceof Error ? err.message : err);
+        log.error(`[lcm] completeSimple error: ${describeLogError(err)}`);
         const authError = detectProviderAuthError(err);
+        const configError =
+          !authError &&
+          err instanceof Error &&
+          err.message.startsWith(PROVIDER_API_RESOLUTION_ERROR_PREFIX)
+            ? {
+                kind: "provider_config",
+                message: err.message,
+              }
+            : undefined;
         return {
           content: [],
           ...(authError ? { error: authError } : {}),
+          ...(configError ? { error: configError } : {}),
         };
       }
     },
@@ -1525,25 +1812,117 @@ function createLcmDependencies(api: OpenClawPluginApi): LcmDependencies {
         const cfg = api.runtime.config.loadConfig();
         const parsed = parseAgentSessionKey(key);
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = api.runtime.channel.session.resolveStorePath(cfg.session?.store, {
+        const storePath = api.runtime.agent.session.resolveStorePath(cfg.session?.store, {
           agentId,
         });
-        const raw = readFileSync(storePath, "utf8");
-        const store = JSON.parse(raw) as Record<string, { sessionId?: string } | undefined>;
+        const store = api.runtime.agent.session.loadSessionStore(storePath) as Record<
+          string,
+          { sessionId?: string } | undefined
+        >;
         const sessionId = store[key]?.sessionId;
         return typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : undefined;
       } catch {
         return undefined;
       }
     },
-    agentLaneSubagent: "subagent",
-    log: {
-      info: (msg) => console.error(msg),
-      warn: (msg) => console.error(msg),
-      error: (msg) => console.error(msg),
-      debug: (msg) => api.logger.debug?.(msg),
+    resolveSessionTranscriptFile: async ({ sessionId, sessionKey }) => {
+      const normalizedSessionId = sessionId.trim();
+      if (!normalizedSessionId) {
+        return undefined;
+      }
+
+      try {
+        const cfg = api.runtime.config.loadConfig();
+        const normalizedSessionKey = sessionKey?.trim();
+        const parsed = normalizedSessionKey ? parseAgentSessionKey(normalizedSessionKey) : null;
+        const agentId = normalizeAgentId(parsed?.agentId);
+        const storePath = api.runtime.agent.session.resolveStorePath(cfg.session?.store, {
+          agentId,
+        });
+        const store = api.runtime.agent.session.loadSessionStore(storePath) as Record<
+          string,
+          { sessionId?: string; sessionFile?: string } | undefined
+        >;
+        const entry =
+          (normalizedSessionKey ? store[normalizedSessionKey] : undefined)
+          ?? Object.values(store).find((candidate) => candidate?.sessionId === normalizedSessionId);
+        const transcriptPath = api.runtime.agent.session.resolveSessionFilePath(
+          normalizedSessionId,
+          entry,
+          {
+            agentId,
+            storePath,
+          },
+        );
+        return transcriptPath.trim() || undefined;
+      } catch {
+        return undefined;
+      }
     },
+    agentLaneSubagent: "subagent",
+    log,
   };
+}
+
+/**
+ * Wire event handlers, context engines, tools, and commands to the
+ * OpenClaw plugin API using shared init closures.
+ */
+function wirePluginHandlers(
+  api: OpenClawPluginApi,
+  deps: LcmDependencies,
+  shared: SharedLcmInit,
+): void {
+  api.on("before_reset", async (event, ctx) => {
+    await (await shared.waitForEngine()).handleBeforeReset({
+      reason: event.reason,
+      sessionId: ctx.sessionId,
+      sessionKey: ctx.sessionKey,
+    });
+  });
+  api.on("before_prompt_build", () => ({
+    prependSystemContext: LOSSLESS_RECALL_POLICY_PROMPT,
+  }));
+  api.on("session_end", async (event) => {
+    const lifecycleEvent = event as SessionEndLifecycleEvent;
+    await (await shared.waitForEngine()).handleSessionEnd({
+      reason: lifecycleEvent.reason,
+      sessionId: lifecycleEvent.sessionId,
+      sessionKey: lifecycleEvent.sessionKey,
+      nextSessionId: lifecycleEvent.nextSessionId,
+      nextSessionKey: lifecycleEvent.nextSessionKey,
+    });
+  });
+
+  api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
+  api.registerContextEngine("default", () => shared.getCachedEngine() ?? shared.waitForEngine());
+
+  api.registerTool((ctx) =>
+    createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmExpandQueryTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+      requesterSessionKey: ctx.sessionKey,
+    }),
+  );
+
+  api.registerCommand(
+    createLcmCommand({
+      db: shared.waitForDatabase,
+      config: deps.config,
+      deps,
+      getLcm: shared.waitForEngine,
+    }),
+  );
 }
 
 const lcmPlugin = {
@@ -1558,13 +1937,25 @@ const lcmPlugin = {
         value && typeof value === "object" && !Array.isArray(value)
           ? (value as Record<string, unknown>)
           : {};
-      return resolveLcmConfig(process.env, raw);
+      return resolveLcmConfigWithDiagnostics(process.env, raw).config;
     },
   },
 
   register(api: OpenClawPluginApi) {
     const deps = createLcmDependencies(api);
     const dbPath = deps.config.databasePath;
+    const normalizedDbPath = normalizePath(dbPath);
+
+    // ── Singleton check ─────────────────────────────────────────────
+    // OpenClaw v2026.4.5+ calls register() per-agent-context (main,
+    // subagents, cron lanes). Reuse the existing connection and engine
+    // when the same DB path is already initialized.
+    const existingInit = getSharedInit(normalizedDbPath);
+    if (existingInit && !existingInit.stopped) {
+      deps.log.info(`[lcm] Reusing shared engine init for db=${normalizedDbPath}`);
+      wirePluginHandlers(api, deps, existingInit);
+      return;
+    }
 
     // ── Eager-first DB init with deferred fallback on lock ──────────
     let database: DatabaseSync | null = null;
@@ -1582,15 +1973,22 @@ const lcmPlugin = {
 
     /** Build a live DB+engine pair and roll back the DB handle if engine init fails. */
     function initializeEngine(): LcmContextEngine {
+      const startedAt = Date.now();
       const nextDatabase = createLcmDatabaseConnection(dbPath);
       try {
         const nextEngine = new LcmContextEngine(deps, nextDatabase);
         database = nextDatabase;
         lcm = nextEngine;
         initError = null;
+        deps.log.info(
+          `[lcm] Engine initialized for db=${normalizedDbPath} duration=${Date.now() - startedAt}ms`,
+        );
         return nextEngine;
       } catch (error) {
         closeLcmConnection(nextDatabase);
+        deps.log.info(
+          `[lcm] Engine init failed for db=${normalizedDbPath} duration=${Date.now() - startedAt}ms error=${toInitError(error).message}`,
+        );
         throw error;
       }
     }
@@ -1652,7 +2050,7 @@ const lcmPlugin = {
           throw normalized;
         }
 
-        console.error("[lcm] DB locked during eager init, deferring to gateway_start");
+        deps.log.warn("[lcm] DB locked during eager init, deferring to gateway_start");
         return ensureDeferredInitPromise();
       }
     }
@@ -1676,7 +2074,7 @@ const lcmPlugin = {
         throw normalized;
       }
 
-      console.error("[lcm] DB locked during eager init, deferring to gateway_start");
+      deps.log.warn("[lcm] DB locked during eager init, deferring to gateway_start");
       ensureDeferredInitPromise();
       api.on("gateway_start", async () => {
         if (stopped || lcm || initError) {
@@ -1689,13 +2087,22 @@ const lcmPlugin = {
         } catch (retryError) {
           const normalizedRetryError = toInitError(retryError);
           rejectDeferredEngine(normalizedRetryError);
-          console.error(`[lcm] Deferred DB init failed: ${normalizedRetryError.message}`);
+          deps.log.error(`[lcm] Deferred DB init failed: ${normalizedRetryError.message}`);
         }
       });
     }
 
+    const shared: SharedLcmInit = {
+      stopped: false,
+      getCachedEngine: () => lcm,
+      waitForEngine,
+      waitForDatabase,
+    };
+    setSharedInit(normalizedDbPath, shared);
+
     api.on("gateway_stop", async () => {
       stopped = true;
+      shared.stopped = true;
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
@@ -1704,88 +2111,37 @@ const lcmPlugin = {
         database = null;
       }
       lcm = null;
+      removeSharedInit(normalizedDbPath);
     });
 
-    // ── Event handlers ──────────────────────────────────────────────
-    api.on("before_reset", async (event, ctx) => {
-      await (await waitForEngine()).handleBeforeReset({
-        reason: event.reason,
-        sessionId: ctx.sessionId,
-        sessionKey: ctx.sessionKey,
-      });
-    });
-    api.on("before_prompt_build", () => ({
-      prependSystemContext: LOSSLESS_RECALL_POLICY_PROMPT,
-    }));
-    api.on("session_end", async (event) => {
-      const lifecycleEvent = event as SessionEndLifecycleEvent;
-      await (await waitForEngine()).handleSessionEnd({
-        reason: lifecycleEvent.reason,
-        sessionId: lifecycleEvent.sessionId,
-        sessionKey: lifecycleEvent.sessionKey,
-        nextSessionId: lifecycleEvent.nextSessionId,
-        nextSessionKey: lifecycleEvent.nextSessionKey,
-      });
-    });
-
-    // ── Context engines ─────────────────────────────────────────────
-    api.registerContextEngine("lossless-claw", () => lcm ?? waitForEngine());
-    api.registerContextEngine("default", () => lcm ?? waitForEngine());
-
-    // ── Tools ───────────────────────────────────────────────────────
-    api.registerTool((ctx) =>
-      createLcmGrepTool({
-        deps,
-        getLcm: waitForEngine,
-        sessionKey: ctx.sessionKey,
-      }),
-    );
-    api.registerTool((ctx) =>
-      createLcmDescribeTool({
-        deps,
-        getLcm: waitForEngine,
-        sessionKey: ctx.sessionKey,
-      }),
-    );
-    api.registerTool((ctx) =>
-      createLcmExpandTool({
-        deps,
-        getLcm: waitForEngine,
-        sessionKey: ctx.sessionKey,
-      }),
-    );
-    api.registerTool((ctx) =>
-      createLcmExpandQueryTool({
-        deps,
-        getLcm: waitForEngine,
-        sessionKey: ctx.sessionKey,
-        requesterSessionKey: ctx.sessionKey,
-      }),
-    );
-
-    // ── Command ─────────────────────────────────────────────────────
-    api.registerCommand(
-      createLcmCommand({
-        db: waitForDatabase,
-        config: deps.config,
-        deps,
-      }),
-    );
+    wirePluginHandlers(api, deps, shared);
 
     logStartupBannerOnce({
       key: "plugin-loaded",
-      log: (message) => console.error(message),
-      message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold})`,
+      log: (message) => deps.log.info(message),
+      message: `[lcm] Plugin loaded (enabled=${deps.config.enabled}, db=${deps.config.databasePath}, threshold=${deps.config.contextThreshold}, proactiveThresholdCompactionMode=${deps.config.proactiveThresholdCompactionMode})`,
+    });
+    logStartupBannerOnce({
+      key: "state-dir",
+      log: (message) => deps.log.info(message),
+      message: `[lcm] State dir: ${resolveOpenclawStateDir(process.env)}`,
     });
     logStartupBannerOnce({
       key: "compaction-model",
-      log: (message) => console.error(message),
+      log: (message) => deps.log.info(message),
       message: buildCompactionModelLog({
         config: deps.config,
         openClawConfig: api.config,
         defaultProvider: process.env.OPENCLAW_PROVIDER?.trim() ?? "",
       }),
     });
+    if (deps.config.fallbackProviders.length > 0) {
+      logStartupBannerOnce({
+        key: "fallback-providers",
+        log: (message) => deps.log.info(message),
+        message: `[lcm] Fallback providers: ${deps.config.fallbackProviders.map((fp) => `${fp.provider}/${fp.model}`).join(", ")}`,
+      });
+    }
   },
 };
 

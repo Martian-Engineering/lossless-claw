@@ -3,35 +3,59 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 type ConnectionKey = string;
-const SQLITE_BUSY_TIMEOUT_MS = 5_000;
+/**
+ * SQLite busy timeout in milliseconds.  30 s accommodates high-concurrency
+ * multi-agent setups where 10+ writers contend on the WAL.  The default 5 s
+ * proved insufficient in production with ≥13 concurrent lanes.
+ */
+const SQLITE_BUSY_TIMEOUT_MS = 30_000;
 
 const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
 const connectionIndex = new Map<DatabaseSync, ConnectionKey>();
 
-function isInMemoryPath(dbPath: string): boolean {
+export function isInMemoryPath(dbPath: string): boolean {
   const normalized = dbPath.trim();
   return normalized === ":memory:" || normalized.startsWith("file::memory:");
 }
 
-function normalizePath(dbPath: string): ConnectionKey {
-  if (isInMemoryPath(dbPath)) {
+export function getFileBackedDatabasePath(dbPath: string): string | null {
+  const trimmed = dbPath.trim();
+  if (!trimmed || isInMemoryPath(trimmed)) {
+    return null;
+  }
+  return resolve(trimmed);
+}
+
+export function normalizePath(dbPath: string): ConnectionKey {
+  const fileBackedDatabasePath = getFileBackedDatabasePath(dbPath);
+  if (!fileBackedDatabasePath) {
     const trimmed = dbPath.trim();
     return trimmed.length > 0 ? trimmed : ":memory:";
   }
-  return resolve(dbPath);
+  return fileBackedDatabasePath;
 }
 
 function ensureDbDirectory(dbPath: string): void {
-  if (isInMemoryPath(dbPath)) {
+  const fileBackedDatabasePath = getFileBackedDatabasePath(dbPath);
+  if (!fileBackedDatabasePath) {
     return;
   }
-  mkdirSync(dirname(dbPath), { recursive: true });
+  mkdirSync(dirname(fileBackedDatabasePath), { recursive: true });
 }
 
 function configureConnection(db: DatabaseSync): DatabaseSync {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
   db.exec("PRAGMA foreign_keys = ON");
+  // 64MB page cache (default 2MB is severely undersized for multi-GB databases
+  // with concurrent agents). Memory is demand-allocated, released on close.
+  db.exec("PRAGMA cache_size = -65536");
+  // NORMAL is officially recommended for WAL mode — crash-safe for app crashes,
+  // only risks data loss on power failure (OS/kernel crash). The bootstrap
+  // process re-ingests any lost transactions from session files.
+  db.exec("PRAGMA synchronous = NORMAL");
+  // Keep temp tables/indexes in RAM (helps ordinal resequencing).
+  db.exec("PRAGMA temp_store = MEMORY");
   return db;
 }
 
@@ -66,6 +90,9 @@ function closeDatabase(db: DatabaseSync | undefined): void {
     return;
   }
   try {
+    // Update query planner statistics for tables that changed since last optimize.
+    // Separate try so a SQLITE_BUSY/SQLITE_READONLY from optimize doesn't skip close.
+    try { db.exec("PRAGMA optimize"); } catch { /* best-effort */ }
     db.close();
   } catch {
     // Ignore close failures; callers are shutting down anyway.
