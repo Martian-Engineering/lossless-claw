@@ -4807,6 +4807,54 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(result.reason).toBe("already under target");
   });
 
+  it("treats full-sweep compaction as already under target when tokensAfter is below budget", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 12_000,
+      threshold: 8_200,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: false,
+      tokensBefore: 12_000,
+      tokensAfter: 4_200,
+      condensed: false,
+    });
+
+    await engine.ingest({
+      sessionId: "manual-observed-token-session",
+      message: { role: "user", content: "trigger manual compact" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "manual-observed-token-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 10_000,
+      currentTokenCount: 12_000,
+      legacyParams: {
+        manualCompaction: true,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toBe("already under target");
+    expect(result.result?.tokensBefore).toBe(12_000);
+    expect(result.result?.tokensAfter).toBe(4_200);
+  });
+
   it("routes forced budget recovery through compactUntilUnder for the issue #268 overflow shape", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {

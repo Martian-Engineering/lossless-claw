@@ -3107,9 +3107,17 @@ export class LcmContextEngine implements ContextEngine {
           } else if (sweepResult.actionTaken && breakerKey) {
             this.recordCompactionSuccess(breakerKey);
           }
+          const sweepTokensAfter =
+            typeof sweepResult.tokensAfter === "number" && Number.isFinite(sweepResult.tokensAfter)
+              ? sweepResult.tokensAfter
+              : undefined;
+          const isUnderTargetAfterSweep =
+            sweepTokensAfter !== undefined
+              ? sweepTokensAfter <= targetTokens
+              : !liveContextStillExceedsTarget;
 
           return {
-            ok: !sweepResult.authFailure && (sweepResult.actionTaken || !liveContextStillExceedsTarget),
+            ok: !sweepResult.authFailure && (sweepResult.actionTaken || isUnderTargetAfterSweep),
             compacted: sweepResult.actionTaken,
             reason: sweepResult.authFailure
               ? (sweepResult.actionTaken
@@ -3117,11 +3125,11 @@ export class LcmContextEngine implements ContextEngine {
                   : "provider auth failure")
               : sweepResult.actionTaken
                 ? "compacted"
-                : manualCompactionRequested
-                  ? "nothing to compact"
-                  : liveContextStillExceedsTarget
-                    ? "live context still exceeds target"
-                    : "already under target",
+                : isUnderTargetAfterSweep
+                  ? "already under target"
+                  : manualCompactionRequested
+                    ? "nothing to compact"
+                    : "live context still exceeds target",
             result: {
               tokensBefore: decision.currentTokens,
               tokensAfter: sweepResult.tokensAfter,
