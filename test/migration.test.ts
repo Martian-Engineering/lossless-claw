@@ -467,6 +467,56 @@ describe("runLcmMigrations summary depth backfill", () => {
     ).toBe(true);
   });
 
+  it("backfills message identity hashes across multiple batches", () => {
+    const db = createTestDb("identity-hash-batches.db");
+
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE messages (
+        message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+        content TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (conversation_id, seq)
+      );
+    `);
+
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      1,
+      "identity-hash-batch-session",
+    );
+
+    const insertMessage = db.prepare(
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    for (let index = 0; index < 1_205; index += 1) {
+      insertMessage.run(1, index, "assistant", `batch message ${index}`, 3);
+    }
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const unhashedCount = db
+      .prepare(`SELECT COUNT(*) AS count FROM messages WHERE identity_hash IS NULL OR identity_hash = ''`)
+      .get() as { count: number };
+    expect(unhashedCount.count).toBe(0);
+
+    const sampledRow = db
+      .prepare(`SELECT identity_hash FROM messages WHERE conversation_id = ? AND seq = ?`)
+      .get(1, 1_204) as { identity_hash: string | null };
+    expect(sampledRow.identity_hash).toBe(buildMessageIdentityHash("assistant", "batch message 1204"));
+  });
+
   it("skips FTS tables when fts5 is unavailable", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
     tempDirs.push(tempDir);

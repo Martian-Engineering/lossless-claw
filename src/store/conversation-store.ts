@@ -142,11 +142,6 @@ interface MessageSearchRow {
   created_at: string;
 }
 
-interface MessageIdentityRow {
-  role: MessageRole;
-  content: string;
-}
-
 interface MessagePartRow {
   part_id: string;
   message_id: number;
@@ -553,15 +548,14 @@ export class ConversationStore {
     const identityHash = buildMessageIdentityHash(role, content);
     const row = this.db
       .prepare(
-        `SELECT role, content
+        `SELECT 1 AS count
        FROM messages
-       WHERE conversation_id = ? AND identity_hash = ?
-       LIMIT 8`,
+       WHERE conversation_id = ? AND identity_hash = ? AND role = ? AND content = ?
+       LIMIT 1`,
       )
-      .all(conversationId, identityHash) as unknown as MessageIdentityRow[];
+      .get(conversationId, identityHash, role, content) as unknown as CountRow | undefined;
 
-    // The hash narrows candidates quickly; the raw-content check preserves exact identity.
-    return row.some((candidate) => candidate.role === role && candidate.content === content);
+    return row?.count === 1;
   }
 
   async countMessagesByIdentity(
@@ -570,22 +564,15 @@ export class ConversationStore {
     content: string,
   ): Promise<number> {
     const identityHash = buildMessageIdentityHash(role, content);
-    const rows = this.db
+    const row = this.db
       .prepare(
-       `SELECT role, content
+        `SELECT COUNT(*) AS count
        FROM messages
-       WHERE conversation_id = ? AND identity_hash = ?`,
+       WHERE conversation_id = ? AND identity_hash = ? AND role = ? AND content = ?`,
       )
-      .all(conversationId, identityHash) as unknown as MessageIdentityRow[];
+      .get(conversationId, identityHash, role, content) as unknown as CountRow | undefined;
 
-    // Count only verified matches so the hash stays a performance hint, not the source of truth.
-    let count = 0;
-    for (const candidate of rows) {
-      if (candidate.role === role && candidate.content === content) {
-        count += 1;
-      }
-    }
-    return count;
+    return row?.count ?? 0;
   }
 
   async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {

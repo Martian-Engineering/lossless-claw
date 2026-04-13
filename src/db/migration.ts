@@ -185,8 +185,19 @@ function backfillMessageIdentityHashes(db: DatabaseSync): void {
     if (rows.length === 0) {
       return;
     }
-    for (const row of rows) {
-      updateStmt.run(buildMessageIdentityHash(row.role, row.content), row.message_id);
+    db.exec(`BEGIN`);
+    try {
+      for (const row of rows) {
+        updateStmt.run(buildMessageIdentityHash(row.role, row.content), row.message_id);
+      }
+      db.exec(`COMMIT`);
+    } catch (error) {
+      try {
+        db.exec(`ROLLBACK`);
+      } catch {
+        // Preserve the original migration failure if rollback also errors.
+      }
+      throw error;
     }
   }
 }
