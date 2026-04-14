@@ -1143,6 +1143,7 @@ describe("lcm command", () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
+    vi.stubEnv("OPENCLAW_STATE_DIR", "/tmp/openclaw-restore-profile");
 
     const latestPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
     const timestampedPath = join(fixture.tempDir, "lcm.db.backup-20260413t010203z-abcd12.bak");
@@ -1154,15 +1155,17 @@ describe("lcm command", () => {
     expect(result.text).toContain("🧯 Lossless Claw Restore");
     expect(result.text).toContain("`/lossless restore latest`");
     expect(result.text).toContain("`/lossless restore backup-20260413t010203z-abcd12`");
+    expect(result.text).toContain("`OPENCLAW_STATE_DIR='/tmp/openclaw-restore-profile' openclaw lossless restore 'latest'`");
     expect(result.text).toContain(latestPath);
     expect(result.text).toContain(timestampedPath);
     expect(result.text).toContain("restore-pending");
   });
 
-  it("renders a safe restore shell recipe for a selected target", async () => {
+  it("renders the external restore command for a selected target", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
+    vi.stubEnv("OPENCLAW_STATE_DIR", "/tmp/openclaw-restore-profile");
 
     const latestPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
     writeFileSync(latestPath, "latest");
@@ -1172,11 +1175,10 @@ describe("lcm command", () => {
     expect(result.text).toContain("🧯 Lossless Claw Restore");
     expect(result.text).toContain("status: ready");
     expect(result.text).toContain(`snapshot: ${latestPath}`);
-    expect(result.text).toContain("Stop OpenClaw before running this shell recipe");
-    expect(result.text).toContain("mv \"$DB-wal\" \"$WAL_ARCHIVE\"");
-    expect(result.text).toContain("mv \"$DB-shm\" \"$SHM_ARCHIVE\"");
-    expect(result.text).toContain("cp -p \"$BACKUP\" \"$DB\"");
-    expect(result.text).toContain("restore_guard_pending = 1");
+    expect(result.text).toContain("offline command: `OPENCLAW_STATE_DIR='/tmp/openclaw-restore-profile' openclaw lossless restore 'latest'`");
+    expect(result.text).toContain("Run the external command from your shell");
+    expect(result.text).toContain("stops the gateway before touching the database");
+    expect(result.text).toContain("verify RPC health before reporting success");
   });
 
   it("rotates the current session and replaces the latest rotate backup", async () => {

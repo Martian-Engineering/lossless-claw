@@ -16,7 +16,7 @@
     "dag"
   ],
   "scripts": {
-    "build": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@mariozechner/*\" --minify-whitespace",
+    "build": "esbuild index.ts cli-metadata.ts --bundle --platform=node --target=node22 --format=esm --outdir=dist --external:openclaw --external:\"@mariozechner/*\" --minify-whitespace",
     "changeset": "changeset",
     "release:verify": "npm run build && npm test && npm pack --dry-run",
     "test": "vitest run --dir test",
@@ -24,6 +24,7 @@
   },
   "files": [
     "dist/",
+    "cli-metadata.js",
     "skills/",
     "openclaw.plugin.json",
     "docs/",

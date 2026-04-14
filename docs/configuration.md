@@ -273,14 +273,17 @@ Before rotating, Lossless-claw replaces one rolling `rotate-latest` SQLite backu
 - `/lcm restore` with no target lists the currently available restore targets.
 - `latest` maps to the rolling `rotate-latest` backup when it exists.
 - timestamped/manual snapshots use the stable target name derived from the `.bak` filename.
-- `/lcm restore <target>` prints the exact shell recipe to run after OpenClaw is stopped.
+- `/lcm restore <target>` prints the exact `openclaw lossless restore <target>` command to run from your shell.
 
-The emitted restore recipe is intentionally conservative:
+The external restore command is intentionally conservative:
 
+- it pins `OPENCLAW_STATE_DIR` so the stop/start/restore cycle targets the same OpenClaw profile as the running slash command
+- it stops the gateway before touching the database
 - it archives the current `lcm.db` before overwriting it
 - it archives stale `lcm.db-wal` and `lcm.db-shm` sidecars instead of leaving them behind
 - it copies the chosen backup into place as the new main database file
 - it marks bootstrap checkpoints as restore-pending so the next startup trusts the restored DB snapshot and does not replay transcript history that was written after the backup was taken
+- it starts the gateway again and verifies RPC health before reporting success
 
 ## Environment-only knobs outside plugin config
 

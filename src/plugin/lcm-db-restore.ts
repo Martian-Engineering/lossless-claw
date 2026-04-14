@@ -1,6 +1,13 @@
-import { readdirSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, readdirSync, renameSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { getFileBackedDatabasePath } from "../db/connection.js";
+import { getLcmDbFeatures } from "../db/features.js";
+import { runLcmMigrations } from "../db/migration.js";
+import {
+  closeLcmConnection,
+  createLcmDatabaseConnection,
+  getFileBackedDatabasePath,
+} from "../db/connection.js";
+import type { DatabaseSync } from "node:sqlite";
 
 export type LcmRestoreTarget = {
   name: string;
@@ -12,6 +19,24 @@ export type LcmRestoreTarget = {
 
 function quoteShellArg(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function formatRestoreStamp(): string {
+  return new Date().toISOString().replace(/[-:.]/g, "");
+}
+
+function readQuickCheckResult(db: DatabaseSync): string {
+  const rows = db.prepare(`PRAGMA quick_check`).all() as Array<{ quick_check?: string }>;
+  const results = rows
+    .map((row) => row.quick_check)
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  if (results.length === 0) {
+    return "unknown";
+  }
+  if (results.length === 1 && results[0] === "ok") {
+    return "ok";
+  }
+  return results.join("; ");
 }
 
 function sanitizeShellPathFragment(value: string): string {
@@ -75,7 +100,92 @@ export function listLcmRestoreTargets(databasePath: string): LcmRestoreTarget[] 
 }
 
 /**
+ * Return the exact CLI command operators should run for an offline restore.
+ */
+export function buildLcmRestoreCliCommand(params: {
+  target: string;
+  stateDir?: string;
+}): string {
+  const command = `openclaw lossless restore ${quoteShellArg(params.target)}`;
+  if (!params.stateDir?.trim()) {
+    return command;
+  }
+  return `OPENCLAW_STATE_DIR=${quoteShellArg(params.stateDir)} ${command}`;
+}
+
+export type LcmRestoreExecutionResult = {
+  databasePath: string;
+  snapshotPath: string;
+  currentBackupPath: string | null;
+  walArchivePath: string | null;
+  shmArchivePath: string | null;
+  quickCheck: string;
+};
+
+/**
+ * Restore a chosen SQLite snapshot into place and mark bootstrap restore guard state.
+ */
+export function restoreLcmDatabaseFromBackup(params: {
+  databasePath: string;
+  target: LcmRestoreTarget;
+}): LcmRestoreExecutionResult {
+  const fileBackedDatabasePath = getFileBackedDatabasePath(params.databasePath);
+  if (!fileBackedDatabasePath) {
+    throw new Error("Lossless Claw restore requires a file-backed SQLite database path.");
+  }
+  if (!existsSync(params.target.backupPath)) {
+    throw new Error(`Restore snapshot not found: ${params.target.backupPath}`);
+  }
+
+  const tag = sanitizeShellPathFragment(params.target.name);
+  const stamp = formatRestoreStamp();
+  const currentBackupPath = existsSync(fileBackedDatabasePath)
+    ? `${fileBackedDatabasePath}.pre-restore-${tag}-${stamp}.bak`
+    : null;
+  const walPath = `${fileBackedDatabasePath}-wal`;
+  const shmPath = `${fileBackedDatabasePath}-shm`;
+  const walArchivePath = existsSync(walPath)
+    ? `${walPath}.pre-restore-${tag}-${stamp}.bak`
+    : null;
+  const shmArchivePath = existsSync(shmPath)
+    ? `${shmPath}.pre-restore-${tag}-${stamp}.bak`
+    : null;
+
+  if (currentBackupPath) {
+    copyFileSync(fileBackedDatabasePath, currentBackupPath);
+  }
+  if (walArchivePath) {
+    renameSync(walPath, walArchivePath);
+  }
+  if (shmArchivePath) {
+    renameSync(shmPath, shmArchivePath);
+  }
+  copyFileSync(params.target.backupPath, fileBackedDatabasePath);
+
+  const db = createLcmDatabaseConnection(fileBackedDatabasePath);
+  try {
+    const { fts5Available } = getLcmDbFeatures(db);
+    runLcmMigrations(db, { fts5Available });
+    db.exec(`UPDATE conversation_bootstrap_state
+             SET restore_guard_pending = 1,
+                 updated_at = datetime('now')`);
+    return {
+      databasePath: fileBackedDatabasePath,
+      snapshotPath: params.target.backupPath,
+      currentBackupPath,
+      walArchivePath,
+      shmArchivePath,
+      quickCheck: readQuickCheckResult(db),
+    };
+  } finally {
+    closeLcmConnection(db);
+  }
+}
+
+/**
  * Build an exact shell recipe for restoring a chosen SQLite snapshot safely.
+ *
+ * Deprecated in favor of the external OpenClaw CLI command path.
  */
 export function buildLcmRestoreShellScript(params: {
   databasePath: string;
@@ -85,7 +195,6 @@ export function buildLcmRestoreShellScript(params: {
   if (!fileBackedDatabasePath) {
     return null;
   }
-
   const tag = sanitizeShellPathFragment(params.target.name);
   const db = quoteShellArg(fileBackedDatabasePath);
   const backup = quoteShellArg(params.target.backupPath);
