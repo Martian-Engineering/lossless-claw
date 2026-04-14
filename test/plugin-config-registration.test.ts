@@ -524,7 +524,7 @@ describe("lcm plugin registration", () => {
   });
 
   it("falls back to runtime plugin config for the startup banner when register runs before api.pluginConfig is populated", () => {
-    const { api } = buildApi(
+    const { api, infoLog } = buildApi(
       {},
       {
         runtimeConfig: {
@@ -542,18 +542,16 @@ describe("lcm plugin registration", () => {
       },
     );
     api.config = {} as OpenClawPluginApi["config"];
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     lcmPlugin.register(api);
 
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: openai-codex/gpt-5.4 (override)",
     );
-    consoleErrorSpy.mockRestore();
   });
 
   it("uses runtime OpenClaw defaults when api.pluginConfig is ready before api.config", () => {
-    const { api, getFactory } = buildApi(
+    const { api, getFactory, infoLog } = buildApi(
       {
         enabled: true,
       },
@@ -564,11 +562,10 @@ describe("lcm plugin registration", () => {
       },
     );
     api.config = {} as OpenClawPluginApi["config"];
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     lcmPlugin.register(api);
 
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
+    expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Compaction summarization model: anthropic/claude-sonnet-4-6 (default)",
     );
 
@@ -584,7 +581,6 @@ describe("lcm plugin registration", () => {
       provider: "anthropic",
       model: "claude-sonnet-4-6",
     });
-    consoleErrorSpy.mockRestore();
   });
 
   it("logs the OpenClaw compaction model at startup when no plugin override is set", () => {
