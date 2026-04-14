@@ -122,6 +122,102 @@ export type LcmRestoreExecutionResult = {
   quickCheck: string;
 };
 
+export type LcmRestoreRollbackResult = {
+  databasePath: string;
+  rollbackDbArchivePath: string | null;
+  rollbackWalArchivePath: string | null;
+  rollbackShmArchivePath: string | null;
+  restoredPreviousDb: boolean;
+  restoredWal: boolean;
+  restoredShm: boolean;
+  quickCheck: string;
+};
+
+function archiveActiveFile(path: string, suffix: string): string | null {
+  if (!existsSync(path)) {
+    return null;
+  }
+  const archivedPath = `${path}.${suffix}.bak`;
+  renameSync(path, archivedPath);
+  return archivedPath;
+}
+
+function quickCheckDatabaseAtPath(databasePath: string): string {
+  const db = createLcmDatabaseConnection(databasePath);
+  try {
+    return readQuickCheckResult(db);
+  } finally {
+    closeLcmConnection(db);
+  }
+}
+
+/**
+ * Restore the preserved pre-restore database and SQLite sidecars when a restore-orchestration step fails.
+ */
+export function rollbackLcmDatabaseRestore(params: {
+  restore: Pick<LcmRestoreExecutionResult, "databasePath" | "currentBackupPath" | "walArchivePath" | "shmArchivePath">;
+}): LcmRestoreRollbackResult {
+  const fileBackedDatabasePath = getFileBackedDatabasePath(params.restore.databasePath);
+  if (!fileBackedDatabasePath) {
+    throw new Error("Lossless Claw restore rollback requires a file-backed SQLite database path.");
+  }
+
+  const canRestorePreviousDb =
+    typeof params.restore.currentBackupPath === "string" && existsSync(params.restore.currentBackupPath);
+  const walPath = `${fileBackedDatabasePath}-wal`;
+  const shmPath = `${fileBackedDatabasePath}-shm`;
+  const rollbackTag = `failed-restore-${formatRestoreStamp()}`;
+
+  const rollbackDbArchivePath = canRestorePreviousDb
+    ? archiveActiveFile(fileBackedDatabasePath, rollbackTag)
+    : null;
+  const rollbackWalArchivePath = canRestorePreviousDb
+    ? archiveActiveFile(walPath, rollbackTag)
+    : null;
+  const rollbackShmArchivePath = canRestorePreviousDb
+    ? archiveActiveFile(shmPath, rollbackTag)
+    : null;
+
+  let restoredPreviousDb = false;
+  if (canRestorePreviousDb) {
+    copyFileSync(params.restore.currentBackupPath!, fileBackedDatabasePath);
+    restoredPreviousDb = true;
+  }
+
+  let restoredWal = false;
+  if (
+    restoredPreviousDb &&
+    typeof params.restore.walArchivePath === "string" &&
+    existsSync(params.restore.walArchivePath)
+  ) {
+    renameSync(params.restore.walArchivePath, walPath);
+    restoredWal = true;
+  }
+
+  let restoredShm = false;
+  if (
+    restoredPreviousDb &&
+    typeof params.restore.shmArchivePath === "string" &&
+    existsSync(params.restore.shmArchivePath)
+  ) {
+    renameSync(params.restore.shmArchivePath, shmPath);
+    restoredShm = true;
+  }
+
+  return {
+    databasePath: fileBackedDatabasePath,
+    rollbackDbArchivePath,
+    rollbackWalArchivePath,
+    rollbackShmArchivePath,
+    restoredPreviousDb,
+    restoredWal,
+    restoredShm,
+    quickCheck: existsSync(fileBackedDatabasePath)
+      ? quickCheckDatabaseAtPath(fileBackedDatabasePath)
+      : "unknown",
+  };
+}
+
 /**
  * Restore a chosen SQLite snapshot into place and mark bootstrap restore guard state.
  */
@@ -160,25 +256,42 @@ export function restoreLcmDatabaseFromBackup(params: {
   if (shmArchivePath) {
     renameSync(shmPath, shmArchivePath);
   }
-  copyFileSync(params.target.backupPath, fileBackedDatabasePath);
-
-  const db = createLcmDatabaseConnection(fileBackedDatabasePath);
   try {
-    const { fts5Available } = getLcmDbFeatures(db);
-    runLcmMigrations(db, { fts5Available });
-    db.exec(`UPDATE conversation_bootstrap_state
-             SET restore_guard_pending = 1,
-                 updated_at = datetime('now')`);
-    return {
-      databasePath: fileBackedDatabasePath,
-      snapshotPath: params.target.backupPath,
-      currentBackupPath,
-      walArchivePath,
-      shmArchivePath,
-      quickCheck: readQuickCheckResult(db),
-    };
-  } finally {
-    closeLcmConnection(db);
+    copyFileSync(params.target.backupPath, fileBackedDatabasePath);
+
+    const db = createLcmDatabaseConnection(fileBackedDatabasePath);
+    try {
+      const { fts5Available } = getLcmDbFeatures(db);
+      runLcmMigrations(db, { fts5Available });
+      db.exec(`UPDATE conversation_bootstrap_state
+               SET restore_guard_pending = 1,
+                   updated_at = datetime('now')`);
+      return {
+        databasePath: fileBackedDatabasePath,
+        snapshotPath: params.target.backupPath,
+        currentBackupPath,
+        walArchivePath,
+        shmArchivePath,
+        quickCheck: readQuickCheckResult(db),
+      };
+    } finally {
+      closeLcmConnection(db);
+    }
+  } catch (error) {
+    try {
+      rollbackLcmDatabaseRestore({
+        restore: {
+          databasePath: fileBackedDatabasePath,
+          currentBackupPath,
+          walArchivePath,
+          shmArchivePath,
+        },
+      });
+    } catch {
+      // Preserve the original restore error. The CLI layer reports preserved
+      // archive paths and handles higher-level orchestration rollback details.
+    }
+    throw error;
   }
 }
 

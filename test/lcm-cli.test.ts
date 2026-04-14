@@ -39,6 +39,33 @@ function createRestoreFixture(): RestoreFixture {
   return { tempDir, dbPath };
 }
 
+function addLiveDbMarker(dbPath: string): void {
+  const db = createLcmDatabaseConnection(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS rollback_marker (
+        value TEXT NOT NULL
+      );
+      DELETE FROM rollback_marker;
+      INSERT INTO rollback_marker (value) VALUES ('live-db-state');
+    `);
+  } finally {
+    closeLcmConnection(db);
+  }
+}
+
+function hasLiveDbMarker(dbPath: string): boolean {
+  const db = createLcmDatabaseConnection(dbPath);
+  try {
+    const row = db.prepare(`SELECT COUNT(*) AS total FROM rollback_marker`).get() as { total?: number };
+    return (row.total ?? 0) > 0;
+  } catch {
+    return false;
+  } finally {
+    closeLcmConnection(db);
+  }
+}
+
 describe("lossless restore cli", () => {
   const tempDirs = new Set<string>();
 
@@ -105,9 +132,10 @@ describe("lossless restore cli", () => {
     ).toBe(true);
   });
 
-  it("reports preserved archive paths when gateway restart fails after restore", () => {
+  it("rolls back to the previous database when gateway restart fails after restore", () => {
     const fixture = createRestoreFixture();
     tempDirs.add(fixture.tempDir);
+    addLiveDbMarker(fixture.dbPath);
 
     mocks.spawnSync
       .mockReturnValueOnce({
@@ -119,15 +147,27 @@ describe("lossless restore cli", () => {
         status: 1,
         stdout: "",
         stderr: "gateway start failed",
+      })
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: "{}",
+        stderr: "",
+      })
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: "{}",
+        stderr: "",
       });
 
     let thrown: Error | null = null;
+    let output = "";
     try {
       runLcmRestoreCli({
         config: resolveLcmConfig({}, { dbPath: fixture.dbPath }),
         target: "latest",
         writer: {
-          write() {
+          write(chunk: string) {
+            output += chunk;
             return true;
           },
         },
@@ -136,10 +176,94 @@ describe("lossless restore cli", () => {
       thrown = error as Error;
     }
 
+    const invokedArgs = mocks.spawnSync.mock.calls.map((call) => (call[1] as string[]).join(" "));
+
     expect(thrown).toBeInstanceOf(Error);
     expect(thrown?.message).toMatch(/gateway start failed/);
-    expect(thrown?.message).toMatch(/Previous DB backup: .*pre-restore-latest-/);
-    expect(thrown?.message).toMatch(/Archived WAL: .*pre-restore-latest-/);
-    expect(thrown?.message).toMatch(/Archived SHM: .*pre-restore-latest-/);
+    expect(thrown?.message).toMatch(/rolled the database back to its pre-restore snapshot/);
+    expect(thrown?.message).toMatch(/Rollback quick_check: ok/);
+    expect(thrown?.message).toMatch(/Archived failed restore DB: .*failed-restore-/);
+    expect(invokedArgs).toEqual([
+      expect.stringContaining("gateway stop --json"),
+      expect.stringContaining("gateway start --json"),
+      expect.stringContaining("gateway start --json"),
+      expect.stringContaining("gateway status --require-rpc --json"),
+    ]);
+    expect(output).toContain("6. Rolling back to the previous database snapshot...");
+    expect(output).toContain("7. Starting gateway after rollback...");
+    expect(output).toContain("8. Verifying gateway health after rollback...");
+    expect(hasLiveDbMarker(fixture.dbPath)).toBe(true);
+  });
+
+  it("stops the gateway again and rolls back when post-start health checks fail", () => {
+    const fixture = createRestoreFixture();
+    tempDirs.add(fixture.tempDir);
+    addLiveDbMarker(fixture.dbPath);
+
+    mocks.spawnSync
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: "{}",
+        stderr: "",
+      })
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: "{}",
+        stderr: "",
+      })
+      .mockReturnValueOnce({
+        status: 1,
+        stdout: "",
+        stderr: "gateway health check failed",
+      })
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: "{}",
+        stderr: "",
+      })
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: "{}",
+        stderr: "",
+      })
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: "{}",
+        stderr: "",
+      });
+
+    let thrown: Error | null = null;
+    let output = "";
+    try {
+      runLcmRestoreCli({
+        config: resolveLcmConfig({}, { dbPath: fixture.dbPath }),
+        target: "latest",
+        writer: {
+          write(chunk: string) {
+            output += chunk;
+            return true;
+          },
+        },
+      });
+    } catch (error) {
+      thrown = error as Error;
+    }
+
+    const invokedArgs = mocks.spawnSync.mock.calls.map((call) => (call[1] as string[]).join(" "));
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown?.message).toMatch(/gateway health check failed/);
+    expect(thrown?.message).toMatch(/rolled the database back to its pre-restore snapshot/);
+    expect(invokedArgs).toEqual([
+      expect.stringContaining("gateway stop --json"),
+      expect.stringContaining("gateway start --json"),
+      expect.stringContaining("gateway status --require-rpc --json"),
+      expect.stringContaining("gateway stop --json"),
+      expect.stringContaining("gateway start --json"),
+      expect.stringContaining("gateway status --require-rpc --json"),
+    ]);
+    expect(output).toContain("5. Stopping gateway for rollback...");
+    expect(output).toContain("6. Rolling back to the previous database snapshot...");
+    expect(hasLiveDbMarker(fixture.dbPath)).toBe(true);
   });
 });
