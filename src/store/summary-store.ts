@@ -1035,6 +1035,7 @@ export class SummaryStore {
               input.conversationId,
               input.since,
               input.before,
+              input.sort,
             );
             if (trigramResults.length > 0) {
               return trigramResults;
@@ -1210,6 +1211,7 @@ export class SummaryStore {
     conversationId?: number,
     since?: Date,
     before?: Date,
+    sort?: SearchSort,
   ): SummarySearchResult[] {
     const cjkSegments = this.extractCjkSegments(query).filter((segment) => segment.length >= 3);
     if (cjkSegments.length === 0) {
@@ -1248,6 +1250,7 @@ export class SummaryStore {
       args.push(before.toISOString());
     }
     args.push(limit);
+    const orderBy = buildFtsOrderBy(sort, SUMMARY_SEARCH_TIME_EXPR);
 
     const sql = `SELECT
          f.summary_id,
@@ -1259,7 +1262,7 @@ export class SummaryStore {
        FROM summaries_fts_cjk f
        JOIN summaries s ON s.summary_id = f.summary_id
        WHERE ${where.join(" AND ")}
-       ORDER BY rank, ${SUMMARY_SEARCH_TIME_EXPR} DESC
+       ORDER BY ${orderBy}
        LIMIT ?`;
     const rows = this.db.prepare(sql).all(...args) as unknown as SummarySearchRow[];
     return rows.map(toSearchResult);

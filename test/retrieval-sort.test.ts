@@ -7,11 +7,21 @@ import { ConversationStore } from "../src/store/conversation-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
 
 const itIfFts5 = detectFts5Support() ? it : it.skip;
+const itIfTrigram = detectTrigramSupport() ? it : it.skip;
 
 function detectFts5Support(): boolean {
   const db = new DatabaseSync(":memory:");
   try {
     return getLcmDbFeatures(db).fts5Available;
+  } finally {
+    db.close();
+  }
+}
+
+function detectTrigramSupport(): boolean {
+  const db = new DatabaseSync(":memory:");
+  try {
+    return getLcmDbFeatures(db).trigramTokenizerAvailable;
   } finally {
     db.close();
   }
@@ -210,6 +220,59 @@ describe("RetrievalEngine sort modes", () => {
       expect(filteredResult.summaries.map((summary) => summary.summaryId)).toEqual([
         "sum_recent_content_older_compaction",
       ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  itIfTrigram("applies recency ordering to CJK trigram summary search", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-cjk-content-recency",
+      });
+      await summaryStore.insertSummary({
+        summaryId: "sum_cjk_old_content_recent_compaction",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "端到端测试结果 端到端测试结果 端到端测试结果 旧记录",
+        tokenCount: 12,
+        latestAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      await summaryStore.insertSummary({
+        summaryId: "sum_cjk_recent_content_older_compaction",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "最近的端到端测试结果",
+        tokenCount: 6,
+        latestAt: new Date("2026-01-09T00:00:00.000Z"),
+      });
+
+      db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?").run(
+        "2026-01-10T00:00:00.000Z",
+        "sum_cjk_old_content_recent_compaction",
+      );
+      db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?").run(
+        "2026-01-05T00:00:00.000Z",
+        "sum_cjk_recent_content_older_compaction",
+      );
+
+      const result = await summaryStore.searchSummaries({
+        query: "端到端测试结果",
+        mode: "full_text",
+        conversationId: conversation.conversationId,
+        limit: 2,
+        sort: "recency",
+      });
+
+      expect(result.map((summary) => summary.summaryId)).toEqual([
+        "sum_cjk_recent_content_older_compaction",
+        "sum_cjk_old_content_recent_compaction",
+      ]);
+      expect(result[0]?.createdAt.toISOString()).toBe("2026-01-09T00:00:00.000Z");
     } finally {
       db.close();
     }
