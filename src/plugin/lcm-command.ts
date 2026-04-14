@@ -2,13 +2,14 @@ import { existsSync, statSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
-import type { LcmConfig } from "../db/config.js";
+import { resolveOpenclawStateDir, type LcmConfig } from "../db/config.js";
 import type { RotateSessionStorageWithBackupResult } from "../engine.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
 import type { OpenClawPluginCommandDefinition, PluginCommandContext } from "openclaw/plugin-sdk";
 import { applyScopedDoctorRepair } from "./lcm-doctor-apply.js";
 import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
+import { buildLcmRestoreCliCommand, listLcmRestoreTargets } from "./lcm-db-restore.js";
 import { describeLogError } from "../lcm-log.js";
 import {
   applyDoctorCleaners,
@@ -69,6 +70,7 @@ type CurrentConversationResolution =
 type ParsedLcmCommand =
   | { kind: "status" }
   | { kind: "backup" }
+  | { kind: "restore"; target?: string }
   | { kind: "rotate" }
   | { kind: "doctor"; apply: boolean }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
@@ -216,6 +218,10 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return rest.length === 0
         ? { kind: "backup" }
         : { kind: "help", error: "`/lcm backup` does not accept extra arguments." };
+    case "restore":
+      return rest.length <= 1
+        ? { kind: "restore", target: rest[0]?.trim() || undefined }
+        : { kind: "help", error: "`/lcm restore` accepts at most one restore target." };
     case "rotate":
       return rest.length === 0
         ? { kind: "rotate" }
@@ -251,7 +257,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, backup, restore, rotate, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -560,6 +566,10 @@ function buildHelpText(error?: string): string {
         "Create a timestamped backup of the current LCM database.",
       ),
       buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} restore`),
+        "List restorable DB snapshots and show the exact safe restore commands for each target.",
+      ),
+      buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} rotate`),
         "Compact the current session transcript while preserving the same LCM conversation and live session identity.",
       ),
@@ -579,6 +589,7 @@ function buildHelpText(error?: string): string {
       buildStatLine("subcommands", `Discover them with ${formatCommand(`${VISIBLE_COMMAND} help`)}.`),
       buildStatLine("alias", `${formatCommand(HIDDEN_ALIAS)} is accepted as a shorter alias.`),
       buildStatLine("current conversation", "Uses the active LCM session when the host exposes session identity."),
+      buildStatLine("restore safety", "Restore guidance assumes OpenClaw is stopped before you run the emitted shell commands."),
       buildStatLine("`/new`", "Prunes context for the current LCM conversation. It does not split storage."),
       buildStatLine("`/reset`", "Resets OpenClaw session flow. Use rotate when you only want transcript compaction."),
     ]),
@@ -926,6 +937,106 @@ async function buildBackupText(params: {
       buildStatLine("db path", params.config.databasePath),
       buildStatLine("backup path", backupPath),
     ]),
+  );
+  return lines.join("\n");
+}
+
+function buildRestoreTargetsSection(config: LcmConfig): string {
+  const targets = listLcmRestoreTargets(config.databasePath);
+  const stateDir = resolveOpenclawStateDir(process.env);
+  if (targets.length === 0) {
+    return buildSection("💾 Restore targets", [
+      buildStatLine("status", "unavailable"),
+      buildStatLine("reason", "No restore snapshots were found for the configured LCM database."),
+    ]);
+  }
+
+  return buildSection("💾 Restore targets", targets.map((target) => {
+    const label = target.kind === "latest" ? "latest rotate backup" : target.label;
+    const cliCommand = buildLcmRestoreCliCommand({
+      target: target.name,
+      stateDir,
+    });
+    return `${formatCommand(`${VISIBLE_COMMAND} restore ${target.name}`)} → ${formatCommand(cliCommand)} · ${label} · ${target.backupPath}`;
+  }));
+}
+
+function buildRestoreText(params: {
+  config: LcmConfig;
+  target?: string;
+}): string {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🧯 Lossless Claw Restore",
+    "",
+  ];
+  const targets = listLcmRestoreTargets(params.config.databasePath);
+
+  if (targets.length === 0) {
+    lines.push(
+      buildSection("💾 Restore targets", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", "No restore snapshots were found for the configured LCM database."),
+      ]),
+      "",
+      buildSection("🧭 Notes", [
+        "Run `/lossless backup` or `/lossless rotate` first to create a restorable SQLite snapshot.",
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  if (!params.target) {
+    lines.push(
+      buildRestoreTargetsSection(params.config),
+      "",
+      buildSection("🧭 Notes", [
+        `Run ${formatCommand(`${VISIBLE_COMMAND} restore latest`)} or one of the exact target commands above to reprint the offline OpenClaw restore command.`,
+        "The external command stops the gateway, archives the current DB plus any stale WAL/SHM sidecars, restores the chosen snapshot, then restarts and health-checks the gateway.",
+        "During the restore copy, Lossless Claw marks bootstrap checkpoints as restore-pending so the next startup will trust the restored DB snapshot instead of replaying newer transcript history into it.",
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const target = targets.find((candidate) => candidate.name === params.target);
+  if (!target) {
+    lines.push(
+      buildSection("💾 Restore target", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", `Unknown restore target \`${params.target}\`.`),
+      ]),
+      "",
+      buildRestoreTargetsSection(params.config),
+    );
+    return lines.join("\n");
+  }
+
+  const restoreCommand = buildLcmRestoreCliCommand({
+    target: target.name,
+    stateDir: resolveOpenclawStateDir(process.env),
+  });
+
+  lines.push(
+    buildSection("💾 Restore target", [
+      buildStatLine("status", "ready"),
+      buildStatLine("target", target.name),
+      buildStatLine("snapshot", target.backupPath),
+      buildStatLine("offline command", formatCommand(restoreCommand)),
+      buildStatLine("preview command", formatCommand(`${VISIBLE_COMMAND} restore ${target.name}`)),
+    ]),
+    "",
+    buildSection("🧭 Notes", [
+      "Run the external command from your shell, not inside the active OpenClaw slash-command session.",
+      "The command stops the gateway before touching the database, archives the current DB plus stale `-wal` and `-shm` sidecars instead of deleting them, then restores the chosen snapshot.",
+      "After the restore copy, Lossless Claw marks bootstrap checkpoints as pending so bootstrap will trust the restored DB, restart the gateway, and verify RPC health before reporting success.",
+    ]),
+    "",
+    "**🛠️ External Command**",
+    "```sh",
+    restoreCommand,
+    "```",
   );
   return lines.join("\n");
 }
@@ -1391,7 +1502,7 @@ export function createLcmCommand(params: {
       telegram: "Lossless Claw is working...",
     },
     description:
-      "Show Lossless Claw health, create DB backups, compact the current session transcript while preserving LCM context, inspect high-confidence junk candidates, and run scoped doctor actions.",
+      "Show Lossless Claw health, create or safely restore DB snapshots, compact the current session transcript while preserving LCM context, inspect high-confidence junk candidates, and run scoped doctor actions.",
     acceptsArgs: true,
     handler: async (ctx) => {
       const parsed = parseLcmCommand(ctx.args);
@@ -1403,6 +1514,13 @@ export function createLcmCommand(params: {
             text: await buildBackupText({
               db: await getDb(),
               config: params.config,
+            }),
+          };
+        case "restore":
+          return {
+            text: buildRestoreText({
+              config: params.config,
+              target: parsed.target,
             }),
           };
         case "rotate":

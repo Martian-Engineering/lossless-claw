@@ -110,6 +110,7 @@ export type UpsertConversationBootstrapStateInput = {
   lastSeenMtimeMs: number;
   lastProcessedOffset: number;
   lastProcessedEntryHash?: string | null;
+  restoreGuardPending?: boolean;
 };
 
 export type ConversationBootstrapStateRecord = {
@@ -119,6 +120,7 @@ export type ConversationBootstrapStateRecord = {
   lastSeenMtimeMs: number;
   lastProcessedOffset: number;
   lastProcessedEntryHash: string | null;
+  restoreGuardPending: boolean;
   updatedAt: Date;
 };
 
@@ -222,6 +224,7 @@ interface ConversationBootstrapStateRow {
   last_seen_mtime_ms: number;
   last_processed_offset: number;
   last_processed_entry_hash: string | null;
+  restore_guard_pending: number;
   updated_at: string;
 }
 
@@ -323,6 +326,7 @@ function toConversationBootstrapStateRecord(
     lastSeenMtimeMs: row.last_seen_mtime_ms,
     lastProcessedOffset: row.last_processed_offset,
     lastProcessedEntryHash: row.last_processed_entry_hash,
+    restoreGuardPending: row.restore_guard_pending === 1,
     updatedAt: parseUtcTimestamp(row.updated_at),
   };
 }
@@ -1476,7 +1480,7 @@ export class SummaryStore {
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, updated_at
+                last_processed_offset, last_processed_entry_hash, restore_guard_pending, updated_at
          FROM conversation_bootstrap_state
          WHERE conversation_id = ?`,
       )
@@ -1495,15 +1499,17 @@ export class SummaryStore {
            last_seen_size,
            last_seen_mtime_ms,
            last_processed_offset,
-           last_processed_entry_hash
+           last_processed_entry_hash,
+           restore_guard_pending
          )
-         VALUES (?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (conversation_id) DO UPDATE SET
            session_file_path = excluded.session_file_path,
            last_seen_size = excluded.last_seen_size,
            last_seen_mtime_ms = excluded.last_seen_mtime_ms,
            last_processed_offset = excluded.last_processed_offset,
            last_processed_entry_hash = excluded.last_processed_entry_hash,
+           restore_guard_pending = excluded.restore_guard_pending,
            updated_at = datetime('now')`,
       )
       .run(
@@ -1513,12 +1519,13 @@ export class SummaryStore {
         Math.max(0, Math.floor(input.lastSeenMtimeMs)),
         Math.max(0, Math.floor(input.lastProcessedOffset)),
         input.lastProcessedEntryHash ?? null,
+        input.restoreGuardPending === true ? 1 : 0,
       );
 
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, updated_at
+                last_processed_offset, last_processed_entry_hash, restore_guard_pending, updated_at
          FROM conversation_bootstrap_state
          WHERE conversation_id = ?`,
       )

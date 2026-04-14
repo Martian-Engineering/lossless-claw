@@ -47,6 +47,18 @@ That behavior preserves continuity across session resets for the same chat ident
 
 This makes rotate the lightweight option when the problem is transcript bloat rather than LCM conversation structure.
 
+## `/lossless restore`
+
+`/lossless restore` is the safe follow-up path for those SQLite backups.
+
+- `/lossless restore` lists available restore targets
+- `/lossless restore latest` resolves the rolling rotate backup
+- `/lossless restore <timestamped-target>` resolves a named manual/timestamped snapshot
+- the command prints the exact `openclaw lossless restore <target>` command to run from your shell
+- that external command pins `OPENCLAW_STATE_DIR`, stops the gateway, archives any existing `lcm.db`, `lcm.db-wal`, and `lcm.db-shm` files, then copies the chosen snapshot into place
+- after the copy, it marks bootstrap checkpoints as restore-pending so startup trusts the restored DB and skips replaying transcript history newer than the backup
+- it then restarts the gateway and verifies RPC health before reporting success
+
 ## Important limitation
 
 There is still **no plugin-specific `/new` vs `/reset` split** in stock lossless-claw docs or runtime behavior.

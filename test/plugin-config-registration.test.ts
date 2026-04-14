@@ -278,6 +278,48 @@ describe("lcm plugin registration", () => {
     );
   });
 
+  it("registers the external CLI surface without initializing runtime-only services during cli-only loads", () => {
+    const registerContextEngine = vi.fn();
+    const registerCommand = vi.fn();
+    const registerCli = vi.fn();
+    const api = {
+      id: "lossless-claw",
+      name: "Lossless Context Management",
+      source: "/tmp/lossless-claw",
+      config: {},
+      pluginConfig: {
+        enabled: true,
+        dbPath: "/tmp/lossless-cli-only.db",
+      },
+      runtime: {},
+      logger: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+      registerContextEngine,
+      registerTool: vi.fn(),
+      registerHook: vi.fn(),
+      registerHttpHandler: vi.fn(),
+      registerHttpRoute: vi.fn(),
+      registerChannel: vi.fn(),
+      registerGatewayMethod: vi.fn(),
+      registerCli,
+      registerService: vi.fn(),
+      registerProvider: vi.fn(),
+      registerCommand,
+      resolvePath: vi.fn(() => "/tmp/fake-agent"),
+      on: vi.fn(),
+    } as unknown as OpenClawPluginApi;
+
+    lcmPlugin.register(api);
+
+    expect(registerCli).toHaveBeenCalledTimes(1);
+    expect(registerContextEngine).not.toHaveBeenCalled();
+    expect(registerCommand).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["missing", undefined],
     ["invalid", ["not-a-plugin-config"]],

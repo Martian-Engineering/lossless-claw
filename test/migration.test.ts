@@ -799,6 +799,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       "last_seen_mtime_ms",
       "last_processed_offset",
       "last_processed_entry_hash",
+      "restore_guard_pending",
       "updated_at",
     ]);
   });

@@ -20,6 +20,7 @@ import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
+import { registerLcmCli } from "./lcm-cli.js";
 import type { LcmDependencies } from "../types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -240,6 +241,33 @@ function resolvePluginConfig(api: OpenClawPluginApi): Record<string, unknown> | 
   const entries = toPluginConfig(plugins?.entries);
   const pluginEntry = toPluginConfig(entries?.["lossless-claw"]);
   return toPluginConfig(pluginEntry?.config);
+}
+
+/** CLI loads provide an empty runtime surface; skip gateway-only initialization there. */
+function shouldRegisterCliOnly(api: OpenClawPluginApi): boolean {
+  return typeof api.runtime?.logging?.getChildLogger !== "function";
+}
+
+/** Register the external `openclaw lossless` CLI surface with the resolved plugin config. */
+function registerLosslessCli(api: OpenClawPluginApi, config: LcmDependencies["config"]): void {
+  api.registerCli(
+    ({ program, logger }) => {
+      registerLcmCli({
+        program,
+        config,
+        logger,
+      });
+    },
+    {
+      descriptors: [
+        {
+          name: "lossless",
+          description: "Operate Lossless Claw maintenance commands outside the running gateway",
+          hasSubcommands: true,
+        },
+      ],
+    },
+  );
 }
 
 function truncateErrorMessage(message: string, maxChars = 240): string {
@@ -1943,7 +1971,15 @@ const lcmPlugin = {
   },
 
   register(api: OpenClawPluginApi) {
+    if (shouldRegisterCliOnly(api)) {
+      const config = resolveLcmConfigWithDiagnostics(process.env, resolvePluginConfig(api)).config;
+      registerLosslessCli(api, config);
+      return;
+    }
+
     const deps = createLcmDependencies(api);
+    registerLosslessCli(api, deps.config);
+
     const dbPath = deps.config.databasePath;
     const normalizedDbPath = normalizePath(dbPath);
 
