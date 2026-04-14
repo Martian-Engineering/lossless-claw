@@ -1,5 +1,21 @@
 # @martian-engineering/lossless-claw
 
+## 0.9.1
+
+### Patch Changes
+
+- [#392](https://github.com/Martian-Engineering/lossless-claw/pull/392) [`00d1fa2`](https://github.com/Martian-Engineering/lossless-claw/commit/00d1fa2c5a7cd2c1b77adb0a9f6c103e487f5e52) Thanks [@GodsBoy](https://github.com/GodsBoy)! - Avoid repeated full bootstrap rereads when an unchanged session transcript misses the normal checkpoint fast paths.
+
+- [#305](https://github.com/Martian-Engineering/lossless-claw/pull/305) [`2d1446f`](https://github.com/Martian-Engineering/lossless-claw/commit/2d1446f29b2e54701baf5b234c2937a5b2909bd7) Thanks [@stilrmy](https://github.com/stilrmy)! - Fix startup-time summary model resolution when OpenClaw populates plugin config before the top-level runtime config surface.
+
+- [#388](https://github.com/Martian-Engineering/lossless-claw/pull/388) [`5bdd596`](https://github.com/Martian-Engineering/lossless-claw/commit/5bdd596f6c3223c3cdaf12c15ba44b685d1b61c6) Thanks [@bennybuoy](https://github.com/bennybuoy)! - Fix the built-in API-family fallback for `ollama` providers so summarization can use OpenAI-compatible Ollama models without requiring an explicit `models.providers.ollama.api` setting.
+
+- [#433](https://github.com/Martian-Engineering/lossless-claw/pull/433) [`5c8ef34`](https://github.com/Martian-Engineering/lossless-claw/commit/5c8ef34ff6baf551a42c73dc1b217a3bb4828891) Thanks [@jalehman](https://github.com/jalehman)! - Apply content-recency sorting consistently to CJK summary full-text search so recent summarized content does not lose to older but stronger trigram matches.
+
+- [#441](https://github.com/Martian-Engineering/lossless-claw/pull/441) [`26708b9`](https://github.com/Martian-Engineering/lossless-claw/commit/26708b9b0b788babba4d1349158414722b18af63) Thanks [@jalehman](https://github.com/jalehman)! - Keep deferred incremental compaction debt pending until oversized raw backlog is actually compacted, and let budget-triggered catch-up scale passes with prompt overage instead of forcing one pass per turn.
+
+- [#434](https://github.com/Martian-Engineering/lossless-claw/pull/434) [`049ce3b`](https://github.com/Martian-Engineering/lossless-claw/commit/049ce3b82339ad373dcc6ef6346fb98087c65159) Thanks [@jalehman](https://github.com/jalehman)! - Keep deferred Anthropic leaf compaction moving once the prompt-cache TTL has gone stale, even if cache-aware cold-observation smoothing still treats the session as effectively hot for routing-noise protection.
+
 ## 0.9.0
 
 ### Minor Changes
