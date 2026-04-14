@@ -5477,6 +5477,77 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(assembleResult.messages).toHaveLength(1);
   });
 
+  it("assemble() still executes deferred Anthropic leaf debt after TTL expiry when cache smoothing remains effectively hot", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+      executeLeafCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-deferred-compaction-stale-ttl-hysteresis";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "cold",
+      retention: "short",
+      lastCacheTouchAt: new Date(Date.now() - 10 * 60 * 1000),
+      lastObservedCacheHitAt: new Date(),
+      consecutiveColdObservations: 1,
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+    });
+    vi.spyOn(privateEngine, "evaluateIncrementalCompaction").mockResolvedValue({
+      shouldCompact: false,
+      reason: "hot-cache-budget-headroom",
+      maxPasses: 1,
+      allowCondensedPasses: false,
+      activityBand: "medium",
+      leafChunkTokens: 40_000,
+      fallbackLeafChunkTokens: [40_000, 30_000, 20_000],
+      rawTokensOutsideTail: 55_000,
+      threshold: 40_000,
+      cacheState: "hot",
+    });
+    const executeLeafCompactionCoreSpy = vi.spyOn(
+      privateEngine,
+      "executeLeafCompactionCore",
+    ).mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "hello" })],
+      tokenBudget: 4_096,
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(executeLeafCompactionCoreSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: conversation.conversationId,
+        sessionId,
+        tokenBudget: 4_096,
+        maxPasses: 1,
+        leafChunkTokens: 40_000,
+        allowCondensedPasses: false,
+      }),
+    );
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+    expect(assembleResult.messages).toHaveLength(1);
+  });
+
   it("assemble() waits for the session queue before consuming deferred debt", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
