@@ -355,6 +355,26 @@ describe("createLcmDependencies.complete provider config resolution", () => {
     expect(piAiMock.completeSimple).not.toHaveBeenCalled();
   });
 
+  it("falls back to openai-completions for ollama when no api family is configured", async () => {
+    await callComplete({
+      loadConfigResult: {},
+      provider: "ollama",
+      model: "kimi-k2.5:cloud",
+      runtimeConfig: {},
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "kimi-k2.5:cloud",
+        provider: "ollama",
+        api: "openai-completions",
+        baseUrl: "",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
   it("preserves provider auth error metadata when completeSimple throws a 401 scope error", async () => {
     piAiMock.completeSimple.mockRejectedValue({
       statusCode: 401,
