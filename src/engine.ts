@@ -108,6 +108,8 @@ type DynamicLeafChunkBounds = {
   high: number;
   max: number;
 };
+const DEFERRED_COMPACTION_STILL_NEEDED_REASON = "deferred compaction still needed";
+const MAX_BUDGET_TRIGGER_CATCHUP_PASSES = 10;
 type TranscriptRewriteReplacement = {
   entryId: string;
   message: AgentMessage;
@@ -1799,6 +1801,23 @@ export class LcmContextEngine implements ContextEngine {
     return params.currentTokenCount <= safeBudget;
   }
 
+  /** Scale budget-trigger catch-up passes by how far the prompt exceeds threshold. */
+  private resolveBudgetTriggerCatchupPasses(params: {
+    currentTokens: number;
+    threshold: number;
+    leafChunkTokens: number;
+  }): number {
+    const overage = Math.max(0, params.currentTokens - params.threshold);
+    if (overage <= 0) {
+      return 1;
+    }
+    const chunkTokens = Math.max(1, Math.floor(params.leafChunkTokens));
+    return Math.max(
+      1,
+      Math.min(MAX_BUDGET_TRIGGER_CATCHUP_PASSES, Math.ceil(overage / chunkTokens)),
+    );
+  }
+
   /** Resolve bounded dynamic leaf chunk sizes from config and the active token budget. */
   private resolveDynamicLeafChunkBounds(tokenBudget?: number): DynamicLeafChunkBounds {
     const floor = Math.max(1, Math.floor(this.config.leafChunkTokens));
@@ -2180,6 +2199,11 @@ export class LcmContextEngine implements ContextEngine {
       params.currentTokenCount,
     );
     if (budgetDecision.shouldCompact) {
+      const maxPasses = this.resolveBudgetTriggerCatchupPasses({
+        currentTokens: budgetDecision.currentTokens,
+        threshold: budgetDecision.threshold,
+        leafChunkTokens: preferredLeafChunkTokens,
+      });
       return this.logIncrementalCompactionDecision({
         conversationId: params.conversationId,
         cacheState,
@@ -2190,7 +2214,7 @@ export class LcmContextEngine implements ContextEngine {
         rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
         threshold: leafTrigger.threshold,
         shouldCompact: true,
-        maxPasses: 1,
+        maxPasses,
         allowCondensedPasses: true,
         reason: "budget-trigger",
       });
@@ -2352,11 +2376,15 @@ export class LcmContextEngine implements ContextEngine {
                   leafDecision,
                 });
               if (!leafDecision.shouldCompact) {
+                const deferredLeafStillNeeded =
+                  leafDecision.rawTokensOutsideTail >= leafDecision.threshold;
                 if (executionLeafDecision === leafDecision) {
                   return {
                     ok: true,
                     compacted: false,
-                    reason: "deferred compaction no longer needed",
+                    reason: deferredLeafStillNeeded
+                      ? DEFERRED_COMPACTION_STILL_NEEDED_REASON
+                      : "deferred compaction no longer needed",
                   };
                 }
                 this.deps.log.info(
@@ -2382,7 +2410,7 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: params.conversationId,
         finishedAt: new Date(),
         failureSummary: result.ok ? null : result.reason ?? "deferred compaction failed",
-        keepPending: !result.ok,
+        keepPending: !result.ok || result.reason === DEFERRED_COMPACTION_STILL_NEEDED_REASON,
       });
       this.deps.log.info(
         `[lcm] maintain: deferred compaction ${result.compacted ? "completed" : "skipped"} conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} ok=${result.ok} reason=${result.reason ?? "none"}`,
@@ -4704,8 +4732,16 @@ export class LcmContextEngine implements ContextEngine {
     };
     let shouldRefreshBootstrapState = true;
 
+    let rawLeafTrigger:
+      | {
+          shouldCompact: boolean;
+          rawTokensOutsideTail: number;
+          threshold: number;
+        }
+      | null = null;
+
     try {
-      const rawLeafTrigger = await this.compaction.evaluateLeafTrigger(conversation.conversationId);
+      rawLeafTrigger = await this.compaction.evaluateLeafTrigger(conversation.conversationId);
       await this.updateCompactionTelemetry({
         conversationId: conversation.conversationId,
         runtimeContext: legacyParams,
@@ -4765,10 +4801,14 @@ export class LcmContextEngine implements ContextEngine {
             await recordAfterTurnCompactionRetry(retryReason);
           }
         }
-      } else if (thresholdDecision.shouldCompact || leafDecision.shouldCompact) {
+      } else if (thresholdDecision.shouldCompact || rawLeafTrigger?.shouldCompact) {
         await this.recordDeferredCompactionDebt({
           conversationId: conversation.conversationId,
-          reason: thresholdDecision.shouldCompact ? "threshold" : leafDecision.reason,
+          reason: thresholdDecision.shouldCompact
+            ? "threshold"
+            : leafDecision.shouldCompact
+              ? leafDecision.reason
+              : "leaf-trigger",
           tokenBudget,
           currentTokenCount: liveContextTokens,
         });
