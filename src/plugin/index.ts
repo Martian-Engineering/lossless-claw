@@ -243,9 +243,10 @@ function resolvePluginConfig(api: OpenClawPluginApi): Record<string, unknown> | 
   return toPluginConfig(pluginEntry?.config);
 }
 
-/** CLI loads provide an empty runtime surface; skip gateway-only initialization there. */
+/** CLI metadata loads provide a truly empty runtime surface; skip gateway-only initialization there. */
 function shouldRegisterCliOnly(api: OpenClawPluginApi): boolean {
-  return typeof api.runtime?.logging?.getChildLogger !== "function";
+  const runtime = api.runtime;
+  return !!runtime && typeof runtime === "object" && Object.keys(runtime).length === 0;
 }
 
 /** Register the external `openclaw lossless` CLI surface with the resolved plugin config. */
