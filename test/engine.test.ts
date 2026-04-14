@@ -5538,9 +5538,87 @@ describe("LcmContextEngine fidelity and token budget", () => {
         conversationId: conversation.conversationId,
         sessionId,
         tokenBudget: 4_096,
-        maxPasses: 1,
+        maxPasses: 2,
         leafChunkTokens: 40_000,
-        allowCondensedPasses: false,
+        allowCondensedPasses: true,
+      }),
+    );
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+    expect(assembleResult.messages).toHaveLength(1);
+  });
+
+  it("assemble() uses cold-cache catch-up passes when stale Anthropic debt overrides hot-cache smoothing", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+      compaction: {
+        compactLeaf: (input: {
+          allowCondensedPasses?: boolean;
+        }) => Promise<unknown>;
+      };
+    };
+    const sessionId = "assemble-deferred-compaction-stale-ttl-catchup";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "cold",
+      retention: "short",
+      lastCacheTouchAt: new Date(Date.now() - 10 * 60 * 1000),
+      lastObservedCacheHitAt: new Date(),
+      consecutiveColdObservations: 1,
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+    });
+    vi.spyOn(privateEngine, "evaluateIncrementalCompaction").mockResolvedValue({
+      shouldCompact: false,
+      reason: "hot-cache-budget-headroom",
+      maxPasses: 1,
+      allowCondensedPasses: false,
+      activityBand: "medium",
+      leafChunkTokens: 40_000,
+      fallbackLeafChunkTokens: [40_000, 30_000, 20_000],
+      rawTokensOutsideTail: 55_000,
+      threshold: 40_000,
+      cacheState: "hot",
+    });
+    const compactLeafSpy = vi
+      .spyOn(privateEngine.compaction, "compactLeaf")
+      .mockResolvedValueOnce({
+        actionTaken: true,
+        tokensBefore: 900,
+        tokensAfter: 700,
+        condensed: false,
+      })
+      .mockResolvedValueOnce({
+        actionTaken: false,
+        tokensBefore: 700,
+        tokensAfter: 700,
+        condensed: false,
+      });
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "hello" })],
+      tokenBudget: 4_096,
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(compactLeafSpy).toHaveBeenCalledTimes(2);
+    expect(compactLeafSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        allowCondensedPasses: true,
       }),
     );
     expect(maintenance?.pending).toBe(false);
