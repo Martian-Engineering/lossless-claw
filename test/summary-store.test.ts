@@ -11,6 +11,7 @@ function createStores() {
   const { fts5Available } = getLcmDbFeatures(db);
   runLcmMigrations(db, { fts5Available });
   return {
+    db,
     conversationStore: new ConversationStore(db, { fts5Available }),
     summaryStore: new SummaryStore(db, { fts5Available }),
   };
@@ -93,6 +94,74 @@ describe("SummaryStore shallow-tree helpers", () => {
       {
         messageId: firstMessage.messageId,
         summaryId: "sum_leaf_a",
+      },
+    ]);
+  });
+
+  it("uses content recency for fallback summary search ordering and time filters", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "summary-store-search-time",
+      title: "Summary search time",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_regex_old_content_recent_compaction",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "pagedrop regression historical request",
+      tokenCount: 5,
+      latestAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_regex_recent_content_older_compaction",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "pagedrop regression recent request",
+      tokenCount: 5,
+      latestAt: new Date("2026-01-09T00:00:00.000Z"),
+    });
+
+    db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?").run(
+      "2026-01-10T00:00:00.000Z",
+      "sum_regex_old_content_recent_compaction",
+    );
+    db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?").run(
+      "2026-01-05T00:00:00.000Z",
+      "sum_regex_recent_content_older_compaction",
+    );
+
+    await expect(
+      summaryStore.searchSummaries({
+        conversationId: conversation.conversationId,
+        query: "pagedrop regression",
+        mode: "regex",
+        limit: 10,
+      }),
+    ).resolves.toMatchObject([
+      {
+        summaryId: "sum_regex_recent_content_older_compaction",
+        createdAt: new Date("2026-01-09T00:00:00.000Z"),
+      },
+      {
+        summaryId: "sum_regex_old_content_recent_compaction",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      },
+    ]);
+
+    await expect(
+      summaryStore.searchSummaries({
+        conversationId: conversation.conversationId,
+        query: "pagedrop regression",
+        mode: "regex",
+        since: new Date("2026-01-05T00:00:00.000Z"),
+        limit: 10,
+      }),
+    ).resolves.toMatchObject([
+      {
+        summaryId: "sum_regex_recent_content_older_compaction",
       },
     ]);
   });

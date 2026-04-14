@@ -147,4 +147,71 @@ describe("RetrievalEngine sort modes", () => {
       db.close();
     }
   });
+
+  itIfFts5("uses content recency instead of compaction time for summary recency and time filters", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+    const retrieval = new RetrievalEngine(conversationStore, summaryStore);
+
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-content-recency",
+      });
+      await summaryStore.insertSummary({
+        summaryId: "sum_old_content_recent_compaction",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "pagedrop launch notes pagedrop launch notes legacy request",
+        tokenCount: 12,
+        latestAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      await summaryStore.insertSummary({
+        summaryId: "sum_recent_content_older_compaction",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "pagedrop launch notes current request details",
+        tokenCount: 10,
+        latestAt: new Date("2026-01-09T00:00:00.000Z"),
+      });
+
+      db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?").run(
+        "2026-01-10T00:00:00.000Z",
+        "sum_old_content_recent_compaction",
+      );
+      db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?").run(
+        "2026-01-05T00:00:00.000Z",
+        "sum_recent_content_older_compaction",
+      );
+
+      const recencyResult = await retrieval.grep({
+        query: '"pagedrop launch notes"',
+        mode: "full_text",
+        scope: "summaries",
+        conversationId: conversation.conversationId,
+        limit: 2,
+        sort: "recency",
+      });
+      const filteredResult = await retrieval.grep({
+        query: '"pagedrop launch notes"',
+        mode: "full_text",
+        scope: "summaries",
+        conversationId: conversation.conversationId,
+        since: new Date("2026-01-05T00:00:00.000Z"),
+        limit: 2,
+        sort: "recency",
+      });
+
+      expect(recencyResult.summaries.map((summary) => summary.summaryId)).toEqual([
+        "sum_recent_content_older_compaction",
+        "sum_old_content_recent_compaction",
+      ]);
+      expect(recencyResult.summaries[0]?.createdAt.toISOString()).toBe("2026-01-09T00:00:00.000Z");
+      expect(filteredResult.summaries.map((summary) => summary.summaryId)).toEqual([
+        "sum_recent_content_older_compaction",
+      ]);
+    } finally {
+      db.close();
+    }
+  });
 });
