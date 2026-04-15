@@ -1355,6 +1355,15 @@ function createLcmDependencies(
   const pluginConfig = registrationConfig.pluginConfig;
   const log = createLcmLogger(api);
   const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
+  const sessionAllowlistRaw = process.env.LCM_SESSION_ALLOWLIST ?? "";
+  const sessionAllowlistPatterns = sessionAllowlistRaw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const effectiveConfig = {
+    ...config,
+    sessionAllowlistPatterns,
+  };
 
   if (diagnostics.ignoreSessionPatternsEnvOverridesPluginConfig) {
     logStartupBannerOnce({
@@ -1392,7 +1401,7 @@ function createLcmDependencies(
   logStartupBannerOnce({
     key: "transcript-gc-enabled",
     log: (message) => log.info(message),
-    message: `[lcm] Transcript GC ${config.transcriptGcEnabled ? "enabled" : "disabled"} (default false)`,
+    message: `[lcm] Transcript GC ${effectiveConfig.transcriptGcEnabled ? "enabled" : "disabled"} (default false)`,
   });
   logStartupBannerOnce({
     key: "proactive-threshold-compaction-mode",
@@ -1459,7 +1468,7 @@ function createLcmDependencies(
   };
 
   return {
-    config,
+    config: effectiveConfig,
     configDiagnostics: diagnostics,
     isRuntimeManagedAuthProvider: (provider: string, providerApi?: string) => {
       const normalizedProvider = normalizeProviderId(provider);

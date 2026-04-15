@@ -51,6 +51,8 @@ export type LcmConfig = {
   ignoreSessionPatterns: string[];
   /** Glob patterns for session keys that may read from LCM but never write to it. */
   statelessSessionPatterns: string[];
+  /** Glob patterns for session keys allowed to persist to LCM. Empty means allow all sessions. */
+  sessionAllowlistPatterns: string[];
   /** When true, stateless session pattern matching is enforced. */
   skipStatelessSessions: boolean;
   contextThreshold: number;
@@ -351,6 +353,7 @@ export function resolveLcmConfigWithDiagnostics(
         ?? join(resolveOpenclawStateDir(env), "lcm-files"),
       ignoreSessionPatterns: ignoreSessionPatterns.patterns,
       statelessSessionPatterns: statelessSessionPatterns.patterns,
+      sessionAllowlistPatterns: [],
       skipStatelessSessions:
         env.LCM_SKIP_STATELESS_SESSIONS !== undefined
           ? env.LCM_SKIP_STATELESS_SESSIONS === "true"
