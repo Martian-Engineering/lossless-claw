@@ -193,6 +193,20 @@ const STRUCTURED_MEDIA_NESTED_KEYS = ["content", "parts", "items", "message", "m
 
 const CONDENSED_MIN_INPUT_RATIO = 0.1;
 
+/**
+ * Minimum text length (after stripping file/media references) for a message
+ * to be worth sending to the summarizer.  Messages below this threshold are
+ * typically media-only (an image attachment with no accompanying text).
+ */
+const MEDIA_ONLY_MIN_TEXT_LENGTH = 50;
+
+const MEDIA_PATH_RE = /MEDIA:\/\S+/g;
+
+function isMediaOnlyContent(content: string): boolean {
+  const stripped = content.replace(MEDIA_PATH_RE, "").trim();
+  return stripped.length < MEDIA_ONLY_MIN_TEXT_LENGTH;
+}
+
 function dedupeOrderedIds(ids: Iterable<string>): string[] {
   const seen = new Set<string>();
   const ordered: string[] = [];
@@ -1490,7 +1504,21 @@ export class CompactionEngine {
       }
     }
 
-    const concatenated = messageContents
+    // Skip media-only messages that cannot be meaningfully summarized.
+    const summarizable = messageContents.filter(
+      (message) => !isMediaOnlyContent(message.content),
+    );
+
+    // If every message in this chunk is media-only, skip the entire leaf pass
+    // rather than sending an empty string to the summarizer.
+    if (summarizable.length === 0) {
+      console.warn(
+        `[lcm] skipping leaf chunk: all ${messageContents.length} messages are media-only; conversationId=${conversationId}`,
+      );
+      return null;
+    }
+
+    const concatenated = summarizable
       .map((message) => `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${message.content}`)
       .join("\n\n");
     const fileIds = dedupeOrderedIds(
