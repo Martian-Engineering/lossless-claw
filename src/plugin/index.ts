@@ -1992,6 +1992,43 @@ function wirePluginHandlers(
       getLcm: shared.waitForEngine,
     }),
   );
+
+  api.registerCli(
+    ({ program }) => {
+      const command = createLcmCommand({
+        db: shared.waitForDatabase,
+        config: deps.config,
+        deps,
+        getLcm: shared.waitForEngine,
+      });
+
+      program
+        .command("lcm [args...]")
+        .alias("lossless")
+        .description(command.description)
+        .action(async (args) => {
+          const result = await command.handler({
+            args: Array.isArray(args) ? args.join(" ") : "",
+          });
+
+          if (result && typeof result.text === "string" && result.text.length > 0) {
+            console.log(result.text);
+          } else if (result !== undefined) {
+            console.log(JSON.stringify(result, null, 2));
+          }
+        });
+    },
+    {
+      commands: ["lcm", "lossless"],
+      descriptors: [
+        {
+          name: "lcm",
+          description: "Show Lossless Claw health, backups, rotate, and doctor actions",
+          hasSubcommands: true,
+        },
+      ],
+    },
+  );
 }
 
 const lcmPlugin = {

@@ -221,6 +221,18 @@ describe("lcm plugin registration", () => {
         }),
       }),
     );
+    expect(api.registerCli).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.objectContaining({
+        commands: ["lcm", "lossless"],
+        descriptors: expect.arrayContaining([
+          expect.objectContaining({
+            name: "lcm",
+            hasSubcommands: true,
+          }),
+        ]),
+      }),
+    );
 
     const factory = getFactory();
     expect(factory).toBeTypeOf("function");
