@@ -5517,6 +5517,13 @@ export class LcmContextEngine implements ContextEngine {
     if (this.isStatelessSession(params.sessionKey ?? params.nextSessionKey)) {
       return;
     }
+    const nextSessionKey = params.nextSessionKey?.trim() || undefined;
+    if (nextSessionKey && this.shouldIgnoreSession({ sessionKey: nextSessionKey })) {
+      return;
+    }
+    if (nextSessionKey && this.isStatelessSession(nextSessionKey)) {
+      return;
+    }
 
     const createReplacement = reason !== "deleted";
     this.ensureMigrated();

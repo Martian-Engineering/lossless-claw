@@ -405,7 +405,10 @@ export class ConversationStore {
     const existing = await this.getConversationBySessionId(sessionId);
     if (existing) {
       if (!normalizedSessionKey) {
-        return existing;
+        if (existing.active) {
+          return existing;
+        }
+        return this.createConversation({ sessionId, title: opts.title });
       }
       if (existing.active && !existing.sessionKey) {
         this.db
