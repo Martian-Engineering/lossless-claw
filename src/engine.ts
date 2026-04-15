@@ -65,7 +65,11 @@ import {
   type MessagePartType,
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
-import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
+import {
+  createLcmSummarizeFromLegacyParams,
+  LcmProviderAuthError,
+  type LcmSummarizeFn,
+} from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
@@ -4826,6 +4830,129 @@ export class LcmContextEngine implements ContextEngine {
     this.deps.log.info(
       `[lcm] afterTurn: done conversation=${conversation.conversationId} ${sessionLabel} newMessages=${newMessages.length} dedupedMessages=${dedupedNewMessages.length} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
     );
+  }
+
+  /**
+   * Sweep active conversations for background compaction.
+   * Called periodically to compact idle sessions that haven't had recent turns.
+   */
+  async sweepActiveConversations(options?: {
+    summarize?: LcmSummarizeFn;
+    signal?: AbortSignal;
+  }): Promise<{ swept: number; compacted: number; errors: number }> {
+    if (options?.signal?.aborted) {
+      return { swept: 0, compacted: 0, errors: 0 };
+    }
+
+    this.ensureMigrated();
+    const rows = this.db.prepare(
+      `SELECT conversation_id, session_id, session_key
+       FROM conversations
+       WHERE active = 1 AND archived_at IS NULL`,
+    ).all() as Array<{
+      conversation_id: number;
+      session_id: string;
+      session_key: string | null;
+    }>;
+
+    let swept = 0;
+    let compacted = 0;
+    let errors = 0;
+
+    for (const row of rows) {
+      if (options?.signal?.aborted) {
+        break;
+      }
+
+      const sessionId = typeof row.session_id === "string" ? row.session_id.trim() : "";
+      const normalizedSessionKey =
+        typeof row.session_key === "string" && row.session_key.trim().length > 0
+          ? row.session_key.trim()
+          : undefined;
+
+      if (this.shouldIgnoreSession({ sessionId, sessionKey: normalizedSessionKey })) {
+        continue;
+      }
+      if (this.isStatelessSession(normalizedSessionKey)) {
+        continue;
+      }
+
+      const queueKey = this.resolveSessionQueueKey(sessionId, normalizedSessionKey);
+      const context = [
+        `conversation=${row.conversation_id}`,
+        ...(sessionId ? [`session=${sessionId}`] : []),
+        ...(normalizedSessionKey ? [`sessionKey=${normalizedSessionKey}`] : []),
+      ].join(" ");
+
+      swept += 1;
+
+      try {
+        const didCompact = await this.withSessionQueue(
+          queueKey,
+          async () => {
+            if (options?.signal?.aborted) {
+              return false;
+            }
+
+            const conversationId = Number(row.conversation_id);
+            if (!Number.isFinite(conversationId) || conversationId <= 0) {
+              return false;
+            }
+
+            const leafTrigger = await this.compaction.evaluateLeafTrigger(conversationId);
+            if (!leafTrigger.shouldCompact) {
+              return false;
+            }
+
+            const tokenBudget = this.applyAssemblyBudgetCap(128_000);
+            const resolvedSummarizer = options?.summarize
+              ? {
+                  summarize: options.summarize,
+                  summaryModel: "unknown",
+                  breakerKey: `sweep:${queueKey}`,
+                }
+              : await this.resolveSummarize({ breakerScope: `sweep:${queueKey}` });
+
+            if (
+              resolvedSummarizer.breakerKey
+              && this.isCircuitBreakerOpen(resolvedSummarizer.breakerKey)
+            ) {
+              return false;
+            }
+
+            const sweepResult = await this.compaction.compact({
+              conversationId,
+              tokenBudget,
+              summarize: resolvedSummarizer.summarize,
+              hardTrigger: false,
+              summaryModel: resolvedSummarizer.summaryModel,
+            });
+
+            if (sweepResult.authFailure && resolvedSummarizer.breakerKey) {
+              this.recordCompactionAuthFailure(resolvedSummarizer.breakerKey);
+            } else if (sweepResult.actionTaken && resolvedSummarizer.breakerKey) {
+              this.recordCompactionSuccess(resolvedSummarizer.breakerKey);
+            }
+
+            if (sweepResult.actionTaken) {
+              await this.markLeafCompactionTelemetrySuccess({ conversationId });
+            }
+
+            return sweepResult.actionTaken;
+          },
+          { operationName: "sweep", context },
+        );
+
+        if (didCompact) {
+          compacted += 1;
+        }
+      } catch (err) {
+        errors += 1;
+        this.deps.log.warn(`[lcm] sweep conversation failed: ${context} error=${describeLogError(err)}`);
+      }
+    }
+
+    return { swept, compacted, errors };
   }
 
   async assemble(params: {
