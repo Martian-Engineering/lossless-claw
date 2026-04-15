@@ -11,6 +11,7 @@ import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
 
 type RegisteredEngineFactory = (() => unknown) | undefined;
 type HookHandler = (event: unknown, context: unknown) => unknown;
+type RegisteredContextEngine = { id: string; factory: () => unknown };
 
 function buildApi(
   pluginConfig: unknown,
@@ -23,6 +24,7 @@ function buildApi(
   api: OpenClawPluginApi;
   getFactory: () => RegisteredEngineFactory;
   getHook: (hookName: string) => HookHandler | undefined;
+  getRegisteredContextEngines: () => RegisteredContextEngine[];
   infoLog: ReturnType<typeof vi.fn>;
   warnLog: ReturnType<typeof vi.fn>;
   errorLog: ReturnType<typeof vi.fn>;
@@ -31,6 +33,7 @@ function buildApi(
   sessionWarnLog: ReturnType<typeof vi.fn>;
 } {
   let factory: RegisteredEngineFactory;
+  const registeredContextEngines: RegisteredContextEngine[] = [];
   const hooks = new Map<string, HookHandler[]>();
   const infoLog = vi.fn();
   const warnLog = vi.fn();
@@ -84,7 +87,8 @@ function buildApi(
       error: vi.fn(),
       debug: vi.fn(),
     },
-    registerContextEngine: vi.fn((_id: string, nextFactory: () => unknown) => {
+    registerContextEngine: vi.fn((id: string, nextFactory: () => unknown) => {
+      registeredContextEngines.push({ id, factory: nextFactory });
       factory = nextFactory;
     }),
     registerTool: vi.fn(),
@@ -109,6 +113,7 @@ function buildApi(
     api,
     getFactory: () => factory,
     getHook: (hookName: string) => hooks.get(hookName)?.[0],
+    getRegisteredContextEngines: () => [...registeredContextEngines],
     infoLog,
     warnLog,
     errorLog,
@@ -173,6 +178,16 @@ describe("lcm plugin registration", () => {
       rmSync(dir, { recursive: true, force: true });
     }
     tempDirs.clear();
+  });
+
+  it("registers only the lossless-claw context engine id", () => {
+    const { api, getRegisteredContextEngines } = buildApi({ enabled: true });
+
+    lcmPlugin.register(api);
+
+    expect(getRegisteredContextEngines()).toEqual([
+      expect.objectContaining({ id: "lossless-claw" }),
+    ]);
   });
 
   it("uses api.pluginConfig values during register", { timeout: 20000 }, () => {

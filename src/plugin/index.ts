@@ -1965,7 +1965,6 @@ function wirePluginHandlers(
   });
 
   api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
-  api.registerContextEngine("default", () => shared.getCachedEngine() ?? shared.waitForEngine());
 
   api.registerTool((ctx) =>
     createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
