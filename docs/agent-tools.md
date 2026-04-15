@@ -185,6 +185,27 @@ When summaries in context have an "Expand for details about:" footer
 listing something you need, use `lcm_expand_query` to get the full detail.
 ```
 
+OpenClaw agents commonly have two complementary recall systems. LCM handles conversation history; memory_search handles curated workspace files. Both should be available and both should be used for different questions.
+
+For openclaw specifically use these instructions instead of the above prompt to avoid conflicting information from system prompt and LCM tools suggestion:
+
+Add to AGENTS.md (or equivalent startup file):
+
+```markdown
+## Memory & Context
+
+Two separate recall systems — use both as appropriate:
+
+**1. `memory_search` (workspace files)** — Searches MEMORY.md + memory/*.md via local embeddings. Use for: prior decisions, protocols, system setup, long-term knowledge. This is curated, edited knowledge — "what's our protocol for X?"
+
+**2. LCM tools (conversation history)** — Searches compacted conversation transcripts in the LCM database. Use for: recalling what happened in past sessions, finding specific discussions, recovering details from summaries. Nothing is lost — raw messages persist in the DB.
+- `lcm_grep` — Search all conversations by keyword/regex
+- `lcm_describe` — Inspect a specific summary (cheap, no sub-agent)
+- `lcm_expand_query` — Deep recall with sub-agent expansion
+
+When summaries in context have an "Expand for details about:" footer listing something you need, use `lcm_expand_query` to get the full detail.
+```
+
 ### Conversation scoping
 
 By default, tools operate on the current conversation. Use `lcm_grep(..., allConversations: true)` when you need broad global discovery. Use `lcm_expand_query(..., allConversations: true)` when you want bounded synthesis across sessions. Use `conversationId` when you already know the exact conversation to inspect or expand.
