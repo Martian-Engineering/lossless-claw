@@ -1045,8 +1045,8 @@ describe("runLcmMigrations summary depth backfill", () => {
 
     runLcmMigrations(instrumentedDb, { fts5Available: false });
 
-    const beginCalls = execCalls.filter((sql) => sql.startsWith("BEGIN"));
-    expect(beginCalls).toEqual(["BEGIN EXCLUSIVE"]);
+    const beginStatements = execCalls.filter((sql) => sql.startsWith("BEGIN"));
+    expect(beginStatements).toEqual(["BEGIN EXCLUSIVE"]);
     expect(execCalls.at(-1)).toBe("COMMIT");
   });
 
