@@ -187,17 +187,24 @@ function backfillMessageIdentityHashes(db: DatabaseSync): void {
     if (rows.length === 0) {
       return;
     }
-    db.exec(`BEGIN`);
+    const managesOwnTransaction = !db.isTransaction;
+    if (managesOwnTransaction) {
+      db.exec(`BEGIN`);
+    }
     try {
       for (const row of rows) {
         updateStmt.run(buildMessageIdentityHash(row.role, row.content), row.message_id);
       }
-      db.exec(`COMMIT`);
+      if (managesOwnTransaction) {
+        db.exec(`COMMIT`);
+      }
     } catch (error) {
-      try {
-        db.exec(`ROLLBACK`);
-      } catch {
-        // Preserve the original migration failure if rollback also errors.
+      if (managesOwnTransaction) {
+        try {
+          db.exec(`ROLLBACK`);
+        } catch {
+          // Preserve the original migration failure if rollback also errors.
+        }
       }
       throw error;
     }
@@ -724,7 +731,12 @@ export function runLcmMigrations(
   options?: { fts5Available?: boolean; log?: MigrationLogger },
 ): void {
   const log = options?.log;
-  db.exec(`
+  let transactionActive = false;
+  db.exec(`BEGIN EXCLUSIVE`);
+  transactionActive = true;
+
+  try {
+    db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
@@ -913,160 +925,170 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
   `);
 
-  // Forward-compatible conversations migration for existing DBs.
-  const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
-    name?: string;
-  }>;
-  const hasBootstrappedAt = conversationColumns.some((col) => col.name === "bootstrapped_at");
-  if (!hasBootstrappedAt) {
-    db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
-  }
-
-  const hasSessionKey = conversationColumns.some((col) => col.name === "session_key");
-  if (!hasSessionKey) {
-    db.exec(`ALTER TABLE conversations ADD COLUMN session_key TEXT`);
-  }
-
-  const hasActive = conversationColumns.some((col) => col.name === "active");
-  if (!hasActive) {
-    db.exec(`ALTER TABLE conversations ADD COLUMN active INTEGER NOT NULL DEFAULT 1`);
-  }
-
-  const hasArchivedAt = conversationColumns.some((col) => col.name === "archived_at");
-  if (!hasArchivedAt) {
-    db.exec(`ALTER TABLE conversations ADD COLUMN archived_at TEXT`);
-  }
-
-  db.exec(`UPDATE conversations SET active = 1 WHERE active IS NULL`);
-  db.exec(`
-    CREATE UNIQUE INDEX IF NOT EXISTS conversations_active_session_key_idx
-    ON conversations (session_key)
-    WHERE session_key IS NOT NULL AND active = 1
-  `);
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS conversations_session_key_active_created_idx
-    ON conversations (session_key, active, created_at)
-  `);
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS conversations_session_id_active_created_idx
-    ON conversations (session_id, active, created_at)
-  `);
-  db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
-  runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
-  runMigrationStep("ensureSummaryMetadataColumns", log, () =>
-    ensureSummaryMetadataColumns(db),
-  );
-  runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
-  runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
-    ensureMessageIdentityHashColumn(db),
-  );
-  runMigrationStep("backfillMessageIdentityHashes", log, () =>
-    backfillMessageIdentityHashes(db),
-  );
-  runMigrationStep("createMessagesIdentityHashIndex", log, () =>
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS messages_conv_identity_hash_idx ON messages (conversation_id, identity_hash)`,
-    ),
-  );
-  runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
-    ensureCompactionTelemetryColumns(db),
-  );
-  runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));
-  // Index on depth — created AFTER backfillSummaryDepths to avoid index
-  // maintenance overhead during bulk depth updates on large existing DBs.
-  runMigrationStep("createSummariesDepthIndex", log, () =>
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
-    ),
-  );
-  runVersionedBackfillStep(db, "backfillSummaryMetadata", log, () =>
-    backfillSummaryMetadata(db),
-  );
-  runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
-    backfillToolCallColumns(db),
-  );
-
-  const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
-  const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
-  if (!fts5Available) {
-    return;
-  }
-
-  const trigramTokenizerAvailable = detectedFeatures?.trigramTokenizerAvailable ?? false;
-  if (!trigramTokenizerAvailable) {
-    try {
-      db.exec(`DROP TABLE IF EXISTS summaries_fts_cjk`);
-    } catch {
-      // Best effort only. A stale virtual table should not block core migration.
+    // Forward-compatible conversations migration for existing DBs.
+    const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
+      name?: string;
+    }>;
+    const hasBootstrappedAt = conversationColumns.some((col) => col.name === "bootstrapped_at");
+    if (!hasBootstrappedAt) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
     }
-  }
 
-  // FTS5 virtual tables for full-text search (cannot use IF NOT EXISTS, so check manually)
-  runMigrationStep("ensureMessagesFts", log, () => {
-    ensureStandaloneFtsTable(db, {
-      tableName: "messages_fts",
-      createSql: `
-        CREATE VIRTUAL TABLE messages_fts USING fts5(
-          content,
-          tokenize='porter unicode61'
-        )
-      `,
-      seedSql: `
-        INSERT INTO messages_fts(rowid, content)
-        SELECT message_id, content FROM messages
-      `,
-      expectedColumns: ["content"],
-      staleSchemaPatterns: ["content_rowid"],
-    });
-  });
+    const hasSessionKey = conversationColumns.some((col) => col.name === "session_key");
+    if (!hasSessionKey) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN session_key TEXT`);
+    }
 
-  runMigrationStep("ensureSummariesFts", log, () => {
-    ensureStandaloneFtsTable(db, {
-      tableName: "summaries_fts",
-      createSql: `
-        CREATE VIRTUAL TABLE summaries_fts USING fts5(
-          summary_id UNINDEXED,
-          content,
-          tokenize='porter unicode61'
-        )
-      `,
-      seedSql: `
-        INSERT INTO summaries_fts(summary_id, content)
-        SELECT summary_id, content FROM summaries
-      `,
-      expectedColumns: ["summary_id", "content"],
-      staleSchemaPatterns: [
-        "content_rowid='summary_id'",
-        'content_rowid="summary_id"',
-      ],
-    });
-  });
+    const hasActive = conversationColumns.some((col) => col.name === "active");
+    if (!hasActive) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN active INTEGER NOT NULL DEFAULT 1`);
+    }
 
-  // ── CJK trigram FTS table ────────────────────────────────────────────────
-  // FTS5 unicode61 (porter) tokenizer cannot segment CJK ideographs, so CJK
-  // queries currently fall back to a LIKE path with AND logic.  When the user's
-  // phrasing doesn't match the summary verbatim (e.g. "端到端测试结果" vs
-  // "端到端测试"), ALL terms must match and the query returns 0 candidates.
-  //
-  // A trigram-tokenized table indexes every 3-character substring, enabling
-  // native CJK substring matching via FTS5 MATCH with OR semantics.
-  runMigrationStep("ensureSummariesFtsCjk", log, () => {
-    if (trigramTokenizerAvailable) {
-      ensureStandaloneFtsTable(db, {
-        tableName: "summaries_fts_cjk",
-        createSql: `
-          CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
-            summary_id UNINDEXED,
-            content,
-            tokenize='trigram'
-          )
-        `,
-        seedSql: `
-          INSERT INTO summaries_fts_cjk(summary_id, content)
-          SELECT summary_id, content FROM summaries
-        `,
-        expectedColumns: ["summary_id", "content"],
+    const hasArchivedAt = conversationColumns.some((col) => col.name === "archived_at");
+    if (!hasArchivedAt) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN archived_at TEXT`);
+    }
+
+    db.exec(`UPDATE conversations SET active = 1 WHERE active IS NULL`);
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS conversations_active_session_key_idx
+      ON conversations (session_key)
+      WHERE session_key IS NOT NULL AND active = 1
+    `);
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS conversations_session_key_active_created_idx
+      ON conversations (session_key, active, created_at)
+    `);
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS conversations_session_id_active_created_idx
+      ON conversations (session_id, active, created_at)
+    `);
+    db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
+    runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
+    runMigrationStep("ensureSummaryMetadataColumns", log, () =>
+      ensureSummaryMetadataColumns(db),
+    );
+    runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
+    runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
+      ensureMessageIdentityHashColumn(db),
+    );
+    runMigrationStep("backfillMessageIdentityHashes", log, () =>
+      backfillMessageIdentityHashes(db),
+    );
+    runMigrationStep("createMessagesIdentityHashIndex", log, () =>
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS messages_conv_identity_hash_idx ON messages (conversation_id, identity_hash)`,
+      ),
+    );
+    runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
+      ensureCompactionTelemetryColumns(db),
+    );
+    runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));
+    // Index on depth — created AFTER backfillSummaryDepths to avoid index
+    // maintenance overhead during bulk depth updates on large existing DBs.
+    runMigrationStep("createSummariesDepthIndex", log, () =>
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
+      ),
+    );
+    runVersionedBackfillStep(db, "backfillSummaryMetadata", log, () =>
+      backfillSummaryMetadata(db),
+    );
+    runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
+      backfillToolCallColumns(db),
+    );
+
+    const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
+    const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
+    if (fts5Available) {
+      const trigramTokenizerAvailable = detectedFeatures?.trigramTokenizerAvailable ?? false;
+      if (!trigramTokenizerAvailable) {
+        try {
+          db.exec(`DROP TABLE IF EXISTS summaries_fts_cjk`);
+        } catch {
+          // Best effort only. A stale virtual table should not block core migration.
+        }
+      }
+
+      // FTS5 virtual tables for full-text search (cannot use IF NOT EXISTS, so check manually)
+      runMigrationStep("ensureMessagesFts", log, () => {
+        ensureStandaloneFtsTable(db, {
+          tableName: "messages_fts",
+          createSql: `
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+              content,
+              tokenize='porter unicode61'
+            )
+          `,
+          seedSql: `
+            INSERT INTO messages_fts(rowid, content)
+            SELECT message_id, content FROM messages
+          `,
+          expectedColumns: ["content"],
+          staleSchemaPatterns: ["content_rowid"],
+        });
+      });
+
+      runMigrationStep("ensureSummariesFts", log, () => {
+        ensureStandaloneFtsTable(db, {
+          tableName: "summaries_fts",
+          createSql: `
+            CREATE VIRTUAL TABLE summaries_fts USING fts5(
+              summary_id UNINDEXED,
+              content,
+              tokenize='porter unicode61'
+            )
+          `,
+          seedSql: `
+            INSERT INTO summaries_fts(summary_id, content)
+            SELECT summary_id, content FROM summaries
+          `,
+          expectedColumns: ["summary_id", "content"],
+          staleSchemaPatterns: [
+            "content_rowid='summary_id'",
+            'content_rowid="summary_id"',
+          ],
+        });
+      });
+
+      // ── CJK trigram FTS table ────────────────────────────────────────────────
+      // FTS5 unicode61 (porter) tokenizer cannot segment CJK ideographs, so CJK
+      // queries currently fall back to a LIKE path with AND logic.  When the user's
+      // phrasing doesn't match the summary verbatim (e.g. "端到端测试结果" vs
+      // "端到端测试"), ALL terms must match and the query returns 0 candidates.
+      //
+      // A trigram-tokenized table indexes every 3-character substring, enabling
+      // native CJK substring matching via FTS5 MATCH with OR semantics.
+      runMigrationStep("ensureSummariesFtsCjk", log, () => {
+        if (trigramTokenizerAvailable) {
+          ensureStandaloneFtsTable(db, {
+            tableName: "summaries_fts_cjk",
+            createSql: `
+              CREATE VIRTUAL TABLE summaries_fts_cjk USING fts5(
+                summary_id UNINDEXED,
+                content,
+                tokenize='trigram'
+              )
+            `,
+            seedSql: `
+              INSERT INTO summaries_fts_cjk(summary_id, content)
+              SELECT summary_id, content FROM summaries
+            `,
+            expectedColumns: ["summary_id", "content"],
+          });
+        }
       });
     }
-  });
+    db.exec(`COMMIT`);
+    transactionActive = false;
+  } catch (error) {
+    if (transactionActive) {
+      try {
+        db.exec(`ROLLBACK`);
+      } catch {
+        // Preserve the original migration failure if rollback also errors.
+      }
+    }
+    throw error;
+  }
 }

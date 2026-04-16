@@ -1025,11 +1025,39 @@ describe("runLcmMigrations summary depth backfill", () => {
     ]);
   });
 
+  it("wraps the full migration in one exclusive transaction", () => {
+    const db = createTestDb("exclusive-transaction.db");
+    seedLegacySummaryGraph(db);
+
+    const execCalls: string[] = [];
+    const instrumentedDb = {
+      get isTransaction() {
+        return db.isTransaction;
+      },
+      prepare(sql: string) {
+        return db.prepare(sql);
+      },
+      exec(sql: string) {
+        execCalls.push(sql.trim());
+        return db.exec(sql);
+      },
+    } as unknown as Parameters<typeof runLcmMigrations>[0];
+
+    runLcmMigrations(instrumentedDb, { fts5Available: false });
+
+    const beginCalls = execCalls.filter((sql) => sql.startsWith("BEGIN"));
+    expect(beginCalls).toEqual(["BEGIN EXCLUSIVE"]);
+    expect(execCalls.at(-1)).toBe("COMMIT");
+  });
+
   it("retries a versioned backfill cleanly after the state write fails", () => {
     const db = createTestDb("retry-state-write.db");
     seedLegacySummaryGraph(db);
 
     const failingDb = {
+      get isTransaction() {
+        return db.isTransaction;
+      },
       prepare(sql: string) {
         if (sql.includes("INSERT INTO lcm_migration_state")) {
           throw new Error("simulated state write failure");
@@ -1045,25 +1073,24 @@ describe("runLcmMigrations summary depth backfill", () => {
       "simulated state write failure",
     );
 
-    const failedDepthRow = db.prepare(
-      `SELECT depth, earliest_at, latest_at
-       FROM summaries
-       WHERE summary_id = ?`,
-    ).get("sum-condensed") as {
-      depth: number;
-      earliest_at: string | null;
-      latest_at: string | null;
-    };
-    expect(failedDepthRow).toEqual({
-      depth: 0,
-      earliest_at: null,
-      latest_at: null,
-    });
+    const failedSummaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as Array<{
+      name?: string;
+    }>;
+    const failedConversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
+      name?: string;
+    }>;
+    const migrationStateTable = db.prepare(
+      `SELECT name
+       FROM sqlite_master
+       WHERE type = 'table' AND name = 'lcm_migration_state'`,
+    ).get() as { name?: string } | undefined;
 
-    const stateRowsAfterFailure = db
-      .prepare(`SELECT step_name, algorithm_version FROM lcm_migration_state`)
-      .all() as Array<{ step_name: string; algorithm_version: number }>;
-    expect(stateRowsAfterFailure).toEqual([]);
+    expect(failedSummaryColumns.some((column) => column.name === "depth")).toBe(false);
+    expect(failedSummaryColumns.some((column) => column.name === "earliest_at")).toBe(false);
+    expect(failedSummaryColumns.some((column) => column.name === "latest_at")).toBe(false);
+    expect(failedConversationColumns.some((column) => column.name === "session_key")).toBe(false);
+    expect(failedConversationColumns.some((column) => column.name === "active")).toBe(false);
+    expect(migrationStateTable).toBeUndefined();
 
     runLcmMigrations(db, { fts5Available: false });
 
