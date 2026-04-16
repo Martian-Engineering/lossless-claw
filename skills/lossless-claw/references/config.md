@@ -57,6 +57,21 @@ Good starting range:
 - Leave unset unless large tool outputs are forcing avoidable cost or overflow.
 - Start around `12000` to `32000` when you want a softer, size-aware fresh tail.
 
+### `promptAwareEviction`
+
+Controls whether budget-constrained assembly keeps older context by prompt relevance or pure chronology.
+
+Why it matters:
+
+- when enabled, lossless-claw can keep an older but on-topic summary instead of a newer irrelevant one
+- this can improve retrieval quality when the assembled context is tight
+- it also makes the preserved prompt prefix less stable, which can reduce prefix-based prompt-cache hit rates
+
+Good default:
+
+- `false`
+- enable it only when topical older-context recall under tight budgets matters more than prompt-cache stability
+
 ### `leafChunkTokens`
 
 Caps how much raw material gets summarized into one leaf summary.
@@ -231,6 +246,21 @@ See high-impact settings above.
 ### `freshTailMaxTokens`
 
 See high-impact settings above.
+
+### `promptAwareEviction`
+
+Boolean toggle for prompt-sensitive selection inside the evictable prefix during assembly.
+
+Why it matters:
+
+- only applies when the older evictable prefix does not fit the token budget
+- the protected fresh tail is unaffected
+- `true` keeps the most relevant older items for the current prompt
+- `false` falls back to pure chronological retention for the older prefix
+
+Env override:
+
+- `LCM_PROMPT_AWARE_EVICTION_ENABLED`
 
 ### `leafChunkTokens`
 

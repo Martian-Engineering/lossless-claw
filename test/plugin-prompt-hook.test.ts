@@ -152,6 +152,21 @@ describe("lcm plugin prompt hook", () => {
     expect(result.prependSystemContext).toContain(
       "For `query`, use 1-3 distinctive terms or a quoted phrase",
     );
+    expect(result.prependSystemContext).toContain("## Compacted Conversation Context");
+    expect(result.prependSystemContext).toContain(
+      "If compacted summaries appear above, treat them as compressed recall cues rather than proof of exact wording or exact values.",
+    );
+    expect(result.prependSystemContext).toContain(
+      'If a summary includes an "Expand for details about:" footer, use it as a cue to expand before asserting specifics.',
+    );
+    expect(result.prependSystemContext).toContain(
+      "For exact commands, SHAs, paths, timestamps, config values, or causal chains, expand for details before answering.",
+    );
+    expect(result.prependSystemContext).toContain("**Precision flow:**");
+    expect(result.prependSystemContext).toContain("1. `lcm_grep` to find the relevant summaries or messages");
+    expect(result.prependSystemContext).toContain("2. `lcm_expand_query` when you need exact evidence before answering");
+    expect(result.prependSystemContext).toContain("**Uncertainty checklist:**");
+    expect(result.prependSystemContext).toContain("Could compaction have omitted a crucial detail?");
     expect(result.prependSystemContext).toContain(
       "Lossless-claw does not supersede memory tools globally",
     );

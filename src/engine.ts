@@ -75,7 +75,6 @@ import {
 } from "./transaction-mutex.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
-type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
 type CircuitBreakerState = {
   failures: number;
   openSince: number | null;
@@ -4711,7 +4710,6 @@ export class LcmContextEngine implements ContextEngine {
       );
       return;
     }
-
     const refreshAfterTurnBootstrapState = async (): Promise<void> => {
       try {
         await this.refreshBootstrapState({
@@ -4929,6 +4927,7 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget,
         freshTailCount: this.config.freshTailCount,
         freshTailMaxTokens: this.config.freshTailMaxTokens,
+        promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
       });
 
@@ -4948,12 +4947,9 @@ export class LcmContextEngine implements ContextEngine {
         `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${assembled.messages.length} tokenBudget=${tokenBudget} estimatedTokens=${assembled.estimatedTokens} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
 
-      const result: AssembleResultWithSystemPrompt = {
+      const result: AssembleResult = {
         messages: assembled.messages,
         estimatedTokens: assembled.estimatedTokens,
-        ...(assembled.systemPromptAddition
-          ? { systemPromptAddition: assembled.systemPromptAddition }
-          : {}),
       };
       return result;
     } catch (err) {

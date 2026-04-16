@@ -4221,7 +4221,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     ]);
   });
 
-  it("omits dynamic LCM system prompt guidance when no summaries exist", async () => {
+  it("does not emit assembly-specific system prompt guidance when no summaries exist", async () => {
     const engine = createEngine();
     const sessionId = "session-no-summary-guidance";
 
@@ -4244,7 +4244,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(promptAddition).toBeUndefined();
   });
 
-  it("adds only dynamic compacted-context guidance when summaries are present", async () => {
+  it("does not emit assembly-specific system prompt guidance when summaries are present", async () => {
     const engine = createEngine();
     const sessionId = "session-summary-guidance";
 
@@ -4276,78 +4276,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     });
 
     const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
-    expect(promptAddition).toContain("## Compacted Conversation Context");
-    expect(promptAddition).toContain("Summaries above are compressed context, not full detail");
-    expect(promptAddition).toContain("Expand for details about:");
-    expect(promptAddition).toContain("expand for details before answering");
-    expect(promptAddition).toContain("State uncertainty instead of guessing from compressed summaries");
-    expect(promptAddition).not.toContain("## Lossless Recall Policy");
-    expect(promptAddition).not.toContain("The lossless-claw plugin is active");
-    expect(promptAddition).not.toContain("Recall order for compacted conversation history");
-    expect(promptAddition).not.toContain("memory_search");
-    expect(promptAddition).not.toContain("memory_get");
-    expect(promptAddition).not.toContain("Uncertainty checklist");
-    expect(promptAddition).not.toContain("Deeply compacted context");
-  });
-
-  it("emphasizes expand-before-asserting when summaries are deeply compacted", async () => {
-    const engine = createEngine();
-    const sessionId = "session-deep-summary-guidance";
-
-    await engine.ingest({
-      sessionId,
-      message: { role: "user", content: "seed message" } as AgentMessage,
-    });
-
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
-
-    await engine.getSummaryStore().insertSummary({
-      summaryId: "sum_guidance_deep",
-      conversationId: conversation!.conversationId,
-      kind: "condensed",
-      depth: 2,
-      content: "Deep condensed summary",
-      tokenCount: 24,
-      descendantCount: 12,
-    });
-    await engine
-      .getSummaryStore()
-      .appendContextSummary(conversation!.conversationId, "sum_guidance_deep");
-
-    const result = await engine.assemble({
-      sessionId,
-      messages: [],
-      tokenBudget: 10_000,
-    });
-
-    const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
-    expect(promptAddition).toContain("## Compacted Conversation Context");
-    expect(promptAddition).toContain("Deeply compacted context");
-    expect(promptAddition).toContain("expand before asserting specifics");
-    expect(promptAddition).toContain("Default recall flow for precision work:");
-    expect(promptAddition).toContain("1) `lcm_grep` to locate relevant summary/message IDs");
-    expect(promptAddition).toContain("2) `lcm_expand_query` with a focused prompt");
-    expect(promptAddition).toContain("3) Answer directly from the retrieved evidence");
-    expect(promptAddition).toContain("Keep raw summary IDs in tool context for follow-up");
-    expect(promptAddition).toContain("prefer `mode: \"full_text\"` for keyword/topic lookup");
-    expect(promptAddition).toContain("quote exact multi-word phrases");
-    expect(promptAddition).toContain("use `sort: \"relevance\"` for older-topic retrieval");
-    expect(promptAddition).toContain("use `sort: \"hybrid\"` when recency should still influence ranking");
-    expect(promptAddition).toContain("uses the same FTS5 full-text search rules as `lcm_grep`");
-    expect(promptAddition).toContain("terms are ANDed by default");
-    expect(promptAddition).toContain("put the natural-language question in `prompt`");
-    expect(promptAddition).toContain("Uncertainty checklist");
-    expect(promptAddition).toContain("Am I making an exact factual claim from a compressed or condensed summary?");
-    expect(promptAddition).toContain("Could compaction have omitted a crucial detail?");
-    expect(promptAddition).toContain("Would I need an expansion step if the user asks for proof or the exact text?");
-    expect(promptAddition).toContain("Should I state uncertainty instead of asserting specifics until I expand?");
-    expect(promptAddition).toContain("expand first or explicitly say that you need to expand");
-    expect(promptAddition).toContain("Do not guess exact commands, SHAs, file paths, timestamps, config values, or causal claims from condensed summaries.");
-    expect(promptAddition).not.toContain("## Lossless Recall Policy");
-    expect(promptAddition).not.toContain("The lossless-claw plugin is active");
-    expect(promptAddition).not.toContain("Recall order for compacted conversation history");
-    expect(promptAddition).not.toContain("memory_search");
+    expect(promptAddition).toBeUndefined();
   });
 });
 

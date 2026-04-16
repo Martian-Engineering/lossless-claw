@@ -57,6 +57,8 @@ export type LcmConfig = {
   freshTailCount: number;
   /** Optional token cap for the protected fresh tail; newest message is always preserved. */
   freshTailMaxTokens?: number;
+  /** When true, budget-constrained assembly may keep older items by prompt relevance instead of pure chronology. */
+  promptAwareEviction: boolean;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -364,6 +366,10 @@ export function resolveLcmConfigWithDiagnostics(
       freshTailMaxTokens:
         parseFiniteInt(env.LCM_FRESH_TAIL_MAX_TOKENS)
           ?? toNumber(pc.freshTailMaxTokens) ?? undefined,
+      promptAwareEviction:
+        env.LCM_PROMPT_AWARE_EVICTION_ENABLED !== undefined
+          ? env.LCM_PROMPT_AWARE_EVICTION_ENABLED === "true"
+          : toBool(pc.promptAwareEviction) ?? false,
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,
