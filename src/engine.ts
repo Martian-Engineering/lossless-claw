@@ -2451,9 +2451,17 @@ export class LcmContextEngine implements ContextEngine {
       if (sweepResult.actionTaken) {
         await this.markLeafCompactionTelemetrySuccess({ conversationId });
       }
+      const sweepTokensAfter =
+        typeof sweepResult.tokensAfter === "number" && Number.isFinite(sweepResult.tokensAfter)
+          ? sweepResult.tokensAfter
+          : undefined;
+      const isUnderTargetAfterSweep =
+        sweepTokensAfter !== undefined
+          ? sweepTokensAfter <= targetTokens
+          : !liveContextStillExceedsTarget;
 
       return {
-        ok: !sweepResult.authFailure && (sweepResult.actionTaken || !liveContextStillExceedsTarget),
+        ok: !sweepResult.authFailure && (sweepResult.actionTaken || isUnderTargetAfterSweep),
         compacted: sweepResult.actionTaken,
         reason: sweepResult.authFailure
           ? (sweepResult.actionTaken
@@ -2461,11 +2469,11 @@ export class LcmContextEngine implements ContextEngine {
               : "provider auth failure")
           : sweepResult.actionTaken
             ? "compacted"
-            : manualCompactionRequested
-              ? "nothing to compact"
-              : liveContextStillExceedsTarget
-                ? "live context still exceeds target"
-                : "already under target",
+            : isUnderTargetAfterSweep
+              ? "already under target"
+              : manualCompactionRequested
+                ? "nothing to compact"
+                : "live context still exceeds target",
         result: {
           tokensBefore: decision.currentTokens,
           tokensAfter: sweepResult.tokensAfter,
@@ -4973,111 +4981,6 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: params.currentTokenCount,
           compactionTarget: params.compactionTarget,
           customInstructions: params.customInstructions,
-          breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-        });
-        if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
-          return {
-            ok: true,
-            compacted: false,
-            reason: "circuit breaker open",
-          };
-        }
-
-        // Evaluate whether compaction is needed (unless forced)
-        const observedTokens = this.normalizeObservedTokenCount(
-          params.currentTokenCount ??
-            (
-              lp as {
-                currentTokenCount?: unknown;
-              }
-            ).currentTokenCount,
-        );
-        const decision =
-          observedTokens !== undefined
-            ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
-            : await this.compaction.evaluate(conversationId, tokenBudget);
-        const targetTokens =
-          params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
-        const liveContextStillExceedsTarget =
-          observedTokens !== undefined && observedTokens >= targetTokens;
-
-        if (!forceCompaction && !decision.shouldCompact) {
-          return {
-            ok: true,
-            compacted: false,
-            reason: "below threshold",
-            result: {
-              tokensBefore: decision.currentTokens,
-            },
-          };
-        }
-
-        // Forced budget recovery should use the capped convergence loop so live
-        // overflow counts can drive recovery even when persisted context is already small.
-        const useSweep = manualCompactionRequested || params.compactionTarget === "threshold";
-        if (useSweep) {
-          const sweepResult = await this.compaction.compactFullSweep({
-            conversationId,
-            tokenBudget,
-            summarize,
-            force: forceCompaction,
-            hardTrigger: false,
-            summaryModel,
-          });
-
-          if (sweepResult.authFailure && breakerKey) {
-            this.recordCompactionAuthFailure(breakerKey);
-          } else if (sweepResult.actionTaken && breakerKey) {
-            this.recordCompactionSuccess(breakerKey);
-          }
-          const sweepTokensAfter =
-            typeof sweepResult.tokensAfter === "number" && Number.isFinite(sweepResult.tokensAfter)
-              ? sweepResult.tokensAfter
-              : undefined;
-          const isUnderTargetAfterSweep =
-            sweepTokensAfter !== undefined
-              ? sweepTokensAfter <= targetTokens
-              : !liveContextStillExceedsTarget;
-
-          return {
-            ok: !sweepResult.authFailure && (sweepResult.actionTaken || isUnderTargetAfterSweep),
-            compacted: sweepResult.actionTaken,
-            reason: sweepResult.authFailure
-              ? (sweepResult.actionTaken
-                  ? "provider auth failure after partial compaction"
-                  : "provider auth failure")
-              : sweepResult.actionTaken
-                ? "compacted"
-                : isUnderTargetAfterSweep
-                  ? "already under target"
-                  : manualCompactionRequested
-                    ? "nothing to compact"
-                    : "live context still exceeds target",
-            result: {
-              tokensBefore: decision.currentTokens,
-              tokensAfter: sweepResult.tokensAfter,
-              details: {
-                rounds: sweepResult.actionTaken ? 1 : 0,
-                targetTokens,
-              },
-            },
-          };
-        }
-
-        // When forced, use the token budget as target
-        const convergenceTargetTokens = forceCompaction
-          ? tokenBudget
-          : params.compactionTarget === "threshold"
-            ? decision.threshold
-            : tokenBudget;
-
-        const compactResult = await this.compaction.compactUntilUnder({
-          conversationId,
-          tokenBudget,
-          targetTokens: convergenceTargetTokens,
-          ...(observedTokens !== undefined ? { currentTokens: observedTokens } : {}),
-          summarize,
-          summaryModel,
           runtimeContext: params.runtimeContext,
           legacyParams: params.legacyParams,
           force: params.force,
