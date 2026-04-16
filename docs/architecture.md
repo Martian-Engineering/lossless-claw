@@ -125,7 +125,7 @@ The assembler runs before each model turn and builds the message array:
 2. Resolve each item — summaries become user messages with XML wrappers; messages are reconstructed from parts.
 3. Split into evictable prefix and protected fresh tail (last `freshTailCount` raw messages).
 4. Compute fresh tail token cost (always included, even if over budget).
-5. Fill remaining budget from the evictable set, keeping newest items and dropping oldest.
+5. Fill remaining budget from the evictable set. By default this keeps newest older items and drops the oldest; when `promptAwareEviction` is enabled and a searchable prompt is present, the evictable prefix is ranked by prompt relevance first and then restored to chronological order.
 6. Normalize assistant content to array blocks (Anthropic API compatibility).
 7. Sanitize tool-use/result pairing (ensures every tool_result has a matching tool_use).
 

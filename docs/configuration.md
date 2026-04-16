@@ -23,6 +23,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "contextThreshold": 0.75,
   "freshTailCount": 64,
   "freshTailMaxTokens": 24000,
+  "promptAwareEviction": false,
   "newSessionRetainDepth": 2,
   "leafMinFanout": 8,
   "condensedMinFanout": 4,
@@ -123,6 +124,7 @@ openclaw plugins install --link /path/to/lossless-claw
 | `contextThreshold` | `number` | `0.75` | `LCM_CONTEXT_THRESHOLD` | Fraction of the active model context window that triggers compaction. |
 | `freshTailCount` | `integer` | `64` | `LCM_FRESH_TAIL_COUNT` | Number of newest messages always kept raw. |
 | `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. The newest message is always preserved even if it exceeds the cap. |
+| `promptAwareEviction` | `boolean` | `false` | `LCM_PROMPT_AWARE_EVICTION_ENABLED` | When enabled, budget-constrained assembly keeps older evictable items by prompt relevance instead of pure chronology. This improves retrieval under tight budgets, but it can reduce prompt-cache hit rates because the preserved prefix changes as prompts change. |
 | `leafMinFanout` | `integer` | `8` | `LCM_LEAF_MIN_FANOUT` | Minimum number of raw messages required before a leaf pass runs. |
 | `condensedMinFanout` | `integer` | `4` | `LCM_CONDENSED_MIN_FANOUT` | Number of same-depth summaries needed before condensation is attempted. |
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |
@@ -189,6 +191,21 @@ When cache-aware compaction is enabled:
 - cold cache still allows bounded catch-up passes via `cacheAwareCompaction.maxColdCacheCatchupPasses`
 
 When incremental leaf compaction still runs on a hot cache, follow-on condensed passes are suppressed so the maintenance cycle only pays for the leaf pass that was explicitly justified.
+
+### Prompt-aware eviction
+
+When `promptAwareEviction` is enabled:
+
+- the protected fresh tail is still preserved exactly as usual
+- only the older evictable prefix is affected
+- if the evictable prefix does not fit and the current prompt has searchable terms, lossless-claw keeps the most relevant older items instead of just the newest older items
+
+Tradeoff:
+
+- this can improve retrieval quality when the prompt is asking about an older topic and the assembled context is tight
+- it also makes the assembled prefix less stable for providers with prefix-based prompt caching, because different prompts can keep different older items
+
+If Anthropic prompt-cache stability matters more than topical recall under pressure, set `promptAwareEviction: false`.
 
 ## Behavior notes
 

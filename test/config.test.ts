@@ -28,6 +28,7 @@ describe("resolveLcmConfig", () => {
     expect(config.contextThreshold).toBe(0.75);
     expect(config.freshTailCount).toBe(64);
     expect(config.freshTailMaxTokens).toBeUndefined();
+    expect(config.promptAwareEviction).toBe(false);
     expect(config.newSessionRetainDepth).toBe(2);
     expect(config.incrementalMaxDepth).toBe(1);
     expect(config.leafChunkTokens).toBe(20000);
@@ -59,6 +60,7 @@ describe("resolveLcmConfig", () => {
       contextThreshold: 0.5,
       freshTailCount: 16,
       freshTailMaxTokens: 12000,
+      promptAwareEviction: false,
       leafChunkTokens: 80000,
       newSessionRetainDepth: 3,
       incrementalMaxDepth: -1,
@@ -94,6 +96,7 @@ describe("resolveLcmConfig", () => {
     expect(config.contextThreshold).toBe(0.5);
     expect(config.freshTailCount).toBe(16);
     expect(config.freshTailMaxTokens).toBe(12000);
+    expect(config.promptAwareEviction).toBe(false);
     expect(config.newSessionRetainDepth).toBe(3);
     expect(config.leafChunkTokens).toBe(80000);
     expect(config.incrementalMaxDepth).toBe(-1);
@@ -121,6 +124,7 @@ describe("resolveLcmConfig", () => {
       LCM_CONTEXT_THRESHOLD: "0.9",
       LCM_FRESH_TAIL_COUNT: "64",
       LCM_FRESH_TAIL_MAX_TOKENS: "32000",
+      LCM_PROMPT_AWARE_EVICTION_ENABLED: "false",
       LCM_NEW_SESSION_RETAIN_DEPTH: "5",
       LCM_INCREMENTAL_MAX_DEPTH: "3",
       LCM_ENABLED: "false",
@@ -142,6 +146,7 @@ describe("resolveLcmConfig", () => {
       contextThreshold: 0.5,
       freshTailCount: 16,
       freshTailMaxTokens: 12000,
+      promptAwareEviction: true,
       incrementalMaxDepth: -1,
       ignoreSessionPatterns: ["agent:*:test:*"],
       statelessSessionPatterns: ["agent:*:preview:*"],
@@ -178,6 +183,7 @@ describe("resolveLcmConfig", () => {
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.freshTailMaxTokens).toBe(32000); // env wins
+    expect(config.promptAwareEviction).toBe(false); // env wins
     expect(config.newSessionRetainDepth).toBe(5); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
     expect(config.cacheAwareCompaction).toEqual({
@@ -242,6 +248,7 @@ describe("resolveLcmConfig", () => {
       contextThreshold: "0.6",
       freshTailCount: "24",
       freshTailMaxTokens: "4800",
+      promptAwareEviction: "false",
       leafChunkTokens: "64000",
       newSessionRetainDepth: "6",
       ignoreSessionPatterns: "agent:*:cron:*, agent:main:subagent:**",
@@ -251,6 +258,7 @@ describe("resolveLcmConfig", () => {
     expect(config.contextThreshold).toBe(0.6);
     expect(config.freshTailCount).toBe(24);
     expect(config.freshTailMaxTokens).toBe(4800);
+    expect(config.promptAwareEviction).toBe(false);
     expect(config.newSessionRetainDepth).toBe(6);
     expect(config.leafChunkTokens).toBe(64000);
     expect(config.ignoreSessionPatterns).toEqual([
@@ -269,12 +277,14 @@ describe("resolveLcmConfig", () => {
       contextThreshold: "not-a-number",
       freshTailCount: null,
       freshTailMaxTokens: "not-a-number",
+      promptAwareEviction: "maybe",
       newSessionRetainDepth: "nope",
       enabled: "maybe",
     });
     expect(config.contextThreshold).toBe(0.75); // falls through to default
     expect(config.freshTailCount).toBe(64); // falls through to default
     expect(config.freshTailMaxTokens).toBeUndefined();
+    expect(config.promptAwareEviction).toBe(false); // falls through to default
     expect(config.newSessionRetainDepth).toBe(2); // falls through to default
     expect(config.enabled).toBe(true); // falls through to default
   });
@@ -529,6 +539,12 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.leafChunkTokens).toEqual({
       type: "integer",
       minimum: 1,
+    });
+  });
+
+  it("ships a manifest with promptAwareEviction in schema", () => {
+    expect(manifest.configSchema.properties.promptAwareEviction).toEqual({
+      type: "boolean",
     });
   });
 

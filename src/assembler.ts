@@ -30,6 +30,8 @@ export interface AssembleContextInput {
   freshTailMaxTokens?: number;
   /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
   prompt?: string;
+  /** When false, evictable items are always retained chronologically even if a searchable prompt is present. */
+  promptAwareEviction?: boolean;
 }
 
 export interface AssembleContextResult {
@@ -37,8 +39,6 @@ export interface AssembleContextResult {
   messages: AgentMessage[];
   /** Total estimated tokens */
   estimatedTokens: number;
-  /** Optional dynamic system prompt guidance derived from DAG state */
-  systemPromptAddition?: string;
   /** Stats about what was assembled */
   stats: {
     rawMessageCount: number;
@@ -48,77 +48,6 @@ export interface AssembleContextResult {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-type SummaryPromptSignal = Pick<SummaryRecord, "kind" | "depth" | "descendantCount">;
-
-/**
- * Build dynamic prompt guidance for compacted session context.
- *
- * Guidance is emitted only when summaries are present in assembled context.
- * Static recall policy lives in the plugin prompt hook so this addition
- * remains session-specific and reflects only the current compaction state.
- */
-function buildSystemPromptAddition(summarySignals: SummaryPromptSignal[]): string | undefined {
-  if (summarySignals.length === 0) {
-    return undefined;
-  }
-
-  const maxDepth = summarySignals.reduce((deepest, signal) => Math.max(deepest, signal.depth), 0);
-  const condensedCount = summarySignals.filter((signal) => signal.kind === "condensed").length;
-  const heavilyCompacted = maxDepth >= 2 || condensedCount >= 2;
-
-  const sections: string[] = [];
-
-  // Dynamic compaction reminder — always present when summaries exist.
-  sections.push(
-    "## Compacted Conversation Context",
-    "",
-    "Summaries above are compressed context, not full detail.",
-    "",
-    "Treat summaries as compressed recall cues rather than proof of exact wording or exact values.",
-    "",
-    "If a summary includes an \"Expand for details about:\" footer, use it as a cue to expand before asserting specifics.",
-  );
-
-  // Precision/evidence rules — always present but stronger when heavily compacted.
-  if (heavilyCompacted) {
-    sections.push(
-      "",
-      "**Deeply compacted context: expand before asserting specifics.**",
-      "",
-      "Before answering with exact commands, SHAs, paths, timestamps, config values, or causal chains, expand for the missing detail.",
-      "",
-      "Default recall flow for precision work:",
-      "1) `lcm_grep` to locate relevant summary/message IDs",
-      "2) `lcm_expand_query` with a focused prompt",
-      "3) Answer directly from the retrieved evidence",
-      "",
-      "Keep raw summary IDs in tool context for follow-up; do not include them in the user-facing answer unless the user asks for sources or IDs.",
-      "",
-      "`lcm_grep` tips: prefer `mode: \"full_text\"` for keyword/topic lookup, quote exact multi-word phrases, use `sort: \"relevance\"` for older-topic retrieval, and use `sort: \"hybrid\"` when recency should still influence ranking.",
-      "`lcm_expand_query(query: ...)` uses the same FTS5 full-text search rules as `lcm_grep`: terms are ANDed by default, so extra query words narrow results. Keep `query` to 1-3 distinctive terms or a quoted phrase, and put the natural-language question in `prompt`.",
-      "",
-      "**Uncertainty checklist (run before answering):**",
-      "- Am I making an exact factual claim from a compressed or condensed summary?",
-      "- Could compaction have omitted a crucial detail?",
-      "- Would I need an expansion step if the user asks for proof or the exact text?",
-      "- Should I state uncertainty instead of asserting specifics until I expand?",
-      "",
-      "If yes to any item, expand first or explicitly say that you need to expand.",
-      "",
-      "Do not guess exact commands, SHAs, file paths, timestamps, config values, or causal claims from condensed summaries. Expand first or explicitly say that you need to expand.",
-    );
-  } else {
-    sections.push(
-      "",
-      "For exact commands, SHAs, paths, timestamps, config values, or causal chains, expand for details before answering.",
-      "State uncertainty instead of guessing from compressed summaries.",
-    );
-  }
-
-  return sections.join("\n");
-}
 
 /**
  * Map a DB message role to an AgentMessage role.
@@ -856,8 +785,6 @@ interface ResolvedItem {
   isMessage: boolean;
   /** Pre-extracted plain text used for relevance scoring */
   text: string;
-  /** Summary metadata used for dynamic system prompt guidance */
-  summarySignal?: SummaryPromptSignal;
 }
 
 function resolveFreshTailOrdinal(
@@ -1000,19 +927,13 @@ export class ContextAssembler {
     // Count stats from the full (pre-truncation) set
     let rawMessageCount = 0;
     let summaryCount = 0;
-    const summarySignals: SummaryPromptSignal[] = [];
     for (const item of resolved) {
       if (item.isMessage) {
         rawMessageCount++;
       } else {
         summaryCount++;
-        if (item.summarySignal) {
-          summarySignals.push(item.summarySignal);
-        }
       }
     }
-
-    const systemPromptAddition = buildSystemPromptAddition(summarySignals);
 
     // Step 3: Split into evictable prefix and protected fresh tail
     const freshTailOrdinal = resolveFreshTailOrdinal(
@@ -1062,7 +983,7 @@ export class ContextAssembler {
       // Everything fits
       selected.push(...evictable);
       evictableTokens = evictableTotalTokens;
-    } else if (hasSearchablePrompt(input.prompt)) {
+    } else if (input.promptAwareEviction !== false && hasSearchablePrompt(input.prompt)) {
       // Prompt-aware eviction: score each evictable item by relevance to the
       // prompt, then greedily fill budget from highest-scoring items down.
       // Re-sort selected items by ordinal to restore chronological order.
@@ -1143,7 +1064,6 @@ export class ContextAssembler {
     return {
       messages: sanitizeToolUseResultPairing(cleaned) as AgentMessage[],
       estimatedTokens,
-      systemPromptAddition,
       stats: {
         rawMessageCount,
         summaryCount,
@@ -1281,11 +1201,6 @@ export class ContextAssembler {
       tokens,
       isMessage: false,
       text: summary.content,
-      summarySignal: {
-        kind: summary.kind,
-        depth: summary.depth,
-        descendantCount: summary.descendantCount,
-      },
     };
   }
 }
