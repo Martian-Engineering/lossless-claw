@@ -1018,7 +1018,12 @@ function resolveSummaryCandidates(params: {
           };
         })
       : undefined;
-  const nestedPluginConfig = runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config;
+  const directPluginConfig = params.deps.config as {
+    summaryModel?: unknown;
+    summaryProvider?: unknown;
+  };
+  const nestedPluginConfig =
+    runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config ?? directPluginConfig;
 
   const resolutionCandidates: SummaryResolutionCandidate[] = [
     {

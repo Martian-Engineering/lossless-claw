@@ -188,6 +188,26 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("gpt-4.1", "qiniu");
   });
 
+  it("uses resolved plugin summary config from deps when runtime config is unavailable", async () => {
+    const deps = makeDeps({
+      config: {
+        ...makeDeps().config,
+        summaryProvider: "openrouter",
+        summaryModel: "openrouter/z-ai/glm-5.1",
+      },
+    });
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {},
+    });
+
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith(
+      "openrouter/z-ai/glm-5.1",
+      "openrouter",
+    );
+  });
+
   it("prefers env summaryModel over compaction model and session model", async () => {
     vi.stubEnv("LCM_SUMMARY_MODEL", "gpt-4o-mini");
     vi.stubEnv("LCM_SUMMARY_PROVIDER", "openai-resp");
