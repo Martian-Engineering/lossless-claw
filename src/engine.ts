@@ -115,6 +115,14 @@ type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   ) => Promise<ContextEngineMaintenanceResult>;
 };
 
+function getErrorCode(error: unknown): string | undefined {
+  if (!(error instanceof Error)) {
+    return undefined;
+  }
+  const { code } = error as NodeJS.ErrnoException;
+  return typeof code === "string" ? code : undefined;
+}
+
 const TRANSCRIPT_GC_BATCH_SIZE = 12;
 const HOT_CACHE_HYSTERESIS_TURNS = 2;
 const DYNAMIC_LEAF_CHUNK_MEDIUM_MULTIPLIER = 1.5;
@@ -3016,7 +3024,18 @@ export class LcmContextEngine implements ContextEngine {
               const trackedSessionFile = activeBootstrapState?.sessionFilePath;
               let trackedSessionFileMissing = false;
               if (typeof trackedSessionFile === "string" && trackedSessionFile.length > 0) {
-                try { await stat(trackedSessionFile); } catch { trackedSessionFileMissing = true; }
+                try {
+                  await stat(trackedSessionFile);
+                } catch (err) {
+                  const code = getErrorCode(err);
+                  if (code === "ENOENT" || code === "ENOTDIR") {
+                    trackedSessionFileMissing = true;
+                  } else {
+                    this.deps.log.warn(
+                      `[lcm] bootstrap: could not verify tracked transcript path conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
+                    );
+                  }
+                }
               }
               const transcriptRotated =
                 typeof trackedSessionFile === "string" &&
