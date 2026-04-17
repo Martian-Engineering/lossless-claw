@@ -724,6 +724,14 @@ export function runLcmMigrations(
   options?: { fts5Available?: boolean; log?: MigrationLogger },
 ): void {
   const log = options?.log;
+  // Serialize concurrent callers at the SQLite level. When multiple agents
+  // (or a restart race) call runLcmMigrations simultaneously, the second
+  // caller blocks on BEGIN EXCLUSIVE until the first commits. Every step is
+  // idempotent, so the second caller completes in <5 ms after acquiring the
+  // lock. Without this guard, concurrent DDL/backfill writes can produce
+  // "database is locked" errors or partial schema state.
+  db.exec(`BEGIN EXCLUSIVE`);
+  try {
   db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -989,6 +997,7 @@ export function runLcmMigrations(
   const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
   const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
   if (!fts5Available) {
+    db.exec(`COMMIT`);
     return;
   }
 
@@ -1069,4 +1078,10 @@ export function runLcmMigrations(
       });
     }
   });
+
+  db.exec(`COMMIT`);
+  } catch (err) {
+    try { db.exec(`ROLLBACK`); } catch { /* ignore rollback error */ }
+    throw err;
+  }
 }
