@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ContextEngine } from "openclaw/plugin-sdk";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
@@ -9,6 +10,7 @@ import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/sum
 import { estimateTokens } from "./estimate-tokens.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
+type AssemblySegment = "evictable" | "freshTail";
 
 const TOOL_CALL_TYPES = new Set([
   "toolCall",
@@ -32,6 +34,8 @@ export interface AssembleContextInput {
   prompt?: string;
   /** When false, evictable items are always retained chronologically even if a searchable prompt is present. */
   promptAwareEviction?: boolean;
+  /** Optional stable boundary for orphan tool-call stripping during hot-cache epochs. */
+  orphanStrippingOrdinal?: number;
 }
 
 export interface AssembleContextResult {
@@ -44,6 +48,27 @@ export interface AssembleContextResult {
     rawMessageCount: number;
     summaryCount: number;
     totalContextItems: number;
+  };
+  /** Optional local diagnostics for cache-stability debugging. */
+  debug?: {
+    freshTailOrdinal: number;
+    orphanStrippingOrdinal: number;
+    baseFreshTailCount: number;
+    freshTailCount: number;
+    tailTokens: number;
+    remainingBudget: number;
+    evictableTotalTokens: number;
+    selectionMode: "full-fit" | "prompt-aware" | "chronological";
+    promotedToolResultCount: number;
+    promotedOrdinals: number[];
+    removedToolUseBlockCount: number;
+    touchedAssistantMessageCount: number;
+    preSanitizeEvictableCount: number;
+    preSanitizeFreshTailCount: number;
+    preSanitizeEvictableHash: string;
+    preSanitizeFreshTailHash: string;
+    preSanitizeMessagesHash: string;
+    finalMessagesHash: string;
   };
 }
 
@@ -556,121 +581,41 @@ function extractToolResultIdFromMessage(message: AgentMessage): string | null {
   return null;
 }
 
-function collectAssistantToolCallIds(items: ResolvedItem[]): Set<string> {
-  const ids = new Set<string>();
-  for (const item of items) {
-    for (const id of extractToolCallIdsFromAssistant(item.message)) {
-      ids.add(id);
-    }
-  }
-  return ids;
-}
-
-function normalizeFreshTailTokenCap(freshTailMaxTokens?: number): number | undefined {
-  if (
-    typeof freshTailMaxTokens === "number" &&
-    Number.isFinite(freshTailMaxTokens) &&
-    freshTailMaxTokens >= 0
-  ) {
-    return Math.floor(freshTailMaxTokens);
-  }
-  return undefined;
-}
-
-function mergeFreshTailWithMatchingToolResults(
-  freshTail: ResolvedItem[],
-  matchingToolResults: ResolvedItem[],
-  freshTailMaxTokens?: number,
-): { items: ResolvedItem[]; promotedOrdinals: Set<number> } {
-  if (matchingToolResults.length === 0) {
-    return { items: freshTail, promotedOrdinals: new Set<number>() };
-  }
-
-  const resultsById = new Map<string, ResolvedItem[]>();
-  for (const item of matchingToolResults) {
-    const toolResultId = extractToolResultIdFromMessage(item.message);
-    if (!toolResultId) {
-      continue;
-    }
-    const existing = resultsById.get(toolResultId);
-    if (existing) {
-      existing.push(item);
-    } else {
-      resultsById.set(toolResultId, [item]);
-    }
-  }
-
-  const merged: ResolvedItem[] = [];
-  const promotedOrdinals = new Set<number>();
-  const tokenCap = normalizeFreshTailTokenCap(freshTailMaxTokens);
-  let mergedTokens = freshTail.reduce((sum, item) => sum + item.tokens, 0);
-
-  for (const item of freshTail) {
-    merged.push(item);
-
-    const toolCallIds = extractToolCallIdsFromAssistant(item.message);
-    if (toolCallIds.length === 0) {
-      continue;
-    }
-
-    for (const toolCallId of toolCallIds) {
-      const matches = resultsById.get(toolCallId);
-      if (!matches) {
-        continue;
-      }
-      for (const match of matches) {
-        if (promotedOrdinals.has(match.ordinal)) {
-          continue;
-        }
-        if (
-          typeof tokenCap === "number" &&
-          mergedTokens + match.tokens > tokenCap
-        ) {
-          continue;
-        }
-        merged.push(match);
-        promotedOrdinals.add(match.ordinal);
-        mergedTokens += match.tokens;
-      }
-    }
-  }
-
-  if (typeof tokenCap !== "number") {
-    for (const item of matchingToolResults) {
-      if (!promotedOrdinals.has(item.ordinal)) {
-        merged.push(item);
-      }
-    }
-  }
-
-  return { items: merged, promotedOrdinals };
-}
-
 function filterNonFreshAssistantToolCalls(
   items: ResolvedItem[],
   freshTailOrdinals: Set<number>,
-  preserveFreshTailToolCalls = true,
-): AgentMessage[] {
-  const availableToolResultIds = new Set<string>();
+  orphanStrippingOrdinal: number,
+  allToolResultOrdinalsById: Map<string, number[]>,
+): {
+  entries: Array<{ message: AgentMessage; segment: AssemblySegment }>;
+  removedToolUseBlockCount: number;
+  touchedAssistantMessageCount: number;
+} {
+  const selectedToolResultOrdinalsById = new Map<string, number[]>();
   for (const item of items) {
     const toolResultId = extractToolResultIdFromMessage(item.message);
     if (toolResultId) {
-      availableToolResultIds.add(toolResultId);
+      const ordinals = selectedToolResultOrdinalsById.get(toolResultId);
+      if (ordinals) {
+        ordinals.push(item.ordinal);
+      } else {
+        selectedToolResultOrdinalsById.set(toolResultId, [item.ordinal]);
+      }
     }
   }
 
-  const filteredMessages: AgentMessage[] = [];
+  const filteredEntries: Array<{ message: AgentMessage; segment: AssemblySegment }> = [];
+  let removedToolUseBlockCount = 0;
+  let touchedAssistantMessageCount = 0;
   for (const item of items) {
-    if (
-      item.message?.role !== "assistant" ||
-      (preserveFreshTailToolCalls && freshTailOrdinals.has(item.ordinal))
-    ) {
-      filteredMessages.push(item.message);
+    const segment: AssemblySegment = freshTailOrdinals.has(item.ordinal) ? "freshTail" : "evictable";
+    if (item.message?.role !== "assistant") {
+      filteredEntries.push({ message: item.message, segment });
       continue;
     }
 
     if (!Array.isArray(item.message.content)) {
-      filteredMessages.push(item.message);
+      filteredEntries.push({ message: item.message, segment });
       continue;
     }
 
@@ -684,7 +629,19 @@ function filterNonFreshAssistantToolCalls(
         return true;
       }
       const toolCallId = extractToolCallId(record);
-      if (!toolCallId || availableToolResultIds.has(toolCallId)) {
+      if (!toolCallId) {
+        return true;
+      }
+      const selectedOrdinals = selectedToolResultOrdinalsById.get(toolCallId) ?? [];
+      const hasUsableSelectedResult = selectedOrdinals.some((ordinal) => ordinal > item.ordinal);
+      if (hasUsableSelectedResult) {
+        return true;
+      }
+      if (item.ordinal < orphanStrippingOrdinal) {
+        removedAny = true;
+        return false;
+      }
+      if (!(allToolResultOrdinalsById.get(toolCallId)?.length)) {
         return true;
       }
       removedAny = true;
@@ -692,18 +649,33 @@ function filterNonFreshAssistantToolCalls(
     });
 
     if (content.length === 0) {
+      removedToolUseBlockCount++;
+      touchedAssistantMessageCount++;
       continue;
     }
     if (!removedAny) {
-      filteredMessages.push(item.message);
+      filteredEntries.push({ message: item.message, segment });
       continue;
     }
-    filteredMessages.push({
-      ...item.message,
-      content: content as typeof item.message.content,
-    } as AgentMessage);
+    removedToolUseBlockCount++;
+    touchedAssistantMessageCount++;
+    filteredEntries.push({
+      message: {
+        ...item.message,
+        content: content as typeof item.message.content,
+      } as AgentMessage,
+      segment,
+    });
   }
-  return filteredMessages;
+  return {
+    entries: filteredEntries,
+    removedToolUseBlockCount,
+    touchedAssistantMessageCount,
+  };
+}
+
+function hashMessages(messages: AgentMessage[]): string {
+  return createHash("sha256").update(JSON.stringify(messages)).digest("hex").slice(0, 16);
 }
 
 /** Format a Date for XML attributes in the agent's timezone. */
@@ -941,23 +913,28 @@ export class ContextAssembler {
       freshTailCount,
       input.freshTailMaxTokens,
     );
-    const baseFreshTail = resolved.filter((item) => item.ordinal >= freshTailOrdinal);
-    const initialEvictable = resolved.filter((item) => item.ordinal < freshTailOrdinal);
-    const freshTailOrdinals = new Set(baseFreshTail.map((item) => item.ordinal));
-    const tailToolCallIds = collectAssistantToolCallIds(baseFreshTail);
-    const tailPairToolResults = initialEvictable.filter((item) => {
+    const orphanStrippingOrdinal =
+      typeof input.orphanStrippingOrdinal === "number"
+      && Number.isFinite(input.orphanStrippingOrdinal)
+      && input.orphanStrippingOrdinal >= 0
+        ? Math.floor(input.orphanStrippingOrdinal)
+        : freshTailOrdinal;
+    const allToolResultOrdinalsById = new Map<string, number[]>();
+    for (const item of resolved) {
       const toolResultId = extractToolResultIdFromMessage(item.message);
-      return toolResultId !== null && tailToolCallIds.has(toolResultId);
-    });
-    const mergedFreshTail = mergeFreshTailWithMatchingToolResults(
-      baseFreshTail,
-      tailPairToolResults,
-      input.freshTailMaxTokens,
-    );
-    const evictable = initialEvictable.filter(
-      (item) => !mergedFreshTail.promotedOrdinals.has(item.ordinal),
-    );
-    const freshTail = mergedFreshTail.items;
+      if (!toolResultId) {
+        continue;
+      }
+      const ordinals = allToolResultOrdinalsById.get(toolResultId);
+      if (ordinals) {
+        ordinals.push(item.ordinal);
+      } else {
+        allToolResultOrdinalsById.set(toolResultId, [item.ordinal]);
+      }
+    }
+    const baseFreshTail = resolved.filter((item) => item.ordinal >= freshTailOrdinal);
+    const evictable = resolved.filter((item) => item.ordinal < freshTailOrdinal);
+    const freshTail = baseFreshTail;
 
     // Step 4: Budget-aware selection
     // First, compute the token cost of the fresh tail (always included).
@@ -979,11 +956,13 @@ export class ContextAssembler {
     // total, then trim from the front.
     const evictableTotalTokens = evictable.reduce((sum, it) => sum + it.tokens, 0);
 
+    let selectionMode: "full-fit" | "prompt-aware" | "chronological" = "full-fit";
     if (evictableTotalTokens <= remainingBudget) {
       // Everything fits
       selected.push(...evictable);
       evictableTokens = evictableTotalTokens;
     } else if (input.promptAwareEviction !== false && hasSearchablePrompt(input.prompt)) {
+      selectionMode = "prompt-aware";
       // Prompt-aware eviction: score each evictable item by relevance to the
       // prompt, then greedily fill budget from highest-scoring items down.
       // Re-sort selected items by ordinal to restore chronological order.
@@ -1008,6 +987,7 @@ export class ContextAssembler {
       selected.push(...kept);
       evictableTokens = accum;
     } else {
+      selectionMode = "chronological";
       // Chronological eviction (default): drop oldest items until we fit.
       // Walk from the END of evictable (newest first) accumulating tokens,
       // then reverse to restore chronological order.
@@ -1035,39 +1015,74 @@ export class ContextAssembler {
 
     // Normalize assistant string content to array blocks (some providers return
     // content as a plain string; Anthropic expects content block arrays).
-    const rawMessages = filterNonFreshAssistantToolCalls(
+    const filteredToolCalls = filterNonFreshAssistantToolCalls(
       selected,
-      freshTailOrdinals,
-      normalizeFreshTailTokenCap(input.freshTailMaxTokens) === undefined,
+      new Set(freshTail.map((item) => item.ordinal)),
+      orphanStrippingOrdinal,
+      allToolResultOrdinalsById,
     );
-    for (let i = 0; i < rawMessages.length; i++) {
-      const msg = rawMessages[i];
+    const normalizedEntries = filteredToolCalls.entries.map((entry) => {
+      const msg = entry.message;
       if (msg?.role === "assistant" && typeof msg.content === "string") {
-        rawMessages[i] = {
-          ...msg,
-          content: [{ type: "text", text: msg.content }] as unknown as typeof msg.content,
-        } as typeof msg;
+        return {
+          ...entry,
+          message: {
+            ...msg,
+            content: [{ type: "text", text: msg.content }] as unknown as typeof msg.content,
+          } as AgentMessage,
+        };
       }
-    }
+      return entry;
+    });
 
     // Filter out assistant messages with empty content — these can occur when
     // tool-use-only turns are stored with content="" and zero message_parts,
     // or when filterNonFreshAssistantToolCalls strips all tool_use blocks.
     // Anthropic (and other providers) reject empty content arrays/strings.
-    const cleaned = rawMessages.filter(
-      (m) =>
+    const cleanedEntries = normalizedEntries.filter(
+      (entry) =>
         !(
-          m?.role === "assistant" &&
-          (Array.isArray(m.content) ? m.content.length === 0 : !m.content)
+          entry.message?.role === "assistant" &&
+          (Array.isArray(entry.message.content)
+            ? entry.message.content.length === 0
+            : !entry.message.content)
         ),
     );
+    const cleaned = cleanedEntries.map((entry) => entry.message);
+    const preSanitizeEvictableMessages = cleanedEntries
+      .filter((entry) => entry.segment === "evictable")
+      .map((entry) => entry.message);
+    const preSanitizeFreshTailMessages = cleanedEntries
+      .filter((entry) => entry.segment === "freshTail")
+      .map((entry) => entry.message);
+    const repaired = sanitizeToolUseResultPairing(cleaned) as AgentMessage[];
     return {
-      messages: sanitizeToolUseResultPairing(cleaned) as AgentMessage[],
+      messages: repaired,
       estimatedTokens,
       stats: {
         rawMessageCount,
         summaryCount,
         totalContextItems: resolved.length,
+      },
+      debug: {
+        freshTailOrdinal,
+        orphanStrippingOrdinal,
+        baseFreshTailCount: baseFreshTail.length,
+        freshTailCount: freshTail.length,
+        tailTokens,
+        remainingBudget,
+        evictableTotalTokens,
+        selectionMode,
+        promotedToolResultCount: 0,
+        promotedOrdinals: [],
+        removedToolUseBlockCount: filteredToolCalls.removedToolUseBlockCount,
+        touchedAssistantMessageCount: filteredToolCalls.touchedAssistantMessageCount,
+        preSanitizeEvictableCount: preSanitizeEvictableMessages.length,
+        preSanitizeFreshTailCount: preSanitizeFreshTailMessages.length,
+        preSanitizeEvictableHash: hashMessages(preSanitizeEvictableMessages),
+        preSanitizeFreshTailHash: hashMessages(preSanitizeFreshTailMessages),
+        preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
+        finalMessagesHash: hashMessages(repaired),
       },
     };
   }

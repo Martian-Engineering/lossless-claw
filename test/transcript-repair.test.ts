@@ -38,4 +38,30 @@ describe("sanitizeToolUseResultPairing", () => {
       { type: "function_call", call_id: "fc_2", name: "bash", arguments: '{"cmd":"ls"}' },
     ]);
   });
+
+  it("creates deterministic synthetic tool results for missing calls", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_missing", name: "update_plan", input: { step: "x" } }],
+      },
+    ];
+
+    const first = sanitizeToolUseResultPairing(messages);
+    const second = sanitizeToolUseResultPairing(messages);
+
+    expect(first).toEqual(second);
+    expect(first[1]).toEqual({
+      role: "toolResult",
+      toolCallId: "call_missing",
+      toolName: "update_plan",
+      content: [
+        {
+          type: "text",
+          text: "[lossless-claw] missing tool result in session history; inserted synthetic error result for transcript repair.",
+        },
+      ],
+      isError: true,
+    });
+  });
 });

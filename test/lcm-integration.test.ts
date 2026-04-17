@@ -862,7 +862,7 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(contents.some((text) => text.includes("Huge tail"))).toBe(true);
   });
 
-  it("pulls matching tool results into the protected tail when the tail contains their tool call", async () => {
+  it("drops reverse-ordered tool-call blocks instead of promoting old tool results", async () => {
     await convStore.createConversation({ sessionId: "session-tail-tool-pair" });
 
     const toolResultMsg = await convStore.createMessage({
@@ -900,8 +900,18 @@ describe("LCM integration: ingest -> assemble", () => {
     await convStore.createMessageParts(assistantMsg.messageId, [
       {
         sessionId: "session-tail-tool-pair",
-        partType: "tool",
+        partType: "text",
         ordinal: 0,
+        textContent: "tail tool call",
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "text",
+        }),
+      },
+      {
+        sessionId: "session-tail-tool-pair",
+        partType: "tool",
+        ordinal: 1,
         toolCallId: "call_tail",
         toolName: "read",
         toolInput: JSON.stringify({ path: "foo.txt" }),
@@ -930,15 +940,150 @@ describe("LCM integration: ingest -> assemble", () => {
 
     const result = await assembler.assemble({
       conversationId: CONV_ID,
-      tokenBudget: 1,
+      tokenBudget: 1_000,
       freshTailCount: 2,
     });
 
-    expect(result.messages).toHaveLength(3);
+    expect(result.messages).toHaveLength(2);
     expect(result.messages[0].role).toBe("assistant");
-    expect(result.messages[1].role).toBe("toolResult");
-    expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_tail");
-    expect(extractMessageText(result.messages[2].content)).toBe("tail marker");
+    expect(extractMessageText(result.messages[0].content)).toContain("tail tool call");
+    expect(
+      Array.isArray(result.messages[0].content) &&
+      result.messages[0].content.some(
+        (block) =>
+          block &&
+          typeof block === "object" &&
+          "type" in block &&
+          [
+            "toolCall",
+            "toolUse",
+            "tool_use",
+            "tool-use",
+            "functionCall",
+            "function_call",
+          ].includes((block as { type?: string }).type ?? ""),
+      ),
+    ).toBe(false);
+    expect(result.messages[1].role).toBe("user");
+    expect(extractMessageText(result.messages[1].content)).toBe("tail marker");
+    expect(result.messages.some((message) => message.role === "toolResult")).toBe(false);
+    expect(result.debug).toMatchObject({
+      selectionMode: "full-fit",
+      promotedToolResultCount: 0,
+      promotedOrdinals: [],
+      freshTailOrdinal: 1,
+      baseFreshTailCount: 2,
+      freshTailCount: 2,
+    });
+    expect(result.debug?.finalMessagesHash).toMatch(/^[0-9a-f]{16}$/);
+    expect(result.debug?.preSanitizeMessagesHash).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it("keeps assembled prompt prefixes stable across append-only turns", async () => {
+    await convStore.createConversation({ sessionId: "session-tail-tool-prefix-stability" });
+
+    const toolResultMsg = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 1,
+      role: "tool",
+      content: "real tool result",
+      tokenCount: estimateTokens("real tool result"),
+    });
+    await convStore.createMessageParts(toolResultMsg.messageId, [
+      {
+        sessionId: "session-tail-tool-prefix-stability",
+        partType: "tool",
+        ordinal: 0,
+        textContent: "real tool result",
+        toolCallId: "call_stable",
+        toolName: "read",
+        metadata: JSON.stringify({
+          originalRole: "toolResult",
+          rawType: "tool_result",
+          toolCallId: "call_stable",
+          toolName: "read",
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, toolResultMsg.messageId);
+
+    const assistantMsg = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 2,
+      role: "assistant",
+      content: "stable tool call",
+      tokenCount: estimateTokens("stable tool call"),
+    });
+    await convStore.createMessageParts(assistantMsg.messageId, [
+      {
+        sessionId: "session-tail-tool-prefix-stability",
+        partType: "text",
+        ordinal: 0,
+        textContent: "stable tool call",
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "text",
+        }),
+      },
+      {
+        sessionId: "session-tail-tool-prefix-stability",
+        partType: "tool",
+        ordinal: 1,
+        toolCallId: "call_stable",
+        toolName: "read",
+        toolInput: JSON.stringify({ path: "foo.txt" }),
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "toolCall",
+          raw: {
+            type: "toolCall",
+            id: "call_stable",
+            name: "read",
+            input: { path: "foo.txt" },
+          },
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, assistantMsg.messageId);
+
+    const turnOneMarker = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 3,
+      role: "user",
+      content: "turn one tail marker",
+      tokenCount: estimateTokens("turn one tail marker"),
+    });
+    await sumStore.appendContextMessage(CONV_ID, turnOneMarker.messageId);
+
+    const turnOne = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      freshTailCount: 2,
+    });
+
+    for (const [seq, content] of [
+      [4, "turn two tail marker"],
+      [5, "turn three tail marker"],
+    ] as const) {
+      const message = await convStore.createMessage({
+        conversationId: CONV_ID,
+        seq,
+        role: "user",
+        content,
+        tokenCount: estimateTokens(content),
+      });
+      await sumStore.appendContextMessage(CONV_ID, message.messageId);
+    }
+
+    const turnTwo = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      freshTailCount: 2,
+    });
+
+    expect(turnOne.messages.some((message) => message.role === "toolResult")).toBe(false);
+    expect(turnTwo.messages.some((message) => message.role === "toolResult")).toBe(false);
+    expect(turnTwo.messages.slice(0, turnOne.messages.length)).toEqual(turnOne.messages);
   });
 
   it("does not let paired tool results bypass fresh tail token caps", async () => {

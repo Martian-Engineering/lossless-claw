@@ -75,6 +75,14 @@ import {
 } from "./transaction-mutex.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
+type AssemblePrefixSnapshot = {
+  serializedMessages: string[];
+  messageSummaries: string[];
+  fullHash: string;
+};
+
+const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
+const MAX_STABLE_ORPHAN_STRIPPING_BOUNDARIES = 100;
 type CircuitBreakerState = {
   failures: number;
   openSince: number | null;
@@ -82,6 +90,7 @@ type CircuitBreakerState = {
 type PromptCacheSnapshot = {
   lastObservedCacheRead?: number;
   lastObservedCacheWrite?: number;
+  lastObservedPromptTokenCount?: number;
   cacheState: CacheState;
   retention?: string;
   sawExplicitBreak: boolean;
@@ -163,6 +172,135 @@ const DYNAMIC_ACTIVITY_HIGH_DOWNSHIFT_FACTOR = 0.75;
 function toJson(value: unknown): string {
   const encoded = JSON.stringify(value);
   return typeof encoded === "string" ? encoded : "";
+}
+
+function hashSerializedMessages(messages: string[]): string {
+  return createHash("sha256").update(JSON.stringify(messages)).digest("hex").slice(0, 16);
+}
+
+function normalizeDebugTextSnippet(value: string, maxLength: number = 48): string {
+  const collapsed = value.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= maxLength) {
+    return collapsed;
+  }
+  return `${collapsed.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function summarizeMessageContentShape(content: unknown): string {
+  if (Array.isArray(content)) {
+    const blockTypes = content
+      .map((item) => {
+        const record = asRecord(item);
+        if (record) {
+          return safeString(record.type) ?? "object";
+        }
+        return typeof item;
+      })
+      .slice(0, 4);
+    const typeSummary = blockTypes.length > 0 ? blockTypes.join(",") : "empty";
+    return `blocks=${content.length}:${typeSummary}`;
+  }
+  if (typeof content === "string") {
+    return "content=text";
+  }
+  if (content == null) {
+    return "content=empty";
+  }
+  if (typeof content === "object") {
+    return "content=object";
+  }
+  return `content=${typeof content}`;
+}
+
+function summarizeMessageForPrefixDebug(message: AgentMessage): string {
+  const serialized = JSON.stringify(message);
+  const topLevel = message as Record<string, unknown>;
+  const role = safeString(topLevel.role) ?? "unknown";
+  const summaryParts = [role, summarizeMessageContentShape(topLevel.content)];
+  const toolCallId = extractTranscriptToolCallId(message);
+  if (toolCallId) {
+    summaryParts.push(`tool=${toolCallId}`);
+  }
+  const toolName =
+    safeString(topLevel.toolName) ??
+    safeString(topLevel.tool_name) ??
+    (Array.isArray(topLevel.content)
+      ? topLevel.content
+          .map((item) => asRecord(item))
+          .map((record) => safeString(record?.name))
+          .find((name) => typeof name === "string")
+      : undefined);
+  if (toolName) {
+    summaryParts.push(`name=${toolName}`);
+  }
+  const text = extractStructuredText(topLevel.content);
+  if (typeof text === "string" && text.trim().length > 0) {
+    summaryParts.push(`text=${toJson(normalizeDebugTextSnippet(text))}`);
+  }
+  summaryParts.push(
+    `hash=${createHash("sha256").update(serialized).digest("hex").slice(0, 8)}`,
+  );
+  return summaryParts.join("|");
+}
+
+function describeAssembledPrefixChange(
+  previous: AssemblePrefixSnapshot | undefined,
+  messages: AgentMessage[],
+): {
+  currentSnapshot: AssemblePrefixSnapshot;
+  previousCount: number;
+  commonPrefixCount: number;
+  commonPrefixHash: string;
+  previousWasPrefix: boolean;
+  firstDivergenceIndex: number;
+  previousDivergenceMessage: string;
+  currentDivergenceMessage: string;
+} {
+  const serializedMessages = messages.map((message) => JSON.stringify(message));
+  const messageSummaries = messages.map((message) => summarizeMessageForPrefixDebug(message));
+  const currentSnapshot = {
+    serializedMessages,
+    messageSummaries,
+    fullHash: hashSerializedMessages(serializedMessages),
+  };
+
+  if (!previous) {
+    return {
+      currentSnapshot,
+      previousCount: 0,
+      commonPrefixCount: 0,
+      commonPrefixHash: hashSerializedMessages([]),
+      previousWasPrefix: true,
+      firstDivergenceIndex: -1,
+      previousDivergenceMessage: "none",
+      currentDivergenceMessage: "none",
+    };
+  }
+
+  const limit = Math.min(previous.serializedMessages.length, serializedMessages.length);
+  let commonPrefixCount = 0;
+  while (
+    commonPrefixCount < limit &&
+    previous.serializedMessages[commonPrefixCount] === serializedMessages[commonPrefixCount]
+  ) {
+    commonPrefixCount++;
+  }
+
+  const previousWasPrefix = commonPrefixCount === previous.serializedMessages.length;
+  return {
+    currentSnapshot,
+    previousCount: previous.serializedMessages.length,
+    commonPrefixCount,
+    commonPrefixHash: hashSerializedMessages(serializedMessages.slice(0, commonPrefixCount)),
+    previousWasPrefix,
+    firstDivergenceIndex: previousWasPrefix ? -1 : commonPrefixCount,
+    previousDivergenceMessage: previousWasPrefix
+      ? "none"
+      : (previous.messageSummaries[commonPrefixCount] ?? "(end)"),
+    currentDivergenceMessage: previousWasPrefix
+      ? "none"
+      : (currentSnapshot.messageSummaries[commonPrefixCount] ?? "(end)"),
+  };
 }
 
 function safeString(value: unknown): string | undefined {
@@ -1305,6 +1443,8 @@ export class LcmContextEngine implements ContextEngine {
     string,
     { promise: Promise<void>; refCount: number }
   >();
+  private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
+  private stableOrphanStrippingOrdinalsByConversation = new Map<number, number>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
@@ -1954,6 +2094,11 @@ export class LcmContextEngine implements ContextEngine {
     const observation = asRecord(promptCache?.observation);
     const cacheRead = this.normalizeOptionalCount(lastCallUsage?.cacheRead);
     const cacheWrite = this.normalizeOptionalCount(lastCallUsage?.cacheWrite);
+    const promptTokenCount = (() => {
+      const input = this.normalizeOptionalCount(lastCallUsage?.input) ?? 0;
+      const total = input + (cacheRead ?? 0) + (cacheWrite ?? 0);
+      return total > 0 ? total : undefined;
+    })();
     const sawExplicitBreak = safeBoolean(observation?.broke) === true;
     const retention = safeString(promptCache?.retention)?.trim();
     const lastCacheTouchAtRaw = promptCache?.lastCacheTouchAt;
@@ -1979,6 +2124,9 @@ export class LcmContextEngine implements ContextEngine {
     return {
       ...(cacheRead !== undefined ? { lastObservedCacheRead: cacheRead } : {}),
       ...(cacheWrite !== undefined ? { lastObservedCacheWrite: cacheWrite } : {}),
+      ...(promptTokenCount !== undefined
+        ? { lastObservedPromptTokenCount: promptTokenCount }
+        : {}),
       cacheState,
       ...(retention ? { retention } : {}),
       sawExplicitBreak,
@@ -2039,6 +2187,8 @@ export class LcmContextEngine implements ContextEngine {
       lastObservedCacheRead: snapshot?.lastObservedCacheRead ?? existing?.lastObservedCacheRead ?? null,
       lastObservedCacheWrite:
         snapshot?.lastObservedCacheWrite ?? existing?.lastObservedCacheWrite ?? null,
+      lastObservedPromptTokenCount:
+        snapshot?.lastObservedPromptTokenCount ?? existing?.lastObservedPromptTokenCount ?? null,
       lastObservedCacheHitAt:
         snapshot?.cacheState === "hot"
           ? now
@@ -2064,7 +2214,7 @@ export class LcmContextEngine implements ContextEngine {
     );
     if (updated) {
       this.deps.log.debug(
-        `[lcm] compaction telemetry updated: conversation=${params.conversationId} cacheState=${updated.cacheState} coldObservationStreak=${updated.consecutiveColdObservations} cacheRead=${updated.lastObservedCacheRead ?? "null"} cacheWrite=${updated.lastObservedCacheWrite ?? "null"} retention=${updated.retention ?? "null"} lastApiCallAt=${updated.lastApiCallAt?.toISOString() ?? "null"} lastCacheTouchAt=${updated.lastCacheTouchAt?.toISOString() ?? "null"} provider=${updated.provider ?? "null"} model=${updated.model ?? "null"} turnsSinceLeafCompaction=${updated.turnsSinceLeafCompaction} tokensSinceLeafCompaction=${updated.tokensAccumulatedSinceLeafCompaction} activityBand=${updated.lastActivityBand} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"} tokenBudget=${params.tokenBudget ?? "null"}`,
+        `[lcm] compaction telemetry updated: conversation=${params.conversationId} cacheState=${updated.cacheState} coldObservationStreak=${updated.consecutiveColdObservations} cacheRead=${updated.lastObservedCacheRead ?? "null"} cacheWrite=${updated.lastObservedCacheWrite ?? "null"} promptTokenCount=${updated.lastObservedPromptTokenCount ?? "null"} retention=${updated.retention ?? "null"} lastApiCallAt=${updated.lastApiCallAt?.toISOString() ?? "null"} lastCacheTouchAt=${updated.lastCacheTouchAt?.toISOString() ?? "null"} provider=${updated.provider ?? "null"} model=${updated.model ?? "null"} turnsSinceLeafCompaction=${updated.turnsSinceLeafCompaction} tokensSinceLeafCompaction=${updated.tokensAccumulatedSinceLeafCompaction} activityBand=${updated.lastActivityBand} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"} tokenBudget=${params.tokenBudget ?? "null"}`,
       );
     }
     return updated;
@@ -2082,6 +2232,7 @@ export class LcmContextEngine implements ContextEngine {
       conversationId: params.conversationId,
       lastObservedCacheRead: existing?.lastObservedCacheRead ?? null,
       lastObservedCacheWrite: existing?.lastObservedCacheWrite ?? null,
+      lastObservedPromptTokenCount: existing?.lastObservedPromptTokenCount ?? null,
       lastObservedCacheHitAt: existing?.lastObservedCacheHitAt ?? null,
       lastObservedCacheBreakAt: existing?.lastObservedCacheBreakAt ?? null,
       cacheState: existing?.cacheState ?? "unknown",
@@ -2106,6 +2257,11 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number;
     cacheState: CacheState;
     activityBand: ActivityBand;
+    tokenBudget: number;
+    currentTokenCount?: number;
+    cacheRead?: number | null;
+    cacheWrite?: number | null;
+    cachePromptTokenCount?: number | null;
     triggerLeafChunkTokens: number;
     preferredLeafChunkTokens: number;
     fallbackLeafChunkTokens: number[];
@@ -2116,8 +2272,16 @@ export class LcmContextEngine implements ContextEngine {
     allowCondensedPasses: boolean;
     reason: string;
   }): IncrementalCompactionDecision {
+    const cacheReadSharePct =
+      typeof params.cacheRead === "number"
+      && Number.isFinite(params.cacheRead)
+      && typeof params.cachePromptTokenCount === "number"
+      && Number.isFinite(params.cachePromptTokenCount)
+      && params.cachePromptTokenCount > 0
+        ? `${((params.cacheRead / params.cachePromptTokenCount) * 100).toFixed(1)}%`
+        : "null";
     this.deps.log.info(
-      `[lcm] incremental compaction decision: conversation=${params.conversationId} cacheState=${params.cacheState} activityBand=${params.activityBand} triggerLeafChunkTokens=${params.triggerLeafChunkTokens} preferredLeafChunkTokens=${params.preferredLeafChunkTokens} fallbackLeafChunkTokens=${params.fallbackLeafChunkTokens.join(",")} rawTokensOutsideTail=${params.rawTokensOutsideTail} threshold=${params.threshold} shouldCompact=${params.shouldCompact} maxPasses=${params.maxPasses} allowCondensedPasses=${params.allowCondensedPasses} reason=${params.reason}`,
+      `[lcm] incremental compaction decision: conversation=${params.conversationId} cacheState=${params.cacheState} activityBand=${params.activityBand} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"} cacheRead=${params.cacheRead ?? "null"} cacheWrite=${params.cacheWrite ?? "null"} cachePromptTokenCount=${params.cachePromptTokenCount ?? "null"} cacheReadSharePct=${cacheReadSharePct} triggerLeafChunkTokens=${params.triggerLeafChunkTokens} preferredLeafChunkTokens=${params.preferredLeafChunkTokens} fallbackLeafChunkTokens=${params.fallbackLeafChunkTokens.join(",")} rawTokensOutsideTail=${params.rawTokensOutsideTail} threshold=${params.threshold} shouldCompact=${params.shouldCompact} maxPasses=${params.maxPasses} allowCondensedPasses=${params.allowCondensedPasses} reason=${params.reason}`,
     );
     return {
       shouldCompact: params.shouldCompact,
@@ -2142,6 +2306,9 @@ export class LcmContextEngine implements ContextEngine {
     const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
       params.conversationId,
     );
+    const cacheRead = telemetry?.lastObservedCacheRead ?? null;
+    const cacheWrite = telemetry?.lastObservedCacheWrite ?? null;
+    const cachePromptTokenCount = telemetry?.lastObservedPromptTokenCount ?? null;
     const cacheState =
       this.config.cacheAwareCompaction.enabled
         ? this.resolveCacheAwareState(telemetry)
@@ -2180,6 +2347,11 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: params.conversationId,
         cacheState,
         activityBand,
+        tokenBudget: params.tokenBudget,
+        currentTokenCount: params.currentTokenCount,
+        cacheRead,
+        cacheWrite,
+        cachePromptTokenCount,
         triggerLeafChunkTokens,
         preferredLeafChunkTokens,
         fallbackLeafChunkTokens,
@@ -2207,6 +2379,11 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: params.conversationId,
         cacheState,
         activityBand,
+        tokenBudget: params.tokenBudget,
+        currentTokenCount: params.currentTokenCount,
+        cacheRead,
+        cacheWrite,
+        cachePromptTokenCount,
         triggerLeafChunkTokens,
         preferredLeafChunkTokens,
         fallbackLeafChunkTokens,
@@ -2230,6 +2407,11 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: params.conversationId,
         cacheState,
         activityBand,
+        tokenBudget: params.tokenBudget,
+        currentTokenCount: params.currentTokenCount,
+        cacheRead,
+        cacheWrite,
+        cachePromptTokenCount,
         triggerLeafChunkTokens,
         preferredLeafChunkTokens,
         fallbackLeafChunkTokens,
@@ -2253,6 +2435,11 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: params.conversationId,
         cacheState,
         activityBand,
+        tokenBudget: params.tokenBudget,
+        currentTokenCount: params.currentTokenCount,
+        cacheRead,
+        cacheWrite,
+        cachePromptTokenCount,
         triggerLeafChunkTokens,
         preferredLeafChunkTokens,
         fallbackLeafChunkTokens,
@@ -2273,6 +2460,11 @@ export class LcmContextEngine implements ContextEngine {
       conversationId: params.conversationId,
       cacheState,
       activityBand,
+      tokenBudget: params.tokenBudget,
+      currentTokenCount: params.currentTokenCount,
+      cacheRead,
+      cacheWrite,
+      cachePromptTokenCount,
       triggerLeafChunkTokens,
       preferredLeafChunkTokens,
       fallbackLeafChunkTokens,
@@ -2594,6 +2786,7 @@ export class LcmContextEngine implements ContextEngine {
       }
       if (sweepResult.actionTaken) {
         await this.markLeafCompactionTelemetrySuccess({ conversationId });
+        this.clearStableOrphanStrippingOrdinal(conversationId);
       }
 
       return {
@@ -2656,6 +2849,7 @@ export class LcmContextEngine implements ContextEngine {
     const didCompact = compactResult.rounds > 0;
     if (didCompact) {
       await this.markLeafCompactionTelemetrySuccess({ conversationId });
+      this.clearStableOrphanStrippingOrdinal(conversationId);
     }
 
     return {
@@ -3223,6 +3417,79 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
+   * Return the most recent assembled snapshot for a conversation and refresh its
+   * recency so the bounded debug cache behaves as an LRU.
+   */
+  private getPreviousAssembledSnapshot(conversationId: number): AssemblePrefixSnapshot | undefined {
+    const snapshot = this.previousAssembledMessagesByConversation.get(conversationId);
+    if (!snapshot) {
+      return undefined;
+    }
+    this.previousAssembledMessagesByConversation.delete(conversationId);
+    this.previousAssembledMessagesByConversation.set(conversationId, snapshot);
+    return snapshot;
+  }
+
+  /**
+   * Retain only a bounded number of recent assembled snapshots so debug-only
+   * prefix instrumentation cannot grow without limit on long-lived servers.
+   */
+  private setPreviousAssembledSnapshot(
+    conversationId: number,
+    snapshot: AssemblePrefixSnapshot,
+  ): void {
+    this.previousAssembledMessagesByConversation.delete(conversationId);
+    this.previousAssembledMessagesByConversation.set(conversationId, snapshot);
+    while (this.previousAssembledMessagesByConversation.size > MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS) {
+      const oldestConversationId = this.previousAssembledMessagesByConversation.keys().next().value;
+      if (typeof oldestConversationId !== "number") {
+        break;
+      }
+      this.previousAssembledMessagesByConversation.delete(oldestConversationId);
+    }
+  }
+
+  /**
+   * Return the stable orphan-stripping ordinal for a conversation and refresh its
+   * recency so the bounded cache behaves as an LRU.
+   */
+  private getStableOrphanStrippingOrdinal(conversationId: number): number | undefined {
+    const ordinal = this.stableOrphanStrippingOrdinalsByConversation.get(conversationId);
+    if (typeof ordinal !== "number") {
+      return undefined;
+    }
+    this.stableOrphanStrippingOrdinalsByConversation.delete(conversationId);
+    this.stableOrphanStrippingOrdinalsByConversation.set(conversationId, ordinal);
+    return ordinal;
+  }
+
+  /** Remember the stable orphan-stripping ordinal for a hot-cache conversation. */
+  private setStableOrphanStrippingOrdinal(conversationId: number, ordinal: number): void {
+    if (!Number.isFinite(ordinal) || ordinal < 0) {
+      return;
+    }
+    const normalizedOrdinal = Math.floor(ordinal);
+    this.stableOrphanStrippingOrdinalsByConversation.delete(conversationId);
+    this.stableOrphanStrippingOrdinalsByConversation.set(conversationId, normalizedOrdinal);
+    while (
+      this.stableOrphanStrippingOrdinalsByConversation.size
+      > MAX_STABLE_ORPHAN_STRIPPING_BOUNDARIES
+    ) {
+      const oldestConversationId =
+        this.stableOrphanStrippingOrdinalsByConversation.keys().next().value;
+      if (typeof oldestConversationId !== "number") {
+        break;
+      }
+      this.stableOrphanStrippingOrdinalsByConversation.delete(oldestConversationId);
+    }
+  }
+
+  /** Drop any cached orphan-stripping state after a history rewrite or cold-cache transition. */
+  private clearStableOrphanStrippingOrdinal(conversationId: number): void {
+    this.stableOrphanStrippingOrdinalsByConversation.delete(conversationId);
+  }
+
+  /**
    * Intercept oversized <file> blocks before persistence and replace them with
    * compact file references backed by large_files records.
    */
@@ -3702,6 +3969,7 @@ export class LcmContextEngine implements ContextEngine {
             // old file's messages. Clear them all in one place so subsequent
             // reads treat this conversation as unbootstrapped.
             this.lastFullReadFileState.delete(conversationId);
+            this.clearStableOrphanStrippingOrdinal(conversationId);
             bootstrapState = null;
           }
 
@@ -3790,6 +4058,9 @@ export class LcmContextEngine implements ContextEngine {
                 }
 
                 await persistBootstrapState(conversationId);
+                if (importedMessages > 0) {
+                  this.clearStableOrphanStrippingOrdinal(conversationId);
+                }
                 this.deps.log.info(
                   `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
                 );
@@ -3879,6 +4150,7 @@ export class LcmContextEngine implements ContextEngine {
             if (this.config.pruneHeartbeatOk) {
               const pruned = await this.pruneHeartbeatOkTurns(conversationId);
               if (pruned > 0) {
+                this.clearStableOrphanStrippingOrdinal(conversationId);
                 this.deps.log.info(
                   `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
                 );
@@ -3886,6 +4158,9 @@ export class LcmContextEngine implements ContextEngine {
             }
 
             await persistBootstrapState(conversationId);
+            if (inserted.length > 0) {
+              this.clearStableOrphanStrippingOrdinal(conversationId);
+            }
             this.deps.log.info(
               `[lcm] bootstrap: initial import conversation=${conversationId} ${sessionLabel} importedMessages=${inserted.length} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
             );
@@ -3921,6 +4196,7 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           if (reconcile.importedMessages > 0) {
+            this.clearStableOrphanStrippingOrdinal(conversationId);
             await persistBootstrapState(conversationId);
             return {
               bootstrapped: true,
@@ -3963,6 +4239,7 @@ export class LcmContextEngine implements ContextEngine {
         if (conversation) {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
+            this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
             await this.refreshBootstrapState({
               conversationId: conversation.conversationId,
               sessionFile: params.sessionFile,
@@ -4259,6 +4536,7 @@ export class LcmContextEngine implements ContextEngine {
         });
 
         if (result.changed) {
+          this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
           try {
             await this.refreshBootstrapState({
               conversationId: conversation.conversationId,
@@ -4649,6 +4927,7 @@ export class LcmContextEngine implements ContextEngine {
         if (conversation) {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
+            this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
             const sessionContext = this.formatSessionLogContext({
               conversationId: conversation.conversationId,
               sessionId: params.sessionId,
@@ -4691,7 +4970,14 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
 
-    const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
+    const observedCurrentTokenCount =
+      this.normalizeObservedTokenCount(
+        (
+          (legacyParams ?? {}) as {
+            currentTokenCount?: unknown;
+          }
+        ).currentTokenCount,
+      ) ?? estimateSessionTokenCountForAfterTurn(params.messages);
     const conversation = await this.conversationStore.getConversationForSession({
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
@@ -4720,7 +5006,7 @@ export class LcmContextEngine implements ContextEngine {
           conversationId: conversation.conversationId,
           reason,
           tokenBudget,
-          currentTokenCount: liveContextTokens,
+          currentTokenCount: observedCurrentTokenCount,
         });
       } catch (err) {
         this.deps.log.warn(
@@ -4756,12 +5042,12 @@ export class LcmContextEngine implements ContextEngine {
       const leafDecision = await this.evaluateIncrementalCompaction({
         conversationId: conversation.conversationId,
         tokenBudget,
-        currentTokenCount: liveContextTokens,
+        currentTokenCount: observedCurrentTokenCount,
       });
       const thresholdDecision = await this.compaction.evaluate(
         conversation.conversationId,
         tokenBudget,
-        liveContextTokens,
+        observedCurrentTokenCount,
       );
       if (this.config.proactiveThresholdCompactionMode === "inline") {
         let leafCompactionScheduled = false;
@@ -4774,7 +5060,7 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             sessionFile: params.sessionFile,
             tokenBudget,
-            currentTokenCount: liveContextTokens,
+            currentTokenCount: observedCurrentTokenCount,
             legacyParams,
             leafDecision,
             sessionLabel,
@@ -4789,7 +5075,7 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             sessionFile: params.sessionFile,
             tokenBudget,
-            currentTokenCount: liveContextTokens,
+            currentTokenCount: observedCurrentTokenCount,
             compactionTarget: "threshold",
             legacyParams,
           });
@@ -4808,7 +5094,7 @@ export class LcmContextEngine implements ContextEngine {
               ? leafDecision.reason
               : "leaf-trigger",
           tokenBudget,
-          currentTokenCount: liveContextTokens,
+          currentTokenCount: observedCurrentTokenCount,
         });
       }
     } catch (err) {
@@ -4889,6 +5175,17 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
+      const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+        conversation.conversationId,
+      );
+      const cacheAwareState = this.resolveCacheAwareState(telemetry);
+      const stableOrphanStrippingOrdinal = cacheAwareState === "hot"
+        ? this.getStableOrphanStrippingOrdinal(conversation.conversationId)
+        : undefined;
+      if (cacheAwareState !== "hot") {
+        this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
+      }
+
       const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       if (contextItems.length === 0) {
         this.deps.log.info(
@@ -4921,7 +5218,14 @@ export class LcmContextEngine implements ContextEngine {
         freshTailMaxTokens: this.config.freshTailMaxTokens,
         promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
+        orphanStrippingOrdinal: stableOrphanStrippingOrdinal,
       });
+      if (cacheAwareState === "hot") {
+        this.setStableOrphanStrippingOrdinal(
+          conversation.conversationId,
+          assembled.debug?.orphanStrippingOrdinal ?? assembled.debug?.freshTailOrdinal ?? 0,
+        );
+      }
 
       // If assembly produced no messages for a non-empty live session,
       // fail safe to the live context.
@@ -4938,6 +5242,23 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.info(
         `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${assembled.messages.length} tokenBudget=${tokenBudget} estimatedTokens=${assembled.estimatedTokens} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
+      const prefixChange = describeAssembledPrefixChange(
+        this.getPreviousAssembledSnapshot(conversation.conversationId),
+        assembled.messages,
+      );
+      this.setPreviousAssembledSnapshot(
+        conversation.conversationId,
+        prefixChange.currentSnapshot,
+      );
+      if (assembled.debug) {
+        const promotedOrdinals =
+          assembled.debug.promotedOrdinals.length > 0
+            ? assembled.debug.promotedOrdinals.join(",")
+            : "none";
+        this.deps.log.info(
+          `[lcm] assemble-debug conversation=${conversation.conversationId} ${sessionLabel} cacheAwareState=${cacheAwareState} messagesHash=${assembled.debug.finalMessagesHash} preSanitizeHash=${assembled.debug.preSanitizeMessagesHash} previousAssembledCount=${prefixChange.previousCount} commonPrefixCount=${prefixChange.commonPrefixCount} commonPrefixHash=${prefixChange.commonPrefixHash} previousWasPrefix=${prefixChange.previousWasPrefix} firstDivergenceIndex=${prefixChange.firstDivergenceIndex} previousDivergenceMessage=${prefixChange.previousDivergenceMessage} currentDivergenceMessage=${prefixChange.currentDivergenceMessage} evictableCount=${assembled.debug.preSanitizeEvictableCount} evictableHash=${assembled.debug.preSanitizeEvictableHash} freshTailSegmentCount=${assembled.debug.preSanitizeFreshTailCount} freshTailSegmentHash=${assembled.debug.preSanitizeFreshTailHash} selectionMode=${assembled.debug.selectionMode} freshTailOrdinal=${assembled.debug.freshTailOrdinal} orphanStrippingOrdinal=${assembled.debug.orphanStrippingOrdinal} baseFreshTailCount=${assembled.debug.baseFreshTailCount} freshTailCount=${assembled.debug.freshTailCount} tailTokens=${assembled.debug.tailTokens} remainingBudget=${assembled.debug.remainingBudget} evictableTotalTokens=${assembled.debug.evictableTotalTokens} promotedToolResults=${assembled.debug.promotedToolResultCount} promotedOrdinals=${promotedOrdinals} removedToolUseBlocks=${assembled.debug.removedToolUseBlockCount} touchedAssistantMessages=${assembled.debug.touchedAssistantMessageCount}`,
+        );
+      }
 
       const result: AssembleResult = {
         messages: assembled.messages,
@@ -5106,6 +5427,7 @@ export class LcmContextEngine implements ContextEngine {
         conversationId: params.conversationId,
         activityBand: params.activityBand,
       });
+      this.clearStableOrphanStrippingOrdinal(params.conversationId);
     }
 
     const tokensBefore = observedTokens ?? storedTokensBefore;
@@ -5606,6 +5928,7 @@ export class LcmContextEngine implements ContextEngine {
       ...linearizedEntries.map((entry) => JSON.stringify(entry)),
     ].join("\n") + "\n";
     await writeFile(params.sessionFile, serialized, "utf8");
+    this.clearStableOrphanStrippingOrdinal(params.conversationId);
 
     const rewrittenStats = await stat(params.sessionFile);
     await this.refreshBootstrapState({

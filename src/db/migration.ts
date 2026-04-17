@@ -124,6 +124,9 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   const hasLastCacheTouchAt = telemetryColumns.some((col) => col.name === "last_cache_touch_at");
   const hasProvider = telemetryColumns.some((col) => col.name === "provider");
   const hasModel = telemetryColumns.some((col) => col.name === "model");
+  const hasLastObservedPromptTokenCount = telemetryColumns.some(
+    (col) => col.name === "last_observed_prompt_token_count",
+  );
 
   if (!hasConsecutiveColdObservations) {
     db.exec(
@@ -159,6 +162,9 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   }
   if (!hasModel) {
     db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN model TEXT`);
+  }
+  if (!hasLastObservedPromptTokenCount) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_observed_prompt_token_count INTEGER`);
   }
 }
 
@@ -856,6 +862,7 @@ export function runLcmMigrations(
       conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
       last_observed_cache_read INTEGER,
       last_observed_cache_write INTEGER,
+      last_observed_prompt_token_count INTEGER,
       last_observed_cache_hit_at TEXT,
       last_observed_cache_break_at TEXT,
       cache_state TEXT NOT NULL DEFAULT 'unknown'

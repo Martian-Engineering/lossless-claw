@@ -9,6 +9,7 @@ import { ContextAssembler } from "../src/assembler.js";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
+import { estimateTokens } from "../src/estimate-tokens.js";
 import {
   createDelegatedExpansionGrant,
   getRuntimeExpansionAuthManager,
@@ -4094,6 +4095,230 @@ describe("LcmContextEngine.assemble canonical path", () => {
     ).toBe(false);
   });
 
+  it("keeps hot-cache orphan tool-call stripping stable across append-only assembles", async () => {
+    const engine = createEngineWithConfig({ freshTailCount: 2 });
+    const sessionId = "session-hot-cache-stable-orphan-stripping";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_hot", name: "read", input: { path: "foo.txt" } }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "fresh message 0" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation!.conversationId,
+      cacheState: "hot",
+      retention: "long",
+      lastObservedCacheHitAt: new Date(),
+      lastCacheTouchAt: new Date(),
+      provider: "anthropic",
+      model: "claude-opus-4-6",
+    });
+
+    const first = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(
+      first.messages.some(
+        (message) =>
+          message.role === "toolResult" &&
+          (message as { toolCallId?: string }).toolCallId === "call_hot",
+      ),
+    ).toBe(true);
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "fresh message 1" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "fresh message 2" } as AgentMessage,
+    });
+
+    const second = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const firstSerialized = first.messages.map((message) => JSON.stringify(message));
+    const secondSerialized = second.messages.map((message) => JSON.stringify(message));
+
+    expect(secondSerialized.slice(0, firstSerialized.length)).toEqual(firstSerialized);
+    expect(
+      second.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          Array.isArray(message.content) &&
+          message.content.some(
+            (block) =>
+              block &&
+              typeof block === "object" &&
+              "id" in block &&
+              (block as { id?: unknown }).id === "call_hot",
+          ),
+      ),
+    ).toBe(true);
+    expect(
+      second.messages.some(
+        (message) =>
+          message.role === "toolResult" &&
+          (message as { toolCallId?: string }).toolCallId === "call_hot",
+      ),
+    ).toBe(true);
+  });
+
+  it("clears stable orphan stripping state when cache-aware state is cold", async () => {
+    const engine = createEngine();
+    const sessionId = "session-cold-cache-clears-orphan-stripping-state";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted message" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const cache = (
+      engine as unknown as {
+        stableOrphanStrippingOrdinalsByConversation: Map<number, number>;
+      }
+    ).stableOrphanStrippingOrdinalsByConversation;
+    cache.set(conversation!.conversationId, 123);
+
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation!.conversationId,
+      cacheState: "cold",
+      retention: "long",
+      lastObservedCacheBreakAt: new Date(),
+      provider: "anthropic",
+      model: "claude-opus-4-6",
+    });
+
+    await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(cache.has(conversation!.conversationId)).toBe(false);
+  });
+
+  it("bounds previous assembled prefix snapshots with LRU eviction", async () => {
+    const engine = createEngine();
+    const cache = (
+      engine as unknown as {
+        previousAssembledMessagesByConversation: Map<number, unknown>;
+      }
+    ).previousAssembledMessagesByConversation;
+
+    let firstConversationId: number | undefined;
+    let secondConversationId: number | undefined;
+
+    for (let i = 0; i < 101; i += 1) {
+      const sessionId = `session-prefix-cache-${i}`;
+      await engine.ingest({
+        sessionId,
+        message: { role: "user", content: `persisted message ${i}` } as AgentMessage,
+      });
+      await engine.assemble({
+        sessionId,
+        messages: [],
+        tokenBudget: 10_000,
+      });
+
+      const newestConversationId = [...cache.keys()].at(-1);
+      if (i === 0) {
+        firstConversationId = newestConversationId;
+      } else if (i === 1) {
+        secondConversationId = newestConversationId;
+      }
+    }
+
+    expect(firstConversationId).toBeTypeOf("number");
+    expect(secondConversationId).toBeTypeOf("number");
+    expect(cache.size).toBe(100);
+    expect(cache.has(firstConversationId as number)).toBe(false);
+    expect(cache.has(secondConversationId as number)).toBe(true);
+
+    await engine.assemble({
+      sessionId: "session-prefix-cache-0",
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(cache.size).toBe(100);
+    expect(cache.has(firstConversationId as number)).toBe(true);
+    expect(cache.has(secondConversationId as number)).toBe(false);
+  });
+
+  it("logs previous and current divergence message summaries when assembled prefixes change", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: infoLog,
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "session-prefix-divergence-debug";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted message" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    (
+      engine as unknown as {
+        previousAssembledMessagesByConversation: Map<
+          number,
+          { serializedMessages: string[]; messageSummaries: string[]; fullHash: string }
+        >;
+      }
+    ).previousAssembledMessagesByConversation.set(conversation!.conversationId, {
+      serializedMessages: [JSON.stringify({ role: "assistant", content: "older different message" })],
+      messageSummaries: ["seed-prev"],
+      fullHash: "seed-hash",
+    });
+
+    await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const assembleDebugLog = infoLog.mock.calls
+      .map((call: unknown[]) => call[0])
+      .find(
+        (entry: unknown) =>
+          typeof entry === "string" &&
+          entry.includes("[lcm] assemble-debug") &&
+          entry.includes(`conversation=${conversation!.conversationId}`),
+      );
+
+    expect(assembleDebugLog).toEqual(expect.any(String));
+    expect(assembleDebugLog).toContain("previousWasPrefix=false");
+    expect(assembleDebugLog).toContain("firstDivergenceIndex=0");
+    expect(assembleDebugLog).toContain("previousDivergenceMessage=seed-prev");
+    expect(assembleDebugLog).toContain("currentDivergenceMessage=user|content=text");
+  });
+
   it("repairs OpenAI function_call transcripts without dropping reasoning blocks", async () => {
     const engine = createEngine();
     const sessionId = "session-openai-function-call";
@@ -5393,6 +5618,89 @@ describe("LcmContextEngine fidelity and token budget", () => {
     );
   });
 
+  it("afterTurn prefers runtimeContext.currentTokenCount for compaction decisions", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-runtime-current-token-count";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 500,
+      threshold: 3_072,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-runtime-current-token-count"),
+      messages: [makeMessage({ role: "assistant", content: "tiny" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+      runtimeContext: {
+        provider: "openai",
+        model: "gpt-5.4",
+        currentTokenCount: 500,
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 4_096, 500);
+  });
+
+  it("afterTurn falls back to local message token estimates when runtimeContext.currentTokenCount is absent", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-local-current-token-count-fallback";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 1,
+      threshold: 3_072,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-local-current-token-count-fallback"),
+      messages: [makeMessage({ role: "assistant", content: "tiny" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+      runtimeContext: {
+        provider: "openai",
+        model: "gpt-5.4",
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 4_096, estimateTokens("tiny"));
+  });
+
   it("afterTurn records deferred compaction debt instead of compacting inline by default", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
@@ -6211,6 +6519,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
         promptCache: {
           retention: "long",
           lastCallUsage: {
+            input: 512,
             cacheRead: 1_024,
             cacheWrite: 128,
           },
@@ -6232,6 +6541,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       cacheState: "hot",
       lastObservedCacheRead: 1_024,
       lastObservedCacheWrite: 128,
+      lastObservedPromptTokenCount: 1_664,
       retention: "long",
     });
     expect(telemetry?.lastObservedCacheHitAt).toBeInstanceOf(Date);
@@ -6288,6 +6598,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       conversationId: conversation!.conversationId,
       cacheState: "hot",
       lastObservedCacheRead: 2_048,
+      lastObservedPromptTokenCount: 10_000,
       turnsSinceLeafCompaction: 1,
       tokensAccumulatedSinceLeafCompaction: 50_000,
       lastActivityBand: "low",
@@ -6318,6 +6629,24 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(decision.leafChunkTokens).toBe(40_000);
     expect(infoLog).toHaveBeenCalledWith(
       expect.stringContaining("reason=hot-cache-budget-headroom"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("tokenBudget=100000"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("currentTokenCount=10000"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("cacheRead=2048"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("cacheWrite=null"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("cachePromptTokenCount=10000"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("cacheReadSharePct=20.5%"),
     );
   });
 

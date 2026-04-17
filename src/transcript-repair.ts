@@ -155,7 +155,6 @@ function makeMissingToolResult(params: {
       },
     ],
     isError: true,
-    timestamp: Date.now(),
   };
 }
 
