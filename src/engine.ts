@@ -4357,9 +4357,22 @@ export class LcmContextEngine implements ContextEngine {
     message: AgentMessage;
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
-    const { sessionId, sessionKey, message, isHeartbeat } = params;
-    if (isHeartbeat) {
-      return { ingested: false };
+    const { sessionId, sessionKey, message } = params;
+
+    // Filter heartbeat user messages at ingest time
+    if (message.role === "user") {
+      const content = extractMessageContent(message.content);
+      if (isHeartbeatUserMessage(content)) {
+        return { ingested: false };
+      }
+    }
+
+    // Filter pure HEARTBEAT_OK assistant messages
+    if (message.role === "assistant") {
+      const content = extractMessageContent(message.content);
+      if (isHeartbeatOkContent(content)) {
+        return { ingested: false };
+      }
     }
 
     // Skip assistant messages that failed with an error and have no useful content.
@@ -4703,41 +4716,25 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
-    if (batchLooksLikeHeartbeatAckTurn(ingestBatch)) {
-      try {
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-        });
-        if (conversation) {
-          const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
-          if (pruned > 0) {
-            const sessionContext = this.formatSessionLogContext({
-              conversationId: conversation.conversationId,
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-            });
-            try {
-              await this.refreshBootstrapState({
-                conversationId: conversation.conversationId,
-                sessionFile: params.sessionFile,
-              });
-            } catch (err) {
-              this.deps.log.warn(
-                `[lcm] afterTurn: heartbeat pruning checkpoint refresh failed for ${sessionContext}: ${describeLogError(err)}`,
-              );
-            }
-            this.deps.log.info(
-              `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
-            );
-            return;
-          }
+    // Prune legacy heartbeat/empty/NO_REPLY messages that may have been stored
+    // before ingest-time filtering was enabled.
+    try {
+      const conversation = await this.conversationStore.getConversationForSession({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+      });
+      if (conversation) {
+        const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
+        if (pruned > 0) {
+          this.deps.log.info(
+            `[lcm] afterTurn: pruned ${pruned} heartbeat/empty/NO_REPLY messages`,
+          );
         }
-      } catch (err) {
-        this.deps.log.warn(
-          `[lcm] afterTurn: heartbeat pruning failed: ${describeLogError(err)}`,
-        );
       }
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] afterTurn: heartbeat pruning failed: ${describeLogError(err)}`,
+      );
     }
 
     const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
@@ -5999,18 +5996,11 @@ export class LcmContextEngine implements ContextEngine {
   // ── Heartbeat pruning ──────────────────────────────────────────────────
 
   /**
-   * Detect HEARTBEAT_OK turn cycles in a conversation and delete them.
-   *
-   * A HEARTBEAT_OK turn is: a user message (the heartbeat prompt), followed by
-   * any tool call/result messages, ending with an assistant message that is a
-   * heartbeat ack. The entire sequence has no durable information value for LCM.
-   *
-   * Detection: assistant content (trimmed, lowercased) starts with "heartbeat_ok"
-   * and any text after is not alphanumeric (matches OpenClaw core's ack detection).
-   * This catches both exact "HEARTBEAT_OK" and chatty variants like
-   * "HEARTBEAT_OK — weekend, no market".
-   *
-   * Returns the number of messages deleted.
+   * Delete heartbeat user messages, empty messages, and no-reply responses.
+   * This cleans up:
+   * 1. Heartbeat prompt injections (user messages)
+   * 2. Empty messages (no content or only whitespace)
+   * 3. No-reply assistant messages (meaningless acknowledgments)
    */
   private async pruneHeartbeatOkTurns(conversationId: number): Promise<number> {
     const allMessages = await this.conversationStore.getMessages(conversationId);
@@ -6020,43 +6010,25 @@ export class LcmContextEngine implements ContextEngine {
 
     const toDelete: number[] = [];
 
-    // Walk through messages finding HEARTBEAT_OK assistant replies, then
-    // collect the entire turn (back to the preceding user message).
-    for (let i = 0; i < allMessages.length; i++) {
-      const msg = allMessages[i];
-      if (msg.role !== "assistant") {
+    for (const msg of allMessages) {
+      if (msg.role === "user" && isHeartbeatUserMessage(msg.content)) {
+        toDelete.push(msg.messageId);
         continue;
       }
-      if (!isHeartbeatOkContent(msg.content)) {
+      if (isEmptyMessage(msg.content)) {
+        toDelete.push(msg.messageId);
         continue;
       }
-
-      // Found an exact HEARTBEAT_OK reply. Walk backward to find the turn start
-      // (the preceding user message).
-      const turnMessages = [msg];
-      for (let j = i - 1; j >= 0; j--) {
-        const prev = allMessages[j];
-        turnMessages.push(prev);
-        if (prev.role === "user") {
-          break; // Found turn start
-        }
-      }
-
-      if (!turnMessages.some((record) => record.role === "user")) {
+      if (msg.role === "assistant" && isNoReplyContent(msg.content)) {
+        toDelete.push(msg.messageId);
         continue;
       }
-      if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
-        continue;
-      }
-
-      toDelete.push(...turnMessages.map((record) => record.messageId));
     }
 
     if (toDelete.length === 0) {
       return 0;
     }
 
-    // Deduplicate (a message could theoretically appear in multiple turns)
     const uniqueIds = [...new Set(toDelete)];
     return this.conversationStore.deleteMessages(uniqueIds);
   }
@@ -6065,7 +6037,13 @@ export class LcmContextEngine implements ContextEngine {
 // ── Heartbeat detection ─────────────────────────────────────────────────────
 
 const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
-const HEARTBEAT_TURN_MARKER = "heartbeat.md";
+
+/**
+ * Detect whether a user message is a heartbeat prompt injection.
+ */
+function isHeartbeatUserMessage(content: string): boolean {
+  return content.toLowerCase().includes("read heartbeat.md if it exists (workspace context)");
+}
 
 /**
  * Detect whether an assistant message is a heartbeat ack.
@@ -6077,30 +6055,20 @@ function isHeartbeatOkContent(content: string): boolean {
   return content.trim().toLowerCase() === HEARTBEAT_OK_TOKEN;
 }
 
-function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolean {
-  let sawHeartbeatMarker = false;
-  let sawHeartbeatAck = false;
-
-  for (const message of messages) {
-    const stored = toStoredMessage(message);
-    if (!sawHeartbeatMarker && stored.content.toLowerCase().includes(HEARTBEAT_TURN_MARKER)) {
-      sawHeartbeatMarker = true;
-    }
-    if (!sawHeartbeatAck && stored.role === "assistant" && isHeartbeatOkContent(stored.content)) {
-      sawHeartbeatAck = true;
-    }
-    if (sawHeartbeatMarker && sawHeartbeatAck) {
-      return true;
-    }
-  }
-
-  return false;
+/**
+ * Detect whether a message is empty (no content).
+ */
+function isEmptyMessage(content: string): boolean {
+  const trimmed = content.trim();
+  return trimmed === "" || trimmed === "[]" || trimmed === "{}";
 }
 
-function turnLooksLikeHeartbeatTurn(turnMessages: Array<{ content: string }>): boolean {
-  return turnMessages.some((message) =>
-    message.content.toLowerCase().includes(HEARTBEAT_TURN_MARKER),
-  );
+/**
+ * Detect whether an assistant message is a NO_REPLY.
+ */
+function isNoReplyContent(content: string): boolean {
+  const trimmed = content.trim();
+  return trimmed === "NO_REPLY" || trimmed === "NO REPLY";
 }
 
 // ── Emergency fallback summarization ────────────────────────────────────────
