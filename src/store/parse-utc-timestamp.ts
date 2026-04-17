@@ -5,6 +5,7 @@
  * See: https://github.com/Martian-Engineering/lossless-claw/issues/216
  */
 export function parseUtcTimestamp(value: string): Date {
+  if (typeof value !== "string") return new Date(value == null ? NaN : value as unknown as number);
   const s = value.trim();
   if (/(?:[zZ]|[+-]\d{2}:\d{2})$/.test(s)) {
     return new Date(s);

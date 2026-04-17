@@ -31,6 +31,7 @@ const UNIT_TO_DAYS: Record<string, number> = {
  * a number of days.  Returns `null` when the input is not recognized.
  */
 export function parseDuration(input: string): number | null {
+  if (typeof input !== "string") return null;
   const trimmed = input.trim().toLowerCase();
   const match = DURATION_RE.exec(trimmed);
   if (!match) {

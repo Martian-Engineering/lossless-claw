@@ -220,6 +220,7 @@ function toMessagePartRecord(row: MessagePartRow): MessagePartRecord {
 }
 
 function normalizeMessageContentForFullTextIndex(content: string): string | null {
+  if (typeof content !== "string") return null;
   const trimmed = content.trim();
   if (!trimmed) {
     return null;

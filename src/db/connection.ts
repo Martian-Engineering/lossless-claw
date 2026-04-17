@@ -14,6 +14,7 @@ const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
 const connectionIndex = new Map<DatabaseSync, ConnectionKey>();
 
 export function isInMemoryPath(dbPath: string): boolean {
+  if (typeof dbPath !== "string") return false;
   const normalized = dbPath.trim();
   return normalized === ":memory:" || normalized.startsWith("file::memory:");
 }

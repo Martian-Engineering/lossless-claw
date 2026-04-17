@@ -129,6 +129,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 /** Normalize provider ids for stable config/profile lookup. */
 function normalizeProviderId(provider: string): string {
+  if (typeof provider !== "string") return "";
   return provider.trim().toLowerCase();
 }
 
@@ -950,6 +951,7 @@ function buildCondensedSummaryPrompt(params: {
  * whole compaction pass.
  */
 function buildDeterministicFallbackSummary(text: string, targetTokens: number): string {
+  if (typeof text !== "string") return "";
   const trimmed = text.trim();
   if (!trimmed) {
     return "";

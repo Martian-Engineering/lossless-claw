@@ -533,6 +533,7 @@ function resolvePluginSelected(config: unknown): boolean {
 }
 
 function resolveDbSizeLabel(dbPath: string): string {
+  if (typeof dbPath !== "string") return "unknown";
   const trimmed = dbPath.trim();
   if (!trimmed || trimmed === ":memory:" || trimmed.startsWith("file::memory:")) {
     return "in-memory";
@@ -866,6 +867,7 @@ function isPassingQuickCheck(result: string): boolean {
 }
 
 function getLcmBackupUnavailableReason(databasePath: string): string | null {
+  if (typeof databasePath !== "string") return "Invalid database path.";
   const trimmed = databasePath.trim();
   if (!trimmed || trimmed === ":memory:" || trimmed.startsWith("file::memory:")) {
     return "Backup requires a file-backed SQLite database.";

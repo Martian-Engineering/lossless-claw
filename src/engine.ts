@@ -461,6 +461,7 @@ const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 function looksLikeJsonPayload(value: string): boolean {
+  if (typeof value !== "string") return false;
   const trimmed = value.trim();
   if (!trimmed) {
     return false;
@@ -3083,6 +3084,7 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   private static isExternalizedImageReference(value: string): boolean {
+    if (typeof value !== "string") return false;
     return /^\[(?:User|Tool|Assistant|Image) image: .*LCM file: file_[a-f0-9]{16}\]$/.test(
       value.trim(),
     );

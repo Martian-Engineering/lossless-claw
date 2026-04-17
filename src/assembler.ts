@@ -1141,7 +1141,7 @@ export class ContextAssembler {
     // content text AND the message_parts table are empty — assistant
     // messages that contain tool calls have empty text content but
     // non-empty parts and must be preserved.
-    if (msg.role === "assistant" && !msg.content.trim() && parts.length === 0) {
+    if (msg.role === "assistant" && !(typeof msg.content === "string" ? msg.content.trim() : "") && parts.length === 0) {
       return null;
     }
     const roleFromStore = toRuntimeRole(msg.role, parts);

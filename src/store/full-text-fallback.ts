@@ -17,6 +17,7 @@ export type LikeSearchPlan = {
 };
 
 function normalizeFallbackTerm(raw: string): string {
+  if (typeof raw !== "string") return "";
   return raw.trim().replace(EDGE_PUNCTUATION_RE, "").toLowerCase();
 }
 

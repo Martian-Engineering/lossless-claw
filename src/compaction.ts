@@ -222,6 +222,7 @@ function parseMessagePartMetadata(part: CreateMessagePartInput | { metadata: str
 
 /** Detect whether a string is mostly binary/base64 payload and not meaningful prose. */
 function looksLikeBinaryPayload(value: string): boolean {
+  if (typeof value !== "string") return false;
   const trimmed = value.trim();
   if (!trimmed) {
     return false;
@@ -241,6 +242,7 @@ function looksLikeBinaryPayload(value: string): boolean {
 
 /** Strip attachment payloads from plain strings before they reach the summarizer. */
 function stripEmbeddedMediaPayloads(content: string): string {
+  if (typeof content !== "string") return "";
   const withoutDataUrls = content.replace(EMBEDDED_DATA_URL_RE, "[embedded media omitted]");
   const sanitizedLines = withoutDataUrls
     .split(/\r?\n/)
@@ -305,6 +307,7 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
 
 /** Normalize message content down to human-readable text, excluding binary/media payloads. */
 function extractMeaningfulMessageText(content: string): string {
+  if (typeof content !== "string") return "";
   const trimmed = content.trim();
   if (!trimmed) {
     return "";
@@ -1083,7 +1086,7 @@ export class CompactionEngine {
         continue;
       }
       const summary = await this.summaryStore.getSummary(item.summaryId);
-      const content = summary?.content.trim();
+      const content = typeof summary?.content === "string" ? summary.content.trim() : "";
       if (content) {
         summaryContents.push(content);
       }
@@ -1305,7 +1308,7 @@ export class CompactionEngine {
       if (!summary || summary.depth !== targetDepth) {
         continue;
       }
-      const content = summary.content.trim();
+      const content = typeof summary.content === "string" ? summary.content.trim() : "";
       if (content) {
         summaryContents.push(content);
       }
@@ -1331,7 +1334,7 @@ export class CompactionEngine {
     /** Target token count for this summary kind (leaf or condensed). Used for hard-cap enforcement. */
     targetTokens: number;
   }): Promise<{ content: string; level: CompactionLevel } | null> {
-    const sourceText = params.sourceText.trim();
+    const sourceText = typeof params.sourceText === "string" ? params.sourceText.trim() : "";
     if (!sourceText) {
       return {
         content: "[Truncated from 0 tokens]",

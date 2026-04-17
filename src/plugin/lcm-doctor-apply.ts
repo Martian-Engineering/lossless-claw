@@ -121,7 +121,7 @@ export async function applyScopedDoctorRepair(params: {
         });
         continue;
       }
-      if (rewritten === target.content.trim()) {
+      if (rewritten === (typeof target.content === "string" ? target.content.trim() : "")) {
         unchanged += 1;
         continue;
       }
@@ -327,7 +327,8 @@ function buildCondensedSourceText(params: {
   const parts = rows
     .map((row) => {
       const override = params.overrides.get(row.summary_id);
-      const content = (override?.content ?? row.content).trim();
+      const rawContent = override?.content ?? row.content;
+      const content = typeof rawContent === "string" ? rawContent.trim() : String(rawContent ?? "");
       if (!content) {
         return null;
       }
@@ -433,7 +434,7 @@ function previousViaTimestamp(params: {
   target: DoctorTargetRecord;
   overrides: Map<string, SummaryOverride>;
 }): string | undefined {
-  if (!params.target.createdAt.trim()) {
+  if (typeof params.target.createdAt !== "string" || !params.target.createdAt.trim()) {
     return undefined;
   }
 
@@ -467,14 +468,14 @@ function resolveSummaryContent(
   }
 
   const override = overrides.get(summaryId);
-  if (override?.content.trim()) {
+  if (typeof override?.content === "string" && override.content.trim()) {
     return override.content.trim();
   }
 
   const row = db
     .prepare(`SELECT COALESCE(content, '') AS content FROM summaries WHERE summary_id = ?`)
     .get(summaryId) as { content: string } | undefined;
-  const content = row?.content.trim();
+  const content = typeof row?.content === "string" ? row.content.trim() : "";
   return content ? content : undefined;
 }
 
@@ -503,12 +504,12 @@ function formatSqliteTimestamp(value: string, timezone: string): string {
   if (date) {
     return formatTimestamp(date, timezone);
   }
-  const fallback = value.trim();
+  const fallback = typeof value === "string" ? value.trim() : String(value ?? "");
   return fallback || "unknown";
 }
 
 function parseSqliteTimestamp(value: string | null | undefined): Date | null {
-  const normalized = value?.trim();
+  const normalized = typeof value === "string" ? value.trim() : undefined;
   if (!normalized) {
     return null;
   }
