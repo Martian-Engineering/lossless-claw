@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -2590,6 +2590,212 @@ describe("LcmContextEngine.bootstrap", () => {
       .getConversationBootstrapState(conversation!.conversationId);
     expect(rotatedBootstrapState?.sessionFilePath).toBe(rotatedSessionFile);
     expect(await engine.getSummaryStore().getSummary("sum_rotation_session_key_old")).not.toBeNull();
+  });
+
+  it("rotates to a fresh conversation when a stable sessionKey resumes on a new transcript after the old file disappears", async () => {
+    const engine = createEngine();
+    const firstSessionId = "bootstrap-missed-reset-fallback-1";
+    const secondSessionId = "bootstrap-missed-reset-fallback-2";
+    const sessionKey = "agent:main:test:bootstrap-missed-reset-fallback";
+    const firstSessionFile = createSessionFilePath("missed-reset-fallback-old");
+    const firstManager = SessionManager.open(firstSessionFile);
+    firstManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "old user" }],
+    } as AgentMessage);
+    firstManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old assistant" }],
+    } as AgentMessage);
+
+    const first = await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: firstSessionFile,
+    });
+    expect(first).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const originalConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(originalConversation).not.toBeNull();
+
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_missed_reset_fallback_old",
+      conversationId: originalConversation!.conversationId,
+      kind: "leaf",
+      content: "old summary",
+      tokenCount: 5,
+    });
+    await engine
+      .getSummaryStore()
+      .appendContextSummary(originalConversation!.conversationId, "sum_missed_reset_fallback_old");
+
+    rmSync(firstSessionFile, { force: true });
+
+    const secondSessionFile = createSessionFilePath("missed-reset-fallback-new");
+    const secondManager = SessionManager.open(secondSessionFile);
+    secondManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "new user" }],
+    } as AgentMessage);
+    secondManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "new assistant" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: secondSessionFile,
+    });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const activeConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeConversation).not.toBeNull();
+    expect(activeConversation!.conversationId).not.toBe(originalConversation!.conversationId);
+    expect(activeConversation!.sessionId).toBe(secondSessionId);
+    expect(activeConversation!.active).toBe(true);
+
+    const archivedConversation = await engine.getConversationStore().getConversation(
+      originalConversation!.conversationId,
+    );
+    expect(archivedConversation?.active).toBe(false);
+    expect(archivedConversation?.archivedAt).not.toBeNull();
+
+    const archivedMessages = await engine.getConversationStore().getMessages(
+      originalConversation!.conversationId,
+    );
+    expect(archivedMessages.map((message) => message.content)).toEqual([
+      "old user",
+      "old assistant",
+    ]);
+
+    const activeMessages = await engine.getConversationStore().getMessages(
+      activeConversation!.conversationId,
+    );
+    expect(activeMessages.map((message) => message.content)).toEqual([
+      "new user",
+      "new assistant",
+    ]);
+  });
+
+  it("preserves the active conversation when the tracked transcript stat fails for a non-missing reason", async () => {
+    const engine = createEngine();
+    const firstSessionId = "bootstrap-stat-failure-fallback-1";
+    const secondSessionId = "bootstrap-stat-failure-fallback-2";
+    const sessionKey = "agent:main:test:bootstrap-stat-failure-fallback";
+    const firstSessionFile = createSessionFilePath("stat-failure-fallback-old");
+    const firstManager = SessionManager.open(firstSessionFile);
+    firstManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "old user" }],
+    } as AgentMessage);
+    firstManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old assistant" }],
+    } as AgentMessage);
+
+    const first = await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: firstSessionFile,
+    });
+    expect(first).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const originalConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(originalConversation).not.toBeNull();
+
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_stat_failure_fallback_old",
+      conversationId: originalConversation!.conversationId,
+      kind: "leaf",
+      content: "old summary",
+      tokenCount: 5,
+    });
+    await engine
+      .getSummaryStore()
+      .appendContextSummary(originalConversation!.conversationId, "sum_stat_failure_fallback_old");
+
+    const secondSessionFile = createSessionFilePath("stat-failure-fallback-new");
+    const secondManager = SessionManager.open(secondSessionFile);
+    secondManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "old user" }],
+    } as AgentMessage);
+    secondManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old assistant" }],
+    } as AgentMessage);
+    secondManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "new user" }],
+    } as AgentMessage);
+    secondManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "new assistant" }],
+    } as AgentMessage);
+
+    const firstSessionDir = dirname(firstSessionFile);
+    const firstSessionDirMode = statSync(firstSessionDir).mode & 0o777;
+    chmodSync(firstSessionDir, 0o000);
+
+    let second: Awaited<ReturnType<LcmContextEngine["bootstrap"]>>;
+    try {
+      second = await engine.bootstrap({
+        sessionId: secondSessionId,
+        sessionKey,
+        sessionFile: secondSessionFile,
+      });
+    } finally {
+      chmodSync(firstSessionDir, firstSessionDirMode);
+    }
+
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    expect(conversation!.conversationId).toBe(originalConversation!.conversationId);
+    expect(conversation!.sessionId).toBe(secondSessionId);
+    expect(conversation!.active).toBe(true);
+
+    const archivedConversation = await engine.getConversationStore().getConversation(
+      originalConversation!.conversationId,
+    );
+    expect(archivedConversation?.archivedAt).toBeNull();
+
+    const storedMessages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(storedMessages.map((message) => message.content)).toEqual([
+      "old user",
+      "old assistant",
+      "new user",
+      "new assistant",
+    ]);
+
+    expect(await engine.getSummaryStore().getSummary("sum_stat_failure_fallback_old")).not.toBeNull();
   });
 
   it("does not reapply bootstrapMaxTokens after session file rotation", async () => {
@@ -8738,6 +8944,54 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(false);
     expect(result.reason).toBe("already under target");
+  });
+
+  it("treats full-sweep compaction as already under target when tokensAfter is below budget", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 12_000,
+      threshold: 8_200,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: false,
+      tokensBefore: 12_000,
+      tokensAfter: 4_200,
+      condensed: false,
+    });
+
+    await engine.ingest({
+      sessionId: "manual-observed-token-session",
+      message: { role: "user", content: "trigger manual compact" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "manual-observed-token-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 10_000,
+      currentTokenCount: 12_000,
+      legacyParams: {
+        manualCompaction: true,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toBe("already under target");
+    expect(result.result?.tokensBefore).toBe(12_000);
+    expect(result.result?.tokensAfter).toBe(4_200);
   });
 
   it("routes forced budget recovery through compactUntilUnder for the issue #268 overflow shape", async () => {

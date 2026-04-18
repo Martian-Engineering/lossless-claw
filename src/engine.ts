@@ -159,6 +159,14 @@ type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   ) => Promise<ContextEngineMaintenanceResult>;
 };
 
+function getErrorCode(error: unknown): string | undefined {
+  if (!(error instanceof Error)) {
+    return undefined;
+  }
+  const { code } = error as NodeJS.ErrnoException;
+  return typeof code === "string" ? code : undefined;
+}
+
 const TRANSCRIPT_GC_BATCH_SIZE = 12;
 const HOT_CACHE_HYSTERESIS_TURNS = 2;
 const DYNAMIC_LEAF_CHUNK_MEDIUM_MULTIPLIER = 1.5;
@@ -2811,9 +2819,17 @@ export class LcmContextEngine implements ContextEngine {
         await this.markLeafCompactionTelemetrySuccess({ conversationId });
         this.clearStableOrphanStrippingOrdinal(conversationId);
       }
+      const sweepTokensAfter =
+        typeof sweepResult.tokensAfter === "number" && Number.isFinite(sweepResult.tokensAfter)
+          ? sweepResult.tokensAfter
+          : undefined;
+      const isUnderTargetAfterSweep =
+        sweepTokensAfter !== undefined
+          ? sweepTokensAfter <= targetTokens
+          : !liveContextStillExceedsTarget;
 
       return {
-        ok: !sweepResult.authFailure && (sweepResult.actionTaken || !liveContextStillExceedsTarget),
+        ok: !sweepResult.authFailure && (sweepResult.actionTaken || isUnderTargetAfterSweep),
         compacted: sweepResult.actionTaken,
         reason: sweepResult.authFailure
           ? (sweepResult.actionTaken
@@ -2821,11 +2837,11 @@ export class LcmContextEngine implements ContextEngine {
               : "provider auth failure")
           : sweepResult.actionTaken
             ? "compacted"
-            : manualCompactionRequested
-              ? "nothing to compact"
-              : liveContextStillExceedsTarget
-                ? "live context still exceeds target"
-                : "already under target",
+            : isUnderTargetAfterSweep
+              ? "already under target"
+              : manualCompactionRequested
+                ? "nothing to compact"
+                : "live context still exceeds target",
         result: {
           tokensBefore: decision.currentTokens,
           tokensAfter: sweepResult.tokensAfter,
@@ -3971,6 +3987,53 @@ export class LcmContextEngine implements ContextEngine {
               mtimeMs: sessionFileMtimeMs,
             });
           };
+
+          // Guard: when a sessionKey resumes on a new sessionId and the tracked
+          // transcript file has disappeared, treat it as a missed /reset and
+          // rotate the conversation before getOrCreate would re-attach to it.
+          const normalizedSessionKey = params.sessionKey?.trim();
+          if (normalizedSessionKey) {
+            const activeByKey = await this.conversationStore.getConversationBySessionKey(normalizedSessionKey);
+            if (activeByKey && activeByKey.sessionId !== params.sessionId) {
+              const activeBootstrapState = await this.summaryStore.getConversationBootstrapState(
+                activeByKey.conversationId,
+              );
+              const trackedSessionFile = activeBootstrapState?.sessionFilePath;
+              let trackedSessionFileMissing = false;
+              if (typeof trackedSessionFile === "string" && trackedSessionFile.length > 0) {
+                try {
+                  await stat(trackedSessionFile);
+                } catch (err) {
+                  const code = getErrorCode(err);
+                  if (code === "ENOENT" || code === "ENOTDIR") {
+                    trackedSessionFileMissing = true;
+                  } else {
+                    this.deps.log.warn(
+                      `[lcm] bootstrap: could not verify tracked transcript path conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
+                    );
+                  }
+                }
+              }
+              const transcriptRotated =
+                typeof trackedSessionFile === "string" &&
+                trackedSessionFile.length > 0 &&
+                trackedSessionFile !== params.sessionFile;
+
+              if (transcriptRotated && trackedSessionFileMissing) {
+                this.deps.log.warn(
+                  `[lcm] bootstrap: detected reset/rollover without prior lifecycle split; rotating conversation=${activeByKey.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} oldSessionId=${activeByKey.sessionId} oldFile=${trackedSessionFile} newFile=${params.sessionFile}`,
+                );
+                await this.applySessionReplacement({
+                  reason: "bootstrap session-file rollover fallback",
+                  sessionId: activeByKey.sessionId,
+                  sessionKey: normalizedSessionKey,
+                  nextSessionId: params.sessionId,
+                  nextSessionKey: normalizedSessionKey,
+                  createReplacement: true,
+                });
+              }
+            }
+          }
 
           const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
             sessionKey: params.sessionKey,
