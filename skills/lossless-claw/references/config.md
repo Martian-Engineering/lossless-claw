@@ -466,6 +466,25 @@ Why it matters:
 - lets operators steer formatting or emphasis without patching code
 - should be used sparingly; low-quality instructions can degrade summary quality system-wide
 
+### `stripInjectedContextTags`
+
+| | |
+| --- | --- |
+| Type | `string[]` |
+| Default | `["active_memory_plugin", "relevant-memories", "relevant_memories", "hindsight_memories"]` |
+| Env | `LCM_STRIP_INJECTED_CONTEXT_TAGS` (comma-separated) |
+
+XML tag names whose blocks are stripped from message content before compaction summarization.
+
+Why it matters:
+
+- Memory and context plugins (active-memory, memory-lancedb, hindsight-openclaw) prepend XML-tagged blocks to user messages via the `prependContext` hook.  These blocks are ephemeral retrieval context — they helped the model on that specific turn but are not part of the actual conversation.
+- Without stripping, the summarizer treats injected memories as real conversation content, permanently corrupting compacted summaries with auto-retrieved context that the user never said.
+- The default list covers well-known OpenClaw memory plugin tags.  Add custom tag names if you use plugins that inject context via other tags.
+- Set to `[]` (or empty env string) to disable stripping.
+
+Design note: stripping happens at compaction time, not at message ingestion.  The raw message stored in the LCM database still contains the original injected blocks, so `lcm_expand` and `lcm_grep` can still surface the full context the model saw on any given turn.  Only the summarizer input is cleaned.
+
 ## Practical operator workflow
 
 1. Install and enable the plugin.

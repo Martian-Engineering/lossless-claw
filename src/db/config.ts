@@ -111,6 +111,19 @@ export type LcmConfig = {
   cacheAwareCompaction: CacheAwareCompactionConfig;
   /** Dynamic step-band policy for incremental leaf chunk sizing. */
   dynamicLeafChunkTokens: DynamicLeafChunkTokensConfig;
+  /**
+   * XML tag names whose blocks should be stripped from message content before
+   * summarization.  Memory/context plugins (active-memory, memory-lancedb,
+   * hindsight-openclaw, …) prepend tagged blocks to user messages via the
+   * `prependContext` hook.  These blocks are ephemeral retrieval context that
+   * should not leak into compacted summaries.
+   *
+   * Each entry is a plain tag name (no angle brackets).  The default list
+   * covers the well-known OpenClaw memory plugin tags.
+   *
+   * Set to an empty array to disable stripping.
+   */
+  stripInjectedContextTags: string[];
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -136,6 +149,30 @@ function parseFiniteNumber(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const parsed = parseFloat(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * Well-known XML tag names used by OpenClaw memory/context plugins to wrap
+ * auto-injected context blocks prepended to user messages.
+ *
+ * Plugins covered:
+ *   - active-memory         → <active_memory_plugin>
+ *   - memory-lancedb        → <relevant-memories>
+ *   - hindsight-openclaw    → <hindsight_memories>
+ *   - memory-core (legacy)  → <relevant_memories>
+ */
+const DEFAULT_STRIP_INJECTED_CONTEXT_TAGS: string[] = [
+  "active_memory_plugin",
+  "relevant-memories",
+  "relevant_memories",
+  "hindsight_memories",
+];
+
+/** Parse a comma-separated list of tag names from an env string. */
+function parseStripTags(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (value.trim() === "") return []; // explicit empty = disable
+  return value.split(",").map((t) => t.trim()).filter(Boolean);
 }
 
 /** Parse fallback providers from env string (format: "provider/model,provider/model"). */
@@ -468,6 +505,10 @@ export function resolveLcmConfigWithDiagnostics(
             : toBool(dynamicLeafChunkTokens?.enabled) ?? true,
         max: resolvedDynamicLeafChunkMax,
       },
+      stripInjectedContextTags:
+        parseStripTags(env.LCM_STRIP_INJECTED_CONTEXT_TAGS)
+          ?? toStrArray(pc.stripInjectedContextTags)
+          ?? DEFAULT_STRIP_INJECTED_CONTEXT_TAGS,
     },
     diagnostics: {
       ignoreSessionPatternsSource: ignoreSessionPatterns.source,

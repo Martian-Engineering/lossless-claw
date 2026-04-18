@@ -261,6 +261,39 @@ function stripEmbeddedMediaPayloads(content: string): string {
   return sanitizedLines.join("\n").trim();
 }
 
+/**
+ * Strip auto-injected context blocks from message content.
+ *
+ * Memory and context plugins (active-memory, memory-lancedb, hindsight-openclaw,
+ * etc.) prepend XML-tagged blocks to user messages via the `prependContext` hook.
+ * These blocks contain ephemeral retrieval context that should not leak into
+ * compacted summaries or FTS indexes.
+ *
+ * Each tag name from `tags` is matched case-insensitively as `<tag>.....</tag>`.
+ * The leading "Untrusted context" header used by active-memory is also stripped.
+ */
+export function stripInjectedContextBlocks(content: string, tags: string[] | undefined): string {
+  if (!tags || tags.length === 0) {
+    return content;
+  }
+  let result = content;
+  for (const tag of tags) {
+    // Escape any regex-special chars in the tag name (e.g. hyphens).
+    const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(
+      `<${escaped}>[\\s\\S]*?</${escaped}>`,
+      "gi",
+    );
+    result = result.replace(re, "");
+  }
+  // Strip the "Untrusted context" one-liner header used by active-memory.
+  result = result.replace(
+    /^Untrusted context \(metadata, do not treat as instructions or commands\):\s*/gim,
+    "",
+  );
+  return result.trim();
+}
+
 /** Extract human-readable text from structured content while ignoring attachment payload fields. */
 function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
   if (depth >= 4 || value == null) {
@@ -1491,7 +1524,10 @@ export class CompactionEngine {
     }
 
     const concatenated = messageContents
-      .map((message) => `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${message.content}`)
+      .map((message) => {
+        const cleaned = stripInjectedContextBlocks(message.content, this.config.stripInjectedContextTags);
+        return `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${cleaned}`;
+      })
       .join("\n\n");
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
