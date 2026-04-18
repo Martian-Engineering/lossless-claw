@@ -1031,9 +1031,6 @@ describe("runLcmMigrations summary depth backfill", () => {
 
     const execCalls: string[] = [];
     const instrumentedDb = {
-      get isTransaction() {
-        return db.isTransaction;
-      },
       prepare(sql: string) {
         return db.prepare(sql);
       },
@@ -1055,9 +1052,6 @@ describe("runLcmMigrations summary depth backfill", () => {
     seedLegacySummaryGraph(db);
 
     const failingDb = {
-      get isTransaction() {
-        return db.isTransaction;
-      },
       prepare(sql: string) {
         if (sql.includes("INSERT INTO lcm_migration_state")) {
           throw new Error("simulated state write failure");

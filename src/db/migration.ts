@@ -170,7 +170,10 @@ function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
   }
 }
 
-function backfillMessageIdentityHashes(db: DatabaseSync): void {
+function backfillMessageIdentityHashes(
+  db: DatabaseSync,
+  options?: { managesOwnTransaction?: boolean },
+): void {
   const selectStmt = db.prepare(
     `SELECT message_id, role, content
      FROM messages
@@ -181,13 +184,13 @@ function backfillMessageIdentityHashes(db: DatabaseSync): void {
   );
   const updateStmt = db.prepare(`UPDATE messages SET identity_hash = ? WHERE message_id = ?`);
   let lastProcessedMessageId = 0;
+  const managesOwnTransaction = options?.managesOwnTransaction ?? true;
 
   while (true) {
     const rows = selectStmt.all(lastProcessedMessageId, 1_000) as MessageIdentityBackfillRow[];
     if (rows.length === 0) {
       return;
     }
-    const managesOwnTransaction = !db.isTransaction;
     if (managesOwnTransaction) {
       db.exec(`BEGIN`);
     }
@@ -973,7 +976,7 @@ export function runLcmMigrations(
       ensureMessageIdentityHashColumn(db),
     );
     runMigrationStep("backfillMessageIdentityHashes", log, () =>
-      backfillMessageIdentityHashes(db),
+      backfillMessageIdentityHashes(db, { managesOwnTransaction: false }),
     );
     runMigrationStep("createMessagesIdentityHashIndex", log, () =>
       db.exec(
