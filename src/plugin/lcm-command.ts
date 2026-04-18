@@ -529,7 +529,7 @@ function resolveContextEngineSlot(config: unknown): string {
 
 function resolvePluginSelected(config: unknown): boolean {
   const slot = resolveContextEngineSlot(config);
-  return slot === "" || slot === "lossless-claw" || slot === "default";
+  return slot === "" || slot === "lossless-claw";
 }
 
 function resolveDbSizeLabel(dbPath: string): string {

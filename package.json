@@ -31,9 +31,9 @@
     "LICENSE"
   ],
   "dependencies": {
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "^0.67.2",
+    "@mariozechner/pi-agent-core": "0.66.1",
+    "@mariozechner/pi-ai": "0.66.1",
+    "@mariozechner/pi-coding-agent": "0.66.1",
     "@sinclair/typebox": "0.34.48"
   },
   "devDependencies": {

@@ -1718,7 +1718,7 @@ describe("lcm command", () => {
 });
 
 describe("lcm command helpers", () => {
-  it("treats native alias and empty slot states as selected defaults", () => {
+  it("treats only the canonical engine id and empty slot state as selected", () => {
     expect(__testing.resolvePluginSelected({})).toBe(true);
     expect(
       __testing.resolvePluginSelected({
@@ -1728,7 +1728,7 @@ describe("lcm command helpers", () => {
           },
         },
       }),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       __testing.resolvePluginSelected({
         plugins: {
