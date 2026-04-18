@@ -19,6 +19,11 @@ describe("parseUtcTimestamp", () => {
       "2026-03-30T21:11:15.000Z",
     );
   });
+
+  it("returns an invalid date for non-string runtime values", () => {
+    const parsed = parseUtcTimestamp(123 as unknown as string);
+    expect(Number.isNaN(parsed.getTime())).toBe(true);
+  });
 });
 
 describe("parseUtcTimestampOrNull", () => {

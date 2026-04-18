@@ -13,14 +13,17 @@ const SQLITE_BUSY_TIMEOUT_MS = 30_000;
 const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
 const connectionIndex = new Map<DatabaseSync, ConnectionKey>();
 
+function normalizeDbPathInput(dbPath: string): string {
+  return typeof dbPath === "string" ? dbPath.trim() : "";
+}
+
 export function isInMemoryPath(dbPath: string): boolean {
-  if (typeof dbPath !== "string") return false;
-  const normalized = dbPath.trim();
+  const normalized = normalizeDbPathInput(dbPath);
   return normalized === ":memory:" || normalized.startsWith("file::memory:");
 }
 
 export function getFileBackedDatabasePath(dbPath: string): string | null {
-  const trimmed = dbPath.trim();
+  const trimmed = normalizeDbPathInput(dbPath);
   if (!trimmed || isInMemoryPath(trimmed)) {
     return null;
   }
@@ -30,7 +33,7 @@ export function getFileBackedDatabasePath(dbPath: string): string | null {
 export function normalizePath(dbPath: string): ConnectionKey {
   const fileBackedDatabasePath = getFileBackedDatabasePath(dbPath);
   if (!fileBackedDatabasePath) {
-    const trimmed = dbPath.trim();
+    const trimmed = normalizeDbPathInput(dbPath);
     return trimmed.length > 0 ? trimmed : ":memory:";
   }
   return fileBackedDatabasePath;
