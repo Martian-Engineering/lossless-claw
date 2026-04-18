@@ -83,6 +83,7 @@ type AssemblePrefixSnapshot = {
 
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const MAX_STABLE_ORPHAN_STRIPPING_BOUNDARIES = 100;
+const MIN_OBSERVED_CACHE_READ_SHARE_FOR_HOT = 0.2;
 type CircuitBreakerState = {
   failures: number;
   openSince: number | null;
@@ -1800,12 +1801,34 @@ export class LcmContextEngine implements ContextEngine {
     return telemetry.turnsSinceLeafCompaction <= HOT_CACHE_HYSTERESIS_TURNS;
   }
 
+  /** Treat weak observed cache reuse as cold, even if older telemetry still looks hot. */
+  private isObservedCacheReadShareCold(
+    telemetry: ConversationCompactionTelemetryRecord | null,
+  ): boolean {
+    const cacheRead = telemetry?.lastObservedCacheRead;
+    const promptTokenCount = telemetry?.lastObservedPromptTokenCount;
+    if (
+      typeof cacheRead !== "number"
+      || !Number.isFinite(cacheRead)
+      || cacheRead < 0
+      || typeof promptTokenCount !== "number"
+      || !Number.isFinite(promptTokenCount)
+      || promptTokenCount <= 0
+    ) {
+      return false;
+    }
+    return cacheRead / promptTokenCount < MIN_OBSERVED_CACHE_READ_SHARE_FOR_HOT;
+  }
+
   /** Resolve the effective cache state the incremental compaction policy should react to. */
   private resolveCacheAwareState(
     telemetry: ConversationCompactionTelemetryRecord | null,
   ): CacheState {
     if (!telemetry) {
       return "unknown";
+    }
+    if (this.isObservedCacheReadShareCold(telemetry)) {
+      return "cold";
     }
     if (telemetry.cacheState === "hot") {
       return "hot";
