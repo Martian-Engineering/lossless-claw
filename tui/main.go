@@ -1355,19 +1355,8 @@ func (m model) startPendingRewriteAPI() tea.Cmd {
 }
 
 func resolveInteractiveRewriteProviderModel(paths appDataPaths) (string, string, string) {
-	provider := strings.TrimSpace(os.Getenv("LCM_TUI_SUMMARY_PROVIDER"))
-	if provider == "" {
-		provider = strings.TrimSpace(os.Getenv("LCM_SUMMARY_PROVIDER"))
-	}
-
-	model := strings.TrimSpace(os.Getenv("LCM_TUI_SUMMARY_MODEL"))
-	if model == "" {
-		model = strings.TrimSpace(os.Getenv("LCM_SUMMARY_MODEL"))
-	}
-	resolvedProvider, resolvedModel := resolveSummaryProviderModel(provider, model)
-	baseURL := strings.TrimSpace(os.Getenv("LCM_TUI_SUMMARY_BASE_URL"))
-	baseURL = resolveProviderBaseURL(paths, resolvedProvider, baseURL)
-	return resolvedProvider, resolvedModel, baseURL
+	settings := resolveTUISummaryRuntimeSettings(paths, "", "", "", "", "")
+	return settings.provider, settings.model, settings.baseURL
 }
 
 func rewriteSpinnerTickCmd() tea.Cmd {

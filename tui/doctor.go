@@ -30,6 +30,7 @@ type doctorOptions struct {
 	all        bool
 	provider   string
 	model      string
+	baseURL    string
 	showDiff   bool
 	timestamps bool
 }
@@ -114,6 +115,11 @@ func runDoctorCommand(args []string) error {
 		return nil
 	}
 
+	settings := resolveTUISummaryRuntimeSettings(paths, opts.provider, opts.model, opts.baseURL, doctorDefaultProvider, doctorDefaultModel)
+	opts.provider = settings.provider
+	opts.model = settings.model
+	opts.baseURL = settings.baseURL
+
 	fmt.Printf("Doctor found %d broken summaries in conversation %d.\n", len(plan.targets), conversationID)
 	printDoctorPlan(plan)
 	fmt.Println()
@@ -141,6 +147,7 @@ func runDoctorCommand(args []string) error {
 			apiKey:   apiKey,
 			http:     &http.Client{Timeout: defaultHTTPTimeout},
 			model:    opts.model,
+			baseURL:  opts.baseURL,
 		}
 	}
 
@@ -165,6 +172,7 @@ func parseDoctorArgs(args []string) (doctorOptions, int64, bool, error) {
 	all := fs.Bool("all", false, "scan all conversations")
 	provider := fs.String("provider", "", "provider id (e.g. anthropic, openai)")
 	model := fs.String("model", "", "summary model id")
+	baseURL := fs.String("base-url", "", "custom API base URL")
 	showDiff := fs.Bool("show-diff", false, "show unified diff for each fix")
 	timestamps := fs.Bool("timestamps", false, "inject timestamps into the rewrite source")
 
@@ -180,10 +188,12 @@ func parseDoctorArgs(args []string) (doctorOptions, int64, bool, error) {
 		apply:      *apply,
 		summary:    *summary || *all,
 		all:        *all,
+		baseURL:    strings.TrimSpace(*baseURL),
 		showDiff:   *showDiff,
 		timestamps: *timestamps,
 	}
-	opts.provider, opts.model = resolveDoctorProviderModel(strings.TrimSpace(*provider), strings.TrimSpace(*model))
+	opts.provider = strings.TrimSpace(*provider)
+	opts.model = strings.TrimSpace(*model)
 
 	if opts.apply && opts.summary {
 		return doctorOptions{}, 0, false, fmt.Errorf("--apply cannot be combined with scan-only flags\n%s", doctorUsageText())
@@ -216,7 +226,7 @@ func normalizeDoctorArgs(args []string) ([]string, error) {
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		takesValue := arg == "--provider" || arg == "--model"
+		takesValue := arg == "--provider" || arg == "--model" || arg == "--base-url"
 		if takesValue {
 			if i+1 >= len(args) {
 				return nil, fmt.Errorf("missing value for %s", arg)
@@ -225,7 +235,7 @@ func normalizeDoctorArgs(args []string) ([]string, error) {
 			i++
 			continue
 		}
-		if strings.HasPrefix(arg, "--provider=") || strings.HasPrefix(arg, "--model=") {
+		if strings.HasPrefix(arg, "--provider=") || strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "--base-url=") {
 			flags = append(flags, arg)
 			continue
 		}
@@ -244,7 +254,7 @@ func normalizeDoctorArgs(args []string) ([]string, error) {
 
 func doctorUsageText() string {
 	return strings.TrimSpace(`Usage:
-  lcm-tui doctor <conversation_id> [--show-diff] [--timestamps] [--apply]
+  lcm-tui doctor <conversation_id> [--show-diff] [--timestamps] [--apply] [--provider <id>] [--model <model>] [--base-url <url>]
   lcm-tui doctor <conversation_id> --summary
   lcm-tui doctor --summary
   lcm-tui doctor --all
@@ -255,19 +265,14 @@ Flags:
   --all               scan all conversations (discovery mode only)
   --provider <id>     API provider (default: anthropic)
   --model <model>     API model (default: claude-haiku-4-5)
+  --base-url <url>    custom API base URL (overrides config and env)
   --show-diff         show unified diff for each fix
   --timestamps        inject timestamps into rewrite source text
-`)
-}
 
-func resolveDoctorProviderModel(providerHint, modelHint string) (string, string) {
-	if strings.TrimSpace(modelHint) == "" {
-		switch normalizeProviderID(providerHint) {
-		case "", "anthropic":
-			return doctorDefaultProvider, doctorDefaultModel
-		}
-	}
-	return resolveSummaryProviderModel(providerHint, modelHint)
+Env:
+  LCM_TUI_SUMMARY_PROVIDER / LCM_TUI_SUMMARY_MODEL / LCM_TUI_SUMMARY_BASE_URL
+  fall back to LCM_SUMMARY_PROVIDER / LCM_SUMMARY_MODEL / LCM_SUMMARY_BASE_URL
+`)
 }
 
 // buildDoctorPlan keeps the repair order bottom-up so parent rewrites can consume repaired children.
@@ -514,8 +519,8 @@ func detectDoctorMarker(content string) string {
 	if idx >= 0 && len(content)-idx < doctorNewMarkerWindow {
 		return "new"
 	}
-	fidx := strings.Index(content, doctorLCMFallbackMarker)
-	if fidx >= 0 && len(content)-fidx < doctorFallbackWindow {
+	fidx := strings.LastIndex(content, doctorLCMFallbackMarker)
+	if fidx > 0 && len(content)-fidx < doctorFallbackWindow && content[fidx-1] == '\n' {
 		return "fallback"
 	}
 	return ""

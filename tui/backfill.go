@@ -127,6 +127,11 @@ func runBackfillCommand(args []string) error {
 	}
 	defer db.Close()
 
+	settings := resolveTUISummaryRuntimeSettings(paths, opts.provider, opts.model, opts.baseURL, "", "")
+	opts.provider = settings.provider
+	opts.model = settings.model
+	opts.baseURL = settings.baseURL
+
 	ctx := context.Background()
 	input := backfillSessionInput{
 		agent:       opts.agent,
@@ -187,7 +192,7 @@ func runBackfillCommand(args []string) error {
 		apiKey:   apiKey,
 		http:     &http.Client{Timeout: defaultHTTPTimeout},
 		model:    opts.model,
-		baseURL:  resolveProviderBaseURL(paths, opts.provider, opts.baseURL),
+		baseURL:  opts.baseURL,
 	}
 
 	result, stats, err := runBackfillWorkflow(ctx, db, opts, input, client.summarize)
@@ -355,7 +360,6 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 	if opts.promptDir != "" {
 		opts.promptDir = expandHomePath(opts.promptDir)
 	}
-	opts.provider, opts.model = resolveSummaryProviderModel(opts.provider, opts.model)
 	return opts, nil
 }
 
@@ -425,6 +429,10 @@ Flags:
   --provider <id>              API provider (inferred from model when omitted)
   --model <id>                 API model (default: provider-specific)
   --base-url <url>             custom API base URL (overrides openclaw.json and env)
+
+Env:
+  LCM_TUI_SUMMARY_PROVIDER / LCM_TUI_SUMMARY_MODEL / LCM_TUI_SUMMARY_BASE_URL
+  fall back to LCM_SUMMARY_PROVIDER / LCM_SUMMARY_MODEL / LCM_SUMMARY_BASE_URL
 `)
 }
 

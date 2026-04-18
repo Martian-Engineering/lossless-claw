@@ -47,6 +47,9 @@ type repairOptions struct {
 	all       bool
 	summaryID string
 	verbose   bool
+	provider  string
+	model     string
+	baseURL   string
 }
 
 type repairSummary struct {
@@ -178,16 +181,21 @@ func runRepairCommand(args []string) error {
 
 	var client *anthropicClient
 	if opts.apply {
-		apiKey, err := resolveAnthropicAPIKey(paths)
+		settings := resolveTUISummaryRuntimeSettings(paths, opts.provider, opts.model, opts.baseURL, "", "")
+		opts.provider = settings.provider
+		opts.model = settings.model
+		opts.baseURL = settings.baseURL
+
+		apiKey, err := resolveProviderAPIKey(paths, opts.provider)
 		if err != nil {
 			return err
 		}
 		client = &anthropicClient{
-			provider: defaultLLMProvider,
+			provider: opts.provider,
 			apiKey:   apiKey,
 			http:     &http.Client{Timeout: defaultHTTPTimeout},
-			model:    anthropicModel,
-			baseURL:  resolveProviderBaseURL(paths, defaultLLMProvider, ""),
+			model:    opts.model,
+			baseURL:  opts.baseURL,
 		}
 	}
 
@@ -218,6 +226,9 @@ func parseRepairArgs(args []string) (repairOptions, int64, error) {
 	all := fs.Bool("all", false, "scan all conversations")
 	summaryID := fs.String("summary-id", "", "repair a specific summary ID")
 	verbose := fs.Bool("verbose", false, "include old content hash and preview")
+	provider := fs.String("provider", "", "provider id (e.g. anthropic, openai)")
+	model := fs.String("model", "", "summary model id")
+	baseURL := fs.String("base-url", "", "custom API base URL")
 
 	normalizedArgs, err := normalizeRepairArgs(args)
 	if err != nil {
@@ -236,6 +247,9 @@ func parseRepairArgs(args []string) (repairOptions, int64, error) {
 		all:       *all,
 		summaryID: strings.TrimSpace(*summaryID),
 		verbose:   *verbose,
+		provider:  strings.TrimSpace(*provider),
+		model:     strings.TrimSpace(*model),
+		baseURL:   strings.TrimSpace(*baseURL),
 	}
 	if opts.apply {
 		opts.dryRun = false
@@ -270,8 +284,16 @@ func normalizeRepairArgs(args []string) ([]string, error) {
 		switch {
 		case arg == "--apply" || arg == "--dry-run" || arg == "--all" || arg == "--verbose":
 			flags = append(flags, arg)
+		case strings.HasPrefix(arg, "--provider="), strings.HasPrefix(arg, "--model="), strings.HasPrefix(arg, "--base-url="):
+			flags = append(flags, arg)
 		case strings.HasPrefix(arg, "--summary-id="):
 			flags = append(flags, arg)
+		case arg == "--provider" || arg == "--model" || arg == "--base-url":
+			if i+1 >= len(args) {
+				return nil, errors.New("missing value for " + arg)
+			}
+			flags = append(flags, arg, args[i+1])
+			i++
 		case arg == "--summary-id":
 			if i+1 >= len(args) {
 				return nil, errors.New("missing value for --summary-id")
@@ -290,9 +312,13 @@ func normalizeRepairArgs(args []string) ([]string, error) {
 func repairUsageText() string {
 	return strings.TrimSpace(`
 Usage:
-  lcm-tui repair <conversation_id> [--dry-run] [--summary-id <id>]
-  lcm-tui repair <conversation_id> --apply [--summary-id <id>]
-  lcm-tui repair --all [--dry-run|--apply]
+  lcm-tui repair <conversation_id> [--dry-run] [--summary-id <id>] [--provider <id>] [--model <model>] [--base-url <url>]
+  lcm-tui repair <conversation_id> --apply [--summary-id <id>] [--provider <id>] [--model <model>] [--base-url <url>]
+  lcm-tui repair --all [--dry-run|--apply] [--provider <id>] [--model <model>] [--base-url <url>]
+
+Env:
+  LCM_TUI_SUMMARY_PROVIDER / LCM_TUI_SUMMARY_MODEL / LCM_TUI_SUMMARY_BASE_URL
+  fall back to LCM_SUMMARY_PROVIDER / LCM_SUMMARY_MODEL / LCM_SUMMARY_BASE_URL
 `)
 }
 
