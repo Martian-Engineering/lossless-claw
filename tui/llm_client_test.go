@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -200,7 +202,7 @@ func TestSummarizeAnthropicOAuthDelegatesToCLI(t *testing.T) {
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
 	t.Setenv("LCM_HELPER_STDOUT", "CLI summary")
 	t.Setenv("LCM_EXPECT_MODEL", anthropicModel)
-	t.Setenv("LCM_EXPECT_PROMPT", "say hello")
+	t.Setenv("LCM_EXPECT_PROMPT_SHA256", hashPrompt("say hello"))
 	t.Setenv("ANTHROPIC_API_KEY", "should-be-filtered")
 
 	httpCalled := false
@@ -231,7 +233,7 @@ func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
 	t.Setenv("LCM_HELPER_STDOUT", strings.Repeat("word ", 200))
 	t.Setenv("LCM_EXPECT_MODEL", anthropicModel)
-	t.Setenv("LCM_EXPECT_PROMPT", "oversized")
+	t.Setenv("LCM_EXPECT_PROMPT_SHA256", hashPrompt("oversized"))
 
 	client := &anthropicClient{
 		provider: "anthropic",
@@ -246,6 +248,32 @@ func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exceeded target token budget") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSummarizeAnthropicOAuthStreamsLargePromptViaStdin(t *testing.T) {
+	stubClaudeCLI(t)
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("LCM_HELPER_STDOUT", "large prompt summary")
+	t.Setenv("LCM_EXPECT_MODEL", anthropicModel)
+
+	largePrompt := strings.Repeat("large prompt chunk ", 20000)
+	t.Setenv("LCM_EXPECT_PROMPT_SHA256", hashPrompt(largePrompt))
+	t.Setenv("ANTHROPIC_API_KEY", "should-be-filtered")
+
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "sk-ant-oat01-test-token",
+		model:    anthropicModel,
+		http:     &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) { return nil, nil })},
+	}
+
+	summary, err := client.summarize(context.Background(), largePrompt, 200)
+	if err != nil {
+		t.Fatalf("summarize returned error for large prompt: %v", err)
+	}
+	if summary != "large prompt summary" {
+		t.Fatalf("unexpected summary: %q", summary)
 	}
 }
 
@@ -345,7 +373,7 @@ func TestHelperProcessClaudeCLI(t *testing.T) {
 
 	cliArgs := args[separator+2:]
 	expectedModel := os.Getenv("LCM_EXPECT_MODEL")
-	expectedPrompt := os.Getenv("LCM_EXPECT_PROMPT")
+	expectedPromptHash := os.Getenv("LCM_EXPECT_PROMPT_SHA256")
 
 	if os.Getenv("ANTHROPIC_API_KEY") != "" {
 		_, _ = os.Stderr.WriteString("ANTHROPIC_API_KEY should be filtered")
@@ -359,13 +387,28 @@ func TestHelperProcessClaudeCLI(t *testing.T) {
 		_, _ = os.Stderr.WriteString("missing output format")
 		os.Exit(5)
 	}
+	if !containsArgPair(cliArgs, "--input-format", "text") {
+		_, _ = os.Stderr.WriteString("missing input format")
+		os.Exit(9)
+	}
 	if expectedModel != "" && !containsArgPair(cliArgs, "--model", expectedModel) {
 		_, _ = os.Stderr.WriteString("missing model")
 		os.Exit(6)
 	}
-	if expectedPrompt != "" && !containsArgPair(cliArgs, "-p", expectedPrompt) {
-		_, _ = os.Stderr.WriteString("missing prompt")
+	if containsArgs(cliArgs, "-p") || containsArgs(cliArgs, "--prompt") {
+		_, _ = os.Stderr.WriteString("prompt should arrive via stdin, not argv")
 		os.Exit(7)
+	}
+	if expectedPromptHash != "" {
+		prompt, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			_, _ = os.Stderr.WriteString("failed to read stdin")
+			os.Exit(10)
+		}
+		if hashPrompt(string(prompt)) != expectedPromptHash {
+			_, _ = os.Stderr.WriteString("stdin prompt hash mismatch")
+			os.Exit(11)
+		}
 	}
 
 	_, _ = os.Stdout.WriteString(os.Getenv("LCM_HELPER_STDOUT"))
@@ -378,6 +421,11 @@ func TestHelperProcessClaudeCLI(t *testing.T) {
 		os.Exit(code)
 	}
 	os.Exit(0)
+}
+
+func hashPrompt(prompt string) string {
+	sum := sha256.Sum256([]byte(prompt))
+	return fmt.Sprintf("%x", sum)
 }
 
 func containsArgs(args []string, want string) bool {
