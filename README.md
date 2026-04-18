@@ -79,13 +79,18 @@ If you're running from a local OpenClaw checkout, use:
 pnpm openclaw plugins install @martian-engineering/lossless-claw
 ```
 
-For local plugin development, link your working copy instead of copying files:
+For local plugin development, build your working copy first, then link it instead of copying files:
 
 ```bash
+cd /path/to/lossless-claw
+pnpm build
+
 openclaw plugins install --link /path/to/lossless-claw
 # or from a local OpenClaw checkout:
 # pnpm openclaw plugins install --link /path/to/lossless-claw
 ```
+
+Re-run `pnpm build` after local source changes so the linked plugin's `dist/` output stays current.
 
 The install command records the plugin, enables it, and applies compatible slot selection (including `contextEngine` when applicable).
 
@@ -426,7 +431,7 @@ For most long-lived LCM setups, a good starting point is:
 
 ```bash
 # Build (bundles TypeScript to dist/index.js)
-npm run build
+pnpm build
 
 # Run tests
 npx vitest
