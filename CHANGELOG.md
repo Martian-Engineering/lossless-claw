@@ -1,5 +1,27 @@
 # @martian-engineering/lossless-claw
 
+## 0.9.2
+
+### Patch Changes
+
+- [#444](https://github.com/Martian-Engineering/lossless-claw/pull/444) [`6596fb4`](https://github.com/Martian-Engineering/lossless-claw/commit/6596fb4f3113aa34799662b46698d5fdd053683f) Thanks [@andyylin](https://github.com/andyylin)! - Fix context-engine registration so the plugin only registers its canonical `lossless-claw` id, align runtime Pi package versions with the current OpenClaw stack, and tighten selection helpers to stop treating the old `default` alias as equivalent to the plugin id.
+
+- [#455](https://github.com/Martian-Engineering/lossless-claw/pull/455) [`370b91b`](https://github.com/Martian-Engineering/lossless-claw/commit/370b91b58033a890f5ff9e97fd2a950a50618ba4) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Wrap SQLite migrations in a single exclusive transaction so concurrent startup agents serialize migration work instead of racing on per-statement autocommit writes.
+
+- [#465](https://github.com/Martian-Engineering/lossless-claw/pull/465) [`6f7f942`](https://github.com/Martian-Engineering/lossless-claw/commit/6f7f942ca516bf43dbec9b098a84defcd1677328) Thanks [@liu51115](https://github.com/liu51115)! - Harden defensive handling for non-string database path and timestamp values so malformed runtime data does not trigger `.trim()` crashes or silently skew stored chronology.
+
+- [#405](https://github.com/Martian-Engineering/lossless-claw/pull/405) [`5949a4b`](https://github.com/Martian-Engineering/lossless-claw/commit/5949a4b8a4e35281421b3f3a18c0c95897d3cf4f) Thanks [@uf-hy](https://github.com/uf-hy)! - Restrict the missed-`/reset` bootstrap fallback to confirmed missing transcript paths so transient `stat()` failures do not rotate a live conversation.
+
+- [#450](https://github.com/Martian-Engineering/lossless-claw/pull/450) [`36c80d5`](https://github.com/Martian-Engineering/lossless-claw/commit/36c80d5f8b12483ff4de827359fd22da61b8192b) Thanks [@coryscook](https://github.com/coryscook)! - Use the resolved plugin summary config when runtime config is unavailable so compaction keeps the configured summary model instead of falling back to emergency truncation.
+
+- [#418](https://github.com/Martian-Engineering/lossless-claw/pull/418) [`f8fe367`](https://github.com/Martian-Engineering/lossless-claw/commit/f8fe367c9c7d18c0d2b470c72f799e516150c8aa) Thanks [@gitchrisqueen](https://github.com/gitchrisqueen)! - Fix manual and threshold-triggered compaction results so a full sweep that ends under the target budget reports `already under target` instead of a misleading no-op failure.
+
+- [#468](https://github.com/Martian-Engineering/lossless-claw/pull/468) [`082b2a9`](https://github.com/Martian-Engineering/lossless-claw/commit/082b2a918c2721001ea30e952bde95bc500b7241) Thanks [@jalehman](https://github.com/jalehman)! - Unify `lcm-tui` summary provider configuration across doctor, repair, rewrite, and backfill so the standalone commands honor the same provider, model, and base URL overrides as interactive rewrite.
+
+- [#467](https://github.com/Martian-Engineering/lossless-claw/pull/467) [`6580e8f`](https://github.com/Martian-Engineering/lossless-claw/commit/6580e8f641e3b19d7b452d030a71a2d871106722) Thanks [@jalehman](https://github.com/jalehman)! - Fix `lcm-tui` OAuth-backed Claude rewrites, repairs, and doctor apply runs so large prompts stream over stdin instead of overflowing the CLI argument limit.
+
+- [#456](https://github.com/Martian-Engineering/lossless-claw/pull/456) [`134bb8a`](https://github.com/Martian-Engineering/lossless-claw/commit/134bb8aadada3e8e6884940843ad4ebaeb0bf254) Thanks [@jalehman](https://github.com/jalehman)! - Improve prompt-cache stability by making compacted-context guidance static and disabling prompt-aware eviction by default.
+
 ## 0.9.1
 
 ### Patch Changes
