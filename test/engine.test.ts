@@ -475,6 +475,31 @@ describe("LcmContextEngine ignored sessions", () => {
     expect(included.messages[0]?.content).toBe("persisted context");
   });
 
+  it("strips trailing empty-content assistant on fallback returns from assemble", async () => {
+    // Regression: when a generation fails mid-response, OC persists the
+    // assistant message to the jsonl with content:[] and an errorMessage.
+    // If the next turn takes a non-compaction path (no context items yet,
+    // for example), assemble() used to return the live messages unchanged,
+    // and Anthropic 400s with "does not support assistant message prefill".
+    const engine = createEngine();
+
+    const liveMessages = [
+      makeMessage({ role: "user", content: "what's the weather?" }),
+      makeMessage({ role: "assistant", content: [] }),
+    ];
+    const result = await engine.assemble({
+      sessionId: includedSessionId,
+      sessionKey: includedSessionKey,
+      messages: liveMessages,
+      tokenBudget: 500,
+    });
+
+    // Empty-content assistant tail should be dropped regardless of which
+    // fallback path the engine takes.
+    expect(result.messages).toHaveLength(1);
+    expect((result.messages[0] as { role?: string }).role).toBe("user");
+  });
+
   it("skips compact for ignored sessions while compact still evaluates included sessions", async () => {
     const engine = createEngineWithConfig({
       ignoreSessionPatterns: ["agent:*:cron:**"],

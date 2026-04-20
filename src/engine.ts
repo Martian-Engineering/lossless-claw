@@ -45,6 +45,7 @@ import {
 } from "./large-files.js";
 import { describeLogError } from "./lcm-log.js";
 import { describeLcmConfigSource } from "./db/config.js";
+import { stripTrailingEmptyAssistantPrefill } from "./transcript-repair.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
@@ -5208,9 +5209,15 @@ export class LcmContextEngine implements ContextEngine {
     /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
     prompt?: string;
   }): Promise<AssembleResult> {
+    // Anthropic providers reject prompts that end with an empty-content
+    // assistant message. A failed generation can leave such a message
+    // persisted in the session jsonl, and any fallback path here that
+    // returns params.messages unchanged would ship the bad shape to the
+    // provider. Strip once up-front so every return path is safe.
+    const liveMessages = stripTrailingEmptyAssistantPrefill(params.messages);
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       return {
-        messages: params.messages,
+        messages: liveMessages,
         estimatedTokens: 0,
       };
     }
@@ -5231,7 +5238,7 @@ export class LcmContextEngine implements ContextEngine {
           `[lcm] assemble: conversation lookup missed ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
         return {
-          messages: params.messages,
+          messages: liveMessages,
           estimatedTokens: 0,
         };
       }
@@ -5280,7 +5287,7 @@ export class LcmContextEngine implements ContextEngine {
           `[lcm] assemble: no context items conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
         return {
-          messages: params.messages,
+          messages: liveMessages,
           estimatedTokens: 0,
         };
       }
@@ -5294,7 +5301,7 @@ export class LcmContextEngine implements ContextEngine {
           `[lcm] assemble: falling back to live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${params.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
         return {
-          messages: params.messages,
+          messages: liveMessages,
           estimatedTokens: 0,
         };
       }
@@ -5322,7 +5329,7 @@ export class LcmContextEngine implements ContextEngine {
           `[lcm] assemble: empty assembled output, using live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
         return {
-          messages: params.messages,
+          messages: liveMessages,
           estimatedTokens: 0,
         };
       }
@@ -5358,7 +5365,7 @@ export class LcmContextEngine implements ContextEngine {
         `[lcm] assemble: failed for session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} error=${describeLogError(err)}`,
       );
       return {
-        messages: params.messages,
+        messages: liveMessages,
         estimatedTokens: 0,
       };
     }
