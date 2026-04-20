@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { sanitizeToolUseResultPairing } from "../src/transcript-repair.js";
+import {
+  sanitizeToolUseResultPairing,
+  stripTrailingEmptyAssistantPrefill,
+} from "../src/transcript-repair.js";
 
 describe("sanitizeToolUseResultPairing", () => {
   it("moves OpenAI reasoning blocks before function_call blocks", () => {
@@ -63,5 +66,72 @@ describe("sanitizeToolUseResultPairing", () => {
       ],
       isError: true,
     });
+  });
+});
+
+describe("stripTrailingEmptyAssistantPrefill", () => {
+  it("drops a trailing assistant message with empty-array content", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: [] },
+    ];
+    const out = stripTrailingEmptyAssistantPrefill(messages);
+    expect(out).toHaveLength(1);
+    expect(out[0]?.role).toBe("user");
+  });
+
+  it("drops a trailing assistant message with undefined content", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant" },
+    ];
+    const out = stripTrailingEmptyAssistantPrefill(messages);
+    expect(out).toHaveLength(1);
+    expect(out[0]?.role).toBe("user");
+  });
+
+  it("drops a trailing assistant message with an empty string content", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: "   " },
+    ];
+    const out = stripTrailingEmptyAssistantPrefill(messages);
+    expect(out).toHaveLength(1);
+    expect(out[0]?.role).toBe("user");
+  });
+
+  it("keeps a trailing assistant message with real content", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: [{ type: "text", text: "hello" }] },
+    ];
+    const out = stripTrailingEmptyAssistantPrefill(messages);
+    expect(out).toHaveLength(2);
+    expect(out[1]?.role).toBe("assistant");
+  });
+
+  it("keeps a trailing user message even if empty", () => {
+    const messages = [
+      { role: "assistant", content: [{ type: "text", text: "done" }] },
+      { role: "user", content: [] },
+    ];
+    const out = stripTrailingEmptyAssistantPrefill(messages);
+    expect(out).toHaveLength(2);
+    expect(out[1]?.role).toBe("user");
+  });
+
+  it("is a no-op on an empty list", () => {
+    const out = stripTrailingEmptyAssistantPrefill([]);
+    expect(out).toEqual([]);
+  });
+
+  it("does not mutate the input array", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      { role: "assistant", content: [] },
+    ];
+    const snapshot = JSON.parse(JSON.stringify(messages));
+    stripTrailingEmptyAssistantPrefill(messages);
+    expect(messages).toEqual(snapshot);
   });
 });

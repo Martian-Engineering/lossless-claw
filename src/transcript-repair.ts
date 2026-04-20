@@ -298,3 +298,31 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(message
   const changedOrMoved = changed || moved;
   return changedOrMoved ? out : messages;
 }
+
+/**
+ * Drop a trailing assistant message whose content is empty.
+ *
+ * Anthropic providers such as `claude-sonnet-4-6` reject a prompt that ends
+ * with an empty-content assistant entry ("does not support assistant message
+ * prefill. The conversation must end with a user message."). Post-compaction
+ * assembly can produce this shape when a cleanup pass evicts the final
+ * assistant turn's content without removing the envelope.
+ *
+ * No-op when the tail is non-empty or not an assistant role.
+ */
+export function stripTrailingEmptyAssistantPrefill<T extends AgentMessageLike>(
+  messages: T[],
+): T[] {
+  if (messages.length === 0) return messages;
+  const last = messages[messages.length - 1];
+  if (!last || typeof last !== "object") return messages;
+  if (last.role !== "assistant") return messages;
+  const content = (last as { content?: unknown }).content;
+  const isEmpty =
+    content === undefined ||
+    content === null ||
+    (typeof content === "string" && content.trim() === "") ||
+    (Array.isArray(content) && content.length === 0);
+  if (!isEmpty) return messages;
+  return messages.slice(0, -1);
+}
