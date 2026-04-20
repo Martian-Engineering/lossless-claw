@@ -204,6 +204,10 @@
     "fallbackProviders": {
       "label": "Fallback Providers",
       "help": "Explicit fallback provider/model pairs for compaction summarization (e.g., [{\"provider\": \"anthropic\", \"model\": \"claude-haiku-4-5\"}])"
+    },
+    "stripInjectedContextTags": {
+      "label": "Strip Injected Context Tags",
+      "help": "XML tag names whose blocks are stripped from messages before summarization. Covers memory/context plugin prepended blocks (active-memory, memory-lancedb, hindsight-openclaw). Set to [] to disable."
     }
   },
   "configSchema": {
@@ -420,6 +424,13 @@
           },
           "required": ["provider", "model"],
           "additionalProperties": false
+        }
+      },
+      "stripInjectedContextTags": {
+        "description": "XML tag names whose blocks are stripped from messages before summarization. Memory/context plugins prepend tagged blocks via prependContext that should not leak into compacted summaries.",
+        "type": "array",
+        "items": {
+          "type": "string"
         }
       }
     }
