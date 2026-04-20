@@ -1056,6 +1056,22 @@ export class ContextAssembler {
       .filter((entry) => entry.segment === "freshTail")
       .map((entry) => entry.message);
     const repaired = sanitizeToolUseResultPairing(cleaned) as AgentMessage[];
+    // Guard: Anthropic rejects a prompt ending with an empty-content assistant
+    // message ("does not support assistant message prefill"). Post-compaction
+    // assembly can produce this shape. Drop it so the conversation ends on the
+    // last real user/assistant turn.
+    if (repaired.length > 0) {
+      const last = repaired[repaired.length - 1];
+      const content = (last as { content?: unknown }).content;
+      const isEmpty =
+        content === undefined ||
+        content === null ||
+        (typeof content === "string" && content.trim() === "") ||
+        (Array.isArray(content) && content.length === 0);
+      if (last.role === "assistant" && isEmpty) {
+        repaired.pop();
+      }
+    }
     return {
       messages: repaired,
       estimatedTokens,
