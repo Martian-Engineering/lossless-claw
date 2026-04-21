@@ -5348,9 +5348,50 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
 
+      // Separate condensed summary messages from conversation messages.
+      // Condensed summaries represent stable context (the agent's memory of
+      // past turns) and are better placed in systemPromptAddition so they
+      // become part of the cacheable prompt prefix at providers like Anthropic
+      // and OpenAI.  This dramatically improves prompt cache hit rates because
+      // summaries change content on every compaction cycle but remain
+      // semantically equivalent — a cache-stable prefix means the entire
+      // conversation history up to the summary is only processed once.
+      //
+      // Only condensed summaries are moved; leaf summaries remain as user
+      // messages because they represent recent conversation chunks that are
+      // more specific and detailed.
+      const condensedSummaryMessages: AgentMessage[] = [];
+      const conversationMessages: AgentMessage[] = [];
+      for (const msg of assembled.messages) {
+        if (
+          msg.role === "user" &&
+          typeof msg.content === "string" &&
+          msg.content.startsWith("<summary ") &&
+          /kind="condensed"/.test(msg.content)
+        ) {
+          condensedSummaryMessages.push(msg);
+        } else {
+          conversationMessages.push(msg);
+        }
+      }
+
+      const systemPromptAddition =
+        condensedSummaryMessages.length > 0
+          ? condensedSummaryMessages
+              .map((msg) => (typeof msg.content === "string" ? msg.content : ""))
+              .join("\n\n")
+          : undefined;
+
+      if (condensedSummaryMessages.length > 0) {
+        this.deps.log.info(
+          `[lcm] assemble: moved ${condensedSummaryMessages.length} condensed summary message(s) to systemPromptAddition (${condensedSummaryMessages.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0), 0)} chars) conversation=${conversation.conversationId} ${sessionLabel}`,
+        );
+      }
+
       const result: AssembleResult = {
-        messages: assembled.messages,
+        messages: conversationMessages,
         estimatedTokens: assembled.estimatedTokens,
+        ...(systemPromptAddition ? { systemPromptAddition } : {}),
       };
       return result;
     } catch (err) {
