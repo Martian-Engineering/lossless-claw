@@ -4675,7 +4675,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(promptAddition).toBeUndefined();
   });
 
-  it("does not emit assembly-specific system prompt guidance when summaries are present", async () => {
+  it("does not emit assembly-specific system prompt guidance when leaf summaries are present", async () => {
     const engine = createEngine();
     const sessionId = "session-summary-guidance";
 
@@ -4708,6 +4708,53 @@ describe("LcmContextEngine.assemble canonical path", () => {
 
     const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
     expect(promptAddition).toBeUndefined();
+  });
+
+  it("moves condensed summaries to systemPromptAddition for prompt cache stability", async () => {
+    const engine = createEngine();
+    const sessionId = "session-condensed-summary-to-spa";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "seed message" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    // Insert a condensed summary (depth > 0, represents long-term context)
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_condensed_test",
+      conversationId: conversation!.conversationId,
+      kind: "condensed",
+      depth: 1,
+      content: "Condensed summary of past conversation turns",
+      tokenCount: 50,
+      descendantCount: 5,
+    });
+    await engine
+      .getSummaryStore()
+      .appendContextSummary(conversation!.conversationId, "sum_condensed_test");
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const promptAddition = (result as { systemPromptAddition?: string }).systemPromptAddition;
+    expect(promptAddition).toBeDefined();
+    expect(promptAddition).toContain('kind="condensed"');
+    expect(promptAddition).toContain("Condensed summary of past conversation turns");
+
+    // Condensed summaries should NOT appear as user messages anymore
+    const summaryUserMessages = result.messages.filter(
+      (msg) =>
+        msg.role === "user" &&
+        typeof msg.content === "string" &&
+        msg.content.includes('kind="condensed"'),
+    );
+    expect(summaryUserMessages).toHaveLength(0);
   });
 });
 
