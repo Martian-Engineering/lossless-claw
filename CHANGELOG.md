@@ -1,5 +1,11 @@
 # @martian-engineering/lossless-claw
 
+## 0.9.3
+
+### Patch Changes
+
+- [#470](https://github.com/Martian-Engineering/lossless-claw/pull/470) [`8d634cd`](https://github.com/Martian-Engineering/lossless-claw/commit/8d634cdf4b7544c9093c2e701fbbe5075d1e3de6) Thanks [@GodsBoy](https://github.com/GodsBoy)! - Document `lcm-tui` Codex OAuth flows with the explicit `openai-codex` provider so repair, rewrite, doctor, and backfill examples match the new Codex CLI delegate path after `codex login`.
+
 ## 0.9.2
 
 ### Patch Changes
