@@ -41,6 +41,11 @@ var (
 	cliOutputTokenSlack = 128
 )
 
+// cliSummarizationSystemPrompt is the system directive sent to CLI-delegated
+// summarizers (claude CLI, codex CLI). It constrains the CLI to output only
+// the requested summary, with no preamble, commentary, or protocol tokens.
+const cliSummarizationSystemPrompt = "You are a summarization engine. Output ONLY the requested summary. No preamble, no conversation, no questions, no commentary. Never output HEARTBEAT_OK or any protocol tokens."
+
 type repairOptions struct {
 	apply     bool
 	dryRun    bool
@@ -948,7 +953,10 @@ Files
 
 func (c *anthropicClient) summarize(ctx context.Context, prompt string, targetTokens int) (string, error) {
 	provider, model := resolveSummaryProviderModel(c.provider, c.model)
-	if strings.TrimSpace(c.apiKey) == "" {
+	// Codex OAuth path has no raw API key: the codex CLI reads ~/.codex/auth.json
+	// directly. Allow an empty apiKey to reach summarizeOpenAI, which routes to
+	// the CLI delegate when hasCodexOAuth() is true.
+	if strings.TrimSpace(c.apiKey) == "" && !(provider == "openai-codex" && hasCodexOAuth()) {
 		return "", fmt.Errorf("missing API key for provider %q", provider)
 	}
 	if c.http == nil {
@@ -1051,7 +1059,7 @@ func summarizeViaCLI(ctx context.Context, model, prompt string, targetTokens int
 		"--print",
 		"--input-format", "text",
 		"--output-format", "text",
-		"--system-prompt", "You are a summarization engine. Output ONLY the requested summary. No preamble, no conversation, no questions, no commentary. Never output HEARTBEAT_OK or any protocol tokens.",
+		"--system-prompt", cliSummarizationSystemPrompt,
 		"--model", model,
 	)
 	cmd.Dir = os.TempDir()
@@ -1088,7 +1096,110 @@ func summarizeViaCLI(ctx context.Context, model, prompt string, targetTokens int
 	return result, nil
 }
 
+// filteredOpenAIChildEnv returns env with all OPENAI_* vars stripped, so a
+// CLI-delegated codex subprocess reads credentials and endpoint config from
+// ~/.codex/ alone. Filtering the whole prefix (not just OPENAI_API_KEY)
+// prevents a misconfigured OPENAI_BASE_URL or proxy var from re-routing
+// OAuth-authenticated traffic to an unintended endpoint.
+func filteredOpenAIChildEnv(env []string) []string {
+	filtered := env[:0]
+	for _, e := range env {
+		if strings.HasPrefix(e, "OPENAI_") {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	return filtered
+}
+
+// hasCodexOAuth reports whether ~/.codex/auth.json exists and is non-empty.
+// Presence of that file is how the user indicates they have logged in to the
+// Codex CLI; the binary itself handles OAuth refresh against ChatGPT Plus/Pro.
+func hasCodexOAuth() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(home, ".codex", "auth.json"))
+	if err != nil {
+		return false
+	}
+	return !info.IsDir() && info.Size() > 0
+}
+
+// summarizeViaCodexCLI delegates summarization to the `codex` CLI binary when
+// the user has a Codex OAuth session (~/.codex/auth.json) but no raw
+// OPENAI_API_KEY. Mirrors summarizeViaCLI's shape for Anthropic OAuth.
+//
+// The Codex CLI lacks a --system-prompt flag, so the system directive is
+// prepended to the stdin payload. The --output-last-message flag captures just
+// the model's final message, avoiding session/status preamble that `codex exec`
+// writes to stdout.
+func summarizeViaCodexCLI(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
+	codexPath, err := lookupCLIPath("codex")
+	if err != nil {
+		return "", fmt.Errorf("codex OAuth detected but `codex` CLI not found in PATH: install Codex CLI or set OPENAI_API_KEY")
+	}
+
+	outputFile, err := os.CreateTemp("", "lcm-codex-output-*.txt")
+	if err != nil {
+		return "", fmt.Errorf("create codex output file: %w", err)
+	}
+	outputPath := outputFile.Name()
+	_ = outputFile.Close()
+	defer os.Remove(outputPath)
+
+	cmd := execCLICommand(ctx, codexPath,
+		"exec",
+		"--skip-git-repo-check",
+		"--color", "never",
+		"--ephemeral",
+		"--sandbox", "read-only",
+		"--output-last-message", outputPath,
+		"-m", model,
+		"-",
+	)
+	cmd.Dir = os.TempDir()
+	cmd.Stdin = strings.NewReader(cliSummarizationSystemPrompt + "\n\n" + prompt)
+	cmd.Env = filteredOpenAIChildEnv(os.Environ())
+
+	if _, err := cmd.Output(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", fmt.Errorf("codex CLI exited %d: %s", exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return "", fmt.Errorf("codex CLI: %w", err)
+	}
+
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		return "", fmt.Errorf("read codex CLI output: %w", err)
+	}
+	result := strings.TrimSpace(string(data))
+	if result == "" {
+		return "", fmt.Errorf("codex CLI returned empty output")
+	}
+	estimatedTokens := estimateTokenCount(result)
+	if estimatedTokens > targetTokens+cliOutputTokenSlack {
+		return "", fmt.Errorf(
+			"codex CLI output exceeded target token budget: got %d tokens for target %d",
+			estimatedTokens,
+			targetTokens,
+		)
+	}
+	return result, nil
+}
+
 func (c *anthropicClient) summarizeOpenAI(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
+	// Codex ChatGPT Plus/Pro OAuth cannot authenticate against api.openai.com
+	// with a raw key because no key exists for that plan. When the openai-codex
+	// provider is selected with no OPENAI_API_KEY but a populated
+	// ~/.codex/auth.json is present, delegate to the `codex` CLI which already
+	// holds valid OAuth credentials and handles token refresh transparently.
+	if normalizeProviderID(c.provider) == "openai-codex" && strings.TrimSpace(c.apiKey) == "" && hasCodexOAuth() {
+		return summarizeViaCodexCLI(ctx, model, prompt, targetTokens)
+	}
+
 	reqBody := openAIResponsesRequest{
 		Model:           model,
 		MaxOutputTokens: targetTokens,
@@ -1379,6 +1490,15 @@ func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) 
 		}
 	}
 
+	// Codex OAuth fallback: when ~/.codex/auth.json exists the codex CLI
+	// can handle auth itself. Return an empty apiKey with nil error so the
+	// caller routes to summarizeViaCodexCLI. Placed before the OpenClaw
+	// auth-profile and credential-file lookups because those don't apply to
+	// ChatGPT Plus/Pro plans, which have no API-key equivalent.
+	if normalizedProvider == "openai-codex" && hasCodexOAuth() {
+		return "", nil
+	}
+
 	// Check CLAUDE_CODE_OAUTH_TOKEN env var (setup-token / OAuth support).
 	if normalizedProvider == "anthropic" {
 		if oauthToken := strings.TrimSpace(os.Getenv("CLAUDE_CODE_OAUTH_TOKEN")); oauthToken != "" {
@@ -1422,11 +1542,15 @@ func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) 
 		}
 	}
 
-	return "", fmt.Errorf(
+	msg := fmt.Sprintf(
 		"unable to resolve API key for provider %q; set one of: %s",
 		normalizedProvider,
 		strings.Join(envCandidates, ", "),
 	)
+	if normalizedProvider == "openai-codex" {
+		msg += " (or run `codex login` to populate ~/.codex/auth.json)"
+	}
+	return "", errors.New(msg)
 }
 
 // readSetupTokenFromSecrets reads an Anthropic setup-token from ~/.openclaw/secrets.json.

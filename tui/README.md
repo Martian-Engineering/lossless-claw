@@ -51,15 +51,17 @@ lcm-tui --db /path/to/lcm.db    # custom database path
 Each interactive operation has a standalone CLI equivalent for scripting:
 
 ```bash
-lcm-tui doctor 44 --apply --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai
-lcm-tui repair 44 --apply --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai
-lcm-tui rewrite 44 --all --apply --diff --provider openai --model gpt-5.3-codex
+lcm-tui doctor 44 --apply --provider openai-codex --model gpt-5.3-codex
+lcm-tui repair 44 --apply --provider openai-codex --model gpt-5.3-codex
+lcm-tui rewrite 44 --all --apply --diff --provider openai-codex --model gpt-5.3-codex
 lcm-tui dissolve 44 --summary-id sum_abc --apply     # undo a condensation
 lcm-tui transplant 18 653 --apply                    # copy DAG between conversations
-lcm-tui backfill my-agent session_abc --apply --provider openai --model gpt-5.3-codex
+lcm-tui backfill my-agent session_abc --apply --provider openai-codex --model gpt-5.3-codex
 lcm-tui backfill my-agent session_abc --apply --recompact --single-root # re-fold existing import to one root
 lcm-tui prompts --list                               # show active prompt sources
 ```
+
+Use `--provider openai-codex` after `codex login` when you want the TUI to delegate through the Codex CLI OAuth session. Keep `--provider openai` for direct OpenAI-compatible HTTP calls with a raw `OPENAI_API_KEY`.
 
 ## Documentation
 

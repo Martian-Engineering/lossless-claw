@@ -10,6 +10,10 @@ tui/lcm-tui
 dist/
 tui/tui
 
-# CE planning artifacts
+# CE planning artifacts (local agent scratch, never commit)
 docs/plans/
+docs/brainstorms/
+.compound-engineering/
 TASK.md
+BRIEF.md
+PROGRESS.md

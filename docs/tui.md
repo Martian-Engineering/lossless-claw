@@ -245,8 +245,8 @@ Scans for genuinely truncated summaries and can rewrite them in place. This is n
 # Preview repairs for one conversation
 lcm-tui doctor 44 --show-diff
 
-# Apply repairs with an OpenAI-compatible backend
-lcm-tui doctor 44 --apply --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai
+# Apply repairs through Codex CLI OAuth after `codex login`
+lcm-tui doctor 44 --apply --provider openai-codex --model gpt-5.3-codex
 
 # Scan only across every conversation
 lcm-tui doctor --all
@@ -262,6 +262,8 @@ lcm-tui doctor --all
 | `--base-url <url>` | Custom API base URL (overrides config and env) |
 | `--show-diff` | Show unified diff for each fix |
 | `--timestamps` | Inject timestamps into rewrite source text |
+
+Use `--provider openai-codex` when you want ChatGPT Plus/Pro OAuth from the Codex CLI. Keep `--provider openai` for direct OpenAI-compatible HTTP calls with a raw `OPENAI_API_KEY`, including custom `--base-url` proxies.
 
 ### `lcm-tui repair`
 
@@ -280,7 +282,10 @@ lcm-tui repair 44 --apply
 # Repair a specific summary
 lcm-tui repair 44 --summary-id sum_abc123 --apply
 
-# Repair through an OpenAI-compatible backend
+# Repair through Codex CLI OAuth after `codex login`
+lcm-tui repair 44 --apply --provider openai-codex --model gpt-5.3-codex
+
+# Repair through a custom OpenAI-compatible proxy with a raw API key
 lcm-tui repair 44 --apply --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai
 ```
 
@@ -316,10 +321,10 @@ lcm-tui rewrite 44 --depth 0 --apply
 # Rewrite everything bottom-up
 lcm-tui rewrite 44 --all --apply --diff
 
-# Rewrite with OpenAI Responses API
-lcm-tui rewrite 44 --summary sum_abc123 --provider openai --model gpt-5.3-codex --apply
+# Rewrite with Codex CLI OAuth after `codex login`
+lcm-tui rewrite 44 --summary sum_abc123 --provider openai-codex --model gpt-5.3-codex --apply
 
-# Rewrite through a custom OpenAI-compatible proxy
+# Rewrite through a custom OpenAI-compatible proxy with a raw API key
 lcm-tui rewrite 44 --summary sum_abc123 --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai --apply
 
 # Use custom prompt templates
@@ -412,10 +417,10 @@ lcm-tui backfill my-agent session_abc123 --apply --recompact --single-root
 # Import + compact + transplant into an active conversation
 lcm-tui backfill my-agent session_abc123 --apply --transplant-to 653
 
-# Backfill using OpenAI
-lcm-tui backfill my-agent session_abc123 --apply --provider openai --model gpt-5.3-codex
+# Backfill using Codex CLI OAuth after `codex login`
+lcm-tui backfill my-agent session_abc123 --apply --provider openai-codex --model gpt-5.3-codex
 
-# Backfill through a custom OpenAI-compatible proxy
+# Backfill through a custom OpenAI-compatible proxy with a raw API key
 lcm-tui backfill my-agent session_abc123 --apply --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai
 ```
 
