@@ -62,7 +62,13 @@ Most installations only need to override a handful of keys. If you want a comple
   "dynamicLeafChunkTokens": {
     "enabled": true,
     "max": 40000
-  }
+  },
+  "stripInjectedContextTags": [
+    "active_memory_plugin",
+    "relevant-memories",
+    "relevant_memories",
+    "hindsight_memories"
+  ]
 }
 ```
 
@@ -160,6 +166,7 @@ openclaw plugins install --link /path/to/lossless-claw
 | `fallbackProviders` | `Array<{ provider: string; model: string }>` | `[]` | `LCM_FALLBACK_PROVIDERS` | Explicit provider/model fallback chain for compaction summarization. Format for env vars is `provider/model,provider/model`. |
 | `circuitBreakerThreshold` | `integer` | `5` | `LCM_CIRCUIT_BREAKER_THRESHOLD` | Consecutive auth failures before the summarization circuit breaker trips. |
 | `circuitBreakerCooldownMs` | `integer` | `1800000` | `LCM_CIRCUIT_BREAKER_COOLDOWN_MS` | Cooldown before the summarization circuit breaker resets automatically. |
+| `stripInjectedContextTags` | `string[]` | `["active_memory_plugin", "relevant-memories", "relevant_memories", "hindsight_memories"]` | `LCM_STRIP_INJECTED_CONTEXT_TAGS` | XML tag names whose blocks are stripped from message content before compaction summarization. Memory/context plugins inject these via `prependContext`; stripping prevents ephemeral retrieval context from polluting compacted summaries. Env var format is comma-separated tag names. Set to `[]` (or empty env string) to disable. |
 
 ### Nested objects
 
