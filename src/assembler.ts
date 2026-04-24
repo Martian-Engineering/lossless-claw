@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import type { ContextEngine } from "openclaw/plugin-sdk";
-import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
+import {
+  sanitizeToolUseResultPairing,
+  stripTrailingEmptyAssistantPrefill,
+} from "./transcript-repair.js";
 import type {
   ConversationStore,
   MessagePartRecord,
@@ -1055,7 +1058,9 @@ export class ContextAssembler {
     const preSanitizeFreshTailMessages = cleanedEntries
       .filter((entry) => entry.segment === "freshTail")
       .map((entry) => entry.message);
-    const repaired = sanitizeToolUseResultPairing(cleaned) as AgentMessage[];
+    const repaired = stripTrailingEmptyAssistantPrefill(
+      sanitizeToolUseResultPairing(cleaned),
+    ) as AgentMessage[];
     return {
       messages: repaired,
       estimatedTokens,
