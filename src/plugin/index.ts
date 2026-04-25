@@ -22,6 +22,13 @@ import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type { LcmDependencies } from "../types.js";
 
+type PeriodicSweepState = {
+  timer: ReturnType<typeof setInterval> | null;
+  running: boolean;
+};
+
+const periodicSweepByInit = new WeakMap<SharedLcmInit, PeriodicSweepState>();
+
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
   const value = sessionKey.trim();
@@ -1965,6 +1972,43 @@ function wirePluginHandlers(
   deps: LcmDependencies,
   shared: SharedLcmInit,
 ): void {
+  const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+  const sweepState = periodicSweepByInit.get(shared) ?? { timer: null, running: false };
+  periodicSweepByInit.set(shared, sweepState);
+
+  const startPeriodicSweep = () => {
+    if (sweepState.timer) {
+      return;
+    }
+
+    sweepState.timer = setInterval(async () => {
+      if (sweepState.running) {
+        return;
+      }
+      sweepState.running = true;
+      try {
+        const engine = shared.getCachedEngine();
+        if (!engine) {
+          return;
+        }
+        const result = await engine.sweepActiveConversations();
+        if (result.swept > 0) {
+          deps.log.info(
+            `[lcm] sweep: checked=${result.swept} compacted=${result.compacted} errors=${result.errors}`,
+          );
+        }
+      } catch (err) {
+        deps.log.warn(`[lcm] sweep failed: ${describeLogError(err)}`);
+      } finally {
+        sweepState.running = false;
+      }
+    }, SWEEP_INTERVAL_MS);
+  };
+
+  shared.waitForEngine().then(startPeriodicSweep).catch((err) => {
+    deps.log.warn(`[lcm] sweep start deferred: ${describeLogError(err)}`);
+  });
+
   api.on("before_reset", async (event, ctx) => {
     await (await shared.waitForEngine()).handleBeforeReset({
       reason: event.reason,
@@ -2014,6 +2058,14 @@ function wirePluginHandlers(
       getLcm: shared.waitForEngine,
     }),
   );
+
+  api.on("gateway_stop", async () => {
+    if (sweepState.timer) {
+      clearInterval(sweepState.timer);
+      sweepState.timer = null;
+    }
+    sweepState.running = false;
+  });
 }
 
 const lcmPlugin = {
