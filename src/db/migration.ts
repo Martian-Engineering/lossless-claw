@@ -168,6 +168,73 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   }
 }
 
+/**
+ * Belt-and-suspenders guard: create `message_parts` if it does not yet exist.
+ *
+ * `message_parts` is defined inside the large `db.exec()` block in
+ * `runLcmMigrations`.  On some Node.js SQLite builds (particularly
+ * `node:sqlite` before v22.12) a syntax error or constraint-check mismatch
+ * anywhere in that block causes the exec to stop early, silently leaving
+ * tables that appear later in the string uncreated.  Any subsequent INSERT
+ * into `message_parts` then throws "no such table".
+ *
+ * This function probes `sqlite_master` directly and creates the table +
+ * indexes when absent, matching the pattern used for column guards
+ * (`ensureSummaryDepthColumn`, `ensureMessageIdentityHashColumn`, …).
+ */
+function ensureMessagePartsTable(db: DatabaseSync): void {
+  const tables = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'message_parts'`)
+    .all() as { name: string }[];
+  if (tables.length > 0) return;
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS message_parts (
+      part_id TEXT PRIMARY KEY,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      part_type TEXT NOT NULL CHECK (part_type IN (
+        'text', 'reasoning', 'tool', 'patch', 'file',
+        'subtask', 'compaction', 'step_start', 'step_finish',
+        'snapshot', 'agent', 'retry'
+      )),
+      ordinal INTEGER NOT NULL,
+      text_content TEXT,
+      is_ignored INTEGER,
+      is_synthetic INTEGER,
+      tool_call_id TEXT,
+      tool_name TEXT,
+      tool_status TEXT,
+      tool_input TEXT,
+      tool_output TEXT,
+      tool_error TEXT,
+      tool_title TEXT,
+      patch_hash TEXT,
+      patch_files TEXT,
+      file_mime TEXT,
+      file_name TEXT,
+      file_url TEXT,
+      subtask_prompt TEXT,
+      subtask_desc TEXT,
+      subtask_agent TEXT,
+      step_reason TEXT,
+      step_cost REAL,
+      step_tokens_in INTEGER,
+      step_tokens_out INTEGER,
+      snapshot_hash TEXT,
+      compaction_auto INTEGER,
+      metadata TEXT,
+      UNIQUE (message_id, ordinal)
+    )
+  `);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts (message_id)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type)`,
+  );
+}
+
 function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
   const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
   const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
@@ -982,6 +1049,9 @@ export function runLcmMigrations(
     runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
       ensureMessageIdentityHashColumn(db),
     );
+    // Belt-and-suspenders: ensure message_parts exists even if the bulk
+    // CREATE TABLE block above was interrupted before reaching it.
+    runMigrationStep("ensureMessagePartsTable", log, () => ensureMessagePartsTable(db));
     runMigrationStep("backfillMessageIdentityHashes", log, () =>
       backfillMessageIdentityHashes(db, { managesOwnTransaction: false }),
     );
