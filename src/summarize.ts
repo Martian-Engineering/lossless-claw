@@ -2,6 +2,13 @@ import { describeLogError } from "./lcm-log.js";
 import type { LcmDependencies } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 
+/**
+ * Module-level atomic counter for round-robin profile rotation.
+ * Each concurrent summarizer invocation starts at a different offset
+ * to distribute load across auth profiles and avoid thundering-herd 429s.
+ */
+let _profileRotationCounter = 0;
+
 export type LcmSummarizeOptions = {
   previousSummary?: string;
   isCondensed?: boolean;
@@ -1195,11 +1202,18 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
     let lastAuthError: LcmProviderAuthError | undefined;
 
-    for (let index = 0; index < resolvedCandidates.length; index += 1) {
-      const candidate = resolvedCandidates[index]!;
+    // Rotate starting index to distribute concurrent calls across profiles
+    const startIndex = _profileRotationCounter++ % resolvedCandidates.length;
+    const orderedCandidates = [
+      ...resolvedCandidates.slice(startIndex),
+      ...resolvedCandidates.slice(0, startIndex),
+    ];
+
+    for (let index = 0; index < orderedCandidates.length; index += 1) {
+      const candidate = orderedCandidates[index]!;
       const provider = candidate.provider;
       const model = candidate.model;
-      const nextCandidate = index < resolvedCandidates.length - 1 ? resolvedCandidates[index + 1]! : undefined;
+      const nextCandidate = index < orderedCandidates.length - 1 ? orderedCandidates[index + 1]! : undefined;
       const authProfileId = candidate.useLegacyAuthProfile ? legacyAuthProfileId : undefined;
       const providerApi = resolveProviderApiFromLegacyConfig(params.legacyParams.config, provider);
       const lookupOptions = {
