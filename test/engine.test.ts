@@ -4144,6 +4144,68 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.estimatedTokens).toBe(0);
   });
 
+  it("falls back to live context when assembled result has no user turns (cold-cache new session)", async () => {
+    // Reproduces the cold-cache new session scenario:
+    // Session starts with only an assistant greeting before any user message.
+    // When the cache goes cold and assemble() is called, the assembled DB context
+    // contains only the assistant greeting — no user turns.  This would cause a
+    // prefill error on providers that require conversations to end with a user message.
+    // The guard should detect the missing user turns and fall back to live context.
+    const engine = createEngine();
+    const sessionId = "session-cold-cache-no-user-turns";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "Hello! How can I help you today?" } as AgentMessage,
+    });
+
+    // Simulate the first real user message arriving (params.messages = current turn only)
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "Hi, I need help with something." },
+    ] as AgentMessage[];
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 10_000,
+    });
+
+    // Should fall back to live context, not return the assistant-only DB context
+    expect(result.messages).toBe(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("does not fall back when assembled result has user turns even if it ends with assistant", async () => {
+    // Normal session: DB has [user, assistant].  The assembled result ends with an
+    // assistant turn, but it contains user turns — this is valid because the framework
+    // appends the current user turn after the assembled context.
+    const engine = createEngine();
+    const sessionId = "session-ends-with-assistant-has-user-turns";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted message one" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "persisted message two" } as AgentMessage,
+    });
+
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "live turn" },
+    ] as AgentMessage[];
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 10_000,
+    });
+
+    // Should use the DB context (has user turns), not fall back to live
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0].role).toBe("user");
+    expect(result.messages[1].role).toBe("assistant");
+  });
+
   it("drops orphan tool results during assembled transcript repair", async () => {
     const engine = createEngine();
     const sessionId = "session-orphan-tool-result";
