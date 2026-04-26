@@ -905,6 +905,23 @@ describe("ConversationStore session reuse", () => {
     const refreshed = await store.getConversation(conv1.conversationId);
     expect(refreshed?.sessionId).toBe("uuid-2");
   });
+
+  it("does not reuse archived conversations by sessionId alone when sessionKey is missing", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const original = await store.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+    await store.archiveConversation(original.conversationId);
+
+    const recycled = await store.getOrCreateConversation("uuid-1");
+
+    expect(recycled.conversationId).not.toBe(original.conversationId);
+    expect(recycled.active).toBe(true);
+    expect((await store.getConversation(original.conversationId))?.active).toBe(false);
+  });
 });
 
 describe("LcmContextEngine before_reset lifecycle", () => {
@@ -1263,6 +1280,36 @@ describe("LcmContextEngine session_end lifecycle", () => {
 
     expect(firstFresh?.conversationId).not.toBe(original.conversationId);
     expect(secondFresh?.conversationId).toBe(firstFresh?.conversationId);
+  });
+
+  it("leaves the current conversation active when the next session key is ignored", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:workspace-support:**"],
+    });
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const original = await store.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+
+    await engine.handleSessionEnd({
+      reason: "idle",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+      nextSessionId: "uuid-2",
+      nextSessionKey: "agent:workspace-support:main",
+    });
+
+    const active = await store.getConversationBySessionKey("agent:main:main");
+    const ignored = await store.getConversationBySessionKey("agent:workspace-support:main");
+    const archived = await store.getConversation(original.conversationId);
+
+    expect(active?.conversationId).toBe(original.conversationId);
+    expect(active?.active).toBe(true);
+    expect(ignored).toBeNull();
+    expect(archived?.active).toBe(true);
+    expect(archived?.archivedAt).toBeNull();
   });
 });
 
