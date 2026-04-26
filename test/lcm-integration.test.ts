@@ -1257,6 +1257,68 @@ describe("LCM integration: compaction", () => {
     expect(contextItems.length).toBeLessThan(10);
   });
 
+  it("leaf compaction strips thinking/reasoning blocks from the summarizer input", async () => {
+    // Ingest a mix of messages: some with thinking blocks only, some with visible text,
+    // and some with both thinking blocks and visible text.
+    const thinkingOnlyContent = JSON.stringify([
+      { type: "thinking", thinking: "", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_abc", encrypted_content: "ENCRYPTED_PAYLOAD_XXXX" }) },
+    ]);
+    const mixedContent = JSON.stringify([
+      { type: "thinking", thinking: "Let me reason...", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_xyz", encrypted_content: "ANOTHER_ENCRYPTED" }) },
+      { type: "text", text: "Visible assistant reply." },
+    ]);
+    const plainContent = "A plain user message.";
+
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => plainContent,
+      roleFn: () => "user",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => thinkingOnlyContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => mixedContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    // Add extra user messages to cross the compaction threshold
+    await ingestMessages(convStore, sumStore, 7, {
+      contentFn: (i) => `Follow-up message ${i}`,
+      roleFn: () => "user",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+
+    let capturedSourceText = "";
+    const summarize = vi.fn(async (text: string) => {
+      capturedSourceText = text;
+      return "Leaf summary.";
+    });
+
+    await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(summarize).toHaveBeenCalled();
+
+    // Thinking block types and encrypted signatures must not appear in the summarizer input
+    expect(capturedSourceText).not.toContain("thinkingSignature");
+    expect(capturedSourceText).not.toContain("ENCRYPTED_PAYLOAD_XXXX");
+    expect(capturedSourceText).not.toContain("ANOTHER_ENCRYPTED");
+    expect(capturedSourceText).not.toContain('"type":"thinking"');
+
+    // The visible text from the mixed-content message must still be present
+    expect(capturedSourceText).toContain("Visible assistant reply.");
+
+    // The plain user message must still be present
+    expect(capturedSourceText).toContain("A plain user message.");
+  });
+
   it("leaf-trigger accounting respects fresh tail token caps", async () => {
     const tokenAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
