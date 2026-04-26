@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
+import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
@@ -64,6 +65,7 @@ export type ContextItemRecord = {
 
 export type SummarySearchInput = {
   conversationId?: number;
+  conversationIds?: number[];
   query: string;
   mode: "regex" | "full_text";
   since?: Date;
@@ -1033,6 +1035,7 @@ export class SummaryStore {
               input.query,
               limit,
               input.conversationId,
+              input.conversationIds,
               input.since,
               input.before,
               input.sort,
@@ -1048,6 +1051,7 @@ export class SummaryStore {
           input.query,
           limit,
           input.conversationId,
+          input.conversationIds,
           input.since,
           input.before,
         );
@@ -1058,6 +1062,7 @@ export class SummaryStore {
             input.query,
             limit,
             input.conversationId,
+            input.conversationIds,
             input.since,
             input.before,
             input.sort,
@@ -1067,30 +1072,49 @@ export class SummaryStore {
             input.query,
             limit,
             input.conversationId,
+            input.conversationIds,
             input.since,
             input.before,
           );
         }
       }
-      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before);
+      return this.searchLike(
+        input.query,
+        limit,
+        input.conversationId,
+        input.conversationIds,
+        input.since,
+        input.before,
+      );
     }
-    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
+    return this.searchRegex(
+      input.query,
+      limit,
+      input.conversationId,
+      input.conversationIds,
+      input.since,
+      input.before,
+    );
   }
 
   private searchFullText(
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
     sort?: SearchSort,
   ): SummarySearchResult[] {
     const where: string[] = ["summaries_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
-    if (conversationId != null) {
-      where.push("s.conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "s.conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR}) >= julianday(?)`);
       args.push(since.toISOString());
@@ -1122,6 +1146,7 @@ export class SummaryStore {
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
@@ -1132,10 +1157,13 @@ export class SummaryStore {
 
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) >= julianday(?)`);
       args.push(since.toISOString());
@@ -1209,6 +1237,7 @@ export class SummaryStore {
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
     sort?: SearchSort,
@@ -1237,10 +1266,13 @@ export class SummaryStore {
       where.push("LOWER(s.content) LIKE ? ESCAPE '\\'");
       args.push(`%${this.escapeLikeTerm(token)}%`);
     }
-    if (conversationId != null) {
-      where.push("s.conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "s.conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR}) >= julianday(?)`);
       args.push(since.toISOString());
@@ -1278,6 +1310,7 @@ export class SummaryStore {
     query: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
@@ -1312,10 +1345,13 @@ export class SummaryStore {
 
     const where: string[] = [...cjkClauses, ...latinClauses];
     const args: Array<string | number> = [...cjkArgs, ...latinArgs];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) >= julianday(?)`);
       args.push(since.toISOString());
@@ -1354,6 +1390,7 @@ export class SummaryStore {
     pattern: string,
     limit: number,
     conversationId?: number,
+    conversationIds?: number[],
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
@@ -1370,10 +1407,13 @@ export class SummaryStore {
 
     const where: string[] = [];
     const args: Array<string | number> = [];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) >= julianday(?)`);
       args.push(since.toISOString());

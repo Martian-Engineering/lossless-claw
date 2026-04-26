@@ -152,6 +152,7 @@ export function createLcmGrepTool(input: {
         mode,
         scope,
         conversationId: conversationScope.conversationId,
+        conversationIds: conversationScope.conversationIds,
         limit,
         since,
         before,
@@ -165,7 +166,12 @@ export function createLcmGrepTool(input: {
       if (conversationScope.allConversations) {
         lines.push("**Conversation scope:** all conversations");
       } else if (conversationScope.conversationId != null) {
-        lines.push(`**Conversation scope:** ${conversationScope.conversationId}`);
+        const familyCount = conversationScope.conversationIds?.length ?? 0;
+        lines.push(
+          familyCount > 1
+            ? `**Conversation scope:** session family rooted at ${conversationScope.conversationId} (${familyCount} segments)`
+            : `**Conversation scope:** ${conversationScope.conversationId}`,
+        );
       }
       if (since || before) {
         lines.push(
