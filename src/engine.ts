@@ -5327,6 +5327,22 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
+      // Guard: if assembled context contains no user turns at all (e.g. a new session
+      // that starts with an agent greeting before the first user message, cold-cache),
+      // fall back to live context to prevent LLM prefill errors.  Summaries always
+      // have role "user", so this only fires for raw-message-only DB states where
+      // every stored message is role "assistant" or "toolResult".
+      const assembledHasUserTurn = assembled.messages.some((m) => m.role === "user");
+      if (!assembledHasUserTurn && params.messages.length > 0) {
+        this.deps.log.info(
+          `[lcm] assemble: assembled context has no user turns, falling back to live context to prevent prefill errors conversation=${conversation.conversationId} ${sessionLabel} assembledMessages=${assembled.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        );
+        return {
+          messages: params.messages,
+          estimatedTokens: 0,
+        };
+      }
+
       this.deps.log.info(
         `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${assembled.messages.length} tokenBudget=${tokenBudget} estimatedTokens=${assembled.estimatedTokens} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
