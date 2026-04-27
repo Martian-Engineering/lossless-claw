@@ -6142,6 +6142,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
         ) => Promise<unknown>;
       };
       evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+      refreshBootstrapState: (params: unknown) => Promise<void>;
       consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
     };
     vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
@@ -6247,8 +6248,20 @@ describe("LcmContextEngine fidelity and token budget", () => {
       privateEngine,
       "consumeDeferredCompactionDebt",
     );
+    let releaseRefresh!: () => void;
+    let resolveRefreshStarted!: () => void;
+    const refreshStarted = new Promise<void>((resolve) => {
+      resolveRefreshStarted = resolve;
+    });
+    const refreshRelease = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    vi.spyOn(privateEngine, "refreshBootstrapState").mockImplementation(async () => {
+      resolveRefreshStarted();
+      await refreshRelease;
+    });
 
-    await engine.afterTurn({
+    const afterTurnPromise = engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("after-turn-background-busy-debt-durable"),
       messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
@@ -6260,6 +6273,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
       },
     });
 
+    await refreshStarted;
+    await flushImmediate();
+    expect(consumeDeferredCompactionDebtSpy).not.toHaveBeenCalled();
+
     let releaseQueue!: () => void;
     const heldQueue = privateEngine.withSessionQueue(sessionId, async () => {
       await new Promise<void>((resolve) => {
@@ -6267,6 +6284,8 @@ describe("LcmContextEngine fidelity and token budget", () => {
       });
     });
 
+    releaseRefresh();
+    await afterTurnPromise;
     await flushImmediate();
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
