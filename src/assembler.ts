@@ -21,6 +21,24 @@ const TOOL_CALL_TYPES = new Set([
   "function_call",
 ]);
 
+/** Block types that represent model-internal reasoning and will be stripped
+ *  by the provider layer before sending to the API. If an assistant message
+ *  contains *only* these block types, it should be treated as empty. */
+const THINKING_LIKE_TYPES = new Set(["thinking", "redacted_thinking", "reasoning"]);
+
+/** Returns true when every block in the content array is a thinking/reasoning
+ *  block that will be stripped downstream, leaving the message with an empty
+ *  content array (which Bedrock and other providers reject). */
+function isThinkingOnlyContent(content: unknown[]): boolean {
+  if (content.length === 0) return false;
+  return content.every(
+    (block) =>
+      !!block &&
+      typeof block === "object" &&
+      THINKING_LIKE_TYPES.has((block as Record<string, unknown>).type as string),
+  );
+}
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface AssembleContextInput {
@@ -1035,16 +1053,19 @@ export class ContextAssembler {
       return entry;
     });
 
-    // Filter out assistant messages with empty content — these can occur when
-    // tool-use-only turns are stored with content="" and zero message_parts,
-    // or when filterNonFreshAssistantToolCalls strips all tool_use blocks.
-    // Anthropic (and other providers) reject empty content arrays/strings.
+    // Filter out assistant messages with empty or thinking-only content —
+    // these can occur when tool-use-only turns are stored with content=""
+    // and zero message_parts, when filterNonFreshAssistantToolCalls strips
+    // all tool_use blocks, or when a turn contains only thinking/reasoning
+    // blocks that will be stripped by the provider layer, leaving an empty
+    // content array. Anthropic/Bedrock reject empty content arrays/strings.
     const cleanedEntries = normalizedEntries.filter(
       (entry) =>
         !(
           entry.message?.role === "assistant" &&
           (Array.isArray(entry.message.content)
-            ? entry.message.content.length === 0
+            ? entry.message.content.length === 0 ||
+              isThinkingOnlyContent(entry.message.content)
             : !entry.message.content)
         ),
     );

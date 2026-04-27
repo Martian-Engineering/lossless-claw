@@ -4377,23 +4377,42 @@ export class LcmContextEngine implements ContextEngine {
 
     const conversationId = conversation.conversationId;
     const storedMessageCount = await this.conversationStore.getMessageCount(conversationId);
-    if (storedMessageCount === 0 || storedMessageCount > batch.length) {
-      return batch;
+    if (storedMessageCount === 0) return batch;
+
+    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
+    if (!lastDbMessage) return batch;
+
+    const storedBatch = batch.map((m) => toStoredMessage(m));
+
+    // When the DB already has more messages than the incoming batch,
+    // the batch may be a tail-only replay. Try tail-matching first,
+    // then fall back to suffix-matching.
+    if (storedMessageCount > batch.length) {
+      return this.deduplicateOversizedBatch(
+        conversationId,
+        batch,
+        storedBatch,
+        storedMessageCount,
+        lastDbMessage,
+      );
     }
 
     // Aligned-tail check: DB's last message must match the message at the
     // exact replay boundary in the incoming batch. This replaces the
     // hasMessage() check which could false-positive on any repeated content.
-    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
-    if (!lastDbMessage) return batch;
-
-    const storedBatch = batch.map((m) => toStoredMessage(m));
     const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
     if (
       messageIdentity(lastDbMessage.role, lastDbMessage.content) !==
       messageIdentity(batchAtBoundary.role, batchAtBoundary.content)
     ) {
-      return batch;
+      // Prefix mismatch — attempt suffix fallback before giving up.
+      return this.deduplicateSuffixFallback(
+        conversationId,
+        batch,
+        storedBatch,
+        storedMessageCount,
+        "prefix-mismatch",
+      );
     }
 
     // Full proof: incoming batch must start with the entire stored transcript
@@ -4416,6 +4435,127 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     return batch.slice(storedMessageCount);
+  }
+
+  /**
+   * Handle the case where the DB has more messages than the incoming batch.
+   * The batch is likely a tail-only replay after compaction — try to match
+   * the entire batch against the tail of stored messages.
+   */
+  private async deduplicateOversizedBatch(
+    conversationId: number,
+    batch: AgentMessage[],
+    storedBatch: ReturnType<typeof toStoredMessage>[],
+    storedMessageCount: number,
+    lastDbMessage: { role: string; content: string },
+  ): Promise<AgentMessage[]> {
+    const lastBatchIdentity = messageIdentity(
+      storedBatch[storedBatch.length - 1]!.role,
+      storedBatch[storedBatch.length - 1]!.content,
+    );
+    const lastDbIdentity = messageIdentity(lastDbMessage.role, lastDbMessage.content);
+
+    // Quick check: if the last DB message matches the last batch message,
+    // verify that the entire batch matches the DB tail.
+    if (lastDbIdentity === lastBatchIdentity) {
+      const tailAfterSeq = storedMessageCount - batch.length;
+      const tailMessages = await this.conversationStore.getMessages(conversationId, {
+        afterSeq: tailAfterSeq,
+        limit: batch.length,
+      });
+      if (tailMessages.length === batch.length) {
+        let tailMatch = true;
+        for (let i = 0; i < batch.length; i++) {
+          if (
+            messageIdentity(tailMessages[i]!.role, tailMessages[i]!.content) !==
+            messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
+          ) {
+            tailMatch = false;
+            break;
+          }
+        }
+        if (tailMatch) {
+          this.deps.log.info(
+            `[lcm] dedup: tail-match detected, batch already fully stored ` +
+              `(storedCount=${storedMessageCount} batchLen=${batch.length}), skipping entire batch`,
+          );
+          return [];
+        }
+      }
+    }
+
+    // Fall back to suffix matching.
+    return this.deduplicateSuffixFallback(
+      conversationId,
+      batch,
+      storedBatch,
+      storedMessageCount,
+      "oversized",
+    );
+  }
+
+  /**
+   * Suffix-matching fallback: scan the batch from the end looking for a
+   * boundary where the stored transcript's tail aligns with a suffix of the
+   * batch. Returns only the genuinely new messages after that boundary.
+   */
+  private async deduplicateSuffixFallback(
+    conversationId: number,
+    batch: AgentMessage[],
+    storedBatch: ReturnType<typeof toStoredMessage>[],
+    storedMessageCount: number,
+    context: string,
+  ): Promise<AgentMessage[]> {
+    const allStored = await this.conversationStore.getMessages(conversationId, {
+      limit: storedMessageCount,
+    });
+    if (allStored.length === 0) return batch;
+
+    const lastStoredIdentity = messageIdentity(
+      allStored[allStored.length - 1]!.role,
+      allStored[allStored.length - 1]!.content,
+    );
+
+    for (let k = batch.length - 1; k >= 0; k--) {
+      if (
+        messageIdentity(storedBatch[k]!.role, storedBatch[k]!.content) !== lastStoredIdentity
+      ) {
+        continue;
+      }
+      const matchLen = Math.min(k + 1, allStored.length);
+      const startDb = allStored.length - matchLen;
+      let suffixMatch = true;
+      for (let j = 0; j < matchLen; j++) {
+        if (
+          messageIdentity(
+            allStored[startDb + j]!.role,
+            allStored[startDb + j]!.content,
+          ) !==
+          messageIdentity(
+            storedBatch[k - matchLen + 1 + j]!.role,
+            storedBatch[k - matchLen + 1 + j]!.content,
+          )
+        ) {
+          suffixMatch = false;
+          break;
+        }
+      }
+      if (suffixMatch && k + 1 < batch.length) {
+        const newSlice = batch.slice(k + 1);
+        this.deps.log.info(
+          `[lcm] dedup: ${context} suffix-match at batch[${k}], ` +
+            `returning ${newSlice.length} new messages ` +
+            `(storedCount=${storedMessageCount} batchLen=${batch.length})`,
+        );
+        return newSlice;
+      }
+    }
+
+    this.deps.log.warn(
+      `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
+        `no overlap found — ingesting full batch`,
+    );
+    return batch;
   }
   /**
    * Rebuild a compact tool-result message from stored message parts.
