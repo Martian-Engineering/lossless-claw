@@ -5208,11 +5208,21 @@ export class LcmContextEngine implements ContextEngine {
     /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
     prompt?: string;
   }): Promise<AssembleResult> {
+    // Return a NEW array (breaking reference equality with params.messages)
+    // and strip trailing assistant messages to prevent prefill errors.
+    // The runtime hook checks `assembled.messages !== sourceMessages` — if
+    // the same reference is returned, it passes raw messages straight to the
+    // API which may end on an assistant turn and trigger a prefill rejection.
+    const safeFallback = (): AssembleResult => {
+      const msgs = params.messages.slice();
+      while (msgs.length > 0 && msgs[msgs.length - 1]?.role === "assistant") {
+        msgs.pop();
+      }
+      return { messages: msgs, estimatedTokens: 0 };
+    };
+
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      return {
-        messages: params.messages,
-        estimatedTokens: 0,
-      };
+      return safeFallback();
     }
     try {
       this.ensureMigrated();
@@ -5230,10 +5240,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: conversation lookup missed ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return {
-          messages: params.messages,
-          estimatedTokens: 0,
-        };
+        return safeFallback();
       }
 
       const tokenBudget = this.applyAssemblyBudgetCap(
@@ -5279,10 +5286,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: no context items conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return {
-          messages: params.messages,
-          estimatedTokens: 0,
-        };
+        return safeFallback();
       }
 
       // Guard against incomplete bootstrap/coverage: if the DB only has
@@ -5293,10 +5297,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: falling back to live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${params.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return {
-          messages: params.messages,
-          estimatedTokens: 0,
-        };
+        return safeFallback();
       }
 
       const assembled = await this.assembler.assemble({
@@ -5321,10 +5322,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: empty assembled output, using live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return {
-          messages: params.messages,
-          estimatedTokens: 0,
-        };
+        return safeFallback();
       }
 
       this.deps.log.info(
@@ -5348,6 +5346,14 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
 
+      // Strip trailing assistant messages from assembled output to prevent prefill errors
+      while (
+        assembled.messages.length > 0 &&
+        assembled.messages[assembled.messages.length - 1]?.role === "assistant"
+      ) {
+        assembled.messages.pop();
+      }
+
       const result: AssembleResult = {
         messages: assembled.messages,
         estimatedTokens: assembled.estimatedTokens,
@@ -5357,10 +5363,7 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.info(
         `[lcm] assemble: failed for session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} error=${describeLogError(err)}`,
       );
-      return {
-        messages: params.messages,
-        estimatedTokens: 0,
-      };
+      return safeFallback();
     }
   }
 
