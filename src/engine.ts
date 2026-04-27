@@ -5198,6 +5198,13 @@ export class LcmContextEngine implements ContextEngine {
       }
     };
     let shouldRefreshBootstrapState = true;
+    let deferredCompactionDrain:
+      | {
+          reason: string;
+          tokenBudget: number;
+          currentTokenCount: number;
+        }
+      | null = null;
 
     let rawLeafTrigger:
       | {
@@ -5282,14 +5289,11 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: observedCurrentTokenCount,
         });
         if (compactionTelemetry?.provider || compactionTelemetry?.model) {
-          this.scheduleDeferredCompactionDebtDrain({
-            conversationId: conversation.conversationId,
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
+          deferredCompactionDrain = {
             tokenBudget,
             currentTokenCount: observedCurrentTokenCount,
             reason: deferredReason,
-          });
+          };
         } else {
           this.deps.log.info(
             `[lcm] background deferred compaction not scheduled conversation=${conversation.conversationId} ${sessionLabel} reason=cache-context-unknown debtReason=${deferredReason}`,
@@ -5304,6 +5308,17 @@ export class LcmContextEngine implements ContextEngine {
 
     if (shouldRefreshBootstrapState) {
       await refreshAfterTurnBootstrapState();
+    }
+
+    if (deferredCompactionDrain) {
+      this.scheduleDeferredCompactionDebtDrain({
+        conversationId: conversation.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget: deferredCompactionDrain.tokenBudget,
+        currentTokenCount: deferredCompactionDrain.currentTokenCount,
+        reason: deferredCompactionDrain.reason,
+      });
     }
 
     this.deps.log.info(
