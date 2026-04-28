@@ -1267,6 +1267,14 @@ describe("LCM integration: compaction", () => {
       { type: "thinking", thinking: "Let me reason...", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_xyz", encrypted_content: "ANOTHER_ENCRYPTED" }) },
       { type: "text", text: "Visible assistant reply." },
     ]);
+    const reasoningTextContent = JSON.stringify([
+      { type: "reasoning", text: "PRIVATE_REASONING_TEXT" },
+      { type: "text", text: "Visible reply after reasoning text." },
+    ]);
+    const thinkingSummaryContent = JSON.stringify([
+      { type: "thinking", summary: "PRIVATE_THINKING_SUMMARY" },
+      { type: "text", text: "Visible reply after thinking summary." },
+    ]);
     const plainContent = "A plain user message.";
 
     await ingestMessages(convStore, sumStore, 1, {
@@ -1281,6 +1289,16 @@ describe("LCM integration: compaction", () => {
     });
     await ingestMessages(convStore, sumStore, 1, {
       contentFn: () => mixedContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => reasoningTextContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => thinkingSummaryContent,
       roleFn: () => "assistant",
       tokenCountFn: (_i, c) => estimateTokens(c),
     });
@@ -1311,9 +1329,13 @@ describe("LCM integration: compaction", () => {
     expect(capturedSourceText).not.toContain("ENCRYPTED_PAYLOAD_XXXX");
     expect(capturedSourceText).not.toContain("ANOTHER_ENCRYPTED");
     expect(capturedSourceText).not.toContain('"type":"thinking"');
+    expect(capturedSourceText).not.toContain("PRIVATE_REASONING_TEXT");
+    expect(capturedSourceText).not.toContain("PRIVATE_THINKING_SUMMARY");
 
     // The visible text from the mixed-content message must still be present
     expect(capturedSourceText).toContain("Visible assistant reply.");
+    expect(capturedSourceText).toContain("Visible reply after reasoning text.");
+    expect(capturedSourceText).toContain("Visible reply after thinking summary.");
 
     // The plain user message must still be present
     expect(capturedSourceText).toContain("A plain user message.");
