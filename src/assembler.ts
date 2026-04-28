@@ -12,6 +12,71 @@ import { estimateTokens } from "./estimate-tokens.js";
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssemblySegment = "evictable" | "freshTail";
 
+export interface AssemblyOverflowContributor {
+  /** Context item ordinal in the persisted conversation window. */
+  ordinal: number;
+  /** Estimated token cost for the emitted prompt item. */
+  tokens: number;
+  /** Whether this item survived budget selection. */
+  selected: boolean;
+  /** Raw message id when the contributor is a message. */
+  messageId?: number;
+  /** Raw message sequence when the contributor is a message. */
+  seq?: number;
+  /** Raw message role when the contributor is a message. */
+  role?: MessageRole | "toolResult";
+  /** Summary id when the contributor is a summary. */
+  summaryId?: string;
+  /** Summary kind when the contributor is a summary. */
+  summaryKind?: SummaryRecord["kind"];
+  /** Summary depth when the contributor is a summary. */
+  summaryDepth?: number;
+}
+
+export interface AssemblyDuplicateCluster {
+  /** Depersonalized duplicate key or content hash. */
+  key: string;
+  /** Number of context items in this duplicate cluster. */
+  count: number;
+  /** Sum of estimated tokens in the duplicate cluster. */
+  tokens: number;
+  /** Context item ordinals participating in the cluster. */
+  ordinals: number[];
+  /** Message sequence hints when available. */
+  seqs?: number[];
+  /** Duplicate source kind. */
+  kind: "message-ref" | "summary-ref" | "message-content";
+}
+
+export interface AssemblyOverflowDiagnostics {
+  /** Token budget used by this assembly pass. */
+  tokenBudget: number;
+  /** Estimated token total for all resolved context items before selection. */
+  totalContextTokens: number;
+  /** Estimated raw-message tokens before selection. */
+  rawMessageTokens: number;
+  /** Estimated summary tokens before selection. */
+  summaryTokens: number;
+  /** Number of resolved raw messages before selection. */
+  rawMessageCount: number;
+  /** Number of resolved summaries before selection. */
+  summaryCount: number;
+  /** Number of resolved context items before selection. */
+  totalContextItems: number;
+  /** Raw messages selected for the assembled prompt. */
+  selectedRawMessageCount: number;
+  /** Summaries selected for the assembled prompt. */
+  selectedSummaryCount: number;
+  /** Duplicate context-reference clusters found before selection. */
+  duplicateRefClusters: AssemblyDuplicateCluster[];
+  /** Duplicate raw message-content clusters found before selection. */
+  duplicateMessageClusters: AssemblyDuplicateCluster[];
+  /** Largest raw-message token contributors. */
+  topMessageContributors: AssemblyOverflowContributor[];
+  /** Largest summary token contributors. */
+  topSummaryContributors: AssemblyOverflowContributor[];
+}
+
 const TOOL_CALL_TYPES = new Set([
   "toolCall",
   "toolUse",
@@ -69,6 +134,7 @@ export interface AssembleContextResult {
     preSanitizeFreshTailHash: string;
     preSanitizeMessagesHash: string;
     finalMessagesHash: string;
+    overflowDiagnostics: AssemblyOverflowDiagnostics;
   };
 }
 
@@ -678,6 +744,10 @@ function hashMessages(messages: AgentMessage[]): string {
   return createHash("sha256").update(JSON.stringify(messages)).digest("hex").slice(0, 16);
 }
 
+function hashText(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
 /** Format a Date for XML attributes in the agent's timezone. */
 function formatDateForAttribute(date: Date, timezone?: string): string {
   const tz = timezone ?? "UTC";
@@ -757,6 +827,120 @@ interface ResolvedItem {
   isMessage: boolean;
   /** Pre-extracted plain text used for relevance scoring */
   text: string;
+  /** Source raw message id when this item resolves a message. */
+  messageId?: number;
+  /** Source raw message sequence when this item resolves a message. */
+  seq?: number;
+  /** Source raw message role when this item resolves a message. */
+  sourceRole?: MessageRole;
+  /** Source summary record when this item resolves a summary. */
+  summary?: SummaryRecord;
+}
+
+function topContributors(
+  items: ResolvedItem[],
+  selectedOrdinals: Set<number>,
+  isMessage: boolean,
+): AssemblyOverflowContributor[] {
+  return items
+    .filter((item) => item.isMessage === isMessage)
+    .slice()
+    .sort((a, b) => b.tokens - a.tokens || a.ordinal - b.ordinal)
+    .slice(0, 5)
+    .map((item) => ({
+      ordinal: item.ordinal,
+      tokens: item.tokens,
+      selected: selectedOrdinals.has(item.ordinal),
+      ...(item.messageId != null ? { messageId: item.messageId } : {}),
+      ...(item.seq != null ? { seq: item.seq } : {}),
+      ...(item.sourceRole ? { role: item.sourceRole } : {}),
+      ...(item.summary
+        ? {
+            summaryId: item.summary.summaryId,
+            summaryKind: item.summary.kind,
+            summaryDepth: item.summary.depth,
+          }
+        : {}),
+    }));
+}
+
+function buildRefDuplicateClusters(items: ResolvedItem[]): AssemblyDuplicateCluster[] {
+  const clusters = new Map<string, ResolvedItem[]>();
+  for (const item of items) {
+    const key = item.isMessage
+      ? item.messageId == null ? null : `message:${item.messageId}`
+      : item.summary == null ? null : `summary:${item.summary.summaryId}`;
+    if (!key) {
+      continue;
+    }
+    const existing = clusters.get(key) ?? [];
+    existing.push(item);
+    clusters.set(key, existing);
+  }
+  return formatDuplicateClusters(clusters, (key) =>
+    key.startsWith("message:") ? "message-ref" : "summary-ref",
+  );
+}
+
+function buildMessageContentDuplicateClusters(items: ResolvedItem[]): AssemblyDuplicateCluster[] {
+  const clusters = new Map<string, ResolvedItem[]>();
+  for (const item of items) {
+    if (!item.isMessage || item.text.length === 0) {
+      continue;
+    }
+    const hash = hashText(item.text);
+    const existing = clusters.get(hash) ?? [];
+    existing.push(item);
+    clusters.set(hash, existing);
+  }
+  return formatDuplicateClusters(clusters, () => "message-content");
+}
+
+function formatDuplicateClusters(
+  clusters: Map<string, ResolvedItem[]>,
+  kindForKey: (key: string) => AssemblyDuplicateCluster["kind"],
+): AssemblyDuplicateCluster[] {
+  return [...clusters.entries()]
+    .filter(([, items]) => items.length > 1)
+    .map(([key, items]) => ({
+      key,
+      kind: kindForKey(key),
+      count: items.length,
+      tokens: items.reduce((sum, item) => sum + item.tokens, 0),
+      ordinals: items.map((item) => item.ordinal).slice(0, 8),
+      ...(items.some((item) => item.seq != null)
+        ? { seqs: items.flatMap((item) => item.seq == null ? [] : [item.seq]).slice(0, 8) }
+        : {}),
+    }))
+    .sort((a, b) => b.tokens - a.tokens || b.count - a.count || a.key.localeCompare(b.key))
+    .slice(0, 5);
+}
+
+function buildOverflowDiagnostics(
+  params: {
+    resolved: ResolvedItem[];
+    selected: ResolvedItem[];
+    tokenBudget: number;
+  },
+): AssemblyOverflowDiagnostics {
+  const selectedOrdinals = new Set(params.selected.map((item) => item.ordinal));
+  const rawMessageItems = params.resolved.filter((item) => item.isMessage);
+  const summaryItems = params.resolved.filter((item) => !item.isMessage);
+  return {
+    tokenBudget: params.tokenBudget,
+    totalContextTokens: params.resolved.reduce((sum, item) => sum + item.tokens, 0),
+    rawMessageTokens: rawMessageItems.reduce((sum, item) => sum + item.tokens, 0),
+    summaryTokens: summaryItems.reduce((sum, item) => sum + item.tokens, 0),
+    rawMessageCount: rawMessageItems.length,
+    summaryCount: summaryItems.length,
+    totalContextItems: params.resolved.length,
+    selectedRawMessageCount: params.selected.filter((item) => item.isMessage).length,
+    selectedSummaryCount: params.selected.filter((item) => !item.isMessage).length,
+    duplicateRefClusters: buildRefDuplicateClusters(params.resolved),
+    duplicateMessageClusters: buildMessageContentDuplicateClusters(params.resolved),
+    topMessageContributors: topContributors(params.resolved, selectedOrdinals, true),
+    topSummaryContributors: topContributors(params.resolved, selectedOrdinals, false),
+  };
 }
 
 function resolveFreshTailOrdinal(
@@ -1012,6 +1196,11 @@ export class ContextAssembler {
     selected.push(...freshTail);
 
     const estimatedTokens = evictableTokens + tailTokens;
+    const overflowDiagnostics = buildOverflowDiagnostics({
+      resolved,
+      selected,
+      tokenBudget,
+    });
 
     // Normalize assistant string content to array blocks (some providers return
     // content as a plain string; Anthropic expects content block arrays).
@@ -1083,6 +1272,7 @@ export class ContextAssembler {
         preSanitizeFreshTailHash: hashMessages(preSanitizeFreshTailMessages),
         preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
         finalMessagesHash: hashMessages(repaired),
+        overflowDiagnostics,
       },
     };
   }
@@ -1193,6 +1383,9 @@ export class ContextAssembler {
       tokens: tokenCount,
       isMessage: true,
       text: contentText,
+      messageId: msg.messageId,
+      seq: msg.seq,
+      sourceRole: msg.role,
     };
   }
 
@@ -1216,6 +1409,7 @@ export class ContextAssembler {
       tokens,
       isMessage: false,
       text: summary.content,
+      summary,
     };
   }
 }
