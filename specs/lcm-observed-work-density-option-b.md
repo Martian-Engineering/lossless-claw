@@ -217,22 +217,29 @@ PR16 should implement Option B as the default path:
 
 ---
 
-## Implementation scaffold added in this draft
+## Implementation added in this draft
 
-This draft now includes minimal code scaffolding so reviewers can evaluate the proposed shape in-repo instead of reading the architecture in isolation.
+This draft includes the persistence/read model, read-only query tool, and
+conservative deterministic extraction from new leaf summaries.
 
 Added files:
 
 - `src/store/observed-work-store.ts`
+- `src/observed-work-extractor.ts`
 - `src/tools/lcm-work-density-tool.ts`
 - `test/observed-work-store.test.ts`
+- `test/lcm-ultimate-architecture.test.ts`
 
-The scaffold intentionally keeps extraction out of scope. It defines the persistence/read-model and the read-only tool contract first. Extraction can be added in a follow-up once maintain-time watermarks and classifier quality are reviewed.
+Extraction remains deliberately conservative and rule-based. It uses leaf
+summary lines as evidence, preserves per-conversation processing watermarks,
+raises confidence only with repeated evidence, and records source links for
+proof-oriented drilldown.
 
 ### Current scaffold behavior
 
 - Creates observed-work tables idempotently during migration.
 - Stores observed work items, source links, and per-conversation processing state.
+- Processes new leaf summaries during maintenance.
 - Exposes `lcm_work_density` as a read-only tool.
 - Supports deterministic period filters for `today`, `yesterday`, `7d`, `30d`, `week`, `month`, and `date:YYYY-MM-DD`.
 - Returns density counts for a period:
@@ -254,10 +261,10 @@ The scaffold intentionally keeps extraction out of scope. It defines the persist
 - `ObservedWorkStore` preserves omitted incremental-state fields on partial updates.
 - `lcm_work_density` reads through `LcmContextEngine.getObservedWorkStore()` rather than reaching into private database state.
 - Period windows use the shared temporal helper module from the `lcm_recent` stack, so UTC+13/DST date boundaries stay consistent.
+- Extraction failures preserve retry state instead of dropping the watermark.
 
 ### Explicitly not implemented yet
 
-- automatic extraction from summaries
 - LLM classification
 - live current-day refresh
 - OpenClaw task bridge writes

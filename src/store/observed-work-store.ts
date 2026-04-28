@@ -57,6 +57,23 @@ export type ObservedWorkDensityQuery = {
   limit?: number;
 };
 
+export type ObservedWorkProcessingState = {
+  conversationId: number;
+  lastProcessedSummaryCreatedAt?: string;
+  lastProcessedSummaryId?: string;
+  pendingRebuild: boolean;
+  updatedAt: string;
+};
+
+export type ObservedWorkItemSnapshot = {
+  workItemId: string;
+  observedStatus: ObservedWorkStatus;
+  confidence: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  evidenceCount: number;
+};
+
 type ObservedWorkRow = {
   work_item_id: string;
   conversation_id: number;
@@ -85,6 +102,23 @@ type ObservedWorkSourceRow = {
     | "completed"
     | "contradicted"
     | "dismissed";
+};
+
+type ObservedWorkStateRow = {
+  conversation_id: number;
+  last_processed_summary_created_at: string | null;
+  last_processed_summary_id: string | null;
+  pending_rebuild: number;
+  updated_at: string;
+};
+
+type ObservedWorkItemSnapshotRow = {
+  work_item_id: string;
+  observed_status: ObservedWorkStatus;
+  confidence: number;
+  first_seen_at: string;
+  last_seen_at: string;
+  evidence_count: number;
 };
 
 export type ObservedWorkSource = {
@@ -161,8 +195,31 @@ function placeholders(values: readonly unknown[]): string {
   return values.map(() => "?").join(", ");
 }
 
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (part) => `\\${part}`);
+}
+
 export class ObservedWorkStore {
   constructor(private readonly db: DatabaseSync) {}
+
+  getItem(workItemId: string): ObservedWorkItemSnapshot | null {
+    const row = this.db.prepare(
+      `SELECT work_item_id, observed_status, confidence, first_seen_at, last_seen_at, evidence_count
+       FROM lcm_observed_work_items
+       WHERE work_item_id = ?`,
+    ).get(workItemId) as ObservedWorkItemSnapshotRow | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      workItemId: row.work_item_id,
+      observedStatus: row.observed_status,
+      confidence: row.confidence,
+      firstSeenAt: row.first_seen_at,
+      lastSeenAt: row.last_seen_at,
+      evidenceCount: row.evidence_count,
+    };
+  }
 
   upsertItem(item: ObservedWorkItemInput): void {
     this.db.prepare(
@@ -274,9 +331,32 @@ export class ObservedWorkStore {
     );
   }
 
+  getState(conversationId: number): ObservedWorkProcessingState | null {
+    const row = this.db.prepare(
+      `SELECT conversation_id, last_processed_summary_created_at, last_processed_summary_id,
+              pending_rebuild, updated_at
+       FROM lcm_observed_work_state
+       WHERE conversation_id = ?`,
+    ).get(conversationId) as ObservedWorkStateRow | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      conversationId: row.conversation_id,
+      ...(row.last_processed_summary_created_at
+        ? { lastProcessedSummaryCreatedAt: row.last_processed_summary_created_at }
+        : {}),
+      ...(row.last_processed_summary_id
+        ? { lastProcessedSummaryId: row.last_processed_summary_id }
+        : {}),
+      pendingRebuild: row.pending_rebuild === 1,
+      updatedAt: row.updated_at,
+    };
+  }
+
   getDensity(query: ObservedWorkDensityQuery): ObservedWorkDensityResult {
     const where: string[] = [];
-    const args: unknown[] = [];
+    const args: Array<string | number> = [];
     if (query.conversationId != null) {
       where.push("conversation_id = ?");
       args.push(query.conversationId);
@@ -298,8 +378,12 @@ export class ObservedWorkStore {
       args.push(...query.kinds);
     }
     if (query.topic) {
-      where.push("topic_key = ?");
-      args.push(query.topic);
+      const topic = query.topic.trim().toLowerCase();
+      const likeTopic = `%${escapeLikePattern(topic)}%`;
+      where.push(
+        "(lower(coalesce(topic_key, '')) = ? OR lower(title) LIKE ? ESCAPE '\\' OR lower(coalesce(rationale, '')) LIKE ? ESCAPE '\\')"
+      );
+      args.push(topic, likeTopic, likeTopic);
     }
     if (query.minConfidence != null) {
       where.push("confidence >= ?");

@@ -189,7 +189,8 @@ The scaffold exists so future maintainers can reason about the persistence bound
 - Supports accepting/rejecting/dismissing suggestions as records only.
 - Requires source IDs, rationale, and confidence between 0 and 1.
 - Does not create, link, close, or modify OpenClaw tasks.
-- Does not register a default tool.
+- Registers suggestion/review tools only when `taskBridgeToolsEnabled` or
+  `LCM_TASK_BRIDGE_TOOLS_ENABLED` explicitly enables them.
 
 ### Review hardening in this branch
 
@@ -200,7 +201,7 @@ The scaffold exists so future maintainers can reason about the persistence bound
 
 ### Explicitly not implemented
 
-- no runtime tool registration
+- no default-on runtime tool registration
 - no direct task writes
 - no task closure
 - no notifications/reminders

@@ -12,6 +12,9 @@ Use recall tools when the answer depends on historical evidence from compacted c
 | ------------------------------------------------------------------ | ----------------------------------------------- | ----------------------------------------------------- |
 | Recap by known time window                                         | `lcm_recent` only if active; otherwise `lcm_grep` | `lcm_describe` / `lcm_expand_query` for proof       |
 | Keyword, PR, file, customer, error, or identifier search           | `lcm_grep`                                      | `lcm_describe` / `lcm_expand_query`                   |
+| Observed done/blocked/unfinished work                              | `lcm_work_density` if active                    | `lcm_describe` / `lcm_expand_query` for proof         |
+| First occurrence, retelling, import, or incident cue                | `lcm_event_search` if active                    | `lcm_describe` / `lcm_expand_query` for proof         |
+| Suggested task action from observed evidence                        | `lcm_task_suggestions` only if active and enabled | Real task system after explicit approval            |
 | Known summary or file ID                                           | `lcm_describe`                                  | `lcm_expand` / `lcm_expand_query` if needed           |
 | Exact command, path, timestamp, root cause, or shipped-proof claim | `lcm_recent` or `lcm_grep` only to narrow       | `lcm_describe` / `lcm_expand_query` before asserting  |
 | Rollup freshness/provenance/debugging                              | `lcm_rollup_debug` only if active               | Source drilldown if needed                            |

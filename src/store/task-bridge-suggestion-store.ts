@@ -150,7 +150,7 @@ export class TaskBridgeSuggestionStore {
     limit?: number;
   }): TaskBridgeSuggestion[] {
     const where: string[] = [];
-    const args: unknown[] = [];
+    const args: Array<string | number> = [];
     if (input?.status) {
       where.push("status = ?");
       args.push(input.status);

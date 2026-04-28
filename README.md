@@ -189,6 +189,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
 | `LCM_TRANSCRIPT_GC_ENABLED` | `false` | Enable transcript rewrite GC during `maintain()` |
 | `LCM_ROLLUP_DEBUG_ENABLED` | `false` | Register the operator-facing `lcm_rollup_debug` inspection tool |
+| `LCM_TASK_BRIDGE_TOOLS_ENABLED` | `false` | Register opt-in inert LCM task suggestion tools; they write only to the LCM suggestion ledger and never mutate external tasks |
 | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | `deferred` | Choose whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior |
 | `LCM_CACHE_TTL_SECONDS` | `300` | Cache TTL used by cache-aware deferred compaction when provider/runtime telemetry does not supply a more specific retention window |
 

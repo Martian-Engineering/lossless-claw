@@ -21,6 +21,11 @@ import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmRecentTool } from "../tools/lcm-recent-tool.js";
 import { createLcmRollupDebugTool } from "../tools/lcm-rollup-debug-tool.js";
+import { createLcmEventSearchTool } from "../tools/lcm-event-search-tool.js";
+import {
+  createLcmTaskSuggestionReviewTool,
+  createLcmTaskSuggestionsTool,
+} from "../tools/lcm-task-suggestions-tool.js";
 import { createLcmWorkDensityTool } from "../tools/lcm-work-density-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type { LcmDependencies } from "../types.js";
@@ -2075,6 +2080,27 @@ function wirePluginHandlers(
       sessionKey: ctx.sessionKey,
     }),
   );
+  api.registerTool((ctx) =>
+    createLcmEventSearchTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+    }),
+  );
+  if (deps.config.taskBridgeToolsEnabled) {
+    api.registerTool((ctx) =>
+      createLcmTaskSuggestionsTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool(() =>
+      createLcmTaskSuggestionReviewTool({
+        getLcm: shared.waitForEngine,
+      }),
+    );
+  }
   if (deps.config.rollupDebugEnabled) {
     api.registerTool((ctx) =>
       createLcmRollupDebugTool({

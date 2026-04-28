@@ -47,6 +47,7 @@ import { describeLogError } from "./lcm-log.js";
 import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { RollupBuilder } from "./rollup-builder.js";
+import { ObservedWorkExtractor } from "./observed-work-extractor.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
@@ -66,8 +67,10 @@ import {
   type MessagePartType,
 } from "./store/conversation-store.js";
 import { ObservedWorkStore } from "./store/observed-work-store.js";
+import { EventObservationStore } from "./store/event-observation-store.js";
 import { RollupStore } from "./store/rollup-store.js";
 import { SummaryStore } from "./store/summary-store.js";
+import { TaskBridgeSuggestionStore } from "./store/task-bridge-suggestion-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
@@ -1453,6 +1456,9 @@ export class LcmContextEngine implements ContextEngine {
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
   private observedWorkStore: ObservedWorkStore;
+  private observedWorkExtractor: ObservedWorkExtractor;
+  private eventObservationStore: EventObservationStore;
+  private taskBridgeSuggestionStore: TaskBridgeSuggestionStore;
   private rollupStore: RollupStore;
   private rollupBuilder: RollupBuilder;
   private assembler: ContextAssembler;
@@ -1544,6 +1550,13 @@ export class LcmContextEngine implements ContextEngine {
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
     this.observedWorkStore = new ObservedWorkStore(this.db);
+    this.eventObservationStore = new EventObservationStore(this.db);
+    this.taskBridgeSuggestionStore = new TaskBridgeSuggestionStore(this.db);
+    this.observedWorkExtractor = new ObservedWorkExtractor(
+      this.db,
+      this.observedWorkStore,
+      this.eventObservationStore,
+    );
     this.rollupStore = new RollupStore(this.db);
     this.rollupBuilder = new RollupBuilder(this.rollupStore, {
       timezone: this.timezone,
@@ -4789,6 +4802,35 @@ export class LcmContextEngine implements ContextEngine {
             );
             markRollupRebuildPending("rollup-build-failed");
           }
+          try {
+            const observedResult = this.observedWorkExtractor.processConversation(
+              conversation.conversationId,
+              { limit: 500 },
+            );
+            if (
+              observedResult.summariesScanned > 0 ||
+              observedResult.workItemsUpserted > 0 ||
+              observedResult.eventsUpserted > 0
+            ) {
+              this.deps.log.info(
+                `[lcm] maintain: observed-work extraction conversation=${conversation.conversationId} ${sessionLabel} summaries=${observedResult.summariesScanned} workItems=${observedResult.workItemsUpserted} events=${observedResult.eventsUpserted}`,
+              );
+            }
+          } catch (error) {
+            this.deps.log.warn(
+              `[lcm] maintain: observed-work extraction failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
+            );
+            try {
+              this.observedWorkStore.upsertState({
+                conversationId: conversation.conversationId,
+                pendingRebuild: true,
+              });
+            } catch (stateError) {
+              this.deps.log.warn(
+                `[lcm] maintain: failed to preserve observed-work retry state conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(stateError)}`,
+              );
+            }
+          }
           return result;
         };
         const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
@@ -5082,9 +5124,13 @@ export class LcmContextEngine implements ContextEngine {
         last_message_at: new Date().toISOString(),
         pending_rebuild: 1,
       });
+      this.observedWorkStore.upsertState({
+        conversationId,
+        pendingRebuild: true,
+      });
     } catch (error) {
       this.deps.log.warn(
-        `[lcm] ingest: failed to mark rollup state dirty conversation=${conversationId}: ${describeLogError(error)}`,
+        `[lcm] ingest: failed to mark derived LCM state dirty conversation=${conversationId}: ${describeLogError(error)}`,
       );
     }
 
@@ -6692,6 +6738,14 @@ export class LcmContextEngine implements ContextEngine {
 
   getObservedWorkStore(): ObservedWorkStore {
     return this.observedWorkStore;
+  }
+
+  getEventObservationStore(): EventObservationStore {
+    return this.eventObservationStore;
+  }
+
+  getTaskBridgeSuggestionStore(): TaskBridgeSuggestionStore {
+    return this.taskBridgeSuggestionStore;
   }
 
   getRollupStore(): RollupStore {
