@@ -1672,6 +1672,70 @@ describe("LcmContextEngine.ingest content extraction", () => {
     );
   });
 
+  it("externalizes native user image blocks before raw payload fallback", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+    const sessionId = randomUUID();
+    const base64Image = `/9j/${"A".repeat(600)}`;
+    const userText =
+      "[media attached: /Users/example/inbound/screenshot.jpg (image/jpeg)]\nplease inspect";
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({
+        role: "user",
+        content: [
+          { type: "text", text: userText },
+          { type: "image", data: base64Image, mimeType: "image/jpeg" },
+        ],
+      }),
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("please inspect");
+    expect(messages[0].content).toContain("[User image: screenshot.jpg");
+    expect(messages[0].content).not.toContain("[LCM Raw Payload:");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+
+    const largeFiles = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(largeFiles).toHaveLength(1);
+    expect(largeFiles[0].fileName).toBe("screenshot.jpg");
+    expect(largeFiles[0].mimeType).toBe("image/jpeg");
+    expect(readFileSync(largeFiles[0].storageUri)).toEqual(Buffer.from(base64Image, "base64"));
+
+    const parts = await engine.getConversationStore().getMessageParts(messages[0].messageId);
+    expect(parts.map((part) => part.partType)).toEqual(["text", "text"]);
+    expect(JSON.stringify(parts)).not.toContain(base64Image.slice(0, 32));
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+    const assembledUser = assembled.messages[0] as {
+      role: string;
+      content?: Array<{ type?: unknown; text?: unknown }>;
+    };
+    expect(assembledUser.role).toBe("user");
+    expect(assembledUser.content?.[0]?.text).toContain("please inspect");
+    expect(assembledUser.content?.[1]?.text).toContain("[User image: screenshot.jpg");
+    expect(JSON.stringify(assembled.messages)).not.toContain(base64Image.slice(0, 32));
+  });
+
   it("externalizes oversized tool-result payloads into large_files", async () => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });

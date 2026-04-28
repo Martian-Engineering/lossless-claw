@@ -3378,6 +3378,93 @@ export class LcmContextEngine implements ContextEngine {
     return null;
   }
 
+  private static extensionForImageMimeType(mimeType: string): string | null {
+    switch (mimeType.toLowerCase()) {
+      case "image/jpeg":
+      case "image/jpg":
+        return "jpg";
+      case "image/png":
+        return "png";
+      case "image/gif":
+        return "gif";
+      case "image/webp":
+        return "webp";
+      case "image/svg+xml":
+        return "svg";
+      default:
+        return null;
+    }
+  }
+
+  private static normalizeNativeImageBlock(value: unknown): {
+    base64Data: string;
+    extension: string;
+    mimeType: string;
+  } | null {
+    const record = asRecord(value);
+    if (!record || record.type !== "image") {
+      return null;
+    }
+
+    const rawData = safeString(record.data);
+    if (!rawData) {
+      return null;
+    }
+
+    const dataUrlMatch = rawData.match(/^data:([^;,]+);base64,(.*)$/s);
+    const declaredMimeType =
+      dataUrlMatch?.[1] ??
+      safeString(record.mimeType) ??
+      safeString(record.mime_type) ??
+      safeString(record.mediaType) ??
+      safeString(record.media_type);
+    const base64Data = (dataUrlMatch?.[2] ?? rawData).replace(/\s+/g, "");
+    if (!base64Data || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64Data)) {
+      return null;
+    }
+
+    const detected = LcmContextEngine.detectBase64ImageType(base64Data);
+    const mimeType = detected?.mimeType ?? declaredMimeType;
+    if (!mimeType?.toLowerCase().startsWith("image/")) {
+      return null;
+    }
+
+    const extension = detected?.extension ?? LcmContextEngine.extensionForImageMimeType(mimeType);
+    return extension ? { base64Data, extension, mimeType } : null;
+  }
+
+  private static basenameForImageReference(pathLike: string): string | null {
+    const baseName = pathLike.trim().split(/[\\/]/).filter(Boolean).pop();
+    if (!baseName) {
+      return null;
+    }
+    return baseName.replace(/[^\w.\-@]+/g, "_") || null;
+  }
+
+  private static inferNativeImageFileName(params: {
+    content: unknown[];
+    imageIndex: number;
+    extension: string;
+  }): string {
+    for (let index = params.imageIndex - 1; index >= 0; index -= 1) {
+      const entry = asRecord(params.content[index]);
+      const text = entry?.type === "text" ? safeString(entry.text) : undefined;
+      if (!text) {
+        continue;
+      }
+
+      const mediaMatch = text.match(/\[media attached(?:\s+\d+\/\d+)?:\s*([^\s\]|()]+)/i);
+      const fileName = mediaMatch?.[1]
+        ? LcmContextEngine.basenameForImageReference(mediaMatch[1])
+        : null;
+      if (fileName) {
+        return fileName;
+      }
+    }
+
+    return `user-image.${params.extension}`;
+  }
+
   private static isExternalizedImageReference(value: string): boolean {
     if (typeof value !== "string") return false;
     return /^\[(?:User|Tool|Assistant|Image) image: .*LCM file: file_[a-f0-9]{16}\]$/.test(
@@ -3448,6 +3535,60 @@ export class LcmContextEngine implements ContextEngine {
 
     const reference = `[${params.label}: ${fileName} (${params.mimeType}, ${byteSize.toLocaleString("en-US")} bytes) | LCM file: ${fileId}]`;
     return { fileId, byteSize, summary, reference };
+  }
+
+  private async interceptNativeUserImageBlocks(params: {
+    conversationId: number;
+    message: AgentMessage;
+  }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
+    if (params.message.role !== "user" || !("content" in params.message)) {
+      return null;
+    }
+    if (!Array.isArray(params.message.content)) {
+      return null;
+    }
+
+    const rewrittenContent: unknown[] = [];
+    const fileIds: string[] = [];
+    let changed = false;
+
+    for (let index = 0; index < params.message.content.length; index += 1) {
+      const block = params.message.content[index];
+      const image = LcmContextEngine.normalizeNativeImageBlock(block);
+      if (!image) {
+        rewrittenContent.push(block);
+        continue;
+      }
+
+      const externalized = await this.externalizeImage({
+        conversationId: params.conversationId,
+        base64Data: image.base64Data,
+        fileName: LcmContextEngine.inferNativeImageFileName({
+          content: params.message.content,
+          imageIndex: index,
+          extension: image.extension,
+        }),
+        extension: image.extension,
+        mimeType: image.mimeType,
+        label: "User image",
+      });
+
+      rewrittenContent.push({ type: "text", text: externalized.reference });
+      fileIds.push(externalized.fileId);
+      changed = true;
+    }
+
+    if (!changed) {
+      return null;
+    }
+
+    return {
+      rewrittenMessage: {
+        ...params.message,
+        content: rewrittenContent,
+      } as AgentMessage,
+      fileIds,
+    };
   }
 
   private async interceptInlineImages(params: {
@@ -5275,6 +5416,15 @@ export class LcmContextEngine implements ContextEngine {
         stored = toStoredMessage(messageForParts);
       }
     } else {
+      const nativeImageIntercepted = await this.interceptNativeUserImageBlocks({
+        conversationId,
+        message: messageForParts,
+      });
+      if (nativeImageIntercepted) {
+        messageForParts = nativeImageIntercepted.rewrittenMessage;
+        stored = toStoredMessage(messageForParts);
+      }
+
       const imageIntercepted = await this.interceptInlineImages({
         conversationId,
         content: stored.content,
