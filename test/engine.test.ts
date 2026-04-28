@@ -4021,7 +4021,7 @@ describe("LcmContextEngine.bootstrap", () => {
 // ── Assemble canonical path with fallback ───────────────────────────────────
 
 describe("LcmContextEngine.assemble canonical path", () => {
-  it("falls back to live messages when no DB conversation exists", async () => {
+  it("strips assistant prefill tails when no DB conversation exists", async () => {
     const engine = createEngine();
     const liveMessages: AgentMessage[] = [
       { role: "user", content: "first turn" },
@@ -4034,7 +4034,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 100,
     });
 
-    expect(result.messages).toBe(liveMessages);
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
     expect(result.estimatedTokens).toBe(0);
   });
 
@@ -4058,7 +4059,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 256,
     });
 
-    expect(result.messages).toBe(liveMessages);
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
     expect(result.estimatedTokens).toBe(0);
   });
 
@@ -4140,7 +4142,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 1000,
     });
 
-    expect(result.messages).toBe(liveMessages);
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
     expect(result.estimatedTokens).toBe(0);
   });
 
