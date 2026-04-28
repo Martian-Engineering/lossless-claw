@@ -5531,6 +5531,18 @@ export class LcmContextEngine implements ContextEngine {
         const finish = async (
           result: ContextEngineMaintenanceResult,
         ): Promise<ContextEngineMaintenanceResult> => {
+          const markRollupRebuildPending = (reason: string): void => {
+            try {
+              this.rollupStore.upsertState(conversation.conversationId, {
+                timezone: this.timezone,
+                pending_rebuild: 1,
+              });
+            } catch (error) {
+              this.deps.log.warn(
+                `[lcm] maintain: failed to mark rollup rebuild pending conversation=${conversation.conversationId} ${sessionLabel} reason=${reason}: ${describeLogError(error)}`,
+              );
+            }
+          };
           try {
             const rollupState = this.rollupStore.getState(conversation.conversationId);
             if (
@@ -5548,10 +5560,7 @@ export class LcmContextEngine implements ContextEngine {
               );
               const errorCount = rollupResult.errors.length + aggregateResult.errors.length;
               if (errorCount > 0) {
-                this.rollupStore.upsertState(conversation.conversationId, {
-                  timezone: this.timezone,
-                  pending_rebuild: 1,
-                });
+                markRollupRebuildPending("rollup-build-errors");
               }
               this.deps.log.info(
                 `[lcm] maintain: rollups conversation=${conversation.conversationId} ${sessionLabel} dailyBuilt=${rollupResult.built} dailySkipped=${rollupResult.skipped} aggregateBuilt=${aggregateResult.built} aggregateSkipped=${aggregateResult.skipped} errors=${errorCount}`,
@@ -5561,10 +5570,7 @@ export class LcmContextEngine implements ContextEngine {
             this.deps.log.warn(
               `[lcm] maintain: rollup build failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
             );
-            this.rollupStore.upsertState(conversation.conversationId, {
-              timezone: this.timezone,
-              pending_rebuild: 1,
-            });
+            markRollupRebuildPending("rollup-build-failed");
           }
           return result;
         };

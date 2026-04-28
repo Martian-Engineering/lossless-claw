@@ -1,12 +1,21 @@
 import * as crypto from "node:crypto";
 import { estimateTokens } from "./estimate-tokens.js";
 import { withDatabaseTransaction } from "./transaction-mutex.js";
+import {
+  addDays,
+  assertValidPlainDate,
+  getLocalDateKey,
+  getLocalDayBoundsForDateKey,
+  getUtcDateForZonedMidnight,
+} from "./timezone-windows.js";
 import type {
   LeafSummaryForDayRow,
   RollupRow,
   RollupStateRow,
   RollupStore,
 } from "./store/rollup-store.js";
+
+export { getLocalDateKey, getLocalDayBounds } from "./timezone-windows.js";
 
 const DEFAULT_DAILY_TARGET_TOKENS = 5_000;
 const DEFAULT_DAILY_MAX_TOKENS = 15_000;
@@ -355,7 +364,7 @@ export class RollupBuilder {
     const scannedAt = new Date();
 
     for (let offset = 0; offset < daysBack; offset += 1) {
-      const dateKey = shiftDateKey(todayKey, -offset);
+      const dateKey = addDays(todayKey, -offset);
       if (!forceCurrentDay && dateKey === todayKey) {
         result.skipped += 1;
         continue;
@@ -449,9 +458,12 @@ export class RollupBuilder {
     try {
       const finishedAt = new Date();
       const latestState = this.store.getState(conversationId);
+      const latestSummaryCreatedAt =
+        this.store.getLatestLeafSummaryCreatedAt(conversationId);
       const shouldClearPending =
         result.errors.length === 0 &&
-        isTimestampAtOrBefore(latestState?.last_message_at, scannedAt);
+        isTimestampAtOrBefore(latestState?.last_message_at, scannedAt) &&
+        isTimestampAtOrBefore(latestSummaryCreatedAt, scannedAt);
       this.store.upsertState(conversationId, {
         timezone: this.config.timezone,
         last_rollup_check_at: laterDate(
@@ -650,54 +662,6 @@ function normalizeFingerprintDate(value: string | Date | null | undefined): stri
   }
   const date = value instanceof Date ? value : new Date(value);
   return Number.isNaN(date.getTime()) ? "" : date.toISOString();
-}
-
-export function getLocalDateKey(date: Date, timezone: string): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(date);
-}
-
-export function getLocalDayBounds(
-  date: Date,
-  timezone: string
-): { start: Date; end: Date } {
-  const dateKey = getLocalDateKey(date, timezone);
-  return getLocalDayBoundsForDateKey(dateKey, timezone);
-}
-
-function getLocalDayBoundsForDateKey(
-  dateKey: string,
-  timezone: string
-): { start: Date; end: Date } {
-  assertValidDateKey(dateKey);
-  const start = localDayBoundaryToUtc(dateKey, timezone);
-  const end = localDayBoundaryToUtc(
-    shiftDateKey(dateKey, 1),
-    timezone
-  );
-  return { start, end };
-}
-
-function localDayBoundaryToUtc(dateKey: string, timezone: string): Date {
-  try {
-    return localDateTimeToUtc(dateKey, "00:00:00", timezone);
-  } catch (error) {
-    for (let minuteOfDay = 1; minuteOfDay < 24 * 60; minuteOfDay += 1) {
-      const hour = Math.floor(minuteOfDay / 60);
-      const minute = minuteOfDay % 60;
-      const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`;
-      try {
-        return localDateTimeToUtc(dateKey, time, timezone);
-      } catch {
-        // Keep walking forward until the first real local instant for the day.
-      }
-    }
-    throw error;
-  }
 }
 
 function isTimestampAtOrBefore(
@@ -1112,7 +1076,7 @@ function startOfWeekKey(dayKey: string, timezone: string): string {
   const date = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
   const weekday = date.getUTCDay();
   const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
-  return shiftDateKey(dayKey, mondayOffset);
+  return addDays(dayKey, mondayOffset);
 }
 
 function getWeekBounds(
@@ -1121,8 +1085,8 @@ function getWeekBounds(
 ): { start: Date; end: Date } {
   assertValidDateKey(weekKey);
   return {
-    start: localDayBoundaryToUtc(weekKey, timezone),
-    end: localDayBoundaryToUtc(shiftDateKey(weekKey, 7), timezone),
+    start: getUtcDateForZonedMidnight(weekKey, timezone),
+    end: getUtcDateForZonedMidnight(addDays(weekKey, 7), timezone),
   };
 }
 
@@ -1133,12 +1097,12 @@ function getAggregateDayKeys(
   const startKey = periodKind === WEEK_PERIOD_KIND ? periodKey : `${periodKey}-01`;
   const endKey =
     periodKind === WEEK_PERIOD_KIND
-      ? shiftDateKey(periodKey, 7)
+      ? addDays(periodKey, 7)
       : getNextMonthStartKey(periodKey);
   const keys: string[] = [];
   for (let key = startKey, guard = 0; key < endKey && guard < 370; guard += 1) {
     keys.push(key);
-    key = shiftDateKey(key, 1);
+    key = addDays(key, 1);
   }
   return keys;
 }
@@ -1173,157 +1137,13 @@ function getMonthBounds(
   }
   const nextMonth = getNextMonthStartKey(monthKey);
   return {
-    start: localDayBoundaryToUtc(`${monthKey}-01`, timezone),
-    end: localDayBoundaryToUtc(nextMonth, timezone),
+    start: getUtcDateForZonedMidnight(`${monthKey}-01`, timezone),
+    end: getUtcDateForZonedMidnight(nextMonth, timezone),
   };
-}
-
-function shiftDateKey(dateKey: string, dayDelta: number): string {
-  assertValidDateKey(dateKey);
-  const utcDate = new Date(`${dateKey}T00:00:00.000Z`);
-  utcDate.setUTCDate(utcDate.getUTCDate() + dayDelta);
-  return utcDate.toISOString().slice(0, 10);
 }
 
 function assertValidDateKey(dateKey: string): void {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
-    throw new Error(`Invalid date key: ${dateKey}`);
-  }
-  const probe = new Date(`${dateKey}T12:00:00.000Z`);
-  if (
-    Number.isNaN(probe.getTime()) ||
-    probe.toISOString().slice(0, 10) !== dateKey
-  ) {
-    throw new Error(`Invalid date key: ${dateKey}`);
-  }
-}
-
-function parseTimeParts(time: string): {
-  hour: number;
-  minute: number;
-  second: number;
-} {
-  const match = /^(\d{2}):(\d{2}):(\d{2})$/.exec(time);
-  if (!match) {
-    throw new Error(`Invalid time: ${time}`);
-  }
-  const hour = Number.parseInt(match[1]!, 10);
-  const minute = Number.parseInt(match[2]!, 10);
-  const second = Number.parseInt(match[3]!, 10);
-  if (
-    hour < 0 ||
-    hour > 23 ||
-    minute < 0 ||
-    minute > 59 ||
-    second < 0 ||
-    second > 59
-  ) {
-    throw new Error(`Invalid time: ${time}`);
-  }
-  return { hour, minute, second };
-}
-
-function localDateTimeToUtc(
-  dateKey: string,
-  time: string,
-  timezone: string
-): Date {
-  assertValidDateKey(dateKey);
-  const [year, month, day] = dateKey
-    .split("-")
-    .map((part) => Number.parseInt(part, 10));
-  const { hour, minute, second } = parseTimeParts(time);
-  let candidate = new Date(
-    Date.UTC(year, month - 1, day, hour, minute, second, 0)
-  );
-
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const parts = getZonedDateTimeParts(candidate, timezone);
-    const deltaMs =
-      Date.UTC(year, month - 1, day, hour, minute, second, 0) -
-      Date.UTC(
-        parts.year,
-        parts.month - 1,
-        parts.day,
-        parts.hour,
-        parts.minute,
-        parts.second,
-        0
-      );
-    if (deltaMs === 0) {
-      return candidate;
-    }
-    candidate = new Date(candidate.getTime() + deltaMs);
-  }
-
-  throw new Error(
-    `Nonexistent local time ${dateKey} ${time} in timezone ${timezone}`
-  );
-}
-
-function getZonedDateTimeParts(
-  date: Date,
-  timezone: string
-): {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
-} {
-  const formatter = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-  const parts = formatter.formatToParts(date);
-  const lookup = new Map(parts.map((part) => [part.type, part.value]));
-  return normalizeZonedParts({
-    year: Number.parseInt(lookup.get("year") ?? "0", 10),
-    month: Number.parseInt(lookup.get("month") ?? "1", 10),
-    day: Number.parseInt(lookup.get("day") ?? "1", 10),
-    hour: Number.parseInt(lookup.get("hour") ?? "0", 10),
-    minute: Number.parseInt(lookup.get("minute") ?? "0", 10),
-    second: Number.parseInt(lookup.get("second") ?? "0", 10),
-  });
-}
-
-function normalizeZonedParts(parts: {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
-}): {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
-} {
-  if (parts.hour !== 24) {
-    return parts;
-  }
-  const rolled = new Date(
-    Date.UTC(parts.year, parts.month - 1, parts.day, 0, parts.minute, parts.second)
-  );
-  rolled.setUTCDate(rolled.getUTCDate() + 1);
-  return {
-    year: rolled.getUTCFullYear(),
-    month: rolled.getUTCMonth() + 1,
-    day: rolled.getUTCDate(),
-    hour: 0,
-    minute: rolled.getUTCMinutes(),
-    second: rolled.getUTCSeconds(),
-  };
+  assertValidPlainDate(dateKey, "Invalid date key");
 }
 
 function formatError(error: unknown): string {

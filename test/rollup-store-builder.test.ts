@@ -1794,6 +1794,71 @@ describe("LCM weekly and monthly rollups", () => {
     }
   });
 
+  it("keeps rebuild pending when leaf summaries change during a daily sweep", async () => {
+    const scanStart = new Date("2026-04-28T12:00:00.000Z");
+    const summaryChange = new Date("2026-04-28T12:00:05.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(scanStart);
+    try {
+      const { db, conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "rollup-summary-watermark",
+        sessionKey: "agent:main:rollup-summary-watermark",
+        title: "Rollup summary watermark",
+      });
+
+      await summaryStore.insertSummary({
+        summaryId: "sum_watermark",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Summary changes during sweep should keep rebuild pending.",
+        tokenCount: 10,
+        earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+        latestAt: new Date("2026-04-27T10:30:00.000Z"),
+      });
+      db.prepare(
+        `UPDATE summaries
+         SET created_at = ?
+         WHERE summary_id = ?`
+      ).run("2026-04-28T11:59:00.000Z", "sum_watermark");
+
+      const originalGetLeafSummaries =
+        rollupStore.getLeafSummariesForDay.bind(rollupStore);
+      let movedWatermark = false;
+      const lookupSpy = vi
+        .spyOn(rollupStore, "getLeafSummariesForDay")
+        .mockImplementation((...args) => {
+          const rows = originalGetLeafSummaries(...args);
+          if (!movedWatermark && args[1] === "2026-04-27T00:00:00.000Z") {
+            movedWatermark = true;
+            vi.setSystemTime(summaryChange);
+            db.prepare(
+              `UPDATE summaries
+               SET created_at = ?
+               WHERE summary_id = ?`
+            ).run(summaryChange.toISOString(), "sum_watermark");
+          }
+          return rows;
+        });
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await expect(
+        builder.buildDailyRollups(conversation.conversationId, {
+          forceCurrentDay: true,
+          daysBack: 2,
+        })
+      ).resolves.toMatchObject({ built: 1, errors: [] });
+      lookupSpy.mockRestore();
+
+      const state = rollupStore.getState(conversation.conversationId);
+      expect(state?.pending_rebuild).toBe(1);
+      expect(state?.last_rollup_check_at).toBe(summaryChange.toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports final sweep-state write failures without aborting built rollups", async () => {
     const { conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({
