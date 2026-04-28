@@ -407,6 +407,19 @@ export class RollupStore {
     return row ?? null;
   }
 
+  getLatestLeafSummaryCreatedAt(conversationId: number): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT strftime('%Y-%m-%dT%H:%M:%fZ', MAX(julianday(created_at))) AS latest_created_at
+         FROM summaries
+         WHERE conversation_id = ?
+           AND kind = 'leaf'`
+      )
+      .get(conversationId) as { latest_created_at: string | null } | undefined;
+
+    return row?.latest_created_at ?? null;
+  }
+
   upsertState(
     conversationId: number,
     updates: Partial<
