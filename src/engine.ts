@@ -5208,11 +5208,8 @@ export class LcmContextEngine implements ContextEngine {
     /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
     prompt?: string;
   }): Promise<AssembleResult> {
-    // Return a NEW array (breaking reference equality with params.messages)
-    // and strip trailing assistant messages to prevent prefill errors.
-    // The runtime hook checks `assembled.messages !== sourceMessages` — if
-    // the same reference is returned, it passes raw messages straight to the
-    // API which may end on an assistant turn and trigger a prefill rejection.
+    // Return a new fallback array so the runtime hook treats this as assembled
+    // context, and remove assistant prefill tails from fallback-only paths.
     const safeFallback = (): AssembleResult => {
       const msgs = params.messages.slice();
       while (msgs.length > 0 && msgs[msgs.length - 1]?.role === "assistant") {
@@ -5344,14 +5341,6 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble-debug conversation=${conversation.conversationId} ${sessionLabel} cacheAwareState=${cacheAwareState} messagesHash=${assembled.debug.finalMessagesHash} preSanitizeHash=${assembled.debug.preSanitizeMessagesHash} previousAssembledCount=${prefixChange.previousCount} commonPrefixCount=${prefixChange.commonPrefixCount} commonPrefixHash=${prefixChange.commonPrefixHash} previousWasPrefix=${prefixChange.previousWasPrefix} firstDivergenceIndex=${prefixChange.firstDivergenceIndex} previousDivergenceMessage=${prefixChange.previousDivergenceMessage} currentDivergenceMessage=${prefixChange.currentDivergenceMessage} evictableCount=${assembled.debug.preSanitizeEvictableCount} evictableHash=${assembled.debug.preSanitizeEvictableHash} freshTailSegmentCount=${assembled.debug.preSanitizeFreshTailCount} freshTailSegmentHash=${assembled.debug.preSanitizeFreshTailHash} selectionMode=${assembled.debug.selectionMode} freshTailOrdinal=${assembled.debug.freshTailOrdinal} orphanStrippingOrdinal=${assembled.debug.orphanStrippingOrdinal} baseFreshTailCount=${assembled.debug.baseFreshTailCount} freshTailCount=${assembled.debug.freshTailCount} tailTokens=${assembled.debug.tailTokens} remainingBudget=${assembled.debug.remainingBudget} evictableTotalTokens=${assembled.debug.evictableTotalTokens} promotedToolResults=${assembled.debug.promotedToolResultCount} promotedOrdinals=${promotedOrdinals} removedToolUseBlocks=${assembled.debug.removedToolUseBlockCount} touchedAssistantMessages=${assembled.debug.touchedAssistantMessageCount}`,
         );
-      }
-
-      // Strip trailing assistant messages from assembled output to prevent prefill errors
-      while (
-        assembled.messages.length > 0 &&
-        assembled.messages[assembled.messages.length - 1]?.role === "assistant"
-      ) {
-        assembled.messages.pop();
       }
 
       const result: AssembleResult = {
