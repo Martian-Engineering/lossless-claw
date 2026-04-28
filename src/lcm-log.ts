@@ -1,4 +1,4 @@
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "./openclaw-bridge.js";
 import type { LcmDependencies } from "./types.js";
 
 export type LcmLogger = LcmDependencies["log"];

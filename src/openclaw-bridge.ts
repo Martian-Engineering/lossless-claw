@@ -5,6 +5,7 @@
  */
 
 export type {
+  AnyAgentTool,
   ContextEngine,
   ContextEngineInfo,
   AssembleResult,
@@ -12,6 +13,9 @@ export type {
   IngestResult,
   IngestBatchResult,
   BootstrapResult,
+  OpenClawPluginApi,
+  OpenClawPluginCommandDefinition,
+  PluginCommandContext,
   SubagentSpawnPreparation,
   SubagentEndReason,
 } from "openclaw/plugin-sdk";

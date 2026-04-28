@@ -1,4 +1,4 @@
-import type { AnyAgentTool as OpenClawAnyAgentTool } from "openclaw/plugin-sdk";
+import type { AnyAgentTool as OpenClawAnyAgentTool } from "../openclaw-bridge.js";
 
 export type AnyAgentTool = OpenClawAnyAgentTool;
 

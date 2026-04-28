@@ -16,7 +16,7 @@ import type {
   IngestResult,
   SubagentEndReason,
   SubagentSpawnPreparation,
-} from "openclaw/plugin-sdk";
+} from "./openclaw-bridge.js";
 import {
   blockFromPart,
   contentFromParts,
