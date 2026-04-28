@@ -1178,6 +1178,99 @@ function estimateSessionTokenCountForAfterTurn(messages: AgentMessage[]): number
   return total;
 }
 
+function normalizeNonNegativeInteger(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return undefined;
+  }
+  return Math.floor(value);
+}
+
+function firstRuntimeTokenCount(record: Record<string, unknown> | null, keys: string[]): number | undefined {
+  if (!record) {
+    return undefined;
+  }
+  for (const key of keys) {
+    const count = normalizeNonNegativeInteger(record[key]);
+    if (count !== undefined) {
+      return count;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Extract the runtime prompt token count from OpenClaw runtimeContext.
+ *
+ * OpenClaw derives this as: input + cacheRead + cacheWrite from the
+ * normalizeUsage() result.  The runtimeContext carries it three ways:
+ *   1. runtimeContext.currentTokenCount  — direct value (preferred)
+ *   2. runtimeContext.usage             — {input, cacheRead, cacheWrite, ...}
+ *   3. runtimeContext.promptCache.lastCallUsage — same normalized shape
+ *
+ * normalizeUsage() maps provider-specific fields (prompt_tokens, input_tokens,
+ * cache_read, etc.) to the canonical {input, cacheRead, cacheWrite} shape,
+ * so the lastCallUsage passed to LCM is already provider-normalized.
+ */
+/**
+ * Sum prompt tokens from a usage record.
+ *
+ * Supports two shapes:
+ * - Normalized (OpenClaw internal): {input, cacheRead, cacheWrite}
+ * - Raw provider: {prompt_tokens, ...}
+ *
+ * normalizeUsage() maps raw provider fields (prompt_tokens, cache_read, etc.)
+ * to the canonical normalized shape before LCM receives runtimeContext.
+ * We accept both shapes to be robust to direct test calls and future changes.
+ */
+function sumPromptTokensFromUsageRecord(record: Record<string, unknown> | null): number | undefined {
+  if (!record) {
+    return undefined;
+  }
+  // Normalized shape: input + cacheRead + cacheWrite
+  const input = normalizeNonNegativeInteger(record["input"]);
+  const cacheRead = normalizeNonNegativeInteger(record["cacheRead"]);
+  const cacheWrite = normalizeNonNegativeInteger(record["cacheWrite"]);
+  if (input !== undefined || cacheRead !== undefined || cacheWrite !== undefined) {
+    return (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0);
+  }
+  // Raw provider shape: prompt_tokens (already includes cache reads)
+  const rawPromptTokens = normalizeNonNegativeInteger(
+    record["prompt_tokens"] ?? record["promptTokens"] ?? record["input_tokens"] ?? record["inputTokens"],
+  );
+  if (rawPromptTokens !== undefined) {
+    return rawPromptTokens;
+  }
+  return undefined;
+}
+
+function extractRuntimePromptTokenCount(runtimeContext?: Record<string, unknown>): number | undefined {
+  const ctx = asRecord(runtimeContext);
+  if (!ctx) {
+    return undefined;
+  }
+
+  // 1. Direct currentTokenCount (already derived by OpenClaw: input+cacheRead+cacheWrite)
+  const direct = normalizeNonNegativeInteger(ctx["currentTokenCount"]);
+  if (direct !== undefined) {
+    return direct;
+  }
+
+  // 2. Sum from runtimeContext.usage (normalizeUsage output: {input, cacheRead, cacheWrite})
+  const usageSum = sumPromptTokensFromUsageRecord(asRecord(ctx["usage"]) ?? asRecord(ctx["lastCallUsage"]));
+  if (usageSum !== undefined && usageSum > 0) {
+    return usageSum;
+  }
+
+  // 3. Sum from promptCache.lastCallUsage (same normalized shape)
+  const promptCache = asRecord(ctx["promptCache"]);
+  const promptCacheUsageSum = sumPromptTokensFromUsageRecord(asRecord(promptCache?.["lastCallUsage"]));
+  if (promptCacheUsageSum !== undefined && promptCacheUsageSum > 0) {
+    return promptCacheUsageSum;
+  }
+
+  return undefined;
+}
+
 function isBootstrapMessage(value: unknown): value is AgentMessage {
   if (!value || typeof value !== "object") {
     return false;
@@ -5538,14 +5631,22 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
 
+    const estimatedContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
+    const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
+    const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
+      (
+        (legacyParams ?? {}) as {
+          currentTokenCount?: unknown;
+        }
+      ).currentTokenCount,
+    );
     const observedCurrentTokenCount =
-      this.normalizeObservedTokenCount(
-        (
-          (legacyParams ?? {}) as {
-            currentTokenCount?: unknown;
-          }
-        ).currentTokenCount,
-      ) ?? estimateSessionTokenCountForAfterTurn(params.messages);
+      runtimePromptTokens ?? suppliedCurrentTokenCount ?? estimatedContextTokens;
+    if (runtimePromptTokens !== undefined) {
+      this.deps.log.debug(
+        `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens} estimatedTokenCount=${estimatedContextTokens}`,
+      );
+    }
     const conversation = await this.conversationStore.getConversationForSession({
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,

@@ -7602,6 +7602,62 @@ describe("LcmContextEngine fidelity and token budget", () => {
     );
   });
 
+  it("afterTurn prefers runtime prompt tokens over transcript estimates for compaction decisions", async () => {
+    const debugLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: {
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: debugLog,
+        },
+      },
+    );
+    const sessionId = "after-turn-runtime-prompt-tokens";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 204_800,
+      threshold: 98_304,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-runtime-prompt-tokens"),
+      messages: [makeMessage({ role: "assistant", content: "small transcript estimate" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 128_000,
+      runtimeContext: {
+        usage: {
+          prompt_tokens: 204_800,
+        },
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), expect.any(Number), 204_800);
+    expect(debugLog).toHaveBeenCalledWith(
+      expect.stringContaining("using runtime prompt token count currentTokenCount=204800"),
+    );
+  });
+
   it("evaluateIncrementalCompaction skips hot-cache maintenance when real budget headroom is comfortable", async () => {
     const infoLog = vi.fn();
     const engine = createEngineWithDeps(
