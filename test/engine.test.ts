@@ -3728,16 +3728,16 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(reconcileSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("uses the bulk import path for initial bootstrap", async () => {
-    const sessionFile = createSessionFilePath("bulk");
+  it("uses the live ingest path for initial bootstrap", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-ingest-path");
     const sm = SessionManager.open(sessionFile);
     sm.appendMessage({
       role: "user",
-      content: [{ type: "text", text: "bulk one" }],
+      content: [{ type: "text", text: "ingest one" }],
     } as AgentMessage);
     sm.appendMessage({
       role: "assistant",
-      content: [{ type: "text", text: "bulk two" }],
+      content: [{ type: "text", text: "ingest two" }],
     } as AgentMessage);
 
     const warnLog = vi.fn();
@@ -3753,13 +3753,185 @@ describe("LcmContextEngine.bootstrap", () => {
     const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
 
     const result = await engine.bootstrap({
-      sessionId: "bootstrap-bulk",
+      sessionId: "bootstrap-ingest-path",
       sessionFile,
     });
 
     expect(result.bootstrapped).toBe(true);
-    expect(bulkSpy).toHaveBeenCalledTimes(1);
-    expect(singleSpy).not.toHaveBeenCalled();
+    expect(result.importedMessages).toBe(2);
+    expect(bulkSpy).not.toHaveBeenCalled();
+    expect(singleSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("externalizes oversized file blocks during first-time bootstrap and still reconciles later tail messages", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("bootstrap-large-file-parity");
+      const fileText = `${"bootstrap file line\n".repeat(160)}done`;
+      writeFileSync(
+        sessionFile,
+        `${JSON.stringify({
+          role: "user",
+          content: `<file name="bootstrap.md" mime="text/markdown">${fileText}</file>`,
+        })}\n`,
+        "utf8",
+      );
+
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = "bootstrap-large-file-parity";
+      const first = await engine.bootstrap({ sessionId, sessionFile });
+      expect(first).toEqual({
+        bootstrapped: true,
+        importedMessages: 1,
+      });
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const initiallyStored = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(initiallyStored).toHaveLength(1);
+      expect(initiallyStored[0].content).toContain("[LCM File: file_");
+      expect(initiallyStored[0].content).not.toContain("<file name=");
+      expect(initiallyStored[0].content).not.toContain(fileText.slice(0, 64));
+
+      const fileIdMatch = initiallyStored[0].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("bootstrap.md");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(fileText);
+
+      const parts = await engine.getConversationStore().getMessageParts(initiallyStored[0].messageId);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].textContent).toContain("[LCM File: file_");
+
+      appendFileSync(
+        sessionFile,
+        `${JSON.stringify({
+          role: "assistant",
+          content: [{ type: "text", text: "tail after externalized bootstrap" }],
+        })}\n`,
+        "utf8",
+      );
+
+      const second = await engine.bootstrap({ sessionId, sessionFile });
+      expect(second).toEqual({
+        bootstrapped: true,
+        importedMessages: 1,
+        reason: "reconciled missing session messages",
+      });
+
+      const afterReconcile = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(afterReconcile.map((message) => message.content)).toEqual([
+        initiallyStored[0].content,
+        "tail after externalized bootstrap",
+      ]);
+    });
+  });
+
+  it("externalizes inline images during first-time bootstrap", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const sessionFile = createSessionFilePath("bootstrap-inline-image-parity");
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "user",
+        content: `[media attached: bootstrap.png]\n${base64Image}\n`,
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+    const sessionId = "bootstrap-inline-image-parity";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("[User image: bootstrap.png");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+
+    const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+    expect(fileIdMatch).not.toBeNull();
+    const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+    expect(storedFile).not.toBeNull();
+    expect(storedFile!.mimeType).toBe("image/png");
+    expect(storedFile!.storageUri).toContain(`${largeFilesDir}/${conversation!.conversationId}/`);
+  });
+
+  it("externalizes oversized tool results during first-time bootstrap", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("bootstrap-tool-result-parity");
+      const sm = SessionManager.open(sessionFile);
+      const toolOutput = `${"bootstrap tool output\n".repeat(160)}done`;
+      sm.appendMessage({
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_bootstrap_externalized",
+            name: "exec",
+            input: { cmd: "cat large.txt" },
+          },
+        ],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_bootstrap_externalized",
+        toolName: "exec",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_bootstrap_externalized",
+            name: "exec",
+            content: [{ type: "text", text: toolOutput }],
+          },
+        ],
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = "bootstrap-tool-result-parity";
+      const result = await engine.bootstrap({ sessionId, sessionFile });
+      expect(result.bootstrapped).toBe(true);
+      expect(result.importedMessages).toBe(2);
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+      const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(2);
+      expect(messages[1].content).toContain("[LCM Tool Output: file_");
+      expect(messages[1].content).toContain("tool=exec");
+      expect(messages[1].content).not.toContain(toolOutput.slice(0, 64));
+
+      const fileIdMatch = messages[1].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("exec.txt");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(toolOutput);
+
+      const parts = await engine.getConversationStore().getMessageParts(messages[1].messageId);
+      expect(parts).toHaveLength(1);
+      const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
+      expect(metadata).toMatchObject({
+        externalizedFileId: fileId,
+        originalByteSize: Buffer.byteLength(toolOutput, "utf8"),
+        toolOutputExternalized: true,
+        externalizationReason: "large_tool_result",
+      });
+    });
   });
 
   it("limits first-time bootstrap imports to the newest messages within bootstrapMaxTokens", async () => {
