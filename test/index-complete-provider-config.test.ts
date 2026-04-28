@@ -85,6 +85,7 @@ async function callComplete(params: {
   loadConfigResult: Record<string, unknown>;
   provider: string;
   model: string;
+  providerApi?: string;
   runtimeConfig?: unknown;
 }) {
   const { api, getFactory, loadConfig } = buildApi(params.loadConfigResult);
@@ -99,6 +100,7 @@ async function callComplete(params: {
       complete: (input: {
         provider: string;
         model: string;
+        providerApi?: string;
         runtimeConfig?: unknown;
         messages: Array<{ role: string; content: string }>;
         maxTokens: number;
@@ -111,6 +113,7 @@ async function callComplete(params: {
     const result = await engine.deps.complete({
       provider: params.provider,
       model: params.model,
+      providerApi: params.providerApi,
       runtimeConfig: params.runtimeConfig,
       messages: [{ role: "user", content: "Summarize this." }],
       maxTokens: 256,
@@ -223,6 +226,75 @@ describe("createLcmDependencies.complete provider config resolution", () => {
         headers: {
           Authorization: "Bearer test",
         },
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("prefers model-level runtime api over known model and provider api", async () => {
+    piAiMock.getModel.mockReturnValue({
+      id: "gpt-5.4-mini",
+      provider: "openai-codex",
+      api: "openai-codex-responses",
+      name: "GPT-5.4 Mini",
+      baseUrl: "https://chatgpt.com/backend-api/v1",
+    });
+
+    const runtimeConfig = {
+      models: {
+        providers: {
+          "openai-codex": {
+            api: "openai-codex-responses",
+            baseUrl: "https://api.openai.com/v1",
+            models: [{ id: "gpt-5.4-mini", api: "openai-completions" }],
+          },
+        },
+      },
+    };
+
+    await callComplete({
+      loadConfigResult: runtimeConfig,
+      provider: "openai-codex",
+      model: "gpt-5.4-mini",
+      providerApi: "openai-codex-responses",
+      runtimeConfig,
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "gpt-5.4-mini",
+        provider: "openai-codex",
+        api: "openai-completions",
+        baseUrl: "https://api.openai.com/v1",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("prefers model-level runtime api over provider api when model is custom", async () => {
+    await callComplete({
+      loadConfigResult: {},
+      provider: "openai-codex",
+      model: "custom-mini",
+      providerApi: "openai-codex-responses",
+      runtimeConfig: {
+        models: {
+          providers: {
+            "openai-codex": {
+              models: [{ id: "custom-mini", api: "openai-completions" }],
+            },
+          },
+        },
+      },
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "custom-mini",
+        provider: "openai-codex",
+        api: "openai-completions",
       }),
       expect.any(Object),
       expect.any(Object),

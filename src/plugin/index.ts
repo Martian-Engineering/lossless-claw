@@ -1574,13 +1574,22 @@ function createLcmDependencies(
 
         const knownModel =
           typeof mod.getModel === "function" ? mod.getModel(providerId, modelId) : undefined;
-        const fallbackApi =
-          (isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
-            ? knownModel.api.trim()
-            : undefined) ||
+        const modelRuntimeApi = resolveModelApiFromRuntimeConfig(
+          effectiveRuntimeConfig,
+          providerId,
+          modelId,
+        );
+        const providerRuntimeApi =
           providerApi?.trim() ||
-          resolveModelApiFromRuntimeConfig(effectiveRuntimeConfig, providerId, modelId) ||
-          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
+          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId);
+        const knownModelApi =
+          isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
+            ? knownModel.api.trim()
+            : undefined;
+        const fallbackApi =
+          modelRuntimeApi ||
+          providerRuntimeApi ||
+          knownModelApi ||
           (() => {
             if (typeof mod.getModels !== "function") {
               return undefined;
@@ -1624,10 +1633,7 @@ function createLcmDependencies(
                 ...knownModel,
                 id: knownModel.id,
                 provider: knownModel.provider,
-                api:
-                  typeof providerLevelConfig.api === "string" && providerLevelConfig.api.trim()
-                    ? providerLevelConfig.api.trim()
-                    : knownModel.api,
+                api: modelRuntimeApi || providerRuntimeApi || knownModel.api,
                 // Provider config must be able to override built-in transport defaults.
                 // Otherwise built-in providers like `openai` keep their catalog baseUrl
                 // (`https://api.openai.com/v1`) even when OpenClaw runtime config points
