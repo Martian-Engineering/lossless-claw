@@ -300,7 +300,7 @@ function buildDelegatedExpandQueryTask(params: {
     `- Keep answer concise and focused (target <= ${params.maxTokens} tokens).`,
     "- citedIds must be unique summary IDs.",
     "- expandedSummaryCount should reflect how many summaries were expanded/used.",
-    "- totalSourceTokens should estimate total tokens consumed from expansion calls.",
+    "- totalSourceTokens should estimate the total source tokens consumed for retrieval. Include both: (a) the `totalTokens` returned by each `lcm_expand` call you made, AND (b) for any explicit leaf summary used as evidence whose `lcm_expand` returned 0 tokens because the leaf has no children to expand, the leaf summary's own `tok` value from `lcm_describe`. This avoids reporting `totalSourceTokens: 0` when the answer was actually derived from a leaf summary's content.",
     "- truncated should indicate whether source expansion appears truncated.",
   ]
     .filter((line): line is string => typeof line === "string")
