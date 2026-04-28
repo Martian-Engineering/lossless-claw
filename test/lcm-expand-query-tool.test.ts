@@ -259,6 +259,8 @@ describe("createLcmExpandQueryTool", () => {
     expect(message).toContain("lcm_describe");
     expect(message).toContain("DO NOT call `lcm_expand_query` from this delegated session.");
     expect(message).toContain("Synthesize the final answer from retrieved evidence, not assumptions.");
+    expect(message).toContain("for any explicit leaf summary used as evidence");
+    expect(message).toContain("even if you did not call `lcm_expand` for that leaf");
     expect(message).toContain("Expansion token budget");
 
     expect(delegatedSessionKey).not.toBe("");
