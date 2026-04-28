@@ -205,6 +205,80 @@ describe("LCM temporal rollup MVP", () => {
       )?.content
     ).toContain("skipped local midnight");
   });
+
+  it("uses the requested UTC+13 local date key for daily rollups", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "utc-plus-day",
+      sessionKey: "agent:main:utc-plus-day",
+      title: "UTC plus day",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_utc_plus_day",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Captured work in the Pacific/Auckland local day.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-26T12:30:00.000Z"),
+      latestAt: new Date("2026-04-26T13:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, {
+      timezone: "Pacific/Auckland",
+    });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+
+    const rollup = rollupStore.getRollup(
+      conversation.conversationId,
+      "day",
+      "2026-04-27",
+      "Pacific/Auckland"
+    );
+    expect(rollup?.period_start).toBe("2026-04-26T12:00:00.000Z");
+    expect(rollup?.period_end).toBe("2026-04-27T12:00:00.000Z");
+    expect(rollup?.content).toContain("Pacific/Auckland local day");
+  });
+
+  it("looks up existing daily rollups inside the rebuild transaction", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "day-toctou",
+      sessionKey: "agent:main:day-toctou",
+      title: "Day TOCTOU",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_day_toctou",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Existing rollup lookup happens under the write lock.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+
+    const lookupSpy = vi.spyOn(rollupStore, "getRollup");
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+
+    expect(lookupSpy).toHaveBeenCalledTimes(1);
+    expect(lookupSpy).toHaveBeenCalledWith(
+      conversation.conversationId,
+      "day",
+      "2026-04-27",
+      "UTC"
+    );
+    lookupSpy.mockRestore();
+  });
 });
 
 import {
@@ -268,6 +342,31 @@ function makeRecentDeps(): LcmDependencies {
       debug: () => {},
     },
   } as unknown as LcmDependencies;
+}
+
+function makeLcmForConversation(input: {
+  conversationId: number;
+  rollupStore: RollupStore;
+  sessionId: string;
+  timezone?: string;
+  now?: Date;
+}) {
+  const now = input.now ?? new Date();
+  return {
+    timezone: input.timezone ?? "UTC",
+    getRollupStore: () => input.rollupStore,
+    getConversationStore: () => ({
+      getConversationBySessionId: async () => ({
+        conversationId: input.conversationId,
+        sessionId: input.sessionId,
+        title: null,
+        bootstrappedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      }),
+      getConversationBySessionKey: async () => null,
+    }),
+  };
 }
 
 describe("LCM sub-day window retrieval", () => {
@@ -435,6 +534,107 @@ describe("LCM sub-day window retrieval", () => {
     ]);
   });
 
+  it("uses stored daily rollups, validates date periods, and falls back across mixed timestamp formats", async () => {
+    const { db, conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "recent-rollup-fallback",
+      sessionKey: "agent:main:recent-rollup-fallback",
+      title: "Recent rollup fallback",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_recent_rollup",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Stored daily rollup should be served for this local date.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_recent_fallback",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content:
+        "Fallback summary with a space-separated SQLite timestamp should match the day.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+    });
+    db.prepare(
+      `UPDATE summaries
+       SET created_at = ?, earliest_at = NULL, latest_at = NULL
+       WHERE summary_id = ?`
+    ).run("2026-04-26 10:00:00", "sum_recent_fallback");
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: makeLcmForConversation({
+        conversationId: conversation.conversationId,
+        rollupStore,
+        sessionId: "recent-rollup-fallback",
+      }) as never,
+      sessionId: "recent-rollup-fallback",
+    });
+
+    const stored = await tool.execute("call-stored-day", {
+      period: "date:2026-04-27",
+      includeSources: true,
+    });
+    const storedText = (stored.content[0] as { text: string }).text;
+    expect(storedText).toContain("sum_recent_rollup");
+    expect(storedText).toContain("Stored daily rollup should be served");
+    expect((stored.details as { status?: string }).status).toBe("ready");
+
+    const hiddenStored = await tool.execute("call-hidden-stored-day", {
+      period: "date:2026-04-27",
+      includeSources: false,
+    });
+    const hiddenStoredText = (hiddenStored.content[0] as { text: string }).text;
+    expect(hiddenStoredText).toContain("*Sources: omitted*");
+    expect(hiddenStoredText).not.toContain("sum_recent_rollup");
+    expect(
+      (hiddenStored.details as { summaryIds?: string[] }).summaryIds
+    ).toEqual([]);
+
+    const fallback = await tool.execute("call-mixed-timestamp-day", {
+      period: "date:2026-04-26",
+      includeSources: true,
+    });
+    const fallbackText = (fallback.content[0] as { text: string }).text;
+    expect(fallbackText).toContain("sum_recent_fallback");
+    expect(fallbackText).toContain("space-separated SQLite timestamp");
+    expect((fallback.details as { usedFallback?: boolean }).usedFallback).toBe(
+      true
+    );
+
+    const hiddenFallback = await tool.execute("call-hidden-fallback-day", {
+      period: "date:2026-04-26",
+      includeSources: false,
+    });
+    const hiddenFallbackText = (hiddenFallback.content[0] as { text: string })
+      .text;
+    expect(hiddenFallbackText).toContain("*Sources: omitted*");
+    expect(hiddenFallbackText).not.toContain("sum_recent_fallback");
+    expect(
+      (hiddenFallback.details as { summaryIds?: string[] }).summaryIds
+    ).toEqual([]);
+
+    const invalid = await tool.execute("call-invalid-date", {
+      period: "date:2026-02-31",
+    });
+    expect((invalid.details as { error?: string }).error).toMatch(
+      /real calendar date/
+    );
+  });
+
   it("orders fallback rows by the displayed effective time", async () => {
     const { db, conversationStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
@@ -548,6 +748,7 @@ describe("LCM sub-day window retrieval", () => {
       maxSourceSummaries: 80,
     });
     const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("*Sources: omitted*");
     expect(text).not.toContain("sum_budget_");
     expect(estimateTokens(text)).toBeLessThanOrEqual(250);
     expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([]);
@@ -824,6 +1025,85 @@ describe("LCM sub-day window retrieval", () => {
       };
       expect(details.status).toBe("ready");
       expect(details.summaryIds).toHaveLength(25);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("caps combined multi-day rollups by dropping older days first", async () => {
+    const now = new Date("2026-04-29T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { db, conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "seven-day-budget",
+        sessionKey: "agent:main:seven-day-budget",
+        title: "Seven day budget",
+      });
+      const priorDays = [
+        "2026-04-23",
+        "2026-04-24",
+        "2026-04-25",
+        "2026-04-26",
+        "2026-04-27",
+        "2026-04-28",
+      ];
+
+      for (const day of priorDays) {
+        await summaryStore.insertSummary({
+          summaryId: `sum_budget_rollup_${day}`,
+          conversationId: conversation.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content: `Rollup seed for ${day}.`,
+          tokenCount: 10,
+          sourceMessageTokenCount: 10,
+          latestAt: new Date(`${day}T10:00:00.000Z`),
+        });
+      }
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      for (const day of priorDays) {
+        await expect(
+          builder.buildDayRollup(conversation.conversationId, day)
+        ).resolves.toBe(true);
+        db.prepare(
+          `UPDATE lcm_rollups
+           SET content = ?, token_count = ?, source_summary_ids = ?
+           WHERE conversation_id = ? AND period_kind = 'day' AND period_key = ?`
+        ).run(
+          `Rollup payload ${day}. ${"detail ".repeat(1000)}`,
+          10_000,
+          JSON.stringify([`sum_budget_rollup_${day}`]),
+          conversation.conversationId,
+          day
+        );
+      }
+
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: makeLcmForConversation({
+          conversationId: conversation.conversationId,
+          rollupStore,
+          sessionId: "seven-day-budget",
+          now,
+        }) as never,
+        sessionId: "seven-day-budget",
+      });
+
+      const result = await tool.execute("call-7d-budget", {
+        period: "7d",
+        includeSources: true,
+        maxOutputTokens: 700,
+        globalMaxOutputTokens: 700,
+      });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain("earlier rollups omitted to fit budget");
+      expect(text).not.toContain("Rollup payload 2026-04-23");
+      expect(text).toContain("Rollup payload 2026-04-28");
+      expect((result.details as { truncated?: boolean }).truncated).toBe(true);
+      expect(estimateTokens(text)).toBeLessThanOrEqual(700);
     } finally {
       vi.useRealTimers();
     }
