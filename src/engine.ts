@@ -3863,6 +3863,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     conversationId: number;
     historicalMessages: AgentMessage[];
+    checkpointEntryHash?: string | null;
   }): Promise<{
     blockedByImportCap: boolean;
     importedMessages: number;
@@ -3963,10 +3964,24 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (anchorIndex < 0) {
-      this.deps.log.info(
-        `[lcm] reconcileSessionTail: no anchor for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=false`,
-      );
-      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
+      const checkpointEntryHash = params.checkpointEntryHash;
+      if (checkpointEntryHash) {
+        // Externalized bootstrap rows no longer match raw JSONL content, so
+        // fall back to the raw transcript checkpoint before declaring no overlap.
+        for (let index = storedHistoricalMessages.length - 1; index >= 0; index--) {
+          if (createBootstrapEntryHash(storedHistoricalMessages[index]) === checkpointEntryHash) {
+            anchorIndex = index;
+            break;
+          }
+        }
+      }
+
+      if (anchorIndex < 0) {
+        this.deps.log.info(
+          `[lcm] reconcileSessionTail: no anchor for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=false`,
+        );
+        return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
+      }
     }
     if (anchorIndex >= historicalMessages.length - 1) {
       this.deps.log.info(
@@ -4005,15 +4020,15 @@ export class LcmContextEngine implements ContextEngine {
   /**
    * Persist bootstrap checkpoint metadata anchored to the current DB frontier.
    *
-   * We intentionally checkpoint the session file's current EOF while hashing the
-   * latest persisted DB message. This keeps append-only recovery aligned with the
-   * canonical LCM frontier even when trailing transcript entries are pruned or
-   * otherwise noncanonical.
+   * By default, the frontier hash follows the latest persisted DB message. The
+   * first-time bootstrap path can override it with the raw transcript hash so
+   * later reconciliation can anchor entries whose DB content was externalized.
    */
   private async refreshBootstrapState(params: {
     conversationId: number;
     sessionFile: string;
     fileStats?: { size: number; mtimeMs: number };
+    lastProcessedEntryHash?: string | null;
   }): Promise<void> {
     const latestDbMessage = await this.conversationStore.getLastMessage(params.conversationId);
     const fileStats = params.fileStats ?? (await stat(params.sessionFile));
@@ -4023,13 +4038,16 @@ export class LcmContextEngine implements ContextEngine {
       lastSeenSize: fileStats.size,
       lastSeenMtimeMs: Math.trunc(fileStats.mtimeMs),
       lastProcessedOffset: fileStats.size,
-      lastProcessedEntryHash: latestDbMessage
-        ? createBootstrapEntryHash({
-            role: latestDbMessage.role,
-            content: latestDbMessage.content,
-            tokenCount: latestDbMessage.tokenCount,
-          })
-        : null,
+      lastProcessedEntryHash:
+        params.lastProcessedEntryHash !== undefined
+          ? params.lastProcessedEntryHash
+          : latestDbMessage
+            ? createBootstrapEntryHash({
+                role: latestDbMessage.role,
+                content: latestDbMessage.content,
+                tokenCount: latestDbMessage.tokenCount,
+              })
+            : null,
     });
   }
 
@@ -4068,6 +4086,7 @@ export class LcmContextEngine implements ContextEngine {
         this.conversationStore.withTransaction(async () => {
           const persistBootstrapState = async (
             conversationId: number,
+            lastProcessedEntryHash?: string | null,
           ): Promise<void> => {
             await this.refreshBootstrapState({
               conversationId,
@@ -4076,6 +4095,7 @@ export class LcmContextEngine implements ContextEngine {
                 size: sessionFileSize,
                 mtimeMs: sessionFileMtimeMs,
               },
+              lastProcessedEntryHash,
             });
             // Update the file-level cache so subsequent bootstraps against an
             // unchanged file can skip the full read via the cache guard.
@@ -4310,28 +4330,24 @@ export class LcmContextEngine implements ContextEngine {
               };
             }
 
-            const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
-            const bulkInput = bootstrapMessages.map((message, index) => {
-              const stored = toStoredMessage(message);
-              return {
-                conversationId,
-                seq: nextSeq + index,
-                role: stored.role,
-                content: stored.content,
-                tokenCount: stored.tokenCount,
-              };
-            });
-
-            const inserted = await this.conversationStore.createMessagesBulk(bulkInput);
-            await this.summaryStore.appendContextMessages(
-              conversationId,
-              inserted.map((record) => record.messageId),
-            );
+            let importedMessages = 0;
+            for (const message of bootstrapMessages) {
+              const result = await this.ingestSingle({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                message,
+              });
+              if (result.ingested) {
+                importedMessages += 1;
+              }
+            }
             await this.conversationStore.markConversationBootstrapped(conversationId);
 
             // Prune HEARTBEAT_OK turns from the freshly imported data
+            let prunedMessages = 0;
             if (this.config.pruneHeartbeatOk) {
               const pruned = await this.pruneHeartbeatOkTurns(conversationId);
+              prunedMessages = pruned;
               if (pruned > 0) {
                 this.clearStableOrphanStrippingOrdinal(conversationId);
                 this.deps.log.info(
@@ -4340,17 +4356,23 @@ export class LcmContextEngine implements ContextEngine {
               }
             }
 
-            await persistBootstrapState(conversationId);
-            if (inserted.length > 0) {
+            const lastImportedHash =
+              prunedMessages === 0 && bootstrapMessages.length > 0
+                ? createBootstrapEntryHash(
+                    toStoredMessage(bootstrapMessages[bootstrapMessages.length - 1]),
+                  )
+                : undefined;
+            await persistBootstrapState(conversationId, lastImportedHash);
+            if (importedMessages > 0) {
               this.clearStableOrphanStrippingOrdinal(conversationId);
             }
             this.deps.log.info(
-              `[lcm] bootstrap: initial import conversation=${conversationId} ${sessionLabel} importedMessages=${inserted.length} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+              `[lcm] bootstrap: initial import conversation=${conversationId} ${sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
             );
 
             return {
               bootstrapped: true,
-              importedMessages: inserted.length,
+              importedMessages,
             };
           }
 
@@ -4361,6 +4383,7 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             conversationId,
             historicalMessages,
+            checkpointEntryHash: bootstrapState?.lastProcessedEntryHash,
           });
           this.deps.log.info(
             `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - startedAt)}`,
