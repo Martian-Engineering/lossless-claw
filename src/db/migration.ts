@@ -1209,6 +1209,51 @@ export function runLcmMigrations(
       `);
     });
 
+    runMigrationStep("ensureTaskBridgeSuggestionTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_task_bridge_suggestions (
+          suggestion_id TEXT PRIMARY KEY,
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          task_id TEXT,
+          suggestion_kind TEXT NOT NULL CHECK (suggestion_kind IN (
+            'create_task',
+            'link_task',
+            'mark_task_done',
+            'mark_task_blocked',
+            'add_task_evidence'
+          )),
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+            'pending',
+            'accepted',
+            'rejected',
+            'dismissed',
+            'expired'
+          )),
+          confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+          rationale TEXT NOT NULL,
+          source_ids TEXT NOT NULL,
+          created_by TEXT NOT NULL DEFAULT 'lcm_observed',
+          reviewed_by TEXT,
+          reviewed_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureTaskBridgeSuggestionIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_status_kind_idx
+          ON lcm_task_bridge_suggestions(status, suggestion_kind, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_work_item_idx
+          ON lcm_task_bridge_suggestions(work_item_id, status);
+
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
+          ON lcm_task_bridge_suggestions(task_id, status);
+      `);
+    });
+
     const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
     const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
     if (fts5Available) {
