@@ -1,0 +1,1650 @@
+import { describe, expect, it, vi } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { runLcmMigrations } from "../src/db/migration.js";
+import { getLcmDbFeatures } from "../src/db/features.js";
+import { ConversationStore } from "../src/store/conversation-store.js";
+import { SummaryStore } from "../src/store/summary-store.js";
+import { RollupBuilder } from "../src/rollup-builder.js";
+import { RollupStore } from "../src/store/rollup-store.js";
+import { estimateTokens } from "../src/estimate-tokens.js";
+
+function createStores() {
+  const db = new DatabaseSync(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  const { fts5Available } = getLcmDbFeatures(db);
+  runLcmMigrations(db, { fts5Available });
+  return {
+    db,
+    conversationStore: new ConversationStore(db, { fts5Available }),
+    summaryStore: new SummaryStore(db, { fts5Available }),
+    rollupStore: new RollupStore(db),
+  };
+}
+
+describe("LCM temporal rollup MVP", () => {
+  it("creates rollup schema and compatibility views", () => {
+    const { db } = createStores();
+
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollups'"
+        )
+        .get()
+    ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollup_sources'"
+        )
+        .get()
+    ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lcm_rollup_state'"
+        )
+        .get()
+    ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'daily_rollups'"
+        )
+        .get()
+    ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'weekly_rollups'"
+        )
+        .get()
+    ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'view' AND name = 'monthly_rollups'"
+        )
+        .get()
+    ).toBeTruthy();
+  });
+
+  it("builds a stable daily rollup and preserves rollup_id across rebuilds", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "rollup-stability",
+      sessionKey: "agent:main:rollup-stability",
+      title: "Rollup stability",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_rollup_a",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Decided to restore the daily rollup MVP.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_rollup_b",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content:
+        "Completed a safe fallback audit and found the old wildcard path.",
+      tokenCount: 12,
+      sourceMessageTokenCount: 12,
+      earliestAt: new Date("2026-04-27T12:00:00.000Z"),
+      latestAt: new Date("2026-04-27T12:30:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    const first = rollupStore.getRollup(
+      conversation.conversationId,
+      "day",
+      "2026-04-27"
+    );
+    expect(first?.status).toBe("ready");
+    expect(first?.content).toContain("Daily Summary: 2026-04-27");
+    expect(first?.source_summary_ids).toBe(
+      JSON.stringify(["sum_rollup_a", "sum_rollup_b"])
+    );
+
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    const second = rollupStore.getRollup(
+      conversation.conversationId,
+      "day",
+      "2026-04-27"
+    );
+    expect(second?.rollup_id).toBe(first?.rollup_id);
+    expect(second?.source_message_count).toBe(2);
+    expect(
+      rollupStore
+        .getRollupSources(second!.rollup_id)
+        .map((source) => source.source_id)
+    ).toEqual(["sum_rollup_a", "sum_rollup_b"]);
+  });
+
+  it("deletes an existing daily rollup when a direct rebuild finds no sources", async () => {
+    const { db, conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "empty-direct-day",
+      sessionKey: "agent:main:empty-direct-day",
+      title: "Empty direct day",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_empty_direct",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Temporary direct day rollup content.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+    ).toBeTruthy();
+
+    db.prepare("DELETE FROM summaries WHERE summary_id = ?").run("sum_empty_direct");
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+    ).toBeNull();
+  });
+
+  it("builds daily rollups when local midnight is skipped by DST", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "midnight-gap-day",
+      sessionKey: "agent:main:midnight-gap-day",
+      title: "Midnight gap day",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_midnight_gap",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Captured work after a skipped local midnight.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-23T22:30:00.000Z"),
+      latestAt: new Date("2026-04-23T22:45:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, {
+      timezone: "Africa/Cairo",
+    });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-24")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(
+        conversation.conversationId,
+        "day",
+        "2026-04-24",
+        "Africa/Cairo"
+      )?.content
+    ).toContain("skipped local midnight");
+  });
+});
+
+import {
+  createLcmRecentTool,
+  __lcmRecentTestInternals,
+} from "../src/tools/lcm-recent-tool.js";
+import { createLcmRollupDebugTool } from "../src/tools/lcm-rollup-debug-tool.js";
+import type { LcmDependencies } from "../src/types.js";
+
+function makeRecentDeps(): LcmDependencies {
+  return {
+    config: {
+      enabled: true,
+      databasePath: ":memory:",
+      largeFilesDir: "/tmp/lcm-large-files",
+      ignoreSessionPatterns: [],
+      statelessSessionPatterns: [],
+      skipStatelessSessions: true,
+      contextThreshold: 0.75,
+      freshTailCount: 8,
+      promptAwareEviction: false,
+      newSessionRetainDepth: 2,
+      leafMinFanout: 8,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      incrementalMaxDepth: 0,
+      leafChunkTokens: 20_000,
+      leafTargetTokens: 600,
+      condensedTargetTokens: 900,
+      maxExpandTokens: 120,
+      largeFileTokenThreshold: 25_000,
+      summaryProvider: "",
+      summaryModel: "",
+      largeFileSummaryProvider: "",
+      largeFileSummaryModel: "",
+      timezone: "UTC",
+      pruneHeartbeatOk: false,
+      transcriptGcEnabled: false,
+      rollupDebugEnabled: false,
+      proactiveThresholdCompactionMode: "deferred",
+      summaryMaxOverageFactor: 3,
+    },
+    complete: async () => ({ content: [] }),
+    callGateway: async () => ({}),
+    resolveModel: () => ({ provider: "anthropic", model: "claude-opus-4-5" }),
+    getApiKey: async () => undefined,
+    requireApiKey: async () => "",
+    parseAgentSessionKey: () => null,
+    isSubagentSessionKey: () => false,
+    normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
+    buildSubagentSystemPrompt: () => "subagent prompt",
+    readLatestAssistantReply: () => undefined,
+    resolveAgentDir: () => "/tmp/openclaw-agent",
+    resolveSessionIdFromSessionKey: async () => undefined,
+    resolveSessionTranscriptFile: async () => undefined,
+    agentLaneSubagent: "subagent",
+    log: {
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+      debug: () => {},
+    },
+  } as unknown as LcmDependencies;
+}
+
+describe("LCM sub-day window retrieval", () => {
+  it("parses deterministic local-time windows with DST-safe UTC bounds", () => {
+    const dateWindow = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-03-08 1:30-3:30",
+      "America/New_York"
+    );
+    expect(dateWindow.label).toBe("2026-03-08 1:30-3:30");
+    expect(dateWindow.window?.startMinutes).toBe(90);
+    expect(dateWindow.window?.endMinutes).toBe(210);
+    expect(dateWindow.start.toISOString()).toBe("2026-03-08T06:30:00.000Z");
+    expect(dateWindow.end.toISOString()).toBe("2026-03-08T07:30:00.000Z");
+
+    const namedWindow = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-27 morning",
+      "Asia/Bangkok"
+    );
+    expect(namedWindow.label).toBe("2026-04-27 morning");
+    expect(namedWindow.start.toISOString()).toBe("2026-04-26T23:00:00.000Z");
+    expect(namedWindow.end.toISOString()).toBe("2026-04-27T05:00:00.000Z");
+
+    const meridiemWindow = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-27 4-8pm",
+      "Asia/Bangkok"
+    );
+    expect(meridiemWindow.window?.startMinutes).toBe(16 * 60);
+    expect(meridiemWindow.window?.endMinutes).toBe(20 * 60);
+
+    expect(() =>
+      __lcmRecentTestInternals.resolvePeriod(
+        "date:2026-03-08 2:30-3:30",
+        "America/New_York"
+      )
+    ).toThrow(/Nonexistent local time/);
+
+    const nightWindow = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-27 night",
+      "Pacific/Auckland"
+    );
+    expect(nightWindow.start.toISOString()).toBe("2026-04-27T10:00:00.000Z");
+    expect(nightWindow.end.toISOString()).toBe("2026-04-27T12:00:00.000Z");
+
+    const midnightTransition = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-03-28",
+      "Asia/Gaza"
+    );
+    expect(midnightTransition.start.toISOString()).toBe(
+      "2026-03-27T22:00:00.000Z"
+    );
+
+    const skippedMidnight = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-24",
+      "Africa/Cairo"
+    );
+    expect(skippedMidnight.start.toISOString()).toBe(
+      "2026-04-23T22:00:00.000Z"
+    );
+
+    const skippedMidnightNight = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-23 night",
+      "Africa/Cairo"
+    );
+    expect(skippedMidnightNight.start.toISOString()).toBe(
+      "2026-04-23T20:00:00.000Z"
+    );
+    expect(skippedMidnightNight.end.toISOString()).toBe(
+      "2026-04-23T22:00:00.000Z"
+    );
+
+    const explicitEndOfDay = __lcmRecentTestInternals.resolvePeriod(
+      "date:2026-04-23 22:00-24:00",
+      "Africa/Cairo"
+    );
+    expect(explicitEndOfDay.window?.endMinutes).toBe(24 * 60);
+    expect(explicitEndOfDay.start.toISOString()).toBe(
+      "2026-04-23T20:00:00.000Z"
+    );
+    expect(explicitEndOfDay.end.toISOString()).toBe(
+      "2026-04-23T22:00:00.000Z"
+    );
+  });
+
+  it("falls back to leaf summaries inside the requested sub-day window", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "window-retrieval",
+      sessionKey: "agent:main:window-retrieval",
+      title: "Window retrieval",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_before_window",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Morning setup before the interesting window.",
+      tokenCount: 8,
+      latestAt: new Date("2026-04-27T08:00:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_inside_window",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content:
+        "Eric Wilder npm ENOTEMPTY repair happened in the afternoon window.",
+      tokenCount: 12,
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_spanning_window",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Spanning summary began before the window but overlaps it.",
+      tokenCount: 11,
+      earliestAt: new Date("2026-04-27T09:50:00.000Z"),
+      latestAt: new Date("2026-04-27T11:10:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_after_window",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Evening connector rollout after the requested window.",
+      tokenCount: 9,
+      latestAt: new Date("2026-04-27T13:00:00.000Z"),
+    });
+
+    const lcm = {
+      timezone: "Asia/Bangkok",
+      getRollupStore: () => new RollupStore(db),
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "window-retrieval",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "window-retrieval",
+    });
+
+    const result = await tool.execute("call-window", {
+      period: "date:2026-04-27 17:00-18:00",
+      includeSources: true,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("sum_inside_window");
+    expect(text).toContain("sum_spanning_window");
+    expect(text).toContain("ENOTEMPTY repair");
+    expect(text).not.toContain("sum_before_window");
+    expect(text).not.toContain("sum_after_window");
+    expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([
+      "sum_spanning_window",
+      "sum_inside_window",
+    ]);
+  });
+
+  it("orders fallback rows by the displayed effective time", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "fallback-effective-order",
+      sessionKey: "agent:main:fallback-effective-order",
+      title: "Fallback effective order",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_late_effective",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Late effective fallback should appear first.",
+      tokenCount: 8,
+      sourceMessageTokenCount: 8,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T11:55:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_early_effective",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Earlier effective fallback should appear second.",
+      tokenCount: 8,
+      sourceMessageTokenCount: 8,
+      earliestAt: new Date("2026-04-27T11:00:00.000Z"),
+      latestAt: new Date("2026-04-27T11:05:00.000Z"),
+    });
+
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => new RollupStore(db),
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "fallback-effective-order",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "fallback-effective-order",
+    });
+
+    const result = await tool.execute("call-effective-order", {
+      period: "date:2026-04-27 10:00-12:00",
+      includeSources: true,
+    });
+
+    expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([
+      "sum_late_effective",
+      "sum_early_effective",
+    ]);
+  });
+
+  it("hides fallback source IDs unless requested and clamps output budget", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "fallback-budget",
+      sessionKey: "agent:main:fallback-budget",
+      title: "Fallback budget",
+    });
+
+    for (let index = 0; index < 80; index += 1) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_budget_${index}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `Budgeted fallback item ${index} ${"detail ".repeat(80)}`,
+        tokenCount: 90,
+        sourceMessageTokenCount: 90,
+        latestAt: new Date(`2026-04-27T10:${String(index % 60).padStart(2, "0")}:00.000Z`),
+      });
+    }
+
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => new RollupStore(db),
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "fallback-budget",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "fallback-budget",
+    });
+
+    const result = await tool.execute("call-budget", {
+      period: "date:2026-04-27 10:00-11:30",
+      includeSources: false,
+      maxOutputTokens: 250,
+      globalMaxOutputTokens: 250,
+      maxSourceSummaries: 80,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).not.toContain("sum_budget_");
+    expect(estimateTokens(text)).toBeLessThanOrEqual(250);
+    expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([]);
+  });
+
+  it("surfaces SQL-level fallback truncation", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "fallback-sql-cap",
+      sessionKey: "agent:main:fallback-sql-cap",
+      title: "Fallback SQL cap",
+    });
+
+    for (let index = 0; index < 1005; index += 1) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_cap_${index}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `Fallback cap item ${index}.`,
+        tokenCount: 4,
+        sourceMessageTokenCount: 4,
+        latestAt: new Date(Date.UTC(2026, 3, 27, 10, 0, index)),
+      });
+    }
+
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => new RollupStore(db),
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "fallback-sql-cap",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "fallback-sql-cap",
+    });
+
+    const result = await tool.execute("call-cap", {
+      period: "date:2026-04-27",
+      includeSources: false,
+      maxSourceSummaries: 20,
+    });
+    const details = result.details as {
+      totalMatches?: number;
+      truncated?: boolean;
+      summaryIds?: string[];
+    };
+    expect(details.totalMatches).toBe(1005);
+    expect(details.truncated).toBe(true);
+    expect(details.summaryIds).toEqual([]);
+  });
+
+  it("uses fallback status for today's window even when a rollup exists", async () => {
+    const now = new Date("2026-04-27T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { db, conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "today-freshness",
+        sessionKey: "agent:main:today-freshness",
+        title: "Today freshness",
+      });
+      const todayKey = now.toISOString().slice(0, 10);
+
+      await summaryStore.insertSummary({
+        summaryId: "sum_today_fresh",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Fresh same-day work should come from bounded fallback.",
+        tokenCount: 8,
+        latestAt: now,
+      });
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await builder.buildDayRollup(conversation.conversationId, todayKey);
+      db.prepare(
+        `UPDATE lcm_rollups
+         SET content = ?
+         WHERE conversation_id = ? AND period_kind = 'day' AND period_key = ?`
+      ).run(
+        "STALE CURRENT DAY ROLLUP SHOULD NOT BE USED",
+        conversation.conversationId,
+        todayKey
+      );
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "today-freshness",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "today-freshness",
+      });
+
+      const result = await tool.execute("call-today", {
+        period: "today",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain("Fresh same-day work");
+      expect(text).not.toContain("STALE CURRENT DAY ROLLUP");
+      expect(
+        (result.details as { status?: string; usedFallback?: boolean }).status
+      ).toBe("fallback");
+      expect(
+        (result.details as { status?: string; usedFallback?: boolean })
+          .usedFallback
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("combines complete prior daily rollups with live fallback for 7d", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "seven-day-live",
+        sessionKey: "agent:main:seven-day-live",
+        title: "Seven day live",
+      });
+      const priorDays = [
+        "2026-04-22",
+        "2026-04-23",
+        "2026-04-24",
+        "2026-04-25",
+        "2026-04-26",
+        "2026-04-27",
+      ];
+      for (const day of priorDays) {
+        await summaryStore.insertSummary({
+          summaryId: `sum_${day}`,
+          conversationId: conversation.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content: `Completed archived work for ${day}.`,
+          tokenCount: 8,
+          latestAt: new Date(`${day}T10:00:00.000Z`),
+        });
+      }
+      await summaryStore.insertSummary({
+        summaryId: "sum_today_live",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Fresh current-day work should use live fallback.",
+        tokenCount: 8,
+        latestAt: now,
+      });
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      for (const day of priorDays) {
+        await builder.buildDayRollup(conversation.conversationId, day);
+      }
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "seven-day-live",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "seven-day-live",
+      });
+
+      const result = await tool.execute("call-7d", {
+        period: "7d",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain("Completed archived work for 2026-04-22");
+      expect(text).toContain("Fresh current-day work should use live fallback");
+      expect((result.details as { usedFallback?: boolean }).usedFallback).toBe(
+        true
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats inactive days as covered when combining 7d rollups", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "seven-day-sparse",
+        sessionKey: "agent:main:seven-day-sparse",
+        title: "Seven day sparse",
+      });
+
+      for (let index = 0; index < 25; index += 1) {
+        await summaryStore.insertSummary({
+          summaryId: `sum_sparse_${index}`,
+          conversationId: conversation.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content: `Sparse inactive-day item ${index}.`,
+          tokenCount: 8,
+          latestAt: new Date(`2026-04-22T10:${String(index).padStart(2, "0")}:00.000Z`),
+        });
+      }
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await builder.buildDayRollup(conversation.conversationId, "2026-04-22");
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "seven-day-sparse",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "seven-day-sparse",
+      });
+
+      const result = await tool.execute("call-7d-sparse", {
+        period: "7d",
+        includeSources: true,
+      });
+      const details = result.details as {
+        status?: string;
+        summaryIds?: string[];
+      };
+      expect(details.status).toBe("ready");
+      expect(details.summaryIds).toHaveLength(25);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("LCM weekly and monthly rollups", () => {
+  it("rebuilds a day rollup when content changes without changing ids or tokens", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "fingerprint-rebuild",
+      sessionKey: "agent:main:fingerprint-rebuild",
+      title: "Fingerprint rebuild",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_same",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Alpha work item.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    const first = rollupStore.getRollup(
+      conversation.conversationId,
+      "day",
+      "2026-04-27"
+    );
+    expect(first?.content).toContain("Alpha work item");
+
+    rollupStore.db
+      .prepare(
+        `UPDATE summaries
+         SET content = ?
+         WHERE summary_id = ?`
+      )
+      .run("Bravo work item.", "sum_same");
+
+    const result = await builder.buildDailyRollups(conversation.conversationId, {
+      forceCurrentDay: true,
+      daysBack: 2,
+    });
+    expect(result.built).toBeGreaterThan(0);
+    const second = rollupStore.getRollup(
+      conversation.conversationId,
+      "day",
+      "2026-04-27"
+    );
+    expect(second?.rollup_id).toBe(first?.rollup_id);
+    expect(second?.content).toContain("Bravo work item");
+    expect(second?.source_fingerprint).not.toBe(first?.source_fingerprint);
+  });
+
+  it("rejects invalid plain dates", async () => {
+    expect(() =>
+      __lcmRecentTestInternals.resolvePeriod("date:2026-02-30", "UTC")
+    ).toThrow(/real calendar date/i);
+    expect(() =>
+      __lcmRecentTestInternals.resolvePeriod("date:2026-13-01", "UTC")
+    ).toThrow(/real calendar date/i);
+  });
+
+  it("builds week and month aggregates whose boundaries skip local midnight", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const weeklyConversation = await conversationStore.createConversation({
+      sessionId: "aggregate-week-midnight-gap",
+      sessionKey: "agent:main:aggregate-week-midnight-gap",
+      title: "Aggregate week midnight gap",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_tehran_week_gap",
+      conversationId: weeklyConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Weekly aggregate began after a skipped local midnight.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2021-03-21T20:45:00.000Z"),
+      latestAt: new Date("2021-03-21T21:00:00.000Z"),
+    });
+    const weeklyBuilder = new RollupBuilder(rollupStore, {
+      timezone: "Asia/Tehran",
+    });
+    await expect(
+      weeklyBuilder.buildDayRollup(weeklyConversation.conversationId, "2021-03-22")
+    ).resolves.toBe(true);
+    await expect(
+      weeklyBuilder.buildWeeklyRollup(weeklyConversation.conversationId, "2021-03-22")
+    ).resolves.toBe(true);
+
+    const monthlyConversation = await conversationStore.createConversation({
+      sessionId: "aggregate-month-midnight-gap",
+      sessionKey: "agent:main:aggregate-month-midnight-gap",
+      title: "Aggregate month midnight gap",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_cairo_month_gap",
+      conversationId: monthlyConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Monthly aggregate began after a skipped local midnight.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2014-07-31T22:30:00.000Z"),
+      latestAt: new Date("2014-07-31T22:45:00.000Z"),
+    });
+    const monthlyBuilder = new RollupBuilder(rollupStore, {
+      timezone: "Africa/Cairo",
+    });
+    await expect(
+      monthlyBuilder.buildDayRollup(monthlyConversation.conversationId, "2014-08-01")
+    ).resolves.toBe(true);
+    await expect(
+      monthlyBuilder.buildMonthlyRollup(monthlyConversation.conversationId, "2014-08")
+    ).resolves.toBe(true);
+  });
+
+  it("rebuilds stale day and aggregate rows even when fingerprints match", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "stale-fingerprint-rebuild",
+      sessionKey: "agent:main:stale-fingerprint-rebuild",
+      title: "Stale fingerprint rebuild",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_stale_rebuild",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Stale rollup should become ready again.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+    const day = rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27");
+    rollupStore.markStale(day!.rollup_id);
+
+    const daily = await builder.buildDailyRollups(conversation.conversationId, {
+      forceCurrentDay: true,
+      daysBack: 2,
+    });
+    expect(daily.built).toBeGreaterThan(0);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+        ?.status
+    ).toBe("ready");
+
+    await builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27");
+    const week = rollupStore.getRollup(
+      conversation.conversationId,
+      "week",
+      "2026-04-27"
+    );
+    rollupStore.markStale(week!.rollup_id);
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "week", "2026-04-27")
+        ?.status
+    ).toBe("ready");
+  });
+
+  it("builds aggregate week/month rollups from stable daily rollups", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "aggregate-rollups",
+      sessionKey: "agent:main:aggregate-rollups",
+      title: "Aggregate rollups",
+    });
+
+    const aggregateDays = [
+      ...Array.from({ length: 30 }, (_, index) =>
+        `2026-04-${String(index + 1).padStart(2, "0")}`
+      ),
+      "2026-05-01",
+      "2026-05-02",
+      "2026-05-03",
+    ];
+    const specialContent = new Map([
+      ["2026-04-27", "Monday decision completed."],
+      ["2026-04-28", "Tuesday rollout shipped."],
+      ["2026-05-01", "May follow-up issue created."],
+    ]);
+    for (const day of aggregateDays) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_${day}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: specialContent.get(day) ?? `Routine aggregate coverage for ${day}.`,
+        tokenCount: 10,
+        sourceMessageTokenCount: 10,
+        earliestAt: new Date(`${day}T10:00:00.000Z`),
+        latestAt: new Date(`${day}T10:00:00.000Z`),
+      });
+    }
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    for (const day of aggregateDays) {
+      await expect(
+        builder.buildDayRollup(conversation.conversationId, day)
+      ).resolves.toBe(true);
+    }
+
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildMonthlyRollup(conversation.conversationId, "2026-04")
+    ).resolves.toBe(true);
+
+    const week = rollupStore.getRollup(
+      conversation.conversationId,
+      "week",
+      "2026-04-27"
+    );
+    expect(week?.status).toBe("ready");
+    expect(week?.content).toContain("Weekly Summary: 2026-04-27");
+    expect(week?.source_message_count).toBe(7);
+    expect(
+      rollupStore
+        .getRollupSources(week!.rollup_id)
+        .map((source) => source.source_type)
+    ).toEqual(Array.from({ length: 7 }, () => "rollup"));
+
+    const month = rollupStore.getRollup(
+      conversation.conversationId,
+      "month",
+      "2026-04"
+    );
+    expect(month?.status).toBe("ready");
+    expect(month?.content).toContain("Monthly Summary: 2026-04");
+    expect(month?.source_message_count).toBe(30);
+    expect(rollupStore.getRollupSources(month!.rollup_id)).toHaveLength(30);
+
+    const firstMonthId = month?.rollup_id;
+    await expect(
+      builder.buildMonthlyRollup(conversation.conversationId, "2026-04")
+    ).resolves.toBe(false);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "month", "2026-04")
+        ?.rollup_id
+    ).toBe(firstMonthId);
+
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(false);
+  });
+
+  it("rejects non-canonical weekly rollup keys", async () => {
+    const { conversationStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "bad-week-key",
+      sessionKey: "agent:main:bad-week-key",
+      title: "Bad week key",
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-29")
+    ).rejects.toThrow(/Monday calendar week start/);
+  });
+
+  it("treats missing no-activity days as covered for aggregate rollups", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "aggregate-quiet-days",
+      sessionKey: "agent:main:aggregate-quiet-days",
+      title: "Aggregate quiet days",
+    });
+
+    for (const [day, content] of [
+      ["2026-04-27", "Monday work happened."],
+      ["2026-04-29", "Wednesday follow-up happened."],
+    ] as const) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_quiet_${day}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content,
+        tokenCount: 10,
+        sourceMessageTokenCount: 10,
+        latestAt: new Date(`${day}T10:00:00.000Z`),
+      });
+    }
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-29")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+
+    const week = rollupStore.getRollup(
+      conversation.conversationId,
+      "week",
+      "2026-04-27"
+    );
+    expect(week?.status).toBe("ready");
+    expect(week?.source_message_count).toBe(2);
+    expect(week?.content).toContain("Wednesday follow-up happened");
+  });
+
+  it("uses local UTC+13 day keys for week and month aggregation", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "aggregate-utc-plus",
+      sessionKey: "agent:main:aggregate-utc-plus",
+      title: "Aggregate UTC+13",
+    });
+
+    const aggregateDays = Array.from(
+      { length: 31 },
+      (_, index) => `2026-01-${String(index + 1).padStart(2, "0")}`
+    );
+    for (const day of aggregateDays) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_auckland_${day}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content:
+          day === "2026-01-05"
+            ? "Completed the Pacific/Auckland aggregate key fix."
+            : `Routine Pacific/Auckland aggregate coverage for ${day}.`,
+        tokenCount: 10,
+        sourceMessageTokenCount: 10,
+        earliestAt: new Date(`${day}T00:30:00+13:00`),
+        latestAt: new Date(`${day}T01:00:00+13:00`),
+      });
+    }
+
+    const builder = new RollupBuilder(rollupStore, {
+      timezone: "Pacific/Auckland",
+    });
+    for (const day of aggregateDays) {
+      await expect(
+        builder.buildDayRollup(conversation.conversationId, day)
+      ).resolves.toBe(true);
+    }
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-01-05")
+    ).resolves.toBe(true);
+    await expect(
+      builder.buildMonthlyRollup(conversation.conversationId, "2026-01")
+    ).resolves.toBe(true);
+
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "week", "2026-01-05")
+        ?.content
+    ).toContain("2026-01-05");
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "month", "2026-01")
+        ?.source_message_count
+    ).toBe(31);
+  });
+
+  it("does not serve stored aggregate rollups while rebuild is pending", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { db, conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "pending-week",
+        sessionKey: "agent:main:pending-week",
+        title: "Pending week",
+      });
+
+      const weekDays = [
+        "2026-04-27",
+        "2026-04-28",
+        "2026-04-29",
+        "2026-04-30",
+        "2026-05-01",
+        "2026-05-02",
+        "2026-05-03",
+      ];
+      for (const day of weekDays) {
+        await summaryStore.insertSummary({
+          summaryId: `sum_week_old_${day}`,
+          conversationId: conversation.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content: `Original weekly aggregate content for ${day}.`,
+          tokenCount: 10,
+          latestAt: new Date(`${day}T10:00:00.000Z`),
+        });
+      }
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      for (const day of weekDays) {
+        await expect(
+          builder.buildDayRollup(conversation.conversationId, day)
+        ).resolves.toBe(true);
+      }
+      await expect(
+        builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+      ).resolves.toBe(true);
+      await summaryStore.insertSummary({
+        summaryId: "sum_week_new",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Pending rebuild activity must be visible via fallback.",
+        tokenCount: 10,
+        latestAt: now,
+      });
+
+      const update = db.prepare(
+        `UPDATE lcm_rollups
+         SET content = ?
+         WHERE conversation_id = ? AND period_kind = 'week' AND period_key = ?`
+      ).run("STALE WEEK ROLLUP SHOULD NOT BE USED", conversation.conversationId, "2026-04-27");
+      expect(update.changes).toBe(1);
+      rollupStore.upsertState(conversation.conversationId, {
+        timezone: "UTC",
+        pending_rebuild: 1,
+      });
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "pending-week",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "pending-week",
+      });
+
+      const result = await tool.execute("call-week", {
+        period: "week",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain("Pending rebuild activity");
+      expect(text).not.toContain("STALE WEEK ROLLUP");
+      expect((result.details as { usedFallback?: boolean }).usedFallback).toBe(
+        true
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("updates aggregate phase timestamps only for successful phases", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "aggregate-phase-state",
+      sessionKey: "agent:main:aggregate-phase-state",
+      title: "Aggregate phase state",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_phase_state",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Monthly phase can still build if weekly phase fails.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+    const originalBuildAggregate = (
+      builder as unknown as {
+        buildAggregateRollup: (
+          conversationId: number,
+          periodKind: "week" | "month",
+          periodKey: string
+        ) => Promise<boolean>;
+      }
+    ).buildAggregateRollup.bind(builder);
+    const aggregateSpy = vi
+      .spyOn(
+        builder as unknown as {
+          buildAggregateRollup: (
+            conversationId: number,
+            periodKind: "week" | "month",
+            periodKey: string
+          ) => Promise<boolean>;
+        },
+        "buildAggregateRollup"
+      )
+      .mockImplementation(async (conversationId, periodKind, periodKey) => {
+        if (periodKind === "week") {
+          throw new Error("week phase failed");
+        }
+        return originalBuildAggregate(conversationId, periodKind, periodKey);
+      });
+
+    const result = await builder.buildWeeklyMonthlyRollups(
+      conversation.conversationId
+    );
+    aggregateSpy.mockRestore();
+
+    expect(result.errors).toHaveLength(1);
+    const state = rollupStore.getState(conversation.conversationId);
+    expect(state?.last_weekly_build_at).toBeNull();
+    expect(state?.last_monthly_build_at).toBeTruthy();
+    expect(state?.pending_rebuild).toBe(1);
+  });
+
+  it("removes orphaned aggregate rollups when source days disappear", async () => {
+    const { db, conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "orphaned-week",
+      sessionKey: "agent:main:orphaned-week",
+      title: "Orphaned week",
+    });
+    const weekDays = [
+      "2026-04-27",
+      "2026-04-28",
+      "2026-04-29",
+      "2026-04-30",
+      "2026-05-01",
+      "2026-05-02",
+      "2026-05-03",
+    ];
+    for (const day of weekDays) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_orphan_${day}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `Temporary week coverage for ${day}.`,
+        tokenCount: 10,
+        sourceMessageTokenCount: 10,
+        latestAt: new Date(`${day}T10:00:00.000Z`),
+      });
+    }
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    for (const day of weekDays) {
+      await expect(
+        builder.buildDayRollup(conversation.conversationId, day)
+      ).resolves.toBe(true);
+    }
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "week", "2026-04-27")
+    ).not.toBeNull();
+
+    db.prepare("DELETE FROM summaries WHERE summary_id LIKE 'sum_orphan_%'").run();
+    for (const day of weekDays) {
+      await expect(
+        builder.buildDayRollup(conversation.conversationId, day)
+      ).resolves.toBe(true);
+    }
+    const result = await builder.buildWeeklyMonthlyRollups(
+      conversation.conversationId
+    );
+
+    expect(result.built).toBeGreaterThan(0);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "week", "2026-04-27")
+    ).toBeNull();
+  });
+
+  it("removes stale rollups when a day becomes empty", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "empty-day",
+        sessionKey: "agent:main:empty-day",
+        title: "Empty day",
+      });
+      await summaryStore.insertSummary({
+        summaryId: "sum_deleted_day",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "This day will be deleted.",
+        tokenCount: 10,
+        latestAt: new Date("2026-04-27T10:00:00.000Z"),
+      });
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+      expect(
+        rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+      ).not.toBeNull();
+
+      rollupStore.db
+        .prepare(`DELETE FROM summaries WHERE summary_id = ?`)
+        .run("sum_deleted_day");
+      const result = await builder.buildDailyRollups(conversation.conversationId, {
+        forceCurrentDay: true,
+        daysBack: 2,
+      });
+
+      expect(result.built).toBeGreaterThan(0);
+      expect(
+        rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+      ).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not move last_rollup_check_at backwards after sweep builds", async () => {
+    const scanStart = new Date("2026-04-28T12:00:00.000Z");
+    const buildTime = new Date("2026-04-28T12:00:05.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(scanStart);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "rollup-check-monotonic",
+        sessionKey: "agent:main:rollup-check-monotonic",
+        title: "Rollup check monotonic",
+      });
+
+      await summaryStore.insertSummary({
+        summaryId: "sum_rollup_check_monotonic",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Completed a monotonic state update check.",
+        tokenCount: 10,
+        earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+        latestAt: new Date("2026-04-27T10:30:00.000Z"),
+      });
+
+      const originalGetLeafSummaries =
+        rollupStore.getLeafSummariesForDay.bind(rollupStore);
+      const lookupSpy = vi
+        .spyOn(rollupStore, "getLeafSummariesForDay")
+        .mockImplementation((...args) => {
+          vi.setSystemTime(buildTime);
+          return originalGetLeafSummaries(...args);
+        });
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await expect(
+        builder.buildDailyRollups(conversation.conversationId, {
+          forceCurrentDay: true,
+          daysBack: 2,
+        })
+      ).resolves.toMatchObject({ built: 1, errors: [] });
+      lookupSpy.mockRestore();
+
+      const state = rollupStore.getState(conversation.conversationId);
+      expect(state?.last_rollup_check_at).toBe(buildTime.toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports final sweep-state write failures without aborting built rollups", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "rollup-final-state-error",
+      sessionKey: "agent:main:rollup-final-state-error",
+      title: "Rollup final state error",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_final_state_error",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Built work should survive a final state write failure.",
+      tokenCount: 10,
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+
+    const originalUpsertState = rollupStore.upsertState.bind(rollupStore);
+    const upsertSpy = vi
+      .spyOn(rollupStore, "upsertState")
+      .mockImplementation((conversationId, input) => {
+        if (input.pending_rebuild != null) {
+          throw new Error("state write failed");
+        }
+        originalUpsertState(conversationId, input);
+      });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    const result = await builder.buildDailyRollups(conversation.conversationId, {
+      forceCurrentDay: true,
+      daysBack: 2,
+    });
+    upsertSpy.mockRestore();
+
+    expect(result.built).toBe(1);
+    expect(result.errors).toEqual([
+      "final sweep state update failed: state write failed",
+    ]);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+    ).toBeTruthy();
+  });
+
+  it("hides debug source IDs unless includeSources is true", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "debug-source-hiding",
+      sessionKey: "agent:main:debug-source-hiding",
+      title: "Debug source hiding",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_debug_hidden",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Debug provenance should stay hidden by default.",
+      tokenCount: 10,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => rollupStore,
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "debug-source-hiding",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRollupDebugTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "debug-source-hiding",
+    });
+
+    const hidden = await tool.execute("debug-hidden", { periodKind: "day" });
+    const hiddenText = (hidden.content[0] as { text: string }).text;
+    expect(hiddenText).not.toContain("sum_debug_hidden");
+    expect(JSON.stringify(hidden.details)).not.toContain("sum_debug_hidden");
+
+    const shown = await tool.execute("debug-shown", {
+      periodKind: "day",
+      includeSources: true,
+    });
+    const shownText = (shown.content[0] as { text: string }).text;
+    expect(shownText).toContain("sum_debug_hidden");
+
+    const invalid = await tool.execute("debug-invalid", {
+      periodKind: "year",
+    });
+    expect((invalid.content[0] as { text: string }).text).toContain(
+      "periodKind must be one of"
+    );
+
+    for (let index = 0; index < 120; index += 1) {
+      rollupStore.upsertRollup({
+        rollup_id: `debug_extra_${index}`,
+        conversation_id: conversation.conversationId,
+        period_kind: "day",
+        period_key: `debug-${index}`,
+        period_start: "2026-04-27T00:00:00.000Z",
+        period_end: "2026-04-28T00:00:00.000Z",
+        timezone: "UTC",
+        content: `Debug extra ${index}`,
+        token_count: 1,
+        source_summary_ids: "[]",
+        source_message_count: 0,
+        source_token_count: 0,
+        status: "ready",
+        coverage_start: null,
+        coverage_end: null,
+        summarizer_model: "test",
+        source_fingerprint: `debug-extra-${index}`,
+      });
+    }
+    const capped = await tool.execute("debug-capped", {
+      periodKind: "day",
+      limit: 1000,
+    });
+    expect((capped.details as { rollups?: unknown[] }).rollups).toHaveLength(
+      100
+    );
+  });
+});
