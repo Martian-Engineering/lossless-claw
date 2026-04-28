@@ -4456,13 +4456,13 @@ export class LcmContextEngine implements ContextEngine {
     const lastDbIdentity = messageIdentity(lastDbMessage.role, lastDbMessage.content);
 
     // Quick check: if the last DB message matches the last batch message,
-    // verify that the entire batch matches the DB tail.
+    // verify that the entire batch matches the actual DB tail. Message seq
+    // can have gaps after maintenance deletes, so do not derive seq from count.
     if (lastDbIdentity === lastBatchIdentity) {
-      const tailAfterSeq = storedMessageCount - batch.length;
-      const tailMessages = await this.conversationStore.getMessages(conversationId, {
-        afterSeq: tailAfterSeq,
-        limit: batch.length,
+      const storedMessages = await this.conversationStore.getMessages(conversationId, {
+        limit: storedMessageCount,
       });
+      const tailMessages = storedMessages.slice(-batch.length);
       if (tailMessages.length === batch.length) {
         let tailMatch = true;
         for (let i = 0; i < batch.length; i++) {
@@ -4540,8 +4540,8 @@ export class LcmContextEngine implements ContextEngine {
           break;
         }
       }
-      if (suffixMatch && k + 1 < batch.length) {
-        const newSlice = batch.slice(k + 1);
+      const newSlice = batch.slice(k + 1);
+      if (suffixMatch && (newSlice.length > 0 || matchLen > 1)) {
         this.deps.log.info(
           `[lcm] dedup: ${context} suffix-match at batch[${k}], ` +
             `returning ${newSlice.length} new messages ` +

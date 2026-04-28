@@ -4584,6 +4584,49 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[2]?.role).toBe("user");
   });
 
+  it("filters thinking-only assistant messages during assembly", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "Explain the result." }),
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "Internal reasoning only." }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "Keep reasoning with visible output." },
+          { type: "text", text: "Visible answer." },
+        ],
+      } as AgentMessage,
+    });
+
+    const assembled = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(assembled.messages).toHaveLength(2);
+    expect(assembled.messages[0]?.role).toBe("user");
+    const assistant = assembled.messages[1] as {
+      role: string;
+      content?: Array<{ type?: string; text?: string }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content?.map((block) => block.type)).toEqual(["thinking", "text"]);
+    expect(assistant.content?.[1]?.text).toBe("Visible answer.");
+  });
+
   it("rebuilds raw function_call blocks from stored columns when raw arguments are objects", async () => {
     const engine = createEngine();
     const sessionId = "session-openai-function-call-raw-arguments-object";
@@ -8149,6 +8192,102 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       "more work",
       "",
       "done again",
+    ]);
+  });
+
+  it("skips fully replayed suffix batches when the stored prefix is absent", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-full-suffix-replay";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-full-suffix-replay"),
+      messages: [
+        makeMessage({ role: "user", content: "old B" }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-full-suffix-replay-2"),
+      messages: [
+        makeMessage({ role: "user", content: "compacted old A" }),
+        makeMessage({ role: "user", content: "old B" }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old B", "old C"]);
+  });
+
+  it("uses the actual stored tail for oversized single-message replays", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-oversized-single-tail";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-single-tail"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "user", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-single-tail-2"),
+      messages: [
+        makeMessage({ role: "system", content: "system prompt" }),
+        makeMessage({ role: "user", content: "old C" }),
+      ],
+      prePromptMessageCount: 1,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "old C"]);
+  });
+
+  it("does not treat a one-message terminal match as a fully replayed batch", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-terminal-single-match";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-terminal-single-match"),
+      messages: [makeMessage({ role: "assistant", content: "same answer" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-terminal-single-match-2"),
+      messages: [
+        makeMessage({ role: "user", content: "new question" }),
+        makeMessage({ role: "assistant", content: "same answer" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "same answer",
+      "new question",
+      "same answer",
     ]);
   });
 
