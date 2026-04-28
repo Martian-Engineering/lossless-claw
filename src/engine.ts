@@ -39,6 +39,7 @@ import {
 import {
   extensionFromNameOrMime,
   formatFileReference,
+  formatRawPayloadReference,
   formatToolOutputReference,
   generateExplorationSummary,
   parseFileBlocks,
@@ -459,6 +460,12 @@ const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
   "toolResult",
   "tool_use_result",
 ]);
+const REPLAY_CRITICAL_RAW_TYPES: ReadonlySet<string> = new Set([
+  ...TOOL_RAW_TYPES,
+  "thinking",
+  "reasoning",
+]);
+const RAW_PAYLOAD_EXTERNALIZATION_REASON = "large_raw_message";
 
 function looksLikeJsonPayload(value: string): boolean {
   if (typeof value !== "string") return false;
@@ -565,6 +572,60 @@ function extractReasoningText(record: Record<string, unknown>): string | undefin
     .map((chunk) => chunk.trim())
     .filter((chunk, idx, arr) => chunk.length > 0 && arr.indexOf(chunk) === idx);
   return normalized.length > 0 ? normalized.join("\n") : undefined;
+}
+
+/** Return true when a raw block should remain structurally replayable. */
+function hasReplayCriticalRawBlock(value: unknown): boolean {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  if (Array.isArray(value)) {
+    return value.some((entry) => hasReplayCriticalRawBlock(entry));
+  }
+
+  const record = value as Record<string, unknown>;
+  const rawType = safeString(record.type) ?? safeString(record.rawType);
+  if (rawType && REPLAY_CRITICAL_RAW_TYPES.has(rawType)) {
+    return true;
+  }
+
+  for (const key of STRUCTURED_NESTED_FIELD_KEYS) {
+    if (hasReplayCriticalRawBlock(record[key])) {
+      return true;
+    }
+  }
+  for (const key of STRUCTURED_ARRAY_FIELD_KEYS) {
+    if (hasReplayCriticalRawBlock(record[key])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/** Serialize the original message content that backs a generic raw-payload reference. */
+function serializeRawPayloadContent(message: AgentMessage, fallbackContent: string): {
+  content: string;
+  mimeType: string;
+} | null {
+  if (!("content" in message)) {
+    return null;
+  }
+  if (typeof message.content === "string") {
+    return {
+      content: message.content,
+      mimeType: "text/plain",
+    };
+  }
+
+  const serialized = JSON.stringify(message.content);
+  if (typeof serialized !== "string") {
+    return null;
+  }
+  return {
+    content: serialized || fallbackContent,
+    mimeType: "application/json",
+  };
 }
 
 function normalizeUnknownBlock(value: unknown): {
@@ -802,6 +863,13 @@ function buildMessageParts(params: {
   const topLevelIsError =
     safeBoolean(topLevel.isError) ??
     safeBoolean(topLevel.is_error);
+  const rawPayloadExternalized = safeBoolean(topLevel.rawPayloadExternalized);
+  const externalizedFileId = safeString(topLevel.externalizedFileId);
+  const originalByteSize =
+    typeof topLevel.originalByteSize === "number"
+      ? topLevel.originalByteSize
+      : undefined;
+  const externalizationReason = safeString(topLevel.externalizationReason);
 
   // BashExecutionMessage: preserve a synthetic text part so output is round-trippable.
   if (!("content" in message) && "command" in message && "output" in message) {
@@ -848,6 +916,10 @@ function buildMessageParts(params: {
           toolCallId: topLevelToolCallId,
           toolName: topLevelToolName,
           isError: topLevelIsError,
+          rawPayloadExternalized: rawPayloadExternalized || undefined,
+          externalizedFileId,
+          originalByteSize,
+          externalizationReason,
         }),
       },
     ];
@@ -3090,6 +3162,18 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  private static isExternalizedReferenceContent(value: string): boolean {
+    const trimmed = value.trim();
+    return (
+      trimmed.startsWith("[LCM File:") ||
+      trimmed.startsWith("[LCM Tool Output:") ||
+      trimmed.includes("LCM file: file_") ||
+      /\[(?:User|Tool|Assistant|Image) image: [^\]]*LCM file: file_[a-f0-9]{16}\]/.test(
+        trimmed,
+      )
+    );
+  }
+
   /** Resolve the configured externalized-payload directory for one conversation. */
   private largeFilesDirForConversation(conversationId: number): string {
     return join(this.config.largeFilesDir, String(conversationId));
@@ -3754,6 +3838,66 @@ export class LcmContextEngine implements ContextEngine {
         content: rewrittenContent,
       } as AgentMessage,
       fileIds,
+    };
+  }
+
+  /** Externalize oversized raw messages that survived role-specific interceptors. */
+  private async interceptLargeRawPayload(params: {
+    conversationId: number;
+    message: AgentMessage;
+    stored: StoredMessage;
+  }): Promise<{ rewrittenMessage: AgentMessage; stored: StoredMessage } | null> {
+    const threshold = Math.max(1, this.config.largeFileTokenThreshold);
+    if (params.stored.tokenCount < threshold) {
+      return null;
+    }
+    if (params.stored.role === "tool") {
+      return null;
+    }
+    if (LcmContextEngine.isExternalizedReferenceContent(params.stored.content)) {
+      return null;
+    }
+    if ("content" in params.message && hasReplayCriticalRawBlock(params.message.content)) {
+      return null;
+    }
+
+    const rawPayload = serializeRawPayloadContent(params.message, params.stored.content);
+    if (!rawPayload || rawPayload.content.length === 0) {
+      return null;
+    }
+
+    const role = typeof params.message.role === "string" ? params.message.role : params.stored.role;
+    const externalized = await this.externalizeLargeTextPayload({
+      conversationId: params.conversationId,
+      content: rawPayload.content,
+      fileName: `raw-${role}-payload.${rawPayload.mimeType === "application/json" ? "json" : "txt"}`,
+      mimeType: rawPayload.mimeType,
+      formatReference: ({ fileId, byteSize, summary }) =>
+        formatRawPayloadReference({
+          fileId,
+          role,
+          byteSize,
+          reason: RAW_PAYLOAD_EXTERNALIZATION_REASON,
+          summary,
+        }),
+    });
+
+    const rewrittenMessage = {
+      ...params.message,
+      content: externalized.reference,
+      rawPayloadExternalized: true,
+      externalizedFileId: externalized.fileId,
+      originalByteSize: externalized.byteSize,
+      externalizationReason: RAW_PAYLOAD_EXTERNALIZATION_REASON,
+    } as AgentMessage;
+
+    return {
+      rewrittenMessage,
+      stored: {
+        ...params.stored,
+        content: externalized.reference,
+        tokenCount: estimateTokens(externalized.reference),
+      },
     };
   }
 
@@ -4755,6 +4899,16 @@ export class LcmContextEngine implements ContextEngine {
         stored.content = rewrittenStored.content;
         stored.tokenCount = rewrittenStored.tokenCount;
       }
+    }
+
+    const rawPayloadIntercepted = await this.interceptLargeRawPayload({
+      conversationId,
+      message: messageForParts,
+      stored,
+    });
+    if (rawPayloadIntercepted) {
+      messageForParts = rawPayloadIntercepted.rewrittenMessage;
+      stored = rawPayloadIntercepted.stored;
     }
 
     // Determine next sequence number

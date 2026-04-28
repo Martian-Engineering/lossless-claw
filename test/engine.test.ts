@@ -1457,6 +1457,177 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("externalizes oversized plain user text as a raw payload", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const rawText = `${"plain raw message line\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: rawText }),
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toContain("[LCM Raw Payload: file_");
+      expect(messages[0].content).toContain("role=user");
+      expect(messages[0].content).toContain("reason=large_raw_message");
+      expect(messages[0].content).not.toContain(rawText.slice(0, 64));
+
+      const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("raw-user-payload.txt");
+      expect(storedFile!.mimeType).toBe("text/plain");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(rawText);
+
+      const parts = await engine.getConversationStore().getMessageParts(messages[0].messageId);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].textContent).toBe(messages[0].content);
+      const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
+      expect(metadata).toMatchObject({
+        originalRole: "user",
+        rawPayloadExternalized: true,
+        externalizedFileId: fileId,
+        originalByteSize: Buffer.byteLength(rawText, "utf8"),
+        externalizationReason: "large_raw_message",
+      });
+    });
+  });
+
+  it("keeps plain user text inline when below the raw-payload threshold", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+      const sessionId = randomUUID();
+      const rawText = "short raw message";
+
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: rawText }),
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe(rawText);
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(0);
+    });
+  });
+
+  it("externalizes oversized non-file non-tool raw payloads", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const rawBlob = "RAW_VENDOR_PAYLOAD ".repeat(220);
+      const rawPayload = [{ type: "vendor_payload", blob: rawBlob, status: "ok" }];
+
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "assistant", content: rawPayload }),
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toContain("[LCM Raw Payload: file_");
+      expect(messages[0].content).toContain("role=assistant");
+      expect(messages[0].content).not.toContain(rawBlob.slice(0, 64));
+
+      const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("raw-assistant-payload.json");
+      expect(storedFile!.mimeType).toBe("application/json");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(JSON.stringify(rawPayload));
+
+      const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+      const assembled = await assembler.assemble({
+        conversationId: conversation!.conversationId,
+        tokenBudget: 10_000,
+      });
+      const assembledMessage = assembled.messages[0] as {
+        role: string;
+        content?: Array<{ type?: unknown; text?: unknown }>;
+      };
+      expect(assembledMessage.role).toBe("assistant");
+      expect(assembledMessage.content?.[0]?.type).toBe("text");
+      expect(String(assembledMessage.content?.[0]?.text)).toContain("[LCM Raw Payload:");
+    });
+  });
+
+  it("does not externalize assistant tool or reasoning blocks generically", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const largeReasoning = "protected reasoning ".repeat(220);
+      const largeInput = "protected tool input ".repeat(220);
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "reasoning", summary: [{ text: largeReasoning }] },
+            {
+              type: "toolCall",
+              id: "call_protected",
+              name: "exec",
+              input: { cmd: largeInput },
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).not.toContain("[LCM Raw Payload:");
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(0);
+
+      const parts = await engine.getConversationStore().getMessageParts(messages[0].messageId);
+      expect(parts.map((part) => part.partType)).toEqual(["reasoning", "tool"]);
+      expect(parts[1].toolCallId).toBe("call_protected");
+      expect(parts[1].toolName).toBe("exec");
+    });
+  });
+
   it("stores externalized inline images under largeFilesDir", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
