@@ -1116,6 +1116,99 @@ export function runLcmMigrations(
       `);
     });
 
+    runMigrationStep("ensureObservedWorkTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_items (
+          work_item_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          owner_id TEXT,
+          title TEXT NOT NULL,
+          description TEXT,
+          observed_status TEXT NOT NULL CHECK (observed_status IN (
+            'observed_completed',
+            'observed_unfinished',
+            'observed_ambiguous',
+            'decision_recorded',
+            'dismissed'
+          )),
+          kind TEXT NOT NULL CHECK (kind IN (
+            'implementation',
+            'review',
+            'blocker',
+            'decision',
+            'question',
+            'follow_up',
+            'test',
+            'deploy',
+            'research',
+            'other'
+          )),
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          confidence_band TEXT NOT NULL DEFAULT 'medium' CHECK (confidence_band IN ('low', 'medium', 'medium-high', 'high')),
+          rationale TEXT,
+          topic_key TEXT,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          completed_at TEXT,
+          completion_confidence REAL CHECK (completion_confidence IS NULL OR (completion_confidence >= 0 AND completion_confidence <= 1)),
+          evidence_count INTEGER NOT NULL DEFAULT 0,
+          source_message_count INTEGER NOT NULL DEFAULT 0,
+          source_token_count INTEGER NOT NULL DEFAULT 0,
+          authority_source TEXT NOT NULL DEFAULT 'lcm_observed',
+          sensitivity TEXT,
+          visibility TEXT,
+          fingerprint TEXT NOT NULL,
+          fingerprint_version INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_sources (
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
+          source_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+            'created',
+            'reinforced',
+            'possible_completion',
+            'completed',
+            'contradicted',
+            'dismissed'
+          )),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (work_item_id, source_type, source_id, evidence_kind)
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_state (
+          conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          last_processed_summary_created_at TEXT,
+          last_processed_summary_id TEXT,
+          pending_rebuild INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureObservedWorkIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
+          ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
+          ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_topic_status_seen_idx
+          ON lcm_observed_work_items(topic_key, observed_status, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
+          ON lcm_observed_work_items(fingerprint);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
+          ON lcm_observed_work_sources(source_type, source_id);
+      `);
+    });
+
     const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
     const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
     if (fts5Available) {
