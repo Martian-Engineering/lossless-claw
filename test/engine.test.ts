@@ -4985,6 +4985,94 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(assembleDebugLog).toContain("currentDivergenceMessage=user|content=text");
   });
 
+  it("adds compact overflow diagnostics to stressed assemble debug logs", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: infoLog,
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "session-overflow-diagnostics";
+    const secretMarker = "PRIVATE_OVERFLOW_MARKER";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: `large prompt contributor ${secretMarker} ${"x".repeat(1200)}`,
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: `second prompt contributor ${"y".repeat(600)}`,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    (
+      engine as unknown as {
+        recordRecentBootstrapImport: (
+          conversationId: number,
+          importedMessages: number,
+          reason: string | null,
+        ) => void;
+      }
+    ).recordRecentBootstrapImport(
+      conversation!.conversationId,
+      7,
+      "reconciled missing session messages",
+    );
+
+    await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 100,
+    });
+
+    const assembleDebugLog = infoLog.mock.calls
+      .map((call: unknown[]) => call[0])
+      .find(
+        (entry: unknown) =>
+          typeof entry === "string" &&
+          entry.includes("[lcm] assemble-debug") &&
+          entry.includes("overflowDiagnostics="),
+      ) as string | undefined;
+
+    expect(assembleDebugLog).toEqual(expect.any(String));
+    expect(assembleDebugLog).not.toContain(secretMarker);
+    const diagnostics = JSON.parse(
+      assembleDebugLog!
+        .slice(assembleDebugLog!.indexOf("overflowDiagnostics="))
+        .replace("overflowDiagnostics=", ""),
+    ) as Record<string, unknown>;
+    expect(diagnostics).toMatchObject({
+      tokenBudget: 100,
+      rawMessageCount: 2,
+      summaryCount: 0,
+      totalContextItems: 2,
+      recentBootstrapImportCount: 7,
+      recentBootstrapImportReason: "reconciled missing session messages",
+    });
+    expect(diagnostics.topMessageContributors).toEqual([
+      expect.objectContaining({
+        seq: 1,
+        role: "user",
+        selected: true,
+      }),
+      expect.objectContaining({
+        seq: 2,
+        role: "assistant",
+        selected: true,
+      }),
+    ]);
+  });
+
   it("repairs OpenAI function_call transcripts without dropping reasoning blocks", async () => {
     const engine = createEngine();
     const sessionId = "session-openai-function-call";

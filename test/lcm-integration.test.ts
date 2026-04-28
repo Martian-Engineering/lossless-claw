@@ -799,6 +799,90 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(summaryMsg!.content).toContain("This is a leaf summary");
   });
 
+  it("emits depersonalized overflow diagnostics with top contributors", async () => {
+    const [small, large, duplicate] = await ingestMessages(convStore, sumStore, 3, {
+      contentFn: (i) => {
+        if (i === 0) return "tiny";
+        if (i === 1) return `large message ${"x".repeat(800)}`;
+        return `repeated content ${"y".repeat(120)}`;
+      },
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+    const duplicateText = duplicate.content;
+    const secondDuplicate = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 4,
+      role: "assistant",
+      content: duplicateText,
+      tokenCount: estimateTokens(duplicateText),
+    });
+    await sumStore.appendContextMessage(CONV_ID, secondDuplicate.messageId);
+
+    const summaryId = "sum_overflow_diag";
+    await sumStore.insertSummary({
+      summaryId,
+      conversationId: CONV_ID,
+      kind: "leaf",
+      content: `summary contributor ${"z".repeat(500)}`,
+      tokenCount: 125,
+    });
+    await sumStore.appendContextSummary(CONV_ID, summaryId);
+    sumStore._contextItems.push({
+      conversationId: CONV_ID,
+      ordinal: 5,
+      itemType: "message",
+      messageId: large.messageId,
+      summaryId: null,
+      createdAt: new Date(),
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 150,
+      freshTailCount: 1,
+    });
+
+    const diagnostics = result.debug?.overflowDiagnostics;
+    expect(diagnostics).toMatchObject({
+      tokenBudget: 150,
+      rawMessageCount: 5,
+      summaryCount: 1,
+      totalContextItems: 6,
+    });
+    expect(diagnostics?.rawMessageTokens).toBeGreaterThan(diagnostics?.summaryTokens ?? 0);
+    expect(diagnostics?.duplicateRefClusters).toEqual([
+      expect.objectContaining({
+        kind: "message-ref",
+        count: 2,
+        ordinals: [1, 5],
+        seqs: [2, 2],
+      }),
+    ]);
+    expect(diagnostics?.duplicateMessageClusters).toContainEqual(
+      expect.objectContaining({
+        kind: "message-content",
+        count: 2,
+        seqs: [2, 2],
+      }),
+    );
+    expect(diagnostics?.topMessageContributors[0]).toMatchObject({
+      messageId: large.messageId,
+      seq: 2,
+      role: "assistant",
+    });
+    expect(diagnostics?.topMessageContributors[0]?.tokens).toBeGreaterThanOrEqual(
+      diagnostics?.topMessageContributors[1]?.tokens ?? 0,
+    );
+    expect(diagnostics?.topSummaryContributors[0]).toMatchObject({
+      summaryId,
+      summaryKind: "leaf",
+      summaryDepth: 0,
+    });
+    expect(JSON.stringify(diagnostics)).not.toContain("large message");
+    expect(JSON.stringify(diagnostics)).not.toContain("summary contributor");
+    expect(small.messageId).toBeGreaterThan(0);
+  });
+
   it("empty conversation returns empty result", async () => {
     const result = await assembler.assemble({
       conversationId: CONV_ID,

@@ -24,6 +24,7 @@ import {
   pickToolCallId,
   pickToolIsError,
   pickToolName,
+  type AssemblyOverflowDiagnostics,
 } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
@@ -80,6 +81,12 @@ type AssemblePrefixSnapshot = {
   serializedMessages: string[];
   messageSummaries: string[];
   fullHash: string;
+};
+
+type BootstrapImportObservation = {
+  importedMessages: number;
+  reason: string | null;
+  observedAt: Date;
 };
 
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
@@ -319,6 +326,33 @@ function describeAssembledPrefixChange(
       ? "none"
       : (currentSnapshot.messageSummaries[commonPrefixCount] ?? "(end)"),
   };
+}
+
+function shouldLogOverflowDiagnostics(params: {
+  diagnostics: AssemblyOverflowDiagnostics;
+  assembledTokens: number;
+  liveContextTokens: number;
+}): boolean {
+  const budget = Math.max(1, params.diagnostics.tokenBudget);
+  return (
+    params.diagnostics.totalContextTokens > budget ||
+    params.assembledTokens >= Math.floor(budget * 0.9) ||
+    params.liveContextTokens >= Math.floor(budget * 0.9) ||
+    params.diagnostics.duplicateRefClusters.length > 0 ||
+    params.diagnostics.duplicateMessageClusters.length > 0
+  );
+}
+
+function formatOverflowDiagnosticsForLog(params: {
+  diagnostics: AssemblyOverflowDiagnostics;
+  recentBootstrapImport?: BootstrapImportObservation;
+}): string {
+  const recent = params.recentBootstrapImport;
+  return JSON.stringify({
+    ...params.diagnostics,
+    recentBootstrapImportCount: recent?.importedMessages ?? null,
+    recentBootstrapImportReason: recent?.reason ?? null,
+  });
 }
 
 function safeString(value: unknown): string | undefined {
@@ -1535,6 +1569,7 @@ export class LcmContextEngine implements ContextEngine {
   >();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private stableOrphanStrippingOrdinalsByConversation = new Map<number, number>();
+  private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
@@ -3669,6 +3704,27 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
+  /** Store the latest bootstrap import count for assembly overflow diagnostics. */
+  private recordRecentBootstrapImport(
+    conversationId: number,
+    importedMessages: number,
+    reason: string | null,
+  ): void {
+    this.recentBootstrapImportsByConversation.delete(conversationId);
+    this.recentBootstrapImportsByConversation.set(conversationId, {
+      importedMessages: Math.max(0, Math.floor(importedMessages)),
+      reason,
+      observedAt: new Date(),
+    });
+    while (this.recentBootstrapImportsByConversation.size > MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS) {
+      const oldestConversationId = this.recentBootstrapImportsByConversation.keys().next().value;
+      if (typeof oldestConversationId !== "number") {
+        break;
+      }
+      this.recentBootstrapImportsByConversation.delete(oldestConversationId);
+    }
+  }
+
   /**
    * Return the stable orphan-stripping ordinal for a conversation and refresh its
    * recency so the bounded cache behaves as an LRU.
@@ -4604,6 +4660,18 @@ export class LcmContextEngine implements ContextEngine {
           `[lcm] bootstrap: heartbeat pruning failed: ${describeLogError(err)}`,
         );
       }
+    }
+
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    if (conversation) {
+      this.recordRecentBootstrapImport(
+        conversation.conversationId,
+        result.importedMessages,
+        result.reason ?? null,
+      );
     }
 
     this.deps.log.info(
@@ -5797,8 +5865,20 @@ export class LcmContextEngine implements ContextEngine {
           assembled.debug.promotedOrdinals.length > 0
             ? assembled.debug.promotedOrdinals.join(",")
             : "none";
+        const overflowDiagnostics = shouldLogOverflowDiagnostics({
+          diagnostics: assembled.debug.overflowDiagnostics,
+          assembledTokens: assembled.estimatedTokens,
+          liveContextTokens,
+        })
+          ? ` overflowDiagnostics=${formatOverflowDiagnosticsForLog({
+              diagnostics: assembled.debug.overflowDiagnostics,
+              recentBootstrapImport: this.recentBootstrapImportsByConversation.get(
+                conversation.conversationId,
+              ),
+            })}`
+          : "";
         this.deps.log.info(
-          `[lcm] assemble-debug conversation=${conversation.conversationId} ${sessionLabel} cacheAwareState=${cacheAwareState} messagesHash=${assembled.debug.finalMessagesHash} preSanitizeHash=${assembled.debug.preSanitizeMessagesHash} previousAssembledCount=${prefixChange.previousCount} commonPrefixCount=${prefixChange.commonPrefixCount} commonPrefixHash=${prefixChange.commonPrefixHash} previousWasPrefix=${prefixChange.previousWasPrefix} firstDivergenceIndex=${prefixChange.firstDivergenceIndex} previousDivergenceMessage=${prefixChange.previousDivergenceMessage} currentDivergenceMessage=${prefixChange.currentDivergenceMessage} evictableCount=${assembled.debug.preSanitizeEvictableCount} evictableHash=${assembled.debug.preSanitizeEvictableHash} freshTailSegmentCount=${assembled.debug.preSanitizeFreshTailCount} freshTailSegmentHash=${assembled.debug.preSanitizeFreshTailHash} selectionMode=${assembled.debug.selectionMode} freshTailOrdinal=${assembled.debug.freshTailOrdinal} orphanStrippingOrdinal=${assembled.debug.orphanStrippingOrdinal} baseFreshTailCount=${assembled.debug.baseFreshTailCount} freshTailCount=${assembled.debug.freshTailCount} tailTokens=${assembled.debug.tailTokens} remainingBudget=${assembled.debug.remainingBudget} evictableTotalTokens=${assembled.debug.evictableTotalTokens} promotedToolResults=${assembled.debug.promotedToolResultCount} promotedOrdinals=${promotedOrdinals} removedToolUseBlocks=${assembled.debug.removedToolUseBlockCount} touchedAssistantMessages=${assembled.debug.touchedAssistantMessageCount}`,
+          `[lcm] assemble-debug conversation=${conversation.conversationId} ${sessionLabel} cacheAwareState=${cacheAwareState} messagesHash=${assembled.debug.finalMessagesHash} preSanitizeHash=${assembled.debug.preSanitizeMessagesHash} previousAssembledCount=${prefixChange.previousCount} commonPrefixCount=${prefixChange.commonPrefixCount} commonPrefixHash=${prefixChange.commonPrefixHash} previousWasPrefix=${prefixChange.previousWasPrefix} firstDivergenceIndex=${prefixChange.firstDivergenceIndex} previousDivergenceMessage=${prefixChange.previousDivergenceMessage} currentDivergenceMessage=${prefixChange.currentDivergenceMessage} evictableCount=${assembled.debug.preSanitizeEvictableCount} evictableHash=${assembled.debug.preSanitizeEvictableHash} freshTailSegmentCount=${assembled.debug.preSanitizeFreshTailCount} freshTailSegmentHash=${assembled.debug.preSanitizeFreshTailHash} selectionMode=${assembled.debug.selectionMode} freshTailOrdinal=${assembled.debug.freshTailOrdinal} orphanStrippingOrdinal=${assembled.debug.orphanStrippingOrdinal} baseFreshTailCount=${assembled.debug.baseFreshTailCount} freshTailCount=${assembled.debug.freshTailCount} tailTokens=${assembled.debug.tailTokens} remainingBudget=${assembled.debug.remainingBudget} evictableTotalTokens=${assembled.debug.evictableTotalTokens} promotedToolResults=${assembled.debug.promotedToolResultCount} promotedOrdinals=${promotedOrdinals} removedToolUseBlocks=${assembled.debug.removedToolUseBlockCount} touchedAssistantMessages=${assembled.debug.touchedAssistantMessageCount}${overflowDiagnostics}`,
         );
       }
 
