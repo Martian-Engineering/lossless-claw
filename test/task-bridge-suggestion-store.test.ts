@@ -105,6 +105,27 @@ describe("TaskBridgeSuggestionStore", () => {
       status: "accepted",
       reviewedBy: "tester",
     });
+
+    store.upsertSuggestion({
+      suggestionId: "sug_2",
+      workItemId: "work_2",
+      taskId: "task_123",
+      suggestionKind: "mark_task_done",
+      confidence: 0.99,
+      rationale: "A later deterministic scan saw the same suggestion again.",
+      sourceIds: ["sum_done", "sum_done_later"],
+      createdBy: "second-writer",
+    });
+    const stillAccepted = store.listSuggestions({ status: "accepted" });
+    expect(stillAccepted).toHaveLength(1);
+    expect(stillAccepted[0]).toMatchObject({
+      suggestionId: "sug_2",
+      status: "accepted",
+      createdBy: "lcm_observed",
+      reviewedBy: "tester",
+      sourceIds: ["sum_done", "sum_done_later"],
+    });
+    expect(store.listSuggestions({ status: "pending" })).toHaveLength(0);
   });
 
   it("rejects invalid suggestion records and reports missing review targets", () => {
