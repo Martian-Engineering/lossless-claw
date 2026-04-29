@@ -803,6 +803,92 @@ describe("runLcmMigrations summary depth backfill", () => {
     ]);
   });
 
+  it("creates message_parts when the bulk schema create did not", () => {
+    const db = createTestDb("missing-message-parts.db");
+    let skippedBulkMessagePartsCreate = false;
+
+    const instrumentedDb = {
+      prepare(sql: string) {
+        return db.prepare(sql);
+      },
+      exec(sql: string) {
+        const isInitialSchemaCreate =
+          !skippedBulkMessagePartsCreate &&
+          sql.includes("CREATE TABLE IF NOT EXISTS message_parts") &&
+          sql.includes("CREATE TABLE IF NOT EXISTS lcm_migration_state");
+        if (!isInitialSchemaCreate) {
+          return db.exec(sql);
+        }
+
+        // Simulate the Node sqlite bulk-exec failure mode by letting the rest of
+        // the schema block run while omitting only the original message_parts DDL.
+        skippedBulkMessagePartsCreate = true;
+        const schemaWithoutMessageParts = sql
+          .replace(
+            /\n\s*CREATE TABLE IF NOT EXISTS message_parts \([\s\S]*?\n\s*\);\n\s*\n\s*CREATE TABLE IF NOT EXISTS summary_messages/,
+            "\n\n    CREATE TABLE IF NOT EXISTS summary_messages",
+          )
+          .replace(
+            /\n\s*CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts \(message_id\);/,
+            "",
+          )
+          .replace(
+            /\n\s*CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts \(part_type\);/,
+            "",
+          );
+        expect(schemaWithoutMessageParts).not.toContain(
+          "CREATE TABLE IF NOT EXISTS message_parts",
+        );
+        return db.exec(schemaWithoutMessageParts);
+      },
+    } as unknown as Parameters<typeof runLcmMigrations>[0];
+
+    runLcmMigrations(instrumentedDb, { fts5Available: false });
+
+    expect(skippedBulkMessagePartsCreate).toBe(true);
+    const tableRow = db
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'table' AND name = 'message_parts'`,
+      )
+      .get() as { name?: string } | undefined;
+    expect(tableRow?.name).toBe("message_parts");
+
+    const indexRows = db
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'index' AND name IN (?, ?)
+         ORDER BY name`,
+      )
+      .all("message_parts_message_idx", "message_parts_type_idx") as Array<{
+      name: string;
+    }>;
+    expect(indexRows.map((row) => row.name)).toEqual([
+      "message_parts_message_idx",
+      "message_parts_type_idx",
+    ]);
+
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      1,
+      "partial-schema-session",
+    );
+    db.prepare(
+      `INSERT INTO messages (message_id, conversation_id, seq, role, content, token_count)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(1, 1, 1, "assistant", "hello", 1);
+    db.prepare(
+      `INSERT INTO message_parts (part_id, message_id, session_id, part_type, ordinal, text_content)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("part-1", 1, "partial-schema-session", "text", 0, "hello");
+
+    const partRow = db
+      .prepare(`SELECT text_content FROM message_parts WHERE part_id = ?`)
+      .get("part-1") as { text_content?: string } | undefined;
+    expect(partRow?.text_content).toBe("hello");
+  });
+
   it("backfills legacy tool_call_id values from metadata.raw.call_id", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
     tempDirs.push(tempDir);
