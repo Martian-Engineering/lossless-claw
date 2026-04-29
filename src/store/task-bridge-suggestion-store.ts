@@ -129,7 +129,7 @@ export class TaskBridgeSuggestionStore {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(suggestion_id) DO UPDATE SET
         work_item_id = excluded.work_item_id,
-        task_id = excluded.task_id,
+        task_id = COALESCE(excluded.task_id, lcm_task_bridge_suggestions.task_id),
         suggestion_kind = excluded.suggestion_kind,
         confidence = excluded.confidence,
         rationale = excluded.rationale,
@@ -197,7 +197,10 @@ export class TaskBridgeSuggestionStore {
     }
     const result = this.db.prepare(
       `UPDATE lcm_task_bridge_suggestions
-       SET status = ?, reviewed_by = ?, reviewed_at = datetime('now'), updated_at = datetime('now')
+       SET status = ?,
+           reviewed_by = COALESCE(?, reviewed_by),
+           reviewed_at = datetime('now'),
+           updated_at = datetime('now')
        WHERE suggestion_id = ?`,
     ).run(input.status, input.reviewedBy ?? null, input.suggestionId);
     return result.changes > 0;
