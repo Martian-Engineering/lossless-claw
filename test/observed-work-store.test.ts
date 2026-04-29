@@ -518,6 +518,64 @@ describe("ObservedWorkStore", () => {
     ]);
   });
 
+  it("classifies incident cues before primary cues and caps combined event results", async () => {
+    const db = makeDb();
+    createConversation(db, 13);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const events = new EventObservationStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork, events);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 13,
+      summaryId: "sum_event_precedence",
+      createdAt: "2026-04-28T07:00:00.000Z",
+      content: [
+        "- Created failing incident report for Tarzan onboarding outage",
+        "- First occurrence: opened project kickoff note",
+      ].join("\n"),
+    });
+    expect(extractor.processConversation(13)).toMatchObject({
+      summariesScanned: 1,
+      eventsUpserted: 2,
+    });
+
+    const tarzanEvents = events.listObservations({
+      conversationId: 13,
+      query: "tarzan",
+      limit: 10,
+    });
+    expect(tarzanEvents[0]?.eventKind).toBe("operational_incident");
+
+    const lcm = {
+      getEventObservationStore: () => events,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const tool = createLcmEventSearchTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "event-session",
+    });
+
+    const result = await tool.execute("event-total-limit", {
+      conversationId: 13,
+      includeEpisodes: true,
+      limit: 3,
+    });
+    const details = result.details as {
+      accounting: { eventsIncluded: number; episodesIncluded: number };
+    };
+    expect(details.accounting.eventsIncluded + details.accounting.episodesIncluded).toBeLessThanOrEqual(3);
+  });
+
   it("reports completed, unfinished, and ambiguous work density", () => {
     const db = makeDb();
     createConversation(db, 1);

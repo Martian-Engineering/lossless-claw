@@ -106,6 +106,7 @@ export function createLcmEventSearchTool(input: {
       }
       const query = typeof p.query === "string" && p.query.trim() ? p.query.trim() : undefined;
       const store = lcm.getEventObservationStore();
+      const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 20;
       const observations = store.listObservations({
         conversationId: scope.conversationId,
         eventKinds,
@@ -114,19 +115,22 @@ export function createLcmEventSearchTool(input: {
         before,
         first: p.first === true,
         includeSources: p.includeSources === true,
-        limit: typeof p.limit === "number" ? Math.trunc(p.limit) : 20,
+        limit,
       });
+      const remainingEpisodeLimit = Math.max(0, limit - observations.length);
       const episodes = p.includeEpisodes === true
-        ? store.listEpisodes({
-            conversationId: scope.conversationId,
-            eventKinds,
-            query,
-            since,
-            before,
-            first: p.first === true,
-            includeSources: p.includeSources === true,
-            limit: typeof p.limit === "number" ? Math.trunc(p.limit) : 20,
-          })
+        ? remainingEpisodeLimit > 0
+          ? store.listEpisodes({
+              conversationId: scope.conversationId,
+              eventKinds,
+              query,
+              since,
+              before,
+              first: p.first === true,
+              includeSources: p.includeSources === true,
+              limit: remainingEpisodeLimit,
+            })
+          : []
         : undefined;
       return jsonResult({
         conversationScope: scope.allConversations ? "all" : scope.conversationId,
