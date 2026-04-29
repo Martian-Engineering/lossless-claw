@@ -112,6 +112,49 @@ describe("ObservedWorkStore", () => {
     expect(pointLookupSpy).not.toHaveBeenCalled();
   });
 
+  it("does not inflate evidence when a retry reprocesses the same summary source", async () => {
+    const db = makeDb();
+    createConversation(db, 12);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 12,
+      summaryId: "sum_retry_same_source",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #552 still has a failing extractor retry test",
+    });
+    expect(extractor.processConversation(12)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    db.prepare(`DELETE FROM lcm_observed_work_state WHERE conversation_id = ?`).run(12);
+    expect(extractor.processConversation(12)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 12,
+      statuses: ["observed_unfinished"],
+      includeSources: true,
+      limit: 10,
+    });
+    expect(density.topUnfinished).toHaveLength(1);
+    expect(density.topUnfinished[0]?.evidenceCount).toBe(1);
+    expect(density.topUnfinished[0]?.sources).toEqual([
+      expect.objectContaining({
+        sourceType: "summary",
+        sourceId: "sum_retry_same_source",
+        evidenceKind: "created",
+      }),
+    ]);
+  });
+
   it("derives the rowid cursor from the processed summary id after rowid drift", async () => {
     const db = makeDb();
     createConversation(db, 11);

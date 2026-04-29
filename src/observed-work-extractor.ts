@@ -242,10 +242,18 @@ export class ObservedWorkExtractor {
     for (const pendingRow of pendingRows) {
       for (const entry of pendingRow.entries) {
         const existing = existingByWorkItemId.get(entry.workItemId);
-        const evidenceCount = (existing?.evidenceCount ?? 0) + 1;
+        const sourceAlreadyRecorded = this.observedWorkStore.hasSource({
+          workItemId: entry.workItemId,
+          sourceType: "summary",
+          sourceId: entry.row.summary_id,
+        });
+        const evidenceCount =
+          (existing?.evidenceCount ?? 0) + (sourceAlreadyRecorded ? 0 : 1);
         const confidence = Math.min(
           0.98,
-          Math.max(entry.work.confidence, (existing?.confidence ?? 0) + 0.05),
+          sourceAlreadyRecorded && existing
+            ? existing.confidence
+            : Math.max(entry.work.confidence, (existing?.confidence ?? 0) + 0.05),
         );
         this.observedWorkStore.upsertItem({
           workItemId: entry.workItemId,
@@ -267,13 +275,15 @@ export class ObservedWorkExtractor {
           fingerprint: entry.fingerprint,
           fingerprintVersion: 2,
         });
-        this.observedWorkStore.addSource({
-          workItemId: entry.workItemId,
-          sourceType: "summary",
-          sourceId: entry.row.summary_id,
-          ordinal: entry.ordinal,
-          evidenceKind: evidenceKindFor(existing, entry.work),
-        });
+        if (!sourceAlreadyRecorded) {
+          this.observedWorkStore.addSource({
+            workItemId: entry.workItemId,
+            sourceType: "summary",
+            sourceId: entry.row.summary_id,
+            ordinal: entry.ordinal,
+            evidenceKind: evidenceKindFor(existing, entry.work),
+          });
+        }
         existingByWorkItemId.set(entry.workItemId, {
           workItemId: entry.workItemId,
           observedStatus: entry.work.observedStatus,
