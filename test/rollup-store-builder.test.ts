@@ -1036,6 +1036,83 @@ describe("LCM sub-day window retrieval", () => {
     );
   });
 
+  it("bypasses a stored day rollup when pending rebuild touches that day", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-prior-day",
+      sessionKey: "agent:main:pending-prior-day",
+      title: "Pending prior day",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_pending_prior_day",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Fresh prior-day work should not be hidden behind a stale ready rollup.",
+      tokenCount: 10,
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+    rollupStore.upsertRollup({
+      rollup_id: "rollup_pending_prior_day",
+      conversation_id: conversation.conversationId,
+      period_kind: "day",
+      period_key: "2026-04-27",
+      period_start: "2026-04-27T00:00:00.000Z",
+      period_end: "2026-04-28T00:00:00.000Z",
+      timezone: "UTC",
+      content: "STALE READY DAY ROLLUP SHOULD NOT BE USED",
+      token_count: 10,
+      source_summary_ids: JSON.stringify([]),
+      source_message_count: 0,
+      source_token_count: 0,
+      status: "ready",
+      coverage_start: null,
+      coverage_end: null,
+      summarizer_model: null,
+      source_fingerprint: null,
+    });
+    rollupStore.upsertState(conversation.conversationId, {
+      timezone: "UTC",
+      last_message_at: "2026-04-27T10:05:00.000Z",
+      pending_rebuild: 1,
+    });
+
+    const now = new Date("2026-04-29T12:00:00.000Z");
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => rollupStore,
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "pending-prior-day",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "pending-prior-day",
+    });
+
+    const result = await tool.execute("call-pending-prior-day", {
+      period: "date:2026-04-27",
+      includeSources: true,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("**Status:** fallback");
+    expect(text).toContain("**Degraded:** Rollup rebuild is pending for 2026-04-27");
+    expect(text).toContain("Fresh prior-day work");
+    expect(text).not.toContain("STALE READY DAY ROLLUP");
+    expect(
+      (result.details as { usedFallback?: boolean; degradedReason?: string }).usedFallback
+    ).toBe(true);
+  });
+
   it("combines complete prior daily rollups with live fallback for 7d", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     vi.useFakeTimers();
@@ -1111,6 +1188,94 @@ describe("LCM sub-day window retrieval", () => {
       expect(text).toContain("Fresh current-day work should use live fallback");
       expect((result.details as { usedFallback?: boolean }).usedFallback).toBe(
         true
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not treat days with unsummarized raw messages as covered by missing rollups", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { db, conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "seven-day-raw-gap",
+        sessionKey: "agent:main:seven-day-raw-gap",
+        title: "Seven day raw gap",
+      });
+      await summaryStore.insertSummary({
+        summaryId: "sum_raw_gap_rollup_source",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Leaf summary for the only prebuilt day.",
+        tokenCount: 8,
+        latestAt: new Date("2026-04-22T10:00:00.000Z"),
+      });
+      const rawMessage = await conversationStore.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "Unsummarized raw gap work should force degraded fallback.",
+        tokenCount: 11,
+      });
+      db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?").run(
+        "2026-04-23T10:00:00.000Z",
+        rawMessage.messageId
+      );
+      rollupStore.upsertRollup({
+        rollup_id: "rollup_raw_gap_prebuilt",
+        conversation_id: conversation.conversationId,
+        period_kind: "day",
+        period_key: "2026-04-22",
+        period_start: "2026-04-22T00:00:00.000Z",
+        period_end: "2026-04-23T00:00:00.000Z",
+        timezone: "UTC",
+        content: "STORED PARTIAL ROLLUP SHOULD NOT MASK RAW GAP",
+        token_count: 8,
+        source_summary_ids: JSON.stringify(["sum_raw_gap_rollup_source"]),
+        source_message_count: 1,
+        source_token_count: 8,
+        status: "ready",
+        coverage_start: "2026-04-22T10:00:00.000Z",
+        coverage_end: "2026-04-22T10:00:00.000Z",
+        summarizer_model: null,
+        source_fingerprint: null,
+      });
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "seven-day-raw-gap",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "seven-day-raw-gap",
+      });
+
+      const result = await tool.execute("call-7d-raw-gap", {
+        period: "7d",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain("Unsummarized raw gap work");
+      expect(text).toContain(`message:${rawMessage.messageId}`);
+      expect(text).not.toContain("STORED PARTIAL ROLLUP");
+      expect((result.details as { status?: string; usedFallback?: boolean }).status).toBe(
+        "fallback"
       );
     } finally {
       vi.useRealTimers();
