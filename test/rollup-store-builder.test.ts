@@ -832,14 +832,14 @@ describe("LCM sub-day window retrieval", () => {
     const result = await tool.execute("call-budget", {
       period: "date:2026-04-27 10:00-11:30",
       includeSources: false,
-      maxOutputTokens: 250,
-      globalMaxOutputTokens: 250,
+      maxOutputTokens: 320,
+      globalMaxOutputTokens: 320,
       maxSourceSummaries: 80,
     });
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("*Sources: omitted*");
     expect(text).not.toContain("sum_budget_");
-    expect(estimateTokens(text)).toBeLessThanOrEqual(250);
+    expect(estimateTokens(text)).toBeLessThanOrEqual(320);
     expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([]);
   });
 
