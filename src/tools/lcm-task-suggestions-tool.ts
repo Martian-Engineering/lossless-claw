@@ -43,7 +43,7 @@ const LcmTaskSuggestionsSchema = Type.Object({
   allConversations: Type.Optional(Type.Boolean({ description: "Explicitly inspect all conversations. Defaults to false." })),
   since: Type.Optional(Type.String({ description: "Only include observed items last seen at or after this ISO timestamp." })),
   before: Type.Optional(Type.String({ description: "Only include observed items first seen before this ISO timestamp." })),
-  topic: Type.Optional(Type.String({ description: "Deterministic topic/title/rationale filter." })),
+  topic: Type.Optional(Type.String({ description: "Exact observed-work topic_key filter." })),
   statuses: Type.Optional(Type.Array(Type.String({ enum: [...STATUS_VALUES] }), { description: "Observed statuses to turn into suggestions. Defaults to unfinished and ambiguous." })),
   kinds: Type.Optional(Type.Array(Type.String({ enum: [...KIND_VALUES] }), { description: "Observed work kinds to include." })),
   minConfidence: Type.Optional(Type.Number({ description: "Minimum observed confidence. Default 0.6.", minimum: 0, maximum: 1 })),
