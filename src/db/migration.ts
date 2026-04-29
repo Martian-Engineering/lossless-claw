@@ -1313,6 +1313,46 @@ export function runLcmMigrations(
       `);
     });
 
+    runMigrationStep("ensureEventEpisodeTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_event_episodes (
+          episode_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          episode_kind TEXT NOT NULL CHECK (episode_kind IN (
+            'primary',
+            'retelling',
+            'memory_injection',
+            'echo',
+            'imported',
+            'operational_incident',
+            'decision'
+          )),
+          topic_key TEXT NOT NULL,
+          title TEXT NOT NULL,
+          first_event_time TEXT NOT NULL,
+          last_event_time TEXT NOT NULL,
+          observation_count INTEGER NOT NULL DEFAULT 0,
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          source_ids TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_event_episode_observations (
+          episode_id TEXT NOT NULL REFERENCES lcm_event_episodes(episode_id) ON DELETE CASCADE,
+          event_id TEXT NOT NULL REFERENCES lcm_event_observations(event_id) ON DELETE CASCADE,
+          ordinal INTEGER NOT NULL,
+          PRIMARY KEY (episode_id, event_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS lcm_event_episodes_conversation_topic_idx
+          ON lcm_event_episodes(conversation_id, topic_key, first_event_time ASC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_episodes_kind_time_idx
+          ON lcm_event_episodes(episode_kind, first_event_time ASC);
+      `);
+    });
+
     const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
     const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
     if (fts5Available) {

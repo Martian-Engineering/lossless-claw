@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 export type EventObservationKind =
@@ -41,6 +42,21 @@ export type EventObservation = {
   updatedAt: string;
 };
 
+export type EventEpisode = {
+  episodeId: string;
+  conversationId: number;
+  episodeKind: EventObservationKind;
+  topicKey: string;
+  title: string;
+  firstEventTime: string;
+  lastEventTime: string;
+  observationCount: number;
+  confidence: number;
+  sources?: Array<{ sourceType: "summary" | "rollup" | "message"; sourceId: string }>;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type EventObservationRow = {
   event_id: string;
   conversation_id: number;
@@ -58,6 +74,25 @@ type EventObservationRow = {
   created_at: string;
   updated_at: string;
 };
+
+type EventEpisodeRow = {
+  episode_id: string;
+  conversation_id: number;
+  episode_kind: EventObservationKind;
+  topic_key: string;
+  title: string;
+  first_event_time: string;
+  last_event_time: string;
+  observation_count: number;
+  confidence: number;
+  source_ids: string;
+  created_at: string;
+  updated_at: string;
+};
+
+function hashId(prefix: string, value: string): string {
+  return `${prefix}_${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
+}
 
 function placeholders(values: readonly unknown[]): string {
   return values.map(() => "?").join(", ");
@@ -128,6 +163,36 @@ function rowToEvent(row: EventObservationRow, includeSources: boolean): EventObs
   };
 }
 
+function rowToEpisode(row: EventEpisodeRow, includeSources: boolean): EventEpisode {
+  return {
+    episodeId: row.episode_id,
+    conversationId: row.conversation_id,
+    episodeKind: row.episode_kind,
+    topicKey: row.topic_key,
+    title: row.title,
+    firstEventTime: row.first_event_time,
+    lastEventTime: row.last_event_time,
+    observationCount: row.observation_count,
+    confidence: row.confidence,
+    ...(includeSources
+      ? { sources: parseSourceIds(row.source_ids, "summary") }
+      : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function compareIso(a: string, b: string, pick: "min" | "max"): string {
+  const aTime = new Date(a).getTime();
+  const bTime = new Date(b).getTime();
+  if (!Number.isFinite(aTime)) return b;
+  if (!Number.isFinite(bTime)) return a;
+  if (pick === "min") {
+    return aTime <= bTime ? a : b;
+  }
+  return aTime >= bTime ? a : b;
+}
+
 export class EventObservationStore {
   constructor(private readonly db: DatabaseSync) {}
 
@@ -181,6 +246,101 @@ export class EventObservationStore {
       sourceId,
       JSON.stringify(sourceIds),
     );
+    this.upsertEpisodeFromObservation({
+      eventId: input.eventId,
+      conversationId: input.conversationId,
+      eventKind: input.eventKind,
+      title: input.title.trim(),
+      queryKey: input.queryKey?.trim().toLowerCase() || "uncategorized",
+      eventTime: input.eventTime ?? input.ingestTime,
+      confidence: input.confidence ?? 0.5,
+      sourceIds,
+    });
+  }
+
+  private upsertEpisodeFromObservation(input: {
+    eventId: string;
+    conversationId: number;
+    eventKind: EventObservationKind;
+    title: string;
+    queryKey: string;
+    eventTime: string;
+    confidence: number;
+    sourceIds: string[];
+  }): void {
+    const episodeId = hashId(
+      "ep",
+      `${input.conversationId}:${input.eventKind}:${input.queryKey}`,
+    );
+    const existing = this.db.prepare(
+      `SELECT episode_id, conversation_id, episode_kind, topic_key, title,
+              first_event_time, last_event_time, observation_count, confidence,
+              source_ids, created_at, updated_at
+       FROM lcm_event_episodes
+       WHERE episode_id = ?`,
+    ).get(episodeId) as EventEpisodeRow | undefined;
+    const sourceIds = normalizeSourceIds(
+      existing
+        ? [
+            ...parseSourceIds(existing.source_ids, "summary").map((source) => source.sourceId),
+            ...input.sourceIds,
+          ]
+        : input.sourceIds,
+      input.sourceIds[0] ?? input.eventId,
+    );
+    const firstEventTime = existing
+      ? compareIso(existing.first_event_time, input.eventTime, "min")
+      : input.eventTime;
+    const lastEventTime = existing
+      ? compareIso(existing.last_event_time, input.eventTime, "max")
+      : input.eventTime;
+    this.db.prepare(
+      `INSERT INTO lcm_event_episodes (
+        episode_id, conversation_id, episode_kind, topic_key, title,
+        first_event_time, last_event_time, observation_count, confidence,
+        source_ids, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, datetime('now'))
+      ON CONFLICT(episode_id) DO UPDATE SET
+        title = CASE
+          WHEN julianday(excluded.first_event_time) < julianday(lcm_event_episodes.first_event_time)
+          THEN excluded.title
+          ELSE lcm_event_episodes.title
+        END,
+        first_event_time = excluded.first_event_time,
+        last_event_time = excluded.last_event_time,
+        confidence = max(lcm_event_episodes.confidence, excluded.confidence),
+        source_ids = excluded.source_ids,
+        updated_at = datetime('now')`,
+    ).run(
+      episodeId,
+      input.conversationId,
+      input.eventKind,
+      input.queryKey,
+      input.title,
+      firstEventTime,
+      lastEventTime,
+      input.confidence,
+      JSON.stringify(sourceIds),
+    );
+    this.db.prepare(
+      `INSERT OR IGNORE INTO lcm_event_episode_observations (
+        episode_id, event_id, ordinal
+      ) VALUES (
+        ?,
+        ?,
+        COALESCE((SELECT MAX(ordinal) + 1 FROM lcm_event_episode_observations WHERE episode_id = ?), 0)
+      )`,
+    ).run(episodeId, input.eventId, episodeId);
+    const count = this.db.prepare(
+      `SELECT COUNT(*) AS count
+       FROM lcm_event_episode_observations
+       WHERE episode_id = ?`,
+    ).get(episodeId) as { count: number };
+    this.db.prepare(
+      `UPDATE lcm_event_episodes
+       SET observation_count = ?, updated_at = datetime('now')
+       WHERE episode_id = ?`,
+    ).run(count.count, episodeId);
   }
 
   listObservations(input?: {
@@ -232,5 +392,56 @@ export class EventObservationStore {
        LIMIT ?`,
     ).all(...args, limit) as EventObservationRow[];
     return rows.map((row) => rowToEvent(row, input?.includeSources === true));
+  }
+
+  listEpisodes(input?: {
+    conversationId?: number;
+    eventKinds?: EventObservationKind[];
+    query?: string;
+    since?: string;
+    before?: string;
+    first?: boolean;
+    includeSources?: boolean;
+    limit?: number;
+  }): EventEpisode[] {
+    const where: string[] = [];
+    const args: Array<string | number> = [];
+    if (input?.conversationId != null) {
+      where.push("conversation_id = ?");
+      args.push(input.conversationId);
+    }
+    if (input?.eventKinds?.length) {
+      where.push(`episode_kind IN (${placeholders(input.eventKinds)})`);
+      args.push(...input.eventKinds);
+    }
+    const query = input?.query?.trim().toLowerCase();
+    if (query) {
+      const likeQuery = `%${escapeLikePattern(query)}%`;
+      where.push(
+        "(lower(topic_key) = ? OR lower(title) LIKE ? ESCAPE '\\')"
+      );
+      args.push(query, likeQuery);
+    }
+    if (input?.since) {
+      where.push("julianday(last_event_time) >= julianday(?)");
+      args.push(input.since);
+    }
+    if (input?.before) {
+      where.push("julianday(first_event_time) < julianday(?)");
+      args.push(input.before);
+    }
+    const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
+    const order = input?.first ? "ASC" : "DESC";
+    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const rows = this.db.prepare(
+      `SELECT episode_id, conversation_id, episode_kind, topic_key, title,
+              first_event_time, last_event_time, observation_count, confidence,
+              source_ids, created_at, updated_at
+       FROM lcm_event_episodes
+       ${whereSql}
+       ORDER BY julianday(first_event_time) ${order}, confidence DESC
+       LIMIT ?`,
+    ).all(...args, limit) as EventEpisodeRow[];
+    return rows.map((row) => rowToEpisode(row, input?.includeSources === true));
   }
 }

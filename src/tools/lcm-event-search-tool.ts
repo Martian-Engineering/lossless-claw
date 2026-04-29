@@ -25,6 +25,7 @@ const LcmEventSearchSchema = Type.Object({
   before: Type.Optional(Type.String({ description: "Only include events before this ISO timestamp." })),
   first: Type.Optional(Type.Boolean({ description: "Return earliest matching events first. Defaults to latest first." })),
   includeSources: Type.Optional(Type.Boolean({ description: "Include event source IDs. Defaults to false." })),
+  includeEpisodes: Type.Optional(Type.Boolean({ description: "Also return cross-summary event episodes grouped by deterministic topic key and event kind. Defaults to false." })),
   limit: Type.Optional(Type.Number({ description: "Maximum events to return. Default 20.", minimum: 1, maximum: 100 })),
 });
 
@@ -104,7 +105,8 @@ export function createLcmEventSearchTool(input: {
         return jsonResult({ error: "since must be earlier than before." });
       }
       const query = typeof p.query === "string" && p.query.trim() ? p.query.trim() : undefined;
-      const observations = lcm.getEventObservationStore().listObservations({
+      const store = lcm.getEventObservationStore();
+      const observations = store.listObservations({
         conversationId: scope.conversationId,
         eventKinds,
         query,
@@ -114,13 +116,27 @@ export function createLcmEventSearchTool(input: {
         includeSources: p.includeSources === true,
         limit: typeof p.limit === "number" ? Math.trunc(p.limit) : 20,
       });
+      const episodes = p.includeEpisodes === true
+        ? store.listEpisodes({
+            conversationId: scope.conversationId,
+            eventKinds,
+            query,
+            since,
+            before,
+            first: p.first === true,
+            includeSources: p.includeSources === true,
+            limit: typeof p.limit === "number" ? Math.trunc(p.limit) : 20,
+          })
+        : undefined;
       return jsonResult({
         conversationScope: scope.allConversations ? "all" : scope.conversationId,
         query,
         window: since || before ? { since, before } : undefined,
         observations,
+        ...(episodes ? { episodes } : {}),
         accounting: {
           eventsIncluded: observations.length,
+          episodesIncluded: episodes?.length ?? 0,
           includeSources: p.includeSources === true,
         },
         disclaimer:
