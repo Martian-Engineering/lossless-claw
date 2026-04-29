@@ -134,11 +134,24 @@ describe("TaskBridgeSuggestionStore", () => {
     expect(stillAccepted[0]).toMatchObject({
       suggestionId: "sug_2",
       status: "accepted",
+      taskId: "task_123",
       createdBy: "lcm_observed",
       reviewedBy: "tester",
       sourceIds: ["sum_done", "sum_done_later"],
     });
     expect(store.listSuggestions({ status: "pending" })).toHaveLength(0);
+
+    expect(
+      store.reviewSuggestion({
+        suggestionId: "sug_2",
+        status: "dismissed",
+      })
+    ).toBe(true);
+    const dismissed = store.listSuggestions({ status: "dismissed" });
+    expect(dismissed[0]).toMatchObject({
+      suggestionId: "sug_2",
+      reviewedBy: "tester",
+    });
   });
 
   it("rejects invalid suggestion records and reports missing review targets", () => {
