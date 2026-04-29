@@ -554,8 +554,11 @@ function confidenceForAccounting(
   accounting: RecallAccounting,
   status: "ready" | "stale" | "fallback"
 ): "none" | "low" | "medium" | "high" {
-  if (accounting.summariesAvailable === 0 && accounting.outputTokens === 0) {
+  if (accounting.summariesAvailable === 0) {
     return "none";
+  }
+  if (accounting.summariesIncluded === 0) {
+    return "low";
   }
   if (accounting.truncated || accounting.summariesOmitted > 0 || status === "fallback") {
     return accounting.summariesIncluded > 0 ? "medium" : "low";
@@ -1187,6 +1190,13 @@ export function createLcmRecentTool(input: {
           budget,
           includeSources
         );
+        const accounting = buildAccounting(
+          rendered.content,
+          rendered.retainedSummaries,
+          fallback.availableCount,
+          rendered.truncated || fallback.sqlTruncated
+        );
+        const confidence = confidenceForAccounting(accounting, "fallback");
 
         const lines: string[] = [];
         lines.push(`## Recent Activity: ${resolution.label}`);
@@ -1197,6 +1207,8 @@ export function createLcmRecentTool(input: {
           )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
+        lines.push(`**Confidence:** ${confidence}`);
+        lines.push(...formatBudgetLines(budget, accounting));
         lines.push("");
         if (fallback.summaries.length === 0) {
           lines.push(
@@ -1215,7 +1227,7 @@ export function createLcmRecentTool(input: {
         }
         lines.push("---");
         lines.push(formatSourcesLine(sourceSummaryIds, includeSources));
-        lines.push(formatDrilldownHint(includeSources, "medium"));
+        lines.push(formatDrilldownHint(includeSources, confidence));
         const response = enforceResponseBudget(lines.join("\n"), budget);
 
         return {
@@ -1223,9 +1235,12 @@ export function createLcmRecentTool(input: {
           details: {
             status: "fallback",
             usedFallback: true,
+            confidence,
+            budget,
+            accounting,
             totalMatches: fallback.availableCount,
             tokenCount: response.tokenCount,
-            truncated: response.truncated || rendered.truncated || fallback.sqlTruncated,
+            truncated: response.truncated || accounting.truncated || fallback.sqlTruncated,
             summaryIds: includeSources ? sourceSummaryIds : [],
           },
         };
