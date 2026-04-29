@@ -12,7 +12,10 @@ import type {
 } from "../store/observed-work-store.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
-import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import {
+  parseIsoTimestampParam,
+  resolveLcmConversationScope,
+} from "./lcm-conversation-scope.js";
 
 const STATUS_VALUES = [
   "observed_completed",
@@ -50,17 +53,6 @@ const LcmWorkDensitySchema = Type.Object({
   minConfidence: Type.Optional(Type.Number({ description: "Minimum observed confidence to include.", minimum: 0, maximum: 1 })),
   limit: Type.Optional(Type.Number({ description: "Maximum items per highlight section. Default 5.", minimum: 1, maximum: 50 })),
 });
-
-function parseTimestamp(value: unknown, key: string): string | undefined {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    return undefined;
-  }
-  const parsed = new Date(value.trim());
-  if (Number.isNaN(parsed.getTime())) {
-    throw new Error(`${key} must be a valid ISO timestamp.`);
-  }
-  return parsed.toISOString();
-}
 
 function resolvePeriodBounds(
   period: unknown,
@@ -201,8 +193,8 @@ export function createLcmWorkDensityTool(input: {
       try {
         const periodBounds = resolvePeriodBounds(p.period, lcm.timezone);
         periodLabel = periodBounds.label;
-        since = parseTimestamp(p.since, "since") ?? periodBounds.since;
-        before = parseTimestamp(p.before, "before") ?? periodBounds.before;
+        since = parseIsoTimestampParam(p, "since")?.toISOString() ?? periodBounds.since;
+        before = parseIsoTimestampParam(p, "before")?.toISOString() ?? periodBounds.before;
         statuses = arrayParam(p.statuses, STATUS_VALUES, "statuses");
         kinds = arrayParam(p.kinds, KIND_VALUES, "kinds");
       } catch (error) {
