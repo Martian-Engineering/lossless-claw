@@ -1152,7 +1152,7 @@ describe("LCM weekly and monthly rollups", () => {
 
     const result = await builder.buildDailyRollups(conversation.conversationId, {
       forceCurrentDay: true,
-      daysBack: 2,
+      daysBack: 3,
     });
     expect(result.built).toBeGreaterThan(0);
     const second = rollupStore.getRollup(
@@ -1256,7 +1256,7 @@ describe("LCM weekly and monthly rollups", () => {
 
     const daily = await builder.buildDailyRollups(conversation.conversationId, {
       forceCurrentDay: true,
-      daysBack: 2,
+      daysBack: 3,
     });
     expect(daily.built).toBeGreaterThan(0);
     expect(
@@ -1890,7 +1890,7 @@ describe("LCM weekly and monthly rollups", () => {
     const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
     const result = await builder.buildDailyRollups(conversation.conversationId, {
       forceCurrentDay: true,
-      daysBack: 2,
+      daysBack: 3,
     });
     upsertSpy.mockRestore();
 
