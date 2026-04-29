@@ -244,7 +244,8 @@ describe("LCM ultimate architecture implementation", () => {
       conversationId: 3,
       topic: "PR #518",
     });
-    expect(JSON.stringify(preview.details)).toContain("mark_task_blocked");
+    expect(JSON.stringify(preview.details)).toContain("create_task");
+    expect(JSON.stringify(preview.details)).not.toContain("mark_task_blocked");
     expect(JSON.stringify(preview.details)).not.toContain("sum_blocked");
     expect(taskBridge.listSuggestions()).toHaveLength(0);
 
@@ -264,7 +265,7 @@ describe("LCM ultimate architecture implementation", () => {
     expect(JSON.stringify(recorded.details)).toContain("sum_blocked");
     const pending = taskBridge.listSuggestions({ status: "pending" });
     expect(pending).toHaveLength(1);
-    expect(pending[0]?.suggestionKind).toBe("mark_task_blocked");
+    expect(pending[0]?.suggestionKind).toBe("create_task");
     expect(db.prepare(`SELECT name FROM sqlite_master WHERE name = 'tasks'`).get()).toBeUndefined();
 
     const reviewTool = createLcmTaskSuggestionReviewTool({ lcm: lcm as never });

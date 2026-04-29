@@ -93,12 +93,12 @@ function suggestionKindFor(item: ObservedWorkDensityItem): TaskBridgeSuggestionK
   if (item.observedStatus === "observed_completed") {
     return "add_task_evidence";
   }
-  if (item.kind === "blocker") {
-    return "mark_task_blocked";
-  }
   if (item.observedStatus === "observed_ambiguous" || item.kind === "decision") {
     return "add_task_evidence";
   }
+  // Observed-work items do not carry an authoritative external task id. Until a
+  // later opt-in linker supplies one, blockers become task-creation suggestions
+  // rather than task-targeted mutations such as mark_task_blocked.
   return "create_task";
 }
 
