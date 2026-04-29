@@ -2156,6 +2156,55 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("maintain() runs observed-work extraction without mutating density reads", async () => {
+    const engine = createEngineWithConfig({
+      transcriptGcEnabled: false,
+    });
+    const sessionId = randomUUID();
+    const sessionFile = createSessionFilePath("observed-work-maintenance");
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed observed work maintenance" }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_observed_maintenance",
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      content: "- Completed: PR #540 maintenance extraction tests passed",
+      tokenCount: 12,
+    });
+
+    const beforeRead = engine.getObservedWorkStore().getDensity({
+      conversationId: conversation!.conversationId,
+      limit: 10,
+    });
+    expect(beforeRead.density.totalObserved).toBe(0);
+    expect(engine.getObservedWorkStore().getState(conversation!.conversationId)).toBeNull();
+
+    await engine.maintain({
+      sessionId,
+      sessionFile,
+    });
+
+    const afterMaintain = engine.getObservedWorkStore().getDensity({
+      conversationId: conversation!.conversationId,
+      statuses: ["observed_completed"],
+      limit: 10,
+    });
+    expect(afterMaintain.density.completed).toBe(1);
+    expect(afterMaintain.completedHighlights[0]?.topicKey).toBe("pr-540");
+    expect(engine.getObservedWorkStore().getState(conversation!.conversationId)).toMatchObject({
+      pendingRebuild: false,
+      lastProcessedSummaryId: "sum_observed_maintenance",
+    });
+  });
+
   it("serializes recycled session writes by stable sessionKey", async () => {
     const engine = createEngine();
     const sessionKey = "agent:main:main";

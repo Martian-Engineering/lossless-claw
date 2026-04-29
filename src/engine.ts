@@ -45,6 +45,7 @@ import {
 } from "./large-files.js";
 import { describeLogError } from "./lcm-log.js";
 import { describeLcmConfigSource } from "./db/config.js";
+import { ObservedWorkExtractor } from "./observed-work-extractor.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { RollupBuilder } from "./rollup-builder.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
@@ -1455,6 +1456,7 @@ export class LcmContextEngine implements ContextEngine {
   private compactionMaintenanceStore: CompactionMaintenanceStore;
   private eventObservationStore: EventObservationStore;
   private observedWorkStore: ObservedWorkStore;
+  private observedWorkExtractor: ObservedWorkExtractor;
   private rollupStore: RollupStore;
   private rollupBuilder: RollupBuilder;
   private assembler: ContextAssembler;
@@ -1547,6 +1549,11 @@ export class LcmContextEngine implements ContextEngine {
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
     this.eventObservationStore = new EventObservationStore(this.db);
     this.observedWorkStore = new ObservedWorkStore(this.db);
+    this.observedWorkExtractor = new ObservedWorkExtractor(
+      this.db,
+      this.observedWorkStore,
+      this.eventObservationStore,
+    );
     this.rollupStore = new RollupStore(this.db);
     this.rollupBuilder = new RollupBuilder(this.rollupStore, {
       timezone: this.timezone,
@@ -4791,6 +4798,35 @@ export class LcmContextEngine implements ContextEngine {
               `[lcm] maintain: rollup build failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
             );
             markRollupRebuildPending("rollup-build-failed");
+          }
+          try {
+            const observedResult = this.observedWorkExtractor.processConversation(
+              conversation.conversationId,
+              { limit: 500 },
+            );
+            if (
+              observedResult.summariesScanned > 0 ||
+              observedResult.workItemsUpserted > 0 ||
+              observedResult.eventsUpserted > 0
+            ) {
+              this.deps.log.info(
+                `[lcm] maintain: observed-work extraction conversation=${conversation.conversationId} ${sessionLabel} summariesScanned=${observedResult.summariesScanned} workItemsUpserted=${observedResult.workItemsUpserted} eventsUpserted=${observedResult.eventsUpserted}`,
+              );
+            }
+          } catch (error) {
+            this.deps.log.warn(
+              `[lcm] maintain: observed-work extraction failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
+            );
+            try {
+              this.observedWorkStore.upsertState({
+                conversationId: conversation.conversationId,
+                pendingRebuild: true,
+              });
+            } catch (stateError) {
+              this.deps.log.warn(
+                `[lcm] maintain: failed to preserve observed-work pending state conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(stateError)}`,
+              );
+            }
           }
           return result;
         };

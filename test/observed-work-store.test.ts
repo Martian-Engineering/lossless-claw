@@ -352,6 +352,13 @@ describe("ObservedWorkStore", () => {
       });
       expect(JSON.stringify(shown.details)).toContain("sum_today");
       expect((shown.details as { period?: string }).period).toBe("today");
+
+      const allConversations = await tool.execute("density-all", {
+        allConversations: true,
+      });
+      expect((allConversations.details as { error?: string }).error).toContain(
+        "does not support allConversations=true",
+      );
     } finally {
       vi.useRealTimers();
     }
