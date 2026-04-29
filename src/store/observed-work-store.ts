@@ -324,6 +324,22 @@ export class ObservedWorkStore {
     ).run(input.workItemId, input.sourceType, input.sourceId, input.ordinal, input.evidenceKind);
   }
 
+  hasSource(input: {
+    workItemId: string;
+    sourceType: "summary" | "rollup" | "message";
+    sourceId: string;
+  }): boolean {
+    const row = this.db.prepare(
+      `SELECT 1 AS found
+       FROM lcm_observed_work_sources
+       WHERE work_item_id = ?
+         AND source_type = ?
+         AND source_id = ?
+       LIMIT 1`,
+    ).get(input.workItemId, input.sourceType, input.sourceId);
+    return row != null;
+  }
+
   upsertState(input: {
     conversationId: number;
     lastProcessedSummaryCreatedAt?: string;
