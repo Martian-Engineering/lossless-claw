@@ -65,6 +65,13 @@ const REVIEW_STATUSES = new Set<TaskBridgeSuggestionStatus>([
   "expired",
 ]);
 
+const TASK_TARGETING_KINDS = new Set<TaskBridgeSuggestionKind>([
+  "link_task",
+  "mark_task_done",
+  "mark_task_blocked",
+  "add_task_evidence",
+]);
+
 function normalizeSourceIds(sourceIds: string[]): string[] {
   return [
     ...new Set(
@@ -103,17 +110,58 @@ function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
 export class TaskBridgeSuggestionStore {
   constructor(private readonly db: DatabaseSync) {}
 
+  private assertSourceIdsBelongToWorkItem(
+    workItemId: string,
+    sourceIds: string[]
+  ): void {
+    const placeholders = sourceIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT source_id
+         FROM lcm_observed_work_sources
+         WHERE work_item_id = ?
+           AND source_id IN (${placeholders})`
+      )
+      .all(workItemId, ...sourceIds) as Array<{ source_id: string }>;
+    const found = new Set(rows.map((row) => row.source_id));
+    const missing = sourceIds.filter((sourceId) => !found.has(sourceId));
+    if (missing.length > 0) {
+      throw new Error(
+        `source IDs must reference observed-work evidence for this work item: ${missing.join(", ")}`
+      );
+    }
+  }
+
   upsertSuggestion(input: TaskBridgeSuggestionInput): void {
+    const suggestionId = input.suggestionId.trim();
+    if (suggestionId.length === 0) {
+      throw new Error("suggestionId is required.");
+    }
+    const workItemId = input.workItemId.trim();
+    if (workItemId.length === 0) {
+      throw new Error("workItemId is required.");
+    }
     if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
       throw new Error("confidence must be between 0 and 1.");
     }
     if (input.rationale.trim().length === 0) {
       throw new Error("rationale is required.");
     }
+    const requestedStatus = input.status ?? "pending";
+    if (requestedStatus !== "pending") {
+      throw new Error(
+        "upsertSuggestion only creates or refreshes pending suggestions; use reviewSuggestion for reviewed states."
+      );
+    }
+    const taskId = input.taskId?.trim();
+    if (TASK_TARGETING_KINDS.has(input.suggestionKind) && !taskId) {
+      throw new Error(`${input.suggestionKind} suggestions require taskId.`);
+    }
     const sourceIds = normalizeSourceIds(input.sourceIds);
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
     }
+    this.assertSourceIdsBelongToWorkItem(workItemId, sourceIds);
     this.db.prepare(
       `INSERT INTO lcm_task_bridge_suggestions (
         suggestion_id, work_item_id, task_id, suggestion_kind, status, confidence,
@@ -121,22 +169,22 @@ export class TaskBridgeSuggestionStore {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(suggestion_id) DO UPDATE SET
         work_item_id = excluded.work_item_id,
-        task_id = excluded.task_id,
+        task_id = COALESCE(excluded.task_id, lcm_task_bridge_suggestions.task_id),
         suggestion_kind = excluded.suggestion_kind,
         confidence = excluded.confidence,
         rationale = excluded.rationale,
         source_ids = excluded.source_ids,
         updated_at = datetime('now')`,
     ).run(
-      input.suggestionId,
-      input.workItemId,
-      input.taskId ?? null,
+      suggestionId,
+      workItemId,
+      taskId ?? null,
       input.suggestionKind,
-      input.status ?? "pending",
+      "pending",
       input.confidence,
       input.rationale.trim(),
       JSON.stringify(sourceIds),
-      input.createdBy ?? "lcm_observed",
+      input.createdBy?.trim() || "lcm_observed",
     );
   }
 
@@ -189,7 +237,10 @@ export class TaskBridgeSuggestionStore {
     }
     const result = this.db.prepare(
       `UPDATE lcm_task_bridge_suggestions
-       SET status = ?, reviewed_by = ?, reviewed_at = datetime('now'), updated_at = datetime('now')
+       SET status = ?,
+           reviewed_by = COALESCE(?, reviewed_by),
+           reviewed_at = datetime('now'),
+           updated_at = datetime('now')
        WHERE suggestion_id = ?`,
     ).run(input.status, input.reviewedBy ?? null, input.suggestionId);
     return result.changes > 0;
