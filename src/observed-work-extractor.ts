@@ -240,67 +240,71 @@ export class ObservedWorkExtractor {
       existing && work.evidenceKind === "created" ? "reinforced" : work.evidenceKind;
 
     for (const pendingRow of pendingRows) {
-      for (const entry of pendingRow.entries) {
-        const existing = existingByWorkItemId.get(entry.workItemId);
-        const sourceAlreadyRecorded = this.observedWorkStore.hasSource({
-          workItemId: entry.workItemId,
-          sourceType: "summary",
-          sourceId: entry.row.summary_id,
-        });
-        const evidenceCount =
-          (existing?.evidenceCount ?? 0) + (sourceAlreadyRecorded ? 0 : 1);
-        const confidence = Math.min(
-          0.98,
-          sourceAlreadyRecorded && existing
-            ? existing.confidence
-            : Math.max(entry.work.confidence, (existing?.confidence ?? 0) + 0.05),
-        );
-        this.observedWorkStore.upsertItem({
-          workItemId: entry.workItemId,
-          conversationId,
-          title: entry.work.title,
-          observedStatus: entry.work.observedStatus,
-          kind: entry.work.kind,
-          confidence,
-          confidenceBand: confidenceBand(confidence),
-          rationale: entry.work.rationale,
-          topicKey: entry.work.topicKey,
-          firstSeenAt: existing?.firstSeenAt ?? entry.observedAt,
-          lastSeenAt: entry.observedAt,
-          completedAt: entry.work.completed ? entry.observedAt : undefined,
-          completionConfidence: entry.work.completed ? confidence : undefined,
-          evidenceCount,
-          sourceMessageCount: entry.row.source_message_count,
-          sourceTokenCount: entry.row.source_message_token_count || entry.row.token_count,
-          fingerprint: entry.fingerprint,
-          fingerprintVersion: 2,
-        });
-        if (!sourceAlreadyRecorded) {
-          this.observedWorkStore.addSource({
+      let rowWorkItemsUpserted = 0;
+      this.withSummarySavepoint(pendingRow.row.summary_rowid, () => {
+        for (const entry of pendingRow.entries) {
+          const existing = existingByWorkItemId.get(entry.workItemId);
+          const sourceAlreadyRecorded = this.observedWorkStore.hasSource({
             workItemId: entry.workItemId,
             sourceType: "summary",
             sourceId: entry.row.summary_id,
-            ordinal: entry.ordinal,
-            evidenceKind: evidenceKindFor(existing, entry.work),
           });
+          const evidenceCount =
+            (existing?.evidenceCount ?? 0) + (sourceAlreadyRecorded ? 0 : 1);
+          const confidence = Math.min(
+            0.98,
+            sourceAlreadyRecorded && existing
+              ? existing.confidence
+              : Math.max(entry.work.confidence, (existing?.confidence ?? 0) + 0.05),
+          );
+          this.observedWorkStore.upsertItem({
+            workItemId: entry.workItemId,
+            conversationId,
+            title: entry.work.title,
+            observedStatus: entry.work.observedStatus,
+            kind: entry.work.kind,
+            confidence,
+            confidenceBand: confidenceBand(confidence),
+            rationale: entry.work.rationale,
+            topicKey: entry.work.topicKey,
+            firstSeenAt: existing?.firstSeenAt ?? entry.observedAt,
+            lastSeenAt: entry.observedAt,
+            completedAt: entry.work.completed ? entry.observedAt : undefined,
+            completionConfidence: entry.work.completed ? confidence : undefined,
+            evidenceCount,
+            sourceMessageCount: entry.row.source_message_count,
+            sourceTokenCount: entry.row.source_message_token_count || entry.row.token_count,
+            fingerprint: entry.fingerprint,
+            fingerprintVersion: 2,
+          });
+          if (!sourceAlreadyRecorded) {
+            this.observedWorkStore.addSource({
+              workItemId: entry.workItemId,
+              sourceType: "summary",
+              sourceId: entry.row.summary_id,
+              ordinal: entry.ordinal,
+              evidenceKind: evidenceKindFor(existing, entry.work),
+            });
+          }
+          existingByWorkItemId.set(entry.workItemId, {
+            workItemId: entry.workItemId,
+            observedStatus: entry.work.observedStatus,
+            confidence,
+            firstSeenAt: existing?.firstSeenAt ?? entry.observedAt,
+            lastSeenAt: entry.observedAt,
+            evidenceCount,
+          });
+          rowWorkItemsUpserted += 1;
         }
-        existingByWorkItemId.set(entry.workItemId, {
-          workItemId: entry.workItemId,
-          observedStatus: entry.work.observedStatus,
-          confidence,
-          firstSeenAt: existing?.firstSeenAt ?? entry.observedAt,
-          lastSeenAt: entry.observedAt,
-          evidenceCount,
+        this.observedWorkStore.upsertState({
+          conversationId,
+          lastProcessedSummaryCreatedAt: pendingRow.row.created_at,
+          lastProcessedSummaryId: pendingRow.row.summary_id,
+          lastProcessedSummaryRowid: pendingRow.row.summary_rowid,
+          pendingRebuild: false,
         });
-        workItemsUpserted += 1;
-      }
-      this.observedWorkStore.upsertState({
-        conversationId,
-        lastProcessedSummaryCreatedAt: pendingRow.row.created_at,
-        lastProcessedSummaryId: pendingRow.row.summary_id,
-        lastProcessedSummaryRowid: pendingRow.row.summary_rowid,
-        pendingRebuild: false,
       });
+      workItemsUpserted += rowWorkItemsUpserted;
     }
     return {
       summariesScanned: rows.length,
@@ -394,5 +398,19 @@ export class ObservedWorkExtractor {
        WHERE summary_id = ?`,
     ).get(summaryId) as { summary_rowid: number } | undefined;
     return row?.summary_rowid;
+  }
+
+  private withSummarySavepoint<T>(summaryRowid: number, fn: () => T): T {
+    const savepoint = `lcm_observed_work_summary_${Math.max(0, Math.trunc(summaryRowid))}`;
+    this.db.exec(`SAVEPOINT ${savepoint}`);
+    try {
+      const result = fn();
+      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      return result;
+    } catch (error) {
+      this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      throw error;
+    }
   }
 }
