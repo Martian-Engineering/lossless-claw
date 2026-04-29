@@ -473,16 +473,17 @@ describe("LcmContextEngine ignored sessions", () => {
 
     expect(ignored).toMatchObject({
       messages: liveMessages,
-      estimatedTokens: 0,
+      estimatedTokens: ignored.estimatedTokens,
       promptAuthority: "assembled",
       lcmAssembly: {
         mode: "live_fallback",
         fallbackReason: "ignored_session",
         inputMessageCount: 1,
         outputMessageCount: 1,
-        estimatedTokens: 0,
+        estimatedTokens: ignored.estimatedTokens,
       },
     });
+    expect(ignored.estimatedTokens).toBeGreaterThan(0);
     expect(included.messages).toHaveLength(1);
     expect(included.messages[0]?.content).toBe("persisted context");
   });
@@ -4497,7 +4498,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
 
     expect(result.messages).not.toBe(liveMessages);
     expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
-    expect(result.estimatedTokens).toBe(0);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
     expect(assemblyProvenance(result)).toMatchObject({
       promptAuthority: "assembled",
       lcmAssembly: {
@@ -4505,7 +4506,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
         fallbackReason: "conversation_miss",
         inputMessageCount: 2,
         outputMessageCount: 1,
-        estimatedTokens: 0,
+        estimatedTokens: result.estimatedTokens,
       },
     });
   });
@@ -4523,7 +4524,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 100,
     });
 
-    expect(result.estimatedTokens).toBe(0);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
     expect(assemblyProvenance(result)).toMatchObject({
       promptAuthority: "assembled",
       lcmAssembly: {
@@ -4534,6 +4535,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
         contextItemCount: 0,
         rawContextItemCount: 0,
         summaryContextItemCount: 0,
+        estimatedTokens: result.estimatedTokens,
       },
     });
   });
@@ -4560,7 +4562,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
 
     expect(result.messages).not.toBe(liveMessages);
     expect(result.messages).toStrictEqual(liveMessages);
-    expect(result.estimatedTokens).toBe(0);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
     expect(assemblyProvenance(result)).toMatchObject({
       promptAuthority: "assembled",
       lcmAssembly: {
@@ -4571,6 +4573,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
         contextItemCount: 1,
         rawContextItemCount: 1,
         summaryContextItemCount: 0,
+        estimatedTokens: result.estimatedTokens,
       },
     });
   });
@@ -4670,7 +4673,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
 
     expect(result.messages).not.toBe(liveMessages);
     expect(result.messages).toStrictEqual(liveMessages);
-    expect(result.estimatedTokens).toBe(0);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
     expect(assemblyProvenance(result)).toMatchObject({
       promptAuthority: "assembled",
       lcmAssembly: {
@@ -4678,7 +4681,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
         fallbackReason: "error",
         inputMessageCount: 1,
         outputMessageCount: 1,
-        estimatedTokens: 0,
+        estimatedTokens: result.estimatedTokens,
       },
     });
   });
@@ -4714,6 +4717,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages).toStrictEqual([
       { role: "user", content: "live fallback message" },
     ]);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
     expect(assemblyProvenance(result)).toMatchObject({
       promptAuthority: "assembled",
       lcmAssembly: {
@@ -4722,6 +4726,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
         inputMessageCount: 1,
         outputMessageCount: 1,
         contextItemCount: 1,
+        estimatedTokens: result.estimatedTokens,
       },
     });
   });
@@ -4754,7 +4759,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     // Should fall back to live context, not return the assistant-only DB context
     expect(result.messages).toEqual(liveMessages);
     expect(result.messages).not.toBe(liveMessages);
-    expect(result.estimatedTokens).toBe(0);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
     expect(assemblyProvenance(result)).toMatchObject({
       promptAuthority: "assembled",
       lcmAssembly: {
@@ -4763,6 +4768,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
         inputMessageCount: 1,
         outputMessageCount: 1,
         contextItemCount: 1,
+        estimatedTokens: result.estimatedTokens,
       },
     });
   });

@@ -6051,9 +6051,10 @@ export class LcmContextEngine implements ContextEngine {
       while (msgs.length > 0 && msgs[msgs.length - 1]?.role === "assistant") {
         msgs.pop();
       }
+      const estimatedTokens = estimateSessionTokenCountForAfterTurn(msgs);
       return buildAssembleResult({
         messages: msgs,
-        estimatedTokens: 0,
+        estimatedTokens,
         mode: "live_fallback",
         fallbackReason,
         ...diagnostics,
