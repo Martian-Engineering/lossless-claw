@@ -23,7 +23,28 @@ function createConversation(db: DatabaseSync, conversationId: number): void {
   );
 }
 
-function createObservedWorkItem(db: DatabaseSync, workItemId: string): void {
+function addObservedSources(
+  db: DatabaseSync,
+  workItemId: string,
+  sourceIds: string[]
+): void {
+  const observedWork = new ObservedWorkStore(db);
+  sourceIds.forEach((sourceId, index) => {
+    observedWork.addSource({
+      workItemId,
+      sourceType: "summary",
+      sourceId,
+      ordinal: index,
+      evidenceKind: "created",
+    });
+  });
+}
+
+function createObservedWorkItem(
+  db: DatabaseSync,
+  workItemId: string,
+  sourceIds: string[] = ["sum_default"]
+): void {
   createConversation(db, 1);
   const observedWork = new ObservedWorkStore(db);
   observedWork.upsertItem({
@@ -37,6 +58,7 @@ function createObservedWorkItem(db: DatabaseSync, workItemId: string): void {
     confidence: 0.86,
     fingerprint: `observed:${workItemId}`,
   });
+  addObservedSources(db, workItemId, sourceIds);
 }
 
 describe("TaskBridgeSuggestionStore", () => {
@@ -50,7 +72,7 @@ describe("TaskBridgeSuggestionStore", () => {
 
   it("stores suggestions as pending records without applying task writes", () => {
     const db = makeDb();
-    createObservedWorkItem(db, "work_1");
+    createObservedWorkItem(db, "work_1", ["sum_a", "sum_b"]);
     const store = new TaskBridgeSuggestionStore(db);
     store.upsertSuggestion({
       suggestionId: "sug_1",
@@ -79,7 +101,7 @@ describe("TaskBridgeSuggestionStore", () => {
 
   it("records review status without modifying external task state", () => {
     const db = makeDb();
-    createObservedWorkItem(db, "work_2");
+    createObservedWorkItem(db, "work_2", ["sum_done", "sum_done_later"]);
     const store = new TaskBridgeSuggestionStore(db);
     store.upsertSuggestion({
       suggestionId: "sug_2",
@@ -144,7 +166,7 @@ describe("TaskBridgeSuggestionStore", () => {
 
   it("rejects invalid suggestion records and reports missing review targets", () => {
     const db = makeDb();
-    createObservedWorkItem(db, "work_3");
+    createObservedWorkItem(db, "work_3", ["sum_bad"]);
     const store = new TaskBridgeSuggestionStore(db);
 
     expect(() =>
@@ -197,6 +219,37 @@ describe("TaskBridgeSuggestionStore", () => {
         sourceIds: ["sum_bad"],
       })
     ).toThrow();
+    expect(() =>
+      store.upsertSuggestion({
+        suggestionId: "missing_source",
+        workItemId: "work_3",
+        suggestionKind: "create_task",
+        confidence: 0.8,
+        rationale: "missing observed source",
+        sourceIds: ["missing_source"],
+      })
+    ).toThrow(/source IDs/);
+    expect(() =>
+      store.upsertSuggestion({
+        suggestionId: "reviewed_on_upsert",
+        workItemId: "work_3",
+        suggestionKind: "create_task",
+        status: "accepted",
+        confidence: 0.8,
+        rationale: "review state attempted on upsert",
+        sourceIds: ["sum_bad"],
+      })
+    ).toThrow(/reviewSuggestion/);
+    expect(() =>
+      store.upsertSuggestion({
+        suggestionId: "missing_task_id",
+        workItemId: "work_3",
+        suggestionKind: "mark_task_done",
+        confidence: 0.8,
+        rationale: "targeted task action without task target",
+        sourceIds: ["sum_bad"],
+      })
+    ).toThrow(/taskId/);
     expect(
       store.reviewSuggestion({
         suggestionId: "missing",

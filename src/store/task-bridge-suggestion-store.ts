@@ -65,6 +65,13 @@ const REVIEW_STATUSES = new Set<TaskBridgeSuggestionStatus>([
   "expired",
 ]);
 
+const TASK_TARGETING_KINDS = new Set<TaskBridgeSuggestionKind>([
+  "link_task",
+  "mark_task_done",
+  "mark_task_blocked",
+  "add_task_evidence",
+]);
+
 function normalizeSourceIds(sourceIds: string[]): string[] {
   return [
     ...new Set(
@@ -103,6 +110,28 @@ function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
 export class TaskBridgeSuggestionStore {
   constructor(private readonly db: DatabaseSync) {}
 
+  private assertSourceIdsBelongToWorkItem(
+    workItemId: string,
+    sourceIds: string[]
+  ): void {
+    const placeholders = sourceIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT source_id
+         FROM lcm_observed_work_sources
+         WHERE work_item_id = ?
+           AND source_id IN (${placeholders})`
+      )
+      .all(workItemId, ...sourceIds) as Array<{ source_id: string }>;
+    const found = new Set(rows.map((row) => row.source_id));
+    const missing = sourceIds.filter((sourceId) => !found.has(sourceId));
+    if (missing.length > 0) {
+      throw new Error(
+        `source IDs must reference observed-work evidence for this work item: ${missing.join(", ")}`
+      );
+    }
+  }
+
   upsertSuggestion(input: TaskBridgeSuggestionInput): void {
     const suggestionId = input.suggestionId.trim();
     if (suggestionId.length === 0) {
@@ -118,10 +147,21 @@ export class TaskBridgeSuggestionStore {
     if (input.rationale.trim().length === 0) {
       throw new Error("rationale is required.");
     }
+    const requestedStatus = input.status ?? "pending";
+    if (requestedStatus !== "pending") {
+      throw new Error(
+        "upsertSuggestion only creates or refreshes pending suggestions; use reviewSuggestion for reviewed states."
+      );
+    }
+    const taskId = input.taskId?.trim();
+    if (TASK_TARGETING_KINDS.has(input.suggestionKind) && !taskId) {
+      throw new Error(`${input.suggestionKind} suggestions require taskId.`);
+    }
     const sourceIds = normalizeSourceIds(input.sourceIds);
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
     }
+    this.assertSourceIdsBelongToWorkItem(workItemId, sourceIds);
     this.db.prepare(
       `INSERT INTO lcm_task_bridge_suggestions (
         suggestion_id, work_item_id, task_id, suggestion_kind, status, confidence,
@@ -138,13 +178,13 @@ export class TaskBridgeSuggestionStore {
     ).run(
       suggestionId,
       workItemId,
-      input.taskId ?? null,
+      taskId ?? null,
       input.suggestionKind,
-      input.status ?? "pending",
+      "pending",
       input.confidence,
       input.rationale.trim(),
       JSON.stringify(sourceIds),
-      input.createdBy ?? "lcm_observed",
+      input.createdBy?.trim() || "lcm_observed",
     );
   }
 
