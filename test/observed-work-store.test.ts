@@ -92,6 +92,65 @@ describe("ObservedWorkStore", () => {
     expect(density.ambiguous[0]?.title).toBe("Decide task bridge policy");
   });
 
+  it("preserves temporal invariants while updating mutable metadata", () => {
+    const db = makeDb();
+    createConversation(db, 1);
+    const store = new ObservedWorkStore(db);
+    store.upsertItem({
+      workItemId: "work_temporal",
+      conversationId: 1,
+      ownerId: "agent:main",
+      description: "Initial description",
+      firstSeenAt: "2026-04-28T05:00:00.000Z",
+      lastSeenAt: "2026-04-28T06:00:00.000Z",
+      completedAt: "2026-04-28T06:00:00.000Z",
+      completionConfidence: 0.72,
+      title: "Temporal invariant test",
+      observedStatus: "observed_completed",
+      kind: "test",
+      fingerprint: "test:temporal-invariant",
+    });
+    store.upsertItem({
+      workItemId: "work_temporal",
+      conversationId: 1,
+      ownerId: "agent:reviewer",
+      description: "Updated description",
+      firstSeenAt: "2026-04-28T04:00:00.000Z",
+      lastSeenAt: "2026-04-28T05:30:00.000Z",
+      completedAt: "2026-04-28T05:30:00.000Z",
+      completionConfidence: 0.91,
+      title: "Temporal invariant test updated",
+      observedStatus: "observed_completed",
+      kind: "test",
+      fingerprint: "test:temporal-invariant",
+    });
+
+    const row = db
+      .prepare(
+        `SELECT owner_id, description, title, first_seen_at, last_seen_at, completed_at, completion_confidence
+         FROM lcm_observed_work_items
+         WHERE work_item_id = ?`,
+      )
+      .get("work_temporal") as {
+      owner_id: string;
+      description: string;
+      title: string;
+      first_seen_at: string;
+      last_seen_at: string;
+      completed_at: string;
+      completion_confidence: number;
+    };
+    expect(row).toMatchObject({
+      owner_id: "agent:reviewer",
+      description: "Updated description",
+      title: "Temporal invariant test updated",
+      first_seen_at: "2026-04-28T04:00:00.000Z",
+      last_seen_at: "2026-04-28T06:00:00.000Z",
+      completed_at: "2026-04-28T05:30:00.000Z",
+      completion_confidence: 0.91,
+    });
+  });
+
   it("hides sources by default and includes them only when requested", () => {
     const db = makeDb();
     createConversation(db, 1);
@@ -126,6 +185,53 @@ describe("ObservedWorkStore", () => {
         evidenceKind: "created",
       },
     ]);
+
+    store.addSource({
+      workItemId: "work_with_sources",
+      sourceType: "summary",
+      sourceId: "sum_hidden",
+      ordinal: 5,
+      evidenceKind: "created",
+    });
+    const reordered = store.getDensity({ conversationId: 1, includeSources: true });
+    expect(reordered.topUnfinished[0]?.sources?.[0]?.ordinal).toBe(5);
+  });
+
+  it("bounds density detail rows and only loads sources for included items", () => {
+    const db = makeDb();
+    createConversation(db, 1);
+    const store = new ObservedWorkStore(db);
+    for (const index of [1, 2, 3]) {
+      store.upsertItem({
+        workItemId: `work_limited_${index}`,
+        conversationId: 1,
+        firstSeenAt: `2026-04-28T0${index}:00:00.000Z`,
+        lastSeenAt: `2026-04-28T0${index}:30:00.000Z`,
+        title: `Limited unfinished ${index}`,
+        observedStatus: "observed_unfinished",
+        kind: "review",
+        fingerprint: `review:limited:${index}`,
+      });
+      store.addSource({
+        workItemId: `work_limited_${index}`,
+        sourceType: "summary",
+        sourceId: `sum_limited_${index}`,
+        ordinal: index,
+        evidenceKind: "created",
+      });
+    }
+
+    const density = store.getDensity({
+      conversationId: 1,
+      includeSources: true,
+      limit: 1,
+    });
+    expect(density.density.unfinished).toBe(3);
+    expect(density.topUnfinished).toHaveLength(1);
+    expect(density.itemsOmitted).toBe(2);
+    expect(JSON.stringify(density)).toContain("sum_limited_3");
+    expect(JSON.stringify(density)).not.toContain("sum_limited_1");
+    expect(JSON.stringify(density)).not.toContain("sum_limited_2");
   });
 
   it("tracks incremental processing state", () => {
@@ -222,6 +328,31 @@ describe("ObservedWorkStore", () => {
       });
       expect(JSON.stringify(shown.details)).toContain("sum_today");
       expect((shown.details as { period?: string }).period).toBe("today");
+
+      const week = await tool.execute("density-week", {
+        conversationId: 1,
+        period: "week",
+        detailLevel: 0,
+      });
+      expect((week.details as { density: { totalObserved: number }; window?: { since?: string; before?: string } }).density.totalObserved).toBe(2);
+      expect((week.details as { window?: { since?: string; before?: string } }).window).toMatchObject({
+        since: "2026-04-27T00:00:00.000Z",
+        before: "2026-05-04T00:00:00.000Z",
+      });
+
+      const sinceOverride = await tool.execute("density-since-override", {
+        conversationId: 1,
+        period: "week",
+        since: "2026-04-28T00:00:00.000Z",
+        detailLevel: 0,
+      });
+      expect((sinceOverride.details as { density: { totalObserved: number } }).density.totalObserved).toBe(1);
+
+      const invalid = await tool.execute("density-invalid-period", {
+        conversationId: 1,
+        period: "quarter",
+      });
+      expect((invalid.details as { error?: string }).error).toContain("period must be one of");
 
       const global = await tool.execute("density-global", {
         allConversations: true,
