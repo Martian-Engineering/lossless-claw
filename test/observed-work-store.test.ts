@@ -222,6 +222,13 @@ describe("ObservedWorkStore", () => {
       });
       expect(JSON.stringify(shown.details)).toContain("sum_today");
       expect((shown.details as { period?: string }).period).toBe("today");
+
+      const global = await tool.execute("density-global", {
+        allConversations: true,
+      });
+      expect((global.details as { error?: string }).error).toMatch(
+        /does not support allConversations/,
+      );
     } finally {
       vi.useRealTimers();
     }
