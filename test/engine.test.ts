@@ -6808,6 +6808,88 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenance?.running).toBe(false);
   });
 
+  it("afterTurn treats Codex cache-write-only telemetry as mutation-sensitive", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-background-codex-cache-write-deferred";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+      refreshBootstrapState: (params: unknown) => Promise<void>;
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 60_000,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine, "evaluateIncrementalCompaction").mockResolvedValue({
+      shouldCompact: false,
+      reason: "hot-cache-budget-headroom",
+      maxPasses: 1,
+      allowCondensedPasses: false,
+      activityBand: "high",
+      leafChunkTokens: 40_000,
+      fallbackLeafChunkTokens: [40_000, 30_000, 20_000],
+      rawTokensOutsideTail: 60_000,
+      threshold: 40_000,
+      cacheState: "hot",
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 1_024,
+      threshold: 3_072,
+    });
+    const consumeDeferredCompactionDebtSpy = vi.spyOn(
+      privateEngine,
+      "consumeDeferredCompactionDebt",
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-background-codex-cache-write-deferred"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+      runtimeContext: {
+        provider: "openai-codex-responses",
+        model: "gpt-5.5",
+        promptCache: {
+          retention: "short",
+          lastCallUsage: {
+            input: 8_000,
+            cacheRead: 0,
+            cacheWrite: 8_000,
+          },
+        },
+      },
+    });
+
+    await flushImmediate();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    const telemetry = await engine
+      .getCompactionTelemetryStore()
+      .getConversationCompactionTelemetry(conversation!.conversationId);
+    expect(consumeDeferredCompactionDebtSpy).not.toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(telemetry?.cacheState).toBe("hot");
+    expect(telemetry?.lastObservedCacheWrite).toBe(8_000);
+    expect(telemetry?.lastCacheTouchAt).toBeInstanceOf(Date);
+  });
+
   it("afterTurn keeps deferred debt durable when background drain finds the session busy", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-background-busy-debt-durable";
@@ -7134,6 +7216,161 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenance?.running).toBe(false);
     expect(evaluateIncrementalCompactionSpy).not.toHaveBeenCalled();
     expect(maintenanceResult.changed).toBe(false);
+  });
+
+  it("maintain() keeps deferred prompt-mutating debt pending while Codex cache is still hot", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "maintain-deferred-compaction-codex-hot-cache";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "unknown",
+      retention: "short",
+      lastCacheTouchAt: new Date(),
+      provider: "openai-codex-responses",
+      model: "gpt-5.5",
+    });
+
+    const evaluateIncrementalCompactionSpy = vi.spyOn(privateEngine, "evaluateIncrementalCompaction");
+
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-codex-hot-cache"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(evaluateIncrementalCompactionSpy).not.toHaveBeenCalled();
+    expect(maintenanceResult.changed).toBe(false);
+  });
+
+  it("maintain() lets explicit Codex cache breaks override recent cache touches", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "maintain-deferred-compaction-codex-explicit-break";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    const now = new Date();
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "cold",
+      retention: "short",
+      lastCacheTouchAt: now,
+      lastObservedCacheBreakAt: now,
+      provider: "openai-codex-responses",
+      model: "gpt-5.5",
+    });
+    const evaluateIncrementalCompactionSpy = vi
+      .spyOn(privateEngine, "evaluateIncrementalCompaction")
+      .mockResolvedValue({
+        shouldCompact: false,
+        reason: "deferred compaction no longer needed",
+        maxPasses: 1,
+        allowCondensedPasses: false,
+        activityBand: "low",
+        leafChunkTokens: 20_000,
+        fallbackLeafChunkTokens: [20_000, 15_000, 10_000],
+        rawTokensOutsideTail: 0,
+        threshold: 20_000,
+        cacheState: "cold",
+      });
+
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-codex-explicit-break"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(evaluateIncrementalCompactionSpy).toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenanceResult.reason).toBe("deferred compaction no longer needed");
+  });
+
+  it("maintain() consumes deferred Codex debt after the prompt cache TTL expires", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "maintain-deferred-compaction-codex-stale-cache";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "cold",
+      retention: "short",
+      lastCacheTouchAt: new Date(Date.now() - 10 * 60 * 1000),
+      provider: "github-copilot",
+      model: "gpt-5.5",
+    });
+    const evaluateIncrementalCompactionSpy = vi
+      .spyOn(privateEngine, "evaluateIncrementalCompaction")
+      .mockResolvedValue({
+        shouldCompact: false,
+        reason: "deferred compaction no longer needed",
+        maxPasses: 1,
+        allowCondensedPasses: false,
+        activityBand: "low",
+        leafChunkTokens: 20_000,
+        fallbackLeafChunkTokens: [20_000, 15_000, 10_000],
+        rawTokensOutsideTail: 0,
+        threshold: 20_000,
+        cacheState: "cold",
+      });
+
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-codex-stale-cache"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(evaluateIncrementalCompactionSpy).toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenanceResult.reason).toBe("deferred compaction no longer needed");
   });
 
   it("maintain() treats a recent Anthropic API call as a hot-cache touch when explicit cache telemetry is absent", async () => {
