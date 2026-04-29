@@ -7318,6 +7318,50 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenanceResult.reason).toBe("deferred compaction no longer needed");
   });
 
+  it("maintain() treats Codex cache touches after explicit breaks as hot again", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "maintain-deferred-compaction-codex-break-then-touch";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    const now = new Date();
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "cold",
+      retention: "short",
+      lastCacheTouchAt: now,
+      lastObservedCacheBreakAt: new Date(now.getTime() - 1_000),
+      provider: "openai-codex-responses",
+      model: "gpt-5.5",
+    });
+    const evaluateIncrementalCompactionSpy = vi.spyOn(privateEngine, "evaluateIncrementalCompaction");
+
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-codex-break-then-touch"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(evaluateIncrementalCompactionSpy).not.toHaveBeenCalled();
+    expect(maintenanceResult.changed).toBe(false);
+  });
+
   it("maintain() consumes deferred Codex debt after the prompt cache TTL expires", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {

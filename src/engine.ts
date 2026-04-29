@@ -2128,15 +2128,29 @@ export class LcmContextEngine implements ContextEngine {
     return now.getTime() - touchAt.getTime() < ttlMs;
   }
 
-  /** Return true when an explicit prompt-cache break is newer than any cache hit. */
+  private latestPromptCacheTouchSignalAt(
+    telemetry: ConversationCompactionTelemetryRecord | null,
+  ): Date | null {
+    const candidates = [
+      telemetry?.lastCacheTouchAt,
+      telemetry?.lastObservedCacheHitAt,
+    ].filter((value): value is Date => value instanceof Date);
+    return candidates.reduce<Date | null>(
+      (latest, value) => (!latest || value > latest ? value : latest),
+      null,
+    );
+  }
+
+  /** Return true when an explicit prompt-cache break is newer than any cache touch signal. */
   private hasFreshPromptCacheBreak(
     telemetry: ConversationCompactionTelemetryRecord | null,
   ): boolean {
+    const lastCacheTouchSignalAt = this.latestPromptCacheTouchSignalAt(telemetry);
     return Boolean(
       telemetry?.lastObservedCacheBreakAt
         && (
-          !telemetry.lastObservedCacheHitAt
-          || telemetry.lastObservedCacheBreakAt >= telemetry.lastObservedCacheHitAt
+          !lastCacheTouchSignalAt
+          || telemetry.lastObservedCacheBreakAt >= lastCacheTouchSignalAt
         ),
     );
   }
