@@ -338,11 +338,9 @@ export class ObservedWorkExtractor {
   ): LeafSummaryRow[] {
     const args: Array<string | number> = [conversationId];
     const where = ["s.conversation_id = ?", "s.kind = 'leaf'"];
-    const cursorRowid =
-      state?.lastProcessedSummaryRowid ??
-      (state?.lastProcessedSummaryId
-        ? this.lookupSummaryRowid(state.lastProcessedSummaryId)
-        : undefined);
+    const cursorRowid = state?.lastProcessedSummaryId
+      ? this.lookupSummaryRowid(state.lastProcessedSummaryId)
+      : state?.lastProcessedSummaryRowid;
     if (cursorRowid != null) {
       where.push("s.rowid > ?");
       args.push(cursorRowid);
