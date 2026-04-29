@@ -48,7 +48,8 @@ function addObservedSources(
 function createObservedWorkItem(
   db: DatabaseSync,
   workItemId: string,
-  sourceIds?: string[]
+  sourceIds?: string[],
+  kind: "follow_up" | "blocker" = "follow_up"
 ): void {
   createConversation(db, 1);
   const observedWork = new ObservedWorkStore(db);
@@ -59,7 +60,7 @@ function createObservedWorkItem(
     lastSeenAt: "2026-04-28T01:00:00.000Z",
     title: `Observed work ${workItemId}`,
     observedStatus: "observed_unfinished",
-    kind: "follow_up",
+    kind,
     confidence: 0.86,
     fingerprint: `observed:${workItemId}`,
   });
@@ -318,5 +319,44 @@ describe("TaskBridgeSuggestionStore", () => {
     });
     expect((reviewed.details as { changed: boolean }).changed).toBe(true);
     expect(taskBridge.listSuggestions({ status: "dismissed" })).toHaveLength(1);
+  });
+
+  it("records unlinked blocker observations as task-creation suggestions", async () => {
+    const db = makeDb();
+    createObservedWorkItem(db, "work_blocker", ["sum_blocker"], "blocker");
+    const observedWork = new ObservedWorkStore(db);
+    const taskBridge = new TaskBridgeSuggestionStore(db);
+    const lcm = {
+      getObservedWorkStore: () => observedWork,
+      getTaskBridgeSuggestionStore: () => taskBridge,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const suggestionsTool = createLcmTaskSuggestionsTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "task-suggestion-session",
+    });
+
+    const preview = await suggestionsTool.execute("suggest-preview", {
+      conversationId: 1,
+      kinds: ["blocker"],
+    });
+    expect(JSON.stringify(preview.details)).toContain("create_task");
+    expect(JSON.stringify(preview.details)).not.toContain("mark_task_blocked");
+
+    await suggestionsTool.execute("suggest-record", {
+      conversationId: 1,
+      kinds: ["blocker"],
+      mode: "record",
+    });
+    const pending = taskBridge.listSuggestions({ status: "pending" });
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.suggestionKind).toBe("create_task");
   });
 });
