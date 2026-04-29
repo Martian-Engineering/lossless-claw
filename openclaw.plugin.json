@@ -201,6 +201,10 @@
       "label": "Rollup Debug Tool",
       "help": "Register the operator-facing lcm_rollup_debug tool; disabled by default"
     },
+    "taskBridgeToolsEnabled": {
+      "label": "Task Bridge Suggestion Tools",
+      "help": "Register opt-in inert LCM task suggestion tools; they write only to the LCM suggestion ledger and never mutate external tasks"
+    },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
       "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
@@ -400,6 +404,9 @@
         "type": "boolean"
       },
       "rollupDebugEnabled": {
+        "type": "boolean"
+      },
+      "taskBridgeToolsEnabled": {
         "type": "boolean"
       },
       "proactiveThresholdCompactionMode": {

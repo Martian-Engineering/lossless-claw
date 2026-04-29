@@ -3,6 +3,11 @@ import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ObservedWorkStore } from "../src/store/observed-work-store.js";
 import { TaskBridgeSuggestionStore } from "../src/store/task-bridge-suggestion-store.js";
+import {
+  createLcmTaskSuggestionReviewTool,
+  createLcmTaskSuggestionsTool,
+} from "../src/tools/lcm-task-suggestions-tool.js";
+import type { LcmDependencies } from "../src/types.js";
 
 function makeDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -35,6 +40,13 @@ function createObservedWorkItem(db: DatabaseSync, workItemId: string): void {
     kind: "follow_up",
     confidence: 0.86,
     fingerprint: `observed:${workItemId}`,
+  });
+  observedWork.addSource({
+    workItemId,
+    sourceType: "summary",
+    sourceId: `sum_${workItemId}`,
+    ordinal: 0,
+    evidenceKind: "created",
   });
 }
 
@@ -160,5 +172,61 @@ describe("TaskBridgeSuggestionStore", () => {
         reviewedBy: "tester",
       })
     ).toBe(false);
+  });
+
+  it("previews, records, and reviews suggestions without external task writes", async () => {
+    const db = makeDb();
+    createObservedWorkItem(db, "work_tool");
+    const observedWork = new ObservedWorkStore(db);
+    const taskBridge = new TaskBridgeSuggestionStore(db);
+    const lcm = {
+      getObservedWorkStore: () => observedWork,
+      getTaskBridgeSuggestionStore: () => taskBridge,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const suggestionsTool = createLcmTaskSuggestionsTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "task-suggestion-session",
+    });
+
+    const preview = await suggestionsTool.execute("suggest-preview", {
+      conversationId: 1,
+    });
+    expect(JSON.stringify(preview.details)).toContain("create_task");
+    expect(JSON.stringify(preview.details)).not.toContain("sum_work_tool");
+    expect(taskBridge.listSuggestions()).toHaveLength(0);
+
+    const allConversations = await suggestionsTool.execute("suggest-all", {
+      allConversations: true,
+    });
+    expect((allConversations.details as { error?: string }).error).toMatch(
+      /does not support allConversations/,
+    );
+
+    const recorded = await suggestionsTool.execute("suggest-record", {
+      conversationId: 1,
+      mode: "record",
+      includeSources: true,
+    });
+    expect(JSON.stringify(recorded.details)).toContain("sum_work_tool");
+    const pending = taskBridge.listSuggestions({ status: "pending" });
+    expect(pending).toHaveLength(1);
+    expect(db.prepare(`SELECT name FROM sqlite_master WHERE name = 'tasks'`).get()).toBeUndefined();
+
+    const reviewTool = createLcmTaskSuggestionReviewTool({ lcm: lcm as never });
+    const reviewed = await reviewTool.execute("suggest-review", {
+      suggestionId: pending[0]!.suggestionId,
+      status: "dismissed",
+      reviewedBy: "unit-test",
+    });
+    expect((reviewed.details as { changed: boolean }).changed).toBe(true);
+    expect(taskBridge.listSuggestions({ status: "dismissed" })).toHaveLength(1);
   });
 });
