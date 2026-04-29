@@ -104,6 +104,14 @@ export class TaskBridgeSuggestionStore {
   constructor(private readonly db: DatabaseSync) {}
 
   upsertSuggestion(input: TaskBridgeSuggestionInput): void {
+    const suggestionId = input.suggestionId.trim();
+    if (suggestionId.length === 0) {
+      throw new Error("suggestionId is required.");
+    }
+    const workItemId = input.workItemId.trim();
+    if (workItemId.length === 0) {
+      throw new Error("workItemId is required.");
+    }
     if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
       throw new Error("confidence must be between 0 and 1.");
     }
@@ -128,8 +136,8 @@ export class TaskBridgeSuggestionStore {
         source_ids = excluded.source_ids,
         updated_at = datetime('now')`,
     ).run(
-      input.suggestionId,
-      input.workItemId,
+      suggestionId,
+      workItemId,
       input.taskId ?? null,
       input.suggestionKind,
       input.status ?? "pending",
