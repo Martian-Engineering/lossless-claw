@@ -134,26 +134,48 @@ describe("TaskBridgeSuggestionStore", () => {
       status: "accepted",
       reviewedBy: "tester",
     });
+    const observedWork = new ObservedWorkStore(db);
+    observedWork.upsertItem({
+      workItemId: "work_2b",
+      conversationId: 1,
+      firstSeenAt: "2026-04-28T00:00:00.000Z",
+      lastSeenAt: "2026-04-28T01:00:00.000Z",
+      title: "Different observed work item",
+      observedStatus: "observed_unfinished",
+      kind: "follow_up",
+      confidence: 0.8,
+      fingerprint: "observed:work_2b",
+    });
+    observedWork.addSource({
+      workItemId: "work_2b",
+      sourceType: "summary",
+      sourceId: "sum_other",
+      ordinal: 0,
+      evidenceKind: "created",
+    });
 
     store.upsertSuggestion({
       suggestionId: "sug_2",
-      workItemId: "work_2",
-      taskId: "task_123",
-      suggestionKind: "mark_task_done",
+      workItemId: "work_2b",
+      suggestionKind: "create_task",
       confidence: 0.99,
       rationale: "A later deterministic scan saw the same suggestion again.",
-      sourceIds: ["sum_done", "sum_done_later"],
+      sourceIds: ["sum_other"],
       createdBy: "second-writer",
     });
     const stillAccepted = store.listSuggestions({ status: "accepted" });
     expect(stillAccepted).toHaveLength(1);
     expect(stillAccepted[0]).toMatchObject({
       suggestionId: "sug_2",
+      workItemId: "work_2",
+      suggestionKind: "mark_task_done",
       status: "accepted",
       taskId: "task_123",
+      confidence: 0.97,
+      rationale: "Observed explicit completion evidence.",
       createdBy: "lcm_observed",
       reviewedBy: "tester",
-      sourceIds: ["sum_done", "sum_done_later"],
+      sourceIds: ["sum_done"],
     });
     expect(store.listSuggestions({ status: "pending" })).toHaveLength(0);
 
