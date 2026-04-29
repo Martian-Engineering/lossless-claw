@@ -43,6 +43,12 @@ const LcmRecentSchema = Type.Object({
       description: "Search all conversations.",
     })
   ),
+  topic: Type.Optional(
+    Type.String({
+      description:
+        "Deterministic case-insensitive content filter applied inside the requested time window. Uses bounded leaf-summary fallback rather than whole-period rollups.",
+    })
+  ),
   includeSources: Type.Optional(
     Type.Boolean({
       description: "Include source summary IDs.",
@@ -490,6 +496,18 @@ function formatSourcesLine(
   return `*Sources: ${sourceIds.join(", ")}*`;
 }
 
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (part) => `\\${part}`);
+}
+
+function normalizeTopicFilter(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim().replace(/\s+/g, " ");
+  return normalized.length > 0 ? normalized : undefined;
+}
+
 function formatDrilldownHint(
   includeSources: boolean,
   confidence: "none" | "low" | "medium" | "high"
@@ -820,14 +838,47 @@ function getRecentSummaryFallback(
   db: DatabaseSync,
   conversationId: number | undefined,
   start: Date,
-  end: Date
+  end: Date,
+  topic?: string
 ): RecentSummaryFallbackResult {
-  const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
-  const args: Array<string | number> =
-    conversationId == null
-      ? [end.toISOString(), start.toISOString()]
-      : [conversationId, end.toISOString(), start.toISOString()];
-  const messageScopeClause = conversationId == null ? "" : "m.conversation_id = ? AND";
+  const summaryWhere = [
+    "kind = 'leaf'",
+    "julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)",
+    "julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)",
+  ];
+  const summaryArgs: Array<string | number> = [];
+  if (conversationId != null) {
+    summaryWhere.unshift("conversation_id = ?");
+    summaryArgs.push(conversationId);
+  }
+  summaryArgs.push(end.toISOString(), start.toISOString());
+
+  const messageWhere = [
+    "julianday(m.created_at) < julianday(?)",
+    "julianday(m.created_at) >= julianday(?)",
+    `NOT EXISTS (
+      SELECT 1
+      FROM summary_messages sm
+      WHERE sm.message_id = m.message_id
+    )`,
+  ];
+  const messageArgs: Array<string | number> = [];
+  if (conversationId != null) {
+    messageWhere.unshift("m.conversation_id = ?");
+    messageArgs.push(conversationId);
+  }
+  messageArgs.push(end.toISOString(), start.toISOString());
+
+  const normalizedTopic = topic?.trim().toLowerCase();
+  if (normalizedTopic) {
+    const topicPattern = `%${escapeLikePattern(normalizedTopic)}%`;
+    summaryWhere.push("lower(content) LIKE ? ESCAPE '\\'");
+    summaryArgs.push(topicPattern);
+    messageWhere.push("lower(m.content) LIKE ? ESCAPE '\\'");
+    messageArgs.push(topicPattern);
+  }
+  const summaryWhereSql = summaryWhere.join(" AND ");
+  const messageWhereSql = messageWhere.join(" AND ");
 
   const summaryRows = db
     .prepare(
@@ -840,14 +891,11 @@ function getRecentSummaryFallback(
         strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS created_at,
         strftime('%Y-%m-%dT%H:%M:%fZ', coalesce(latest_at, earliest_at, created_at)) AS effective_time
        FROM summaries
-       WHERE ${scopeClause}
-         kind = 'leaf'
-         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
-         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+       WHERE ${summaryWhereSql}
        ORDER BY julianday(coalesce(latest_at, earliest_at, created_at)) DESC
        LIMIT ${FALLBACK_SQL_LIMIT + 1}`
     )
-    .all(...args) as unknown as RecentSummaryFallbackRow[];
+    .all(...summaryArgs) as unknown as RecentSummaryFallbackRow[];
   const messageRows = db
     .prepare(
       `SELECT
@@ -859,18 +907,11 @@ function getRecentSummaryFallback(
         strftime('%Y-%m-%dT%H:%M:%fZ', m.created_at) AS created_at,
         strftime('%Y-%m-%dT%H:%M:%fZ', m.created_at) AS effective_time
        FROM messages m
-       WHERE ${messageScopeClause}
-         julianday(m.created_at) < julianday(?)
-         AND julianday(m.created_at) >= julianday(?)
-         AND NOT EXISTS (
-           SELECT 1
-           FROM summary_messages sm
-           WHERE sm.message_id = m.message_id
-         )
+       WHERE ${messageWhereSql}
        ORDER BY julianday(m.created_at) DESC
        LIMIT ${FALLBACK_SQL_LIMIT + 1}`
     )
-    .all(...args) as unknown as RecentSummaryFallbackRow[];
+    .all(...messageArgs) as unknown as RecentSummaryFallbackRow[];
   const combinedRows = [...summaryRows, ...messageRows].sort(
     (left, right) =>
       new Date(right.effective_time).getTime() -
@@ -888,25 +929,15 @@ function getRecentSummaryFallback(
                (
                  SELECT COUNT(*)
                  FROM summaries
-                 WHERE ${scopeClause}
-                   kind = 'leaf'
-                   AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
-                   AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+                 WHERE ${summaryWhereSql}
                ) +
                (
                  SELECT COUNT(*)
                  FROM messages m
-                 WHERE ${messageScopeClause}
-                   julianday(m.created_at) < julianday(?)
-                   AND julianday(m.created_at) >= julianday(?)
-                   AND NOT EXISTS (
-                     SELECT 1
-                     FROM summary_messages sm
-                     WHERE sm.message_id = m.message_id
-                   )
+                 WHERE ${messageWhereSql}
                ) AS count`
           )
-          .get(...args, ...args) as { count: number } | undefined
+          .get(...summaryArgs, ...messageArgs) as { count: number } | undefined
       )?.count ?? combinedRows.length
     : combinedRows.length;
   return {
@@ -1001,6 +1032,7 @@ export function createLcmRecentTool(input: {
 
       const p = params as Record<string, unknown>;
       const includeSources = p.includeSources === true;
+      const topic = normalizeTopicFilter(p.topic);
       const budget = resolveRecallBudget(p);
       const timezone = lcm.timezone;
       const conversationScope = await resolveLcmConversationScope({
@@ -1038,7 +1070,8 @@ export function createLcmRecentTool(input: {
           db,
           undefined,
           resolution.start,
-          resolution.end
+          resolution.end,
+          topic
         );
         const rendered = renderFallbackRollupSection(
           resolution.label,
@@ -1058,6 +1091,11 @@ export function createLcmRecentTool(input: {
           )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
+        if (topic) {
+          lines.push(
+            `**Topic:** deterministic source-summary filter "${topic}"`
+          );
+        }
         lines.push(`**Confidence:** ${confidence}`);
         lines.push(...formatBudgetLines(budget, rendered.accounting));
         lines.push("");
@@ -1067,7 +1105,9 @@ export function createLcmRecentTool(input: {
           );
         } else {
           lines.push(
-            "No pre-built rollup available. Here's what LCM captured for this period:"
+            topic
+              ? "Topic filters use bounded leaf-summary fallback. Here's what matched in this period:"
+              : "No pre-built rollup available. Here's what LCM captured for this period:"
           );
           lines.push("");
           lines.push(rendered.content);
@@ -1086,6 +1126,7 @@ export function createLcmRecentTool(input: {
             confidence,
             budget,
             accounting: rendered.accounting,
+            topic,
             totalMatches: fallback.availableCount,
             tokenCount: response.tokenCount,
             truncated:
@@ -1142,6 +1183,7 @@ export function createLcmRecentTool(input: {
       }
 
       if (
+        !topic &&
         resolution.kind &&
         resolution.periodKey &&
         !resolution.window &&
@@ -1168,6 +1210,7 @@ export function createLcmRecentTool(input: {
           }.`;
         }
       } else if (
+        !topic &&
         resolution.kind &&
         !resolution.window &&
         (resolution.kind === "day" || !hasPendingRebuild)
@@ -1306,7 +1349,8 @@ export function createLcmRecentTool(input: {
           db,
           conversationId,
           resolution.start,
-          resolution.end
+          resolution.end,
+          topic
         );
         const rendered = renderFallbackRollupSection(
           resolution.label,
@@ -1326,6 +1370,11 @@ export function createLcmRecentTool(input: {
           )} — ${formatDisplayTime(resolution.end, timezone)}`
         );
         lines.push("**Status:** fallback");
+        if (topic) {
+          lines.push(
+            `**Topic:** deterministic source-summary filter "${topic}"`
+          );
+        }
         lines.push(`**Confidence:** ${confidence}`);
         if (degradedReason) {
           lines.push(`**Degraded:** ${degradedReason}`);
@@ -1334,11 +1383,15 @@ export function createLcmRecentTool(input: {
         lines.push("");
         if (fallback.summaries.length === 0) {
           lines.push(
-            "No pre-built rollup available, and LCM captured no leaf summaries or unsummarized raw messages for this period."
+            topic
+              ? "No leaf summaries or unsummarized raw messages matched this topic inside the requested period."
+              : "No pre-built rollup available, and LCM captured no leaf summaries or unsummarized raw messages for this period."
           );
         } else {
           lines.push(
-            "No pre-built rollup available. Here's what LCM captured for this period:"
+            topic
+              ? "Topic filters use bounded leaf-summary fallback. Here's what matched in this period:"
+              : "No pre-built rollup available. Here's what LCM captured for this period:"
           );
           lines.push("");
           lines.push(rendered.content);
@@ -1360,6 +1413,7 @@ export function createLcmRecentTool(input: {
             confidence,
             budget,
             accounting: rendered.accounting,
+            topic,
             totalMatches: fallback.availableCount,
             tokenCount: response.tokenCount,
             truncated:
@@ -1381,6 +1435,9 @@ export function createLcmRecentTool(input: {
         )} — ${formatDisplayTime(resolution.end, timezone)}`
       );
       lines.push(`**Status:** ${status}`);
+      if (topic) {
+        lines.push(`**Topic:** deterministic source-summary filter "${topic}"`);
+      }
       if (degradedReason) {
         lines.push(`**Degraded:** ${degradedReason}`);
       }
@@ -1403,6 +1460,7 @@ export function createLcmRecentTool(input: {
           status,
           usedFallback,
           degradedReason,
+          topic,
           tokenCount: response.tokenCount,
           truncated: response.truncated || truncated,
           summaryIds: includeSources ? sourceSummaryIds : [],

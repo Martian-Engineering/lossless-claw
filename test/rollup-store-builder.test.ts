@@ -684,6 +684,70 @@ describe("LCM sub-day window retrieval", () => {
     );
   });
 
+  it("applies lcm_recent topic filters through bounded source-summary fallback", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "recent-topic-filter",
+      sessionKey: "agent:main:recent-topic-filter",
+      title: "Recent topic filter",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_topic_match",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "ENOTEMPTY repair finished during the handoff window.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_topic_other",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "GraphQL review-thread audit continued in the same day.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      latestAt: new Date("2026-04-27T11:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await expect(
+      builder.buildDayRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: makeLcmForConversation({
+        conversationId: conversation.conversationId,
+        rollupStore,
+        sessionId: "recent-topic-filter",
+      }) as never,
+      sessionId: "recent-topic-filter",
+    });
+
+    const result = await tool.execute("call-topic-filter", {
+      period: "date:2026-04-27",
+      topic: "ENOTEMPTY",
+      includeSources: true,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("Topic filters use bounded leaf-summary fallback");
+    expect(text).toContain("sum_topic_match");
+    expect(text).toContain("ENOTEMPTY repair");
+    expect(text).not.toContain("sum_topic_other");
+    expect(text).not.toContain("GraphQL review-thread");
+    expect(result.details).toMatchObject({
+      status: "fallback",
+      usedFallback: true,
+      topic: "ENOTEMPTY",
+      totalMatches: 1,
+      summaryIds: ["sum_topic_match"],
+    });
+  });
+
   it("orders fallback rows by the displayed effective time", async () => {
     const { db, conversationStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({

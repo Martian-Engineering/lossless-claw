@@ -78,7 +78,9 @@ type PendingActiveTransition = {
 };
 
 const COMPLETED_RE = /\b(completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed)\b/i;
-const UNFINISHED_RE = /\b(todo|follow[- ]?up|needs?|remaining|blocked|blocker|failing|failed|pending|unresolved|changes requested|not done|regression|risk)\b/i;
+const NEGATED_COMPLETION_RE =
+  /\b(?:not|never|no|without|isn't|wasn't|hasn't|haven't|hadn't|didn't|doesn't|don't)\s+(?:completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed|verified)\b|\b(?:completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed|verified)\s+(?:not|false|failed)\b/i;
+const UNFINISHED_RE = /\b(todo|follow[- ]?up|needs?|needs review|needs verification|not verified|remaining|blocked|blocked by|blocker|waiting on|failing|failed|pending|unresolved|still open|still blocked|red ci|changes requested|not done|not completed|not fixed|not resolved|not closed|not merged|not shipped|regression|risk)\b/i;
 const DECISION_RE = /\b(decision|decided|agreed|settled|approved|chose)\b/i;
 const AMBIGUOUS_RE = /\b(unclear|ambiguous|maybe|suspect|investigate|verify|question|unknown|possibly)\b/i;
 const EVENT_RE = /\b(first occurrence|original event|started|created|opened|reported|incident|restart|deploy|error|failed|merged|shipped|decision|retell|recalled|cortex|memory injection|imported|backfill|historical|echo)\b/i;
@@ -210,7 +212,7 @@ function toIso(value: string | null | undefined): string {
 }
 
 function classifyKind(line: string, status: ObservedWorkStatus): ObservedWorkKind {
-  if (/\b(blocked|blocker|risk|regression|failing|failed)\b/i.test(line)) return "blocker";
+  if (/\b(blocked|blocked by|blocker|risk|regression|failing|failed|waiting on|red ci)\b/i.test(line)) return "blocker";
   if (/\b(pr|pull request|review|comment|coderabbit|changes requested)\b/i.test(line)) return "review";
   if (/\b(test|ci|build|suite|vitest|npm test|green|passed)\b/i.test(line)) return "test";
   if (/\b(deploy|release|ship|shipped|launch)\b/i.test(line)) return "deploy";
@@ -223,8 +225,9 @@ function classifyKind(line: string, status: ObservedWorkStatus): ObservedWorkKin
 }
 
 function classifyWork(line: string): WorkCandidate | null {
-  const hasCompleted = COMPLETED_RE.test(line);
-  const hasUnfinished = UNFINISHED_RE.test(line);
+  const hasNegatedCompletion = NEGATED_COMPLETION_RE.test(line);
+  const hasCompleted = COMPLETED_RE.test(line) && !hasNegatedCompletion;
+  const hasUnfinished = UNFINISHED_RE.test(line) || hasNegatedCompletion;
   const hasDecision = DECISION_RE.test(line);
   const hasAmbiguous = AMBIGUOUS_RE.test(line);
   if (!hasCompleted && !hasUnfinished && !hasDecision && !hasAmbiguous) {
