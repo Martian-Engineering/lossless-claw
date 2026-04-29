@@ -57,6 +57,24 @@ export type ObservedWorkDensityQuery = {
   limit?: number;
 };
 
+export type ObservedWorkProcessingState = {
+  conversationId: number;
+  lastProcessedSummaryCreatedAt?: string;
+  lastProcessedSummaryId?: string;
+  lastProcessedSummaryRowid?: number;
+  pendingRebuild: boolean;
+  updatedAt: string;
+};
+
+export type ObservedWorkItemSnapshot = {
+  workItemId: string;
+  observedStatus: ObservedWorkStatus;
+  confidence: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  evidenceCount: number;
+};
+
 type ObservedWorkRow = {
   work_item_id: string;
   conversation_id: number;
@@ -70,6 +88,24 @@ type ObservedWorkRow = {
   first_seen_at: string;
   last_seen_at: string;
   completed_at: string | null;
+  evidence_count: number;
+};
+
+type ObservedWorkStateRow = {
+  conversation_id: number;
+  last_processed_summary_created_at: string | null;
+  last_processed_summary_id: string | null;
+  last_processed_summary_rowid: number | null;
+  pending_rebuild: number;
+  updated_at: string;
+};
+
+type ObservedWorkItemSnapshotRow = {
+  work_item_id: string;
+  observed_status: ObservedWorkStatus;
+  confidence: number;
+  first_seen_at: string;
+  last_seen_at: string;
   evidence_count: number;
 };
 
@@ -164,6 +200,25 @@ function placeholders(values: readonly unknown[]): string {
 export class ObservedWorkStore {
   constructor(private readonly db: DatabaseSync) {}
 
+  getItem(workItemId: string): ObservedWorkItemSnapshot | null {
+    const row = this.db.prepare(
+      `SELECT work_item_id, observed_status, confidence, first_seen_at, last_seen_at, evidence_count
+       FROM lcm_observed_work_items
+       WHERE work_item_id = ?`,
+    ).get(workItemId) as ObservedWorkItemSnapshotRow | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      workItemId: row.work_item_id,
+      observedStatus: row.observed_status,
+      confidence: row.confidence,
+      firstSeenAt: row.first_seen_at,
+      lastSeenAt: row.last_seen_at,
+      evidenceCount: row.evidence_count,
+    };
+  }
+
   upsertItem(item: ObservedWorkItemInput): void {
     this.db.prepare(
       `INSERT INTO lcm_observed_work_items (
@@ -240,6 +295,7 @@ export class ObservedWorkStore {
     conversationId: number;
     lastProcessedSummaryCreatedAt?: string;
     lastProcessedSummaryId?: string;
+    lastProcessedSummaryRowid?: number;
     pendingRebuild?: boolean;
   }): void {
     const pendingRebuild =
@@ -247,8 +303,8 @@ export class ObservedWorkStore {
     this.db.prepare(
       `INSERT INTO lcm_observed_work_state (
         conversation_id, last_processed_summary_created_at, last_processed_summary_id,
-        pending_rebuild, updated_at
-      ) VALUES (?, ?, ?, COALESCE(?, 0), datetime('now'))
+        last_processed_summary_rowid, pending_rebuild, updated_at
+      ) VALUES (?, ?, ?, ?, COALESCE(?, 0), datetime('now'))
       ON CONFLICT(conversation_id) DO UPDATE SET
         last_processed_summary_created_at = CASE
           WHEN ? IS NULL THEN lcm_observed_work_state.last_processed_summary_created_at
@@ -257,6 +313,10 @@ export class ObservedWorkStore {
         last_processed_summary_id = CASE
           WHEN ? IS NULL THEN lcm_observed_work_state.last_processed_summary_id
           ELSE excluded.last_processed_summary_id
+        END,
+        last_processed_summary_rowid = CASE
+          WHEN ? IS NULL THEN lcm_observed_work_state.last_processed_summary_rowid
+          ELSE excluded.last_processed_summary_rowid
         END,
         pending_rebuild = CASE
           WHEN ? IS NULL THEN lcm_observed_work_state.pending_rebuild
@@ -267,11 +327,39 @@ export class ObservedWorkStore {
       input.conversationId,
       input.lastProcessedSummaryCreatedAt ?? null,
       input.lastProcessedSummaryId ?? null,
+      input.lastProcessedSummaryRowid ?? null,
       pendingRebuild,
       input.lastProcessedSummaryCreatedAt ?? null,
       input.lastProcessedSummaryId ?? null,
+      input.lastProcessedSummaryRowid ?? null,
       pendingRebuild,
     );
+  }
+
+  getState(conversationId: number): ObservedWorkProcessingState | null {
+    const row = this.db.prepare(
+      `SELECT conversation_id, last_processed_summary_created_at, last_processed_summary_id,
+              last_processed_summary_rowid, pending_rebuild, updated_at
+       FROM lcm_observed_work_state
+       WHERE conversation_id = ?`,
+    ).get(conversationId) as ObservedWorkStateRow | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      conversationId: row.conversation_id,
+      ...(row.last_processed_summary_created_at
+        ? { lastProcessedSummaryCreatedAt: row.last_processed_summary_created_at }
+        : {}),
+      ...(row.last_processed_summary_id
+        ? { lastProcessedSummaryId: row.last_processed_summary_id }
+        : {}),
+      ...(row.last_processed_summary_rowid != null
+        ? { lastProcessedSummaryRowid: row.last_processed_summary_rowid }
+        : {}),
+      pendingRebuild: row.pending_rebuild === 1,
+      updatedAt: row.updated_at,
+    };
   }
 
   getDensity(query: ObservedWorkDensityQuery): ObservedWorkDensityResult {

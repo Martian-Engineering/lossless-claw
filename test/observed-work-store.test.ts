@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
+import { ObservedWorkExtractor } from "../src/observed-work-extractor.js";
 import { ObservedWorkStore } from "../src/store/observed-work-store.js";
+import { SummaryStore } from "../src/store/summary-store.js";
 import { createLcmWorkDensityTool } from "../src/tools/lcm-work-density-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
@@ -23,6 +25,28 @@ function createConversation(db: DatabaseSync, conversationId: number): void {
   );
 }
 
+async function insertLeafSummary(input: {
+  db: DatabaseSync;
+  summaryStore: SummaryStore;
+  summaryId: string;
+  conversationId: number;
+  content: string;
+  createdAt: string;
+}): Promise<void> {
+  await input.summaryStore.insertSummary({
+    summaryId: input.summaryId,
+    conversationId: input.conversationId,
+    kind: "leaf",
+    depth: 0,
+    content: input.content,
+    tokenCount: 50,
+    sourceMessageTokenCount: 80,
+    latestAt: new Date(input.createdAt),
+  });
+  input.db.prepare(`UPDATE summaries SET created_at = ? WHERE summary_id = ?`)
+    .run(input.createdAt, input.summaryId);
+}
+
 describe("ObservedWorkStore", () => {
   it("creates observed work tables during migration", () => {
     const db = makeDb();
@@ -36,6 +60,54 @@ describe("ObservedWorkStore", () => {
       "lcm_observed_work_sources",
       "lcm_observed_work_state",
     ]);
+  });
+
+  it("extracts leaf-summary work with a rowid cursor so same-second summaries are not skipped", async () => {
+    const db = makeDb();
+    createConversation(db, 7);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 7,
+      summaryId: "sum_z_first",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #540 still has unresolved review comments",
+    });
+    expect(extractor.processConversation(7)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 7,
+      summaryId: "sum_a_later",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #541 still has failing CI",
+    });
+    expect(extractor.processConversation(7)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 7,
+      statuses: ["observed_unfinished"],
+      limit: 10,
+    });
+    expect(density.density.unfinished).toBe(2);
+    expect(density.topUnfinished.map((item) => item.topicKey).sort()).toEqual([
+      "pr-540",
+      "pr-541",
+    ]);
+    const state = observedWork.getState(7);
+    expect(state?.lastProcessedSummaryId).toBe("sum_a_later");
+    expect(state?.lastProcessedSummaryRowid).toBeGreaterThan(0);
   });
 
   it("reports completed, unfinished, and ambiguous work density", () => {
