@@ -318,6 +318,15 @@ export class ObservedWorkExtractor {
                 });
                 workItemsUpserted += 1;
               } else {
+                this.observedWorkStore.updateItemObservation({
+                  workItemId: activeItem.workItemId,
+                  observedStatus: activeItem.observedStatus,
+                  confidence: work.confidence,
+                  confidenceBand: confidenceBand(work.confidence),
+                  lastSeenAt: observedAt,
+                  rationale: `Ambiguous possible resolution observed but left unresolved: ${truncate(line, 220)}`,
+                  evidenceIncrement: 1,
+                });
                 this.observedWorkStore.addSource({
                   workItemId: activeItem.workItemId,
                   sourceType: "summary",

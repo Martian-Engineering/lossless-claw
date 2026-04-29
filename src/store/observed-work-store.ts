@@ -99,8 +99,8 @@ export type ObservedWorkTransition = {
   observedAt: string;
   confidence: number;
   rationale: string;
-  sourceType: "summary" | "rollup" | "message";
-  sourceId: string;
+  sourceType?: "summary" | "rollup" | "message";
+  sourceId?: string;
 };
 
 type ObservedWorkRow = {
@@ -252,7 +252,10 @@ function rowToItem(
   };
 }
 
-function rowToTransition(row: ObservedWorkTransitionRow): ObservedWorkTransition {
+function rowToTransition(
+  row: ObservedWorkTransitionRow,
+  includeSources: boolean,
+): ObservedWorkTransition {
   return {
     transitionId: row.transition_id,
     workItemId: row.work_item_id,
@@ -262,8 +265,12 @@ function rowToTransition(row: ObservedWorkTransitionRow): ObservedWorkTransition
     observedAt: row.observed_at,
     confidence: row.confidence,
     rationale: row.rationale,
-    sourceType: row.source_type,
-    sourceId: row.source_id,
+    ...(includeSources
+      ? {
+          sourceType: row.source_type,
+          sourceId: row.source_id,
+        }
+      : {}),
   };
 }
 
@@ -461,7 +468,10 @@ export class ObservedWorkStore {
              ELSE ?
            END,
            confidence = max(confidence, ?),
-           confidence_band = ?,
+           confidence_band = CASE
+             WHEN ? >= confidence THEN ?
+             ELSE confidence_band
+           END,
            last_seen_at = ?,
            completed_at = CASE WHEN ? IS NOT NULL THEN ? ELSE completed_at END,
            completion_confidence = COALESCE(?, completion_confidence),
@@ -472,6 +482,7 @@ export class ObservedWorkStore {
     ).run(
       input.observedStatus,
       input.observedStatus,
+      input.confidence,
       input.confidence,
       input.confidenceBand,
       input.lastSeenAt,
@@ -686,7 +697,7 @@ export class ObservedWorkStore {
       ? this.getSourcesForWorkItems([...includedIds])
       : undefined;
     const transitions = query.includeTransitions
-      ? this.getTransitionsForWorkItems([...includedIds])
+      ? this.getTransitionsForWorkItems([...includedIds], query.includeSources === true)
       : undefined;
     return {
       density: {
@@ -740,7 +751,10 @@ export class ObservedWorkStore {
     ).all(...args, cutoff, limit) as ObservedWorkRow[];
   }
 
-  private getTransitionsForWorkItems(workItemIds: string[]): ObservedWorkTransition[] {
+  private getTransitionsForWorkItems(
+    workItemIds: string[],
+    includeSources: boolean,
+  ): ObservedWorkTransition[] {
     if (workItemIds.length === 0) {
       return [];
     }
@@ -751,7 +765,7 @@ export class ObservedWorkStore {
        WHERE work_item_id IN (${placeholders(workItemIds)})
        ORDER BY observed_at DESC, created_at DESC`,
     ).all(...workItemIds) as ObservedWorkTransitionRow[];
-    return rows.map(rowToTransition);
+    return rows.map((row) => rowToTransition(row, includeSources));
   }
 
   private getSourcesForWorkItems(

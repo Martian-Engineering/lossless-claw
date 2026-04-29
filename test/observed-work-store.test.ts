@@ -847,6 +847,40 @@ describe("ObservedWorkStore", () => {
     expect(JSON.stringify(density)).not.toContain("sum_limited_2");
   });
 
+  it("keeps confidence band aligned with the retained maximum confidence", () => {
+    const db = makeDb();
+    createConversation(db, 1);
+    const store = new ObservedWorkStore(db);
+    store.upsertItem({
+      workItemId: "work_confidence",
+      conversationId: 1,
+      firstSeenAt: "2026-04-28T00:00:00.000Z",
+      lastSeenAt: "2026-04-28T01:00:00.000Z",
+      title: "Review confidence consistency",
+      observedStatus: "observed_unfinished",
+      kind: "review",
+      confidence: 0.9,
+      confidenceBand: "high",
+      fingerprint: "review:confidence",
+    });
+
+    store.updateItemObservation({
+      workItemId: "work_confidence",
+      observedStatus: "observed_unfinished",
+      confidence: 0.58,
+      confidenceBand: "medium",
+      lastSeenAt: "2026-04-28T02:00:00.000Z",
+    });
+
+    const density = store.getDensity({ conversationId: 1 });
+    expect(density.topUnfinished[0]).toMatchObject({
+      confidence: 0.9,
+      confidenceBand: "high",
+      lastSeenAt: "2026-04-28T02:00:00.000Z",
+      evidenceCount: 1,
+    });
+  });
+
   it("tracks incremental processing state", () => {
     const db = makeDb();
     createConversation(db, 42);
