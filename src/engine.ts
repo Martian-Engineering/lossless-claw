@@ -5581,6 +5581,7 @@ export class LcmContextEngine implements ContextEngine {
               );
               const aggregateResult = await this.rollupBuilder.buildWeeklyMonthlyRollups(
                 conversation.conversationId,
+                { daysBack },
               );
               const errorCount = rollupResult.errors.length + aggregateResult.errors.length;
               if (errorCount > 0) {
