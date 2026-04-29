@@ -5,6 +5,10 @@ import type {
   ObservedWorkStatus,
   ObservedWorkStore,
 } from "./store/observed-work-store.js";
+import type {
+  EventObservationKind,
+  EventObservationStore,
+} from "./store/event-observation-store.js";
 
 type LeafSummaryRow = {
   summary_rowid: number;
@@ -21,6 +25,7 @@ type LeafSummaryRow = {
 export type ObservedWorkExtractionResult = {
   summariesScanned: number;
   workItemsUpserted: number;
+  eventsUpserted: number;
 };
 
 type WorkCandidate = {
@@ -35,10 +40,19 @@ type WorkCandidate = {
   completed: boolean;
 };
 
+type EventCandidate = {
+  eventKind: EventObservationKind;
+  title: string;
+  queryKey: string;
+  confidence: number;
+  rationale: string;
+};
+
 const COMPLETED_RE = /\b(completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed)\b/i;
 const UNFINISHED_RE = /\b(todo|follow[- ]?up|needs?|remaining|blocked|blocker|failing|failed|pending|unresolved|changes requested|not done|regression|risk)\b/i;
 const DECISION_RE = /\b(decision|decided|agreed|settled|approved|chose)\b/i;
 const AMBIGUOUS_RE = /\b(unclear|ambiguous|maybe|suspect|investigate|verify|question|unknown|possibly)\b/i;
+const EVENT_RE = /\b(first occurrence|original event|started|created|opened|reported|incident|restart|deploy|error|failed|merged|shipped|decision|retell|recalled|cortex|memory injection|imported|backfill|historical|echo)\b/i;
 
 function hashId(prefix: string, value: string): string {
   return `${prefix}_${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
@@ -164,6 +178,32 @@ function classifyWork(line: string): WorkCandidate | null {
   };
 }
 
+function classifyEvent(line: string): EventCandidate | null {
+  if (!EVENT_RE.test(line)) {
+    return null;
+  }
+  let eventKind: EventObservationKind = "primary";
+  if (/\b(retell|retold|recalled|mentioned again)\b/i.test(line)) eventKind = "retelling";
+  else if (/\b(cortex|memory injection|injected memory)\b/i.test(line)) eventKind = "memory_injection";
+  else if (/\b(imported|backfill|historical)\b/i.test(line)) eventKind = "imported";
+  else if (/\b(echo|dream|reference)\b/i.test(line)) eventKind = "echo";
+  else if (/\b(incident|root cause|restart|error|failed|failing|outage|blocked)\b/i.test(line)) eventKind = "operational_incident";
+  else if (DECISION_RE.test(line)) eventKind = "decision";
+  const confidence =
+    eventKind === "primary" || eventKind === "decision"
+      ? 0.72
+      : eventKind === "operational_incident"
+        ? 0.76
+        : 0.62;
+  return {
+    eventKind,
+    title: truncate(line, 140),
+    queryKey: topicKeyFor(line, eventKind === "decision" ? "decision" : "other"),
+    confidence,
+    rationale: "Observed event cue from a leaf summary; event time is evidence time, not necessarily original occurrence time.",
+  };
+}
+
 function extractLines(content: string): string[] {
   const lines = content
     .split(/\r?\n/)
@@ -182,6 +222,7 @@ export class ObservedWorkExtractor {
   constructor(
     private readonly db: DatabaseSync,
     private readonly observedWorkStore: ObservedWorkStore,
+    private readonly eventObservationStore?: EventObservationStore,
   ) {}
 
   processConversation(
@@ -192,8 +233,10 @@ export class ObservedWorkExtractor {
     const limit = Math.max(1, Math.min(options?.limit ?? 200, 1000));
     const rows = this.listUnprocessedLeafSummaries(conversationId, state, limit);
     let workItemsUpserted = 0;
+    let eventsUpserted = 0;
     for (const row of rows) {
       const observedAt = toIso(row.effective_at ?? row.created_at);
+      const createdAt = toIso(row.created_at);
       let ordinal = 0;
       for (const line of extractLines(row.content)) {
         const work = classifyWork(line);
@@ -232,6 +275,25 @@ export class ObservedWorkExtractor {
           });
           workItemsUpserted += 1;
         }
+        const event = classifyEvent(line);
+        if (event && this.eventObservationStore) {
+          const eventId = hashId("ev", `${conversationId}:${row.summary_id}:${ordinal}:${event.eventKind}:${event.title}`);
+          this.eventObservationStore.upsertObservation({
+            eventId,
+            conversationId,
+            eventKind: event.eventKind,
+            title: event.title,
+            queryKey: event.queryKey,
+            eventTime: observedAt,
+            ingestTime: createdAt,
+            confidence: event.confidence,
+            rationale: event.rationale,
+            sourceType: "summary",
+            sourceId: row.summary_id,
+            sourceIds: [row.summary_id],
+          });
+          eventsUpserted += 1;
+        }
         ordinal += 1;
       }
       this.observedWorkStore.upsertState({
@@ -245,6 +307,7 @@ export class ObservedWorkExtractor {
     return {
       summariesScanned: rows.length,
       workItemsUpserted,
+      eventsUpserted,
     };
   }
 

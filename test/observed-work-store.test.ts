@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ObservedWorkExtractor } from "../src/observed-work-extractor.js";
+import { EventObservationStore } from "../src/store/event-observation-store.js";
 import { ObservedWorkStore } from "../src/store/observed-work-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
+import { createLcmEventSearchTool } from "../src/tools/lcm-event-search-tool.js";
 import { createLcmWorkDensityTool } from "../src/tools/lcm-work-density-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
@@ -108,6 +110,62 @@ describe("ObservedWorkStore", () => {
     const state = observedWork.getState(7);
     expect(state?.lastProcessedSummaryId).toBe("sum_a_later");
     expect(state?.lastProcessedSummaryRowid).toBeGreaterThan(0);
+  });
+
+  it("records deterministic event observations and hides sources unless requested", async () => {
+    const db = makeDb();
+    createConversation(db, 8);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const events = new EventObservationStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork, events);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 8,
+      summaryId: "sum_incident",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content: [
+        "- Incident: ENOTEMPTY failed during package cleanup",
+        "- Retell: recalled the older Tarzan onboarding incident",
+      ].join("\n"),
+    });
+    expect(extractor.processConversation(8)).toMatchObject({
+      summariesScanned: 1,
+      eventsUpserted: 2,
+    });
+
+    const lcm = {
+      getEventObservationStore: () => events,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const tool = createLcmEventSearchTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "event-session",
+    });
+
+    const hidden = await tool.execute("event-hidden", {
+      conversationId: 8,
+      query: "enotempty",
+    });
+    expect((hidden.details as { accounting: { eventsIncluded: number } }).accounting.eventsIncluded).toBe(1);
+    expect(JSON.stringify(hidden.details)).not.toContain("sum_incident");
+
+    const shown = await tool.execute("event-shown", {
+      conversationId: 8,
+      query: "tarzan",
+      includeSources: true,
+    });
+    expect(JSON.stringify(shown.details)).toContain("sum_incident");
+    expect(JSON.stringify(shown.details)).toContain("retelling");
   });
 
   it("reports completed, unfinished, and ambiguous work density", () => {

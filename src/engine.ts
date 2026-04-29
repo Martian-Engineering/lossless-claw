@@ -65,6 +65,7 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
+import { EventObservationStore } from "./store/event-observation-store.js";
 import { ObservedWorkStore } from "./store/observed-work-store.js";
 import { RollupStore } from "./store/rollup-store.js";
 import { SummaryStore } from "./store/summary-store.js";
@@ -1452,6 +1453,7 @@ export class LcmContextEngine implements ContextEngine {
   private summaryStore: SummaryStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
+  private eventObservationStore: EventObservationStore;
   private observedWorkStore: ObservedWorkStore;
   private rollupStore: RollupStore;
   private rollupBuilder: RollupBuilder;
@@ -1543,6 +1545,7 @@ export class LcmContextEngine implements ContextEngine {
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
+    this.eventObservationStore = new EventObservationStore(this.db);
     this.observedWorkStore = new ObservedWorkStore(this.db);
     this.rollupStore = new RollupStore(this.db);
     this.rollupBuilder = new RollupBuilder(this.rollupStore, {
@@ -6692,6 +6695,10 @@ export class LcmContextEngine implements ContextEngine {
 
   getObservedWorkStore(): ObservedWorkStore {
     return this.observedWorkStore;
+  }
+
+  getEventObservationStore(): EventObservationStore {
+    return this.eventObservationStore;
   }
 
   getRollupStore(): RollupStore {
