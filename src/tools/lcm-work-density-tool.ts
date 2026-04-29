@@ -187,6 +187,12 @@ export function createLcmWorkDensityTool(input: {
       if (!scope.allConversations && scope.conversationId == null) {
         return jsonResult({ error: "No LCM conversation found for this session. Provide conversationId or set allConversations=true." });
       }
+      if (scope.allConversations) {
+        return jsonResult({
+          error:
+            "lcm_work_density does not support allConversations=true yet. Provide a conversationId so observed-work reads stay bounded.",
+        });
+      }
       let since: string | undefined;
       let before: string | undefined;
       let statuses: ObservedWorkStatus[] | undefined;

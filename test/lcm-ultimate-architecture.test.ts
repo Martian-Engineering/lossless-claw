@@ -248,6 +248,13 @@ describe("LCM ultimate architecture implementation", () => {
     expect(JSON.stringify(preview.details)).not.toContain("sum_blocked");
     expect(taskBridge.listSuggestions()).toHaveLength(0);
 
+    const allConversations = await suggestionsTool.execute("suggest-all", {
+      allConversations: true,
+    });
+    expect((allConversations.details as { error?: string }).error).toMatch(
+      /does not support allConversations/,
+    );
+
     const recorded = await suggestionsTool.execute("suggest-record", {
       conversationId: 3,
       topic: "PR #518",
