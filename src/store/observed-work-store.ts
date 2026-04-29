@@ -61,6 +61,7 @@ export type ObservedWorkProcessingState = {
   conversationId: number;
   lastProcessedSummaryCreatedAt?: string;
   lastProcessedSummaryId?: string;
+  lastProcessedSummaryRowid?: number;
   pendingRebuild: boolean;
   updatedAt: string;
 };
@@ -108,6 +109,7 @@ type ObservedWorkStateRow = {
   conversation_id: number;
   last_processed_summary_created_at: string | null;
   last_processed_summary_id: string | null;
+  last_processed_summary_rowid: number | null;
   pending_rebuild: number;
   updated_at: string;
 };
@@ -297,6 +299,7 @@ export class ObservedWorkStore {
     conversationId: number;
     lastProcessedSummaryCreatedAt?: string;
     lastProcessedSummaryId?: string;
+    lastProcessedSummaryRowid?: number;
     pendingRebuild?: boolean;
   }): void {
     const pendingRebuild =
@@ -304,8 +307,8 @@ export class ObservedWorkStore {
     this.db.prepare(
       `INSERT INTO lcm_observed_work_state (
         conversation_id, last_processed_summary_created_at, last_processed_summary_id,
-        pending_rebuild, updated_at
-      ) VALUES (?, ?, ?, COALESCE(?, 0), datetime('now'))
+        last_processed_summary_rowid, pending_rebuild, updated_at
+      ) VALUES (?, ?, ?, ?, COALESCE(?, 0), datetime('now'))
       ON CONFLICT(conversation_id) DO UPDATE SET
         last_processed_summary_created_at = CASE
           WHEN ? IS NULL THEN lcm_observed_work_state.last_processed_summary_created_at
@@ -314,6 +317,10 @@ export class ObservedWorkStore {
         last_processed_summary_id = CASE
           WHEN ? IS NULL THEN lcm_observed_work_state.last_processed_summary_id
           ELSE excluded.last_processed_summary_id
+        END,
+        last_processed_summary_rowid = CASE
+          WHEN ? IS NULL THEN lcm_observed_work_state.last_processed_summary_rowid
+          ELSE excluded.last_processed_summary_rowid
         END,
         pending_rebuild = CASE
           WHEN ? IS NULL THEN lcm_observed_work_state.pending_rebuild
@@ -324,9 +331,11 @@ export class ObservedWorkStore {
       input.conversationId,
       input.lastProcessedSummaryCreatedAt ?? null,
       input.lastProcessedSummaryId ?? null,
+      input.lastProcessedSummaryRowid ?? null,
       pendingRebuild,
       input.lastProcessedSummaryCreatedAt ?? null,
       input.lastProcessedSummaryId ?? null,
+      input.lastProcessedSummaryRowid ?? null,
       pendingRebuild,
     );
   }
@@ -334,7 +343,7 @@ export class ObservedWorkStore {
   getState(conversationId: number): ObservedWorkProcessingState | null {
     const row = this.db.prepare(
       `SELECT conversation_id, last_processed_summary_created_at, last_processed_summary_id,
-              pending_rebuild, updated_at
+              last_processed_summary_rowid, pending_rebuild, updated_at
        FROM lcm_observed_work_state
        WHERE conversation_id = ?`,
     ).get(conversationId) as ObservedWorkStateRow | undefined;
@@ -348,6 +357,9 @@ export class ObservedWorkStore {
         : {}),
       ...(row.last_processed_summary_id
         ? { lastProcessedSummaryId: row.last_processed_summary_id }
+        : {}),
+      ...(row.last_processed_summary_rowid != null
+        ? { lastProcessedSummaryRowid: row.last_processed_summary_rowid }
         : {}),
       pendingRebuild: row.pending_rebuild === 1,
       updatedAt: row.updated_at,

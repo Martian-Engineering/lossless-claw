@@ -119,6 +119,41 @@ describe("LCM ultimate architecture implementation", () => {
     expect(db.prepare(`SELECT name FROM sqlite_master WHERE name = 'tasks'`).get()).toBeUndefined();
   });
 
+  it("uses a rowid cursor so same-second summary IDs are not skipped", async () => {
+    const db = makeDb();
+    createConversation(db, 7);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const events = new EventObservationStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork, events);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 7,
+      summaryId: "sum_z_first",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #540 still has unresolved review comments",
+    });
+    expect(extractor.processConversation(7).summariesScanned).toBe(1);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 7,
+      summaryId: "sum_a_later",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #541 still has failing CI",
+    });
+    expect(extractor.processConversation(7).summariesScanned).toBe(1);
+
+    const density = observedWork.getDensity({
+      conversationId: 7,
+      statuses: ["observed_unfinished"],
+    });
+    expect(density.density.unfinished).toBe(2);
+  });
+
   it("searches event observations with source IDs hidden unless requested", async () => {
     const db = makeDb();
     createConversation(db, 2);

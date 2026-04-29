@@ -107,6 +107,47 @@ describe("TaskBridgeSuggestionStore", () => {
     });
   });
 
+  it("preserves reviewed status and original creator on repeated suggestion upserts", () => {
+    const db = makeDb();
+    createObservedWorkItem(db, "work_4");
+    const store = new TaskBridgeSuggestionStore(db);
+    store.upsertSuggestion({
+      suggestionId: "sug_reviewed",
+      workItemId: "work_4",
+      suggestionKind: "create_task",
+      confidence: 0.9,
+      rationale: "Initial observed task suggestion.",
+      sourceIds: ["sum_initial"],
+      createdBy: "first-agent",
+    });
+    store.reviewSuggestion({
+      suggestionId: "sug_reviewed",
+      status: "dismissed",
+      reviewedBy: "reviewer",
+    });
+
+    store.upsertSuggestion({
+      suggestionId: "sug_reviewed",
+      workItemId: "work_4",
+      suggestionKind: "create_task",
+      confidence: 0.95,
+      rationale: "Repeated record-mode run should refresh evidence only.",
+      sourceIds: ["sum_later"],
+      createdBy: "second-agent",
+    });
+
+    const dismissed = store.listSuggestions({ status: "dismissed" });
+    expect(dismissed).toHaveLength(1);
+    expect(dismissed[0]).toMatchObject({
+      suggestionId: "sug_reviewed",
+      status: "dismissed",
+      reviewedBy: "reviewer",
+      createdBy: "first-agent",
+      sourceIds: ["sum_later"],
+    });
+    expect(store.listSuggestions({ status: "pending" })).toHaveLength(0);
+  });
+
   it("rejects invalid suggestion records and reports missing review targets", () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_3");

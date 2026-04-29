@@ -96,7 +96,7 @@ export type LcmConfig = {
   /** When true, register the operator-facing lcm_rollup_debug tool. */
   rollupDebugEnabled: boolean;
   /** When true, register suggestion-ledger task bridge tools. External task writes remain forbidden. */
-  taskBridgeToolsEnabled?: boolean;
+  taskBridgeToolsEnabled: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */

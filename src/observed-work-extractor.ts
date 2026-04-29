@@ -11,6 +11,7 @@ import type {
 } from "./store/event-observation-store.js";
 
 type LeafSummaryRow = {
+  summary_rowid: number;
   summary_id: string;
   conversation_id: number;
   content: string;
@@ -299,6 +300,7 @@ export class ObservedWorkExtractor {
         conversationId,
         lastProcessedSummaryCreatedAt: row.created_at,
         lastProcessedSummaryId: row.summary_id,
+        lastProcessedSummaryRowid: row.summary_rowid,
         pendingRebuild: false,
       });
     }
@@ -316,7 +318,15 @@ export class ObservedWorkExtractor {
   ): LeafSummaryRow[] {
     const args: Array<string | number> = [conversationId];
     const where = ["s.conversation_id = ?", "s.kind = 'leaf'"];
-    if (state?.lastProcessedSummaryCreatedAt) {
+    const cursorRowid =
+      state?.lastProcessedSummaryRowid ??
+      (state?.lastProcessedSummaryId
+        ? this.lookupSummaryRowid(state.lastProcessedSummaryId)
+        : undefined);
+    if (cursorRowid != null) {
+      where.push("s.rowid > ?");
+      args.push(cursorRowid);
+    } else if (state?.lastProcessedSummaryCreatedAt) {
       where.push(
         `(julianday(s.created_at) > julianday(?) OR (julianday(s.created_at) = julianday(?) AND s.summary_id > ?))`,
       );
@@ -329,6 +339,7 @@ export class ObservedWorkExtractor {
     args.push(limit);
     return this.db.prepare(
       `SELECT
+         s.rowid AS summary_rowid,
          s.summary_id,
          s.conversation_id,
          s.content,
@@ -343,8 +354,17 @@ export class ObservedWorkExtractor {
          ) AS source_message_count
        FROM summaries s
        WHERE ${where.join(" AND ")}
-       ORDER BY julianday(s.created_at) ASC, s.summary_id ASC
+       ORDER BY s.rowid ASC
        LIMIT ?`,
     ).all(...args) as LeafSummaryRow[];
+  }
+
+  private lookupSummaryRowid(summaryId: string): number | undefined {
+    const row = this.db.prepare(
+      `SELECT rowid AS summary_rowid
+       FROM summaries
+       WHERE summary_id = ?`,
+    ).get(summaryId) as { summary_rowid: number } | undefined;
+    return row?.summary_rowid;
   }
 }

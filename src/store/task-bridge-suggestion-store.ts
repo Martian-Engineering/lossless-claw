@@ -123,11 +123,9 @@ export class TaskBridgeSuggestionStore {
         work_item_id = excluded.work_item_id,
         task_id = excluded.task_id,
         suggestion_kind = excluded.suggestion_kind,
-        status = excluded.status,
         confidence = excluded.confidence,
         rationale = excluded.rationale,
         source_ids = excluded.source_ids,
-        created_by = excluded.created_by,
         updated_at = datetime('now')`,
     ).run(
       input.suggestionId,

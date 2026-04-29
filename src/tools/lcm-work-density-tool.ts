@@ -41,7 +41,7 @@ const LcmWorkDensitySchema = Type.Object({
   period: Type.Optional(Type.String({ description: 'Observed work period: "today", "yesterday", "7d", "30d", "week", "month", or "date:YYYY-MM-DD". Explicit since/before wins when provided.' })),
   since: Type.Optional(Type.String({ description: "Only include observed items last seen at or after this ISO timestamp." })),
   before: Type.Optional(Type.String({ description: "Only include observed items first seen before this ISO timestamp." })),
-  topic: Type.Optional(Type.String({ description: "Exact topic_key filter." })),
+  topic: Type.Optional(Type.String({ description: "Deterministic topic_key, title, or rationale filter. Exact topic keys are preferred; title/rationale matching is bounded and case-insensitive." })),
   statuses: Type.Optional(Type.Array(Type.String({ enum: [...STATUS_VALUES] }), { description: "Observed statuses to include." })),
   kinds: Type.Optional(Type.Array(Type.String({ enum: [...KIND_VALUES] }), { description: "Observed work kinds to include." })),
   includeSources: Type.Optional(Type.Boolean({ description: "Include observed-work source IDs. Defaults to false." })),

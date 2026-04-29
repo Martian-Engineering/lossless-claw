@@ -1184,10 +1184,20 @@ export function runLcmMigrations(
           conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
           last_processed_summary_created_at TEXT,
           last_processed_summary_id TEXT,
+          last_processed_summary_rowid INTEGER,
           pending_rebuild INTEGER NOT NULL DEFAULT 0,
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
       `);
+    });
+
+    runMigrationStep("ensureObservedWorkStateCursorColumns", log, () => {
+      addColumnIfMissing(
+        db,
+        "lcm_observed_work_state",
+        "last_processed_summary_rowid",
+        "INTEGER",
+      );
     });
 
     runMigrationStep("ensureObservedWorkIndexes", log, () => {
