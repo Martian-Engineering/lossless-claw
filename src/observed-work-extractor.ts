@@ -336,6 +336,20 @@ export class ObservedWorkExtractor {
           let handledByActiveTransition = false;
           if (activeItems.length > 0 && (work.completed || work.possiblyResolves)) {
             for (const activeItem of activeItems) {
+              const transitionEvidenceKind =
+                work.completed && work.confidence >= 0.75
+                  ? "completed"
+                  : "possible_completion";
+              const sourceAlreadyRecorded = this.observedWorkStore.hasSource({
+                workItemId: activeItem.workItemId,
+                sourceType: "summary",
+                sourceId: row.summary_id,
+                evidenceKind: transitionEvidenceKind,
+              });
+              if (sourceAlreadyRecorded) {
+                handledByActiveTransition = true;
+                continue;
+              }
               if (work.completed && work.confidence >= 0.75) {
                 this.observedWorkStore.updateItemObservation({
                   workItemId: activeItem.workItemId,
@@ -353,7 +367,7 @@ export class ObservedWorkExtractor {
                   sourceType: "summary",
                   sourceId: row.summary_id,
                   ordinal,
-                  evidenceKind: "completed",
+                  evidenceKind: transitionEvidenceKind,
                 });
                 this.observedWorkStore.addTransition({
                   transitionId: hashId("owt", `${activeItem.workItemId}:${row.summary_id}:${ordinal}:resolved`),
@@ -383,7 +397,7 @@ export class ObservedWorkExtractor {
                   sourceType: "summary",
                   sourceId: row.summary_id,
                   ordinal,
-                  evidenceKind: "possible_completion",
+                  evidenceKind: transitionEvidenceKind,
                 });
                 this.observedWorkStore.addTransition({
                   transitionId: hashId("owt", `${activeItem.workItemId}:${row.summary_id}:${ordinal}:possibly_resolved`),

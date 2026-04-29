@@ -393,6 +393,59 @@ describe("ObservedWorkStore", () => {
     );
   });
 
+  it("allows stronger resolution evidence after a weaker same-summary transition", async () => {
+    const db = makeDb();
+    createConversation(db, 14);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 14,
+      summaryId: "sum_pr602_open",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #602 review comments unresolved",
+    });
+    expect(extractor.processConversation(14)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 14,
+      summaryId: "sum_pr602_mixed_resolution",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content:
+        "- Ambiguous: PR #602 review comments possibly resolved\n- Completed: PR #602 review comments resolved",
+    });
+    expect(extractor.processConversation(14)).toMatchObject({
+      summariesScanned: 1,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 14,
+      includeSources: true,
+      includeTransitions: true,
+      limit: 10,
+    });
+    expect(density.completedHighlights.map((item) => item.title)).toContain(
+      "Blocker: PR #602 review comments unresolved"
+    );
+    const completed = density.completedHighlights.find(
+      (item) => item.topicKey === "pr-602"
+    );
+    expect(completed?.sources?.map((source) => source.evidenceKind)).toEqual(
+      expect.arrayContaining(["possible_completion", "completed"])
+    );
+    expect(density.transitions?.map((transition) => transition.transitionType)).toEqual(
+      expect.arrayContaining(["possibly_resolved", "resolved"])
+    );
+  });
+
   it("preserves semantic evidence kinds when reinforcing extracted work", async () => {
     const db = makeDb();
     createConversation(db, 9);

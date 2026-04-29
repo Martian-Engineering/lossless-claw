@@ -437,15 +437,21 @@ export class ObservedWorkStore {
     workItemId: string;
     sourceType: "summary" | "rollup" | "message";
     sourceId: string;
+    evidenceKind?: "created" | "reinforced" | "possible_completion" | "completed" | "contradicted" | "dismissed";
   }): boolean {
+    const evidenceClause = input.evidenceKind ? "AND evidence_kind = ?" : "";
+    const args = input.evidenceKind
+      ? [input.workItemId, input.sourceType, input.sourceId, input.evidenceKind]
+      : [input.workItemId, input.sourceType, input.sourceId];
     const row = this.db.prepare(
       `SELECT 1 AS found
        FROM lcm_observed_work_sources
        WHERE work_item_id = ?
          AND source_type = ?
          AND source_id = ?
+         ${evidenceClause}
        LIMIT 1`,
-    ).get(input.workItemId, input.sourceType, input.sourceId);
+    ).get(...args);
     return row != null;
   }
 
