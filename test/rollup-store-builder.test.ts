@@ -1150,19 +1150,25 @@ describe("LCM weekly and monthly rollups", () => {
       )
       .run("Bravo work item.", "sum_same");
 
-    const result = await builder.buildDailyRollups(conversation.conversationId, {
-      forceCurrentDay: true,
-      daysBack: 2,
-    });
-    expect(result.built).toBeGreaterThan(0);
-    const second = rollupStore.getRollup(
-      conversation.conversationId,
-      "day",
-      "2026-04-27"
-    );
-    expect(second?.rollup_id).toBe(first?.rollup_id);
-    expect(second?.content).toContain("Bravo work item");
-    expect(second?.source_fingerprint).not.toBe(first?.source_fingerprint);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T12:00:00.000Z"));
+    try {
+      const result = await builder.buildDailyRollups(conversation.conversationId, {
+        forceCurrentDay: true,
+        daysBack: 2,
+      });
+      expect(result.built).toBeGreaterThan(0);
+      const second = rollupStore.getRollup(
+        conversation.conversationId,
+        "day",
+        "2026-04-27"
+      );
+      expect(second?.rollup_id).toBe(first?.rollup_id);
+      expect(second?.content).toContain("Bravo work item");
+      expect(second?.source_fingerprint).not.toBe(first?.source_fingerprint);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects invalid plain dates", async () => {
@@ -1254,15 +1260,21 @@ describe("LCM weekly and monthly rollups", () => {
     const day = rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27");
     rollupStore.markStale(day!.rollup_id);
 
-    const daily = await builder.buildDailyRollups(conversation.conversationId, {
-      forceCurrentDay: true,
-      daysBack: 2,
-    });
-    expect(daily.built).toBeGreaterThan(0);
-    expect(
-      rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
-        ?.status
-    ).toBe("ready");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T12:00:00.000Z"));
+    try {
+      const daily = await builder.buildDailyRollups(conversation.conversationId, {
+        forceCurrentDay: true,
+        daysBack: 2,
+      });
+      expect(daily.built).toBeGreaterThan(0);
+      expect(
+        rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
+          ?.status
+      ).toBe("ready");
+    } finally {
+      vi.useRealTimers();
+    }
 
     await builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27");
     const week = rollupStore.getRollup(
@@ -1888,10 +1900,17 @@ describe("LCM weekly and monthly rollups", () => {
       });
 
     const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
-    const result = await builder.buildDailyRollups(conversation.conversationId, {
-      forceCurrentDay: true,
-      daysBack: 2,
-    });
+    let result!: Awaited<ReturnType<RollupBuilder["buildDailyRollups"]>>;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T12:00:00.000Z"));
+    try {
+      result = await builder.buildDailyRollups(conversation.conversationId, {
+        forceCurrentDay: true,
+        daysBack: 2,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
     upsertSpy.mockRestore();
 
     expect(result.built).toBe(1);
