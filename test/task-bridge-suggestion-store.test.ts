@@ -3,6 +3,11 @@ import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ObservedWorkStore } from "../src/store/observed-work-store.js";
 import { TaskBridgeSuggestionStore } from "../src/store/task-bridge-suggestion-store.js";
+import {
+  createLcmTaskSuggestionReviewTool,
+  createLcmTaskSuggestionsTool,
+} from "../src/tools/lcm-task-suggestions-tool.js";
+import type { LcmDependencies } from "../src/types.js";
 
 function makeDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -166,7 +171,7 @@ describe("TaskBridgeSuggestionStore", () => {
       status: "dismissed",
       reviewedBy: "reviewer",
       createdBy: "first-agent",
-      sourceIds: ["sum_later"],
+      sourceIds: ["sum_initial"],
     });
     expect(store.listSuggestions({ status: "pending" })).toHaveLength(0);
   });

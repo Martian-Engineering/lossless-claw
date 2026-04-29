@@ -90,15 +90,10 @@ function arrayParam<T extends string>(value: unknown, allowed: readonly T[], key
 }
 
 function suggestionKindFor(item: ObservedWorkDensityItem): TaskBridgeSuggestionKind {
-  if (item.observedStatus === "observed_completed") {
-    return "add_task_evidence";
-  }
-  if (item.observedStatus === "observed_ambiguous" || item.kind === "decision") {
-    return "add_task_evidence";
-  }
+  void item;
   // Observed-work items do not carry an authoritative external task id. Until a
-  // later opt-in linker supplies one, blockers become task-creation suggestions
-  // rather than task-targeted mutations such as mark_task_blocked.
+  // later opt-in linker supplies one, suggestions stay task-creation previews
+  // rather than targeted mutations such as mark_task_blocked or add_task_evidence.
   return "create_task";
 }
 

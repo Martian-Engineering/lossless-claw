@@ -168,13 +168,35 @@ export class TaskBridgeSuggestionStore {
         rationale, source_ids, created_by, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(suggestion_id) DO UPDATE SET
-        work_item_id = excluded.work_item_id,
-        task_id = COALESCE(excluded.task_id, lcm_task_bridge_suggestions.task_id),
-        suggestion_kind = excluded.suggestion_kind,
-        confidence = excluded.confidence,
-        rationale = excluded.rationale,
-        source_ids = excluded.source_ids,
-        updated_at = datetime('now')`,
+        work_item_id = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.work_item_id
+          ELSE lcm_task_bridge_suggestions.work_item_id
+        END,
+        task_id = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending'
+            THEN COALESCE(excluded.task_id, lcm_task_bridge_suggestions.task_id)
+          ELSE lcm_task_bridge_suggestions.task_id
+        END,
+        suggestion_kind = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.suggestion_kind
+          ELSE lcm_task_bridge_suggestions.suggestion_kind
+        END,
+        confidence = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.confidence
+          ELSE lcm_task_bridge_suggestions.confidence
+        END,
+        rationale = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.rationale
+          ELSE lcm_task_bridge_suggestions.rationale
+        END,
+        source_ids = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.source_ids
+          ELSE lcm_task_bridge_suggestions.source_ids
+        END,
+        updated_at = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN datetime('now')
+          ELSE lcm_task_bridge_suggestions.updated_at
+        END`,
     ).run(
       suggestionId,
       workItemId,
