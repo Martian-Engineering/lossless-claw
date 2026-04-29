@@ -2018,12 +2018,16 @@ export class LcmContextEngine implements ContextEngine {
     return telemetry.turnsSinceLeafCompaction <= HOT_CACHE_HYSTERESIS_TURNS;
   }
 
-  /** Treat weak observed cache reuse as cold, even if older telemetry still looks hot. */
+  /** Treat weak observed cache reuse without a cache write as cold, even if older telemetry still looks hot. */
   private isObservedCacheReadShareCold(
     telemetry: ConversationCompactionTelemetryRecord | null,
   ): boolean {
     const cacheRead = telemetry?.lastObservedCacheRead;
+    const cacheWrite = telemetry?.lastObservedCacheWrite;
     const promptTokenCount = telemetry?.lastObservedPromptTokenCount;
+    if (typeof cacheWrite === "number" && Number.isFinite(cacheWrite) && cacheWrite > 0) {
+      return false;
+    }
     if (
       typeof cacheRead !== "number"
       || !Number.isFinite(cacheRead)
