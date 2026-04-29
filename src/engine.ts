@@ -1669,6 +1669,27 @@ function messageContentCoveredBySummary(params: {
   return summary.includes(content);
 }
 
+const MAX_ROLLUP_MAINTENANCE_DAYS_BACK = 30;
+
+function computeRollupMaintenanceDaysBack(
+  lastRollupCheckAt: string | null | undefined,
+  now = new Date(),
+): number {
+  if (!lastRollupCheckAt) {
+    return MAX_ROLLUP_MAINTENANCE_DAYS_BACK;
+  }
+  const parsed = new Date(lastRollupCheckAt);
+  if (Number.isNaN(parsed.getTime())) {
+    return MAX_ROLLUP_MAINTENANCE_DAYS_BACK;
+  }
+  const elapsedMs = Math.max(0, now.getTime() - parsed.getTime());
+  const elapsedDays = Math.ceil(elapsedMs / 86_400_000);
+  return Math.min(
+    MAX_ROLLUP_MAINTENANCE_DAYS_BACK,
+    Math.max(1, elapsedDays + 1),
+  );
+}
+
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
 export class LcmContextEngine implements ContextEngine {
@@ -5551,9 +5572,12 @@ export class LcmContextEngine implements ContextEngine {
               rollupState.timezone !== this.timezone ||
               result.changed
             ) {
+              const daysBack = computeRollupMaintenanceDaysBack(
+                rollupState?.last_rollup_check_at,
+              );
               const rollupResult = await this.rollupBuilder.buildDailyRollups(
                 conversation.conversationId,
-                { daysBack: 30, forceCurrentDay: true },
+                { daysBack, forceCurrentDay: true },
               );
               const aggregateResult = await this.rollupBuilder.buildWeeklyMonthlyRollups(
                 conversation.conversationId,
