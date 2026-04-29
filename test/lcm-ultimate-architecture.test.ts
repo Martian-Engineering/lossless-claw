@@ -275,5 +275,20 @@ describe("LCM ultimate architecture implementation", () => {
     });
     expect((reviewed.details as { changed: boolean }).changed).toBe(true);
     expect(taskBridge.listSuggestions({ status: "dismissed" })).toHaveLength(1);
+
+    taskBridge.upsertSuggestion({
+      suggestionId: pending[0]!.suggestionId,
+      workItemId: pending[0]!.workItemId,
+      suggestionKind: pending[0]!.suggestionKind,
+      confidence: 0.95,
+      rationale: "Deterministic re-record should refresh evidence without undoing review.",
+      sourceIds: ["sum_blocked"],
+      createdBy: "second-writer",
+    });
+    const stillDismissed = taskBridge.listSuggestions({ status: "dismissed" });
+    expect(stillDismissed).toHaveLength(1);
+    expect(stillDismissed[0]?.createdBy).toBe("lcm_observed");
+    expect(stillDismissed[0]?.reviewedBy).toBe("unit-test");
+    expect(taskBridge.listSuggestions({ status: "pending" })).toHaveLength(0);
   });
 });
