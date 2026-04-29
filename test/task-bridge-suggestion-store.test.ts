@@ -7,6 +7,7 @@ import { TaskBridgeSuggestionStore } from "../src/store/task-bridge-suggestion-s
 function makeDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
   runLcmMigrations(db, { fts5Available: false });
+  db.exec("PRAGMA foreign_keys = ON");
   return db;
 }
 
@@ -153,6 +154,36 @@ describe("TaskBridgeSuggestionStore", () => {
         sourceIds: [],
       })
     ).toThrow(/source ID/);
+    expect(() =>
+      store.upsertSuggestion({
+        suggestionId: " ",
+        workItemId: "work_3",
+        suggestionKind: "create_task",
+        confidence: 0.8,
+        rationale: "blank suggestion ID",
+        sourceIds: ["sum_bad"],
+      })
+    ).toThrow(/suggestionId/);
+    expect(() =>
+      store.upsertSuggestion({
+        suggestionId: "bad_work_item",
+        workItemId: " ",
+        suggestionKind: "create_task",
+        confidence: 0.8,
+        rationale: "blank work item ID",
+        sourceIds: ["sum_bad"],
+      })
+    ).toThrow(/workItemId/);
+    expect(() =>
+      store.upsertSuggestion({
+        suggestionId: "missing_work",
+        workItemId: "missing_work_item",
+        suggestionKind: "create_task",
+        confidence: 0.8,
+        rationale: "missing FK target",
+        sourceIds: ["sum_bad"],
+      })
+    ).toThrow();
     expect(
       store.reviewSuggestion({
         suggestionId: "missing",
