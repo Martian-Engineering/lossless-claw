@@ -610,10 +610,16 @@ describe("LCM sub-day window retrieval", () => {
     });
     const fallbackText = (fallback.content[0] as { text: string }).text;
     expect(fallbackText).toContain("sum_recent_fallback");
+    expect(fallbackText).toContain("**Confidence:** medium");
     expect(fallbackText).toContain("space-separated SQLite timestamp");
-    expect((fallback.details as { usedFallback?: boolean }).usedFallback).toBe(
-      true
-    );
+    expect(
+      (fallback.details as { confidence?: string; usedFallback?: boolean })
+        .usedFallback
+    ).toBe(true);
+    expect(
+      (fallback.details as { confidence?: string; usedFallback?: boolean })
+        .confidence
+    ).toBe("medium");
 
     const hiddenFallback = await tool.execute("call-hidden-fallback-day", {
       period: "date:2026-04-26",
@@ -626,6 +632,18 @@ describe("LCM sub-day window retrieval", () => {
     expect(
       (hiddenFallback.details as { summaryIds?: string[] }).summaryIds
     ).toEqual([]);
+
+    const emptyFallback = await tool.execute("call-empty-fallback-day", {
+      period: "date:2026-04-25",
+      includeSources: false,
+    });
+    const emptyFallbackText = (emptyFallback.content[0] as { text: string })
+      .text;
+    expect(emptyFallbackText).toContain("**Confidence:** none");
+    expect(
+      (emptyFallback.details as { confidence?: string; usedFallback?: boolean })
+        .confidence
+    ).toBe("none");
 
     const invalid = await tool.execute("call-invalid-date", {
       period: "date:2026-02-31",
@@ -743,14 +761,14 @@ describe("LCM sub-day window retrieval", () => {
     const result = await tool.execute("call-budget", {
       period: "date:2026-04-27 10:00-11:30",
       includeSources: false,
-      maxOutputTokens: 250,
-      globalMaxOutputTokens: 250,
+      maxOutputTokens: 500,
+      globalMaxOutputTokens: 500,
       maxSourceSummaries: 80,
     });
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("*Sources: omitted*");
     expect(text).not.toContain("sum_budget_");
-    expect(estimateTokens(text)).toBeLessThanOrEqual(250);
+    expect(estimateTokens(text)).toBeLessThanOrEqual(500);
     expect((result.details as { summaryIds?: string[] }).summaryIds).toEqual([]);
   });
 
@@ -802,10 +820,15 @@ describe("LCM sub-day window retrieval", () => {
       maxSourceSummaries: 20,
     });
     const details = result.details as {
+      confidence?: string;
       totalMatches?: number;
       truncated?: boolean;
       summaryIds?: string[];
     };
+    expect((result.content[0] as { text: string }).text).toContain(
+      "**Confidence:** medium"
+    );
+    expect(details.confidence).toBe("medium");
     expect(details.totalMatches).toBe(1005);
     expect(details.truncated).toBe(true);
     expect(details.summaryIds).toEqual([]);
