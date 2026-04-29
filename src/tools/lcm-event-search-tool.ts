@@ -107,31 +107,37 @@ export function createLcmEventSearchTool(input: {
       const query = typeof p.query === "string" && p.query.trim() ? p.query.trim() : undefined;
       const store = lcm.getEventObservationStore();
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 20;
-      const observations = store.listObservations({
-        conversationId: scope.conversationId,
-        eventKinds,
-        query,
-        since,
-        before,
-        first: p.first === true,
-        includeSources: p.includeSources === true,
-        limit,
-      });
-      const remainingEpisodeLimit = Math.max(0, limit - observations.length);
-      const episodes = p.includeEpisodes === true
-        ? remainingEpisodeLimit > 0
-          ? store.listEpisodes({
-              conversationId: scope.conversationId,
-              eventKinds,
-              query,
-              since,
-              before,
-              first: p.first === true,
-              includeSources: p.includeSources === true,
-              limit: remainingEpisodeLimit,
-            })
-          : []
+      const includeEpisodes = p.includeEpisodes === true;
+      const reservedEpisodeLimit = includeEpisodes
+        ? Math.max(1, Math.min(limit, Math.ceil(limit / 2)))
+        : 0;
+      const episodes = includeEpisodes
+        ? store.listEpisodes({
+            conversationId: scope.conversationId,
+            eventKinds,
+            query,
+            since,
+            before,
+            first: p.first === true,
+            includeSources: p.includeSources === true,
+            limit: reservedEpisodeLimit,
+          })
         : undefined;
+      const observationLimit = includeEpisodes
+        ? Math.max(0, limit - (episodes?.length ?? 0))
+        : limit;
+      const observations = observationLimit > 0
+        ? store.listObservations({
+            conversationId: scope.conversationId,
+            eventKinds,
+            query,
+            since,
+            before,
+            first: p.first === true,
+            includeSources: p.includeSources === true,
+            limit: observationLimit,
+          })
+        : [];
       return jsonResult({
         conversationScope: scope.allConversations ? "all" : scope.conversationId,
         query,

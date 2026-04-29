@@ -574,6 +574,7 @@ describe("ObservedWorkStore", () => {
       accounting: { eventsIncluded: number; episodesIncluded: number };
     };
     expect(details.accounting.eventsIncluded + details.accounting.episodesIncluded).toBeLessThanOrEqual(3);
+    expect(details.accounting.episodesIncluded).toBeGreaterThan(0);
   });
 
   it("reports completed, unfinished, and ambiguous work density", () => {
