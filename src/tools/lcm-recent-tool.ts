@@ -500,11 +500,11 @@ function formatDrilldownHint(
 ): string {
   if (confidence === "high") {
     return includeSources
-      ? "*Confidence: high for recap coverage. For proof/exact wording, use lcm_expand_query with summary IDs; message:<id> sources identify unsummarized raw messages.*"
+      ? "*Confidence: high for recap coverage. For proof/exact wording, use lcm_expand_query with summary IDs. message:<id> entries identify inline raw messages in this recap and are not lcm_describe targets.*"
       : "*Confidence: high for recap coverage. Re-run with includeSources=true if exact proof is needed.*";
   }
   return includeSources
-    ? "*Confidence: partial. Dive deeper with lcm_expand_query on summary IDs, inspect message:<id> raw-message sources, or request a larger maxOutputTokens/detailLevel.*"
+    ? "*Confidence: partial. Dive deeper with lcm_expand_query on summary IDs, use the same time window for raw-message evidence, or request a larger maxOutputTokens/detailLevel. message:<id> entries are not lcm_describe targets.*"
     : "*Confidence: partial. Re-run with includeSources=true, higher detailLevel, or a larger maxOutputTokens to inspect source summaries.*";
 }
 
@@ -922,7 +922,7 @@ function getRecentSummaryFallback(
   };
 }
 
-function hasLeafSummariesInRange(
+function hasFallbackSourceItemsInRange(
   db: DatabaseSync,
   conversationId: number | undefined,
   start: Date,
@@ -936,25 +936,40 @@ function hasLeafSummariesInRange(
 
   const row = db
     .prepare(
-      `SELECT 1 AS present
-       FROM summaries
-       WHERE ${scopeClause}
-         kind = 'leaf'
-         AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
-         AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+      `SELECT
+         EXISTS (
+           SELECT 1
+           FROM summaries
+           WHERE ${scopeClause}
+             kind = 'leaf'
+             AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
+             AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM messages m
+           WHERE ${conversationId == null ? "" : "m.conversation_id = ? AND"}
+             julianday(m.created_at) < julianday(?)
+             AND julianday(m.created_at) >= julianday(?)
+             AND NOT EXISTS (
+               SELECT 1
+               FROM summary_messages sm
+               WHERE sm.message_id = m.message_id
+             )
+         ) AS present
        LIMIT 1`
     )
-    .get(...args) as { present: 1 } | undefined;
-  return row != null;
+    .get(...args, ...args) as { present: 0 | 1 } | undefined;
+  return row?.present === 1;
 }
 
-function dayHasLeafSummaries(
+function dayHasFallbackSourceItems(
   db: DatabaseSync,
   conversationId: number | undefined,
   dayKey: string,
   timezone: string
 ): boolean {
-  return hasLeafSummariesInRange(
+  return hasFallbackSourceItemsInRange(
     db,
     conversationId,
     getUtcDateForZonedMidnight(dayKey, timezone),
@@ -1099,16 +1114,32 @@ export function createLcmRecentTool(input: {
       let degradedReason: string | undefined;
 
       const currentDayKey = getZonedDayString(new Date(), timezone);
+      const rollupState = rollupStore.getState(conversationId);
+      const lastPendingMessageAt =
+        rollupState?.pending_rebuild === 1 && rollupState.last_message_at
+          ? new Date(rollupState.last_message_at)
+          : null;
+      const pendingDayKey =
+        lastPendingMessageAt &&
+        !Number.isNaN(lastPendingMessageAt.getTime()) &&
+        lastPendingMessageAt >= resolution.start &&
+        lastPendingMessageAt < resolution.end
+          ? getZonedDayString(lastPendingMessageAt, timezone)
+          : null;
       const canUseStoredCurrentDay =
         resolution.periodKey == null || resolution.periodKey !== currentDayKey;
-      const hasPendingRebuild =
-        rollupStore.getState(conversationId)?.pending_rebuild === 1;
+      const hasPendingRebuild = rollupState?.pending_rebuild === 1;
+      const pendingRebuildTouchesWindow = pendingDayKey != null;
       const canUseStoredResolvedRollup =
         canUseStoredCurrentDay &&
+        !pendingRebuildTouchesWindow &&
         (resolution.kind === "day" || !hasPendingRebuild);
       if (!canUseStoredCurrentDay) {
         degradedReason =
           "Stored current-day rollups were bypassed so same-day recall uses bounded fresh sources.";
+      } else if (pendingDayKey) {
+        degradedReason =
+          `Rollup rebuild is pending for ${pendingDayKey}, so stored rollups for that day were bypassed.`;
       } else if (resolution.kind && resolution.kind !== "day" && hasPendingRebuild) {
         degradedReason =
           "Rollup rebuild is pending, so stored aggregate rollups were bypassed.";
@@ -1194,22 +1225,32 @@ export function createLcmRecentTool(input: {
         );
         const currentDayInWindow =
           resolution.kind === "day" && expectedKeys.includes(currentDayKey);
-        const requiredKeys = currentDayInWindow
-          ? expectedKeys.filter((key) => key !== currentDayKey)
-          : expectedKeys;
+        const liveFallbackKeys = new Set<string>();
+        if (currentDayInWindow) {
+          liveFallbackKeys.add(currentDayKey);
+        }
+        if (
+          resolution.kind === "day" &&
+          pendingDayKey &&
+          expectedKeys.includes(pendingDayKey)
+        ) {
+          liveFallbackKeys.add(pendingDayKey);
+        }
+        const requiredKeys = expectedKeys.filter((key) => !liveFallbackKeys.has(key));
         const hasCompleteCoverage =
           resolution.kind !== "day" ||
           (expectedKeys.length > 0 &&
             requiredKeys.every(
               (key) =>
                 usableKeys.has(key) ||
-                !dayHasLeafSummaries(db, conversationId, key, timezone)
+                !dayHasFallbackSourceItems(db, conversationId, key, timezone)
             ));
         const hasStoredCoverage =
           resolution.kind === "day"
             ? requiredKeys.some((key) => usableKeys.has(key))
             : usableRollups.length > 0;
-        if (hasStoredCoverage && hasCompleteCoverage) {
+        const hasLiveFallbackCoverage = liveFallbackKeys.size > 0;
+        if ((hasStoredCoverage || hasLiveFallbackCoverage) && hasCompleteCoverage) {
           const orderedRollups =
             resolution.kind === "day"
               ? requiredKeys
@@ -1224,22 +1265,22 @@ export function createLcmRecentTool(input: {
           const liveSections: string[] = [];
           const liveSummaryIds: string[] = [];
           const liveSourceIds: string[] = [];
-          if (currentDayInWindow) {
+          for (const liveDayKey of liveFallbackKeys) {
             const currentStart = getUtcDateForZonedMidnight(
-              currentDayKey,
+              liveDayKey,
               timezone
             );
             const currentEnd = new Date(
               Math.min(
                 resolution.end.getTime(),
                 getUtcDateForZonedMidnight(
-                  addDays(currentDayKey, 1),
+                  addDays(liveDayKey, 1),
                   timezone
                 ).getTime()
               )
             );
             const live = renderFallbackRollupSection(
-              currentDayKey,
+              liveDayKey,
               getRecentSummaryFallback(db, conversationId, currentStart, currentEnd),
               timezone,
               budget,
@@ -1258,7 +1299,7 @@ export function createLcmRecentTool(input: {
               .join("\n\n");
           }
           tokenCount = estimateTokens(rollupContent);
-          status = combined.status;
+          status = orderedRollups.length > 0 ? combined.status : "fallback";
           sourceSummaryIds = [...combined.sourceSummaryIds, ...liveSummaryIds];
           sourceIds = [...combined.sourceSummaryIds, ...liveSourceIds];
         }
@@ -1344,6 +1385,9 @@ export function createLcmRecentTool(input: {
         )} — ${formatDisplayTime(resolution.end, timezone)}`
       );
       lines.push(`**Status:** ${status}`);
+      if (degradedReason) {
+        lines.push(`**Degraded:** ${degradedReason}`);
+      }
       lines.push("");
       lines.push(rollupContent.trim());
       lines.push("");
@@ -1362,6 +1406,7 @@ export function createLcmRecentTool(input: {
         details: {
           status,
           usedFallback,
+          degradedReason,
           tokenCount: response.tokenCount,
           truncated: response.truncated || truncated,
           summaryIds: includeSources ? sourceSummaryIds : [],
