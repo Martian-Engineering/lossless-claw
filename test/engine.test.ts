@@ -53,6 +53,8 @@ function createTestConfig(databasePath: string): LcmConfig {
     timezone: "UTC",
     pruneHeartbeatOk: false,
     transcriptGcEnabled: false,
+    rollupDebugEnabled: false,
+    observedWorkMaintenanceEnabled: false,
     proactiveThresholdCompactionMode: "deferred",
     summaryMaxOverageFactor: 3,
     customInstructions: "",
@@ -2159,6 +2161,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
   it("maintain() runs observed-work extraction without mutating density reads", async () => {
     const engine = createEngineWithConfig({
       transcriptGcEnabled: false,
+      observedWorkMaintenanceEnabled: true,
     });
     const sessionId = randomUUID();
     const sessionFile = createSessionFilePath("observed-work-maintenance");
@@ -2203,6 +2206,45 @@ describe("LcmContextEngine.ingest content extraction", () => {
       pendingRebuild: false,
       lastProcessedSummaryId: "sum_observed_maintenance",
     });
+  });
+
+  it("maintain() leaves observed-work extraction disabled unless opted in", async () => {
+    const engine = createEngineWithConfig({
+      transcriptGcEnabled: false,
+      observedWorkMaintenanceEnabled: false,
+    });
+    const sessionId = randomUUID();
+    const sessionFile = createSessionFilePath("observed-work-maintenance-disabled");
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed disabled observed work maintenance" }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_observed_maintenance_disabled",
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      content: "- Completed: PR #540 disabled maintenance should not extract",
+      tokenCount: 12,
+    });
+
+    await engine.maintain({
+      sessionId,
+      sessionFile,
+    });
+
+    const afterMaintain = engine.getObservedWorkStore().getDensity({
+      conversationId: conversation!.conversationId,
+      statuses: ["observed_completed"],
+      limit: 10,
+    });
+    expect(afterMaintain.density.completed).toBe(0);
+    expect(engine.getObservedWorkStore().getState(conversation!.conversationId)).toBeNull();
   });
 
   it("maintain() narrows rollup rebuild sweeps from the last check time", async () => {
