@@ -4752,7 +4752,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
     });
 
     // Should fall back to live context, not return the assistant-only DB context
-    expect(result.messages).toBe(liveMessages);
+    expect(result.messages).toEqual(liveMessages);
+    expect(result.messages).not.toBe(liveMessages);
     expect(result.estimatedTokens).toBe(0);
     expect(assemblyProvenance(result)).toMatchObject({
       promptAuthority: "assembled",

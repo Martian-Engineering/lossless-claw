@@ -6121,9 +6121,12 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
-      const summaryContextItemCount = contextItems.filter(
-        (item) => item.itemType === "summary",
-      ).length;
+      let summaryContextItemCount = 0;
+      for (const item of contextItems) {
+        if (item.itemType === "summary") {
+          summaryContextItemCount += 1;
+        }
+      }
       const rawContextItemCount = contextItems.length - summaryContextItemCount;
       const contextDiagnostics = {
         contextItemCount: contextItems.length,
@@ -6184,13 +6187,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: assembled context has no user turns, falling back to live context to prevent prefill errors conversation=${conversation.conversationId} ${sessionLabel} assembledMessages=${assembled.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return buildAssembleResult({
-          messages: params.messages,
-          estimatedTokens: 0,
-          mode: "live_fallback",
-          fallbackReason: "no_user_turn",
-          ...contextDiagnostics,
-        });
+        return safeFallback("no_user_turn", contextDiagnostics);
       }
 
       this.deps.log.info(
