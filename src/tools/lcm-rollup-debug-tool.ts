@@ -39,8 +39,15 @@ function getLcmRollupStore(lcm: LcmContextEngine): RollupStore {
   throw new Error("LCM rollup database is unavailable.");
 }
 
+function parseDbTimestamp(value: string): Date {
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)
+    ? `${value.replace(" ", "T")}Z`
+    : value;
+  return new Date(normalized);
+}
+
 function formatValue(value: string | null, timezone: string): string {
-  return value ? formatTimestamp(new Date(value), timezone) : "-";
+  return value ? formatTimestamp(parseDbTimestamp(value), timezone) : "-";
 }
 
 export function createLcmRollupDebugTool(input: {

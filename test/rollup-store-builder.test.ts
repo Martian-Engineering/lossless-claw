@@ -1944,6 +1944,17 @@ describe("LCM weekly and monthly rollups", () => {
       sessionId: "debug-source-hiding",
     });
 
+    rollupStore.upsertState(conversation.conversationId, {
+      timezone: "America/New_York",
+      last_message_at: "2026-04-27 10:00:00",
+    });
+    const timestamped = await tool.execute("debug-timestamp", {
+      periodKind: "day",
+    });
+    expect((timestamped.content[0] as { text: string }).text).toContain(
+      "last_message_at: 2026-04-27 06:00 EDT"
+    );
+
     const hidden = await tool.execute("debug-hidden", { periodKind: "day" });
     const hiddenText = (hidden.content[0] as { text: string }).text;
     expect(hiddenText).not.toContain("sum_debug_hidden");
