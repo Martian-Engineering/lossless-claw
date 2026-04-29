@@ -114,6 +114,54 @@ describe("ObservedWorkStore", () => {
     expect(pointLookupSpy).not.toHaveBeenCalled();
   });
 
+  it("derives the rowid cursor from the processed summary id after rowid drift", async () => {
+    const db = makeDb();
+    createConversation(db, 11);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 11,
+      summaryId: "sum_cursor_anchor",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #550 needs review",
+    });
+    expect(extractor.processConversation(11)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+    observedWork.upsertState({
+      conversationId: 11,
+      lastProcessedSummaryId: "sum_cursor_anchor",
+      lastProcessedSummaryRowid: 9999,
+    });
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 11,
+      summaryId: "sum_cursor_later",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #551 needs review",
+    });
+    expect(extractor.processConversation(11)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+    const density = observedWork.getDensity({
+      conversationId: 11,
+      statuses: ["observed_unfinished"],
+      limit: 10,
+    });
+    expect(density.topUnfinished.map((item) => item.topicKey).sort()).toEqual([
+      "pr-550",
+      "pr-551",
+    ]);
+  });
+
   it("preserves semantic evidence kinds when reinforcing extracted work", async () => {
     const db = makeDb();
     createConversation(db, 9);
