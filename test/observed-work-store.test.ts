@@ -157,6 +157,51 @@ describe("ObservedWorkStore", () => {
     ]);
   });
 
+  it("rolls back partial summary extraction writes before retry", async () => {
+    const db = makeDb();
+    createConversation(db, 13);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 13,
+      summaryId: "sum_partial_retry",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #553 still has partial write retry risk",
+    });
+
+    const addSourceSpy = vi.spyOn(observedWork, "addSource");
+    addSourceSpy.mockImplementationOnce(() => {
+      throw new Error("simulated source write failure");
+    });
+    expect(() => extractor.processConversation(13)).toThrow(/simulated source/);
+    addSourceSpy.mockRestore();
+
+    expect(
+      observedWork.getDensity({
+        conversationId: 13,
+        statuses: ["observed_unfinished"],
+      }).density.totalObserved
+    ).toBe(0);
+    expect(observedWork.getState(13)).toBeNull();
+
+    expect(extractor.processConversation(13)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+    const density = observedWork.getDensity({
+      conversationId: 13,
+      statuses: ["observed_unfinished"],
+      includeSources: true,
+    });
+    expect(density.topUnfinished).toHaveLength(1);
+    expect(density.topUnfinished[0]?.evidenceCount).toBe(1);
+    expect(density.topUnfinished[0]?.sources).toHaveLength(1);
+  });
+
   it("derives the rowid cursor from the processed summary id after rowid drift", async () => {
     const db = makeDb();
     createConversation(db, 11);
