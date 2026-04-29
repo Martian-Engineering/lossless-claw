@@ -72,6 +72,29 @@ const UNFINISHED_RE = /\b(todo|follow[- ]?up|needs?|remaining|blocked|blocker|fa
 const DECISION_RE = /\b(decision|decided|agreed|settled|approved|chose)\b/i;
 const AMBIGUOUS_RE = /\b(unclear|ambiguous|maybe|suspect|investigate|verify|question|unknown|possibly)\b/i;
 const EVENT_RE = /\b(first occurrence|original event|started|created|opened|reported|incident|restart|deploy|error|failed|merged|shipped|decision|retell|recalled|cortex|memory injection|imported|backfill|historical|echo)\b/i;
+const RESOLUTION_STOPWORDS = new Set([
+  "accepted",
+  "blocked",
+  "blocker",
+  "closed",
+  "completed",
+  "done",
+  "fixed",
+  "green",
+  "implemented",
+  "landed",
+  "merged",
+  "passed",
+  "pending",
+  "pr",
+  "pull",
+  "request",
+  "resolved",
+  "shipped",
+  "still",
+  "the",
+  "unresolved",
+]);
 
 function hashId(prefix: string, value: string): string {
   return `${prefix}_${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
@@ -120,6 +143,33 @@ function topicKeyFor(line: string, kind: ObservedWorkKind): string {
   }
   const fallback = slug(line);
   return fallback || kind;
+}
+
+function resolutionWords(value: string): Set<string> {
+  const words = normalizeSpace(value)
+    .toLowerCase()
+    .match(/[a-z0-9#]+/g) ?? [];
+  return new Set(
+    words.filter((word) => {
+      if (/^#?\d+$/.test(word)) return false;
+      if (RESOLUTION_STOPWORDS.has(word)) return false;
+      return word.length >= 3 || word === "ci";
+    }),
+  );
+}
+
+function hasResolutionOverlap(
+  activeItem: ObservedWorkItemSnapshot,
+  work: WorkCandidate,
+): boolean {
+  const activeWords = resolutionWords(activeItem.title);
+  const completedWords = resolutionWords(work.title);
+  for (const word of completedWords) {
+    if (activeWords.has(word)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function confidenceBand(confidence: number): "low" | "medium" | "medium-high" | "high" {
@@ -281,7 +331,8 @@ export class ObservedWorkExtractor {
               topicKey: work.topicKey,
               limit: 10,
             })
-            .filter((item) => item.workItemId !== workItemId);
+            .filter((item) => item.workItemId !== workItemId)
+            .filter((item) => hasResolutionOverlap(item, work));
           let handledByActiveTransition = false;
           if (activeItems.length > 0 && (work.completed || work.possiblyResolves)) {
             for (const activeItem of activeItems) {
