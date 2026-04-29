@@ -62,6 +62,7 @@ describe("ObservedWorkStore", () => {
       "lcm_observed_work_items",
       "lcm_observed_work_sources",
       "lcm_observed_work_state",
+      "lcm_observed_work_transitions",
     ]);
   });
 

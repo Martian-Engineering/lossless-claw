@@ -1225,6 +1225,49 @@ export function runLcmMigrations(
       `);
     });
 
+    runMigrationStep("ensureObservedWorkTransitionTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_transitions (
+          transition_id TEXT PRIMARY KEY,
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          transition_type TEXT NOT NULL CHECK (transition_type IN (
+            'opened',
+            'reinforced',
+            'possibly_resolved',
+            'resolved',
+            'dismissed',
+            'marked_stale'
+          )),
+          from_status TEXT CHECK (from_status IS NULL OR from_status IN (
+            'observed_completed',
+            'observed_unfinished',
+            'observed_ambiguous',
+            'decision_recorded',
+            'dismissed'
+          )),
+          to_status TEXT CHECK (to_status IS NULL OR to_status IN (
+            'observed_completed',
+            'observed_unfinished',
+            'observed_ambiguous',
+            'decision_recorded',
+            'dismissed'
+          )),
+          observed_at TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          rationale TEXT NOT NULL,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
+          source_id TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_transitions_item_time_idx
+          ON lcm_observed_work_transitions(work_item_id, observed_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_transitions_type_time_idx
+          ON lcm_observed_work_transitions(transition_type, observed_at DESC);
+      `);
+    });
+
     runMigrationStep("ensureTaskBridgeSuggestionTables", log, () => {
       db.exec(`
         CREATE TABLE IF NOT EXISTS lcm_task_bridge_suggestions (

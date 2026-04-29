@@ -41,7 +41,7 @@ const KIND_VALUES = [
 
 const LcmWorkDensitySchema = Type.Object({
   conversationId: Type.Optional(Type.Number({ description: "Conversation ID to inspect. Defaults to the current session conversation." })),
-  allConversations: Type.Optional(Type.Boolean({ description: "Explicitly inspect all conversations. Defaults to false." })),
+  allConversations: Type.Optional(Type.Boolean({ description: "Reserved for a future bounded admin mode; currently rejected so density reads stay conversation-scoped." })),
   period: Type.Optional(Type.String({ description: 'Observed work period: "today", "yesterday", "7d", "30d", "week", "month", or "date:YYYY-MM-DD". Explicit since/before wins when provided.' })),
   since: Type.Optional(Type.String({ description: "Only include observed items last seen at or after this ISO timestamp." })),
   before: Type.Optional(Type.String({ description: "Only include observed items first seen before this ISO timestamp." })),
@@ -49,6 +49,8 @@ const LcmWorkDensitySchema = Type.Object({
   statuses: Type.Optional(Type.Array(Type.String({ enum: [...STATUS_VALUES] }), { description: "Observed statuses to include." })),
   kinds: Type.Optional(Type.Array(Type.String({ enum: [...KIND_VALUES] }), { description: "Observed work kinds to include." })),
   includeSources: Type.Optional(Type.Boolean({ description: "Include observed-work source IDs. Defaults to false." })),
+  includeTransitions: Type.Optional(Type.Boolean({ description: "Include observed open/reinforced/resolved transition records for returned items. Defaults to false." })),
+  staleAfterDays: Type.Optional(Type.Number({ description: "Also report unfinished/ambiguous items not reinforced for this many days.", minimum: 1, maximum: 365 })),
   detailLevel: Type.Optional(Type.Number({ description: "0 = compact counts only; values above 0 include the bounded top item sections. Default 1.", minimum: 0, maximum: 2 })),
   maxOutputTokens: Type.Optional(Type.Number({ description: "Soft output budget hint for future truncation/accounting.", minimum: 256 })),
   minConfidence: Type.Optional(Type.Number({ description: "Minimum observed confidence to include.", minimum: 0, maximum: 1 })),
@@ -202,6 +204,10 @@ export function createLcmWorkDensityTool(input: {
       const minConfidence = typeof p.minConfidence === "number" ? p.minConfidence : undefined;
       const store = lcm.getObservedWorkStore();
       const includeSources = p.includeSources === true;
+      const includeTransitions = p.includeTransitions === true;
+      const staleAfterDays = typeof p.staleAfterDays === "number"
+        ? Math.trunc(p.staleAfterDays)
+        : undefined;
       const result = store.getDensity({
         conversationId: scope.conversationId,
         since,
@@ -211,6 +217,8 @@ export function createLcmWorkDensityTool(input: {
         topic,
         minConfidence,
         includeSources,
+        includeTransitions,
+        staleAfterDays,
         limit,
       });
       const compact = detailLevel <= 0;
@@ -227,12 +235,15 @@ export function createLcmWorkDensityTool(input: {
               ambiguous: result.ambiguous,
               decisions: result.decisions,
               dismissedItems: result.dismissedItems,
+              ...(result.staleItems ? { staleItems: result.staleItems } : {}),
+              ...(result.transitions ? { transitions: result.transitions } : {}),
             }),
         accounting: {
           itemsIncluded: result.itemsIncluded,
           itemsOmitted: result.itemsOmitted,
           truncated: result.itemsOmitted > 0,
           maxOutputTokens: typeof p.maxOutputTokens === "number" ? p.maxOutputTokens : undefined,
+          staleAfterDays,
         },
         confidence: "observed-unrefined",
         disclaimer: "Observed from LCM evidence; not authoritative task state.",

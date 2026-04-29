@@ -54,6 +54,8 @@ export type ObservedWorkDensityQuery = {
   topic?: string;
   minConfidence?: number;
   includeSources?: boolean;
+  includeTransitions?: boolean;
+  staleAfterDays?: number;
   limit?: number;
 };
 
@@ -68,11 +70,37 @@ export type ObservedWorkProcessingState = {
 
 export type ObservedWorkItemSnapshot = {
   workItemId: string;
+  conversationId: number;
   observedStatus: ObservedWorkStatus;
+  kind: ObservedWorkKind;
+  title: string;
+  topicKey?: string;
+  rationale?: string;
   confidence: number;
   firstSeenAt: string;
   lastSeenAt: string;
   evidenceCount: number;
+};
+
+export type ObservedWorkTransitionType =
+  | "opened"
+  | "reinforced"
+  | "possibly_resolved"
+  | "resolved"
+  | "dismissed"
+  | "marked_stale";
+
+export type ObservedWorkTransition = {
+  transitionId: string;
+  workItemId: string;
+  transitionType: ObservedWorkTransitionType;
+  fromStatus?: ObservedWorkStatus;
+  toStatus?: ObservedWorkStatus;
+  observedAt: string;
+  confidence: number;
+  rationale: string;
+  sourceType: "summary" | "rollup" | "message";
+  sourceId: string;
 };
 
 type ObservedWorkRow = {
@@ -102,7 +130,12 @@ type ObservedWorkStateRow = {
 
 type ObservedWorkItemSnapshotRow = {
   work_item_id: string;
+  conversation_id: number;
   observed_status: ObservedWorkStatus;
+  kind: ObservedWorkKind;
+  title: string;
+  topic_key: string | null;
+  rationale: string | null;
   confidence: number;
   first_seen_at: string;
   last_seen_at: string;
@@ -130,6 +163,19 @@ type ObservedWorkSourceRow = {
     | "completed"
     | "contradicted"
     | "dismissed";
+};
+
+type ObservedWorkTransitionRow = {
+  transition_id: string;
+  work_item_id: string;
+  transition_type: ObservedWorkTransitionType;
+  from_status: ObservedWorkStatus | null;
+  to_status: ObservedWorkStatus | null;
+  observed_at: string;
+  confidence: number;
+  rationale: string;
+  source_type: "summary" | "rollup" | "message";
+  source_id: string;
 };
 
 export type ObservedWorkSource = {
@@ -176,6 +222,8 @@ export type ObservedWorkDensityResult = {
   ambiguous: ObservedWorkDensityItem[];
   decisions: ObservedWorkDensityItem[];
   dismissedItems: ObservedWorkDensityItem[];
+  staleItems?: ObservedWorkDensityItem[];
+  transitions?: ObservedWorkTransition[];
   itemsIncluded: number;
   itemsOmitted: number;
 };
@@ -204,6 +252,21 @@ function rowToItem(
   };
 }
 
+function rowToTransition(row: ObservedWorkTransitionRow): ObservedWorkTransition {
+  return {
+    transitionId: row.transition_id,
+    workItemId: row.work_item_id,
+    transitionType: row.transition_type,
+    ...(row.from_status ? { fromStatus: row.from_status } : {}),
+    ...(row.to_status ? { toStatus: row.to_status } : {}),
+    observedAt: row.observed_at,
+    confidence: row.confidence,
+    rationale: row.rationale,
+    sourceType: row.source_type,
+    sourceId: row.source_id,
+  };
+}
+
 function placeholders(values: readonly unknown[]): string {
   return values.map(() => "?").join(", ");
 }
@@ -213,7 +276,8 @@ export class ObservedWorkStore {
 
   getItem(workItemId: string): ObservedWorkItemSnapshot | null {
     const row = this.db.prepare(
-      `SELECT work_item_id, observed_status, confidence, first_seen_at, last_seen_at, evidence_count
+      `SELECT work_item_id, conversation_id, observed_status, kind, title, topic_key, rationale,
+              confidence, first_seen_at, last_seen_at, evidence_count
        FROM lcm_observed_work_items
        WHERE work_item_id = ?`,
     ).get(workItemId) as ObservedWorkItemSnapshotRow | undefined;
@@ -222,12 +286,48 @@ export class ObservedWorkStore {
     }
     return {
       workItemId: row.work_item_id,
+      conversationId: row.conversation_id,
       observedStatus: row.observed_status,
+      kind: row.kind,
+      title: row.title,
+      ...(row.topic_key ? { topicKey: row.topic_key } : {}),
+      ...(row.rationale ? { rationale: row.rationale } : {}),
       confidence: row.confidence,
       firstSeenAt: row.first_seen_at,
       lastSeenAt: row.last_seen_at,
       evidenceCount: row.evidence_count,
     };
+  }
+
+  findActiveItemsByTopic(input: {
+    conversationId: number;
+    topicKey: string;
+    limit?: number;
+  }): ObservedWorkItemSnapshot[] {
+    const limit = Math.max(1, Math.min(input.limit ?? 10, 50));
+    const rows = this.db.prepare(
+      `SELECT work_item_id, conversation_id, observed_status, kind, title, topic_key, rationale,
+              confidence, first_seen_at, last_seen_at, evidence_count
+       FROM lcm_observed_work_items
+       WHERE conversation_id = ?
+         AND topic_key = ?
+         AND observed_status IN ('observed_unfinished', 'observed_ambiguous')
+       ORDER BY last_seen_at DESC, confidence DESC
+       LIMIT ?`,
+    ).all(input.conversationId, input.topicKey, limit) as ObservedWorkItemSnapshotRow[];
+    return rows.map((row) => ({
+      workItemId: row.work_item_id,
+      conversationId: row.conversation_id,
+      observedStatus: row.observed_status,
+      kind: row.kind,
+      title: row.title,
+      ...(row.topic_key ? { topicKey: row.topic_key } : {}),
+      ...(row.rationale ? { rationale: row.rationale } : {}),
+      confidence: row.confidence,
+      firstSeenAt: row.first_seen_at,
+      lastSeenAt: row.last_seen_at,
+      evidenceCount: row.evidence_count,
+    }));
   }
 
   upsertItem(item: ObservedWorkItemInput): void {
@@ -340,6 +440,79 @@ export class ObservedWorkStore {
        LIMIT 1`,
     ).get(input.workItemId, input.sourceType, input.sourceId);
     return row != null;
+  }
+
+  updateItemObservation(input: {
+    workItemId: string;
+    observedStatus: ObservedWorkStatus;
+    confidence: number;
+    confidenceBand: "low" | "medium" | "medium-high" | "high";
+    lastSeenAt: string;
+    completedAt?: string;
+    completionConfidence?: number;
+    rationale?: string;
+    evidenceIncrement?: number;
+  }): void {
+    this.db.prepare(
+      `UPDATE lcm_observed_work_items
+       SET observed_status = CASE
+             WHEN observed_status = 'observed_completed' AND ? != 'observed_completed'
+               THEN observed_status
+             ELSE ?
+           END,
+           confidence = max(confidence, ?),
+           confidence_band = ?,
+           last_seen_at = ?,
+           completed_at = CASE WHEN ? IS NOT NULL THEN ? ELSE completed_at END,
+           completion_confidence = COALESCE(?, completion_confidence),
+           rationale = COALESCE(?, rationale),
+           evidence_count = evidence_count + ?,
+           updated_at = datetime('now')
+       WHERE work_item_id = ?`,
+    ).run(
+      input.observedStatus,
+      input.observedStatus,
+      input.confidence,
+      input.confidenceBand,
+      input.lastSeenAt,
+      input.completedAt ?? null,
+      input.completedAt ?? null,
+      input.completionConfidence ?? null,
+      input.rationale ?? null,
+      input.evidenceIncrement ?? 1,
+      input.workItemId,
+    );
+  }
+
+  addTransition(input: {
+    transitionId: string;
+    workItemId: string;
+    transitionType: ObservedWorkTransitionType;
+    fromStatus?: ObservedWorkStatus;
+    toStatus?: ObservedWorkStatus;
+    observedAt: string;
+    confidence: number;
+    rationale: string;
+    sourceType: "summary" | "rollup" | "message";
+    sourceId: string;
+  }): void {
+    this.db.prepare(
+      `INSERT OR IGNORE INTO lcm_observed_work_transitions (
+        transition_id, work_item_id, transition_type, from_status, to_status,
+        observed_at, confidence, rationale, source_type, source_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.transitionId,
+      input.workItemId,
+      input.transitionType,
+      input.fromStatus ?? null,
+      input.toStatus ?? null,
+      input.observedAt,
+      input.confidence,
+      input.rationale,
+      input.sourceType,
+      input.sourceId,
+    );
   }
 
   upsertState(input: {
@@ -494,16 +667,26 @@ export class ObservedWorkStore {
     const ambiguousRows = getRowsForStatus("observed_ambiguous", ambiguousLimit);
     const decisionRows = getRowsForStatus("decision_recorded", limit);
     const dismissedRows = getRowsForStatus("dismissed", limit);
+    const staleRows = this.getStaleRows(
+      where,
+      args,
+      Math.min(limit, 10),
+      query.staleAfterDays,
+    );
     const includedRows = [
       ...unfinishedRows,
       ...completedRows,
       ...ambiguousRows,
       ...decisionRows,
       ...dismissedRows,
+      ...staleRows,
     ];
     const includedIds = new Set<string>(includedRows.map((row) => row.work_item_id));
     const sourcesByWorkItemId = query.includeSources
       ? this.getSourcesForWorkItems([...includedIds])
+      : undefined;
+    const transitions = query.includeTransitions
+      ? this.getTransitionsForWorkItems([...includedIds])
       : undefined;
     return {
       density: {
@@ -519,9 +702,56 @@ export class ObservedWorkStore {
       ambiguous: ambiguousRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
       decisions: decisionRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
       dismissedItems: dismissedRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
+      ...(query.staleAfterDays != null
+        ? {
+            staleItems: staleRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
+          }
+        : {}),
+      ...(transitions ? { transitions } : {}),
       itemsIncluded: includedIds.size,
       itemsOmitted: Math.max(0, (counts.total_observed ?? 0) - includedIds.size),
     };
+  }
+
+  private getStaleRows(
+    where: string[],
+    args: unknown[],
+    limit: number,
+    staleAfterDays: number | undefined,
+  ): ObservedWorkRow[] {
+    if (staleAfterDays == null || limit <= 0) {
+      return [];
+    }
+    const days = Math.max(1, Math.min(Math.trunc(staleAfterDays), 365));
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const staleWhere = [
+      ...where,
+      "observed_status IN ('observed_unfinished', 'observed_ambiguous')",
+      "julianday(last_seen_at) < julianday(?)",
+    ];
+    return this.db.prepare(
+      `SELECT work_item_id, conversation_id, title, observed_status, kind, confidence,
+              confidence_band, rationale, topic_key, first_seen_at, last_seen_at,
+              completed_at, evidence_count
+       FROM lcm_observed_work_items
+       WHERE ${staleWhere.join(" AND ")}
+       ORDER BY last_seen_at ASC, confidence DESC
+       LIMIT ?`,
+    ).all(...args, cutoff, limit) as ObservedWorkRow[];
+  }
+
+  private getTransitionsForWorkItems(workItemIds: string[]): ObservedWorkTransition[] {
+    if (workItemIds.length === 0) {
+      return [];
+    }
+    const rows = this.db.prepare(
+      `SELECT transition_id, work_item_id, transition_type, from_status, to_status,
+              observed_at, confidence, rationale, source_type, source_id
+       FROM lcm_observed_work_transitions
+       WHERE work_item_id IN (${placeholders(workItemIds)})
+       ORDER BY observed_at DESC, created_at DESC`,
+    ).all(...workItemIds) as ObservedWorkTransitionRow[];
+    return rows.map(rowToTransition);
   }
 
   private getSourcesForWorkItems(

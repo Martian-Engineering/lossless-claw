@@ -39,6 +39,7 @@ type WorkCandidate = {
   topicKey: string;
   rationale: string;
   completed: boolean;
+  possiblyResolves: boolean;
 };
 
 type EventCandidate = {
@@ -159,7 +160,9 @@ function classifyWork(line: string): WorkCandidate | null {
     return null;
   }
   let observedStatus: ObservedWorkStatus = "observed_ambiguous";
-  if (hasDecision && !hasUnfinished && !hasAmbiguous) {
+  if (hasAmbiguous && (hasCompleted || hasUnfinished)) {
+    observedStatus = "observed_ambiguous";
+  } else if (hasDecision && !hasUnfinished && !hasAmbiguous) {
     observedStatus = "decision_recorded";
   } else if (hasUnfinished) {
     observedStatus = "observed_unfinished";
@@ -193,6 +196,7 @@ function classifyWork(line: string): WorkCandidate | null {
     topicKey: topicKeyFor(line, kind),
     rationale: `Deterministic LCM extraction from a leaf summary line: ${truncate(line, 220)}`,
     completed: observedStatus === "observed_completed",
+    possiblyResolves: hasCompleted && observedStatus === "observed_ambiguous",
   };
 }
 
@@ -271,6 +275,76 @@ export class ObservedWorkExtractor {
         if (work) {
           const fingerprint = `${conversationId}:${work.kind}:${work.topicKey}:${slug(work.title)}`;
           const workItemId = hashId("ow", fingerprint);
+          const activeItems = this.observedWorkStore
+            .findActiveItemsByTopic({
+              conversationId,
+              topicKey: work.topicKey,
+              limit: 10,
+            })
+            .filter((item) => item.workItemId !== workItemId);
+          let handledByActiveTransition = false;
+          if (activeItems.length > 0 && (work.completed || work.possiblyResolves)) {
+            for (const activeItem of activeItems) {
+              if (work.completed && work.confidence >= 0.75) {
+                this.observedWorkStore.updateItemObservation({
+                  workItemId: activeItem.workItemId,
+                  observedStatus: "observed_completed",
+                  confidence: work.confidence,
+                  confidenceBand: confidenceBand(work.confidence),
+                  lastSeenAt: observedAt,
+                  completedAt: observedAt,
+                  completionConfidence: work.confidence,
+                  rationale: `Resolved by later observed evidence: ${truncate(line, 220)}`,
+                  evidenceIncrement: 1,
+                });
+                this.observedWorkStore.addSource({
+                  workItemId: activeItem.workItemId,
+                  sourceType: "summary",
+                  sourceId: row.summary_id,
+                  ordinal,
+                  evidenceKind: "completed",
+                });
+                this.observedWorkStore.addTransition({
+                  transitionId: hashId("owt", `${activeItem.workItemId}:${row.summary_id}:${ordinal}:resolved`),
+                  workItemId: activeItem.workItemId,
+                  transitionType: "resolved",
+                  fromStatus: activeItem.observedStatus,
+                  toStatus: "observed_completed",
+                  observedAt,
+                  confidence: work.confidence,
+                  rationale: `High-confidence observed resolution from leaf summary: ${truncate(line, 220)}`,
+                  sourceType: "summary",
+                  sourceId: row.summary_id,
+                });
+                workItemsUpserted += 1;
+              } else {
+                this.observedWorkStore.addSource({
+                  workItemId: activeItem.workItemId,
+                  sourceType: "summary",
+                  sourceId: row.summary_id,
+                  ordinal,
+                  evidenceKind: "possible_completion",
+                });
+                this.observedWorkStore.addTransition({
+                  transitionId: hashId("owt", `${activeItem.workItemId}:${row.summary_id}:${ordinal}:possibly_resolved`),
+                  workItemId: activeItem.workItemId,
+                  transitionType: "possibly_resolved",
+                  fromStatus: activeItem.observedStatus,
+                  toStatus: activeItem.observedStatus,
+                  observedAt,
+                  confidence: work.confidence,
+                  rationale: `Ambiguous possible resolution left unresolved: ${truncate(line, 220)}`,
+                  sourceType: "summary",
+                  sourceId: row.summary_id,
+                });
+              }
+              handledByActiveTransition = true;
+            }
+          }
+          if (handledByActiveTransition) {
+            ordinal += 1;
+            continue;
+          }
           entries.push({
             row,
             observedAt,
@@ -373,6 +447,23 @@ export class ObservedWorkExtractor {
               sourceId: entry.row.summary_id,
               ordinal: entry.ordinal,
               evidenceKind: evidenceKindFor(existing, entry.work),
+            });
+            this.observedWorkStore.addTransition({
+              transitionId: hashId(
+                "owt",
+                `${entry.workItemId}:${entry.row.summary_id}:${entry.ordinal}:${existing ? "reinforced" : "opened"}`,
+              ),
+              workItemId: entry.workItemId,
+              transitionType: existing ? "reinforced" : "opened",
+              fromStatus: existing?.observedStatus,
+              toStatus: entry.work.observedStatus,
+              observedAt: entry.observedAt,
+              confidence,
+              rationale: existing
+                ? `Observed evidence reinforced this item: ${truncate(entry.work.title, 220)}`
+                : `Observed evidence opened this item: ${truncate(entry.work.title, 220)}`,
+              sourceType: "summary",
+              sourceId: entry.row.summary_id,
             });
           }
           existingByWorkItemId.set(entry.workItemId, {

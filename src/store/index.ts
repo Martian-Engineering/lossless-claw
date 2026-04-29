@@ -43,9 +43,31 @@ export type {
   ConversationCompactionMaintenanceRecord,
 } from "./compaction-maintenance-store.js";
 
+export { ObservedWorkStore } from "./observed-work-store.js";
+export type {
+  ObservedWorkDensityItem,
+  ObservedWorkDensityQuery,
+  ObservedWorkDensityResult,
+  ObservedWorkItemInput,
+  ObservedWorkKind,
+  ObservedWorkProcessingState,
+  ObservedWorkSource,
+  ObservedWorkStatus,
+  ObservedWorkTransition,
+  ObservedWorkTransitionType,
+} from "./observed-work-store.js";
+
 export { EventObservationStore } from "./event-observation-store.js";
 export type {
   EventObservation,
   EventObservationInput,
   EventObservationKind,
 } from "./event-observation-store.js";
+
+export { TaskBridgeSuggestionStore } from "./task-bridge-suggestion-store.js";
+export type {
+  TaskBridgeSuggestion,
+  TaskBridgeSuggestionInput,
+  TaskBridgeSuggestionKind,
+  TaskBridgeSuggestionStatus,
+} from "./task-bridge-suggestion-store.js";
