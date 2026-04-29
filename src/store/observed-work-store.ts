@@ -109,6 +109,15 @@ type ObservedWorkItemSnapshotRow = {
   evidence_count: number;
 };
 
+type ObservedWorkDensityCountRow = {
+  total_observed: number;
+  completed: number | null;
+  unfinished: number | null;
+  ambiguous: number | null;
+  dismissed: number | null;
+  decision_recorded: number | null;
+};
+
 type ObservedWorkSourceRow = {
   work_item_id: string;
   source_type: "summary" | "rollup" | "message";
@@ -230,17 +239,39 @@ export class ObservedWorkStore {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(work_item_id) DO UPDATE SET
         conversation_id = excluded.conversation_id,
+        owner_id = excluded.owner_id,
         title = excluded.title,
+        description = excluded.description,
         observed_status = excluded.observed_status,
         kind = excluded.kind,
         confidence = excluded.confidence,
         confidence_band = excluded.confidence_band,
         rationale = excluded.rationale,
         topic_key = excluded.topic_key,
-        first_seen_at = excluded.first_seen_at,
-        last_seen_at = excluded.last_seen_at,
-        completed_at = excluded.completed_at,
-        completion_confidence = excluded.completion_confidence,
+        first_seen_at = CASE
+          WHEN julianday(excluded.first_seen_at) < julianday(lcm_observed_work_items.first_seen_at)
+            THEN excluded.first_seen_at
+          ELSE lcm_observed_work_items.first_seen_at
+        END,
+        last_seen_at = CASE
+          WHEN julianday(excluded.last_seen_at) > julianday(lcm_observed_work_items.last_seen_at)
+            THEN excluded.last_seen_at
+          ELSE lcm_observed_work_items.last_seen_at
+        END,
+        completed_at = CASE
+          WHEN lcm_observed_work_items.completed_at IS NULL THEN excluded.completed_at
+          WHEN excluded.completed_at IS NULL THEN lcm_observed_work_items.completed_at
+          WHEN julianday(excluded.completed_at) < julianday(lcm_observed_work_items.completed_at)
+            THEN excluded.completed_at
+          ELSE lcm_observed_work_items.completed_at
+        END,
+        completion_confidence = CASE
+          WHEN excluded.completion_confidence IS NULL THEN lcm_observed_work_items.completion_confidence
+          WHEN lcm_observed_work_items.completion_confidence IS NULL THEN excluded.completion_confidence
+          WHEN excluded.completion_confidence > lcm_observed_work_items.completion_confidence
+            THEN excluded.completion_confidence
+          ELSE lcm_observed_work_items.completion_confidence
+        END,
         evidence_count = excluded.evidence_count,
         source_message_count = excluded.source_message_count,
         source_token_count = excluded.source_token_count,
@@ -285,9 +316,11 @@ export class ObservedWorkStore {
     evidenceKind: "created" | "reinforced" | "possible_completion" | "completed" | "contradicted" | "dismissed";
   }): void {
     this.db.prepare(
-      `INSERT OR IGNORE INTO lcm_observed_work_sources (
+      `INSERT INTO lcm_observed_work_sources (
         work_item_id, source_type, source_id, ordinal, evidence_kind
-      ) VALUES (?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(work_item_id, source_type, source_id, evidence_kind) DO UPDATE SET
+        ordinal = excluded.ordinal`,
     ).run(input.workItemId, input.sourceType, input.sourceId, input.ordinal, input.evidenceKind);
   }
 
@@ -394,48 +427,66 @@ export class ObservedWorkStore {
       args.push(query.minConfidence);
     }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    const rows = this.db.prepare(
-      `SELECT work_item_id, conversation_id, title, observed_status, kind, confidence,
-              confidence_band, rationale, topic_key, first_seen_at, last_seen_at,
-              completed_at, evidence_count
-       FROM lcm_observed_work_items
-       ${whereSql}
-       ORDER BY last_seen_at DESC, confidence DESC`,
-    ).all(...args) as ObservedWorkRow[];
     const limit = Math.max(1, Math.min(query.limit ?? 10, 50));
+    const ambiguousLimit = Math.min(limit, 10);
+    const counts = this.db.prepare(
+      `SELECT
+         COUNT(*) AS total_observed,
+         SUM(CASE WHEN observed_status = 'observed_completed' THEN 1 ELSE 0 END) AS completed,
+         SUM(CASE WHEN observed_status = 'observed_unfinished' THEN 1 ELSE 0 END) AS unfinished,
+         SUM(CASE WHEN observed_status = 'observed_ambiguous' THEN 1 ELSE 0 END) AS ambiguous,
+         SUM(CASE WHEN observed_status = 'dismissed' THEN 1 ELSE 0 END) AS dismissed,
+         SUM(CASE WHEN observed_status = 'decision_recorded' THEN 1 ELSE 0 END) AS decision_recorded
+       FROM lcm_observed_work_items
+       ${whereSql}`,
+    ).get(...args) as ObservedWorkDensityCountRow;
+
+    const statusAllowed = (status: ObservedWorkStatus): boolean =>
+      !query.statuses?.length || query.statuses.includes(status);
+    const getRowsForStatus = (
+      status: ObservedWorkStatus,
+      statusLimit: number,
+    ): ObservedWorkRow[] => {
+      if (!statusAllowed(status) || statusLimit <= 0) {
+        return [];
+      }
+      const statusWhereSql =
+        where.length > 0
+          ? `WHERE ${where.join(" AND ")} AND observed_status = ?`
+          : "WHERE observed_status = ?";
+      return this.db.prepare(
+        `SELECT work_item_id, conversation_id, title, observed_status, kind, confidence,
+                confidence_band, rationale, topic_key, first_seen_at, last_seen_at,
+                completed_at, evidence_count
+         FROM lcm_observed_work_items
+         ${statusWhereSql}
+         ORDER BY last_seen_at DESC, confidence DESC
+         LIMIT ?`,
+      ).all(...args, status, statusLimit) as ObservedWorkRow[];
+    };
+
+    const unfinishedRows = getRowsForStatus("observed_unfinished", limit);
+    const completedRows = getRowsForStatus("observed_completed", limit);
+    const ambiguousRows = getRowsForStatus("observed_ambiguous", ambiguousLimit);
+    const includedRows = [...unfinishedRows, ...completedRows, ...ambiguousRows];
+    const includedIds = new Set<string>(includedRows.map((row) => row.work_item_id));
     const sourcesByWorkItemId = query.includeSources
-      ? this.getSourcesForWorkItems(rows.map((row) => row.work_item_id))
+      ? this.getSourcesForWorkItems([...includedIds])
       : undefined;
-    const completedRows = rows.filter((row) => row.observed_status === "observed_completed");
-    const unfinishedRows = rows.filter((row) => row.observed_status === "observed_unfinished");
-    const ambiguousRows = rows.filter((row) => row.observed_status === "observed_ambiguous");
-    const includedIds = new Set<string>(
-      [
-        ...unfinishedRows.slice(0, limit),
-        ...completedRows.slice(0, limit),
-        ...ambiguousRows.slice(0, Math.min(limit, 10)),
-      ].map((row) => row.work_item_id)
-    );
     return {
       density: {
-        totalObserved: rows.length,
-        completed: completedRows.length,
-        unfinished: unfinishedRows.length,
-        ambiguous: ambiguousRows.length,
-        dismissed: rows.filter((row) => row.observed_status === "dismissed").length,
-        decisionRecorded: rows.filter((row) => row.observed_status === "decision_recorded").length,
+        totalObserved: counts.total_observed ?? 0,
+        completed: counts.completed ?? 0,
+        unfinished: counts.unfinished ?? 0,
+        ambiguous: counts.ambiguous ?? 0,
+        dismissed: counts.dismissed ?? 0,
+        decisionRecorded: counts.decision_recorded ?? 0,
       },
-      topUnfinished: unfinishedRows
-        .slice(0, limit)
-        .map((row) => rowToItem(row, sourcesByWorkItemId)),
-      completedHighlights: completedRows
-        .slice(0, limit)
-        .map((row) => rowToItem(row, sourcesByWorkItemId)),
-      ambiguous: ambiguousRows
-        .slice(0, Math.min(limit, 10))
-        .map((row) => rowToItem(row, sourcesByWorkItemId)),
+      topUnfinished: unfinishedRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
+      completedHighlights: completedRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
+      ambiguous: ambiguousRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
       itemsIncluded: includedIds.size,
-      itemsOmitted: Math.max(0, rows.length - includedIds.size),
+      itemsOmitted: Math.max(0, (counts.total_observed ?? 0) - includedIds.size),
     };
   }
 
