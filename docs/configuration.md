@@ -46,6 +46,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "timezone": "America/Los_Angeles",
   "pruneHeartbeatOk": false,
   "transcriptGcEnabled": false,
+  "observedWorkMaintenanceEnabled": false,
   "maxAssemblyTokenBudget": 30000,
   "summaryMaxOverageFactor": 3,
   "customInstructions": "",
@@ -114,6 +115,7 @@ openclaw plugins install --link /path/to/lossless-claw
 | `pruneHeartbeatOk` | `boolean` | `false` | `LCM_PRUNE_HEARTBEAT_OK` | Retroactively removes `HEARTBEAT_OK` turn cycles from persisted storage. |
 | `transcriptGcEnabled` | `boolean` | `false` | `LCM_TRANSCRIPT_GC_ENABLED` | Enables transcript rewrite GC during `maintain()`; disabled by default so transcript rewrites stay opt-in. |
 | `rollupDebugEnabled` | `boolean` | `false` | `LCM_ROLLUP_DEBUG_ENABLED` | Registers the operator-facing `lcm_rollup_debug` inspection tool. |
+| `observedWorkMaintenanceEnabled` | `boolean` | `false` | `LCM_OBSERVED_WORK_MAINTENANCE_ENABLED` | Allows `maintain()` to run observed-work and event extraction over LCM summaries; disabled by default so evidence-derived write paths stay explicit. |
 | `taskBridgeToolsEnabled` | `boolean` | `false` | `LCM_TASK_BRIDGE_TOOLS_ENABLED` | Registers opt-in suggestion-ledger task bridge tools. These tools only write LCM suggestion rows and do not write OpenClaw tasks. |
 | `proactiveThresholdCompactionMode` | `"deferred" \| "inline"` | `"deferred"` | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | Controls whether proactive threshold compaction is deferred into maintenance debt by default or run inline for legacy behavior. |
 

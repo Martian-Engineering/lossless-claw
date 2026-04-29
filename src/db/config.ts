@@ -95,6 +95,8 @@ export type LcmConfig = {
   transcriptGcEnabled: boolean;
   /** When true, register the operator-facing lcm_rollup_debug tool. */
   rollupDebugEnabled: boolean;
+  /** When true, maintain() may run observed-work and event extraction over summaries. */
+  observedWorkMaintenanceEnabled: boolean;
   /** When true, register suggestion-ledger task bridge tools. External task writes remain forbidden. */
   taskBridgeToolsEnabled: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
@@ -434,6 +436,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_ROLLUP_DEBUG_ENABLED !== undefined
           ? env.LCM_ROLLUP_DEBUG_ENABLED === "true"
           : toBool(pc.rollupDebugEnabled) ?? false,
+      observedWorkMaintenanceEnabled:
+        env.LCM_OBSERVED_WORK_MAINTENANCE_ENABLED !== undefined
+          ? env.LCM_OBSERVED_WORK_MAINTENANCE_ENABLED === "true"
+          : toBool(pc.observedWorkMaintenanceEnabled) ?? false,
       taskBridgeToolsEnabled:
         env.LCM_TASK_BRIDGE_TOOLS_ENABLED !== undefined
           ? env.LCM_TASK_BRIDGE_TOOLS_ENABLED === "true"

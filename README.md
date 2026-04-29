@@ -142,6 +142,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
             "agent:*:cron:**"
           ],
           "transcriptGcEnabled": false,
+          "observedWorkMaintenanceEnabled": false,
           "proactiveThresholdCompactionMode": "deferred",
           "summaryModel": "openai/gpt-5.4-mini",
           "expansionModel": "openai/gpt-5.4-mini",
@@ -237,6 +238,7 @@ Plugin config equivalents:
 - `statelessSessionPatterns`
 - `skipStatelessSessions`
 - `transcriptGcEnabled`
+- `observedWorkMaintenanceEnabled`
 - `newSessionRetainDepth`
 - `summaryModel`
 - `summaryProvider`
