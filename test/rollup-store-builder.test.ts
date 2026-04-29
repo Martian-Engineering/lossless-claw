@@ -716,6 +716,95 @@ describe("LCM sub-day window retrieval", () => {
     ]);
   });
 
+  it("includes unsummarized raw messages in bounded fallback without treating them as summary IDs", async () => {
+    const { db, conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "raw-message-fallback",
+      sessionKey: "agent:main:raw-message-fallback",
+      title: "Raw message fallback",
+    });
+
+    const summarizedMessage = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "This raw message is already covered by a leaf summary.",
+      tokenCount: 12,
+    });
+    const rawMessage = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 2,
+      role: "assistant",
+      content:
+        "Unsummarized raw note: restored the Lexar worktree before the audit.",
+      tokenCount: 14,
+    });
+    db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?").run(
+      "2026-04-27T10:00:00.000Z",
+      summarizedMessage.messageId
+    );
+    db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?").run(
+      "2026-04-27T10:15:00.000Z",
+      rawMessage.messageId
+    );
+    await summaryStore.insertSummary({
+      summaryId: "sum_covers_raw_message",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Leaf summary for the already summarized raw message.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 12,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:05:00.000Z"),
+    });
+    await summaryStore.linkSummaryToMessages("sum_covers_raw_message", [
+      summarizedMessage.messageId,
+    ]);
+
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: makeLcmForConversation({
+        conversationId: conversation.conversationId,
+        rollupStore,
+        sessionId: "raw-message-fallback",
+      }) as never,
+      sessionId: "raw-message-fallback",
+    });
+
+    const result = await tool.execute("call-raw-message-fallback", {
+      period: "date:2026-04-27 10:10-10:30",
+      includeSources: true,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    const details = result.details as {
+      summaryIds?: string[];
+      sourceIds?: string[];
+      totalMatches?: number;
+    };
+
+    expect(text).toContain("Unsummarized raw note");
+    expect(text).toContain(`message:${rawMessage.messageId}`);
+    expect(text).not.toContain("already covered by a leaf summary");
+    expect(details.summaryIds).toEqual([]);
+    expect(details.sourceIds).toEqual([`message:${rawMessage.messageId}`]);
+    expect(details.totalMatches).toBe(1);
+
+    const hidden = await tool.execute("call-hidden-raw-message-fallback", {
+      period: "date:2026-04-27 10:10-10:30",
+      includeSources: false,
+    });
+    const hiddenText = (hidden.content[0] as { text: string }).text;
+    const hiddenDetails = hidden.details as {
+      summaryIds?: string[];
+      sourceIds?: string[];
+    };
+    expect(hiddenText).toContain("Unsummarized raw note");
+    expect(hiddenText).not.toContain(`message:${rawMessage.messageId}`);
+    expect(hiddenDetails.summaryIds).toEqual([]);
+    expect(hiddenDetails.sourceIds).toEqual([]);
+  });
+
   it("hides fallback source IDs unless requested and clamps output budget", async () => {
     const { db, conversationStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
