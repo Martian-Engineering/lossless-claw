@@ -1093,6 +1093,7 @@ export function createLcmRecentTool(input: {
       let sourceIds: string[] = [];
       let usedFallback = false;
       let truncated = false;
+      let degradedReason: string | undefined;
 
       const currentDayKey = getZonedDayString(new Date(), timezone);
       const canUseStoredCurrentDay =
@@ -1102,6 +1103,13 @@ export function createLcmRecentTool(input: {
       const canUseStoredResolvedRollup =
         canUseStoredCurrentDay &&
         (resolution.kind === "day" || !hasPendingRebuild);
+      if (!canUseStoredCurrentDay) {
+        degradedReason =
+          "Stored current-day rollups were bypassed so same-day recall uses bounded fresh sources.";
+      } else if (resolution.kind && resolution.kind !== "day" && hasPendingRebuild) {
+        degradedReason =
+          "Rollup rebuild is pending, so stored aggregate rollups were bypassed.";
+      }
 
       if (
         resolution.kind &&
@@ -1124,6 +1132,10 @@ export function createLcmRecentTool(input: {
           status = rollup.status === "ready" ? "ready" : "stale";
           sourceSummaryIds = parseJsonStringArray(rollup.source_summary_ids);
           sourceIds = sourceSummaryIds;
+        } else if (rollup) {
+          degradedReason = `Stored ${resolution.kind} rollup is ${rollup.status}${
+            rollup.error_text ? `: ${rollup.error_text}` : ""
+          }.`;
         }
       } else if (
         resolution.kind &&
@@ -1275,6 +1287,9 @@ export function createLcmRecentTool(input: {
         );
         lines.push("**Status:** fallback");
         lines.push(`**Confidence:** ${confidence}`);
+        if (degradedReason) {
+          lines.push(`**Degraded:** ${degradedReason}`);
+        }
         lines.push(...formatBudgetLines(budget, rendered.accounting));
         lines.push("");
         if (fallback.summaries.length === 0) {
@@ -1301,6 +1316,7 @@ export function createLcmRecentTool(input: {
           details: {
             status: "fallback",
             usedFallback: true,
+            degradedReason,
             confidence,
             budget,
             accounting: rendered.accounting,

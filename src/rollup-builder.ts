@@ -38,6 +38,10 @@ export interface BuildResult {
   errors: string[];
 }
 
+export interface BuildAggregateRollupsOptions {
+  daysBack?: number;
+}
+
 type RollupSourceRecord = {
   type: "summary" | "rollup";
   id: string;
@@ -86,11 +90,16 @@ export class RollupBuilder {
   }
 
   async buildWeeklyMonthlyRollups(
-    conversationId: number
+    conversationId: number,
+    options: BuildAggregateRollupsOptions = {}
   ): Promise<BuildResult> {
     const result: BuildResult = { built: 0, skipped: 0, errors: [] };
     const weeklyErrorStart = result.errors.length;
-    const weeks = this.collectAggregateKeys(conversationId, WEEK_PERIOD_KIND);
+    const weeks = this.collectAggregateKeys(
+      conversationId,
+      WEEK_PERIOD_KIND,
+      options
+    );
     for (const weekKey of weeks) {
       try {
         (await this.buildAggregateRollup(
@@ -109,7 +118,11 @@ export class RollupBuilder {
     const weeklySucceeded = result.errors.length === weeklyErrorStart;
 
     const monthlyErrorStart = result.errors.length;
-    const months = this.collectAggregateKeys(conversationId, MONTH_PERIOD_KIND);
+    const months = this.collectAggregateKeys(
+      conversationId,
+      MONTH_PERIOD_KIND,
+      options
+    );
     for (const monthKey of months) {
       try {
         (await this.buildAggregateRollup(
@@ -165,8 +178,12 @@ export class RollupBuilder {
 
   private collectAggregateKeys(
     conversationId: number,
-    periodKind: "week" | "month"
+    periodKind: "week" | "month",
+    options: BuildAggregateRollupsOptions = {}
   ): string[] {
+    const windowStart = this.getAggregateWindowStart(options);
+    const overlapsWindow = (rollup: RollupRow): boolean =>
+      !windowStart || new Date(rollup.period_end) > windowStart;
     const dayRollups = this.store.listRollups(
       conversationId,
       DAY_PERIOD_KIND,
@@ -178,11 +195,17 @@ export class RollupBuilder {
       periodKind,
       null
     )) {
-      if (rollup.timezone === this.config.timezone) {
+      if (
+        rollup.timezone === this.config.timezone &&
+        overlapsWindow(rollup)
+      ) {
         keys.add(rollup.period_key);
       }
     }
     for (const rollup of dayRollups) {
+      if (!overlapsWindow(rollup)) {
+        continue;
+      }
       if (rollup.status !== "ready" && rollup.status !== "stale") {
         continue;
       }
@@ -196,6 +219,18 @@ export class RollupBuilder {
       keys.add(key);
     }
     return [...keys].sort();
+  }
+
+  private getAggregateWindowStart(
+    options: BuildAggregateRollupsOptions
+  ): Date | null {
+    if (options.daysBack == null) {
+      return null;
+    }
+    const daysBack = Math.max(1, Math.floor(options.daysBack));
+    const currentDay = getLocalDateKey(new Date(), this.config.timezone);
+    const startKey = addDays(currentDay, -(daysBack - 1));
+    return getLocalDayBoundsForDateKey(startKey, this.config.timezone).start;
   }
 
   private async buildAggregateRollup(

@@ -975,6 +975,67 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("reports failed stored rollups as degraded fallback responses", async () => {
+    const { db, conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "failed-rollup-fallback",
+      sessionKey: "agent:main:failed-rollup-fallback",
+      title: "Failed rollup fallback",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "sum_failed_rollup_fallback",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Fallback should explain that the stored daily rollup failed.",
+      tokenCount: 8,
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+    db.prepare(
+      `UPDATE lcm_rollups
+       SET status = 'failed', error_text = ?
+       WHERE conversation_id = ? AND period_kind = 'day' AND period_key = ?`
+    ).run("summarizer timeout", conversation.conversationId, "2026-04-27");
+
+    const now = new Date("2026-04-29T12:00:00.000Z");
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => rollupStore,
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "failed-rollup-fallback",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "failed-rollup-fallback",
+    });
+
+    const result = await tool.execute("call-failed-rollup", {
+      period: "date:2026-04-27",
+      includeSources: false,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("**Status:** fallback");
+    expect(text).toContain("**Degraded:** Stored day rollup is failed: summarizer timeout.");
+    expect(text).toContain("Fallback should explain");
+    expect((result.details as { degradedReason?: string }).degradedReason).toBe(
+      "Stored day rollup is failed: summarizer timeout."
+    );
+  });
+
   it("combines complete prior daily rollups with live fallback for 7d", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     vi.useFakeTimers();
@@ -1730,6 +1791,78 @@ describe("LCM weekly and monthly rollups", () => {
     expect(state?.last_weekly_build_at).toBeNull();
     expect(state?.last_monthly_build_at).toBeTruthy();
     expect(state?.pending_rebuild).toBe(1);
+  });
+
+  it("bounds aggregate maintenance to affected recent periods", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-29T12:00:00.000Z"));
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "aggregate-maintenance-bounds",
+        sessionKey: "agent:main:aggregate-maintenance-bounds",
+        title: "Aggregate maintenance bounds",
+      });
+
+      for (const [summaryId, day] of [
+        ["sum_old_aggregate_window", "2026-01-01"],
+        ["sum_recent_aggregate_window", "2026-04-29"],
+      ] as const) {
+        await summaryStore.insertSummary({
+          summaryId,
+          conversationId: conversation.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content: `Aggregate maintenance coverage for ${day}.`,
+          tokenCount: 10,
+          sourceMessageTokenCount: 10,
+          earliestAt: new Date(`${day}T10:00:00.000Z`),
+          latestAt: new Date(`${day}T10:00:00.000Z`),
+        });
+      }
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await builder.buildDayRollup(conversation.conversationId, "2026-01-01");
+      await builder.buildDayRollup(conversation.conversationId, "2026-04-29");
+
+      const originalBuildAggregate = (
+        builder as unknown as {
+          buildAggregateRollup: (
+            conversationId: number,
+            periodKind: "week" | "month",
+            periodKey: string
+          ) => Promise<boolean>;
+        }
+      ).buildAggregateRollup.bind(builder);
+      const aggregateSpy = vi
+        .spyOn(
+          builder as unknown as {
+            buildAggregateRollup: (
+              conversationId: number,
+              periodKind: "week" | "month",
+              periodKey: string
+            ) => Promise<boolean>;
+          },
+          "buildAggregateRollup"
+        )
+        .mockImplementation(originalBuildAggregate);
+
+      await builder.buildWeeklyMonthlyRollups(conversation.conversationId, {
+        daysBack: 2,
+      });
+
+      const aggregateKeys = aggregateSpy.mock.calls.map(
+        ([, periodKind, periodKey]) => `${periodKind}:${periodKey}`
+      );
+      aggregateSpy.mockRestore();
+
+      expect(aggregateKeys).toContain("week:2026-04-27");
+      expect(aggregateKeys).toContain("month:2026-04");
+      expect(aggregateKeys).not.toContain("week:2025-12-29");
+      expect(aggregateKeys).not.toContain("month:2026-01");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("removes orphaned aggregate rollups when source days disappear", async () => {
