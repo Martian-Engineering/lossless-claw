@@ -26,6 +26,11 @@ export type EventObservationInput = {
   sourceIds?: string[];
 };
 
+export type EventSource = {
+  sourceType?: "summary" | "rollup" | "message";
+  sourceId: string;
+};
+
 export type EventObservation = {
   eventId: string;
   conversationId: number;
@@ -37,7 +42,7 @@ export type EventObservation = {
   ingestTime: string;
   confidence: number;
   rationale: string;
-  sources?: Array<{ sourceType: "summary" | "rollup" | "message"; sourceId: string }>;
+  sources?: EventSource[];
   createdAt: string;
   updatedAt: string;
 };
@@ -52,7 +57,7 @@ export type EventEpisode = {
   lastEventTime: string;
   observationCount: number;
   confidence: number;
-  sources?: Array<{ sourceType: "summary" | "rollup" | "message"; sourceId: string }>;
+  sources?: EventSource[];
   createdAt: string;
   updatedAt: string;
 };
@@ -126,21 +131,76 @@ function normalizeQueryKey(value: string | undefined): string | null {
   return normalized;
 }
 
-function parseSourceIds(raw: string, sourceType: "summary" | "rollup" | "message"): Array<{
-  sourceType: "summary" | "rollup" | "message";
-  sourceId: string;
-}> {
+function isEventSourceType(value: unknown): value is "summary" | "rollup" | "message" {
+  return value === "summary" || value === "rollup" || value === "message";
+}
+
+function parseSources(
+  raw: string,
+  fallbackSourceType?: "summary" | "rollup" | "message",
+): EventSource[] {
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) {
       return [];
     }
     return parsed
-      .filter((sourceId): sourceId is string => typeof sourceId === "string" && sourceId.trim().length > 0)
-      .map((sourceId) => ({ sourceType, sourceId }));
+      .map((source): EventSource | null => {
+        if (typeof source === "string" && source.trim().length > 0) {
+          return {
+            ...(fallbackSourceType ? { sourceType: fallbackSourceType } : {}),
+            sourceId: source.trim(),
+          };
+        }
+        if (
+          typeof source === "object" &&
+          source != null &&
+          "sourceId" in source &&
+          typeof source.sourceId === "string" &&
+          source.sourceId.trim().length > 0
+        ) {
+          const sourceType = "sourceType" in source ? source.sourceType : undefined;
+          return {
+            ...(isEventSourceType(sourceType) ? { sourceType } : {}),
+            sourceId: source.sourceId.trim(),
+          };
+        }
+        return null;
+      })
+      .filter((source): source is EventSource => source != null);
   } catch {
     return [];
   }
+}
+
+function normalizeSources(sources: EventSource[]): EventSource[] {
+  const seen = new Set<string>();
+  const normalized: EventSource[] = [];
+  for (const source of sources) {
+    const sourceId = source.sourceId.trim();
+    if (!sourceId) {
+      continue;
+    }
+    const key = `${source.sourceType ?? ""}:${sourceId}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    normalized.push({
+      ...(source.sourceType ? { sourceType: source.sourceType } : {}),
+      sourceId,
+    });
+  }
+  return normalized;
+}
+
+function sourcesFromIds(
+  sourceType: "summary" | "rollup" | "message",
+  sourceIds: string[],
+): EventSource[] {
+  return normalizeSources(
+    sourceIds.map((sourceId) => ({ sourceType, sourceId })),
+  );
 }
 
 function rowToEvent(row: EventObservationRow, includeSources: boolean): EventObservation {
@@ -156,7 +216,7 @@ function rowToEvent(row: EventObservationRow, includeSources: boolean): EventObs
     confidence: row.confidence,
     rationale: row.rationale,
     ...(includeSources
-      ? { sources: parseSourceIds(row.source_ids, row.source_type) }
+      ? { sources: parseSources(row.source_ids, row.source_type) }
       : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -175,7 +235,7 @@ function rowToEpisode(row: EventEpisodeRow, includeSources: boolean): EventEpiso
     observationCount: row.observation_count,
     confidence: row.confidence,
     ...(includeSources
-      ? { sources: parseSourceIds(row.source_ids, "summary") }
+      ? { sources: parseSources(row.source_ids) }
       : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -211,6 +271,7 @@ export class EventObservationStore {
       throw new Error("event source ID is required.");
     }
     const sourceIds = normalizeSourceIds(input.sourceIds, sourceId);
+    const queryKey = normalizeQueryKey(input.queryKey) ?? "uncategorized";
     this.db.prepare(
       `INSERT INTO lcm_event_observations (
         event_id, conversation_id, event_kind, title, description, query_key,
@@ -237,7 +298,7 @@ export class EventObservationStore {
       input.eventKind,
       input.title.trim(),
       input.description?.trim() || null,
-      normalizeQueryKey(input.queryKey),
+      queryKey,
       input.eventTime ?? null,
       input.ingestTime,
       input.confidence ?? 0.5,
@@ -251,9 +312,10 @@ export class EventObservationStore {
       conversationId: input.conversationId,
       eventKind: input.eventKind,
       title: input.title.trim(),
-      queryKey: input.queryKey?.trim().toLowerCase() || "uncategorized",
+      queryKey,
       eventTime: input.eventTime ?? input.ingestTime,
       confidence: input.confidence ?? 0.5,
+      sourceType: input.sourceType,
       sourceIds,
     });
   }
@@ -266,6 +328,7 @@ export class EventObservationStore {
     queryKey: string;
     eventTime: string;
     confidence: number;
+    sourceType: "summary" | "rollup" | "message";
     sourceIds: string[];
   }): void {
     const episodeId = hashId(
@@ -279,15 +342,13 @@ export class EventObservationStore {
        FROM lcm_event_episodes
        WHERE episode_id = ?`,
     ).get(episodeId) as EventEpisodeRow | undefined;
-    const sourceIds = normalizeSourceIds(
-      existing
-        ? [
-            ...parseSourceIds(existing.source_ids, "summary").map((source) => source.sourceId),
-            ...input.sourceIds,
-          ]
-        : input.sourceIds,
-      input.sourceIds[0] ?? input.eventId,
-    );
+    const sources = normalizeSources([
+      ...(existing ? parseSources(existing.source_ids) : []),
+      ...sourcesFromIds(
+        input.sourceType,
+        input.sourceIds.length > 0 ? input.sourceIds : [input.eventId],
+      ),
+    ]);
     const firstEventTime = existing
       ? compareIso(existing.first_event_time, input.eventTime, "min")
       : input.eventTime;
@@ -320,7 +381,7 @@ export class EventObservationStore {
       firstEventTime,
       lastEventTime,
       input.confidence,
-      JSON.stringify(sourceIds),
+      JSON.stringify(sources),
     );
     this.db.prepare(
       `INSERT OR IGNORE INTO lcm_event_episode_observations (
