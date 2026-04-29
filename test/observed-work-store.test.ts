@@ -68,6 +68,7 @@ describe("ObservedWorkStore", () => {
     const summaryStore = new SummaryStore(db, { fts5Available: false });
     const observedWork = new ObservedWorkStore(db);
     const extractor = new ObservedWorkExtractor(db, observedWork);
+    const pointLookupSpy = vi.spyOn(observedWork, "getItem");
 
     await insertLeafSummary({
       db,
@@ -108,6 +109,52 @@ describe("ObservedWorkStore", () => {
     const state = observedWork.getState(7);
     expect(state?.lastProcessedSummaryId).toBe("sum_a_later");
     expect(state?.lastProcessedSummaryRowid).toBeGreaterThan(0);
+    expect(pointLookupSpy).not.toHaveBeenCalled();
+  });
+
+  it("preserves semantic evidence kinds when reinforcing extracted work", async () => {
+    const db = makeDb();
+    createConversation(db, 9);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 9,
+      summaryId: "sum_completed_first",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Completed: PR #542 tests passed",
+    });
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 9,
+      summaryId: "sum_completed_later",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content: "- Completed: PR #542 tests passed",
+    });
+
+    expect(extractor.processConversation(9)).toMatchObject({
+      summariesScanned: 2,
+      workItemsUpserted: 2,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 9,
+      includeSources: true,
+    });
+    expect(density.completedHighlights[0]?.sources).toEqual([
+      expect.objectContaining({
+        sourceId: "sum_completed_first",
+        evidenceKind: "completed",
+      }),
+      expect.objectContaining({
+        sourceId: "sum_completed_later",
+        evidenceKind: "completed",
+      }),
+    ]);
   });
 
   it("reports completed, unfinished, and ambiguous work density", () => {

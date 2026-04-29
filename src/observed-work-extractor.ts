@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type {
   ObservedWorkKind,
+  ObservedWorkItemSnapshot,
   ObservedWorkStatus,
   ObservedWorkStore,
 } from "./store/observed-work-store.js";
@@ -33,6 +34,15 @@ type WorkCandidate = {
   topicKey: string;
   rationale: string;
   completed: boolean;
+};
+
+type PendingObservedWork = {
+  row: LeafSummaryRow;
+  observedAt: string;
+  ordinal: number;
+  work: WorkCandidate;
+  fingerprint: string;
+  workItemId: string;
 };
 
 const COMPLETED_RE = /\b(completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed)\b/i;
@@ -192,53 +202,93 @@ export class ObservedWorkExtractor {
     const limit = Math.max(1, Math.min(options?.limit ?? 200, 1000));
     const rows = this.listUnprocessedLeafSummaries(conversationId, state, limit);
     let workItemsUpserted = 0;
+    const pendingRows: Array<{
+      row: LeafSummaryRow;
+      entries: PendingObservedWork[];
+    }> = [];
+    const workItemIds = new Set<string>();
+
     for (const row of rows) {
       const observedAt = toIso(row.effective_at ?? row.created_at);
+      const entries: PendingObservedWork[] = [];
       let ordinal = 0;
       for (const line of extractLines(row.content)) {
         const work = classifyWork(line);
         if (work) {
           const fingerprint = `${conversationId}:${work.kind}:${work.topicKey}:${slug(work.title)}`;
           const workItemId = hashId("ow", fingerprint);
-          const existing = this.observedWorkStore.getItem(workItemId);
-          const evidenceCount = (existing?.evidenceCount ?? 0) + 1;
-          const confidence = Math.min(0.98, Math.max(work.confidence, (existing?.confidence ?? 0) + 0.05));
-          this.observedWorkStore.upsertItem({
-            workItemId,
-            conversationId,
-            title: work.title,
-            observedStatus: work.observedStatus,
-            kind: work.kind,
-            confidence,
-            confidenceBand: confidenceBand(confidence),
-            rationale: work.rationale,
-            topicKey: work.topicKey,
-            firstSeenAt: existing?.firstSeenAt ?? observedAt,
-            lastSeenAt: observedAt,
-            completedAt: work.completed ? observedAt : undefined,
-            completionConfidence: work.completed ? confidence : undefined,
-            evidenceCount,
-            sourceMessageCount: row.source_message_count,
-            sourceTokenCount: row.source_message_token_count || row.token_count,
-            fingerprint,
-            fingerprintVersion: 2,
-          });
-          this.observedWorkStore.addSource({
-            workItemId,
-            sourceType: "summary",
-            sourceId: row.summary_id,
+          entries.push({
+            row,
+            observedAt,
             ordinal,
-            evidenceKind: existing ? "reinforced" : work.evidenceKind,
+            work,
+            fingerprint,
+            workItemId,
           });
-          workItemsUpserted += 1;
+          workItemIds.add(workItemId);
         }
         ordinal += 1;
       }
+      pendingRows.push({ row, entries });
+    }
+
+    const existingByWorkItemId = this.loadExistingItems([...workItemIds]);
+    const evidenceKindFor = (
+      existing: ObservedWorkItemSnapshot | undefined,
+      work: WorkCandidate,
+    ): WorkCandidate["evidenceKind"] =>
+      existing && work.evidenceKind === "created" ? "reinforced" : work.evidenceKind;
+
+    for (const pendingRow of pendingRows) {
+      for (const entry of pendingRow.entries) {
+        const existing = existingByWorkItemId.get(entry.workItemId);
+        const evidenceCount = (existing?.evidenceCount ?? 0) + 1;
+        const confidence = Math.min(
+          0.98,
+          Math.max(entry.work.confidence, (existing?.confidence ?? 0) + 0.05),
+        );
+        this.observedWorkStore.upsertItem({
+          workItemId: entry.workItemId,
+          conversationId,
+          title: entry.work.title,
+          observedStatus: entry.work.observedStatus,
+          kind: entry.work.kind,
+          confidence,
+          confidenceBand: confidenceBand(confidence),
+          rationale: entry.work.rationale,
+          topicKey: entry.work.topicKey,
+          firstSeenAt: existing?.firstSeenAt ?? entry.observedAt,
+          lastSeenAt: entry.observedAt,
+          completedAt: entry.work.completed ? entry.observedAt : undefined,
+          completionConfidence: entry.work.completed ? confidence : undefined,
+          evidenceCount,
+          sourceMessageCount: entry.row.source_message_count,
+          sourceTokenCount: entry.row.source_message_token_count || entry.row.token_count,
+          fingerprint: entry.fingerprint,
+          fingerprintVersion: 2,
+        });
+        this.observedWorkStore.addSource({
+          workItemId: entry.workItemId,
+          sourceType: "summary",
+          sourceId: entry.row.summary_id,
+          ordinal: entry.ordinal,
+          evidenceKind: evidenceKindFor(existing, entry.work),
+        });
+        existingByWorkItemId.set(entry.workItemId, {
+          workItemId: entry.workItemId,
+          observedStatus: entry.work.observedStatus,
+          confidence,
+          firstSeenAt: existing?.firstSeenAt ?? entry.observedAt,
+          lastSeenAt: entry.observedAt,
+          evidenceCount,
+        });
+        workItemsUpserted += 1;
+      }
       this.observedWorkStore.upsertState({
         conversationId,
-        lastProcessedSummaryCreatedAt: row.created_at,
-        lastProcessedSummaryId: row.summary_id,
-        lastProcessedSummaryRowid: row.summary_rowid,
+        lastProcessedSummaryCreatedAt: pendingRow.row.created_at,
+        lastProcessedSummaryId: pendingRow.row.summary_id,
+        lastProcessedSummaryRowid: pendingRow.row.summary_rowid,
         pendingRebuild: false,
       });
     }
@@ -246,6 +296,39 @@ export class ObservedWorkExtractor {
       summariesScanned: rows.length,
       workItemsUpserted,
     };
+  }
+
+  private loadExistingItems(
+    workItemIds: string[],
+  ): Map<string, ObservedWorkItemSnapshot> {
+    if (workItemIds.length === 0) {
+      return new Map();
+    }
+    const rows = this.db.prepare(
+      `SELECT work_item_id, observed_status, confidence, first_seen_at, last_seen_at, evidence_count
+       FROM lcm_observed_work_items
+       WHERE work_item_id IN (${workItemIds.map(() => "?").join(", ")})`,
+    ).all(...workItemIds) as Array<{
+      work_item_id: string;
+      observed_status: ObservedWorkStatus;
+      confidence: number;
+      first_seen_at: string;
+      last_seen_at: string;
+      evidence_count: number;
+    }>;
+    return new Map(
+      rows.map((row) => [
+        row.work_item_id,
+        {
+          workItemId: row.work_item_id,
+          observedStatus: row.observed_status,
+          confidence: row.confidence,
+          firstSeenAt: row.first_seen_at,
+          lastSeenAt: row.last_seen_at,
+          evidenceCount: row.evidence_count,
+        },
+      ]),
+    );
   }
 
   private listUnprocessedLeafSummaries(
