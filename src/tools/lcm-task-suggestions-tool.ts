@@ -214,11 +214,16 @@ export function createLcmTaskSuggestionsTool(input: {
       const suggestions = items
         .map((item) => suggestionFor(item, includeSources))
         .filter((suggestion): suggestion is NonNullable<typeof suggestion> => suggestion != null);
+      const recordAccounting = {
+        inserted: 0,
+        refreshed: 0,
+        preservedReviewed: 0,
+      };
       if (mode === "record") {
         const store = lcm.getTaskBridgeSuggestionStore();
         for (const suggestion of suggestions) {
           const sourceIds = sourceIdsFor(items.find((item) => item.workItemId === suggestion.workItemId)!);
-          store.upsertSuggestion({
+          const result = store.upsertSuggestion({
             suggestionId: suggestion.suggestionId,
             workItemId: suggestion.workItemId,
             suggestionKind: suggestion.suggestionKind,
@@ -226,6 +231,13 @@ export function createLcmTaskSuggestionsTool(input: {
             rationale: suggestion.rationale,
             sourceIds,
           });
+          if (result === "inserted") {
+            recordAccounting.inserted += 1;
+          } else if (result === "refreshed") {
+            recordAccounting.refreshed += 1;
+          } else {
+            recordAccounting.preservedReviewed += 1;
+          }
         }
       }
       return jsonResult({
@@ -236,7 +248,12 @@ export function createLcmTaskSuggestionsTool(input: {
           candidatesSeen: items.length,
           suggestionsIncluded: suggestions.length,
           sourceFreeCandidatesOmitted: items.length - suggestions.length,
-          recorded: mode === "record" ? suggestions.length : 0,
+          recorded:
+            mode === "record"
+              ? recordAccounting.inserted + recordAccounting.refreshed
+              : 0,
+          preservedReviewed:
+            mode === "record" ? recordAccounting.preservedReviewed : 0,
         },
         disclaimer:
           "Suggestions are inert LCM ledger records. They do not create, close, assign, remind, wake, or sync external tasks.",
