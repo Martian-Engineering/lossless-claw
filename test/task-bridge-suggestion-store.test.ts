@@ -81,14 +81,22 @@ describe("TaskBridgeSuggestionStore", () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_1", ["sum_a", "sum_b"]);
     const store = new TaskBridgeSuggestionStore(db);
-    store.upsertSuggestion({
+    expect(store.upsertSuggestion({
       suggestionId: "sug_1",
       workItemId: "work_1",
       suggestionKind: "create_task",
       confidence: 0.91,
       rationale: "Observed repeated unfinished blocker evidence.",
       sourceIds: ["sum_a", "sum_b", "sum_a", ""],
-    });
+    })).toBe("inserted");
+    expect(store.upsertSuggestion({
+      suggestionId: "sug_1",
+      workItemId: "work_1",
+      suggestionKind: "create_task",
+      confidence: 0.92,
+      rationale: "Observed repeated unfinished blocker evidence again.",
+      sourceIds: ["sum_a", "sum_b"],
+    })).toBe("refreshed");
 
     const suggestions = store.listSuggestions({ status: "pending" });
     expect(suggestions).toHaveLength(1);
@@ -110,7 +118,7 @@ describe("TaskBridgeSuggestionStore", () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_2", ["sum_done", "sum_done_later"]);
     const store = new TaskBridgeSuggestionStore(db);
-    store.upsertSuggestion({
+    expect(store.upsertSuggestion({
       suggestionId: "sug_2",
       workItemId: "work_2",
       taskId: "task_123",
@@ -118,7 +126,7 @@ describe("TaskBridgeSuggestionStore", () => {
       confidence: 0.97,
       rationale: "Observed explicit completion evidence.",
       sourceIds: ["sum_done"],
-    });
+    })).toBe("inserted");
     expect(
       store.reviewSuggestion({
         suggestionId: "sug_2",
@@ -155,7 +163,7 @@ describe("TaskBridgeSuggestionStore", () => {
       evidenceKind: "created",
     });
 
-    store.upsertSuggestion({
+    expect(store.upsertSuggestion({
       suggestionId: "sug_2",
       workItemId: "work_2b",
       suggestionKind: "create_task",
@@ -163,7 +171,7 @@ describe("TaskBridgeSuggestionStore", () => {
       rationale: "A later deterministic scan saw the same suggestion again.",
       sourceIds: ["sum_other"],
       createdBy: "second-writer",
-    });
+    })).toBe("preserved_reviewed");
     const stillAccepted = store.listSuggestions({ status: "accepted" });
     expect(stillAccepted).toHaveLength(1);
     expect(stillAccepted[0]).toMatchObject({
