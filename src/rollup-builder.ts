@@ -251,8 +251,7 @@ export class RollupBuilder {
       )
       .filter(
         (rollup) =>
-          rollup.timezone === this.config.timezone &&
-          (rollup.status === "ready" || rollup.status === "stale")
+          rollup.timezone === this.config.timezone && rollup.status === "ready"
       )
       .sort((left, right) => left.period_key.localeCompare(right.period_key));
 
