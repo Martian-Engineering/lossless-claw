@@ -85,7 +85,7 @@ describe("LCM ultimate architecture implementation", () => {
       eventsUpserted: 2,
     });
 
-    const density = observedWork.getDensity({ conversationId: 1, topic: "PR #517", includeSources: false });
+    const density = observedWork.getDensity({ conversationId: 1, topic: "pr-517", includeSources: false });
     expect(density.density.unfinished).toBe(1);
     expect(density.topUnfinished[0]?.title).toContain("PR #517");
     expect(density.topUnfinished[0]?.sources).toBeUndefined();
@@ -242,7 +242,7 @@ describe("LCM ultimate architecture implementation", () => {
     const suggestionsTool = createLcmTaskSuggestionsTool({ deps, lcm: lcm as never });
     const preview = await suggestionsTool.execute("suggest-preview", {
       conversationId: 3,
-      topic: "PR #518",
+      topic: "pr-518",
     });
     expect(JSON.stringify(preview.details)).toContain("create_task");
     expect(JSON.stringify(preview.details)).not.toContain("mark_task_blocked");
@@ -258,7 +258,7 @@ describe("LCM ultimate architecture implementation", () => {
 
     const recorded = await suggestionsTool.execute("suggest-record", {
       conversationId: 3,
-      topic: "PR #518",
+      topic: "pr-518",
       mode: "record",
       includeSources: true,
     });
