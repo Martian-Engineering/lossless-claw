@@ -79,14 +79,22 @@ describe("TaskBridgeSuggestionStore", () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_1", ["sum_a", "sum_b"]);
     const store = new TaskBridgeSuggestionStore(db);
-    store.upsertSuggestion({
+    expect(store.upsertSuggestion({
       suggestionId: "sug_1",
       workItemId: "work_1",
       suggestionKind: "create_task",
       confidence: 0.91,
       rationale: "Observed repeated unfinished blocker evidence.",
       sourceIds: ["sum_a", "sum_b", "sum_a", ""],
-    });
+    })).toBe("inserted");
+    expect(store.upsertSuggestion({
+      suggestionId: "sug_1",
+      workItemId: "work_1",
+      suggestionKind: "create_task",
+      confidence: 0.92,
+      rationale: "Observed repeated unfinished blocker evidence again.",
+      sourceIds: ["sum_a", "sum_b"],
+    })).toBe("refreshed");
 
     const suggestions = store.listSuggestions({ status: "pending" });
     expect(suggestions).toHaveLength(1);
@@ -108,7 +116,7 @@ describe("TaskBridgeSuggestionStore", () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_2", ["sum_done", "sum_done_later"]);
     const store = new TaskBridgeSuggestionStore(db);
-    store.upsertSuggestion({
+    expect(store.upsertSuggestion({
       suggestionId: "sug_2",
       workItemId: "work_2",
       taskId: "task_123",
@@ -116,7 +124,7 @@ describe("TaskBridgeSuggestionStore", () => {
       confidence: 0.97,
       rationale: "Observed explicit completion evidence.",
       sourceIds: ["sum_done"],
-    });
+    })).toBe("inserted");
     expect(
       store.reviewSuggestion({
         suggestionId: "sug_2",
@@ -139,7 +147,7 @@ describe("TaskBridgeSuggestionStore", () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_4", ["sum_initial", "sum_later"]);
     const store = new TaskBridgeSuggestionStore(db);
-    store.upsertSuggestion({
+    expect(store.upsertSuggestion({
       suggestionId: "sug_reviewed",
       workItemId: "work_4",
       suggestionKind: "create_task",
@@ -147,14 +155,14 @@ describe("TaskBridgeSuggestionStore", () => {
       rationale: "Initial observed task suggestion.",
       sourceIds: ["sum_initial"],
       createdBy: "first-agent",
-    });
+    })).toBe("inserted");
     store.reviewSuggestion({
       suggestionId: "sug_reviewed",
       status: "dismissed",
       reviewedBy: "reviewer",
     });
 
-    store.upsertSuggestion({
+    expect(store.upsertSuggestion({
       suggestionId: "sug_reviewed",
       workItemId: "work_4",
       suggestionKind: "create_task",
@@ -162,7 +170,7 @@ describe("TaskBridgeSuggestionStore", () => {
       rationale: "Repeated record-mode run should refresh evidence only.",
       sourceIds: ["sum_later"],
       createdBy: "second-agent",
-    });
+    })).toBe("preserved_reviewed");
 
     const dismissed = store.listSuggestions({ status: "dismissed" });
     expect(dismissed).toHaveLength(1);

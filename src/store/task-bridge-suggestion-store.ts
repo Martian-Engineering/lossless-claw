@@ -42,6 +42,11 @@ export type TaskBridgeSuggestion = {
   updatedAt: string;
 };
 
+export type TaskBridgeSuggestionUpsertResult =
+  | "inserted"
+  | "refreshed"
+  | "preserved_reviewed";
+
 type TaskBridgeSuggestionRow = {
   suggestion_id: string;
   work_item_id: string;
@@ -110,6 +115,19 @@ function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
 export class TaskBridgeSuggestionStore {
   constructor(private readonly db: DatabaseSync) {}
 
+  private getSuggestionStatus(
+    suggestionId: string
+  ): TaskBridgeSuggestionStatus | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT status
+         FROM lcm_task_bridge_suggestions
+         WHERE suggestion_id = ?`
+      )
+      .get(suggestionId) as { status: TaskBridgeSuggestionStatus } | undefined;
+    return row?.status;
+  }
+
   private assertSourceIdsBelongToWorkItem(
     workItemId: string,
     sourceIds: string[]
@@ -132,7 +150,7 @@ export class TaskBridgeSuggestionStore {
     }
   }
 
-  upsertSuggestion(input: TaskBridgeSuggestionInput): void {
+  upsertSuggestion(input: TaskBridgeSuggestionInput): TaskBridgeSuggestionUpsertResult {
     const suggestionId = input.suggestionId.trim();
     if (suggestionId.length === 0) {
       throw new Error("suggestionId is required.");
@@ -156,6 +174,10 @@ export class TaskBridgeSuggestionStore {
     const taskId = input.taskId?.trim();
     if (TASK_TARGETING_KINDS.has(input.suggestionKind) && !taskId) {
       throw new Error(`${input.suggestionKind} suggestions require taskId.`);
+    }
+    const existingStatus = this.getSuggestionStatus(suggestionId);
+    if (existingStatus && existingStatus !== "pending") {
+      return "preserved_reviewed";
     }
     const sourceIds = normalizeSourceIds(input.sourceIds);
     if (sourceIds.length === 0) {
@@ -208,6 +230,7 @@ export class TaskBridgeSuggestionStore {
       JSON.stringify(sourceIds),
       input.createdBy?.trim() || "lcm_observed",
     );
+    return existingStatus === "pending" ? "refreshed" : "inserted";
   }
 
   listSuggestions(input?: {
