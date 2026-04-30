@@ -393,6 +393,116 @@ describe("ObservedWorkStore", () => {
     );
   });
 
+  it("does not resolve active work on generic word overlap alone", async () => {
+    const db = makeDb();
+    createConversation(db, 15);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 15,
+      summaryId: "sum_generic_open",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: review thread needs follow-up",
+    });
+    expect(extractor.processConversation(15)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 15,
+      summaryId: "sum_generic_done",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content: "- Completed: review passed",
+    });
+    expect(extractor.processConversation(15)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 15,
+      limit: 10,
+    });
+    expect(density.topUnfinished.map((item) => item.title)).toContain(
+      "Blocker: review thread needs follow-up"
+    );
+    expect(density.completedHighlights.map((item) => item.title)).toContain(
+      "Completed: review passed"
+    );
+    expect(density.completedHighlights.map((item) => item.title)).not.toContain(
+      "Blocker: review thread needs follow-up"
+    );
+  });
+
+  it("rolls back active-item resolution writes before retry", async () => {
+    const db = makeDb();
+    createConversation(db, 16);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 16,
+      summaryId: "sum_active_open",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #603 review comments unresolved",
+    });
+    expect(extractor.processConversation(16)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 16,
+      summaryId: "sum_active_resolved",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content: "- Completed: PR #603 review comments resolved",
+    });
+    const transitionSpy = vi.spyOn(observedWork, "addTransition");
+    transitionSpy.mockImplementationOnce(() => {
+      throw new Error("simulated transition write failure");
+    });
+    expect(() => extractor.processConversation(16)).toThrow(/transition/);
+    transitionSpy.mockRestore();
+
+    expect(observedWork.getState(16)?.lastProcessedSummaryId).toBe(
+      "sum_active_open"
+    );
+    let density = observedWork.getDensity({
+      conversationId: 16,
+      limit: 10,
+    });
+    expect(density.completedHighlights).toHaveLength(0);
+    expect(density.topUnfinished[0]?.evidenceCount).toBe(1);
+
+    expect(extractor.processConversation(16)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+    density = observedWork.getDensity({
+      conversationId: 16,
+      includeTransitions: true,
+      limit: 10,
+    });
+    expect(density.completedHighlights.map((item) => item.title)).toContain(
+      "Blocker: PR #603 review comments unresolved"
+    );
+    expect(density.transitions?.map((transition) => transition.transitionType)).toContain(
+      "resolved"
+    );
+  });
+
   it("allows stronger resolution evidence after a weaker same-summary transition", async () => {
     const db = makeDb();
     createConversation(db, 14);
