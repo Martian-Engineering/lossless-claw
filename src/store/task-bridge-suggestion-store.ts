@@ -42,6 +42,11 @@ export type TaskBridgeSuggestion = {
   updatedAt: string;
 };
 
+export type TaskBridgeSuggestionUpsertResult =
+  | "inserted"
+  | "refreshed"
+  | "preserved_reviewed";
+
 type TaskBridgeSuggestionRow = {
   suggestion_id: string;
   work_item_id: string;
@@ -63,6 +68,13 @@ const REVIEW_STATUSES = new Set<TaskBridgeSuggestionStatus>([
   "rejected",
   "dismissed",
   "expired",
+]);
+
+const TASK_TARGETING_KINDS = new Set<TaskBridgeSuggestionKind>([
+  "link_task",
+  "mark_task_done",
+  "mark_task_blocked",
+  "add_task_evidence",
 ]);
 
 function normalizeSourceIds(sourceIds: string[]): string[] {
@@ -103,7 +115,42 @@ function rowToSuggestion(row: TaskBridgeSuggestionRow): TaskBridgeSuggestion {
 export class TaskBridgeSuggestionStore {
   constructor(private readonly db: DatabaseSync) {}
 
-  upsertSuggestion(input: TaskBridgeSuggestionInput): void {
+  private getSuggestionStatus(
+    suggestionId: string
+  ): TaskBridgeSuggestionStatus | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT status
+         FROM lcm_task_bridge_suggestions
+         WHERE suggestion_id = ?`
+      )
+      .get(suggestionId) as { status: TaskBridgeSuggestionStatus } | undefined;
+    return row?.status;
+  }
+
+  private assertSourceIdsBelongToWorkItem(
+    workItemId: string,
+    sourceIds: string[]
+  ): void {
+    const placeholders = sourceIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT source_id
+         FROM lcm_observed_work_sources
+         WHERE work_item_id = ?
+           AND source_id IN (${placeholders})`
+      )
+      .all(workItemId, ...sourceIds) as Array<{ source_id: string }>;
+    const found = new Set(rows.map((row) => row.source_id));
+    const missing = sourceIds.filter((sourceId) => !found.has(sourceId));
+    if (missing.length > 0) {
+      throw new Error(
+        `source IDs must reference observed-work evidence for this work item: ${missing.join(", ")}`
+      );
+    }
+  }
+
+  upsertSuggestion(input: TaskBridgeSuggestionInput): TaskBridgeSuggestionUpsertResult {
     const suggestionId = input.suggestionId.trim();
     if (suggestionId.length === 0) {
       throw new Error("suggestionId is required.");
@@ -118,34 +165,72 @@ export class TaskBridgeSuggestionStore {
     if (input.rationale.trim().length === 0) {
       throw new Error("rationale is required.");
     }
+    const requestedStatus = input.status ?? "pending";
+    if (requestedStatus !== "pending") {
+      throw new Error(
+        "upsertSuggestion only creates or refreshes pending suggestions; use reviewSuggestion for reviewed states."
+      );
+    }
+    const taskId = input.taskId?.trim();
+    if (TASK_TARGETING_KINDS.has(input.suggestionKind) && !taskId) {
+      throw new Error(`${input.suggestionKind} suggestions require taskId.`);
+    }
+    const existingStatus = this.getSuggestionStatus(suggestionId);
+    if (existingStatus && existingStatus !== "pending") {
+      return "preserved_reviewed";
+    }
     const sourceIds = normalizeSourceIds(input.sourceIds);
     if (sourceIds.length === 0) {
       throw new Error("at least one source ID is required.");
     }
+    this.assertSourceIdsBelongToWorkItem(workItemId, sourceIds);
     this.db.prepare(
       `INSERT INTO lcm_task_bridge_suggestions (
         suggestion_id, work_item_id, task_id, suggestion_kind, status, confidence,
         rationale, source_ids, created_by, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(suggestion_id) DO UPDATE SET
-        work_item_id = excluded.work_item_id,
-        task_id = COALESCE(excluded.task_id, lcm_task_bridge_suggestions.task_id),
-        suggestion_kind = excluded.suggestion_kind,
-        confidence = excluded.confidence,
-        rationale = excluded.rationale,
-        source_ids = excluded.source_ids,
-        updated_at = datetime('now')`,
+        work_item_id = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.work_item_id
+          ELSE lcm_task_bridge_suggestions.work_item_id
+        END,
+        task_id = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending'
+            THEN COALESCE(excluded.task_id, lcm_task_bridge_suggestions.task_id)
+          ELSE lcm_task_bridge_suggestions.task_id
+        END,
+        suggestion_kind = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.suggestion_kind
+          ELSE lcm_task_bridge_suggestions.suggestion_kind
+        END,
+        confidence = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.confidence
+          ELSE lcm_task_bridge_suggestions.confidence
+        END,
+        rationale = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.rationale
+          ELSE lcm_task_bridge_suggestions.rationale
+        END,
+        source_ids = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN excluded.source_ids
+          ELSE lcm_task_bridge_suggestions.source_ids
+        END,
+        updated_at = CASE
+          WHEN lcm_task_bridge_suggestions.status = 'pending' THEN datetime('now')
+          ELSE lcm_task_bridge_suggestions.updated_at
+        END`,
     ).run(
       suggestionId,
       workItemId,
-      input.taskId ?? null,
+      taskId ?? null,
       input.suggestionKind,
-      input.status ?? "pending",
+      "pending",
       input.confidence,
       input.rationale.trim(),
       JSON.stringify(sourceIds),
-      input.createdBy ?? "lcm_observed",
+      input.createdBy?.trim() || "lcm_observed",
     );
+    return existingStatus === "pending" ? "refreshed" : "inserted";
   }
 
   listSuggestions(input?: {
