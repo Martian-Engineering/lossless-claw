@@ -333,6 +333,19 @@ describe("TaskBridgeSuggestionStore", () => {
     });
     expect((reviewed.details as { changed: boolean }).changed).toBe(true);
     expect(taskBridge.listSuggestions({ status: "dismissed" })).toHaveLength(1);
+
+    const rerecorded = await suggestionsTool.execute("suggest-record-again", {
+      conversationId: 1,
+      mode: "record",
+    });
+    expect(
+      (rerecorded.details as { accounting: { recorded: number } }).accounting
+        .recorded
+    ).toBe(0);
+    expect(
+      (rerecorded.details as { accounting: { preservedReviewed: number } })
+        .accounting.preservedReviewed
+    ).toBe(1);
   });
 
   it("records unlinked blocker observations as task-creation suggestions", async () => {
