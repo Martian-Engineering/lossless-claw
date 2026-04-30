@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../src/db/migration.js";
+import { ObservedWorkExtractor } from "../src/observed-work-extractor.js";
+import { EventObservationStore } from "../src/store/event-observation-store.js";
 import { ObservedWorkStore } from "../src/store/observed-work-store.js";
+import { SummaryStore } from "../src/store/summary-store.js";
+import { createLcmEventSearchTool } from "../src/tools/lcm-event-search-tool.js";
 import { createLcmWorkDensityTool } from "../src/tools/lcm-work-density-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
@@ -23,6 +27,28 @@ function createConversation(db: DatabaseSync, conversationId: number): void {
   );
 }
 
+async function insertLeafSummary(input: {
+  db: DatabaseSync;
+  summaryStore: SummaryStore;
+  summaryId: string;
+  conversationId: number;
+  content: string;
+  createdAt: string;
+}): Promise<void> {
+  await input.summaryStore.insertSummary({
+    summaryId: input.summaryId,
+    conversationId: input.conversationId,
+    kind: "leaf",
+    depth: 0,
+    content: input.content,
+    tokenCount: 50,
+    sourceMessageTokenCount: 80,
+    latestAt: new Date(input.createdAt),
+  });
+  input.db.prepare(`UPDATE summaries SET created_at = ? WHERE summary_id = ?`)
+    .run(input.createdAt, input.summaryId);
+}
+
 describe("ObservedWorkStore", () => {
   it("creates observed work tables during migration", () => {
     const db = makeDb();
@@ -36,6 +62,329 @@ describe("ObservedWorkStore", () => {
       "lcm_observed_work_sources",
       "lcm_observed_work_state",
     ]);
+  });
+
+  it("extracts leaf-summary work with a rowid cursor so same-second summaries are not skipped", async () => {
+    const db = makeDb();
+    createConversation(db, 7);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+    const pointLookupSpy = vi.spyOn(observedWork, "getItem");
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 7,
+      summaryId: "sum_z_first",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #540 still has unresolved review comments",
+    });
+    expect(extractor.processConversation(7)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 7,
+      summaryId: "sum_a_later",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #541 still has failing CI",
+    });
+    expect(extractor.processConversation(7)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 7,
+      statuses: ["observed_unfinished"],
+      limit: 10,
+    });
+    expect(density.density.unfinished).toBe(2);
+    expect(density.topUnfinished.map((item) => item.topicKey).sort()).toEqual([
+      "pr-540",
+      "pr-541",
+    ]);
+    const state = observedWork.getState(7);
+    expect(state?.lastProcessedSummaryId).toBe("sum_a_later");
+    expect(state?.lastProcessedSummaryRowid).toBeGreaterThan(0);
+    expect(pointLookupSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not inflate evidence when a retry reprocesses the same summary source", async () => {
+    const db = makeDb();
+    createConversation(db, 12);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 12,
+      summaryId: "sum_retry_same_source",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #552 still has a failing extractor retry test",
+    });
+    expect(extractor.processConversation(12)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    db.prepare(`DELETE FROM lcm_observed_work_state WHERE conversation_id = ?`).run(12);
+    expect(extractor.processConversation(12)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 12,
+      statuses: ["observed_unfinished"],
+      includeSources: true,
+      limit: 10,
+    });
+    expect(density.topUnfinished).toHaveLength(1);
+    expect(density.topUnfinished[0]?.evidenceCount).toBe(1);
+    expect(density.topUnfinished[0]?.sources).toEqual([
+      expect.objectContaining({
+        sourceType: "summary",
+        sourceId: "sum_retry_same_source",
+        evidenceKind: "created",
+      }),
+    ]);
+  });
+
+  it("rolls back partial summary extraction writes before retry", async () => {
+    const db = makeDb();
+    createConversation(db, 13);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 13,
+      summaryId: "sum_partial_retry",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #553 still has partial write retry risk",
+    });
+
+    const addSourceSpy = vi.spyOn(observedWork, "addSource");
+    addSourceSpy.mockImplementationOnce(() => {
+      throw new Error("simulated source write failure");
+    });
+    expect(() => extractor.processConversation(13)).toThrow(/simulated source/);
+    addSourceSpy.mockRestore();
+
+    expect(
+      observedWork.getDensity({
+        conversationId: 13,
+        statuses: ["observed_unfinished"],
+      }).density.totalObserved
+    ).toBe(0);
+    expect(observedWork.getState(13)).toBeNull();
+
+    expect(extractor.processConversation(13)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+    const density = observedWork.getDensity({
+      conversationId: 13,
+      statuses: ["observed_unfinished"],
+      includeSources: true,
+    });
+    expect(density.topUnfinished).toHaveLength(1);
+    expect(density.topUnfinished[0]?.evidenceCount).toBe(1);
+    expect(density.topUnfinished[0]?.sources).toHaveLength(1);
+  });
+
+  it("derives the rowid cursor from the processed summary id after rowid drift", async () => {
+    const db = makeDb();
+    createConversation(db, 11);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 11,
+      summaryId: "sum_cursor_anchor",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #550 needs review",
+    });
+    expect(extractor.processConversation(11)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+    observedWork.upsertState({
+      conversationId: 11,
+      lastProcessedSummaryId: "sum_cursor_anchor",
+      lastProcessedSummaryRowid: 9999,
+    });
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 11,
+      summaryId: "sum_cursor_later",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #551 needs review",
+    });
+    expect(extractor.processConversation(11)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+    const density = observedWork.getDensity({
+      conversationId: 11,
+      statuses: ["observed_unfinished"],
+      limit: 10,
+    });
+    expect(density.topUnfinished.map((item) => item.topicKey).sort()).toEqual([
+      "pr-550",
+      "pr-551",
+    ]);
+  });
+
+  it("preserves semantic evidence kinds when reinforcing extracted work", async () => {
+    const db = makeDb();
+    createConversation(db, 9);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 9,
+      summaryId: "sum_completed_first",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Completed: PR #542 tests passed",
+    });
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 9,
+      summaryId: "sum_completed_later",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content: "- Completed: PR #542 tests passed",
+    });
+
+    expect(extractor.processConversation(9)).toMatchObject({
+      summariesScanned: 2,
+      workItemsUpserted: 2,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 9,
+      includeSources: true,
+    });
+    expect(density.completedHighlights[0]?.sources).toEqual([
+      expect.objectContaining({
+        sourceId: "sum_completed_first",
+        evidenceKind: "completed",
+      }),
+      expect.objectContaining({
+        sourceId: "sum_completed_later",
+        evidenceKind: "completed",
+      }),
+    ]);
+  });
+
+  it("records deterministic event observations and hides sources unless requested", async () => {
+    const db = makeDb();
+    createConversation(db, 8);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const events = new EventObservationStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork, events);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 8,
+      summaryId: "sum_incident",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content: [
+        "- Incident: ENOTEMPTY failed during package cleanup",
+        "- Retell: recalled the older Tarzan onboarding incident",
+      ].join("\n"),
+    });
+    expect(extractor.processConversation(8)).toMatchObject({
+      summariesScanned: 1,
+      eventsUpserted: 2,
+    });
+
+    const lcm = {
+      getEventObservationStore: () => events,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const tool = createLcmEventSearchTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "event-session",
+    });
+
+    const hidden = await tool.execute("event-hidden", {
+      conversationId: 8,
+      query: "enotempty",
+    });
+    expect((hidden.details as { accounting: { eventsIncluded: number } }).accounting.eventsIncluded).toBe(1);
+    expect(JSON.stringify(hidden.details)).not.toContain("sum_incident");
+
+    const shown = await tool.execute("event-shown", {
+      conversationId: 8,
+      query: "tarzan",
+      includeSources: true,
+    });
+    expect(JSON.stringify(shown.details)).toContain("sum_incident");
+    expect(JSON.stringify(shown.details)).toContain("retelling");
+  });
+
+  it("rolls back event observations with failed summary extraction", async () => {
+    const db = makeDb();
+    createConversation(db, 18);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const events = new EventObservationStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork, events);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 18,
+      summaryId: "sum_event_retry",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content: "- Incident: PR #650 failed deploy blocker still needs follow-up",
+    });
+
+    const addSourceSpy = vi.spyOn(observedWork, "addSource");
+    addSourceSpy.mockImplementationOnce(() => {
+      throw new Error("simulated source write failure");
+    });
+    expect(() => extractor.processConversation(18)).toThrow(/simulated source/);
+    addSourceSpy.mockRestore();
+
+    expect(
+      db.prepare(`SELECT COUNT(*) AS count FROM lcm_event_observations`).get()
+    ).toMatchObject({ count: 0 });
+    expect(observedWork.getState(18)).toBeNull();
+
+    expect(extractor.processConversation(18)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+      eventsUpserted: 1,
+    });
   });
 
   it("reports completed, unfinished, and ambiguous work density", () => {
@@ -92,6 +441,65 @@ describe("ObservedWorkStore", () => {
     expect(density.ambiguous[0]?.title).toBe("Decide task bridge policy");
   });
 
+  it("preserves temporal invariants while updating mutable metadata", () => {
+    const db = makeDb();
+    createConversation(db, 1);
+    const store = new ObservedWorkStore(db);
+    store.upsertItem({
+      workItemId: "work_temporal",
+      conversationId: 1,
+      ownerId: "agent:main",
+      description: "Initial description",
+      firstSeenAt: "2026-04-28T05:00:00.000Z",
+      lastSeenAt: "2026-04-28T06:00:00.000Z",
+      completedAt: "2026-04-28T06:00:00.000Z",
+      completionConfidence: 0.72,
+      title: "Temporal invariant test",
+      observedStatus: "observed_completed",
+      kind: "test",
+      fingerprint: "test:temporal-invariant",
+    });
+    store.upsertItem({
+      workItemId: "work_temporal",
+      conversationId: 1,
+      ownerId: "agent:reviewer",
+      description: "Updated description",
+      firstSeenAt: "2026-04-28T04:00:00.000Z",
+      lastSeenAt: "2026-04-28T05:30:00.000Z",
+      completedAt: "2026-04-28T05:30:00.000Z",
+      completionConfidence: 0.91,
+      title: "Temporal invariant test updated",
+      observedStatus: "observed_completed",
+      kind: "test",
+      fingerprint: "test:temporal-invariant",
+    });
+
+    const row = db
+      .prepare(
+        `SELECT owner_id, description, title, first_seen_at, last_seen_at, completed_at, completion_confidence
+         FROM lcm_observed_work_items
+         WHERE work_item_id = ?`,
+      )
+      .get("work_temporal") as {
+      owner_id: string;
+      description: string;
+      title: string;
+      first_seen_at: string;
+      last_seen_at: string;
+      completed_at: string;
+      completion_confidence: number;
+    };
+    expect(row).toMatchObject({
+      owner_id: "agent:reviewer",
+      description: "Updated description",
+      title: "Temporal invariant test updated",
+      first_seen_at: "2026-04-28T04:00:00.000Z",
+      last_seen_at: "2026-04-28T06:00:00.000Z",
+      completed_at: "2026-04-28T05:30:00.000Z",
+      completion_confidence: 0.91,
+    });
+  });
+
   it("hides sources by default and includes them only when requested", () => {
     const db = makeDb();
     createConversation(db, 1);
@@ -126,6 +534,53 @@ describe("ObservedWorkStore", () => {
         evidenceKind: "created",
       },
     ]);
+
+    store.addSource({
+      workItemId: "work_with_sources",
+      sourceType: "summary",
+      sourceId: "sum_hidden",
+      ordinal: 5,
+      evidenceKind: "created",
+    });
+    const reordered = store.getDensity({ conversationId: 1, includeSources: true });
+    expect(reordered.topUnfinished[0]?.sources?.[0]?.ordinal).toBe(5);
+  });
+
+  it("bounds density detail rows and only loads sources for included items", () => {
+    const db = makeDb();
+    createConversation(db, 1);
+    const store = new ObservedWorkStore(db);
+    for (const index of [1, 2, 3]) {
+      store.upsertItem({
+        workItemId: `work_limited_${index}`,
+        conversationId: 1,
+        firstSeenAt: `2026-04-28T0${index}:00:00.000Z`,
+        lastSeenAt: `2026-04-28T0${index}:30:00.000Z`,
+        title: `Limited unfinished ${index}`,
+        observedStatus: "observed_unfinished",
+        kind: "review",
+        fingerprint: `review:limited:${index}`,
+      });
+      store.addSource({
+        workItemId: `work_limited_${index}`,
+        sourceType: "summary",
+        sourceId: `sum_limited_${index}`,
+        ordinal: index,
+        evidenceKind: "created",
+      });
+    }
+
+    const density = store.getDensity({
+      conversationId: 1,
+      includeSources: true,
+      limit: 1,
+    });
+    expect(density.density.unfinished).toBe(3);
+    expect(density.topUnfinished).toHaveLength(1);
+    expect(density.itemsOmitted).toBe(2);
+    expect(JSON.stringify(density)).toContain("sum_limited_3");
+    expect(JSON.stringify(density)).not.toContain("sum_limited_1");
+    expect(JSON.stringify(density)).not.toContain("sum_limited_2");
   });
 
   it("tracks incremental processing state", () => {
@@ -223,12 +678,36 @@ describe("ObservedWorkStore", () => {
       expect(JSON.stringify(shown.details)).toContain("sum_today");
       expect((shown.details as { period?: string }).period).toBe("today");
 
-      const all = await tool.execute("density-all", {
-        allConversations: true,
-        period: "today",
+      const week = await tool.execute("density-week", {
+        conversationId: 1,
+        period: "week",
+        detailLevel: 0,
       });
-      expect((all.details as { error?: string }).error).toMatch(
-        /does not support allConversations/,
+      expect((week.details as { density: { totalObserved: number }; window?: { since?: string; before?: string } }).density.totalObserved).toBe(2);
+      expect((week.details as { window?: { since?: string; before?: string } }).window).toMatchObject({
+        since: "2026-04-27T00:00:00.000Z",
+        before: "2026-05-04T00:00:00.000Z",
+      });
+
+      const sinceOverride = await tool.execute("density-since-override", {
+        conversationId: 1,
+        period: "week",
+        since: "2026-04-28T00:00:00.000Z",
+        detailLevel: 0,
+      });
+      expect((sinceOverride.details as { density: { totalObserved: number } }).density.totalObserved).toBe(1);
+
+      const invalid = await tool.execute("density-invalid-period", {
+        conversationId: 1,
+        period: "quarter",
+      });
+      expect((invalid.details as { error?: string }).error).toContain("period must be one of");
+
+      const global = await tool.execute("density-global", {
+        allConversations: true,
+      });
+      expect((global.details as { error?: string }).error).toContain(
+        "does not support allConversations=true",
       );
     } finally {
       vi.useRealTimers();
