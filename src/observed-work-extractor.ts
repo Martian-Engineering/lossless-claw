@@ -58,6 +58,14 @@ type PendingObservedWork = {
   workItemId: string;
 };
 
+type PendingEventObservation = {
+  row: LeafSummaryRow;
+  observedAt: string;
+  createdAt: string;
+  ordinal: number;
+  event: EventCandidate;
+};
+
 const COMPLETED_RE = /\b(completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed)\b/i;
 const UNFINISHED_RE = /\b(todo|follow[- ]?up|needs?|remaining|blocked|blocker|failing|failed|pending|unresolved|changes requested|not done|regression|risk)\b/i;
 const DECISION_RE = /\b(decision|decided|agreed|settled|approved|chose)\b/i;
@@ -247,6 +255,7 @@ export class ObservedWorkExtractor {
     const pendingRows: Array<{
       row: LeafSummaryRow;
       entries: PendingObservedWork[];
+      events: PendingEventObservation[];
     }> = [];
     const workItemIds = new Set<string>();
 
@@ -254,6 +263,7 @@ export class ObservedWorkExtractor {
       const observedAt = toIso(row.effective_at ?? row.created_at);
       const createdAt = toIso(row.created_at);
       const entries: PendingObservedWork[] = [];
+      const events: PendingEventObservation[] = [];
       let ordinal = 0;
       for (const line of extractLines(row.content)) {
         const work = classifyWork(line);
@@ -272,26 +282,17 @@ export class ObservedWorkExtractor {
         }
         const event = classifyEvent(line);
         if (event && this.eventObservationStore) {
-          const eventId = hashId("ev", `${conversationId}:${row.summary_id}:${ordinal}:${event.eventKind}:${event.title}`);
-          this.eventObservationStore.upsertObservation({
-            eventId,
-            conversationId,
-            eventKind: event.eventKind,
-            title: event.title,
-            queryKey: event.queryKey,
-            eventTime: observedAt,
-            ingestTime: createdAt,
-            confidence: event.confidence,
-            rationale: event.rationale,
-            sourceType: "summary",
-            sourceId: row.summary_id,
-            sourceIds: [row.summary_id],
+          events.push({
+            row,
+            observedAt,
+            createdAt,
+            ordinal,
+            event,
           });
-          eventsUpserted += 1;
         }
         ordinal += 1;
       }
-      pendingRows.push({ row, entries });
+      pendingRows.push({ row, entries, events });
     }
 
     const existingByWorkItemId = this.loadExistingItems([...workItemIds]);
@@ -303,7 +304,32 @@ export class ObservedWorkExtractor {
 
     for (const pendingRow of pendingRows) {
       let rowWorkItemsUpserted = 0;
+      let rowEventsUpserted = 0;
       this.withSummarySavepoint(pendingRow.row.summary_rowid, () => {
+        for (const pendingEvent of pendingRow.events) {
+          if (!this.eventObservationStore) {
+            continue;
+          }
+          const eventId = hashId(
+            "ev",
+            `${conversationId}:${pendingEvent.row.summary_id}:${pendingEvent.ordinal}:${pendingEvent.event.eventKind}:${pendingEvent.event.title}`,
+          );
+          this.eventObservationStore.upsertObservation({
+            eventId,
+            conversationId,
+            eventKind: pendingEvent.event.eventKind,
+            title: pendingEvent.event.title,
+            queryKey: pendingEvent.event.queryKey,
+            eventTime: pendingEvent.observedAt,
+            ingestTime: pendingEvent.createdAt,
+            confidence: pendingEvent.event.confidence,
+            rationale: pendingEvent.event.rationale,
+            sourceType: "summary",
+            sourceId: pendingEvent.row.summary_id,
+            sourceIds: [pendingEvent.row.summary_id],
+          });
+          rowEventsUpserted += 1;
+        }
         for (const entry of pendingRow.entries) {
           const existing = existingByWorkItemId.get(entry.workItemId);
           const sourceAlreadyRecorded = this.observedWorkStore.hasSource({
@@ -367,6 +393,7 @@ export class ObservedWorkExtractor {
         });
       });
       workItemsUpserted += rowWorkItemsUpserted;
+      eventsUpserted += rowEventsUpserted;
     }
     return {
       summariesScanned: rows.length,

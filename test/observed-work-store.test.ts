@@ -351,6 +351,42 @@ describe("ObservedWorkStore", () => {
     expect(JSON.stringify(shown.details)).toContain("retelling");
   });
 
+  it("rolls back event observations with failed summary extraction", async () => {
+    const db = makeDb();
+    createConversation(db, 18);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const events = new EventObservationStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork, events);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 18,
+      summaryId: "sum_event_retry",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content: "- Incident: PR #650 failed deploy blocker still needs follow-up",
+    });
+
+    const addSourceSpy = vi.spyOn(observedWork, "addSource");
+    addSourceSpy.mockImplementationOnce(() => {
+      throw new Error("simulated source write failure");
+    });
+    expect(() => extractor.processConversation(18)).toThrow(/simulated source/);
+    addSourceSpy.mockRestore();
+
+    expect(
+      db.prepare(`SELECT COUNT(*) AS count FROM lcm_event_observations`).get()
+    ).toMatchObject({ count: 0 });
+    expect(observedWork.getState(18)).toBeNull();
+
+    expect(extractor.processConversation(18)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+      eventsUpserted: 1,
+    });
+  });
+
   it("reports completed, unfinished, and ambiguous work density", () => {
     const db = makeDb();
     createConversation(db, 1);
