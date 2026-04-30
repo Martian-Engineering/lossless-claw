@@ -475,6 +475,15 @@ describe("ObservedWorkStore", () => {
         evidenceKind: "created",
       });
     }
+    for (let index = 4; index <= 30; index += 1) {
+      store.addSource({
+        workItemId: "work_limited_3",
+        sourceType: "summary",
+        sourceId: `sum_limited_extra_${index}`,
+        ordinal: index,
+        evidenceKind: "reinforced",
+      });
+    }
 
     const density = store.getDensity({
       conversationId: 1,
@@ -485,6 +494,10 @@ describe("ObservedWorkStore", () => {
     expect(density.topUnfinished).toHaveLength(1);
     expect(density.itemsOmitted).toBe(2);
     expect(JSON.stringify(density)).toContain("sum_limited_3");
+    expect(density.topUnfinished[0]?.sources).toHaveLength(20);
+    expect(density.topUnfinished[0]?.sources?.map((source) => source.sourceId)).not.toContain(
+      "sum_limited_extra_30",
+    );
     expect(JSON.stringify(density)).not.toContain("sum_limited_1");
     expect(JSON.stringify(density)).not.toContain("sum_limited_2");
   });
