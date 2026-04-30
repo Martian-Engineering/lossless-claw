@@ -67,6 +67,20 @@ describe("LCM temporal rollup MVP", () => {
         )
         .get()
     ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'messages_conversation_created_at_idx'"
+        )
+        .get()
+    ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'messages_created_at_idx'"
+        )
+        .get()
+    ).toBeTruthy();
   });
 
   it("builds a stable daily rollup and preserves rollup_id across rebuilds", async () => {
@@ -1593,6 +1607,61 @@ describe("LCM weekly and monthly rollups", () => {
       rollupStore.getRollup(conversation.conversationId, "week", "2026-04-27")
         ?.status
     ).toBe("ready");
+  });
+
+  it("does not build ready aggregate rollups from stale daily sources", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "stale-daily-aggregate",
+      sessionKey: "agent:main:stale-daily-aggregate",
+      title: "Stale daily aggregate",
+    });
+    const weekDays = [
+      "2026-04-27",
+      "2026-04-28",
+      "2026-04-29",
+      "2026-04-30",
+      "2026-05-01",
+      "2026-05-02",
+      "2026-05-03",
+    ];
+    for (const day of weekDays) {
+      await summaryStore.insertSummary({
+        summaryId: `sum_stale_daily_${day}`,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `Daily source for ${day}.`,
+        tokenCount: 10,
+        sourceMessageTokenCount: 10,
+        latestAt: new Date(`${day}T10:00:00.000Z`),
+      });
+    }
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    for (const day of weekDays) {
+      await expect(
+        builder.buildDayRollup(conversation.conversationId, day)
+      ).resolves.toBe(true);
+    }
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(true);
+
+    const staleDay = rollupStore.getRollup(
+      conversation.conversationId,
+      "day",
+      "2026-04-29"
+    );
+    expect(staleDay).toBeTruthy();
+    rollupStore.markStale(staleDay!.rollup_id);
+
+    await expect(
+      builder.buildWeeklyRollup(conversation.conversationId, "2026-04-27")
+    ).resolves.toBe(false);
+    expect(
+      rollupStore.getRollup(conversation.conversationId, "week", "2026-04-27")
+    ).toBeNull();
   });
 
   it("builds aggregate week/month rollups from stable daily rollups", async () => {
