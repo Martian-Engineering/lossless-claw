@@ -577,6 +577,58 @@ describe("ObservedWorkStore", () => {
     expect(details.accounting.episodesIncluded).toBeGreaterThan(0);
   });
 
+  it("orders episodes by recent activity unless first occurrence is requested", () => {
+    const db = makeDb();
+    createConversation(db, 17);
+    const events = new EventObservationStore(db);
+    events.upsertObservation({
+      eventId: "ev_old_first",
+      conversationId: 17,
+      eventKind: "operational_incident",
+      title: "Old incident first report",
+      queryKey: "old-incident",
+      eventTime: "2026-04-01T10:00:00.000Z",
+      ingestTime: "2026-04-01T10:00:00.000Z",
+      confidence: 0.7,
+      rationale: "initial event",
+      sourceType: "summary",
+      sourceId: "sum_old_first",
+    });
+    events.upsertObservation({
+      eventId: "ev_other_middle",
+      conversationId: 17,
+      eventKind: "operational_incident",
+      title: "Middle incident report",
+      queryKey: "middle-incident",
+      eventTime: "2026-04-20T10:00:00.000Z",
+      ingestTime: "2026-04-20T10:00:00.000Z",
+      confidence: 0.8,
+      rationale: "middle event",
+      sourceType: "summary",
+      sourceId: "sum_middle",
+    });
+    events.upsertObservation({
+      eventId: "ev_old_later",
+      conversationId: 17,
+      eventKind: "operational_incident",
+      title: "Old incident later follow-up",
+      queryKey: "old-incident",
+      eventTime: "2026-04-29T10:00:00.000Z",
+      ingestTime: "2026-04-29T10:00:00.000Z",
+      confidence: 0.75,
+      rationale: "later event",
+      sourceType: "summary",
+      sourceId: "sum_old_later",
+    });
+
+    expect(events.listEpisodes({ conversationId: 17 })[0]?.topicKey).toBe(
+      "old-incident"
+    );
+    expect(events.listEpisodes({ conversationId: 17, first: true })[0]?.topicKey).toBe(
+      "old-incident"
+    );
+  });
+
   it("reports completed, unfinished, and ambiguous work density", () => {
     const db = makeDb();
     createConversation(db, 1);

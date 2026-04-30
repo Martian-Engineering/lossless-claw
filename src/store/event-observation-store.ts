@@ -493,6 +493,7 @@ export class EventObservationStore {
     }
     const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
     const order = input?.first ? "ASC" : "DESC";
+    const orderColumn = input?.first ? "first_event_time" : "last_event_time";
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db.prepare(
       `SELECT episode_id, conversation_id, episode_kind, topic_key, title,
@@ -500,7 +501,7 @@ export class EventObservationStore {
               source_ids, created_at, updated_at
        FROM lcm_event_episodes
        ${whereSql}
-       ORDER BY julianday(first_event_time) ${order}, confidence DESC
+       ORDER BY julianday(${orderColumn}) ${order}, confidence DESC
        LIMIT ?`,
     ).all(...args, limit) as EventEpisodeRow[];
     return rows.map((row) => rowToEpisode(row, input?.includeSources === true));
