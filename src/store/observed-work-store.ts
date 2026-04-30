@@ -403,19 +403,30 @@ export class ObservedWorkStore {
   }
 
   private getSourcesForWorkItems(
-    workItemIds: string[]
+    workItemIds: string[],
+    perItemLimit = 20,
   ): Map<string, ObservedWorkSource[]> {
     if (workItemIds.length === 0) {
       return new Map();
     }
+    const sourceLimit = Math.max(1, Math.min(Math.trunc(perItemLimit), 50));
     const rows = this.db
       .prepare(
-        `SELECT work_item_id, source_type, source_id, ordinal, evidence_kind
-         FROM lcm_observed_work_sources
-         WHERE work_item_id IN (${placeholders(workItemIds)})
+        `WITH ranked_sources AS (
+           SELECT work_item_id, source_type, source_id, ordinal, evidence_kind,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY work_item_id
+                    ORDER BY ordinal ASC, created_at ASC
+                  ) AS source_rank
+           FROM lcm_observed_work_sources
+           WHERE work_item_id IN (${placeholders(workItemIds)})
+         )
+         SELECT work_item_id, source_type, source_id, ordinal, evidence_kind
+         FROM ranked_sources
+         WHERE source_rank <= ?
          ORDER BY work_item_id ASC, ordinal ASC`
       )
-      .all(...workItemIds) as ObservedWorkSourceRow[];
+      .all(...workItemIds, sourceLimit) as ObservedWorkSourceRow[];
     const grouped = new Map<string, ObservedWorkSource[]>();
     for (const row of rows) {
       const sources = grouped.get(row.work_item_id) ?? [];
