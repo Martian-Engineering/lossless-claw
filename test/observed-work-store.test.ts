@@ -1048,11 +1048,24 @@ describe("ObservedWorkStore", () => {
         ordinal: index,
         evidenceKind: "reinforced",
       });
+      store.addTransition({
+        transitionId: `transition_limited_${index}`,
+        workItemId: "work_limited_3",
+        transitionType: "reinforced",
+        fromStatus: "observed_unfinished",
+        toStatus: "observed_unfinished",
+        observedAt: `2026-04-28T03:${String(index).padStart(2, "0")}:00.000Z`,
+        confidence: 0.7,
+        rationale: "Synthetic transition used to prove detail caps.",
+        sourceType: "summary",
+        sourceId: `sum_limited_extra_${index}`,
+      });
     }
 
     const density = store.getDensity({
       conversationId: 1,
       includeSources: true,
+      includeTransitions: true,
       limit: 1,
     });
     expect(density.density.unfinished).toBe(3);
@@ -1060,8 +1073,15 @@ describe("ObservedWorkStore", () => {
     expect(density.itemsOmitted).toBe(2);
     expect(JSON.stringify(density)).toContain("sum_limited_3");
     expect(density.topUnfinished[0]?.sources).toHaveLength(20);
+    expect(density.transitions).toHaveLength(20);
     expect(density.topUnfinished[0]?.sources?.map((source) => source.sourceId)).not.toContain(
       "sum_limited_extra_30",
+    );
+    expect(density.transitions?.map((transition) => transition.sourceId)).toContain(
+      "sum_limited_extra_30",
+    );
+    expect(density.transitions?.map((transition) => transition.sourceId)).not.toContain(
+      "sum_limited_extra_10",
     );
     expect(JSON.stringify(density)).not.toContain("sum_limited_1");
     expect(JSON.stringify(density)).not.toContain("sum_limited_2");

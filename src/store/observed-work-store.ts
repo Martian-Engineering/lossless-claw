@@ -760,17 +760,29 @@ export class ObservedWorkStore {
   private getTransitionsForWorkItems(
     workItemIds: string[],
     includeSources: boolean,
+    perItemLimit = 20,
   ): ObservedWorkTransition[] {
     if (workItemIds.length === 0) {
       return [];
     }
+    const transitionLimit = Math.max(1, Math.min(Math.trunc(perItemLimit), 50));
     const rows = this.db.prepare(
-      `SELECT transition_id, work_item_id, transition_type, from_status, to_status,
+      `WITH ranked_transitions AS (
+         SELECT transition_id, work_item_id, transition_type, from_status, to_status,
+                observed_at, confidence, rationale, source_type, source_id,
+                ROW_NUMBER() OVER (
+                  PARTITION BY work_item_id
+                  ORDER BY observed_at DESC, created_at DESC
+                ) AS source_rank
+         FROM lcm_observed_work_transitions
+         WHERE work_item_id IN (${placeholders(workItemIds)})
+       )
+       SELECT transition_id, work_item_id, transition_type, from_status, to_status,
               observed_at, confidence, rationale, source_type, source_id
-       FROM lcm_observed_work_transitions
-       WHERE work_item_id IN (${placeholders(workItemIds)})
-       ORDER BY observed_at DESC, created_at DESC`,
-    ).all(...workItemIds) as ObservedWorkTransitionRow[];
+       FROM ranked_transitions
+       WHERE source_rank <= ?
+       ORDER BY work_item_id ASC, observed_at DESC`,
+    ).all(...workItemIds, transitionLimit) as ObservedWorkTransitionRow[];
     return rows.map((row) => rowToTransition(row, includeSources));
   }
 
