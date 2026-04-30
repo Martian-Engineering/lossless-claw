@@ -1479,10 +1479,17 @@ describe("LCM weekly and monthly rollups", () => {
       )
       .run("Bravo work item.", "sum_same");
 
-    const result = await builder.buildDailyRollups(conversation.conversationId, {
-      forceCurrentDay: true,
-      daysBack: 3,
-    });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T12:00:00.000Z"));
+    let result!: Awaited<ReturnType<RollupBuilder["buildDailyRollups"]>>;
+    try {
+      result = await builder.buildDailyRollups(conversation.conversationId, {
+        forceCurrentDay: true,
+        daysBack: 2,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
     expect(result.built).toBeGreaterThan(0);
     const second = rollupStore.getRollup(
       conversation.conversationId,
@@ -1583,10 +1590,17 @@ describe("LCM weekly and monthly rollups", () => {
     const day = rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27");
     rollupStore.markStale(day!.rollup_id);
 
-    const daily = await builder.buildDailyRollups(conversation.conversationId, {
-      forceCurrentDay: true,
-      daysBack: 3,
-    });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T12:00:00.000Z"));
+    let daily!: Awaited<ReturnType<RollupBuilder["buildDailyRollups"]>>;
+    try {
+      daily = await builder.buildDailyRollups(conversation.conversationId, {
+        forceCurrentDay: true,
+        daysBack: 2,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
     expect(daily.built).toBeGreaterThan(0);
     expect(
       rollupStore.getRollup(conversation.conversationId, "day", "2026-04-27")
@@ -2344,10 +2358,17 @@ describe("LCM weekly and monthly rollups", () => {
       });
 
     const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
-    const result = await builder.buildDailyRollups(conversation.conversationId, {
-      forceCurrentDay: true,
-      daysBack: 3,
-    });
+    let result!: Awaited<ReturnType<RollupBuilder["buildDailyRollups"]>>;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-28T12:00:00.000Z"));
+    try {
+      result = await builder.buildDailyRollups(conversation.conversationId, {
+        forceCurrentDay: true,
+        daysBack: 2,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
     upsertSpy.mockRestore();
 
     expect(result.built).toBe(1);
