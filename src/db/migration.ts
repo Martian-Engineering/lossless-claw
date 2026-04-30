@@ -1170,6 +1170,12 @@ export function runLcmMigrations(
           julianday(coalesce(latest_at, earliest_at, created_at))
         )
         WHERE kind = 'leaf';
+
+        CREATE INDEX IF NOT EXISTS messages_conversation_created_at_idx
+        ON messages (conversation_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS messages_created_at_idx
+        ON messages (created_at);
       `);
     });
 
