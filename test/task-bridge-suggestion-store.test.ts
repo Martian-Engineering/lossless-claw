@@ -185,11 +185,14 @@ describe("TaskBridgeSuggestionStore", () => {
       store.reviewSuggestion({
         suggestionId: "sug_2",
         status: "dismissed",
+        reviewedBy: "second-reviewer",
       })
-    ).toBe(true);
-    const dismissed = store.listSuggestions({ status: "dismissed" });
-    expect(dismissed[0]).toMatchObject({
+    ).toBe(false);
+    expect(store.listSuggestions({ status: "dismissed" })).toHaveLength(0);
+    const acceptedAfterSecondReview = store.listSuggestions({ status: "accepted" });
+    expect(acceptedAfterSecondReview[0]).toMatchObject({
       suggestionId: "sug_2",
+      status: "accepted",
       reviewedBy: "tester",
     });
   });
