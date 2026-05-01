@@ -1104,6 +1104,76 @@ describe("ObservedWorkStore", () => {
     expect(reordered.topUnfinished[0]?.sources?.[0]?.ordinal).toBe(5);
   });
 
+  it("matches density topics against keys, titles, and rationales with escaped literals", () => {
+    const db = makeDb();
+    createConversation(db, 1);
+    const store = new ObservedWorkStore(db);
+    const base = {
+      conversationId: 1,
+      firstSeenAt: "2026-04-28T00:00:00.000Z",
+      lastSeenAt: "2026-04-28T01:00:00.000Z",
+      observedStatus: "observed_unfinished" as const,
+      kind: "review" as const,
+    };
+    store.upsertItem({
+      ...base,
+      workItemId: "work_pr_topic",
+      title: "Review topic-key normalization",
+      topicKey: "pr-777",
+      rationale: "Observed review evidence.",
+      fingerprint: "review:pr-777",
+    });
+    store.upsertItem({
+      ...base,
+      workItemId: "work_title_topic",
+      title: "Lexar drive recovery remains open",
+      topicKey: "storage",
+      rationale: "Observed recovery evidence.",
+      fingerprint: "review:lexar-title",
+    });
+    store.upsertItem({
+      ...base,
+      workItemId: "work_rationale_topic",
+      title: "Package cleanup review",
+      topicKey: "cleanup",
+      rationale: "ENOTEMPTY follow-up still needs verification.",
+      fingerprint: "review:enotempty-rationale",
+    });
+    store.upsertItem({
+      ...base,
+      workItemId: "work_literal_percent",
+      title: "Investigate 100% CPU regression",
+      topicKey: "perf",
+      rationale: "Literal percent sign should be escaped.",
+      fingerprint: "review:literal-percent",
+    });
+    store.upsertItem({
+      ...base,
+      workItemId: "work_not_percent",
+      title: "Investigate 100x CPU regression",
+      topicKey: "perf-alt",
+      rationale: "Should not match a percent wildcard.",
+      fingerprint: "review:not-percent",
+    });
+
+    expect(
+      store.getDensity({ conversationId: 1, topic: "PR 777" }).topUnfinished
+        .map((item) => item.workItemId)
+    ).toEqual(["work_pr_topic"]);
+    expect(
+      store.getDensity({ conversationId: 1, topic: "lexar drive" }).topUnfinished
+        .map((item) => item.workItemId)
+    ).toEqual(["work_title_topic"]);
+    expect(
+      store.getDensity({ conversationId: 1, topic: "ENOTEMPTY" }).topUnfinished
+        .map((item) => item.workItemId)
+    ).toEqual(["work_rationale_topic"]);
+    expect(
+      store.getDensity({ conversationId: 1, topic: "100%" }).topUnfinished
+        .map((item) => item.workItemId)
+    ).toEqual(["work_literal_percent"]);
+  });
+
   it("bounds density detail rows and only loads sources for included items", () => {
     const db = makeDb();
     createConversation(db, 1);

@@ -278,6 +278,19 @@ function placeholders(values: readonly unknown[]): string {
   return values.map(() => "?").join(", ");
 }
 
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (part) => `\\${part}`);
+}
+
+function normalizeTopicQuery(value: string | undefined): string | null {
+  const normalized = value?.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!normalized) {
+    return null;
+  }
+  const pr = /^(?:pr|pull request)\s*#?\s*(\d{1,6})$/.exec(normalized);
+  return pr?.[1] ? `pr-${pr[1]}` : normalized;
+}
+
 export class ObservedWorkStore {
   constructor(private readonly db: DatabaseSync) {}
 
@@ -636,9 +649,16 @@ export class ObservedWorkStore {
       where.push(`kind IN (${placeholders(query.kinds)})`);
       args.push(...query.kinds);
     }
-    if (query.topic) {
-      where.push("topic_key = ?");
-      args.push(query.topic);
+    const topic = normalizeTopicQuery(query.topic);
+    if (topic) {
+      const topicPattern = `%${escapeLikePattern(topic)}%`;
+      where.push(
+        `(lower(coalesce(topic_key, '')) = ?
+          OR lower(coalesce(topic_key, '')) LIKE ? ESCAPE '\\'
+          OR lower(title) LIKE ? ESCAPE '\\'
+          OR lower(coalesce(rationale, '')) LIKE ? ESCAPE '\\')`
+      );
+      args.push(topic, topicPattern, topicPattern, topicPattern);
     }
     if (query.minConfidence != null) {
       where.push("confidence >= ?");
