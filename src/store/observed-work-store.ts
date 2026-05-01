@@ -308,7 +308,13 @@ export class ObservedWorkStore {
   }
 
   getDensity(query: ObservedWorkDensityQuery): ObservedWorkDensityResult {
-    const where: string[] = [];
+    const where: string[] = [
+      `EXISTS (
+        SELECT 1
+        FROM lcm_observed_work_sources src
+        WHERE src.work_item_id = lcm_observed_work_items.work_item_id
+      )`,
+    ];
     const args: unknown[] = [];
     if (query.conversationId != null) {
       where.push("conversation_id = ?");
@@ -340,7 +346,7 @@ export class ObservedWorkStore {
     }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const limit = Math.max(1, Math.min(query.limit ?? 10, 50));
-    const ambiguousLimit = Math.min(limit, 10);
+    const ambiguousLimit = limit;
     const counts = this.db.prepare(
       `SELECT
          COUNT(*) AS total_observed,
