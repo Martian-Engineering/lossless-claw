@@ -1176,6 +1176,12 @@ export function runLcmMigrations(
 
         CREATE INDEX IF NOT EXISTS messages_created_at_idx
         ON messages (created_at);
+
+        CREATE INDEX IF NOT EXISTS messages_conversation_created_at_jd_idx
+        ON messages (conversation_id, julianday(created_at));
+
+        CREATE INDEX IF NOT EXISTS messages_created_at_jd_idx
+        ON messages (julianday(created_at));
       `);
     });
 
