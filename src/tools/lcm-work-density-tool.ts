@@ -40,7 +40,11 @@ const KIND_VALUES = [
 
 const LcmWorkDensitySchema = Type.Object({
   conversationId: Type.Optional(Type.Number({ description: "Conversation ID to inspect. Defaults to the current session conversation." })),
-  allConversations: Type.Optional(Type.Boolean({ description: "Explicitly inspect all conversations. Defaults to false." })),
+  allConversations: Type.Optional(
+    Type.Boolean({
+      description: "Reserved for a future bounded admin mode; currently rejected so density reads stay conversation-scoped.",
+    })
+  ),
   period: Type.Optional(Type.String({ description: 'Observed work period: "today", "yesterday", "7d", "30d", "week", "month", or "date:YYYY-MM-DD". Explicit since/before wins when provided.' })),
   since: Type.Optional(Type.String({ description: "Only include observed items last seen at or after this ISO timestamp." })),
   before: Type.Optional(Type.String({ description: "Only include observed items first seen before this ISO timestamp." })),
@@ -177,7 +181,7 @@ export function createLcmWorkDensityTool(input: {
         params: p,
       });
       if (!scope.allConversations && scope.conversationId == null) {
-        return jsonResult({ error: "No LCM conversation found for this session. Provide conversationId or set allConversations=true." });
+        return jsonResult({ error: "No LCM conversation found for this session. Provide conversationId." });
       }
       if (scope.allConversations) {
         return jsonResult({
