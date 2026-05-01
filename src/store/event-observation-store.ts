@@ -135,6 +135,20 @@ function isEventSourceType(value: unknown): value is "summary" | "rollup" | "mes
   return value === "summary" || value === "rollup" || value === "message";
 }
 
+function normalizeQueryKey(value: string | undefined): string | null {
+  const normalized = value?.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!normalized) {
+    return null;
+  }
+  const pr =
+    /^(?:pr|pull request)\s*#?\s*(\d{1,6})$/.exec(normalized) ??
+    /^pr[-\s#]*(\d{1,6})$/.exec(normalized);
+  if (pr?.[1]) {
+    return `pr-${pr[1]}`;
+  }
+  return normalized;
+}
+
 function parseSources(
   raw: string,
   fallbackSourceType?: "summary" | "rollup" | "message",
@@ -272,6 +286,13 @@ export class EventObservationStore {
     }
     const sourceIds = normalizeSourceIds(input.sourceIds, sourceId);
     const queryKey = normalizeQueryKey(input.queryKey) ?? "uncategorized";
+    const previousEpisodeIds = (
+      this.db.prepare(
+        `SELECT episode_id
+         FROM lcm_event_episode_observations
+        WHERE event_id = ?`,
+      ).all(input.eventId) as Array<{ episode_id: string }>
+    ).map((row) => row.episode_id);
     this.db.prepare(
       `INSERT INTO lcm_event_observations (
         event_id, conversation_id, event_kind, title, description, query_key,
@@ -307,7 +328,7 @@ export class EventObservationStore {
       sourceId,
       JSON.stringify(sourceIds),
     );
-    this.upsertEpisodeFromObservation({
+    const episodeId = this.upsertEpisodeFromObservation({
       eventId: input.eventId,
       conversationId: input.conversationId,
       eventKind: input.eventKind,
@@ -318,6 +339,18 @@ export class EventObservationStore {
       sourceType: input.sourceType,
       sourceIds,
     });
+    const staleEpisodeIds = [...new Set(previousEpisodeIds)]
+      .filter((previousEpisodeId) => previousEpisodeId !== episodeId);
+    if (staleEpisodeIds.length > 0) {
+      this.db.prepare(
+        `DELETE FROM lcm_event_episode_observations
+         WHERE event_id = ? AND episode_id != ?`,
+      ).run(input.eventId, episodeId);
+    }
+    this.rebuildEpisode(episodeId);
+    for (const staleEpisodeId of staleEpisodeIds) {
+      this.rebuildEpisode(staleEpisodeId);
+    }
   }
 
   private upsertEpisodeFromObservation(input: {
@@ -330,7 +363,7 @@ export class EventObservationStore {
     confidence: number;
     sourceType: "summary" | "rollup" | "message";
     sourceIds: string[];
-  }): void {
+  }): string {
     const episodeId = hashId(
       "ep",
       `${input.conversationId}:${input.eventKind}:${input.queryKey}`,
@@ -402,6 +435,79 @@ export class EventObservationStore {
        SET observation_count = ?, updated_at = datetime('now')
        WHERE episode_id = ?`,
     ).run(count.count, episodeId);
+    return episodeId;
+  }
+
+  private rebuildEpisode(episodeId: string): void {
+    const rows = this.db.prepare(
+      `SELECT
+         eo.event_id,
+         eo.conversation_id,
+         eo.event_kind,
+         eo.title,
+         eo.query_key,
+         eo.event_time,
+         eo.ingest_time,
+         eo.confidence,
+         eo.source_type,
+         eo.source_ids
+       FROM lcm_event_episode_observations link
+       JOIN lcm_event_observations eo ON eo.event_id = link.event_id
+       WHERE link.episode_id = ?
+       ORDER BY
+         julianday(coalesce(eo.event_time, eo.ingest_time)) ASC,
+         link.ordinal ASC,
+         eo.event_id ASC`,
+    ).all(episodeId) as Array<{
+      event_id: string;
+      conversation_id: number;
+      event_kind: EventObservationKind;
+      title: string;
+      query_key: string | null;
+      event_time: string | null;
+      ingest_time: string;
+      confidence: number;
+      source_type: "summary" | "rollup" | "message";
+      source_ids: string;
+    }>;
+    if (rows.length === 0) {
+      this.db.prepare(
+        `DELETE FROM lcm_event_episodes
+         WHERE episode_id = ?`,
+      ).run(episodeId);
+      return;
+    }
+    const first = rows[0]!;
+    const last = rows[rows.length - 1]!;
+    const sources = normalizeSources(
+      rows.flatMap((row) => parseSources(row.source_ids, row.source_type)),
+    );
+    const confidence = Math.max(...rows.map((row) => row.confidence));
+    this.db.prepare(
+      `UPDATE lcm_event_episodes
+       SET conversation_id = ?,
+           episode_kind = ?,
+           topic_key = ?,
+           title = ?,
+           first_event_time = ?,
+           last_event_time = ?,
+           observation_count = ?,
+           confidence = ?,
+           source_ids = ?,
+           updated_at = datetime('now')
+       WHERE episode_id = ?`,
+    ).run(
+      first.conversation_id,
+      first.event_kind,
+      first.query_key ?? "uncategorized",
+      first.title,
+      first.event_time ?? first.ingest_time,
+      last.event_time ?? last.ingest_time,
+      rows.length,
+      confidence,
+      JSON.stringify(sources),
+      episodeId,
+    );
   }
 
   listObservations(input?: {
@@ -475,7 +581,7 @@ export class EventObservationStore {
       where.push(`episode_kind IN (${placeholders(input.eventKinds)})`);
       args.push(...input.eventKinds);
     }
-    const query = input?.query?.trim().toLowerCase();
+    const query = normalizeQueryKey(input?.query);
     if (query) {
       const likeQuery = `%${escapeLikePattern(query)}%`;
       where.push(

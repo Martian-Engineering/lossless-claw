@@ -629,6 +629,58 @@ describe("ObservedWorkStore", () => {
     );
   });
 
+  it("moves re-keyed event observations out of stale episodes", () => {
+    const db = makeDb();
+    createConversation(db, 19);
+    const events = new EventObservationStore(db);
+
+    events.upsertObservation({
+      eventId: "ev_rekey",
+      conversationId: 19,
+      eventKind: "operational_incident",
+      title: "PR 701 incident",
+      queryKey: "PR #701",
+      eventTime: "2026-04-28T08:00:00.000Z",
+      ingestTime: "2026-04-28T08:00:00.000Z",
+      confidence: 0.74,
+      rationale: "Initial event classification.",
+      sourceType: "summary",
+      sourceId: "sum_701_a",
+    });
+    expect(events.listEpisodes({ conversationId: 19, query: "PR 701" })).toHaveLength(1);
+
+    events.upsertObservation({
+      eventId: "ev_rekey",
+      conversationId: 19,
+      eventKind: "operational_incident",
+      title: "PR 702 incident",
+      queryKey: "PR #702",
+      eventTime: "2026-04-28T08:30:00.000Z",
+      ingestTime: "2026-04-28T08:30:00.000Z",
+      confidence: 0.81,
+      rationale: "Corrected event classification.",
+      sourceType: "summary",
+      sourceId: "sum_702_b",
+    });
+
+    expect(events.listObservations({ conversationId: 19, query: "PR 702" })[0]?.eventId)
+      .toBe("ev_rekey");
+    expect(events.listEpisodes({ conversationId: 19, query: "PR 701" })).toHaveLength(0);
+    const [episode] = events.listEpisodes({
+      conversationId: 19,
+      query: "PR 702",
+      includeSources: true,
+    });
+    expect(episode).toMatchObject({
+      topicKey: "pr-702",
+      observationCount: 1,
+      confidence: 0.81,
+    });
+    expect(episode?.sources).toEqual([
+      expect.objectContaining({ sourceType: "summary", sourceId: "sum_702_b" }),
+    ]);
+  });
+
   it("uses neutral evidence for ambiguous work without a completion cue", async () => {
     const db = makeDb();
     createConversation(db, 17);
