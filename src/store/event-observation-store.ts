@@ -135,20 +135,6 @@ function isEventSourceType(value: unknown): value is "summary" | "rollup" | "mes
   return value === "summary" || value === "rollup" || value === "message";
 }
 
-function normalizeQueryKey(value: string | undefined): string | null {
-  const normalized = value?.trim().toLowerCase().replace(/\s+/g, " ");
-  if (!normalized) {
-    return null;
-  }
-  const pr =
-    /^(?:pr|pull request)\s*#?\s*(\d{1,6})$/.exec(normalized) ??
-    /^pr[-\s#]*(\d{1,6})$/.exec(normalized);
-  if (pr?.[1]) {
-    return `pr-${pr[1]}`;
-  }
-  return normalized;
-}
-
 function parseSources(
   raw: string,
   fallbackSourceType?: "summary" | "rollup" | "message",
@@ -539,11 +525,11 @@ export class EventObservationStore {
       args.push(query, likeQuery, likeQuery);
     }
     if (input?.since) {
-      where.push("julianday(coalesce(event_time, ingest_time)) >= julianday(?)");
+      where.push("coalesce(event_time, ingest_time) >= ?");
       args.push(input.since);
     }
     if (input?.before) {
-      where.push("julianday(coalesce(event_time, ingest_time)) < julianday(?)");
+      where.push("coalesce(event_time, ingest_time) < ?");
       args.push(input.before);
     }
     const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
@@ -555,7 +541,7 @@ export class EventObservationStore {
               source_ids, created_at, updated_at
        FROM lcm_event_observations
        ${whereSql}
-       ORDER BY julianday(coalesce(event_time, ingest_time)) ${order}, confidence DESC
+       ORDER BY coalesce(event_time, ingest_time) ${order}, confidence DESC, event_id ASC
        LIMIT ?`,
     ).all(...args, limit) as EventObservationRow[];
     return rows.map((row) => rowToEvent(row, input?.includeSources === true));
@@ -590,11 +576,11 @@ export class EventObservationStore {
       args.push(query, likeQuery);
     }
     if (input?.since) {
-      where.push("julianday(last_event_time) >= julianday(?)");
+      where.push("last_event_time >= ?");
       args.push(input.since);
     }
     if (input?.before) {
-      where.push("julianday(first_event_time) < julianday(?)");
+      where.push("first_event_time < ?");
       args.push(input.before);
     }
     const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
@@ -607,7 +593,7 @@ export class EventObservationStore {
               source_ids, created_at, updated_at
        FROM lcm_event_episodes
        ${whereSql}
-       ORDER BY julianday(${orderColumn}) ${order}, confidence DESC
+       ORDER BY ${orderColumn} ${order}, confidence DESC, episode_id ASC
        LIMIT ?`,
     ).all(...args, limit) as EventEpisodeRow[];
     return rows.map((row) => rowToEpisode(row, input?.includeSources === true));

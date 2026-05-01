@@ -217,10 +217,10 @@ function classifyEvent(line: string): EventCandidate | null {
   else if (/\b(memory injection|injected memory)\b/i.test(line)) eventKind = "memory_injection";
   else if (/\b(imported|backfill|historical)\b/i.test(line)) eventKind = "imported";
   else if (/\b(echo|dream|reference)\b/i.test(line)) eventKind = "echo";
-  else if (/\b(first occurrence|original event|started|created|opened|reported)\b/i.test(line)) eventKind = "primary";
   else if (/\b(incident|root cause|restart|error|failed|failure|failing|outage|blocked)\b/i.test(line)) eventKind = "operational_incident";
   else if (/\bcortex\b/i.test(line)) eventKind = "memory_injection";
   else if (DECISION_RE.test(line)) eventKind = "decision";
+  else if (/\b(first occurrence|original event|started|created|opened|reported)\b/i.test(line)) eventKind = "primary";
   const confidence =
     eventKind === "primary" || eventKind === "decision"
       ? 0.72

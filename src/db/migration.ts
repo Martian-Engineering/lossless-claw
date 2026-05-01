@@ -1308,6 +1308,9 @@ export function runLcmMigrations(
         CREATE INDEX IF NOT EXISTS lcm_event_observations_query_time_idx
           ON lcm_event_observations(query_key, event_time DESC);
 
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_observed_time_idx
+          ON lcm_event_observations(conversation_id, coalesce(event_time, ingest_time) DESC);
+
         CREATE INDEX IF NOT EXISTS lcm_event_observations_source_idx
           ON lcm_event_observations(source_type, source_id);
       `);
@@ -1350,6 +1353,12 @@ export function runLcmMigrations(
 
         CREATE INDEX IF NOT EXISTS lcm_event_episodes_kind_time_idx
           ON lcm_event_episodes(episode_kind, first_event_time ASC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_episodes_conversation_last_time_idx
+          ON lcm_event_episodes(conversation_id, last_event_time DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_episodes_conversation_first_time_idx
+          ON lcm_event_episodes(conversation_id, first_event_time ASC);
       `);
     });
 
