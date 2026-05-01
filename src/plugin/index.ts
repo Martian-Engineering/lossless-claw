@@ -749,9 +749,13 @@ function inferApiFromProvider(provider: string): string | undefined {
   const map: Record<string, string> = {
     anthropic: "anthropic-messages",
     deepseek: "openai-completions",
+    groq: "openai-completions",
+    mistral: "openai-completions",
     openai: "openai-responses",
     [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_RESPONSES_API,
     "github-copilot": OPENAI_CODEX_RESPONSES_API,
+    openrouter: "openai-completions",
+    together: "openai-completions",
     google: "google-generative-ai",
     "google-gemini-cli": "google-gemini-cli",
     "google-antigravity": "google-gemini-cli",

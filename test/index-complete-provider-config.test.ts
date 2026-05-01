@@ -500,6 +500,32 @@ describe("createLcmDependencies.complete provider config resolution", () => {
     );
   });
 
+  it.each([
+    ["deepseek", "https://api.deepseek.com"],
+    ["groq", "https://api.groq.com/openai/v1"],
+    ["mistral", "https://api.mistral.ai"],
+    ["openrouter", "https://openrouter.ai/api/v1"],
+    ["together", "https://api.together.xyz"],
+  ])("falls back to OpenAI-compatible routing for %s", async (provider, baseUrl) => {
+    await callComplete({
+      loadConfigResult: {},
+      provider,
+      model: "unit-model",
+      runtimeConfig: {},
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "unit-model",
+        provider,
+        api: "openai-completions",
+        baseUrl,
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
   it("preserves provider auth error metadata when completeSimple throws a 401 scope error", async () => {
     piAiMock.completeSimple.mockRejectedValue({
       statusCode: 401,
