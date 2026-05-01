@@ -19,6 +19,13 @@ import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
+import { createLcmRecentTool } from "../tools/lcm-recent-tool.js";
+import { createLcmRollupDebugTool } from "../tools/lcm-rollup-debug-tool.js";
+import {
+  createLcmTaskSuggestionReviewTool,
+  createLcmTaskSuggestionsTool,
+} from "../tools/lcm-task-suggestions-tool.js";
+import { createLcmWorkDensityTool } from "../tools/lcm-work-density-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type { LcmDependencies } from "../types.js";
 
@@ -171,9 +178,16 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "",
   "**Tool escalation:**",
   "Recall order for compacted conversation history:",
-  "1. `lcm_grep` — search by regex or full-text across messages and summaries",
-  "2. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
-  "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
+  "1. `lcm_recent` — use for time-bounded recaps and likely-window entry (`today`, `yesterday`, `week`, `month`, `date:YYYY-MM-DD`, `yesterday 4-8pm`, `last 3h`)",
+  "2. `lcm_grep` — use for keyword/topic/identifier discovery when the time window is unknown",
+  "3. `lcm_describe` — inspect a specific summary or source ID (cheap, no sub-agent)",
+  "4. `lcm_expand_query` — exact proof/deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited IDs in tool output for follow-up (~120s, don't ration it)",
+  "",
+  "**`lcm_recent` routing guidance:**",
+  "- Use `lcm_recent` first for questions anchored by time rather than topic: what happened today/yesterday/this week/this month, a specific date, a local-time window, or a relative range like `last 90m`.",
+  "- Treat `lcm_recent` as recap/window entry, not proof. For exact commands, paths, timestamps, root cause, shipped/decided claims, or causal chains, verify returned IDs with `lcm_describe` or `lcm_expand_query` before asserting specifics.",
+  "- Event-bounded questions like `after restart` require anchoring the event time/window first with logs, diagnostics, `lcm_grep`, or other evidence, then run `lcm_recent` over that known window.",
+  "- `lcm_recent` may return prebuilt rollups or bounded leaf-summary fallback; both are coverage-limited and should preserve source IDs when `includeSources=true`.",
   "",
   "**`lcm_grep` routing guidance:**",
   '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for literal patterns.',
@@ -212,8 +226,8 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "State uncertainty instead of guessing from compacted summaries.",
   "",
   "**Precision flow:**",
-  "1. `lcm_grep` to find the relevant summaries or messages",
-  "2. `lcm_expand_query` when you need exact evidence before answering",
+  "1. `lcm_recent` for a known time window, or `lcm_grep` when you need topic/identifier discovery",
+  "2. `lcm_describe` or `lcm_expand_query` when you need exact evidence before answering",
   "3. Answer from the retrieved evidence instead of summary paraphrase",
   "",
   "**Uncertainty checklist:**",
@@ -2051,6 +2065,43 @@ function wirePluginHandlers(
       requesterSessionKey: ctx.sessionKey,
     }),
   );
+  api.registerTool((ctx) =>
+    createLcmRecentTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+    }),
+  );
+  api.registerTool((ctx) =>
+    createLcmWorkDensityTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+    }),
+  );
+  if (deps.config.taskBridgeToolsEnabled) {
+    api.registerTool((ctx) =>
+      createLcmTaskSuggestionsTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+    api.registerTool(() =>
+      createLcmTaskSuggestionReviewTool({
+        getLcm: shared.waitForEngine,
+      }),
+    );
+  }
+  if (deps.config.rollupDebugEnabled) {
+    api.registerTool((ctx) =>
+      createLcmRollupDebugTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+  }
 
   api.registerCommand(
     createLcmCommand({
