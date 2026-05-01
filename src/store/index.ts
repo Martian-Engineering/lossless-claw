@@ -42,3 +42,11 @@ export { CompactionMaintenanceStore } from "./compaction-maintenance-store.js";
 export type {
   ConversationCompactionMaintenanceRecord,
 } from "./compaction-maintenance-store.js";
+
+export { EventObservationStore } from "./event-observation-store.js";
+export type {
+  EventObservation,
+  EventEpisode,
+  EventObservationInput,
+  EventObservationKind,
+} from "./event-observation-store.js";

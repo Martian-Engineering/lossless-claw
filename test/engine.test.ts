@@ -2391,6 +2391,46 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("maintain() narrows rollup rebuild sweeps from the last check time", async () => {
+    const engine = createEngineWithConfig({
+      transcriptGcEnabled: false,
+    });
+    const sessionId = randomUUID();
+    const sessionFile = createSessionFilePath("rollup-maintenance-window");
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed rollup maintenance" }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    engine.getRollupStore().upsertState(conversation!.conversationId, {
+      timezone: "UTC",
+      last_rollup_check_at: "2026-04-29T10:00:00.000Z",
+      pending_rebuild: 1,
+    });
+    const buildDailySpy = vi.spyOn(engine.getRollupBuilder(), "buildDailyRollups");
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-29T12:00:00.000Z"));
+    try {
+      await engine.maintain({
+        sessionId,
+        sessionFile,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(buildDailySpy).toHaveBeenCalledWith(conversation!.conversationId, {
+      daysBack: 2,
+      forceCurrentDay: true,
+    });
+  });
+
   it("serializes recycled session writes by stable sessionKey", async () => {
     const engine = createEngine();
     const sessionKey = "agent:main:main";
