@@ -18,7 +18,7 @@ const EVENT_KIND_VALUES = [
 
 const LcmEventSearchSchema = Type.Object({
   conversationId: Type.Optional(Type.Number({ description: "Conversation ID to inspect. Defaults to the current session conversation." })),
-  allConversations: Type.Optional(Type.Boolean({ description: "Explicitly inspect all conversations. Defaults to false." })),
+  allConversations: Type.Optional(Type.Boolean({ description: "Not supported; event search is scoped to one conversation unless a future admin/debug surface is added." })),
   query: Type.Optional(Type.String({ description: "Deterministic query/topic filter over observed event titles and keys." })),
   eventKinds: Type.Optional(Type.Array(Type.String({ enum: [...EVENT_KIND_VALUES] }), { description: "Event kinds to include." })),
   since: Type.Optional(Type.String({ description: "Only include events at or after this ISO timestamp." })),
@@ -82,7 +82,13 @@ export function createLcmEventSearchTool(input: {
         params: p,
       });
       if (!scope.allConversations && scope.conversationId == null) {
-        return jsonResult({ error: "No LCM conversation found for this session. Provide conversationId or set allConversations=true." });
+        return jsonResult({ error: "No LCM conversation found for this session. Provide conversationId." });
+      }
+      if (scope.allConversations) {
+        return jsonResult({
+          error:
+            "lcm_event_search does not support allConversations; provide a conversationId or use the current session scope.",
+        });
       }
       let since: string | undefined;
       let before: string | undefined;

@@ -194,10 +194,11 @@ function classifyEvent(line: string): EventCandidate | null {
   }
   let eventKind: EventObservationKind = "primary";
   if (/\b(retell|retold|recalled|mentioned again)\b/i.test(line)) eventKind = "retelling";
-  else if (/\b(cortex|memory injection|injected memory)\b/i.test(line)) eventKind = "memory_injection";
+  else if (/\b(memory injection|injected memory)\b/i.test(line)) eventKind = "memory_injection";
   else if (/\b(imported|backfill|historical)\b/i.test(line)) eventKind = "imported";
   else if (/\b(echo|dream|reference)\b/i.test(line)) eventKind = "echo";
-  else if (/\b(incident|root cause|restart|error|failed|failing|outage|blocked)\b/i.test(line)) eventKind = "operational_incident";
+  else if (/\b(incident|root cause|restart|error|failed|failure|failing|outage|blocked)\b/i.test(line)) eventKind = "operational_incident";
+  else if (/\bcortex\b/i.test(line)) eventKind = "memory_injection";
   else if (DECISION_RE.test(line)) eventKind = "decision";
   const confidence =
     eventKind === "primary" || eventKind === "decision"

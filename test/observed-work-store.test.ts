@@ -396,12 +396,40 @@ describe("ObservedWorkStore", () => {
       content: [
         "- Incident: ENOTEMPTY failed during package cleanup",
         "- Retell: recalled the older Tarzan onboarding incident",
+        "- Cortex config drift caused plugin validation failure",
       ].join("\n"),
     });
     expect(extractor.processConversation(8)).toMatchObject({
       summariesScanned: 1,
-      eventsUpserted: 2,
+      eventsUpserted: 3,
     });
+    expect(
+      events.listObservations({
+        conversationId: 8,
+        eventKinds: ["operational_incident"],
+        query: "cortex config drift",
+      })[0]?.eventKind
+    ).toBe("operational_incident");
+    events.upsertObservation({
+      eventId: "evt_pr_normalized",
+      conversationId: 8,
+      eventKind: "primary",
+      title: "Normalized event key",
+      queryKey: "PR #123",
+      ingestTime: "2026-04-28T07:00:00.000Z",
+      confidence: 0.8,
+      rationale: "Direct store caller uses human PR spelling.",
+      sourceType: "summary",
+      sourceId: "sum_incident",
+    });
+    expect(
+      events.listObservations({ conversationId: 8, query: "pr-123" })[0]
+        ?.eventId
+    ).toBe("evt_pr_normalized");
+    expect(
+      events.listObservations({ conversationId: 8, query: "PR 123" })[0]
+        ?.eventId
+    ).toBe("evt_pr_normalized");
 
     const lcm = {
       getEventObservationStore: () => events,
@@ -433,6 +461,14 @@ describe("ObservedWorkStore", () => {
     });
     expect(JSON.stringify(shown.details)).toContain("sum_incident");
     expect(JSON.stringify(shown.details)).toContain("retelling");
+
+    const global = await tool.execute("event-global", {
+      allConversations: true,
+      query: "enotempty",
+    });
+    expect((global.details as { error?: string }).error).toMatch(
+      /does not support allConversations/
+    );
   });
 
   it("uses neutral evidence for ambiguous work without a completion cue", async () => {
