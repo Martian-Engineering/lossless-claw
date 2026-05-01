@@ -174,6 +174,8 @@ export type ObservedWorkDensityResult = {
   topUnfinished: ObservedWorkDensityItem[];
   completedHighlights: ObservedWorkDensityItem[];
   ambiguous: ObservedWorkDensityItem[];
+  decisions: ObservedWorkDensityItem[];
+  dismissedItems: ObservedWorkDensityItem[];
   itemsIncluded: number;
   itemsOmitted: number;
 };
@@ -490,7 +492,15 @@ export class ObservedWorkStore {
     const unfinishedRows = getRowsForStatus("observed_unfinished", limit);
     const completedRows = getRowsForStatus("observed_completed", limit);
     const ambiguousRows = getRowsForStatus("observed_ambiguous", ambiguousLimit);
-    const includedRows = [...unfinishedRows, ...completedRows, ...ambiguousRows];
+    const decisionRows = getRowsForStatus("decision_recorded", limit);
+    const dismissedRows = getRowsForStatus("dismissed", limit);
+    const includedRows = [
+      ...unfinishedRows,
+      ...completedRows,
+      ...ambiguousRows,
+      ...decisionRows,
+      ...dismissedRows,
+    ];
     const includedIds = new Set<string>(includedRows.map((row) => row.work_item_id));
     const sourcesByWorkItemId = query.includeSources
       ? this.getSourcesForWorkItems([...includedIds])
@@ -507,6 +517,8 @@ export class ObservedWorkStore {
       topUnfinished: unfinishedRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
       completedHighlights: completedRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
       ambiguous: ambiguousRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
+      decisions: decisionRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
+      dismissedItems: dismissedRows.map((row) => rowToItem(row, sourcesByWorkItemId)),
       itemsIncluded: includedIds.size,
       itemsOmitted: Math.max(0, (counts.total_observed ?? 0) - includedIds.size),
     };
