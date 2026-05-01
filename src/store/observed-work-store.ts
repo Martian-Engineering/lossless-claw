@@ -478,7 +478,10 @@ export class ObservedWorkStore {
              WHEN ? >= confidence THEN ?
              ELSE confidence_band
            END,
-           last_seen_at = ?,
+           last_seen_at = CASE
+             WHEN julianday(?) > julianday(last_seen_at) THEN ?
+             ELSE last_seen_at
+           END,
            completed_at = CASE WHEN ? IS NOT NULL THEN ? ELSE completed_at END,
            completion_confidence = COALESCE(?, completion_confidence),
            rationale = COALESCE(?, rationale),
@@ -491,6 +494,7 @@ export class ObservedWorkStore {
       input.confidence,
       input.confidence,
       input.confidenceBand,
+      input.lastSeenAt,
       input.lastSeenAt,
       input.completedAt ?? null,
       input.completedAt ?? null,

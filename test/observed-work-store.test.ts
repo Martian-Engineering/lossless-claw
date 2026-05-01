@@ -605,6 +605,44 @@ describe("ObservedWorkStore", () => {
     );
   });
 
+  it("does not move last-seen time backward during observation updates", () => {
+    const db = makeDb();
+    createConversation(db, 20);
+    const observedWork = new ObservedWorkStore(db);
+    observedWork.upsertItem({
+      workItemId: "work_last_seen_guard",
+      conversationId: 20,
+      firstSeenAt: "2026-04-28T05:00:00.000Z",
+      lastSeenAt: "2026-04-28T09:00:00.000Z",
+      title: "Guard last seen timestamp",
+      observedStatus: "observed_unfinished",
+      kind: "review",
+      confidence: 0.8,
+      fingerprint: "review:last-seen-guard",
+    });
+    observedWork.addSource({
+      workItemId: "work_last_seen_guard",
+      sourceType: "summary",
+      sourceId: "sum_last_seen_guard",
+      ordinal: 0,
+      evidenceKind: "created",
+    });
+
+    observedWork.updateItemObservation({
+      workItemId: "work_last_seen_guard",
+      observedStatus: "observed_ambiguous",
+      confidence: 0.7,
+      confidenceBand: "medium",
+      lastSeenAt: "2026-04-28T06:00:00.000Z",
+      rationale: "Older possible resolution evidence should not move time backward.",
+    });
+
+    expect(
+      observedWork.getDensity({ conversationId: 20 }).ambiguous[0]
+        ?.lastSeenAt,
+    ).toBe("2026-04-28T09:00:00.000Z");
+  });
+
   it("preserves semantic evidence kinds when reinforcing extracted work", async () => {
     const db = makeDb();
     createConversation(db, 9);
@@ -1151,6 +1189,13 @@ describe("ObservedWorkStore", () => {
       confidence: 0.9,
       confidenceBand: "high",
       fingerprint: "review:confidence",
+    });
+    store.addSource({
+      workItemId: "work_confidence",
+      sourceType: "summary",
+      sourceId: "sum_confidence",
+      ordinal: 0,
+      evidenceKind: "created",
     });
 
     store.updateItemObservation({
