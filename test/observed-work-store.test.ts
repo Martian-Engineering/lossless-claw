@@ -962,4 +962,67 @@ describe("ObservedWorkStore", () => {
       vi.useRealTimers();
     }
   });
+
+  it("trims rich lcm_work_density sections to the requested output budget", async () => {
+    const db = makeDb();
+    createConversation(db, 9);
+    const store = new ObservedWorkStore(db);
+    for (let index = 0; index < 20; index += 1) {
+      const workItemId = `work_budget_${index}`;
+      store.upsertItem({
+        workItemId,
+        conversationId: 9,
+        firstSeenAt: "2026-04-28T01:00:00.000Z",
+        lastSeenAt: `2026-04-28T01:${String(index).padStart(2, "0")}:00.000Z`,
+        title: `Budget-sensitive unfinished item ${index} with a deliberately verbose title for trimming`,
+        observedStatus: "observed_unfinished",
+        kind: "review",
+        rationale: "Verbose evidence rationale that should be removable by output-budget trimming.",
+        fingerprint: `review:budget:${index}`,
+      });
+      for (let sourceIndex = 0; sourceIndex < 5; sourceIndex += 1) {
+        store.addSource({
+          workItemId,
+          sourceType: "summary",
+          sourceId: `sum_budget_${index}_${sourceIndex}`,
+          ordinal: sourceIndex,
+          evidenceKind: "created",
+        });
+      }
+    }
+    const lcm = {
+      timezone: "UTC",
+      getObservedWorkStore: () => store,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const tool = createLcmWorkDensityTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "density-session",
+    });
+
+    const result = await tool.execute("density-budget", {
+      conversationId: 9,
+      includeSources: true,
+      limit: 20,
+      maxOutputTokens: 256,
+    });
+    const details = result.details as {
+      topUnfinished?: unknown[];
+      accounting: {
+        budgetTruncated?: boolean;
+        itemsReturned?: number;
+        estimatedOutputTokens?: number;
+      };
+    };
+    expect(details.accounting.budgetTruncated).toBe(true);
+    expect(details.accounting.itemsReturned).toBeLessThan(20);
+    expect(details.accounting.estimatedOutputTokens).toBeLessThanOrEqual(256);
+  });
 });
