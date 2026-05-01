@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 
@@ -418,6 +418,39 @@ export class RollupStore {
       .get(conversationId) as { latest_created_at: string | null } | undefined;
 
     return row?.latest_created_at ?? null;
+  }
+
+  getLeafSummarySweepFingerprint(conversationId: number): string {
+    const rows = this.db
+      .prepare(
+        `SELECT
+          summary_id,
+          content,
+          token_count,
+          source_message_token_count,
+          strftime('%Y-%m-%dT%H:%M:%fZ', earliest_at) AS earliest_at,
+          strftime('%Y-%m-%dT%H:%M:%fZ', latest_at) AS latest_at,
+          strftime('%Y-%m-%dT%H:%M:%fZ', created_at) AS created_at
+         FROM summaries
+         WHERE conversation_id = ?
+           AND kind = 'leaf'
+         ORDER BY summary_id ASC`
+      )
+      .all(conversationId) as Array<{
+        summary_id: string;
+        content: string;
+        token_count: number;
+        source_message_token_count: number;
+        earliest_at: string | null;
+        latest_at: string | null;
+        created_at: string;
+      }>;
+    const hash = createHash("sha256");
+    for (const row of rows) {
+      hash.update(JSON.stringify(row));
+      hash.update("\n");
+    }
+    return hash.digest("hex");
   }
 
   upsertState(
