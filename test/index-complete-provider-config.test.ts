@@ -493,7 +493,7 @@ describe("createLcmDependencies.complete provider config resolution", () => {
         id: "kimi-k2.5:cloud",
         provider: "ollama",
         api: "openai-completions",
-        baseUrl: "",
+        baseUrl: "http://localhost:11434",
       }),
       expect.any(Object),
       expect.any(Object),
