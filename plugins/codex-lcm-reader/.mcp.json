@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "codex-lcm-reader": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["./scripts/mcp-server.mjs"],
+      "cwd": "."
+    }
+  }
+}
