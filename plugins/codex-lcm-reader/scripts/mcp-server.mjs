@@ -209,7 +209,13 @@ function normalizeSort(sort) {
 }
 
 function compileSafeRegex(pattern, caseSensitive) {
-  if (pattern.length > 500 || /(\+|\*|\?)\)(\+|\*|\?|\{\d)/.test(pattern)) return undefined;
+  if (
+    pattern.length > 500 ||
+    /(\+|\*|\?)\)(\+|\*|\?|\{\d)/.test(pattern) ||
+    /\([^)]*\|[^)]*\)(\+|\*|\{\d)/.test(pattern)
+  ) {
+    return undefined;
+  }
   try {
     return new RegExp(pattern, caseSensitive === true ? "" : "i");
   } catch {
@@ -226,6 +232,8 @@ function searchMessages(db, params) {
   const scope = buildScope(params, "m");
   const regex = mode === "regex" ? compileSafeRegex(query, params.caseSensitive) : undefined;
   if (mode === "regex" && !regex) return [];
+  const terms = mode === "full_text" ? likeTerms(query) : [];
+  if (mode === "full_text" && terms.length === 0) return [];
 
   if (mode === "full_text" && tableExists(db, "messages_fts")) {
     try {
@@ -263,7 +271,6 @@ function searchMessages(db, params) {
     }
   }
 
-  const terms = mode === "full_text" ? likeTerms(query) : [];
   const where = [...scope.where];
   const args = [...scope.args];
   if (scope.since) {
@@ -320,6 +327,8 @@ function searchSummaries(db, params) {
   const timeExpr = "COALESCE(s.latest_at, s.created_at)";
   const regex = mode === "regex" ? compileSafeRegex(query, params.caseSensitive) : undefined;
   if (mode === "regex" && !regex) return [];
+  const terms = mode === "full_text" ? likeTerms(query) : [];
+  if (mode === "full_text" && terms.length === 0) return [];
 
   if (mode === "full_text" && tableExists(db, "summaries_fts")) {
     try {
@@ -357,7 +366,6 @@ function searchSummaries(db, params) {
     }
   }
 
-  const terms = mode === "full_text" ? likeTerms(query) : [];
   const where = [...scope.where];
   const args = [...scope.args];
   if (scope.since) {

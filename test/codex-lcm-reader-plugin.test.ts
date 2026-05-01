@@ -394,6 +394,14 @@ describe("Codex LCM Reader plugin", () => {
 
     expect(result.structuredContent?.count).toBe(0);
     expect(result.structuredContent?.results).toEqual([]);
+
+    const alternationResult = await plugin.callTool(
+      "lcm_grep",
+      { pattern: "(a|aa)+$", mode: "regex", scope: "messages", limit: 10 },
+      { dbPath: fixture.dbPath },
+    );
+    expect(alternationResult.structuredContent?.count).toBe(0);
+    expect(alternationResult.structuredContent?.results).toEqual([]);
   });
 
   it("falls back to LIKE when copied FTS tables are malformed", async () => {
@@ -412,6 +420,24 @@ describe("Codex LCM Reader plugin", () => {
     );
 
     expect(result.structuredContent?.count).toBeGreaterThan(0);
+  });
+
+  it("does not turn punctuation-only full-text fallback into an unfiltered scan", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const db = createLcmDatabaseConnection(fixture.dbPath);
+    db.exec("DROP TABLE IF EXISTS messages_fts");
+    closeLcmConnection(fixture.dbPath);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_grep",
+      { pattern: "!!!", mode: "full_text", scope: "messages", limit: 10 },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.count).toBe(0);
+    expect(result.structuredContent?.results).toEqual([]);
   });
 
   it("rejects legacy databases with missing required columns before raw SQL failures", async () => {
