@@ -266,7 +266,7 @@ export class TaskBridgeSuggestionStore {
               created_at, updated_at
        FROM lcm_task_bridge_suggestions
        ${whereSql}
-       ORDER BY created_at DESC
+       ORDER BY updated_at DESC, created_at DESC
        LIMIT ?`,
     ).all(...args, limit) as TaskBridgeSuggestionRow[];
     return rows.map(rowToSuggestion);

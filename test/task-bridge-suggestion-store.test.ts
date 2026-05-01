@@ -204,6 +204,42 @@ describe("TaskBridgeSuggestionStore", () => {
     });
   });
 
+  it("orders refreshed pending suggestions by updated time", () => {
+    const db = makeDb();
+    createObservedWorkItem(db, "work_order", ["sum_order"]);
+    const store = new TaskBridgeSuggestionStore(db);
+
+    expect(store.upsertSuggestion({
+      suggestionId: "sug_old",
+      workItemId: "work_order",
+      suggestionKind: "create_task",
+      confidence: 0.7,
+      rationale: "Older suggestion.",
+      sourceIds: ["sum_order"],
+    })).toBe("inserted");
+    expect(store.upsertSuggestion({
+      suggestionId: "sug_refreshed",
+      workItemId: "work_order",
+      suggestionKind: "create_task",
+      confidence: 0.8,
+      rationale: "Initial refreshed suggestion.",
+      sourceIds: ["sum_order"],
+    })).toBe("inserted");
+    db.prepare(
+      `UPDATE lcm_task_bridge_suggestions
+       SET created_at = ?, updated_at = ?
+       WHERE suggestion_id = ?`
+    ).run("2026-04-28T01:00:00.000Z", "2026-04-28T01:00:00.000Z", "sug_old");
+    db.prepare(
+      `UPDATE lcm_task_bridge_suggestions
+       SET created_at = ?, updated_at = ?
+       WHERE suggestion_id = ?`
+    ).run("2026-04-28T00:00:00.000Z", "2026-04-28T02:00:00.000Z", "sug_refreshed");
+
+    expect(store.listSuggestions({ status: "pending" }).map((item) => item.suggestionId))
+      .toEqual(["sug_refreshed", "sug_old"]);
+  });
+
   it("rejects invalid suggestion records and reports missing review targets", () => {
     const db = makeDb();
     createObservedWorkItem(db, "work_3", ["sum_bad"]);
