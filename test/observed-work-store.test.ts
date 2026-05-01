@@ -450,19 +450,61 @@ describe("ObservedWorkStore", () => {
       kind: "decision",
       fingerprint: "decision:task-bridge-policy",
     });
+    store.upsertItem({
+      ...base,
+      workItemId: "work_decision",
+      title: "Decision recorded for advisory labels",
+      observedStatus: "decision_recorded",
+      kind: "decision",
+      fingerprint: "decision:advisory-labels",
+    });
+    store.upsertItem({
+      ...base,
+      workItemId: "work_dismissed",
+      title: "Dismiss noisy follow-up",
+      observedStatus: "dismissed",
+      kind: "follow_up",
+      fingerprint: "follow_up:dismissed-noise",
+    });
+    for (const [index, workItemId] of [
+      "work_done",
+      "work_open",
+      "work_maybe",
+      "work_decision",
+      "work_dismissed",
+    ].entries()) {
+      store.addSource({
+        workItemId,
+        sourceType: "summary",
+        sourceId: `sum_density_${index}`,
+        ordinal: index,
+        evidenceKind: "created",
+      });
+    }
 
     const density = store.getDensity({ conversationId: 1, limit: 5 });
     expect(density.density).toMatchObject({
-      totalObserved: 3,
+      totalObserved: 5,
       completed: 1,
       unfinished: 1,
       ambiguous: 1,
-      dismissed: 0,
-      decisionRecorded: 0,
+      dismissed: 1,
+      decisionRecorded: 1,
     });
     expect(density.topUnfinished[0]?.title).toBe("Fix PR #14 review comments");
     expect(density.completedHighlights[0]?.title).toBe("Daily rollup tests passed");
     expect(density.ambiguous[0]?.title).toBe("Decide task bridge policy");
+    expect(density.decisions[0]?.title).toBe("Decision recorded for advisory labels");
+    expect(density.dismissedItems[0]?.title).toBe("Dismiss noisy follow-up");
+
+    const decisionOnly = store.getDensity({
+      conversationId: 1,
+      statuses: ["decision_recorded"],
+      limit: 5,
+    });
+    expect(decisionOnly.density.totalObserved).toBe(1);
+    expect(decisionOnly.decisions[0]?.workItemId).toBe("work_decision");
+    expect(decisionOnly.itemsIncluded).toBe(1);
   });
 
   it("preserves temporal invariants while updating mutable metadata", () => {
@@ -714,6 +756,16 @@ describe("ObservedWorkStore", () => {
       });
       expect(JSON.stringify(shown.details)).toContain("sum_today");
       expect((shown.details as { period?: string }).period).toBe("today");
+
+      const dateWithWhitespace = await tool.execute("density-date-trimmed", {
+        conversationId: 1,
+        period: "date: 2026-04-28 ",
+        detailLevel: 0,
+      });
+      expect(
+        (dateWithWhitespace.details as { density: { totalObserved: number } })
+          .density.totalObserved,
+      ).toBe(1);
 
       const week = await tool.execute("density-week", {
         conversationId: 1,

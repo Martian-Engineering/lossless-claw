@@ -70,7 +70,7 @@ function resolvePeriodBounds(
     return dayBounds("yesterday", addDays(today, -1), timezone);
   }
   if (normalized.startsWith("date:")) {
-    const day = normalized.slice(5);
+    const day = normalized.slice(5).trim();
     return dayBounds(day, day, timezone);
   }
   if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
@@ -226,7 +226,15 @@ export function createLcmWorkDensityTool(input: {
         window: since || before ? { since, before, timezone: lcm.timezone } : undefined,
         conversationScope: scope.allConversations ? "all" : scope.conversationId,
         density: result.density,
-        ...(compact ? {} : { topUnfinished: result.topUnfinished, completedHighlights: result.completedHighlights, ambiguous: result.ambiguous }),
+        ...(compact
+          ? {}
+          : {
+              topUnfinished: result.topUnfinished,
+              completedHighlights: result.completedHighlights,
+              ambiguous: result.ambiguous,
+              decisions: result.decisions,
+              dismissedItems: result.dismissedItems,
+            }),
         accounting: {
           itemsIncluded: result.itemsIncluded,
           itemsOmitted: result.itemsOmitted,
