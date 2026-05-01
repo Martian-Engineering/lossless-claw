@@ -48,6 +48,8 @@ import {
 import { describeLogError } from "./lcm-log.js";
 import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
+import { RollupBuilder } from "./rollup-builder.js";
+import { ObservedWorkExtractor } from "./observed-work-extractor.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
@@ -66,7 +68,11 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
+import { ObservedWorkStore } from "./store/observed-work-store.js";
+import { EventObservationStore } from "./store/event-observation-store.js";
+import { RollupStore } from "./store/rollup-store.js";
 import { SummaryStore } from "./store/summary-store.js";
+import { TaskBridgeSuggestionStore } from "./store/task-bridge-suggestion-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
@@ -1632,6 +1638,27 @@ function messageIdentity(role: string, content: string): string {
   return `${role}\u0000${content}`;
 }
 
+const MAX_ROLLUP_MAINTENANCE_DAYS_BACK = 30;
+
+function computeRollupMaintenanceDaysBack(
+  lastRollupCheckAt: string | null | undefined,
+  now = new Date(),
+): number {
+  if (!lastRollupCheckAt) {
+    return MAX_ROLLUP_MAINTENANCE_DAYS_BACK;
+  }
+  const parsed = new Date(lastRollupCheckAt);
+  if (Number.isNaN(parsed.getTime())) {
+    return MAX_ROLLUP_MAINTENANCE_DAYS_BACK;
+  }
+  const elapsedMs = Math.max(0, now.getTime() - parsed.getTime());
+  const elapsedDays = Math.ceil(elapsedMs / 86_400_000);
+  return Math.min(
+    MAX_ROLLUP_MAINTENANCE_DAYS_BACK,
+    Math.max(1, elapsedDays + 1),
+  );
+}
+
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
 export class LcmContextEngine implements ContextEngine {
@@ -1648,6 +1675,12 @@ export class LcmContextEngine implements ContextEngine {
   private summaryStore: SummaryStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
+  private observedWorkStore: ObservedWorkStore;
+  private observedWorkExtractor: ObservedWorkExtractor;
+  private eventObservationStore: EventObservationStore;
+  private taskBridgeSuggestionStore: TaskBridgeSuggestionStore;
+  private rollupStore: RollupStore;
+  private rollupBuilder: RollupBuilder;
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
@@ -1737,6 +1770,18 @@ export class LcmContextEngine implements ContextEngine {
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
+    this.observedWorkStore = new ObservedWorkStore(this.db);
+    this.eventObservationStore = new EventObservationStore(this.db);
+    this.taskBridgeSuggestionStore = new TaskBridgeSuggestionStore(this.db);
+    this.observedWorkExtractor = new ObservedWorkExtractor(
+      this.db,
+      this.observedWorkStore,
+      this.eventObservationStore,
+    );
+    this.rollupStore = new RollupStore(this.db);
+    this.rollupBuilder = new RollupBuilder(this.rollupStore, {
+      timezone: this.timezone,
+    });
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -5248,6 +5293,87 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         let deferredCompactionResult: ContextEngineMaintenanceResult | null = null;
+        const finish = async (
+          result: ContextEngineMaintenanceResult,
+        ): Promise<ContextEngineMaintenanceResult> => {
+          const markRollupRebuildPending = (reason: string): void => {
+            try {
+              this.rollupStore.upsertState(conversation.conversationId, {
+                timezone: this.timezone,
+                pending_rebuild: 1,
+              });
+            } catch (error) {
+              this.deps.log.warn(
+                `[lcm] maintain: failed to mark rollup rebuild pending conversation=${conversation.conversationId} ${sessionLabel} reason=${reason}: ${describeLogError(error)}`,
+              );
+            }
+          };
+          try {
+            const rollupState = this.rollupStore.getState(conversation.conversationId);
+            if (
+              !rollupState ||
+              rollupState.pending_rebuild === 1 ||
+              rollupState.timezone !== this.timezone ||
+              result.changed
+            ) {
+              const daysBack = computeRollupMaintenanceDaysBack(
+                rollupState?.last_rollup_check_at,
+              );
+              const rollupResult = await this.rollupBuilder.buildDailyRollups(
+                conversation.conversationId,
+                { daysBack, forceCurrentDay: true },
+              );
+              const aggregateResult = await this.rollupBuilder.buildWeeklyMonthlyRollups(
+                conversation.conversationId,
+                { daysBack },
+              );
+              const errorCount = rollupResult.errors.length + aggregateResult.errors.length;
+              if (errorCount > 0) {
+                markRollupRebuildPending("rollup-build-errors");
+              }
+              this.deps.log.info(
+                `[lcm] maintain: rollups conversation=${conversation.conversationId} ${sessionLabel} dailyBuilt=${rollupResult.built} dailySkipped=${rollupResult.skipped} aggregateBuilt=${aggregateResult.built} aggregateSkipped=${aggregateResult.skipped} errors=${errorCount}`,
+              );
+            }
+          } catch (error) {
+            this.deps.log.warn(
+              `[lcm] maintain: rollup build failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
+            );
+            markRollupRebuildPending("rollup-build-failed");
+          }
+          if (this.config.observedWorkMaintenanceEnabled) {
+            try {
+              const observedResult = this.observedWorkExtractor.processConversation(
+                conversation.conversationId,
+                { limit: 500 },
+              );
+              if (
+                observedResult.summariesScanned > 0 ||
+                observedResult.workItemsUpserted > 0 ||
+                observedResult.eventsUpserted > 0
+              ) {
+                this.deps.log.info(
+                  `[lcm] maintain: observed-work extraction conversation=${conversation.conversationId} ${sessionLabel} summariesScanned=${observedResult.summariesScanned} workItemsUpserted=${observedResult.workItemsUpserted} eventsUpserted=${observedResult.eventsUpserted}`,
+                );
+              }
+            } catch (error) {
+              this.deps.log.warn(
+                `[lcm] maintain: observed-work extraction failed conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
+              );
+              try {
+                this.observedWorkStore.upsertState({
+                  conversationId: conversation.conversationId,
+                  pendingRebuild: true,
+                });
+              } catch (stateError) {
+                this.deps.log.warn(
+                  `[lcm] maintain: failed to preserve observed-work pending state conversation=${conversation.conversationId} ${sessionLabel}: ${describeLogError(stateError)}`,
+                );
+              }
+            }
+          }
+          return result;
+        };
         const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
           conversation.conversationId,
         );
@@ -5292,24 +5418,24 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         if (!this.config.transcriptGcEnabled) {
-          return (
+          return finish(
             deferredCompactionResult ?? {
               changed: false,
               bytesFreed: 0,
               rewrittenEntries: 0,
               reason: "transcript GC disabled",
-            }
+            },
           );
         }
 
         if (typeof params.runtimeContext?.rewriteTranscriptEntries !== "function") {
-          return (
+          return finish(
             deferredCompactionResult ?? {
               changed: false,
               bytesFreed: 0,
               rewrittenEntries: 0,
               reason: "runtime rewrite helper unavailable",
-            }
+            },
           );
         }
 
@@ -5322,12 +5448,14 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.info(
             `[lcm] maintain: no transcript GC candidates conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
-          return deferredCompactionResult ?? {
-            changed: false,
-            bytesFreed: 0,
-            rewrittenEntries: 0,
-            reason: "no transcript GC candidates",
-          };
+          return finish(
+            deferredCompactionResult ?? {
+              changed: false,
+              bytesFreed: 0,
+              rewrittenEntries: 0,
+              reason: "no transcript GC candidates",
+            },
+          );
         }
 
         const transcriptEntryIdsByCallId = listTranscriptToolResultEntryIdsByCallId(
@@ -5360,12 +5488,14 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.info(
             `[lcm] maintain: no matching transcript entries conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
-          return deferredCompactionResult ?? {
-            changed: false,
-            bytesFreed: 0,
-            rewrittenEntries: 0,
-            reason: "no matching transcript entries",
-          };
+          return finish(
+            deferredCompactionResult ?? {
+              changed: false,
+              bytesFreed: 0,
+              rewrittenEntries: 0,
+              reason: "no matching transcript entries",
+            },
+          );
         }
 
         const result = await rewriteTranscriptEntries({
@@ -5398,7 +5528,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] maintain: done conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} replacements=${replacements.length} changed=${combinedResult.changed} rewrittenEntries=${combinedResult.rewrittenEntries} bytesFreed=${combinedResult.bytesFreed} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return combinedResult;
+        return finish(combinedResult);
       },
       { operationName: "maintain", context: sessionLabel },
     );
@@ -5548,6 +5678,21 @@ export class LcmContextEngine implements ContextEngine {
 
     // Append to context items so assembler can see it
     await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
+    try {
+      this.rollupStore.upsertState(conversationId, {
+        timezone: this.timezone,
+        last_message_at: new Date().toISOString(),
+        pending_rebuild: 1,
+      });
+      this.observedWorkStore.upsertState({
+        conversationId,
+        pendingRebuild: true,
+      });
+    } catch (error) {
+      this.deps.log.warn(
+        `[lcm] ingest: failed to mark derived LCM state dirty conversation=${conversationId}: ${describeLogError(error)}`,
+      );
+    }
 
     return { ingested: true };
   }
@@ -7169,6 +7314,26 @@ export class LcmContextEngine implements ContextEngine {
 
   getCompactionMaintenanceStore(): CompactionMaintenanceStore {
     return this.compactionMaintenanceStore;
+  }
+
+  getObservedWorkStore(): ObservedWorkStore {
+    return this.observedWorkStore;
+  }
+
+  getEventObservationStore(): EventObservationStore {
+    return this.eventObservationStore;
+  }
+
+  getTaskBridgeSuggestionStore(): TaskBridgeSuggestionStore {
+    return this.taskBridgeSuggestionStore;
+  }
+
+  getRollupStore(): RollupStore {
+    return this.rollupStore;
+  }
+
+  getRollupBuilder(): RollupBuilder {
+    return this.rollupBuilder;
   }
 
   // ── Heartbeat pruning ──────────────────────────────────────────────────
