@@ -286,7 +286,7 @@ export class TaskBridgeSuggestionStore {
            reviewed_by = COALESCE(?, reviewed_by),
            reviewed_at = datetime('now'),
            updated_at = datetime('now')
-       WHERE suggestion_id = ?`,
+       WHERE suggestion_id = ? AND status = 'pending'`,
     ).run(input.status, input.reviewedBy ?? null, input.suggestionId);
     return result.changes > 0;
   }
