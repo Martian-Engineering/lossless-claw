@@ -52,8 +52,8 @@ const LcmWorkDensitySchema = Type.Object({
   statuses: Type.Optional(Type.Array(Type.String({ enum: [...STATUS_VALUES] }), { description: "Observed statuses to include." })),
   kinds: Type.Optional(Type.Array(Type.String({ enum: [...KIND_VALUES] }), { description: "Observed work kinds to include." })),
   includeSources: Type.Optional(Type.Boolean({ description: "Include observed-work source IDs. Defaults to false." })),
-  detailLevel: Type.Optional(Type.Number({ description: "0 = compact counts, 1 = include top items, 2 = include more detail. Default 1.", minimum: 0, maximum: 2 })),
-  maxOutputTokens: Type.Optional(Type.Number({ description: "Soft output budget hint for future truncation/accounting.", minimum: 256 })),
+  detailLevel: Type.Optional(Type.Number({ description: "0 = compact counts only; values above 0 include the bounded top item sections. Default 1.", minimum: 0, maximum: 2 })),
+  maxOutputTokens: Type.Optional(Type.Number({ description: "Approximate response budget; rich item/source sections are trimmed to stay within it when possible.", minimum: 256 })),
   minConfidence: Type.Optional(Type.Number({ description: "Minimum observed confidence to include.", minimum: 0, maximum: 1 })),
   limit: Type.Optional(Type.Number({ description: "Maximum items per highlight section. Default 5.", minimum: 1, maximum: 50 })),
 });
@@ -154,6 +154,107 @@ function arrayParam<T extends string>(value: unknown, allowed: readonly T[], key
   });
 }
 
+const DETAIL_ARRAY_KEYS = [
+  "dismissedItems",
+  "decisions",
+  "completedHighlights",
+  "ambiguous",
+  "staleItems",
+  "transitions",
+  "topUnfinished",
+] as const;
+
+function estimateJsonTokens(value: unknown): number {
+  return Math.ceil(JSON.stringify(value).length / 4);
+}
+
+function itemArray(details: Record<string, unknown>, key: string): unknown[] | undefined {
+  const value = details[key];
+  return Array.isArray(value) ? value : undefined;
+}
+
+function countReturnedItems(details: Record<string, unknown>): number {
+  return DETAIL_ARRAY_KEYS.reduce((count, key) => count + (itemArray(details, key)?.length ?? 0), 0);
+}
+
+function trimOneSource(details: Record<string, unknown>): boolean {
+  for (const key of DETAIL_ARRAY_KEYS) {
+    const items = itemArray(details, key);
+    if (!items) {
+      continue;
+    }
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item == null || typeof item !== "object" || Array.isArray(item)) {
+        continue;
+      }
+      const itemRecord = item as Record<string, unknown>;
+      const sources = itemRecord.sources;
+      if (!Array.isArray(sources) || sources.length === 0) {
+        continue;
+      }
+      const nextItem = { ...itemRecord };
+      const nextSources = sources.slice(0, -1);
+      if (nextSources.length > 0) {
+        nextItem.sources = nextSources;
+      } else {
+        delete nextItem.sources;
+      }
+      const nextItems = items.slice();
+      nextItems[index] = nextItem;
+      details[key] = nextItems;
+      return true;
+    }
+  }
+  return false;
+}
+
+function trimOneItem(details: Record<string, unknown>): boolean {
+  for (const key of DETAIL_ARRAY_KEYS) {
+    const items = itemArray(details, key);
+    if (items && items.length > 0) {
+      details[key] = items.slice(0, -1);
+      return true;
+    }
+  }
+  return false;
+}
+
+function applyOutputBudget(
+  details: Record<string, unknown>,
+  maxOutputTokens: unknown
+): Record<string, unknown> {
+  const budget =
+    typeof maxOutputTokens === "number" && Number.isFinite(maxOutputTokens)
+      ? Math.max(256, Math.trunc(maxOutputTokens))
+      : undefined;
+  if (!budget) {
+    return details;
+  }
+  const next: Record<string, unknown> = { ...details };
+  let budgetTruncated = false;
+  let guard = 0;
+  while (estimateJsonTokens(next) > budget && guard < 10_000) {
+    guard += 1;
+    if (trimOneSource(next) || trimOneItem(next)) {
+      budgetTruncated = true;
+      continue;
+    }
+    break;
+  }
+  const accounting =
+    next.accounting != null && typeof next.accounting === "object" && !Array.isArray(next.accounting)
+      ? { ...(next.accounting as Record<string, unknown>) }
+      : {};
+  accounting.maxOutputTokens = budget;
+  accounting.itemsReturned = countReturnedItems(next);
+  accounting.budgetTruncated = budgetTruncated;
+  accounting.truncated = Boolean(accounting.truncated) || budgetTruncated;
+  next.accounting = accounting;
+  accounting.estimatedOutputTokens = estimateJsonTokens(next);
+  return next;
+}
+
 export function createLcmWorkDensityTool(input: {
   deps: LcmDependencies;
   lcm?: LcmContextEngine;
@@ -225,7 +326,7 @@ export function createLcmWorkDensityTool(input: {
         limit,
       });
       const compact = detailLevel <= 0;
-      return jsonResult({
+      const details = applyOutputBudget({
         period: periodLabel,
         window: since || before ? { since, before, timezone: lcm.timezone } : undefined,
         conversationScope: scope.allConversations ? "all" : scope.conversationId,
@@ -243,7 +344,6 @@ export function createLcmWorkDensityTool(input: {
           itemsIncluded: result.itemsIncluded,
           itemsOmitted: result.itemsOmitted,
           truncated: result.itemsOmitted > 0,
-          maxOutputTokens: typeof p.maxOutputTokens === "number" ? p.maxOutputTokens : undefined,
         },
         confidence: "observed-unrefined",
         disclaimer: "Observed from LCM evidence; not authoritative task state.",
@@ -251,7 +351,8 @@ export function createLcmWorkDensityTool(input: {
           result.density.unfinished > 0
             ? ["Inspect source evidence for unfinished items before claiming certainty."]
             : [],
-      });
+      }, p.maxOutputTokens);
+      return jsonResult(details);
     },
   };
 }
