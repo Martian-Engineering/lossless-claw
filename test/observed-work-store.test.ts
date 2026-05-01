@@ -1155,6 +1155,21 @@ describe("ObservedWorkStore", () => {
       rationale: "Should not match a percent wildcard.",
       fingerprint: "review:not-percent",
     });
+    for (const [index, workItemId] of [
+      "work_pr_topic",
+      "work_title_topic",
+      "work_rationale_topic",
+      "work_literal_percent",
+      "work_not_percent",
+    ].entries()) {
+      store.addSource({
+        workItemId,
+        sourceType: "summary",
+        sourceId: `sum_topic_${index}`,
+        ordinal: index,
+        evidenceKind: "created",
+      });
+    }
 
     expect(
       store.getDensity({ conversationId: 1, topic: "PR 777" }).topUnfinished
