@@ -66,7 +66,11 @@ function parseTimestamp(value: unknown, key: string): string | undefined {
   if (typeof value !== "string" || value.trim().length === 0) {
     return undefined;
   }
-  const parsed = new Date(value.trim());
+  const trimmed = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(trimmed)) {
+    throw new Error(`${key} must be a valid ISO timestamp with timezone.`);
+  }
+  const parsed = new Date(trimmed);
   if (Number.isNaN(parsed.getTime())) {
     throw new Error(`${key} must be a valid ISO timestamp.`);
   }
@@ -211,6 +215,9 @@ export function createLcmTaskSuggestionsTool(input: {
         ...density.ambiguous,
         ...density.completedHighlights,
       ].slice(0, Math.max(1, Math.min(limit, 50)));
+      const sourceIdsByWorkItemId = new Map(
+        items.map((item) => [item.workItemId, sourceIdsFor(item)])
+      );
       const suggestions = items
         .map((item) => suggestionFor(item, includeSources))
         .filter((suggestion): suggestion is NonNullable<typeof suggestion> => suggestion != null);
@@ -222,7 +229,7 @@ export function createLcmTaskSuggestionsTool(input: {
       if (mode === "record") {
         const store = lcm.getTaskBridgeSuggestionStore();
         for (const suggestion of suggestions) {
-          const sourceIds = sourceIdsFor(items.find((item) => item.workItemId === suggestion.workItemId)!);
+          const sourceIds = sourceIdsByWorkItemId.get(suggestion.workItemId) ?? [];
           const result = store.upsertSuggestion({
             suggestionId: suggestion.suggestionId,
             workItemId: suggestion.workItemId,
@@ -282,7 +289,7 @@ export function createLcmTaskSuggestionReviewTool(input: {
       if (!suggestionId) {
         return jsonResult({ error: "suggestionId is required." });
       }
-      const status = typeof p.status === "string" ? p.status : "";
+      const status = typeof p.status === "string" ? p.status.trim() : "";
       if (!REVIEW_STATUS_VALUES.includes(status as (typeof REVIEW_STATUS_VALUES)[number])) {
         return jsonResult({ error: "status must be accepted, rejected, dismissed, or expired." });
       }

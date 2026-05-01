@@ -131,7 +131,7 @@ describe("TaskBridgeSuggestionStore", () => {
       store.reviewSuggestion({
         suggestionId: "sug_2",
         status: "accepted",
-        reviewedBy: "tester",
+        reviewedBy: " tester ",
       })
     ).toBe(true);
 
@@ -370,6 +370,13 @@ describe("TaskBridgeSuggestionStore", () => {
     expect((allConversations.details as { error?: string }).error).toMatch(
       /does not support allConversations/,
     );
+    const invalidSince = await suggestionsTool.execute("suggest-invalid-since", {
+      conversationId: 1,
+      since: "2026-04-28",
+    });
+    expect((invalidSince.details as { error?: string }).error).toMatch(
+      /ISO timestamp with timezone/
+    );
 
     const recorded = await suggestionsTool.execute("suggest-record", {
       conversationId: 1,
@@ -384,11 +391,14 @@ describe("TaskBridgeSuggestionStore", () => {
     const reviewTool = createLcmTaskSuggestionReviewTool({ lcm: lcm as never });
     const reviewed = await reviewTool.execute("suggest-review", {
       suggestionId: pending[0]!.suggestionId,
+      status: "dismissed ",
+      reviewedBy: " unit-test ",
+    });
+    expect((reviewed.details as { changed: boolean }).changed).toBe(true);
+    expect(taskBridge.listSuggestions({ status: "dismissed" })[0]).toMatchObject({
       status: "dismissed",
       reviewedBy: "unit-test",
     });
-    expect((reviewed.details as { changed: boolean }).changed).toBe(true);
-    expect(taskBridge.listSuggestions({ status: "dismissed" })).toHaveLength(1);
 
     const rerecorded = await suggestionsTool.execute("suggest-record-again", {
       conversationId: 1,
