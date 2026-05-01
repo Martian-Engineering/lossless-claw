@@ -159,10 +159,11 @@ export function createLcmRollupDebugTool(input: {
           state,
           rollups: includeSources
             ? rollups
-            : rollups.map(({ source_summary_ids, ...rollup }) => ({
-                ...rollup,
-                source_summary_ids: "omitted",
-              })),
+            : rollups.map((rollup) => {
+                const { source_summary_ids: omitted, ...redacted } = rollup;
+                void omitted;
+                return redacted;
+              }),
         },
       };
     },

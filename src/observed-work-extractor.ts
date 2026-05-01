@@ -58,6 +58,14 @@ type PendingObservedWork = {
   workItemId: string;
 };
 
+type PendingEventObservation = {
+  eventId: string;
+  row: LeafSummaryRow;
+  observedAt: string;
+  createdAt: string;
+  event: EventCandidate;
+};
+
 const COMPLETED_RE = /\b(completed|done|fixed|implemented|merged|shipped|landed|passed|green|resolved|closed)\b/i;
 const UNFINISHED_RE = /\b(todo|follow[- ]?up|needs?|remaining|blocked|blocker|failing|failed|pending|unresolved|changes requested|not done|regression|risk)\b/i;
 const DECISION_RE = /\b(decision|decided|agreed|settled|approved|chose)\b/i;
@@ -248,6 +256,7 @@ export class ObservedWorkExtractor {
     const pendingRows: Array<{
       row: LeafSummaryRow;
       entries: PendingObservedWork[];
+      events: PendingEventObservation[];
     }> = [];
     const workItemIds = new Set<string>();
 
@@ -255,6 +264,7 @@ export class ObservedWorkExtractor {
       const observedAt = toIso(row.effective_at ?? row.created_at);
       const createdAt = toIso(row.created_at);
       const entries: PendingObservedWork[] = [];
+      const events: PendingEventObservation[] = [];
       let ordinal = 0;
       for (const line of extractLines(row.content)) {
         const work = classifyWork(line);
@@ -274,25 +284,17 @@ export class ObservedWorkExtractor {
         const event = classifyEvent(line);
         if (event && this.eventObservationStore) {
           const eventId = hashId("ev", `${conversationId}:${row.summary_id}:${ordinal}:${event.eventKind}:${event.title}`);
-          this.eventObservationStore.upsertObservation({
+          events.push({
             eventId,
-            conversationId,
-            eventKind: event.eventKind,
-            title: event.title,
-            queryKey: event.queryKey,
-            eventTime: observedAt,
-            ingestTime: createdAt,
-            confidence: event.confidence,
-            rationale: event.rationale,
-            sourceType: "summary",
-            sourceId: row.summary_id,
-            sourceIds: [row.summary_id],
+            row,
+            observedAt,
+            createdAt,
+            event,
           });
-          eventsUpserted += 1;
         }
         ordinal += 1;
       }
-      pendingRows.push({ row, entries });
+      pendingRows.push({ row, entries, events });
     }
 
     const existingByWorkItemId = this.loadExistingItems([...workItemIds]);
@@ -304,7 +306,25 @@ export class ObservedWorkExtractor {
 
     for (const pendingRow of pendingRows) {
       let rowWorkItemsUpserted = 0;
+      let rowEventsUpserted = 0;
       this.withSummarySavepoint(pendingRow.row.summary_rowid, () => {
+        for (const entry of pendingRow.events) {
+          this.eventObservationStore?.upsertObservation({
+            eventId: entry.eventId,
+            conversationId,
+            eventKind: entry.event.eventKind,
+            title: entry.event.title,
+            queryKey: entry.event.queryKey,
+            eventTime: entry.observedAt,
+            ingestTime: entry.createdAt,
+            confidence: entry.event.confidence,
+            rationale: entry.event.rationale,
+            sourceType: "summary",
+            sourceId: entry.row.summary_id,
+            sourceIds: [entry.row.summary_id],
+          });
+          rowEventsUpserted += 1;
+        }
         for (const entry of pendingRow.entries) {
           const existing = existingByWorkItemId.get(entry.workItemId);
           const sourceAlreadyRecorded = this.observedWorkStore.hasSource({
@@ -368,6 +388,7 @@ export class ObservedWorkExtractor {
         });
       });
       workItemsUpserted += rowWorkItemsUpserted;
+      eventsUpserted += rowEventsUpserted;
     }
     return {
       summariesScanned: rows.length,
