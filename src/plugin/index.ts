@@ -747,6 +747,7 @@ function inferApiFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
   const map: Record<string, string> = {
     anthropic: "anthropic-messages",
+    deepseek: "openai-completions",
     openai: "openai-responses",
     [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_RESPONSES_API,
     "github-copilot": OPENAI_CODEX_RESPONSES_API,
