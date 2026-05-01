@@ -152,7 +152,7 @@ const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
 const AUTH_ERROR_NESTED_KEYS = ["error", "response", "cause", "details", "data", "body"] as const;
 
 type CompletionBridgeErrorInfo = {
-  kind: "provider_auth";
+  kind: "provider_auth" | "provider_error";
   statusCode?: number;
   code?: string;
   message?: string;
@@ -348,6 +348,26 @@ function detectProviderAuthError(error: unknown): CompletionBridgeErrorInfo | un
     ...(statusCode !== undefined ? { statusCode } : {}),
     ...(directCode ? { code: directCode } : {}),
     ...(normalizedMessage ? { message: truncateErrorMessage(normalizedMessage) } : {}),
+  };
+}
+
+function detectProviderBridgeError(error: unknown): CompletionBridgeErrorInfo {
+  const statusCode = extractErrorStatusCode(error);
+  const directCode =
+    isRecord(error) && typeof error.code === "string" && error.code.trim()
+      ? error.code.trim()
+      : isRecord(error) &&
+          isRecord(error.error) &&
+          typeof error.error.code === "string" &&
+          error.error.code.trim()
+        ? error.error.code.trim()
+        : undefined;
+
+  return {
+    kind: "provider_error",
+    ...(statusCode !== undefined ? { statusCode } : {}),
+    ...(directCode ? { code: directCode } : {}),
+    message: truncateErrorMessage(describeLogError(error)),
   };
 }
 
@@ -626,14 +646,110 @@ function normalizeProviderId(provider: string): string {
   return provider.trim().toLowerCase();
 }
 
+const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+const OPENAI_CODEX_RESPONSES_API = "openai-codex-responses";
+const OPENAI_CODEX_RESPONSES_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
+const OPENAI_CODEX_NATIVE_BASE_URLS = new Set([
+  "https://chatgpt.com/backend-api",
+  "https://chatgpt.com/backend-api/v1",
+  OPENAI_CODEX_RESPONSES_BASE_URL,
+  `${OPENAI_CODEX_RESPONSES_BASE_URL}/v1`,
+]);
+const OPENAI_CODEX_NATIVE_MODEL_IDS = new Set([
+  "gpt-5.2",
+  "gpt-5.2-codex",
+  "gpt-5.3-codex",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.4-pro",
+  "gpt-5.5",
+  "gpt-5.5-pro",
+]);
+
+function isOpenAICodexProvider(provider: string): boolean {
+  return normalizeProviderId(provider) === OPENAI_CODEX_PROVIDER_ID;
+}
+
+function isOpenAICodexResponsesApi(api: string | undefined): boolean {
+  return (api ?? "").trim().toLowerCase() === OPENAI_CODEX_RESPONSES_API;
+}
+
+function normalizeBaseUrl(value: string): string {
+  return value.trim().replace(/\/+$/, "");
+}
+
+function shouldUseNativeCodexBaseUrl(params: {
+  provider: string;
+  api: string | undefined;
+  baseUrl: string | undefined;
+}): boolean {
+  if (!isOpenAICodexProvider(params.provider) || !isOpenAICodexResponsesApi(params.api)) {
+    return false;
+  }
+
+  const baseUrl = params.baseUrl?.trim();
+  if (!baseUrl) {
+    return true;
+  }
+
+  const normalized = normalizeBaseUrl(baseUrl);
+  return normalized === OPENAI_API_BASE_URL || OPENAI_CODEX_NATIVE_BASE_URLS.has(normalized);
+}
+
+function resolveProviderModelBaseUrl(params: {
+  provider: string;
+  api: string | undefined;
+  configuredBaseUrl: unknown;
+  fallbackBaseUrl: unknown;
+}): string {
+  const configuredBaseUrl =
+    typeof params.configuredBaseUrl === "string" ? params.configuredBaseUrl : undefined;
+  const fallbackBaseUrl =
+    typeof params.fallbackBaseUrl === "string" ? params.fallbackBaseUrl : undefined;
+  const baseUrl = configuredBaseUrl ?? fallbackBaseUrl ?? "";
+  return shouldUseNativeCodexBaseUrl({ provider: params.provider, api: params.api, baseUrl })
+    ? OPENAI_CODEX_RESPONSES_BASE_URL
+    : baseUrl;
+}
+
+function getOpenAICodexNativeModelDefaults(params: {
+  provider: string;
+  model: string;
+  api: string | undefined;
+}): {
+  reasoning?: boolean;
+  input?: string[];
+  contextWindow?: number;
+  maxTokens?: number;
+} {
+  // OpenClaw can know about newer ChatGPT Codex models before the pi-ai
+  // package does.  Give those uncataloged models the same broad capabilities as
+  // the native Codex provider instead of falling back to a text-only stub.
+  if (
+    !isOpenAICodexProvider(params.provider) ||
+    !isOpenAICodexResponsesApi(params.api) ||
+    !OPENAI_CODEX_NATIVE_MODEL_IDS.has(params.model.trim().toLowerCase())
+  ) {
+    return {};
+  }
+
+  return {
+    reasoning: true,
+    input: ["text", "image"],
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+  };
+}
+
 /** Resolve known provider API defaults when model lookup misses. */
 function inferApiFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
   const map: Record<string, string> = {
     anthropic: "anthropic-messages",
     openai: "openai-responses",
-    "openai-codex": "openai-codex-responses",
-    "github-copilot": "openai-codex-responses",
+    [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_RESPONSES_API,
+    "github-copilot": OPENAI_CODEX_RESPONSES_API,
     google: "google-generative-ai",
     "google-gemini-cli": "google-gemini-cli",
     "google-antigravity": "google-gemini-cli",
@@ -646,7 +762,7 @@ function inferApiFromProvider(provider: string): string | undefined {
 
 /** Codex Responses rejects `temperature`; omit it for that API family. */
 export function shouldOmitTemperatureForApi(api: string | undefined): boolean {
-  return (api ?? "").trim().toLowerCase() === "openai-codex-responses";
+  return isOpenAICodexResponsesApi(api);
 }
 
 /** Build provider-aware options for pi-ai completeSimple. */
@@ -796,18 +912,24 @@ function buildModelAuthLookupModel(params: {
   api?: string;
   contextWindow?: number;
 }): RuntimeModelAuthModel {
+  const api = params.api?.trim() || inferApiFromProvider(params.provider) || "";
+  const codexDefaults = getOpenAICodexNativeModelDefaults({
+    provider: params.provider,
+    model: params.model,
+    api,
+  });
   const contextWindow =
     typeof params.contextWindow === "number" && Number.isFinite(params.contextWindow) && params.contextWindow > 0
       ? params.contextWindow
-      : 1_000_000;
+      : codexDefaults.contextWindow ?? 1_000_000;
 
   return {
     id: params.model,
     name: params.model,
     provider: params.provider,
-    api: params.api?.trim() || inferApiFromProvider(params.provider) || "",
-    reasoning: false,
-    input: ["text"],
+    api,
+    reasoning: codexDefaults.reasoning ?? false,
+    input: codexDefaults.input ?? ["text"],
     cost: {
       input: 0,
       output: 0,
@@ -815,7 +937,7 @@ function buildModelAuthLookupModel(params: {
       cacheWrite: 0,
     },
     contextWindow,
-    maxTokens: 8_000,
+    maxTokens: codexDefaults.maxTokens ?? 8_000,
   };
 }
 
@@ -1624,6 +1746,16 @@ function createLcmDependencies(
           return isRecord(cfg) ? cfg : {};
         })();
 
+        const resolvedKnownApi =
+          isRecord(knownModel) && typeof knownModel.api === "string"
+            ? modelRuntimeApi || providerRuntimeApi || knownModel.api
+            : undefined;
+        const codexDefaults = getOpenAICodexNativeModelDefaults({
+          provider: providerId,
+          model: modelId,
+          api: fallbackApi,
+        });
+
         let resolvedModel =
           isRecord(knownModel) &&
           typeof knownModel.api === "string" &&
@@ -1633,19 +1765,19 @@ function createLcmDependencies(
                 ...knownModel,
                 id: knownModel.id,
                 provider: knownModel.provider,
-                api: modelRuntimeApi || providerRuntimeApi || knownModel.api,
+                api: resolvedKnownApi ?? knownModel.api,
                 // Provider config must be able to override built-in transport defaults.
                 // Otherwise built-in providers like `openai` keep their catalog baseUrl
                 // (`https://api.openai.com/v1`) even when OpenClaw runtime config points
                 // that provider id at a custom proxy.
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
-                baseUrl:
-                  typeof providerLevelConfig.baseUrl === "string"
-                    ? providerLevelConfig.baseUrl
-                    : typeof knownModel.baseUrl === "string"
-                      ? knownModel.baseUrl
-                      : "",
+                baseUrl: resolveProviderModelBaseUrl({
+                  provider: providerId,
+                  api: resolvedKnownApi ?? knownModel.api,
+                  configuredBaseUrl: providerLevelConfig.baseUrl,
+                  fallbackBaseUrl: knownModel.baseUrl,
+                }),
                 ...(isRecord(providerLevelConfig.headers)
                   ? {
                       headers: {
@@ -1660,21 +1792,24 @@ function createLcmDependencies(
                 name: modelId,
                 provider: providerId,
                 api: fallbackApi,
-                reasoning: false,
-                input: ["text"],
+                reasoning: codexDefaults.reasoning ?? false,
+                input: codexDefaults.input ?? ["text"],
                 cost: {
                   input: 0,
                   output: 0,
                   cacheRead: 0,
                   cacheWrite: 0,
                 },
-                contextWindow: 1_000_000,
-                maxTokens: 8_000,
+                contextWindow: codexDefaults.contextWindow ?? 1_000_000,
+                maxTokens: codexDefaults.maxTokens ?? 8_000,
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
-                baseUrl: typeof providerLevelConfig.baseUrl === "string"
-                  ? providerLevelConfig.baseUrl
-                  : "",
+                baseUrl: resolveProviderModelBaseUrl({
+                  provider: providerId,
+                  api: fallbackApi,
+                  configuredBaseUrl: providerLevelConfig.baseUrl,
+                  fallbackBaseUrl: undefined,
+                }),
                 ...(isRecord(providerLevelConfig.headers)
                   ? { headers: providerLevelConfig.headers }
                   : {}),
@@ -1853,10 +1988,12 @@ function createLcmDependencies(
                 message: err.message,
               }
             : undefined;
+        const providerError = !authError && !configError ? detectProviderBridgeError(err) : undefined;
         return {
           content: [],
           ...(authError ? { error: authError } : {}),
           ...(configError ? { error: configError } : {}),
+          ...(providerError ? { error: providerError } : {}),
         };
       }
     },

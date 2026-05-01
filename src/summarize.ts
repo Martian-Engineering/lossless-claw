@@ -80,6 +80,13 @@ type ProviderAuthFailure = {
   missingModelRequestScope: boolean;
 };
 
+type ProviderResponseFailure = {
+  statusCode?: number;
+  message?: string;
+  code?: string;
+  finishReason?: string;
+};
+
 /**
  * Signals that the summarizer hit a provider-auth failure and callers should
  * avoid treating the result like an empty summary.
@@ -96,6 +103,25 @@ export class LcmProviderAuthError extends Error {
   }) {
     super(buildProviderAuthWarning(params));
     this.name = "LcmProviderAuthError";
+    this.provider = params.provider;
+    this.model = params.model;
+    this.failure = params.failure;
+  }
+}
+
+/** Signals that a provider returned an explicit non-auth error response. */
+class LcmProviderResponseError extends Error {
+  readonly provider: string;
+  readonly model: string;
+  readonly failure: ProviderResponseFailure;
+
+  constructor(params: {
+    provider: string;
+    model: string;
+    failure: ProviderResponseFailure;
+  }) {
+    super(buildProviderResponseWarning(params));
+    this.name = "LcmProviderResponseError";
     this.provider = params.provider;
     this.model = params.model;
     this.failure = params.failure;
@@ -547,6 +573,95 @@ function buildProviderAuthWarning(params: {
       ? ` Detail: ${params.failure.message}`
       : "";
   return `[lcm] compaction failed: ${detail}. Check that the configured summaryProvider has valid API credentials. Current: ${params.provider}/${params.model}${messageSuffix}`;
+}
+
+function getProviderResponseFinishReason(value: Record<string, unknown>): string | undefined {
+  for (const key of ["finish_reason", "stopReason", "stop_reason", "status"]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+function getProviderResponseErrorCode(value: Record<string, unknown>): string | undefined {
+  if (typeof value.code === "string" && value.code.trim()) {
+    return value.code.trim();
+  }
+  if (isRecord(value.error) && typeof value.error.code === "string" && value.error.code.trim()) {
+    return value.error.code.trim();
+  }
+  return undefined;
+}
+
+function getProviderResponseErrorMessage(value: Record<string, unknown>): string | undefined {
+  const textParts: string[] = [];
+  for (const key of ["errorMessage", "message"]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      textParts.push(candidate.trim());
+    }
+  }
+  if (isRecord(value.error)) {
+    collectAuthFailureText(value.error, textParts);
+  }
+  return textParts.length > 0
+    ? truncateDiagnosticText(textParts.join(" ").replace(/\s+/g, " ").trim(), 240)
+    : undefined;
+}
+
+function extractProviderResponseFailure(value: unknown): ProviderResponseFailure | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  // Treat only structural provider-error signals as failures. A plain
+  // `errorMessage` string can be part of an overloaded empty response that the
+  // existing conservative retry path still knows how to recover from.
+  const statusCode = extractAuthFailureStatusCode(value);
+  const finishReason = getProviderResponseFinishReason(value);
+  const normalizedFinishReason = finishReason?.toLowerCase();
+  const nestedError = isRecord(value.error) ? value.error : undefined;
+  const nestedErrorKind = typeof nestedError?.kind === "string" ? nestedError.kind : undefined;
+  const hasExplicitErrorSignal =
+    normalizedFinishReason === "error" ||
+    normalizedFinishReason === "failed" ||
+    normalizedFinishReason === "cancelled" ||
+    (statusCode !== undefined && statusCode >= 400) ||
+    (nestedErrorKind !== undefined && nestedErrorKind !== "provider_auth");
+  if (!hasExplicitErrorSignal) {
+    return undefined;
+  }
+
+  const code = getProviderResponseErrorCode(value);
+  const message = getProviderResponseErrorMessage(value);
+  return {
+    ...(statusCode !== undefined ? { statusCode } : {}),
+    ...(finishReason ? { finishReason } : {}),
+    ...(code ? { code } : {}),
+    ...(message ? { message } : {}),
+  };
+}
+
+function buildProviderResponseWarning(params: {
+  provider: string;
+  model: string;
+  failure: ProviderResponseFailure;
+}): string {
+  const detailParts: string[] = [];
+  if (params.failure.statusCode !== undefined) {
+    detailParts.push(String(params.failure.statusCode));
+  }
+  if (params.failure.finishReason) {
+    detailParts.push(`finish=${params.failure.finishReason}`);
+  }
+  if (params.failure.code) {
+    detailParts.push(`code=${params.failure.code}`);
+  }
+  const detail = detailParts.length > 0 ? ` (${detailParts.join(" / ")})` : "";
+  const messageSuffix = params.failure.message ? ` Detail: ${params.failure.message}` : "";
+  return `[lcm] provider error response${detail}; provider=${params.provider}; model=${params.model}${messageSuffix}`;
 }
 
 /**
@@ -1278,12 +1393,20 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             params.deps.log.warn(retryAuthError.message);
             throw retryAuthError;
           }
+          const directResponseFailure = extractProviderResponseFailure(directResult);
+          if (directResponseFailure) {
+            throw new LcmProviderResponseError({
+              provider,
+              model,
+              failure: directResponseFailure,
+            });
+          }
           params.deps.log.info(
             `[lcm] summarizer auth retry succeeded; provider=${provider}; model=${model}; source=direct-credentials`,
           );
           return directResult;
         } catch (directErr) {
-          if (directErr instanceof LcmProviderAuthError) {
+          if (directErr instanceof LcmProviderAuthError || directErr instanceof LcmProviderResponseError) {
             throw directErr;
           }
           // Catch path: real errors carry structural signals (HTTP 401, error.kind),
@@ -1318,10 +1441,21 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             requireStructuralSignal: true,
           });
           if (!authFailure) {
-            return result;
+            const responseFailure = extractProviderResponseFailure(result);
+            if (!responseFailure) {
+              return result;
+            }
+            throw new LcmProviderResponseError({
+              provider,
+              model,
+              failure: responseFailure,
+            });
           }
           return retryWithoutModelAuth(authFailure, reasoning);
         } catch (err) {
+          if (err instanceof LcmProviderResponseError) {
+            throw err;
+          }
           const authFailure = extractProviderAuthFailure(err);
           if (!authFailure) {
             throw err;
@@ -1345,6 +1479,18 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             continue;
           }
           throw lastAuthError;
+        }
+        if (err instanceof LcmProviderResponseError) {
+          params.deps.log.warn(err.message);
+          if (nextCandidate) {
+            params.deps.log.warn(
+              `[lcm] PROVIDER FALLBACK: ${provider}/${model} provider error → trying ${nextCandidate.provider}/${nextCandidate.model}`,
+            );
+            const backoffMs = Math.min(500 * Math.pow(2, index), 8000);
+            await new Promise((r) => setTimeout(r, backoffMs));
+            continue;
+          }
+          break;
         }
         const errMsg = err instanceof Error ? err.message : String(err);
         const isTimeout = errMsg.includes("summarizer timeout");
@@ -1462,6 +1608,19 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               continue;
             }
             throw lastAuthError;
+          }
+          if (retryErr instanceof LcmProviderResponseError) {
+            params.deps.log.warn(retryErr.message);
+            if (nextCandidate) {
+              params.deps.log.warn(
+                `[lcm] PROVIDER FALLBACK: ${provider}/${model} provider error on retry → trying ${nextCandidate.provider}/${nextCandidate.model}`,
+              );
+              const backoffMs = Math.min(500 * Math.pow(2, index), 8000);
+              await new Promise((r) => setTimeout(r, backoffMs));
+              continue;
+            }
+            summary = initialSummary;
+            continue;
           }
           // Retry is best-effort; log and proceed to deterministic fallback.
           const retryErrMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);

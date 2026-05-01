@@ -301,6 +301,59 @@ describe("createLcmDependencies.complete provider config resolution", () => {
     );
   });
 
+  it("uses native Codex transport defaults for uncataloged openai-codex models", async () => {
+    await callComplete({
+      loadConfigResult: {},
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      runtimeConfig: {},
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "gpt-5.4",
+        provider: "openai-codex",
+        api: "openai-codex-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        reasoning: true,
+        input: ["text", "image"],
+        maxTokens: 128_000,
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("keeps custom Codex proxy baseUrl when openai-codex uses native transport", async () => {
+    const runtimeConfig = {
+      models: {
+        providers: {
+          "openai-codex": {
+            baseUrl: "https://codex-proxy.example.test/v1",
+          },
+        },
+      },
+    };
+
+    await callComplete({
+      loadConfigResult: runtimeConfig,
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      runtimeConfig,
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "gpt-5.4",
+        provider: "openai-codex",
+        api: "openai-codex-responses",
+        baseUrl: "https://codex-proxy.example.test/v1",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
   it("overrides built-in transport defaults for known providers with runtime provider config", async () => {
     piAiMock.getModel.mockReturnValue({
       id: "gpt-5.4",
@@ -473,7 +526,7 @@ describe("createLcmDependencies.complete provider config resolution", () => {
     });
   });
 
-  it("does not mislabel non-config provider errors as provider_config", async () => {
+  it("labels non-config provider errors without mislabeling them as provider_config", async () => {
     piAiMock.completeSimple.mockRejectedValue(new Error("gateway timed out"));
 
     const { result } = await callComplete({
@@ -501,7 +554,15 @@ describe("createLcmDependencies.complete provider config resolution", () => {
 
     expect(result).toMatchObject({
       content: [],
+      error: {
+        kind: "provider_error",
+        message: "gateway timed out",
+      },
     });
-    expect(result).not.toHaveProperty("error");
+    expect(result).not.toMatchObject({
+      error: {
+        kind: "provider_config",
+      },
+    });
   });
 });
