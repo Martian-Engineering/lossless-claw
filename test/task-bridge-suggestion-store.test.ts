@@ -124,7 +124,7 @@ describe("TaskBridgeSuggestionStore", () => {
       store.reviewSuggestion({
         suggestionId: "sug_2",
         status: "accepted",
-        reviewedBy: "tester",
+        reviewedBy: " tester ",
       })
     ).toBe(true);
 
