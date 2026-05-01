@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -49,7 +49,7 @@ async function createLcmFixture() {
       conversationId: conversation.conversationId,
       seq: 0,
       role: "user",
-      content: "We recovered the Lexar drive and audited the LCM plugin idea.",
+      content: `We recovered the Lexar drive and audited the LCM plugin idea. ${"x".repeat(1500)}`,
       tokenCount: 16,
     },
     {
@@ -87,9 +87,7 @@ async function createLcmFixture() {
     firstMessage.messageId,
     secondMessage.messageId,
   ]);
-  await summaryStore.linkSummaryToParents("sum_codex_reader_child", [
-    "sum_codex_reader_parent",
-  ]);
+  await summaryStore.linkSummaryToParents("sum_codex_reader_parent", ["sum_codex_reader_child"]);
   db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?").run(
     "2026-04-29T10:00:00.000Z",
     firstMessage.messageId,
@@ -107,6 +105,31 @@ async function createLcmFixture() {
     firstMessageId: firstMessage.messageId,
     secondMessageId: secondMessage.messageId,
   };
+}
+
+async function createLegacyLcmFixture() {
+  const tempDir = mkdtempSync(join(tmpdir(), "codex-lcm-reader-legacy-"));
+  const dbPath = join(tempDir, "lcm.db");
+  const db = createLcmDatabaseConnection(dbPath);
+  db.exec(`
+    CREATE TABLE conversations (conversation_id INTEGER PRIMARY KEY, session_id TEXT);
+    CREATE TABLE messages (
+      message_id INTEGER PRIMARY KEY,
+      conversation_id INTEGER,
+      content TEXT,
+      created_at TEXT
+    );
+    CREATE TABLE summaries (
+      summary_id TEXT PRIMARY KEY,
+      conversation_id INTEGER,
+      content TEXT,
+      created_at TEXT
+    );
+    CREATE TABLE summary_parents (summary_id TEXT, parent_summary_id TEXT);
+    CREATE TABLE summary_messages (summary_id TEXT, message_id INTEGER);
+  `);
+  closeLcmConnection(dbPath);
+  return { tempDir, dbPath };
 }
 
 function encodeMcp(payload: unknown): string {
@@ -231,16 +254,16 @@ describe("Codex LCM Reader plugin", () => {
 
     const result = await plugin.callTool(
       "lcm_describe",
-      { id: "sum_codex_reader_child" },
+      { id: "sum_codex_reader_parent" },
       { dbPath: fixture.dbPath },
     );
 
     const item = result.structuredContent?.item as {
       parentIds: string[];
-      messageIds: number[];
+      childIds: string[];
     };
-    expect(item.parentIds).toEqual(["sum_codex_reader_parent"]);
-    expect(item.messageIds).toHaveLength(2);
+    expect(item.parentIds).toEqual(["sum_codex_reader_child"]);
+    expect(item.childIds).toEqual([]);
   });
 
   it("describes source messages and linked summaries", async () => {
@@ -264,6 +287,27 @@ describe("Codex LCM Reader plugin", () => {
     expect(item.message_id).toBe(fixture.firstMessageId);
     expect(item.content).toContain("Lexar drive");
     expect(item.summaryIds).toEqual(["sum_codex_reader_child"]);
+  });
+
+  it("bounds lcm_describe source content by maxChars", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_describe",
+      { id: `message:${fixture.firstMessageId}`, maxChars: 1000 },
+      { dbPath: fixture.dbPath },
+    );
+
+    const item = result.structuredContent?.item as {
+      content: string;
+      content_truncated: boolean;
+      content_original_length: number;
+    };
+    expect(item.content.length).toBeLessThanOrEqual(1020);
+    expect(item.content_truncated).toBe(true);
+    expect(item.content_original_length).toBeGreaterThan(1000);
   });
 
   it("returns structured describe errors with tool and ID-format hints", async () => {
@@ -295,6 +339,89 @@ describe("Codex LCM Reader plugin", () => {
 
     expect(result.structuredContent?.text).toContain("read-only plugin");
     expect(result.structuredContent?.text).toContain("expand-query work");
+  });
+
+  it("does not expand explicit summary IDs outside the requested conversation", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_expand_query",
+      {
+        summaryIds: ["sum_codex_reader_parent"],
+        conversationId: fixture.conversationId + 1,
+        prompt: "Should not cross conversations",
+      },
+      { dbPath: fixture.dbPath },
+    );
+
+    const expanded = result.structuredContent?.expanded as Array<{ error: string }>;
+    expect(expanded[0].error).toContain(`conversation ${fixture.conversationId + 1}`);
+    expect(result.structuredContent?.text).toBe("");
+  });
+
+  it("falls back from message hits to linked summaries for expand-query seeds", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_expand_query",
+      {
+        query: "read-only SQLite access",
+        prompt: "What was the safe plan?",
+        conversationId: fixture.conversationId,
+        tokenCap: 4000,
+      },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.summaryIds).toEqual(["sum_codex_reader_child"]);
+    expect(result.structuredContent?.text).toContain("expand-query work");
+  });
+
+  it("rejects unsafe regex patterns without throwing", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_grep",
+      { pattern: "(a+)+$", mode: "regex", scope: "messages", limit: 10 },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.count).toBe(0);
+    expect(result.structuredContent?.results).toEqual([]);
+  });
+
+  it("falls back to LIKE when copied FTS tables are malformed", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const db = createLcmDatabaseConnection(fixture.dbPath);
+    db.exec("DROP TABLE IF EXISTS messages_fts");
+    db.exec("CREATE TABLE messages_fts(content TEXT)");
+    closeLcmConnection(fixture.dbPath);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_grep",
+      { pattern: "Lexar", mode: "full_text", scope: "messages", limit: 10 },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.count).toBeGreaterThan(0);
+  });
+
+  it("rejects legacy databases with missing required columns before raw SQL failures", async () => {
+    const fixture = await createLegacyLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    await expect(
+      plugin.callTool("lcm_describe", { id: "sum_legacy" }, { dbPath: fixture.dbPath }),
+    ).rejects.toThrow("missing required columns");
   });
 
   it("finds seed summaries for expand-query and returns evidence for Codex to synthesize", async () => {
@@ -376,6 +503,56 @@ describe("Codex LCM Reader plugin", () => {
     expect(messages.map((message) => message.id)).toEqual([1, 2, 3]);
     expect(JSON.stringify(messages[1])).toContain("lcm_expand_query");
     expect(JSON.stringify(messages[2])).toContain("Lexar");
+  });
+
+  it("starts over MCP stdio using the checked-in .mcp.json command", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const pluginRoot = join(process.cwd(), "plugins/codex-lcm-reader");
+    const mcpConfig = JSON.parse(
+      readFileSync(join(pluginRoot, ".mcp.json"), "utf8"),
+    ) as {
+      mcpServers: Record<string, { command: string; args: string[]; cwd: string }>;
+    };
+    const server = mcpConfig.mcpServers["codex-lcm-reader"];
+
+    const child = spawn(server.command, server.args, {
+      cwd: join(pluginRoot, server.cwd),
+      env: { ...process.env, LCM_CODEX_DB_PATH: fixture.dbPath },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.stdin.write(encodeMcp({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+    child.stdin.end();
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill("SIGTERM");
+        reject(new Error(`MCP config server timed out. stderr=${stderr}`));
+      }, 5_000);
+      child.on("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.on("exit", (code) => {
+        clearTimeout(timeout);
+        if (code === 0) resolve();
+        else reject(new Error(`MCP config server exited ${code}. stderr=${stderr}`));
+      });
+    });
+
+    const messages = decodeMcp(stdout);
+    expect(messages).toHaveLength(1);
+    expect(JSON.stringify(messages[0])).toContain("lcm_expand_query");
   });
 
   it("starts over MCP stdio when invoked through an installed symlink path", async () => {

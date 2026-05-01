@@ -11,6 +11,11 @@ const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 200;
 const DEFAULT_SCAN_LIMIT = 5_000;
 const MAX_EXPAND_TOKENS = 120_000;
+const MAX_SUMMARY_IDS = 20;
+const DEFAULT_MAX_EXPAND_NODES = 200;
+const MAX_EXPAND_NODES = 1_000;
+const DEFAULT_DESCRIBE_CHARS = 24_000;
+const MAX_DESCRIBE_CHARS = 120_000;
 
 function textResult(text, details = undefined) {
   return {
@@ -39,6 +44,13 @@ function parseDateParam(value, name) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) throw new Error(`${name} must be a valid ISO timestamp.`);
   return date.toISOString();
+}
+
+function readPositiveInt(value, name) {
+  if (value == null) return undefined;
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) throw new Error(`${name} must be a positive integer.`);
+  return id;
 }
 
 function resolveOpenclawStateDir(env = process.env) {
@@ -78,6 +90,36 @@ function requiredSchema(db) {
   const missing = required.filter((name) => !tableExists(db, name));
   if (missing.length > 0) {
     throw new Error(`LCM database is missing required tables: ${missing.join(", ")}`);
+  }
+  const requiredColumns = {
+    messages: ["message_id", "conversation_id", "seq", "role", "content", "token_count", "created_at"],
+    summaries: [
+      "summary_id",
+      "conversation_id",
+      "kind",
+      "depth",
+      "content",
+      "token_count",
+      "file_ids",
+      "earliest_at",
+      "latest_at",
+      "descendant_count",
+      "descendant_token_count",
+      "source_message_token_count",
+      "model",
+      "created_at",
+    ],
+    summary_parents: ["summary_id", "parent_summary_id", "ordinal"],
+    summary_messages: ["summary_id", "message_id", "ordinal"],
+  };
+  for (const [table, columns] of Object.entries(requiredColumns)) {
+    const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name));
+    const missingColumns = columns.filter((column) => !existing.has(column));
+    if (missingColumns.length > 0) {
+      throw new Error(
+        `LCM database table ${table} is missing required columns: ${missingColumns.join(", ")}. Run lossless-claw migrations before using Lossless Codex.`,
+      );
+    }
   }
 }
 
@@ -137,8 +179,7 @@ function buildScope(params, alias = "") {
   const where = [];
   const args = [];
   if (params.conversationId != null) {
-    const id = Number(params.conversationId);
-    if (!Number.isInteger(id) || id <= 0) throw new Error("conversationId must be a positive integer.");
+    const id = readPositiveInt(params.conversationId, "conversationId");
     where.push(`${prefix}conversation_id = ?`);
     args.push(id);
   }
@@ -167,6 +208,15 @@ function normalizeSort(sort) {
   return sort === "relevance" || sort === "hybrid" || sort === "oldest" ? sort : "recency";
 }
 
+function compileSafeRegex(pattern, caseSensitive) {
+  if (pattern.length > 500 || /(\+|\*|\?)\)(\+|\*|\?|\{\d)/.test(pattern)) return undefined;
+  try {
+    return new RegExp(pattern, caseSensitive === true ? "" : "i");
+  } catch {
+    return undefined;
+  }
+}
+
 function searchMessages(db, params) {
   const query = readString(params.pattern ?? params.query);
   if (!query) throw new Error("pattern is required.");
@@ -174,37 +224,43 @@ function searchMessages(db, params) {
   const limit = clampInt(params.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
   const sort = normalizeSort(params.sort);
   const scope = buildScope(params, "m");
+  const regex = mode === "regex" ? compileSafeRegex(query, params.caseSensitive) : undefined;
+  if (mode === "regex" && !regex) return [];
 
   if (mode === "full_text" && tableExists(db, "messages_fts")) {
-    const where = ["messages_fts MATCH ?", ...scope.where];
-    const args = [sanitizeFts5Query(query), ...scope.args];
-    if (scope.since) {
-      where.push("julianday(m.created_at) >= julianday(?)");
-      args.push(scope.since);
+    try {
+      const where = ["messages_fts MATCH ?", ...scope.where];
+      const args = [sanitizeFts5Query(query), ...scope.args];
+      if (scope.since) {
+        where.push("julianday(m.created_at) >= julianday(?)");
+        args.push(scope.since);
+      }
+      if (scope.before) {
+        where.push("julianday(m.created_at) < julianday(?)");
+        args.push(scope.before);
+      }
+      args.push(limit);
+      return db
+        .prepare(
+          `SELECT
+             'message:' || m.message_id AS id,
+             m.message_id,
+             m.conversation_id,
+             m.role AS kind,
+             snippet(messages_fts, 0, '', '', '...', 32) AS snippet,
+             m.created_at,
+             rank
+           FROM messages_fts
+           JOIN messages m ON m.message_id = messages_fts.rowid
+           WHERE ${where.join(" AND ")}
+           ORDER BY ${orderBy(sort, "m.created_at")}
+           LIMIT ?`,
+        )
+        .all(...args)
+        .map((row) => ({ type: "message", ...row }));
+    } catch {
+      // Stale or malformed copied FTS tables should not make read-only recall unusable.
     }
-    if (scope.before) {
-      where.push("julianday(m.created_at) < julianday(?)");
-      args.push(scope.before);
-    }
-    args.push(limit);
-    return db
-      .prepare(
-        `SELECT
-           'message:' || m.message_id AS id,
-           m.message_id,
-           m.conversation_id,
-           m.role AS kind,
-           snippet(messages_fts, 0, '', '', '...', 32) AS snippet,
-           m.created_at,
-           rank
-         FROM messages_fts
-         JOIN messages m ON m.message_id = messages_fts.rowid
-         WHERE ${where.join(" AND ")}
-         ORDER BY ${orderBy(sort, "m.created_at")}
-         LIMIT ?`,
-      )
-      .all(...args)
-      .map((row) => ({ type: "message", ...row }));
   }
 
   const terms = mode === "full_text" ? likeTerms(query) : [];
@@ -240,7 +296,6 @@ function searchMessages(db, params) {
        LIMIT ?`,
     )
     .all(...args);
-  const regex = mode === "regex" ? new RegExp(query, params.caseSensitive === true ? "" : "i") : undefined;
   return rows
     .filter((row) => (regex ? regex.test(String(row.content ?? "")) : true))
     .slice(0, limit)
@@ -263,37 +318,43 @@ function searchSummaries(db, params) {
   const sort = normalizeSort(params.sort);
   const scope = buildScope(params, "s");
   const timeExpr = "COALESCE(s.latest_at, s.created_at)";
+  const regex = mode === "regex" ? compileSafeRegex(query, params.caseSensitive) : undefined;
+  if (mode === "regex" && !regex) return [];
 
   if (mode === "full_text" && tableExists(db, "summaries_fts")) {
-    const where = ["summaries_fts MATCH ?", ...scope.where];
-    const args = [sanitizeFts5Query(query), ...scope.args];
-    if (scope.since) {
-      where.push(`julianday(${timeExpr}) >= julianday(?)`);
-      args.push(scope.since);
+    try {
+      const where = ["summaries_fts MATCH ?", ...scope.where];
+      const args = [sanitizeFts5Query(query), ...scope.args];
+      if (scope.since) {
+        where.push(`julianday(${timeExpr}) >= julianday(?)`);
+        args.push(scope.since);
+      }
+      if (scope.before) {
+        where.push(`julianday(${timeExpr}) < julianday(?)`);
+        args.push(scope.before);
+      }
+      args.push(limit);
+      return db
+        .prepare(
+          `SELECT
+             s.summary_id AS id,
+             s.summary_id,
+             s.conversation_id,
+             s.kind,
+             snippet(summaries_fts, 1, '', '', '...', 32) AS snippet,
+             ${timeExpr} AS created_at,
+             rank
+           FROM summaries_fts
+           JOIN summaries s ON s.summary_id = summaries_fts.summary_id
+           WHERE ${where.join(" AND ")}
+           ORDER BY ${orderBy(sort, timeExpr)}
+           LIMIT ?`,
+        )
+        .all(...args)
+        .map((row) => ({ type: "summary", ...row }));
+    } catch {
+      // Stale or malformed copied FTS tables should fall back to escaped LIKE search.
     }
-    if (scope.before) {
-      where.push(`julianday(${timeExpr}) < julianday(?)`);
-      args.push(scope.before);
-    }
-    args.push(limit);
-    return db
-      .prepare(
-        `SELECT
-           s.summary_id AS id,
-           s.summary_id,
-           s.conversation_id,
-           s.kind,
-           snippet(summaries_fts, 1, '', '', '...', 32) AS snippet,
-           ${timeExpr} AS created_at,
-           rank
-         FROM summaries_fts
-         JOIN summaries s ON s.summary_id = summaries_fts.summary_id
-         WHERE ${where.join(" AND ")}
-         ORDER BY ${orderBy(sort, timeExpr)}
-         LIMIT ?`,
-      )
-      .all(...args)
-      .map((row) => ({ type: "summary", ...row }));
   }
 
   const terms = mode === "full_text" ? likeTerms(query) : [];
@@ -329,7 +390,6 @@ function searchSummaries(db, params) {
        LIMIT ?`,
     )
     .all(...args);
-  const regex = mode === "regex" ? new RegExp(query, params.caseSensitive === true ? "" : "i") : undefined;
   return rows
     .filter((row) => (regex ? regex.test(String(row.content ?? "")) : true))
     .slice(0, limit)
@@ -432,6 +492,7 @@ function describeMessage(db, rawId) {
 function lcmDescribe(db, params) {
   const id = readString(params.id);
   if (!id) throw new Error("id is required.");
+  const maxChars = clampInt(params.maxChars, DEFAULT_DESCRIBE_CHARS, 1_000, MAX_DESCRIBE_CHARS);
   const result =
     id.startsWith("file_")
       ? describeFile(db, id)
@@ -452,9 +513,19 @@ function lcmDescribe(db, params) {
       hint: "The ID exists outside the requested conversation or does not exist.",
     });
   }
+  const bounded = { ...result };
+  for (const field of ["content", "exploration_summary"]) {
+    if (typeof bounded[field] === "string") {
+      const truncated = truncateChars(bounded[field], maxChars);
+      bounded[field] = truncated.text;
+      bounded[`${field}_truncated`] = truncated.truncated;
+      bounded[`${field}_original_length`] = truncated.originalLength;
+    }
+  }
   return jsonTextResult({
     tool: "lcm_describe",
-    item: result,
+    maxChars,
+    item: bounded,
     note:
       result.type === "message"
         ? "This is a source message. Use linked summary IDs for broader context."
@@ -472,19 +543,31 @@ function truncateTokens(text, maxTokens) {
   return value.length <= maxChars ? value : `${value.slice(0, Math.max(0, maxChars - 32)).trimEnd()}\n...(truncated)`;
 }
 
+function truncateChars(text, maxChars) {
+  const value = String(text ?? "");
+  if (value.length <= maxChars) return { text: value, truncated: false, originalLength: value.length };
+  return {
+    text: `${value.slice(0, Math.max(0, maxChars - 32)).trimEnd()}\n...(truncated)`,
+    truncated: true,
+    originalLength: value.length,
+  };
+}
+
 function expandSummary(db, summaryId, options = {}) {
   const maxDepth = clampInt(options.maxDepth, 4, 0, 24);
+  const maxNodes = clampInt(options.maxNodes, DEFAULT_MAX_EXPAND_NODES, 1, MAX_EXPAND_NODES);
+  const conversationId = readPositiveInt(options.conversationId, "conversationId");
   const rows = db
     .prepare(
       `WITH RECURSIVE subtree(summary_id, parent_summary_id, depth_from_root, path) AS (
          SELECT ?, NULL, 0, ''
          UNION ALL
-         SELECT sp.summary_id, sp.parent_summary_id, subtree.depth_from_root + 1,
+         SELECT sp.parent_summary_id, sp.summary_id, subtree.depth_from_root + 1,
                 CASE WHEN subtree.path = '' THEN printf('%04d', sp.ordinal)
                      ELSE subtree.path || '.' || printf('%04d', sp.ordinal)
                 END
          FROM summary_parents sp
-         JOIN subtree ON sp.parent_summary_id = subtree.summary_id
+         JOIN subtree ON sp.summary_id = subtree.summary_id
          WHERE subtree.depth_from_root < ?
        )
        SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
@@ -492,10 +575,37 @@ function expandSummary(db, summaryId, options = {}) {
               subtree.parent_summary_id, subtree.path
        FROM subtree
        JOIN summaries s ON s.summary_id = subtree.summary_id
-       ORDER BY subtree.depth_from_root ASC, subtree.path ASC, s.created_at ASC`,
+       WHERE (? IS NULL OR s.conversation_id = ?)
+       ORDER BY subtree.depth_from_root ASC, subtree.path ASC, s.created_at ASC
+       LIMIT ?`,
     )
-    .all(summaryId, maxDepth);
+    .all(summaryId, maxDepth, conversationId ?? null, conversationId ?? null, maxNodes);
   return rows;
+}
+
+function getSummaryConversationId(db, summaryId) {
+  const row = db.prepare("SELECT conversation_id FROM summaries WHERE summary_id = ?").get(summaryId);
+  return row?.conversation_id;
+}
+
+function getSummaryIdsForMessageHits(db, messageHits, conversationId, limit) {
+  const messageIds = messageHits
+    .map((row) => row.message_id)
+    .filter((id) => Number.isInteger(id) && id > 0);
+  if (messageIds.length === 0) return [];
+  const placeholders = messageIds.map(() => "?").join(", ");
+  return db
+    .prepare(
+      `SELECT DISTINCT sm.summary_id, s.created_at
+       FROM summary_messages sm
+       JOIN summaries s ON s.summary_id = sm.summary_id
+       WHERE s.conversation_id = ?
+         AND sm.message_id IN (${placeholders})
+       ORDER BY s.created_at DESC
+       LIMIT ?`,
+    )
+    .all(conversationId, ...messageIds, limit)
+    .map((row) => row.summary_id);
 }
 
 function lcmExpand(db, params) {
@@ -504,12 +614,25 @@ function lcmExpand(db, params) {
     : readString(params.summaryId)
       ? [readString(params.summaryId)]
       : [];
-  const summaryIds = rawIds.filter((id) => typeof id === "string" && id.trim()).map((id) => id.trim());
+  const summaryIds = rawIds
+    .filter((id) => typeof id === "string" && id.trim())
+    .map((id) => id.trim())
+    .slice(0, MAX_SUMMARY_IDS);
   if (summaryIds.length === 0) throw new Error("summaryId or summaryIds is required.");
   const tokenCap = clampInt(params.tokenCap, 24_000, 1_000, MAX_EXPAND_TOKENS);
+  const conversationId = readPositiveInt(params.conversationId, "conversationId");
   const expanded = [];
   let rendered = "";
   for (const id of summaryIds) {
+    const rootConversationId = getSummaryConversationId(db, id);
+    if (rootConversationId == null) {
+      expanded.push({ summaryId: id, error: "not found" });
+      continue;
+    }
+    if (conversationId != null && rootConversationId !== conversationId) {
+      expanded.push({ summaryId: id, error: `not found in conversation ${conversationId}` });
+      continue;
+    }
     const rows = expandSummary(db, id, params);
     if (rows.length === 0) {
       expanded.push({ summaryId: id, error: "not found" });
@@ -521,7 +644,7 @@ function lcmExpand(db, params) {
       const block = `${header}\n${row.content ?? ""}`.trim();
       if (estimateTokens(`${rendered}\n\n${block}`) > tokenCap) {
         items.push({ summaryId: row.summary_id, omitted: true, reason: "tokenCap" });
-        continue;
+        break;
       }
       rendered += `${rendered ? "\n\n" : ""}${block}`;
       items.push(row);
@@ -532,6 +655,7 @@ function lcmExpand(db, params) {
     tool: "lcm_expand",
     summaryIds,
     tokenCap,
+    maxNodes: clampInt(params.maxNodes, DEFAULT_MAX_EXPAND_NODES, 1, MAX_EXPAND_NODES),
     text: truncateTokens(rendered, tokenCap),
     expanded,
     note: "Read-only Codex expansion. Use the returned source IDs as evidence anchors.",
@@ -553,6 +677,20 @@ function lcmExpandQuery(db, params) {
       limit: clampInt(params.seedLimit, 12, 1, 50),
     });
     summaryIds = matches.map((row) => row.summary_id).filter(Boolean);
+    if (summaryIds.length === 0 && params.conversationId != null) {
+      const messageHits = searchMessages(db, {
+        ...params,
+        pattern: query,
+        mode: params.mode === "regex" ? "regex" : "full_text",
+        limit: clampInt(params.seedLimit, 12, 1, 50),
+      });
+      summaryIds = getSummaryIdsForMessageHits(
+        db,
+        messageHits,
+        readPositiveInt(params.conversationId, "conversationId"),
+        clampInt(params.seedLimit, 12, 1, 50),
+      );
+    }
   }
   if (summaryIds.length === 0) {
     return jsonTextResult({ tool: "lcm_expand_query", prompt, query, summaryIds: [], text: "", note: "No seed summaries matched." });
@@ -600,6 +738,7 @@ const currentTools = [
       properties: {
         id: { type: "string" },
         conversationId: { type: "number" },
+        maxChars: { type: "number", default: DEFAULT_DESCRIBE_CHARS },
       },
       required: ["id"],
       additionalProperties: true,
@@ -615,6 +754,7 @@ const currentTools = [
         summaryId: { type: "string" },
         summaryIds: { type: "array", items: { type: "string" } },
         maxDepth: { type: "number", default: 4 },
+        maxNodes: { type: "number", default: DEFAULT_MAX_EXPAND_NODES },
         tokenCap: { type: "number", default: 24000 },
       },
       additionalProperties: true,
@@ -632,6 +772,7 @@ const currentTools = [
         summaryIds: { type: "array", items: { type: "string" } },
         seedLimit: { type: "number", default: 12 },
         tokenCap: { type: "number", default: 24000 },
+        maxNodes: { type: "number", default: DEFAULT_MAX_EXPAND_NODES },
         conversationId: { type: "number" },
       },
       additionalProperties: true,

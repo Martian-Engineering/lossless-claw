@@ -13,6 +13,17 @@ The plugin does not mutate OpenClaw state, run LCM maintenance, build rollups, w
 
 ## Install Into Codex Desktop
 
+Prerequisites:
+
+- Codex Desktop must be able to launch `node`.
+- `node` must support `node:sqlite`; check with:
+
+```bash
+node -e "import('node:sqlite').then(() => console.log('node:sqlite ok'))"
+```
+
+If Codex Desktop is launched from the macOS GUI and cannot see your shell `PATH`, either launch Codex from a shell that can run `node`, or adjust your local Codex/plugin environment so the `node` command resolves to Node 22+.
+
 For local development from a `lossless-claw` checkout:
 
 1. Keep this plugin directory at `plugins/codex-lcm-reader`.
@@ -22,27 +33,43 @@ For local development from a `lossless-claw` checkout:
 
 For a home-local install:
 
-1. Copy `plugins/codex-lcm-reader` to `~/plugins/codex-lcm-reader`.
-2. Add this entry to `~/.agents/plugins/marketplace.json`:
+1. Copy `plugins/codex-lcm-reader` to `~/plugins/codex-lcm-reader`:
+
+```bash
+mkdir -p ~/plugins ~/.agents/plugins
+cp -R plugins/codex-lcm-reader ~/plugins/codex-lcm-reader
+```
+
+2. Add a complete marketplace file at `~/.agents/plugins/marketplace.json`, or merge the `codex-lcm-reader` entry into your existing file:
 
 ```json
 {
-  "name": "codex-lcm-reader",
-  "source": {
-    "source": "local",
-    "path": "./plugins/codex-lcm-reader"
+  "name": "lossless-codex-local",
+  "interface": {
+    "displayName": "Lossless Codex Local"
   },
-  "policy": {
-    "installation": "INSTALLED_BY_DEFAULT",
-    "authentication": "ON_INSTALL"
-  },
-  "category": "Engineering"
+  "plugins": [
+    {
+      "name": "codex-lcm-reader",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-lcm-reader"
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Engineering"
+    }
+  ]
 }
 ```
 
 3. Restart Codex Desktop.
 
 Codex should then expose the plugin as **Lossless Codex** with read-only LCM tools.
+
+When using a non-default database path from Codex Desktop, make sure the Codex process receives `LCM_CODEX_DB_PATH=/absolute/path/to/lcm.db` or another supported DB-path variable. The plugin falls back to `~/.openclaw/lcm.db` only when no explicit path is provided.
 
 ## Database Path
 

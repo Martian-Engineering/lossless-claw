@@ -5,9 +5,11 @@ description: Use when Codex should inspect local OpenClaw/lossless-claw LCM memo
 
 # Lossless Codex
 
-Use this plugin when a task needs prior OpenClaw conversation context stored in the local lossless-claw LCM database. The user-facing plugin name is Lossless Codex; the package folder remains `codex-lcm-reader`.
+Use this plugin when a task needs prior OpenClaw conversation context stored in the local lossless-claw LCM database and the user has asked for memory/previous-context recall or clearly consented to using local memory. The user-facing plugin name is Lossless Codex; the package folder remains `codex-lcm-reader`.
 
 The tools are read-only and bounded. They do not run LCM maintenance, write rollups, mutate OpenClaw task state, or write Cortex memory.
+
+Do not search all local LCM memory for unrelated repo/path/error questions by default. Prefer repo, time, keyword, or `conversationId` filters when the user gives them, and say when a broad all-conversation search was needed.
 
 ## Tool Routing
 
