@@ -95,6 +95,8 @@ type EventEpisodeRow = {
   updated_at: string;
 };
 
+const MAX_EPISODE_SOURCES = 20;
+
 function hashId(prefix: string, value: string): string {
   return `${prefix}_${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
 }
@@ -236,7 +238,7 @@ function rowToEpisode(row: EventEpisodeRow, includeSources: boolean): EventEpiso
     observationCount: row.observation_count,
     confidence: row.confidence,
     ...(includeSources
-      ? { sources: parseSources(row.source_ids) }
+      ? { sources: parseSources(row.source_ids).slice(0, MAX_EPISODE_SOURCES) }
       : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,

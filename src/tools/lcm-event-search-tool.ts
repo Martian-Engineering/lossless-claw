@@ -25,8 +25,8 @@ const LcmEventSearchSchema = Type.Object({
   before: Type.Optional(Type.String({ description: "Only include events before this ISO timestamp." })),
   first: Type.Optional(Type.Boolean({ description: "Return earliest matching events first. Defaults to latest first." })),
   includeSources: Type.Optional(Type.Boolean({ description: "Include event source IDs. Defaults to false." })),
-  includeEpisodes: Type.Optional(Type.Boolean({ description: "Also return cross-summary event episodes grouped by deterministic topic key and event kind. Defaults to false." })),
-  limit: Type.Optional(Type.Number({ description: "Maximum events to return. Default 20.", minimum: 1, maximum: 100 })),
+  includeEpisodes: Type.Optional(Type.Boolean({ description: "Also return bounded cross-summary event episodes grouped by deterministic topic key and event kind. Defaults to false." })),
+  limit: Type.Optional(Type.Number({ description: "Maximum direct event observations to return. Episode sidecars are capped separately. Default 20.", minimum: 1, maximum: 100 })),
 });
 
 function parseTimestamp(value: unknown, key: string): string | undefined {
@@ -108,7 +108,7 @@ export function createLcmEventSearchTool(input: {
       const store = lcm.getEventObservationStore();
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 20;
       const includeEpisodes = p.includeEpisodes === true;
-      const reservedEpisodeLimit = includeEpisodes
+      const episodeLimit = includeEpisodes
         ? Math.max(1, Math.min(limit, Math.ceil(limit / 2)))
         : 0;
       const episodes = includeEpisodes
@@ -120,24 +120,19 @@ export function createLcmEventSearchTool(input: {
             before,
             first: p.first === true,
             includeSources: p.includeSources === true,
-            limit: reservedEpisodeLimit,
+            limit: episodeLimit,
           })
         : undefined;
-      const observationLimit = includeEpisodes
-        ? Math.max(0, limit - (episodes?.length ?? 0))
-        : limit;
-      const observations = observationLimit > 0
-        ? store.listObservations({
-            conversationId: scope.conversationId,
-            eventKinds,
-            query,
-            since,
-            before,
-            first: p.first === true,
-            includeSources: p.includeSources === true,
-            limit: observationLimit,
-          })
-        : [];
+      const observations = store.listObservations({
+        conversationId: scope.conversationId,
+        eventKinds,
+        query,
+        since,
+        before,
+        first: p.first === true,
+        includeSources: p.includeSources === true,
+        limit,
+      });
       return jsonResult({
         conversationScope: scope.allConversations ? "all" : scope.conversationId,
         query,
@@ -147,6 +142,7 @@ export function createLcmEventSearchTool(input: {
         accounting: {
           eventsIncluded: observations.length,
           episodesIncluded: episodes?.length ?? 0,
+          episodeLimit,
           includeSources: p.includeSources === true,
         },
         disclaimer:

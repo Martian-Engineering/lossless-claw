@@ -574,13 +574,14 @@ describe("ObservedWorkStore", () => {
     const result = await tool.execute("event-total-limit", {
       conversationId: 13,
       includeEpisodes: true,
-      limit: 3,
+      limit: 1,
     });
     const details = result.details as {
-      accounting: { eventsIncluded: number; episodesIncluded: number };
+      accounting: { eventsIncluded: number; episodesIncluded: number; episodeLimit: number };
     };
-    expect(details.accounting.eventsIncluded + details.accounting.episodesIncluded).toBeLessThanOrEqual(3);
-    expect(details.accounting.episodesIncluded).toBeGreaterThan(0);
+    expect(details.accounting.eventsIncluded).toBe(1);
+    expect(details.accounting.episodesIncluded).toBe(1);
+    expect(details.accounting.episodeLimit).toBe(1);
   });
 
   it("orders episodes by recent activity unless first occurrence is requested", () => {
@@ -632,6 +633,60 @@ describe("ObservedWorkStore", () => {
     );
     expect(events.listEpisodes({ conversationId: 17, first: true })[0]?.topicKey).toBe(
       "old-incident"
+    );
+  });
+
+  it("bounds episode sources without starving direct event observations", async () => {
+    const db = makeDb();
+    createConversation(db, 21);
+    const events = new EventObservationStore(db);
+    for (let i = 0; i < 25; i += 1) {
+      events.upsertObservation({
+        eventId: `ev_source_cap_${i}`,
+        conversationId: 21,
+        eventKind: "operational_incident",
+        title: `Source cap incident ${i}`,
+        queryKey: "PR #899",
+        eventTime: `2026-04-28T08:${String(i).padStart(2, "0")}:00.000Z`,
+        ingestTime: `2026-04-28T08:${String(i).padStart(2, "0")}:00.000Z`,
+        confidence: 0.7,
+        rationale: "Repeated incident evidence.",
+        sourceType: "summary",
+        sourceId: `sum_source_cap_${i}`,
+      });
+    }
+    const lcm = {
+      getEventObservationStore: () => events,
+      getConversationStore: () => ({
+        getConversationBySessionKey: async () => null,
+        getConversationBySessionId: async () => null,
+      }),
+    };
+    const deps = {
+      resolveSessionIdFromSessionKey: async () => undefined,
+    } as unknown as LcmDependencies;
+    const tool = createLcmEventSearchTool({
+      deps,
+      lcm: lcm as never,
+      sessionId: "event-session",
+    });
+
+    const result = await tool.execute("event-source-cap", {
+      conversationId: 21,
+      query: "https://github.com/Martian-Engineering/lossless-claw/pull/899",
+      includeEpisodes: true,
+      includeSources: true,
+      limit: 1,
+    });
+    const details = result.details as {
+      observations: Array<{ eventId: string }>;
+      episodes: Array<{ sources?: Array<{ sourceId: string }> }>;
+    };
+    expect(details.observations).toHaveLength(1);
+    expect(details.episodes).toHaveLength(1);
+    expect(details.episodes[0]?.sources).toHaveLength(20);
+    expect(details.episodes[0]?.sources?.map((source) => source.sourceId)).not.toContain(
+      "sum_source_cap_24"
     );
   });
 
