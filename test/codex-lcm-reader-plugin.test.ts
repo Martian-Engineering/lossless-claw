@@ -90,9 +90,23 @@ async function createLcmFixture() {
   await summaryStore.linkSummaryToParents("sum_codex_reader_child", [
     "sum_codex_reader_parent",
   ]);
+  db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?").run(
+    "2026-04-29T10:00:00.000Z",
+    firstMessage.messageId,
+  );
+  db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?").run(
+    "2026-04-29T10:05:00.000Z",
+    secondMessage.messageId,
+  );
 
   closeLcmConnection(dbPath);
-  return { tempDir, dbPath, conversationId: conversation.conversationId };
+  return {
+    tempDir,
+    dbPath,
+    conversationId: conversation.conversationId,
+    firstMessageId: firstMessage.messageId,
+    secondMessageId: secondMessage.messageId,
+  };
 }
 
 function encodeMcp(payload: unknown): string {
@@ -170,6 +184,30 @@ describe("Codex LCM Reader plugin", () => {
     expect(results.some((row) => row.type === "summary")).toBe(true);
   });
 
+  it("can sort grep results oldest-first for first-occurrence discovery", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_grep",
+      {
+        pattern: "Lexar|read-only",
+        mode: "regex",
+        scope: "messages",
+        sort: "oldest",
+        limit: 2,
+      },
+      { dbPath: fixture.dbPath },
+    );
+
+    const results = result.structuredContent?.results as Array<{ id: string }>;
+    expect(results.map((row) => row.id)).toEqual([
+      `message:${fixture.firstMessageId}`,
+      `message:${fixture.secondMessageId}`,
+    ]);
+  });
+
   it("describes known summaries with lineage and source messages", async () => {
     const fixture = await createLcmFixture();
     tempDirs.add(fixture.tempDir);
@@ -187,6 +225,29 @@ describe("Codex LCM Reader plugin", () => {
     };
     expect(item.parentIds).toEqual(["sum_codex_reader_parent"]);
     expect(item.messageIds).toHaveLength(2);
+  });
+
+  it("describes source messages and linked summaries", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_describe",
+      { id: `message:${fixture.firstMessageId}` },
+      { dbPath: fixture.dbPath },
+    );
+
+    const item = result.structuredContent?.item as {
+      type: string;
+      message_id: number;
+      content: string;
+      summaryIds: string[];
+    };
+    expect(item.type).toBe("message");
+    expect(item.message_id).toBe(fixture.firstMessageId);
+    expect(item.content).toContain("Lexar drive");
+    expect(item.summaryIds).toEqual(["sum_codex_reader_child"]);
   });
 
   it("expands a summary subtree without mutating state", async () => {

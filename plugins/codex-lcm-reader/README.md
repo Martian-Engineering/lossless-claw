@@ -25,9 +25,9 @@ Use `LCM_CODEX_DB_PATH` when pointing Codex Desktop at a production database cop
 
 ## Tool Semantics
 
-`lcm_grep` searches messages and summaries with bounded result limits. Regex mode scans a bounded newest-first slice; full-text mode uses LCM FTS tables when available and falls back to escaped `LIKE` predicates.
+`lcm_grep` searches messages and summaries with bounded result limits. Regex mode scans a bounded slice; full-text mode uses LCM FTS tables when available and falls back to escaped `LIKE` predicates. Use `sort: "oldest"` for first-occurrence style discovery.
 
-`lcm_describe` returns cheap metadata and lineage for a known summary or file ID.
+`lcm_describe` returns cheap metadata and lineage for a known summary, `message:<id>`, numeric message ID, or file ID.
 
 `lcm_expand` expands known summary IDs through the persisted summary DAG and returns bounded evidence text.
 

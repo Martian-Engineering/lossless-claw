@@ -11,8 +11,8 @@ The tools are read-only and bounded. They do not run LCM maintenance, write roll
 
 ## Tool Routing
 
-- Use `lcm_grep` for keyword, phrase, topic, path, error, PR number, or identifier discovery.
-- Use `lcm_describe` when you already have a `sum_...` or `file_...` ID and need cheap inspection.
+- Use `lcm_grep` for keyword, phrase, topic, path, error, PR number, or identifier discovery. Use `sort: "oldest"` when the user asks when something first appeared.
+- Use `lcm_describe` when you already have a `sum_...`, `message:<id>`, numeric message ID, or `file_...` ID and need cheap inspection.
 - Use `lcm_expand` to expand a known summary subtree into source evidence.
 - Use `lcm_expand_query` when you have either summary IDs or a short query and want an evidence bundle to answer from.
 

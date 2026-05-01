@@ -156,6 +156,8 @@ function orderBy(sort, createdExpr, rankExpr = "rank") {
       return `${rankExpr} ASC, ${createdExpr} DESC`;
     case "hybrid":
       return `(${rankExpr} / (1 + ((julianday('now') - julianday(${createdExpr})) * 24 * 0.001))) ASC, ${createdExpr} DESC`;
+    case "oldest":
+      return `${createdExpr} ASC`;
     default:
       return `${createdExpr} DESC`;
   }
@@ -166,7 +168,10 @@ function searchMessages(db, params) {
   if (!query) throw new Error("pattern is required.");
   const mode = params.mode === "full_text" ? "full_text" : "regex";
   const limit = clampInt(params.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-  const sort = params.sort === "relevance" || params.sort === "hybrid" ? params.sort : "recency";
+  const sort =
+    params.sort === "relevance" || params.sort === "hybrid" || params.sort === "oldest"
+      ? params.sort
+      : "recency";
   const scope = buildScope(params, "m");
 
   if (mode === "full_text" && tableExists(db, "messages_fts")) {
@@ -230,7 +235,7 @@ function searchMessages(db, params) {
          m.created_at
        FROM messages m
        ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
-       ORDER BY m.created_at DESC
+       ORDER BY ${sort === "oldest" ? "m.created_at ASC" : "m.created_at DESC"}
        LIMIT ?`,
     )
     .all(...args);
@@ -254,7 +259,10 @@ function searchSummaries(db, params) {
   if (!query) throw new Error("pattern is required.");
   const mode = params.mode === "full_text" ? "full_text" : "regex";
   const limit = clampInt(params.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-  const sort = params.sort === "relevance" || params.sort === "hybrid" ? params.sort : "recency";
+  const sort =
+    params.sort === "relevance" || params.sort === "hybrid" || params.sort === "oldest"
+      ? params.sort
+      : "recency";
   const scope = buildScope(params, "s");
   const timeExpr = "COALESCE(s.latest_at, s.created_at)";
 
@@ -319,7 +327,7 @@ function searchSummaries(db, params) {
          ${timeExpr} AS created_at
        FROM summaries s
        ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
-       ORDER BY ${timeExpr} DESC
+       ORDER BY ${sort === "oldest" ? `${timeExpr} ASC` : `${timeExpr} DESC`}
        LIMIT ?`,
     )
     .all(...args);
@@ -344,7 +352,11 @@ function lcmGrep(db, params) {
   if (scope === "messages" || scope === "both") results.push(...searchMessages(db, params));
   if (scope === "summaries" || scope === "both") results.push(...searchSummaries(db, params));
   const limit = clampInt(params.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-  results.sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")));
+  if (params.sort === "oldest") {
+    results.sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")));
+  } else {
+    results.sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")));
+  }
   return jsonTextResult({
     tool: "lcm_grep",
     databasePath: resolveDatabasePath(),
@@ -393,10 +405,33 @@ function describeFile(db, id) {
   return file ? { type: "file", ...file } : undefined;
 }
 
+function describeMessage(db, rawId) {
+  const id = rawId.startsWith("message:") ? rawId.slice("message:".length) : rawId;
+  const messageId = Number(id);
+  if (!Number.isInteger(messageId) || messageId <= 0) return undefined;
+  const message = db
+    .prepare(
+      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+       FROM messages WHERE message_id = ?`,
+    )
+    .get(messageId);
+  if (!message) return undefined;
+  const summaryIds = db
+    .prepare(`SELECT summary_id FROM summary_messages WHERE message_id = ? ORDER BY ordinal ASC`)
+    .all(messageId)
+    .map((row) => row.summary_id);
+  return { type: "message", ...message, summaryIds };
+}
+
 function lcmDescribe(db, params) {
   const id = readString(params.id);
   if (!id) throw new Error("id is required.");
-  const result = id.startsWith("file_") ? describeFile(db, id) : describeSummary(db, id);
+  const result =
+    id.startsWith("file_")
+      ? describeFile(db, id)
+      : id.startsWith("message:") || /^\d+$/.test(id)
+        ? describeMessage(db, id)
+        : describeSummary(db, id);
   if (!result) return jsonTextResult({ error: `Not found: ${id}` });
   if (params.conversationId != null && result.conversation_id !== Number(params.conversationId)) {
     return jsonTextResult({ error: `Not found in conversation ${params.conversationId}: ${id}` });
@@ -404,7 +439,10 @@ function lcmDescribe(db, params) {
   return jsonTextResult({
     tool: "lcm_describe",
     item: result,
-    note: "This is source evidence. Use expand for subtree context.",
+    note:
+      result.type === "message"
+        ? "This is a source message. Use linked summary IDs for broader context."
+        : "This is source evidence. Use expand for subtree context.",
   });
 }
 
@@ -531,7 +569,7 @@ const currentTools = [
         conversationId: { type: "number" },
         since: { type: "string" },
         before: { type: "string" },
-        sort: { type: "string", enum: ["recency", "relevance", "hybrid"], default: "recency" },
+        sort: { type: "string", enum: ["recency", "relevance", "hybrid", "oldest"], default: "recency" },
       },
       required: ["pattern"],
       additionalProperties: true,
@@ -540,7 +578,7 @@ const currentTools = [
   },
   {
     name: "lcm_describe",
-    description: "Describe one LCM summary or file ID from the local database.",
+    description: "Describe one LCM summary, message, or file ID from the local database.",
     inputSchema: {
       type: "object",
       properties: {
