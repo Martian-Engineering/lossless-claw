@@ -7,7 +7,7 @@ type MigrationLogger = {
   info?: (message: string) => void;
 };
 
-type SummaryColumnInfo = {
+type TableColumnInfo = {
   name?: string;
 };
 
@@ -59,7 +59,7 @@ const VERSIONED_BACKFILL_STEPS = {
 type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
 
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasDepth = summaryColumns.some((col) => col.name === "depth");
   if (!hasDepth) {
     db.exec(`ALTER TABLE summaries ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`);
@@ -67,7 +67,7 @@ function ensureSummaryDepthColumn(db: DatabaseSync): void {
 }
 
 function ensureSummaryMetadataColumns(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasEarliestAt = summaryColumns.some((col) => col.name === "earliest_at");
   const hasLatestAt = summaryColumns.some((col) => col.name === "latest_at");
   const hasDescendantCount = summaryColumns.some((col) => col.name === "descendant_count");
@@ -102,7 +102,7 @@ function isoStringOrNull(value: Date | null): string | null {
 }
 
 function ensureSummaryModelColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasModel = summaryColumns.some((col) => col.name === "model");
   if (!hasModel) {
     db.exec(`ALTER TABLE summaries ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`);
@@ -110,7 +110,7 @@ function ensureSummaryModelColumn(db: DatabaseSync): void {
 }
 
 function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
-  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
+  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as TableColumnInfo[];
   const hasConsecutiveColdObservations = telemetryColumns.some(
     (col) => col.name === "consecutive_cold_observations",
   );
@@ -169,7 +169,7 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
 }
 
 function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
-  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as TableColumnInfo[];
   const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
   if (!hasIdentityHash) {
     db.exec(`ALTER TABLE messages ADD COLUMN identity_hash TEXT`);
@@ -695,7 +695,7 @@ function addColumnIfMissing(
   columnName: string,
   columnDefinition: string,
 ): void {
-  const columns = db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all() as SummaryColumnInfo[];
+  const columns = db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all() as TableColumnInfo[];
   if (!columns.some((col) => col.name === columnName)) {
     db.exec(
       `ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${columnDefinition}`,
@@ -724,7 +724,7 @@ function shouldRecreateStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec):
 
     const columns = db
       .prepare(`PRAGMA table_info(${quoteSqlIdentifier(spec.tableName)})`)
-      .all() as SummaryColumnInfo[];
+      .all() as TableColumnInfo[];
     const columnNames = new Set(
       columns
         .map((col) => col.name)
