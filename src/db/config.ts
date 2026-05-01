@@ -93,6 +93,10 @@ export type LcmConfig = {
   pruneHeartbeatOk: boolean;
   /** When true, maintain() may rewrite transcript entries for transcript GC. */
   transcriptGcEnabled: boolean;
+  /** When true, register the operator-facing lcm_rollup_debug tool. */
+  rollupDebugEnabled: boolean;
+  /** When true, maintain() may run observed-work and event extraction over summaries. */
+  observedWorkMaintenanceEnabled: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
@@ -426,6 +430,14 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
           ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"
           : toBool(pc.transcriptGcEnabled) ?? false,
+      rollupDebugEnabled:
+        env.LCM_ROLLUP_DEBUG_ENABLED !== undefined
+          ? env.LCM_ROLLUP_DEBUG_ENABLED === "true"
+          : toBool(pc.rollupDebugEnabled) ?? false,
+      observedWorkMaintenanceEnabled:
+        env.LCM_OBSERVED_WORK_MAINTENANCE_ENABLED !== undefined
+          ? env.LCM_OBSERVED_WORK_MAINTENANCE_ENABLED === "true"
+          : toBool(pc.observedWorkMaintenanceEnabled) ?? false,
       proactiveThresholdCompactionMode,
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)
