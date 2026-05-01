@@ -654,10 +654,27 @@ describe("LCM sub-day window retrieval", () => {
     const emptyFallbackText = (emptyFallback.content[0] as { text: string })
       .text;
     expect(emptyFallbackText).toContain("**Confidence:** none");
+    expect(emptyFallbackText).toContain("*Sources: omitted*");
     expect(
       (emptyFallback.details as { confidence?: string; usedFallback?: boolean })
         .confidence
     ).toBe("none");
+
+    const emptyFallbackWithSources = await tool.execute(
+      "call-empty-fallback-day-with-sources",
+      {
+        period: "date:2026-04-25",
+        includeSources: true,
+      }
+    );
+    const emptyFallbackWithSourcesText = (
+      emptyFallbackWithSources.content[0] as { text: string }
+    ).text;
+    expect(emptyFallbackWithSourcesText).toContain("*Sources: none*");
+    expect(emptyFallbackWithSourcesText).not.toContain("*Sources: omitted*");
+    expect(
+      (emptyFallbackWithSources.details as { summaryIds?: string[] }).summaryIds
+    ).toEqual([]);
 
     const invalid = await tool.execute("call-invalid-date", {
       period: "date:2026-02-31",
