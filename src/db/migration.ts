@@ -7,7 +7,7 @@ type MigrationLogger = {
   info?: (message: string) => void;
 };
 
-type SummaryColumnInfo = {
+type TableColumnInfo = {
   name?: string;
 };
 
@@ -59,7 +59,7 @@ const VERSIONED_BACKFILL_STEPS = {
 type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
 
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasDepth = summaryColumns.some((col) => col.name === "depth");
   if (!hasDepth) {
     db.exec(`ALTER TABLE summaries ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`);
@@ -67,7 +67,7 @@ function ensureSummaryDepthColumn(db: DatabaseSync): void {
 }
 
 function ensureSummaryMetadataColumns(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasEarliestAt = summaryColumns.some((col) => col.name === "earliest_at");
   const hasLatestAt = summaryColumns.some((col) => col.name === "latest_at");
   const hasDescendantCount = summaryColumns.some((col) => col.name === "descendant_count");
@@ -102,7 +102,7 @@ function isoStringOrNull(value: Date | null): string | null {
 }
 
 function ensureSummaryModelColumn(db: DatabaseSync): void {
-  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as TableColumnInfo[];
   const hasModel = summaryColumns.some((col) => col.name === "model");
   if (!hasModel) {
     db.exec(`ALTER TABLE summaries ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'`);
@@ -110,7 +110,7 @@ function ensureSummaryModelColumn(db: DatabaseSync): void {
 }
 
 function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
-  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
+  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as TableColumnInfo[];
   const hasConsecutiveColdObservations = telemetryColumns.some(
     (col) => col.name === "consecutive_cold_observations",
   );
@@ -236,7 +236,7 @@ function ensureMessagePartsTable(db: DatabaseSync): void {
 }
 
 function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
-  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as TableColumnInfo[];
   const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
   if (!hasIdentityHash) {
     db.exec(`ALTER TABLE messages ADD COLUMN identity_hash TEXT`);
@@ -756,6 +756,20 @@ function quoteSqlIdentifier(identifier: string): string {
   return `"${identifier.replaceAll(`"`, `""`)}"`;
 }
 
+function addColumnIfMissing(
+  db: DatabaseSync,
+  tableName: string,
+  columnName: string,
+  columnDefinition: string,
+): void {
+  const columns = db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all() as TableColumnInfo[];
+  if (!columns.some((col) => col.name === columnName)) {
+    db.exec(
+      `ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${columnDefinition}`,
+    );
+  }
+}
+
 function shouldRecreateStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec): boolean {
   const shadowTables = getFtsShadowTableNames(spec.tableName);
   const existingTables = getExistingTableNames(db, [spec.tableName, ...shadowTables]);
@@ -777,7 +791,7 @@ function shouldRecreateStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec):
 
     const columns = db
       .prepare(`PRAGMA table_info(${quoteSqlIdentifier(spec.tableName)})`)
-      .all() as SummaryColumnInfo[];
+      .all() as TableColumnInfo[];
     const columnNames = new Set(
       columns
         .map((col) => col.name)
@@ -1077,6 +1091,303 @@ export function runLcmMigrations(
     runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
       backfillToolCallColumns(db),
     );
+
+    runMigrationStep("ensureRollupTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_rollups (
+          rollup_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          period_kind TEXT NOT NULL CHECK (period_kind IN ('day', 'week', 'month')),
+          period_key TEXT NOT NULL,
+          period_start TEXT NOT NULL,
+          period_end TEXT NOT NULL,
+          timezone TEXT NOT NULL DEFAULT 'UTC',
+          content TEXT NOT NULL,
+          token_count INTEGER NOT NULL DEFAULT 0,
+          source_summary_ids TEXT NOT NULL DEFAULT '[]',
+          source_message_count INTEGER NOT NULL DEFAULT 0,
+          source_token_count INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('building', 'ready', 'stale', 'failed')),
+          coverage_start TEXT,
+          coverage_end TEXT,
+          summarizer_model TEXT,
+          source_fingerprint TEXT,
+          built_at TEXT NOT NULL DEFAULT (datetime('now')),
+          invalidated_at TEXT,
+          error_text TEXT,
+          UNIQUE (conversation_id, period_kind, timezone, period_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_rollup_sources (
+          rollup_id TEXT NOT NULL REFERENCES lcm_rollups(rollup_id) ON DELETE CASCADE,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup')),
+          source_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          PRIMARY KEY (rollup_id, source_type, ordinal)
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_rollup_state (
+          conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          timezone TEXT NOT NULL DEFAULT 'UTC',
+          last_message_at TEXT,
+          last_rollup_check_at TEXT,
+          last_daily_build_at TEXT,
+          last_weekly_build_at TEXT,
+          last_monthly_build_at TEXT,
+          pending_rebuild INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureRollupStateAggregateColumns", log, () => {
+      addColumnIfMissing(db, "lcm_rollup_state", "last_weekly_build_at", "TEXT");
+      addColumnIfMissing(db, "lcm_rollup_state", "last_monthly_build_at", "TEXT");
+    });
+
+    runMigrationStep("ensureRollupIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_rollups_lookup_idx
+        ON lcm_rollups (conversation_id, period_kind, period_start DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_rollups_status_idx
+        ON lcm_rollups (status, built_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_rollup_sources_source_idx
+        ON lcm_rollup_sources (source_id);
+
+        CREATE INDEX IF NOT EXISTS summaries_leaf_effective_time_conv_idx
+        ON summaries (
+          conversation_id,
+          julianday(coalesce(earliest_at, latest_at, created_at)),
+          julianday(coalesce(latest_at, earliest_at, created_at))
+        )
+        WHERE kind = 'leaf';
+
+        CREATE INDEX IF NOT EXISTS summaries_leaf_effective_time_idx
+        ON summaries (
+          julianday(coalesce(earliest_at, latest_at, created_at)),
+          julianday(coalesce(latest_at, earliest_at, created_at))
+        )
+        WHERE kind = 'leaf';
+
+        CREATE INDEX IF NOT EXISTS messages_conversation_created_at_idx
+        ON messages (conversation_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS messages_created_at_idx
+        ON messages (created_at);
+
+        CREATE INDEX IF NOT EXISTS messages_conversation_created_at_jd_idx
+        ON messages (conversation_id, julianday(created_at));
+
+        CREATE INDEX IF NOT EXISTS messages_created_at_jd_idx
+        ON messages (julianday(created_at));
+      `);
+    });
+
+    runMigrationStep("ensureRollupViews", log, () => {
+      db.exec(`
+        CREATE VIEW IF NOT EXISTS daily_rollups AS
+        SELECT * FROM lcm_rollups WHERE period_kind = 'day';
+
+        CREATE VIEW IF NOT EXISTS weekly_rollups AS
+        SELECT * FROM lcm_rollups WHERE period_kind = 'week';
+
+        CREATE VIEW IF NOT EXISTS monthly_rollups AS
+        SELECT * FROM lcm_rollups WHERE period_kind = 'month';
+      `);
+    });
+
+    runMigrationStep("ensureObservedWorkTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_items (
+          work_item_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          owner_id TEXT,
+          title TEXT NOT NULL,
+          description TEXT,
+          observed_status TEXT NOT NULL CHECK (observed_status IN (
+            'observed_completed',
+            'observed_unfinished',
+            'observed_ambiguous',
+            'decision_recorded',
+            'dismissed'
+          )),
+          kind TEXT NOT NULL CHECK (kind IN (
+            'implementation',
+            'review',
+            'blocker',
+            'decision',
+            'question',
+            'follow_up',
+            'test',
+            'deploy',
+            'research',
+            'other'
+          )),
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          confidence_band TEXT NOT NULL DEFAULT 'medium' CHECK (confidence_band IN ('low', 'medium', 'medium-high', 'high')),
+          rationale TEXT,
+          topic_key TEXT,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          completed_at TEXT,
+          completion_confidence REAL CHECK (completion_confidence IS NULL OR (completion_confidence >= 0 AND completion_confidence <= 1)),
+          evidence_count INTEGER NOT NULL DEFAULT 0,
+          source_message_count INTEGER NOT NULL DEFAULT 0,
+          source_token_count INTEGER NOT NULL DEFAULT 0,
+          authority_source TEXT NOT NULL DEFAULT 'lcm_observed',
+          sensitivity TEXT,
+          visibility TEXT,
+          fingerprint TEXT NOT NULL,
+          fingerprint_version INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_sources (
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
+          source_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+            'created',
+            'reinforced',
+            'possible_completion',
+            'completed',
+            'contradicted',
+            'dismissed'
+          )),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (work_item_id, source_type, source_id, evidence_kind)
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_state (
+          conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          last_processed_summary_created_at TEXT,
+          last_processed_summary_id TEXT,
+          last_processed_summary_rowid INTEGER,
+          pending_rebuild INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureObservedWorkStateCursorColumns", log, () => {
+      addColumnIfMissing(
+        db,
+        "lcm_observed_work_state",
+        "last_processed_summary_rowid",
+        "INTEGER",
+      );
+    });
+
+    runMigrationStep("ensureObservedWorkIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
+          ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
+          ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_topic_status_seen_idx
+          ON lcm_observed_work_items(topic_key, observed_status, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
+          ON lcm_observed_work_items(fingerprint);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
+          ON lcm_observed_work_sources(source_type, source_id);
+      `);
+    });
+
+    runMigrationStep("ensureTaskBridgeSuggestionTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_task_bridge_suggestions (
+          suggestion_id TEXT PRIMARY KEY,
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          task_id TEXT,
+          suggestion_kind TEXT NOT NULL CHECK (suggestion_kind IN (
+            'create_task',
+            'link_task',
+            'mark_task_done',
+            'mark_task_blocked',
+            'add_task_evidence'
+          )),
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+            'pending',
+            'accepted',
+            'rejected',
+            'dismissed',
+            'expired'
+          )),
+          confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+          rationale TEXT NOT NULL,
+          source_ids TEXT NOT NULL,
+          created_by TEXT NOT NULL DEFAULT 'lcm_observed',
+          reviewed_by TEXT,
+          reviewed_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureTaskBridgeSuggestionIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_status_kind_idx
+          ON lcm_task_bridge_suggestions(status, suggestion_kind, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_work_item_idx
+          ON lcm_task_bridge_suggestions(work_item_id, status);
+
+        CREATE INDEX IF NOT EXISTS lcm_task_bridge_suggestions_task_idx
+          ON lcm_task_bridge_suggestions(task_id, status);
+      `);
+    });
+
+    runMigrationStep("ensureEventObservationTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_event_observations (
+          event_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          event_kind TEXT NOT NULL CHECK (event_kind IN (
+            'primary',
+            'retelling',
+            'memory_injection',
+            'echo',
+            'imported',
+            'operational_incident',
+            'decision'
+          )),
+          title TEXT NOT NULL,
+          description TEXT,
+          query_key TEXT,
+          event_time TEXT,
+          ingest_time TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          rationale TEXT NOT NULL,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
+          source_id TEXT NOT NULL,
+          source_ids TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureEventObservationIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_kind_time_idx
+          ON lcm_event_observations(conversation_id, event_kind, event_time DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_query_time_idx
+          ON lcm_event_observations(query_key, event_time DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_source_idx
+          ON lcm_event_observations(source_type, source_id);
+      `);
+    });
 
     const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
     const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;

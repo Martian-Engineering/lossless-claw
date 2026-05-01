@@ -197,6 +197,14 @@
       "label": "Transcript GC",
       "help": "Enable transcript rewrite GC during maintain(); disabled by default"
     },
+    "rollupDebugEnabled": {
+      "label": "Rollup Debug Tool",
+      "help": "Register the operator-facing lcm_rollup_debug tool; disabled by default"
+    },
+    "observedWorkMaintenanceEnabled": {
+      "label": "Observed Work Maintenance",
+      "help": "Allow maintain() to run observed-work and event extraction over LCM summaries; disabled by default"
+    },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
       "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
@@ -393,6 +401,12 @@
         "type": "boolean"
       },
       "transcriptGcEnabled": {
+        "type": "boolean"
+      },
+      "rollupDebugEnabled": {
+        "type": "boolean"
+      },
+      "observedWorkMaintenanceEnabled": {
         "type": "boolean"
       },
       "proactiveThresholdCompactionMode": {
