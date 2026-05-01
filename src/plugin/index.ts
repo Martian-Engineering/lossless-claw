@@ -20,7 +20,7 @@ import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
-import type { LcmDependencies, StartupSessionFileCandidate } from "../types.js";
+import type { LcmDependencies } from "../types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
@@ -44,73 +44,6 @@ function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: st
 function normalizeAgentId(agentId: string | undefined): string {
   const normalized = (agentId ?? "").trim();
   return normalized.length > 0 ? normalized : "main";
-}
-
-type RuntimeSessionStoreEntry = {
-  sessionId?: unknown;
-  sessionFile?: unknown;
-};
-
-type RuntimeAgentSessionApi = {
-  resolveStorePath: (store?: string, opts?: { agentId?: string }) => string;
-  loadSessionStore: (storePath: string) => Record<string, RuntimeSessionStoreEntry | undefined>;
-  resolveSessionFilePath: (
-    sessionId: string,
-    entry?: RuntimeSessionStoreEntry,
-    opts?: { agentId?: string; storePath?: string },
-  ) => string;
-};
-type RuntimeAgentSessionApiCandidate = Partial<RuntimeAgentSessionApi>;
-
-/** Return the runtime session registry API when the host exposes it. */
-function getRuntimeAgentSessionApi(api: OpenClawPluginApi): RuntimeAgentSessionApi | undefined {
-  const runtime = api.runtime as unknown as {
-    agent?: { session?: RuntimeAgentSessionApiCandidate };
-    channel?: { session?: RuntimeAgentSessionApiCandidate };
-  };
-  const sessionApi = runtime.agent?.session ?? runtime.channel?.session;
-  if (!sessionApi) {
-    return undefined;
-  }
-  if (
-    typeof sessionApi.resolveStorePath !== "function" ||
-    typeof sessionApi.loadSessionStore !== "function" ||
-    typeof sessionApi.resolveSessionFilePath !== "function"
-  ) {
-    return undefined;
-  }
-  return sessionApi as RuntimeAgentSessionApi;
-}
-
-/** List configured OpenClaw agent ids whose session stores can be active at startup. */
-function listConfiguredAgentIds(config: unknown): string[] {
-  const agents = isRecord(config) ? config.agents : undefined;
-  const list = isRecord(agents) && Array.isArray(agents.list) ? agents.list : [];
-  const seen = new Set<string>();
-  const ids: string[] = [];
-
-  for (const entry of list) {
-    if (!isRecord(entry) || entry.enabled === false || typeof entry.id !== "string") {
-      continue;
-    }
-    const agentId = normalizeAgentId(entry.id);
-    if (seen.has(agentId)) {
-      continue;
-    }
-    seen.add(agentId);
-    ids.push(agentId);
-  }
-
-  return ids.length > 0 ? ids : ["main"];
-}
-
-/** Read a string value from an unknown object field. */
-function getStringField(
-  record: Record<string, unknown> | undefined,
-  key: string,
-): string | undefined {
-  const value = record?.[key];
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 type PluginEnvSnapshot = {
@@ -750,12 +683,6 @@ function shouldUseNativeCodexBaseUrl(params: {
   provider: string;
   api: string | undefined;
   baseUrl: string | undefined;
-  /** True when the user explicitly set baseUrl via runtime config. When
-   *  explicit, do not rewrite `https://api.openai.com/v1` to the ChatGPT
-   *  Codex backend — that breaks paid OpenAI API-key users who chose that
-   *  endpoint deliberately. The native rewrite still applies when the
-   *  baseUrl is empty (default) or already a ChatGPT Codex variant. */
-  isExplicitlyConfigured?: boolean;
 }): boolean {
   if (!isOpenAICodexProvider(params.provider) || !isOpenAICodexResponsesApi(params.api)) {
     return false;
@@ -767,9 +694,6 @@ function shouldUseNativeCodexBaseUrl(params: {
   }
 
   const normalized = normalizeBaseUrl(baseUrl);
-  if (params.isExplicitlyConfigured && normalized === OPENAI_API_BASE_URL) {
-    return false;
-  }
   return normalized === OPENAI_API_BASE_URL || OPENAI_CODEX_NATIVE_BASE_URLS.has(normalized);
 }
 
@@ -785,12 +709,7 @@ function resolveProviderModelBaseUrl(params: {
     typeof params.fallbackBaseUrl === "string" ? params.fallbackBaseUrl : undefined;
   const baseUrl =
     configuredBaseUrl ?? fallbackBaseUrl ?? inferBaseUrlFromProvider(params.provider) ?? "";
-  return shouldUseNativeCodexBaseUrl({
-    provider: params.provider,
-    api: params.api,
-    baseUrl,
-    isExplicitlyConfigured: configuredBaseUrl !== undefined,
-  })
+  return shouldUseNativeCodexBaseUrl({ provider: params.provider, api: params.api, baseUrl })
     ? OPENAI_CODEX_RESPONSES_BASE_URL
     : baseUrl;
 }
@@ -830,13 +749,9 @@ function inferApiFromProvider(provider: string): string | undefined {
   const map: Record<string, string> = {
     anthropic: "anthropic-messages",
     deepseek: "openai-completions",
-    groq: "openai-completions",
-    mistral: "openai-completions",
     openai: "openai-responses",
     [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_RESPONSES_API,
     "github-copilot": OPENAI_CODEX_RESPONSES_API,
-    openrouter: "openai-completions",
-    together: "openai-completions",
     google: "google-generative-ai",
     "google-gemini-cli": "google-gemini-cli",
     "google-antigravity": "google-gemini-cli",
@@ -852,16 +767,7 @@ export function shouldOmitTemperatureForApi(api: string | undefined): boolean {
   return isOpenAICodexResponsesApi(api);
 }
 
-/** Resolve known provider base URLs when model lookup misses.
- *
- *  Note: ollama is intentionally absent. Cloud Ollama (`https://ollama.com`)
- *  and self-hosted setups both rely on explicit baseUrl configuration; a
- *  silent `http://localhost:11434` fallback would silently route cloud
- *  configs to localhost and produce confusing connection errors. Returning
- *  undefined here drops the inferred default — `resolveProviderModelBaseUrl`
- *  still passes `""` through to the dispatcher when no other source yields
- *  a baseUrl, which surfaces a clearer downstream error than a silent
- *  wrong-target connect. */
+/** Resolve known provider base URLs when model lookup misses. */
 function inferBaseUrlFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
   const map: Record<string, string> = {
@@ -874,6 +780,7 @@ function inferBaseUrlFromProvider(provider: string): string | undefined {
     mistral: "https://api.mistral.ai",
     together: "https://api.together.xyz",
     openrouter: "https://openrouter.ai/api/v1",
+    ollama: "http://localhost:11434",
   };
   return map[normalized];
 }
@@ -2197,17 +2104,13 @@ function createLcmDependencies(
       }
 
       try {
-        const sessionApi = getRuntimeAgentSessionApi(api);
-        if (!sessionApi) {
-          return undefined;
-        }
         const cfg = api.runtime.config.loadConfig();
         const parsed = parseAgentSessionKey(key);
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = sessionApi.resolveStorePath(cfg.session?.store, {
+        const storePath = api.runtime.agent.session.resolveStorePath(cfg.session?.store, {
           agentId,
         });
-        const store = sessionApi.loadSessionStore(storePath) as Record<
+        const store = api.runtime.agent.session.loadSessionStore(storePath) as Record<
           string,
           { sessionId?: string } | undefined
         >;
@@ -2224,25 +2127,21 @@ function createLcmDependencies(
       }
 
       try {
-        const sessionApi = getRuntimeAgentSessionApi(api);
-        if (!sessionApi) {
-          return undefined;
-        }
         const cfg = api.runtime.config.loadConfig();
         const normalizedSessionKey = sessionKey?.trim();
         const parsed = normalizedSessionKey ? parseAgentSessionKey(normalizedSessionKey) : null;
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = sessionApi.resolveStorePath(cfg.session?.store, {
+        const storePath = api.runtime.agent.session.resolveStorePath(cfg.session?.store, {
           agentId,
         });
-        const store = sessionApi.loadSessionStore(storePath) as Record<
+        const store = api.runtime.agent.session.loadSessionStore(storePath) as Record<
           string,
           { sessionId?: string; sessionFile?: string } | undefined
         >;
         const entry =
           (normalizedSessionKey ? store[normalizedSessionKey] : undefined)
           ?? Object.values(store).find((candidate) => candidate?.sessionId === normalizedSessionId);
-        const transcriptPath = sessionApi.resolveSessionFilePath(
+        const transcriptPath = api.runtime.agent.session.resolveSessionFilePath(
           normalizedSessionId,
           entry,
           {
@@ -2254,78 +2153,6 @@ function createLcmDependencies(
       } catch {
         return undefined;
       }
-    },
-    listStartupSessionFileCandidates: async () => {
-      const sessionApi = getRuntimeAgentSessionApi(api);
-      if (!sessionApi) {
-        return [];
-      }
-
-      let cfg: unknown = registrationConfig.openClawConfig;
-      try {
-        cfg = api.runtime.config.loadConfig();
-      } catch {
-        // Fall back to the registration config snapshot when live config is unavailable.
-      }
-
-      const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
-      const storeConfig = getStringField(sessionConfig, "store");
-      const candidates: StartupSessionFileCandidate[] = [];
-      const seen = new Set<string>();
-
-      for (const agentId of listConfiguredAgentIds(cfg)) {
-        let storePath: string;
-        let store: Record<string, RuntimeSessionStoreEntry | undefined>;
-        try {
-          storePath = sessionApi.resolveStorePath(storeConfig, { agentId });
-          store = sessionApi.loadSessionStore(storePath);
-        } catch {
-          continue;
-        }
-
-        for (const [rawSessionKey, rawEntry] of Object.entries(store)) {
-          const sessionKey = rawSessionKey.trim();
-          if (!sessionKey || !isRecord(rawEntry)) {
-            continue;
-          }
-          const parsed = parseAgentSessionKey(sessionKey);
-          if (parsed?.agentId && normalizeAgentId(parsed.agentId) !== agentId) {
-            continue;
-          }
-          const sessionId = getStringField(rawEntry, "sessionId");
-          if (!sessionId) {
-            continue;
-          }
-
-          let sessionFile: string;
-          try {
-            sessionFile = sessionApi.resolveSessionFilePath(sessionId, rawEntry, {
-              agentId,
-              storePath,
-            }).trim();
-          } catch {
-            continue;
-          }
-          if (!sessionFile) {
-            continue;
-          }
-
-          const dedupeKey = `${sessionId}\0${sessionKey}\0${sessionFile}`;
-          if (seen.has(dedupeKey)) {
-            continue;
-          }
-          seen.add(dedupeKey);
-          candidates.push({
-            sessionId,
-            sessionKey,
-            sessionFile,
-            agentId,
-            storePath,
-          });
-        }
-      }
-
-      return candidates;
     },
     agentLaneSubagent: "subagent",
     log,
@@ -2439,15 +2266,6 @@ const lcmPlugin = {
       return error instanceof Error ? error : new Error(String(error));
     }
 
-    /** Start the non-blocking startup scan for oversized LCM-managed transcripts. */
-    function scheduleStartupAutoRotate(nextEngine: LcmContextEngine): void {
-      void nextEngine.autoRotateManagedSessionFilesAtStartup().catch((error) => {
-        deps.log.warn(
-          `[lcm] auto-rotate: phase=startup action=warn durationMs=0 reason=startup-scan-failed error=${describeLogError(error).replace(/\s+/g, "_")}`,
-        );
-      });
-    }
-
     /** Build a live DB+engine pair and roll back the DB handle if engine init fails. */
     function initializeEngine(): LcmContextEngine {
       const startedAt = Date.now();
@@ -2460,7 +2278,6 @@ const lcmPlugin = {
         deps.log.info(
           `[lcm] Engine initialized for db=${normalizedDbPath} duration=${Date.now() - startedAt}ms`,
         );
-        scheduleStartupAutoRotate(nextEngine);
         return nextEngine;
       } catch (error) {
         closeLcmConnection(nextDatabase);
