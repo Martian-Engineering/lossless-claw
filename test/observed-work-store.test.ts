@@ -430,6 +430,12 @@ describe("ObservedWorkStore", () => {
       events.listObservations({ conversationId: 8, query: "PR 123" })[0]
         ?.eventId
     ).toBe("evt_pr_normalized");
+    expect(
+      events.listObservations({
+        conversationId: 8,
+        query: "https://github.com/Martian-Engineering/lossless-claw/pull/123",
+      })[0]?.eventId
+    ).toBe("evt_pr_normalized");
     expect(() =>
       events.upsertObservation({
         eventId: "evt_missing_source",

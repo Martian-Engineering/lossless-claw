@@ -84,7 +84,8 @@ function normalizeQueryKey(value: string | undefined): string | null {
   }
   const pr =
     /^(?:pr|pull request)\s*#?\s*(\d{1,6})$/.exec(normalized) ??
-    /^pr[-\s#]*(\d{1,6})$/.exec(normalized);
+    /^pr[-\s#]*(\d{1,6})$/.exec(normalized) ??
+    /(?:^|\/)pull\/(\d{1,6})(?:\b|$)/.exec(normalized);
   if (pr?.[1]) {
     return `pr-${pr[1]}`;
   }
@@ -212,11 +213,11 @@ export class EventObservationStore {
       args.push(query, likeQuery, likeQuery);
     }
     if (input?.since) {
-      where.push("julianday(coalesce(event_time, ingest_time)) >= julianday(?)");
+      where.push("coalesce(event_time, ingest_time) >= ?");
       args.push(input.since);
     }
     if (input?.before) {
-      where.push("julianday(coalesce(event_time, ingest_time)) < julianday(?)");
+      where.push("coalesce(event_time, ingest_time) < ?");
       args.push(input.before);
     }
     const limit = Math.max(1, Math.min(input?.limit ?? 20, 100));
@@ -228,7 +229,7 @@ export class EventObservationStore {
               source_ids, created_at, updated_at
        FROM lcm_event_observations
        ${whereSql}
-       ORDER BY julianday(coalesce(event_time, ingest_time)) ${order}, confidence DESC
+       ORDER BY coalesce(event_time, ingest_time) ${order}, confidence DESC, event_id ASC
        LIMIT ?`,
     ).all(...args, limit) as EventObservationRow[];
     return rows.map((row) => rowToEvent(row, input?.includeSources === true));

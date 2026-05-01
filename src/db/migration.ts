@@ -1308,6 +1308,9 @@ export function runLcmMigrations(
         CREATE INDEX IF NOT EXISTS lcm_event_observations_query_time_idx
           ON lcm_event_observations(query_key, event_time DESC);
 
+        CREATE INDEX IF NOT EXISTS lcm_event_observations_conversation_observed_time_idx
+          ON lcm_event_observations(conversation_id, coalesce(event_time, ingest_time) DESC);
+
         CREATE INDEX IF NOT EXISTS lcm_event_observations_source_idx
           ON lcm_event_observations(source_type, source_id);
       `);
