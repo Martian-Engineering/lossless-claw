@@ -556,6 +556,55 @@ describe("ObservedWorkStore", () => {
     );
   });
 
+  it("does not downgrade completed work after later ambiguous same-summary evidence", async () => {
+    const db = makeDb();
+    createConversation(db, 19);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 19,
+      summaryId: "sum_pr604_open",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #604 review comments unresolved",
+    });
+    expect(extractor.processConversation(19)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 19,
+      summaryId: "sum_pr604_mixed_resolution",
+      createdAt: "2026-04-28T06:00:00.000Z",
+      content:
+        "- Completed: PR #604 review comments resolved\n- Ambiguous: PR #604 review comments possibly resolved",
+    });
+    expect(extractor.processConversation(19)).toMatchObject({
+      summariesScanned: 1,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 19,
+      includeTransitions: true,
+      limit: 10,
+    });
+    expect(density.completedHighlights.map((item) => item.title)).toContain(
+      "Blocker: PR #604 review comments unresolved"
+    );
+    expect(density.topUnfinished.map((item) => item.title)).not.toContain(
+      "Blocker: PR #604 review comments unresolved"
+    );
+    expect(density.transitions?.map((transition) => transition.transitionType)).toEqual(
+      expect.arrayContaining(["resolved", "possibly_resolved"])
+    );
+  });
+
   it("preserves semantic evidence kinds when reinforcing extracted work", async () => {
     const db = makeDb();
     createConversation(db, 9);
