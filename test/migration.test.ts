@@ -369,6 +369,8 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(allIndexNames.has("conversations_session_id_active_created_idx")).toBe(true);
     expect(allIndexNames.has("summary_messages_message_idx")).toBe(true);
     expect(allIndexNames.has("summaries_conv_depth_kind_idx")).toBe(true);
+    expect(allIndexNames.has("messages_conversation_created_at_jd_idx")).toBe(true);
+    expect(allIndexNames.has("messages_created_at_jd_idx")).toBe(true);
 
     const queryPlanRows = db
       .prepare(
