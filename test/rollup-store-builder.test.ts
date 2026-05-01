@@ -81,6 +81,39 @@ describe("LCM temporal rollup MVP", () => {
         )
         .get()
     ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'messages_conversation_created_at_jd_idx'"
+        )
+        .get()
+    ).toBeTruthy();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'messages_created_at_jd_idx'"
+        )
+        .get()
+    ).toBeTruthy();
+    const queryPlanRows = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT m.message_id
+         FROM messages m
+         WHERE m.conversation_id = ?
+           AND julianday(m.created_at) < julianday(?)
+           AND julianday(m.created_at) >= julianday(?)
+         ORDER BY julianday(m.created_at) DESC
+         LIMIT 1001`
+      )
+      .all(1, "2026-04-28T00:00:00.000Z", "2026-04-27T00:00:00.000Z") as Array<{
+      detail: string;
+    }>;
+    expect(
+      queryPlanRows.some((row) =>
+        row.detail.includes("messages_conversation_created_at_jd_idx")
+      )
+    ).toBe(true);
   });
 
   it("builds a stable daily rollup and preserves rollup_id across rebuilds", async () => {
