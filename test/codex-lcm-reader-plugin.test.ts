@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -283,5 +283,53 @@ describe("Codex LCM Reader plugin", () => {
     expect(messages.map((message) => message.id)).toEqual([1, 2, 3]);
     expect(JSON.stringify(messages[1])).toContain("lcm_expand_query");
     expect(JSON.stringify(messages[2])).toContain("Lexar");
+  });
+
+  it("starts over MCP stdio when invoked through an installed symlink path", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const installDir = mkdtempSync(join(tmpdir(), "codex-lcm-reader-install-"));
+    tempDirs.add(installDir);
+    const symlinkedPlugin = join(installDir, "codex-lcm-reader");
+    symlinkSync(join(process.cwd(), "plugins/codex-lcm-reader"), symlinkedPlugin, "dir");
+    const scriptPath = join(symlinkedPlugin, "scripts/mcp-server.mjs");
+
+    const child = spawn(process.execPath, [scriptPath], {
+      cwd: symlinkedPlugin,
+      env: { ...process.env, LCM_CODEX_DB_PATH: fixture.dbPath },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.stdin.write(encodeMcp({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+    child.stdin.end();
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill("SIGTERM");
+        reject(new Error(`MCP symlink server timed out. stderr=${stderr}`));
+      }, 5_000);
+      child.on("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.on("exit", (code) => {
+        clearTimeout(timeout);
+        if (code === 0) resolve();
+        else reject(new Error(`MCP symlink server exited ${code}. stderr=${stderr}`));
+      });
+    });
+
+    const messages = decodeMcp(stdout);
+    expect(messages).toHaveLength(1);
+    expect(JSON.stringify(messages[0])).toContain("lcm_grep");
   });
 });
