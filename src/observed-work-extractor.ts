@@ -187,7 +187,7 @@ function classifyWork(line: string): WorkCandidate | null {
     evidenceKind:
       observedStatus === "observed_completed"
         ? "completed"
-        : observedStatus === "observed_ambiguous"
+        : observedStatus === "observed_ambiguous" && hasCompleted
           ? "possible_completion"
           : "created",
     topicKey: topicKeyFor(line, kind),
@@ -408,18 +408,24 @@ export class ObservedWorkExtractor {
     if (workItemIds.length === 0) {
       return new Map();
     }
-    const rows = this.db.prepare(
-      `SELECT work_item_id, observed_status, confidence, first_seen_at, last_seen_at, evidence_count
-       FROM lcm_observed_work_items
-       WHERE work_item_id IN (${workItemIds.map(() => "?").join(", ")})`,
-    ).all(...workItemIds) as Array<{
+    const rows: Array<{
       work_item_id: string;
       observed_status: ObservedWorkStatus;
       confidence: number;
       first_seen_at: string;
       last_seen_at: string;
       evidence_count: number;
-    }>;
+    }> = [];
+    for (let offset = 0; offset < workItemIds.length; offset += 500) {
+      const chunk = workItemIds.slice(offset, offset + 500);
+      rows.push(
+        ...(this.db.prepare(
+          `SELECT work_item_id, observed_status, confidence, first_seen_at, last_seen_at, evidence_count
+           FROM lcm_observed_work_items
+           WHERE work_item_id IN (${chunk.map(() => "?").join(", ")})`,
+        ).all(...chunk) as typeof rows),
+      );
+    }
     return new Map(
       rows.map((row) => [
         row.work_item_id,
@@ -443,7 +449,8 @@ export class ObservedWorkExtractor {
     const args: Array<string | number> = [conversationId];
     const where = ["s.conversation_id = ?", "s.kind = 'leaf'"];
     const cursorRowid = state?.lastProcessedSummaryId
-      ? this.lookupSummaryRowid(state.lastProcessedSummaryId)
+      ? (this.lookupSummaryRowid(state.lastProcessedSummaryId) ??
+        state?.lastProcessedSummaryRowid)
       : state?.lastProcessedSummaryRowid;
     if (cursorRowid != null) {
       where.push("s.rowid > ?");

@@ -250,6 +250,90 @@ describe("ObservedWorkStore", () => {
     ]);
   });
 
+  it("falls back to the persisted rowid cursor when the processed summary id is missing", async () => {
+    const db = makeDb();
+    createConversation(db, 16);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 16,
+      summaryId: "sum_cursor_deleted_anchor",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #560 needs review",
+    });
+    expect(extractor.processConversation(16)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+    const state = observedWork.getState(16);
+    expect(state?.lastProcessedSummaryRowid).toBeGreaterThan(0);
+    observedWork.upsertState({
+      conversationId: 16,
+      lastProcessedSummaryId: "zz_missing_anchor",
+      lastProcessedSummaryCreatedAt: state?.lastProcessedSummaryCreatedAt,
+      lastProcessedSummaryRowid: state?.lastProcessedSummaryRowid,
+    });
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 16,
+      summaryId: "aaa_cursor_later",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Blocker: PR #561 needs review",
+    });
+    expect(extractor.processConversation(16)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 16,
+      statuses: ["observed_unfinished"],
+      limit: 10,
+    });
+    expect(density.topUnfinished.map((item) => item.topicKey).sort()).toEqual([
+      "pr-560",
+      "pr-561",
+    ]);
+  });
+
+  it("chunks dense summary lookups so extraction stays under SQLite bind limits", async () => {
+    const db = makeDb();
+    createConversation(db, 18);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+    const content = Array.from(
+      { length: 1100 },
+      (_, index) => `- Blocker: PR #${7000 + index} needs review`
+    ).join("\n");
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 18,
+      summaryId: "sum_dense_bind_limit",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content,
+    });
+
+    expect(extractor.processConversation(18, { limit: 1 })).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1100,
+    });
+    expect(
+      observedWork.getDensity({
+        conversationId: 18,
+        statuses: ["observed_unfinished"],
+      }).density.unfinished
+    ).toBe(1100);
+  });
+
   it("preserves semantic evidence kinds when reinforcing extracted work", async () => {
     const db = makeDb();
     createConversation(db, 9);
@@ -312,12 +396,40 @@ describe("ObservedWorkStore", () => {
       content: [
         "- Incident: ENOTEMPTY failed during package cleanup",
         "- Retell: recalled the older Tarzan onboarding incident",
+        "- Cortex config drift caused plugin validation failure",
       ].join("\n"),
     });
     expect(extractor.processConversation(8)).toMatchObject({
       summariesScanned: 1,
-      eventsUpserted: 2,
+      eventsUpserted: 3,
     });
+    expect(
+      events.listObservations({
+        conversationId: 8,
+        eventKinds: ["operational_incident"],
+        query: "cortex config drift",
+      })[0]?.eventKind
+    ).toBe("operational_incident");
+    events.upsertObservation({
+      eventId: "evt_pr_normalized",
+      conversationId: 8,
+      eventKind: "primary",
+      title: "Normalized event key",
+      queryKey: "PR #123",
+      ingestTime: "2026-04-28T07:00:00.000Z",
+      confidence: 0.8,
+      rationale: "Direct store caller uses human PR spelling.",
+      sourceType: "summary",
+      sourceId: "sum_incident",
+    });
+    expect(
+      events.listObservations({ conversationId: 8, query: "pr-123" })[0]
+        ?.eventId
+    ).toBe("evt_pr_normalized");
+    expect(
+      events.listObservations({ conversationId: 8, query: "PR 123" })[0]
+        ?.eventId
+    ).toBe("evt_pr_normalized");
 
     const lcm = {
       getEventObservationStore: () => events,
@@ -349,6 +461,14 @@ describe("ObservedWorkStore", () => {
     });
     expect(JSON.stringify(shown.details)).toContain("sum_incident");
     expect(JSON.stringify(shown.details)).toContain("retelling");
+
+    const global = await tool.execute("event-global", {
+      allConversations: true,
+      query: "enotempty",
+    });
+    expect((global.details as { error?: string }).error).toMatch(
+      /does not support allConversations/
+    );
   });
 
   it("rolls back event observations with failed summary extraction", async () => {
@@ -385,6 +505,40 @@ describe("ObservedWorkStore", () => {
       workItemsUpserted: 1,
       eventsUpserted: 1,
     });
+  });
+
+  it("uses neutral evidence for ambiguous work without a completion cue", async () => {
+    const db = makeDb();
+    createConversation(db, 17);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 17,
+      summaryId: "sum_ambiguous_investigate",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Investigate PR #562 review behavior before calling it complete",
+    });
+    expect(extractor.processConversation(17)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 17,
+      statuses: ["observed_ambiguous"],
+      includeSources: true,
+      limit: 10,
+    });
+    expect(density.ambiguous[0]?.sources).toEqual([
+      expect.objectContaining({
+        sourceId: "sum_ambiguous_investigate",
+        evidenceKind: "created",
+      }),
+    ]);
   });
 
   it("reports completed, unfinished, and ambiguous work density", () => {
