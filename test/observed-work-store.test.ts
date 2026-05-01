@@ -544,6 +544,15 @@ describe("ObservedWorkStore", () => {
       kind: "decision",
       fingerprint: "decision:task-bridge-policy",
     });
+    for (const [index, workItemId] of ["work_done", "work_open", "work_maybe"].entries()) {
+      store.addSource({
+        workItemId,
+        sourceType: "summary",
+        sourceId: `sum_density_${index}`,
+        ordinal: index,
+        evidenceKind: "created",
+      });
+    }
 
     const density = store.getDensity({ conversationId: 1, limit: 5 });
     expect(density.density).toMatchObject({
@@ -557,6 +566,46 @@ describe("ObservedWorkStore", () => {
     expect(density.topUnfinished[0]?.title).toBe("Fix PR #14 review comments");
     expect(density.completedHighlights[0]?.title).toBe("Daily rollup tests passed");
     expect(density.ambiguous[0]?.title).toBe("Decide task bridge policy");
+  });
+
+  it("does not surface source-free observed work in density results", () => {
+    const db = makeDb();
+    createConversation(db, 1);
+    const store = new ObservedWorkStore(db);
+    const base = {
+      conversationId: 1,
+      firstSeenAt: "2026-04-28T00:00:00.000Z",
+      lastSeenAt: "2026-04-28T01:00:00.000Z",
+      observedStatus: "observed_unfinished" as const,
+      kind: "review" as const,
+    };
+
+    store.upsertItem({
+      ...base,
+      workItemId: "work_sourced",
+      title: "Sourced observed item",
+      fingerprint: "review:sourced",
+    });
+    store.addSource({
+      workItemId: "work_sourced",
+      sourceType: "summary",
+      sourceId: "sum_sourced",
+      ordinal: 0,
+      evidenceKind: "created",
+    });
+    store.upsertItem({
+      ...base,
+      workItemId: "work_unsourced",
+      title: "Unsourced observed item",
+      fingerprint: "review:unsourced",
+    });
+
+    const density = store.getDensity({ conversationId: 1, includeSources: true });
+    expect(density.density.totalObserved).toBe(1);
+    expect(density.topUnfinished.map((item) => item.workItemId)).toEqual([
+      "work_sourced",
+    ]);
+    expect(JSON.stringify(density)).not.toContain("work_unsourced");
   });
 
   it("preserves temporal invariants while updating mutable metadata", () => {
@@ -771,6 +820,13 @@ describe("ObservedWorkStore", () => {
       sourceId: "sum_today",
       ordinal: 0,
       evidenceKind: "completed",
+    });
+    store.addSource({
+      workItemId: "work_yesterday",
+      sourceType: "summary",
+      sourceId: "sum_yesterday",
+      ordinal: 0,
+      evidenceKind: "created",
     });
 
     const lcm = {
