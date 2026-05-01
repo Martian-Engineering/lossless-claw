@@ -431,6 +431,19 @@ describe("ObservedWorkStore", () => {
       events.listObservations({ conversationId: 8, query: "PR 123" })[0]
         ?.eventId
     ).toBe("evt_pr_normalized");
+    expect(() =>
+      events.upsertObservation({
+        eventId: "evt_missing_source",
+        conversationId: 8,
+        eventKind: "primary",
+        title: "Missing source event",
+        ingestTime: "2026-04-28T07:00:00.000Z",
+        confidence: 0.8,
+        rationale: "Direct store caller omitted the primary source.",
+        sourceType: "summary",
+        sourceId: " ",
+      }),
+    ).toThrow(/source ID/);
 
     const lcm = {
       getEventObservationStore: () => events,

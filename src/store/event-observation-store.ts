@@ -141,7 +141,11 @@ export class EventObservationStore {
     if (input.rationale.trim().length === 0) {
       throw new Error("event rationale is required.");
     }
-    const sourceIds = normalizeSourceIds(input.sourceIds, input.sourceId);
+    const sourceId = input.sourceId.trim();
+    if (sourceId.length === 0) {
+      throw new Error("event source ID is required.");
+    }
+    const sourceIds = normalizeSourceIds(input.sourceIds, sourceId);
     this.db.prepare(
       `INSERT INTO lcm_event_observations (
         event_id, conversation_id, event_kind, title, description, query_key,
@@ -174,7 +178,7 @@ export class EventObservationStore {
       input.confidence ?? 0.5,
       input.rationale.trim(),
       input.sourceType,
-      input.sourceId,
+      sourceId,
       JSON.stringify(sourceIds),
     );
   }
