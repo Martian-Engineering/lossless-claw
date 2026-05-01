@@ -1231,6 +1231,79 @@ describe("LCM sub-day window retrieval", () => {
     ).toBe(true);
   });
 
+  it("bypasses stored day rollups when rebuild is pending without a message timestamp", async () => {
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-summary-only",
+      sessionKey: "agent:main:pending-summary-only",
+      title: "Pending summary only",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_pending_summary_only",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Summary-only repair should be visible through fallback.",
+      tokenCount: 10,
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+    rollupStore.upsertRollup({
+      rollup_id: "rollup_pending_summary_only",
+      conversation_id: conversation.conversationId,
+      period_kind: "day",
+      period_key: "2026-04-27",
+      period_start: "2026-04-27T00:00:00.000Z",
+      period_end: "2026-04-28T00:00:00.000Z",
+      timezone: "UTC",
+      content: "STALE SUMMARY-ONLY ROLLUP SHOULD NOT BE USED",
+      token_count: 10,
+      source_summary_ids: JSON.stringify([]),
+      source_message_count: 0,
+      source_token_count: 0,
+      status: "ready",
+      coverage_start: null,
+      coverage_end: null,
+      summarizer_model: null,
+      source_fingerprint: null,
+    });
+    rollupStore.upsertState(conversation.conversationId, {
+      timezone: "UTC",
+      pending_rebuild: 1,
+    });
+
+    const now = new Date("2026-04-29T12:00:00.000Z");
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => rollupStore,
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "pending-summary-only",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "pending-summary-only",
+    });
+
+    const result = await tool.execute("call-pending-summary-only", {
+      period: "date:2026-04-27",
+      includeSources: true,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("**Status:** fallback");
+    expect(text).toContain("**Degraded:** Rollup rebuild is pending, so stored day rollups were bypassed.");
+    expect(text).toContain("Summary-only repair");
+    expect(text).not.toContain("STALE SUMMARY-ONLY ROLLUP");
+  });
+
   it("combines complete prior daily rollups with live fallback for 7d", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     vi.useFakeTimers();
@@ -2410,6 +2483,70 @@ describe("LCM weekly and monthly rollups", () => {
                SET created_at = ?
                WHERE summary_id = ?`
             ).run(summaryChange.toISOString(), "sum_watermark");
+          }
+          return rows;
+        });
+
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await expect(
+        builder.buildDailyRollups(conversation.conversationId, {
+          forceCurrentDay: true,
+          daysBack: 2,
+        })
+      ).resolves.toMatchObject({ built: 1, errors: [] });
+      lookupSpy.mockRestore();
+
+      const state = rollupStore.getState(conversation.conversationId);
+      expect(state?.pending_rebuild).toBe(1);
+      expect(state?.last_rollup_check_at).toBe(summaryChange.toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps rebuild pending when leaf summary content changes during a daily sweep", async () => {
+    const scanStart = new Date("2026-04-28T12:00:00.000Z");
+    const summaryChange = new Date("2026-04-28T12:00:05.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(scanStart);
+    try {
+      const { db, conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "rollup-summary-content-watermark",
+        sessionKey: "agent:main:rollup-summary-content-watermark",
+        title: "Rollup summary content watermark",
+      });
+
+      await summaryStore.insertSummary({
+        summaryId: "sum_content_watermark",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Original summary content.",
+        tokenCount: 10,
+        earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+        latestAt: new Date("2026-04-27T10:30:00.000Z"),
+      });
+
+      const originalGetLeafSummaries =
+        rollupStore.getLeafSummariesForDay.bind(rollupStore);
+      let changedContent = false;
+      const lookupSpy = vi
+        .spyOn(rollupStore, "getLeafSummariesForDay")
+        .mockImplementation((...args) => {
+          const rows = originalGetLeafSummaries(...args);
+          if (!changedContent && args[1] === "2026-04-27T00:00:00.000Z") {
+            changedContent = true;
+            vi.setSystemTime(summaryChange);
+            db.prepare(
+              `UPDATE summaries
+               SET content = ?, token_count = ?
+               WHERE summary_id = ?`
+            ).run(
+              "Updated summary content with same created_at.",
+              10,
+              "sum_content_watermark"
+            );
           }
           return rows;
         });
