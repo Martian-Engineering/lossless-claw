@@ -124,7 +124,8 @@ function normalizeQueryKey(value: string | undefined): string | null {
   }
   const pr =
     /^(?:pr|pull request)\s*#?\s*(\d{1,6})$/.exec(normalized) ??
-    /^pr[-\s#]*(\d{1,6})$/.exec(normalized);
+    /^pr[-\s#]*(\d{1,6})$/.exec(normalized) ??
+    /(?:^|\/)pull\/(\d{1,6})(?:\b|$)/.exec(normalized);
   if (pr?.[1]) {
     return `pr-${pr[1]}`;
   }
