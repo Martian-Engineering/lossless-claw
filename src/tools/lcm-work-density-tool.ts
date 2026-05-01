@@ -172,7 +172,7 @@ export function createLcmWorkDensityTool(input: {
         params: p,
       });
       if (!scope.allConversations && scope.conversationId == null) {
-        return jsonResult({ error: "No LCM conversation found for this session. Provide conversationId or set allConversations=true." });
+        return jsonResult({ error: "No LCM conversation found for this session. Provide conversationId." });
       }
       if (scope.allConversations) {
         return jsonResult({
