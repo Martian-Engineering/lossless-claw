@@ -142,6 +142,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
             "agent:*:cron:**"
           ],
           "transcriptGcEnabled": false,
+          "rollupDebugEnabled": false,
           "observedWorkMaintenanceEnabled": false,
           "proactiveThresholdCompactionMode": "deferred",
           "summaryModel": "openai/gpt-5.4-mini",
@@ -190,6 +191,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
 | `LCM_TRANSCRIPT_GC_ENABLED` | `false` | Enable transcript rewrite GC during `maintain()` |
 | `LCM_ROLLUP_DEBUG_ENABLED` | `false` | Register the operator-facing `lcm_rollup_debug` inspection tool |
+| `LCM_OBSERVED_WORK_MAINTENANCE_ENABLED` | `false` | Allow `maintain()` to run observed-work and event extraction over LCM summaries |
 | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | `deferred` | Choose whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior |
 | `LCM_CACHE_TTL_SECONDS` | `300` | Cache TTL used by cache-aware deferred compaction when provider/runtime telemetry does not supply a more specific retention window |
 
@@ -237,6 +239,7 @@ Plugin config equivalents:
 - `statelessSessionPatterns`
 - `skipStatelessSessions`
 - `transcriptGcEnabled`
+- `rollupDebugEnabled`
 - `observedWorkMaintenanceEnabled`
 - `newSessionRetainDepth`
 - `summaryModel`

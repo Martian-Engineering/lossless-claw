@@ -40,6 +40,7 @@ describe("resolveLcmConfig", () => {
     expect(config.summaryModel).toBe("");
     expect(config.pruneHeartbeatOk).toBe(false);
     expect(config.transcriptGcEnabled).toBe(false);
+    expect(config.rollupDebugEnabled).toBe(false);
     expect(config.observedWorkMaintenanceEnabled).toBe(false);
     expect(config.proactiveThresholdCompactionMode).toBe("deferred");
     expect(config.cacheAwareCompaction).toEqual({
@@ -72,6 +73,7 @@ describe("resolveLcmConfig", () => {
       condensedMinFanout: 2,
       pruneHeartbeatOk: true,
       transcriptGcEnabled: true,
+      rollupDebugEnabled: true,
       observedWorkMaintenanceEnabled: true,
       proactiveThresholdCompactionMode: "inline",
       enabled: false,
@@ -106,6 +108,7 @@ describe("resolveLcmConfig", () => {
     expect(config.condensedMinFanout).toBe(2);
     expect(config.pruneHeartbeatOk).toBe(true);
     expect(config.transcriptGcEnabled).toBe(true);
+    expect(config.rollupDebugEnabled).toBe(true);
     expect(config.observedWorkMaintenanceEnabled).toBe(true);
     expect(config.proactiveThresholdCompactionMode).toBe("inline");
     expect(config.cacheAwareCompaction).toEqual({
@@ -135,6 +138,7 @@ describe("resolveLcmConfig", () => {
       LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
       LCM_SKIP_STATELESS_SESSIONS: "false",
       LCM_TRANSCRIPT_GC_ENABLED: "true",
+      LCM_ROLLUP_DEBUG_ENABLED: "true",
       LCM_OBSERVED_WORK_MAINTENANCE_ENABLED: "true",
       LCM_CACHE_AWARE_COMPACTION_ENABLED: "false",
       LCM_CACHE_TTL_SECONDS: "600",
@@ -156,6 +160,7 @@ describe("resolveLcmConfig", () => {
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
       transcriptGcEnabled: false,
+      rollupDebugEnabled: false,
       observedWorkMaintenanceEnabled: false,
       proactiveThresholdCompactionMode: "deferred",
       enabled: true,
@@ -184,6 +189,7 @@ describe("resolveLcmConfig", () => {
     ]);
     expect(config.skipStatelessSessions).toBe(false);
     expect(config.transcriptGcEnabled).toBe(true);
+    expect(config.rollupDebugEnabled).toBe(true);
     expect(config.observedWorkMaintenanceEnabled).toBe(true);
     expect(config.proactiveThresholdCompactionMode).toBe("inline");
     expect(config.contextThreshold).toBe(0.9); // env wins
@@ -572,6 +578,12 @@ describe("resolveLcmConfig", () => {
 
   it("ships a manifest with transcriptGcEnabled in schema", () => {
     expect(manifest.configSchema.properties.transcriptGcEnabled).toEqual({
+      type: "boolean",
+    });
+  });
+
+  it("ships a manifest with rollupDebugEnabled in schema", () => {
+    expect(manifest.configSchema.properties.rollupDebugEnabled).toEqual({
       type: "boolean",
     });
   });

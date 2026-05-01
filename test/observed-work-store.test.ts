@@ -12,6 +12,7 @@ import type { LcmDependencies } from "../src/types.js";
 function makeDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
   runLcmMigrations(db, { fts5Available: false });
+  db.exec("PRAGMA foreign_keys = ON");
   return db;
 }
 
