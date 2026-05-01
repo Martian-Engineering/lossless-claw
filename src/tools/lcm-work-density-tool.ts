@@ -4,6 +4,7 @@ import {
   addDays,
   getUtcDateForZonedMidnight,
   getZonedDayString,
+  startOfWeekDayString,
 } from "../timezone-windows.js";
 import type { LcmDependencies } from "../types.js";
 import type {
@@ -48,7 +49,7 @@ const LcmWorkDensitySchema = Type.Object({
   statuses: Type.Optional(Type.Array(Type.String({ enum: [...STATUS_VALUES] }), { description: "Observed statuses to include." })),
   kinds: Type.Optional(Type.Array(Type.String({ enum: [...KIND_VALUES] }), { description: "Observed work kinds to include." })),
   includeSources: Type.Optional(Type.Boolean({ description: "Include observed-work source IDs. Defaults to false." })),
-  detailLevel: Type.Optional(Type.Number({ description: "0 = compact counts, 1 = include top items, 2 = include more detail. Default 1.", minimum: 0, maximum: 2 })),
+  detailLevel: Type.Optional(Type.Number({ description: "0 = compact counts only; values above 0 include the bounded top item sections. Default 1.", minimum: 0, maximum: 2 })),
   maxOutputTokens: Type.Optional(Type.Number({ description: "Soft output budget hint for future truncation/accounting.", minimum: 256 })),
   minConfidence: Type.Optional(Type.Number({ description: "Minimum observed confidence to include.", minimum: 0, maximum: 1 })),
   limit: Type.Optional(Type.Number({ description: "Maximum items per highlight section. Default 5.", minimum: 1, maximum: 50 })),
@@ -116,14 +117,6 @@ function dayBounds(
     since: getUtcDateForZonedMidnight(day, timezone).toISOString(),
     before: getUtcDateForZonedMidnight(addDays(day, 1), timezone).toISOString(),
   };
-}
-
-function startOfWeekDayString(dayString: string): string {
-  const [year, month, day] = dayString.split("-").map((part) => Number(part));
-  const date = new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
-  const weekday = date.getUTCDay();
-  const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
-  return addDays(dayString, mondayOffset);
 }
 
 function nextMonthStartDay(dayString: string): string {

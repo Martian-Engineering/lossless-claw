@@ -156,7 +156,7 @@ export class RollupBuilder {
     conversationId: number,
     weekKey: string
   ): Promise<boolean> {
-    const canonicalWeekKey = startOfWeekKey(weekKey, this.config.timezone);
+    const canonicalWeekKey = startOfWeekKey(weekKey);
     if (weekKey !== canonicalWeekKey) {
       throw new Error(
         `Week key must be a Monday calendar week start: ${canonicalWeekKey}`
@@ -211,10 +211,7 @@ export class RollupBuilder {
       }
       const key =
         periodKind === WEEK_PERIOD_KIND
-          ? startOfWeekKey(
-              rollup.period_key,
-              rollup.timezone || this.config.timezone
-            )
+          ? startOfWeekKey(rollup.period_key)
           : rollup.period_key.slice(0, 7);
       keys.add(key);
     }
@@ -1101,8 +1098,7 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-function startOfWeekKey(dayKey: string, timezone: string): string {
-  void timezone;
+function startOfWeekKey(dayKey: string): string {
   assertValidDateKey(dayKey);
   const [year, month, day] = dayKey
     .split("-")
