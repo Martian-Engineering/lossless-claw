@@ -280,6 +280,7 @@ export class TaskBridgeSuggestionStore {
     if (!REVIEW_STATUSES.has(input.status)) {
       throw new Error("review status must be accepted, rejected, dismissed, or expired.");
     }
+    const reviewedBy = input.reviewedBy?.trim() || null;
     const result = this.db.prepare(
       `UPDATE lcm_task_bridge_suggestions
        SET status = ?,
@@ -287,7 +288,7 @@ export class TaskBridgeSuggestionStore {
            reviewed_at = datetime('now'),
            updated_at = datetime('now')
        WHERE suggestion_id = ? AND status = 'pending'`,
-    ).run(input.status, input.reviewedBy ?? null, input.suggestionId);
+    ).run(input.status, reviewedBy, input.suggestionId);
     return result.changes > 0;
   }
 }
