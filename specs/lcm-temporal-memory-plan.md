@@ -99,7 +99,8 @@ sequenceDiagram
   Runtime->>Engine: ingest message
   Engine->>State: pending_rebuild=1, last_message_at=now
   Runtime->>Engine: maintain()
-  Engine->>Builder: buildDailyRollups(daysBack=30, forceCurrentDay=true)
+  Engine->>State: compute bounded daysBack from last_rollup_check_at
+  Engine->>Builder: buildDailyRollups(daysBack=dynamic up to 30, forceCurrentDay=true)
   Builder->>Store: upsert day rollups and sources
   Engine->>Builder: buildWeeklyMonthlyRollups()
   Builder->>Store: upsert aggregate rollups and sources

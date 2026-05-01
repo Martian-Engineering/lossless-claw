@@ -488,8 +488,11 @@ function formatSourcesLine(
   sourceIds: string[],
   includeSources: boolean
 ): string {
-  if (!includeSources || sourceIds.length === 0) {
+  if (!includeSources) {
     return "*Sources: omitted*";
+  }
+  if (sourceIds.length === 0) {
+    return "*Sources: none*";
   }
   return `*Sources: ${sourceIds.join(", ")}*`;
 }
