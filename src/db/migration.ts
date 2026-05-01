@@ -756,6 +756,20 @@ function quoteSqlIdentifier(identifier: string): string {
   return `"${identifier.replaceAll(`"`, `""`)}"`;
 }
 
+function addColumnIfMissing(
+  db: DatabaseSync,
+  tableName: string,
+  columnName: string,
+  columnDefinition: string,
+): void {
+  const columns = db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all() as SummaryColumnInfo[];
+  if (!columns.some((col) => col.name === columnName)) {
+    db.exec(
+      `ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${columnDefinition}`,
+    );
+  }
+}
+
 function shouldRecreateStandaloneFtsTable(db: DatabaseSync, spec: FtsTableSpec): boolean {
   const shadowTables = getFtsShadowTableNames(spec.tableName);
   const existingTables = getExistingTableNames(db, [spec.tableName, ...shadowTables]);
@@ -1077,6 +1091,205 @@ export function runLcmMigrations(
     runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
       backfillToolCallColumns(db),
     );
+
+    runMigrationStep("ensureRollupTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_rollups (
+          rollup_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          period_kind TEXT NOT NULL CHECK (period_kind IN ('day', 'week', 'month')),
+          period_key TEXT NOT NULL,
+          period_start TEXT NOT NULL,
+          period_end TEXT NOT NULL,
+          timezone TEXT NOT NULL DEFAULT 'UTC',
+          content TEXT NOT NULL,
+          token_count INTEGER NOT NULL DEFAULT 0,
+          source_summary_ids TEXT NOT NULL DEFAULT '[]',
+          source_message_count INTEGER NOT NULL DEFAULT 0,
+          source_token_count INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('building', 'ready', 'stale', 'failed')),
+          coverage_start TEXT,
+          coverage_end TEXT,
+          summarizer_model TEXT,
+          source_fingerprint TEXT,
+          built_at TEXT NOT NULL DEFAULT (datetime('now')),
+          invalidated_at TEXT,
+          error_text TEXT,
+          UNIQUE (conversation_id, period_kind, timezone, period_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_rollup_sources (
+          rollup_id TEXT NOT NULL REFERENCES lcm_rollups(rollup_id) ON DELETE CASCADE,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup')),
+          source_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          PRIMARY KEY (rollup_id, source_type, ordinal)
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_rollup_state (
+          conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          timezone TEXT NOT NULL DEFAULT 'UTC',
+          last_message_at TEXT,
+          last_rollup_check_at TEXT,
+          last_daily_build_at TEXT,
+          last_weekly_build_at TEXT,
+          last_monthly_build_at TEXT,
+          pending_rebuild INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureRollupStateAggregateColumns", log, () => {
+      addColumnIfMissing(db, "lcm_rollup_state", "last_weekly_build_at", "TEXT");
+      addColumnIfMissing(db, "lcm_rollup_state", "last_monthly_build_at", "TEXT");
+    });
+
+    runMigrationStep("ensureRollupIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_rollups_lookup_idx
+        ON lcm_rollups (conversation_id, period_kind, period_start DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_rollups_status_idx
+        ON lcm_rollups (status, built_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_rollup_sources_source_idx
+        ON lcm_rollup_sources (source_id);
+
+        CREATE INDEX IF NOT EXISTS summaries_leaf_effective_time_conv_idx
+        ON summaries (
+          conversation_id,
+          julianday(coalesce(earliest_at, latest_at, created_at)),
+          julianday(coalesce(latest_at, earliest_at, created_at))
+        )
+        WHERE kind = 'leaf';
+
+        CREATE INDEX IF NOT EXISTS summaries_leaf_effective_time_idx
+        ON summaries (
+          julianday(coalesce(earliest_at, latest_at, created_at)),
+          julianday(coalesce(latest_at, earliest_at, created_at))
+        )
+        WHERE kind = 'leaf';
+
+        CREATE INDEX IF NOT EXISTS messages_conversation_created_at_idx
+        ON messages (conversation_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS messages_created_at_idx
+        ON messages (created_at);
+
+        CREATE INDEX IF NOT EXISTS messages_conversation_created_at_jd_idx
+        ON messages (conversation_id, julianday(created_at));
+
+        CREATE INDEX IF NOT EXISTS messages_created_at_jd_idx
+        ON messages (julianday(created_at));
+      `);
+    });
+
+    runMigrationStep("ensureRollupViews", log, () => {
+      db.exec(`
+        CREATE VIEW IF NOT EXISTS daily_rollups AS
+        SELECT * FROM lcm_rollups WHERE period_kind = 'day';
+
+        CREATE VIEW IF NOT EXISTS weekly_rollups AS
+        SELECT * FROM lcm_rollups WHERE period_kind = 'week';
+
+        CREATE VIEW IF NOT EXISTS monthly_rollups AS
+        SELECT * FROM lcm_rollups WHERE period_kind = 'month';
+      `);
+    });
+
+    runMigrationStep("ensureObservedWorkTables", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_items (
+          work_item_id TEXT PRIMARY KEY,
+          conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          owner_id TEXT,
+          title TEXT NOT NULL,
+          description TEXT,
+          observed_status TEXT NOT NULL CHECK (observed_status IN (
+            'observed_completed',
+            'observed_unfinished',
+            'observed_ambiguous',
+            'decision_recorded',
+            'dismissed'
+          )),
+          kind TEXT NOT NULL CHECK (kind IN (
+            'implementation',
+            'review',
+            'blocker',
+            'decision',
+            'question',
+            'follow_up',
+            'test',
+            'deploy',
+            'research',
+            'other'
+          )),
+          confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+          confidence_band TEXT NOT NULL DEFAULT 'medium' CHECK (confidence_band IN ('low', 'medium', 'medium-high', 'high')),
+          rationale TEXT,
+          topic_key TEXT,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          completed_at TEXT,
+          completion_confidence REAL CHECK (completion_confidence IS NULL OR (completion_confidence >= 0 AND completion_confidence <= 1)),
+          evidence_count INTEGER NOT NULL DEFAULT 0,
+          source_message_count INTEGER NOT NULL DEFAULT 0,
+          source_token_count INTEGER NOT NULL DEFAULT 0,
+          authority_source TEXT NOT NULL DEFAULT 'lcm_observed',
+          sensitivity TEXT,
+          visibility TEXT,
+          fingerprint TEXT NOT NULL,
+          fingerprint_version INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_sources (
+          work_item_id TEXT NOT NULL REFERENCES lcm_observed_work_items(work_item_id) ON DELETE CASCADE,
+          source_type TEXT NOT NULL CHECK (source_type IN ('summary', 'rollup', 'message')),
+          source_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+            'created',
+            'reinforced',
+            'possible_completion',
+            'completed',
+            'contradicted',
+            'dismissed'
+          )),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (work_item_id, source_type, source_id, evidence_kind)
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_observed_work_state (
+          conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+          last_processed_summary_created_at TEXT,
+          last_processed_summary_id TEXT,
+          pending_rebuild INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    });
+
+    runMigrationStep("ensureObservedWorkIndexes", log, () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_conversation_status_kind_seen_idx
+          ON lcm_observed_work_items(conversation_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_owner_status_kind_seen_idx
+          ON lcm_observed_work_items(owner_id, observed_status, kind, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_topic_status_seen_idx
+          ON lcm_observed_work_items(topic_key, observed_status, last_seen_at DESC);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_items_fingerprint_idx
+          ON lcm_observed_work_items(fingerprint);
+
+        CREATE INDEX IF NOT EXISTS lcm_observed_work_sources_source_idx
+          ON lcm_observed_work_sources(source_type, source_id);
+      `);
+    });
 
     const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
     const fts5Available = options?.fts5Available ?? detectedFeatures?.fts5Available ?? false;
