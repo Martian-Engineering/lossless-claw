@@ -1125,7 +1125,8 @@ export function createLcmRecentTool(input: {
       const canUseStoredCurrentDay =
         resolution.periodKey == null || resolution.periodKey !== currentDayKey;
       const hasPendingRebuild = rollupState?.pending_rebuild === 1;
-      const pendingRebuildTouchesWindow = pendingDayKey != null;
+      const pendingRebuildTouchesWindow =
+        hasPendingRebuild && (resolution.kind === "day" || pendingDayKey != null);
       const canUseStoredResolvedRollup =
         canUseStoredCurrentDay &&
         !pendingRebuildTouchesWindow &&
@@ -1136,6 +1137,9 @@ export function createLcmRecentTool(input: {
       } else if (pendingDayKey) {
         degradedReason =
           `Rollup rebuild is pending for ${pendingDayKey}, so stored rollups for that day were bypassed.`;
+      } else if (resolution.kind === "day" && hasPendingRebuild) {
+        degradedReason =
+          "Rollup rebuild is pending, so stored day rollups were bypassed.";
       } else if (resolution.kind && resolution.kind !== "day" && hasPendingRebuild) {
         degradedReason =
           "Rollup rebuild is pending, so stored aggregate rollups were bypassed.";
@@ -1227,10 +1231,15 @@ export function createLcmRecentTool(input: {
         }
         if (
           resolution.kind === "day" &&
-          pendingDayKey &&
-          expectedKeys.includes(pendingDayKey)
+          hasPendingRebuild
         ) {
-          liveFallbackKeys.add(pendingDayKey);
+          if (pendingDayKey && expectedKeys.includes(pendingDayKey)) {
+            liveFallbackKeys.add(pendingDayKey);
+          } else if (!pendingDayKey) {
+            for (const expectedKey of expectedKeys) {
+              liveFallbackKeys.add(expectedKey);
+            }
+          }
         }
         const requiredKeys = expectedKeys.filter((key) => !liveFallbackKeys.has(key));
         const hasCompleteCoverage =

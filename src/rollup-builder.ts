@@ -393,6 +393,13 @@ export class RollupBuilder {
     }
 
     const scannedAt = new Date();
+    let scanFingerprint: string;
+    try {
+      scanFingerprint = this.store.getLeafSummarySweepFingerprint(conversationId);
+    } catch (error) {
+      result.errors.push(`leaf summary fingerprint failed: ${formatError(error)}`);
+      return result;
+    }
 
     for (let offset = 0; offset < daysBack; offset += 1) {
       const dateKey = addDays(todayKey, -offset);
@@ -491,10 +498,13 @@ export class RollupBuilder {
       const latestState = this.store.getState(conversationId);
       const latestSummaryCreatedAt =
         this.store.getLatestLeafSummaryCreatedAt(conversationId);
+      const latestSummaryFingerprint =
+        this.store.getLeafSummarySweepFingerprint(conversationId);
       const shouldClearPending =
         result.errors.length === 0 &&
         isTimestampAtOrBefore(latestState?.last_message_at, scannedAt) &&
-        isTimestampAtOrBefore(latestSummaryCreatedAt, scannedAt);
+        isTimestampAtOrBefore(latestSummaryCreatedAt, scannedAt) &&
+        latestSummaryFingerprint === scanFingerprint;
       this.store.upsertState(conversationId, {
         timezone: this.config.timezone,
         last_rollup_check_at: laterDate(
