@@ -3,9 +3,9 @@ name: codex-lcm-reader
 description: Use when Codex should inspect local OpenClaw/lossless-claw LCM memory through read-only tools. Search and expand evidence from the local SQLite database without mutating OpenClaw state.
 ---
 
-# Codex LCM Reader
+# Lossless Codex
 
-Use this plugin when a task needs prior OpenClaw conversation context stored in the local lossless-claw LCM database.
+Use this plugin when a task needs prior OpenClaw conversation context stored in the local lossless-claw LCM database. The user-facing plugin name is Lossless Codex; the package folder remains `codex-lcm-reader`.
 
 The tools are read-only and bounded. They do not run LCM maintenance, write rollups, mutate OpenClaw task state, or write Cortex memory.
 
@@ -22,6 +22,6 @@ LCM output is evidence, not authority. Verify exact claims such as commands, SHA
 
 ## Database Path
 
-The MCP server reads `LCM_CODEX_DB_PATH` first, then `LCM_DATABASE_PATH`, then defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}/lcm.db`.
+The MCP server reads `LCM_CODEX_DB_PATH` first, then `LCM_DATABASE_PATH`, then `LOSSLESS_CLAW_DB_PATH`, then `OPENCLAW_LCM_DB_PATH`, and finally defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}/lcm.db`.
 
 Prefer pointing `LCM_CODEX_DB_PATH` at a copied database for production rehearsal or destructive experiments. The server opens SQLite in read-only mode and sets `PRAGMA query_only = ON`.

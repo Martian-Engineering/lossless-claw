@@ -163,15 +163,16 @@ function orderBy(sort, createdExpr, rankExpr = "rank") {
   }
 }
 
+function normalizeSort(sort) {
+  return sort === "relevance" || sort === "hybrid" || sort === "oldest" ? sort : "recency";
+}
+
 function searchMessages(db, params) {
   const query = readString(params.pattern ?? params.query);
   if (!query) throw new Error("pattern is required.");
   const mode = params.mode === "full_text" ? "full_text" : "regex";
   const limit = clampInt(params.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-  const sort =
-    params.sort === "relevance" || params.sort === "hybrid" || params.sort === "oldest"
-      ? params.sort
-      : "recency";
+  const sort = normalizeSort(params.sort);
   const scope = buildScope(params, "m");
 
   if (mode === "full_text" && tableExists(db, "messages_fts")) {
@@ -259,10 +260,7 @@ function searchSummaries(db, params) {
   if (!query) throw new Error("pattern is required.");
   const mode = params.mode === "full_text" ? "full_text" : "regex";
   const limit = clampInt(params.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-  const sort =
-    params.sort === "relevance" || params.sort === "hybrid" || params.sort === "oldest"
-      ? params.sort
-      : "recency";
+  const sort = normalizeSort(params.sort);
   const scope = buildScope(params, "s");
   const timeExpr = "COALESCE(s.latest_at, s.created_at)";
 
@@ -346,22 +344,30 @@ function searchSummaries(db, params) {
     }));
 }
 
-function lcmGrep(db, params) {
+function lcmGrep(db, params, context = {}) {
   const scope = params.scope === "messages" || params.scope === "summaries" ? params.scope : "both";
+  const requestedSort = normalizeSort(params.sort);
+  const effectiveSort =
+    scope === "both" && (requestedSort === "relevance" || requestedSort === "hybrid")
+      ? "recency"
+      : requestedSort;
+  const searchParams = effectiveSort === requestedSort ? params : { ...params, sort: effectiveSort };
   const results = [];
-  if (scope === "messages" || scope === "both") results.push(...searchMessages(db, params));
-  if (scope === "summaries" || scope === "both") results.push(...searchSummaries(db, params));
+  if (scope === "messages" || scope === "both") results.push(...searchMessages(db, searchParams));
+  if (scope === "summaries" || scope === "both") results.push(...searchSummaries(db, searchParams));
   const limit = clampInt(params.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-  if (params.sort === "oldest") {
+  if (effectiveSort === "oldest") {
     results.sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")));
-  } else {
+  } else if (effectiveSort === "recency" || scope === "both") {
     results.sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")));
   }
   return jsonTextResult({
     tool: "lcm_grep",
-    databasePath: resolveDatabasePath(),
+    databasePath: context.databasePath ?? resolveDatabasePath(),
     mode: params.mode === "full_text" ? "full_text" : "regex",
     scope,
+    requestedSort,
+    sort: effectiveSort,
     count: Math.min(results.length, limit),
     results: results.slice(0, limit),
     note: "Codex LCM Reader is read-only and bounded. Expand IDs before treating snippets as proof.",
@@ -432,9 +438,19 @@ function lcmDescribe(db, params) {
       : id.startsWith("message:") || /^\d+$/.test(id)
         ? describeMessage(db, id)
         : describeSummary(db, id);
-  if (!result) return jsonTextResult({ error: `Not found: ${id}` });
+  if (!result) {
+    return jsonTextResult({
+      tool: "lcm_describe",
+      error: `Not found: ${id}`,
+      hint: "Expected a summary ID like sum_..., a message:<id> or numeric message ID, or a file_... ID.",
+    });
+  }
   if (params.conversationId != null && result.conversation_id !== Number(params.conversationId)) {
-    return jsonTextResult({ error: `Not found in conversation ${params.conversationId}: ${id}` });
+    return jsonTextResult({
+      tool: "lcm_describe",
+      error: `Not found in conversation ${params.conversationId}: ${id}`,
+      hint: "The ID exists outside the requested conversation or does not exist.",
+    });
   }
   return jsonTextResult({
     tool: "lcm_describe",
@@ -631,11 +647,12 @@ export function createTools() {
 export async function callTool(name, args, options = {}) {
   const tool = createTools().find((entry) => entry.name === name);
   if (!tool) throw new Error(`Unknown tool: ${name}`);
-  const db = options.db ?? openReadOnlyDatabase(options.dbPath);
+  const databasePath = options.dbPath ? resolve(options.dbPath) : resolveDatabasePath();
+  const db = options.db ?? openReadOnlyDatabase(databasePath);
   const shouldClose = !options.db;
   try {
     requiredSchema(db);
-    return await tool.handler(db, args ?? {});
+    return await tool.handler(db, args ?? {}, { databasePath });
   } finally {
     if (shouldClose) db.close();
   }

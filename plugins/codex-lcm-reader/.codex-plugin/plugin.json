@@ -21,9 +21,9 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Codex LCM Reader",
+    "displayName": "Lossless Codex",
     "shortDescription": "Search local OpenClaw LCM memory from Codex",
-    "longDescription": "Codex LCM Reader gives Codex Desktop read-only tools for inspecting a local lossless-claw SQLite database. It exposes bounded recall tools for grep, describe, expand, and expand-query style evidence retrieval without mutating OpenClaw memory.",
+    "longDescription": "Lossless Codex gives Codex Desktop read-only tools for inspecting a local lossless-claw SQLite database. It exposes bounded recall tools for grep, describe, expand, and expand-query style evidence retrieval without mutating OpenClaw memory.",
     "developerName": "Martian Engineering",
     "category": "Engineering",
     "capabilities": [

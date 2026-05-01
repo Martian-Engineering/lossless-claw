@@ -179,9 +179,25 @@ describe("Codex LCM Reader plugin", () => {
     );
 
     expect(result.structuredContent?.tool).toBe("lcm_grep");
+    expect(result.structuredContent?.databasePath).toBe(fixture.dbPath);
     const results = result.structuredContent?.results as Array<{ type: string; id: string }>;
     expect(results.some((row) => row.type === "message")).toBe(true);
     expect(results.some((row) => row.type === "summary")).toBe(true);
+  });
+
+  it("reports effective sort when merged message and summary relevance cannot be compared", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_grep",
+      { pattern: "Lexar", mode: "full_text", scope: "both", sort: "relevance", limit: 10 },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.requestedSort).toBe("relevance");
+    expect(result.structuredContent?.sort).toBe("recency");
   });
 
   it("can sort grep results oldest-first for first-occurrence discovery", async () => {
@@ -248,6 +264,22 @@ describe("Codex LCM Reader plugin", () => {
     expect(item.message_id).toBe(fixture.firstMessageId);
     expect(item.content).toContain("Lexar drive");
     expect(item.summaryIds).toEqual(["sum_codex_reader_child"]);
+  });
+
+  it("returns structured describe errors with tool and ID-format hints", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_describe",
+      { id: "sum_missing" },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.tool).toBe("lcm_describe");
+    expect(result.structuredContent?.error).toContain("sum_missing");
+    expect(result.structuredContent?.hint).toContain("message:<id>");
   });
 
   it("expands a summary subtree without mutating state", async () => {

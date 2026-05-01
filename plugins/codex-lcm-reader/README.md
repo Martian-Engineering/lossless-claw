@@ -1,6 +1,6 @@
-# Codex LCM Reader
+# Lossless Codex
 
-Codex LCM Reader is a repo-local Codex Desktop plugin for read-only access to a local OpenClaw lossless-claw LCM SQLite database.
+Lossless Codex is a Codex Desktop plugin for read-only access to a local OpenClaw lossless-claw LCM SQLite database. The package folder is `codex-lcm-reader` so existing plugin installs and branch names remain stable.
 
 This first slice intentionally exposes only the tools that exist on current lossless-claw `main`:
 
@@ -10,6 +10,39 @@ This first slice intentionally exposes only the tools that exist on current loss
 - `lcm_expand_query`
 
 The plugin does not mutate OpenClaw state, run LCM maintenance, build rollups, write Cortex memory, or write OpenClaw tasks. It opens SQLite in read-only mode and enables `PRAGMA query_only = ON`.
+
+## Install Into Codex Desktop
+
+For local development from a `lossless-claw` checkout:
+
+1. Keep this plugin directory at `plugins/codex-lcm-reader`.
+2. Ensure `.agents/plugins/marketplace.json` includes the `codex-lcm-reader` local plugin entry.
+3. Restart Codex Desktop or refresh its plugin registry.
+4. Point the plugin at an LCM database with `LCM_CODEX_DB_PATH=/absolute/path/to/lcm.db` when the default `~/.openclaw/lcm.db` is not the database you want.
+
+For a home-local install:
+
+1. Copy `plugins/codex-lcm-reader` to `~/plugins/codex-lcm-reader`.
+2. Add this entry to `~/.agents/plugins/marketplace.json`:
+
+```json
+{
+  "name": "codex-lcm-reader",
+  "source": {
+    "source": "local",
+    "path": "./plugins/codex-lcm-reader"
+  },
+  "policy": {
+    "installation": "INSTALLED_BY_DEFAULT",
+    "authentication": "ON_INSTALL"
+  },
+  "category": "Engineering"
+}
+```
+
+3. Restart Codex Desktop.
+
+Codex should then expose the plugin as **Lossless Codex** with read-only LCM tools.
 
 ## Database Path
 
