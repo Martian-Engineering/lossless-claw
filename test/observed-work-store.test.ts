@@ -629,6 +629,40 @@ describe("ObservedWorkStore", () => {
     );
   });
 
+  it("uses neutral evidence for ambiguous work without a completion cue", async () => {
+    const db = makeDb();
+    createConversation(db, 17);
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const observedWork = new ObservedWorkStore(db);
+    const extractor = new ObservedWorkExtractor(db, observedWork);
+
+    await insertLeafSummary({
+      db,
+      summaryStore,
+      conversationId: 17,
+      summaryId: "sum_ambiguous_investigate",
+      createdAt: "2026-04-28T05:00:00.000Z",
+      content: "- Investigate PR #562 review behavior before calling it complete",
+    });
+    expect(extractor.processConversation(17)).toMatchObject({
+      summariesScanned: 1,
+      workItemsUpserted: 1,
+    });
+
+    const density = observedWork.getDensity({
+      conversationId: 17,
+      statuses: ["observed_ambiguous"],
+      includeSources: true,
+      limit: 10,
+    });
+    expect(density.ambiguous[0]?.sources).toEqual([
+      expect.objectContaining({
+        sourceId: "sum_ambiguous_investigate",
+        evidenceKind: "created",
+      }),
+    ]);
+  });
+
   it("reports completed, unfinished, and ambiguous work density", () => {
     const db = makeDb();
     createConversation(db, 1);
