@@ -77,6 +77,20 @@ function normalizeSourceIds(sourceIds: string[] | undefined, fallbackSourceId: s
   ];
 }
 
+function normalizeQueryKey(value: string | undefined): string | null {
+  const normalized = value?.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!normalized) {
+    return null;
+  }
+  const pr =
+    /^(?:pr|pull request)\s*#?\s*(\d{1,6})$/.exec(normalized) ??
+    /^pr[-\s#]*(\d{1,6})$/.exec(normalized);
+  if (pr?.[1]) {
+    return `pr-${pr[1]}`;
+  }
+  return normalized;
+}
+
 function parseSourceIds(raw: string, sourceType: "summary" | "rollup" | "message"): Array<{
   sourceType: "summary" | "rollup" | "message";
   sourceId: string;
@@ -154,7 +168,7 @@ export class EventObservationStore {
       input.eventKind,
       input.title.trim(),
       input.description?.trim() || null,
-      input.queryKey?.trim().toLowerCase() || null,
+      normalizeQueryKey(input.queryKey),
       input.eventTime ?? null,
       input.ingestTime,
       input.confidence ?? 0.5,
@@ -185,7 +199,7 @@ export class EventObservationStore {
       where.push(`event_kind IN (${placeholders(input.eventKinds)})`);
       args.push(...input.eventKinds);
     }
-    const query = input?.query?.trim().toLowerCase();
+    const query = normalizeQueryKey(input?.query);
     if (query) {
       const likeQuery = `%${escapeLikePattern(query)}%`;
       where.push(
