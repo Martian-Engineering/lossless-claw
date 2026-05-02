@@ -11,7 +11,7 @@ import {
   getUtcDateForZonedMidnight,
   getZonedDayString,
 } from "../timezone-windows.js";
-import type { LcmDependencies } from "../types.js";
+import type { CallGatewayFn, LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
@@ -48,16 +48,188 @@ const AUTO_DETAIL_LEVEL_THRESHOLDS: Array<{ minTokens: number; level: number }> 
 const AUTO_DETAIL_LEVEL_SAFETY_RATIO = 0.2;
 
 /**
- * Compute an auto-picked `detailLevel` for the calling agent based on its
- * remaining context room. Returns null if telemetry or model registry data is
- * unavailable; the caller should then fall back to the static default.
+ * Process-lifetime cache of model → contextWindow, populated lazily on first
+ * use via the gateway's `models.list` RPC. Model context windows don't change
+ * within a gateway lifetime, so a single cached fetch is sufficient.
+ *
+ * This is the FALLBACK path — primary is the `status` RPC (see
+ * `fetchRuntimeStatus` below) which gives both contextWindow AND current
+ * usage in one call.
  */
-function computeAutoDetailLevel(
+const modelContextWindowCache = new Map<string, number | null>();
+let modelCatalogFetchPromise: Promise<void> | null = null;
+
+/**
+ * Cached result of the most recent `status` RPC call, with a short TTL.
+ * status returns runtime data (current model, contextTokens, current usage)
+ * that changes per turn — short TTL keeps it close to live without hitting
+ * the gateway every call.
+ */
+const RUNTIME_STATUS_CACHE_TTL_MS = 60_000;
+let runtimeStatusCache: {
+  fetchedAtMs: number;
+  contextTokens: number | null;
+  model: string | null;
+  currentTokensBySessionKey: Map<string, number | null>;
+} | null = null;
+let runtimeStatusFetchPromise: Promise<void> | null = null;
+
+/** Heuristic field path navigation — defensive against status response shape drift. */
+function pickFirstNumber(obj: unknown, paths: string[][]): number | null {
+  for (const path of paths) {
+    let cur: unknown = obj;
+    for (const key of path) {
+      if (cur && typeof cur === "object" && !Array.isArray(cur)) {
+        cur = (cur as Record<string, unknown>)[key];
+      } else {
+        cur = undefined;
+        break;
+      }
+    }
+    if (typeof cur === "number" && Number.isFinite(cur) && cur > 0) {
+      return cur;
+    }
+  }
+  return null;
+}
+
+/**
+ * Tier 1 (primary) — fetch the gateway's `status` RPC (same data the agent's
+ * `/status` slash command shows). Returns contextTokens + per-session usage.
+ *
+ * The result is cached for ~60s. status changes per turn (current usage) but
+ * for auto-pick purposes a 60s window is acceptable.
+ */
+async function fetchRuntimeStatus(
+  callGateway: CallGatewayFn | undefined,
+): Promise<void> {
+  if (!callGateway) return;
+  const now = Date.now();
+  if (
+    runtimeStatusCache &&
+    now - runtimeStatusCache.fetchedAtMs < RUNTIME_STATUS_CACHE_TTL_MS
+  ) {
+    return;
+  }
+  if (runtimeStatusFetchPromise) {
+    await runtimeStatusFetchPromise;
+    return;
+  }
+  runtimeStatusFetchPromise = (async () => {
+    try {
+      const result = (await callGateway({
+        method: "status",
+        params: { includeChannelSummary: false },
+        timeoutMs: 5_000,
+      })) as Record<string, unknown> | undefined;
+      const sessions =
+        (result?.sessions as Record<string, unknown> | undefined) ?? undefined;
+      const defaults =
+        (sessions?.defaults as Record<string, unknown> | undefined) ?? undefined;
+      const contextTokens = pickFirstNumber(defaults, [
+        ["contextTokens"],
+        ["contextWindow"],
+      ]);
+      const model =
+        typeof defaults?.model === "string" && defaults.model.length > 0
+          ? defaults.model
+          : null;
+      const currentBy = new Map<string, number | null>();
+      const byAgent = (sessions?.byAgent as Array<unknown> | undefined) ?? [];
+      for (const agent of byAgent) {
+        const entries =
+          ((agent as Record<string, unknown>)?.entries as Array<unknown>) ?? [];
+        for (const entry of entries) {
+          const e = entry as Record<string, unknown>;
+          const key = typeof e?.sessionKey === "string" ? e.sessionKey : null;
+          if (!key) continue;
+          // Defensive shape navigation — try several plausible field paths.
+          const tokens = pickFirstNumber(e, [
+            ["currentTokens"],
+            ["promptTokens"],
+            ["usage", "promptTokens"],
+            ["usage", "totalTokens"],
+            ["usage", "input"],
+          ]);
+          currentBy.set(key, tokens);
+        }
+      }
+      runtimeStatusCache = {
+        fetchedAtMs: now,
+        contextTokens,
+        model,
+        currentTokensBySessionKey: currentBy,
+      };
+    } catch {
+      // Swallow — fall through to fallback paths.
+    } finally {
+      runtimeStatusFetchPromise = null;
+    }
+  })();
+  await runtimeStatusFetchPromise;
+}
+
+/**
+ * Tier 2 (fallback) — fetch openclaw's full model catalog via `models.list`
+ * and populate `modelContextWindowCache`. Used when `status` doesn't return
+ * a contextTokens for the agent's model. Process-lifetime cache.
+ */
+async function ensureModelCatalogLoaded(
+  callGateway: CallGatewayFn | undefined,
+): Promise<void> {
+  if (!callGateway) return;
+  if (modelContextWindowCache.size > 0) return;
+  if (modelCatalogFetchPromise) {
+    await modelCatalogFetchPromise;
+    return;
+  }
+  modelCatalogFetchPromise = (async () => {
+    try {
+      const result = (await callGateway({
+        method: "models.list",
+        params: { view: "all" },
+        timeoutMs: 5_000,
+      })) as { models?: Array<{ id?: string; contextWindow?: number }> } | undefined;
+      const models = result?.models ?? [];
+      for (const entry of models) {
+        if (
+          typeof entry.id === "string" &&
+          typeof entry.contextWindow === "number" &&
+          entry.contextWindow > 0
+        ) {
+          modelContextWindowCache.set(entry.id, entry.contextWindow);
+        }
+      }
+    } catch {
+      // Swallow — auto-pick will fall through to static default if both
+      // tiers fail. Don't poison the cache so a future call can retry.
+    } finally {
+      modelCatalogFetchPromise = null;
+    }
+  })();
+  await modelCatalogFetchPromise;
+}
+
+/**
+ * Compute an auto-picked `detailLevel` for the calling agent based on its
+ * remaining context room. Returns null if no usable data is available; the
+ * caller then falls back to the static default.
+ *
+ * Resolution order (graceful degradation):
+ *   1. The optional `getModelContextWindow` dep (synchronous fast-path)
+ *   2. The `status` RPC (primary) — same data as /status slash command;
+ *      provides contextTokens + per-session current usage
+ *   3. The `models.list` RPC (fallback) — static contextWindow per model;
+ *      pair with LCM telemetry's last_observed_prompt_token_count for usage
+ *   4. LCM telemetry alone (last resort) — usage estimate only, no window
+ */
+async function computeAutoDetailLevel(
   db: DatabaseSync,
   conversationId: number,
+  sessionKey: string | undefined,
   getModelContextWindow: ((model: string) => number | null) | undefined,
-): number | null {
-  if (!getModelContextWindow) return null;
+  callGateway: CallGatewayFn | undefined,
+): Promise<number | null> {
   const row = db
     .prepare(
       "SELECT last_observed_prompt_token_count AS tokens, model FROM conversation_compaction_telemetry WHERE conversation_id = ?",
@@ -66,11 +238,47 @@ function computeAutoDetailLevel(
     | { tokens: number | null; model: string | null }
     | undefined;
   if (!row || !row.model) return null;
-  const lastObservedTokens = typeof row.tokens === "number" && row.tokens > 0 ? row.tokens : 0;
-  const contextWindow = getModelContextWindow(row.model);
+  const telemetryTokens =
+    typeof row.tokens === "number" && row.tokens > 0 ? row.tokens : 0;
+
+  // Tier 1 fast-path: synchronous dep injection (rare today, future-proof).
+  let contextWindow = getModelContextWindow ? getModelContextWindow(row.model) : null;
+  let currentTokens: number | null = null;
+
+  // Tier 2 primary: status RPC for both contextWindow and live usage.
+  if (!contextWindow || contextWindow <= 0) {
+    await fetchRuntimeStatus(callGateway);
+    if (runtimeStatusCache) {
+      // Use status's contextTokens if it matches our model, else null.
+      if (
+        runtimeStatusCache.model === row.model &&
+        runtimeStatusCache.contextTokens
+      ) {
+        contextWindow = runtimeStatusCache.contextTokens;
+      }
+      if (sessionKey) {
+        currentTokens =
+          runtimeStatusCache.currentTokensBySessionKey.get(sessionKey) ?? null;
+      }
+    }
+  }
+
+  // Tier 3 fallback: models.list catalog for contextWindow only.
+  if (!contextWindow || contextWindow <= 0) {
+    await ensureModelCatalogLoaded(callGateway);
+    contextWindow = modelContextWindowCache.get(row.model) ?? null;
+  }
+
   if (!contextWindow || contextWindow <= 0) return null;
+
+  // Tier 4 final fallback for current usage: LCM telemetry (stale but
+  // available). Status is preferred when present because it reflects the
+  // FULL assembled prompt size including bootstrap + tools + runtime
+  // context, whereas LCM telemetry only sees what got persisted on the last
+  // successful turn.
+  const observedTokens = currentTokens ?? telemetryTokens;
   const safetyReserve = Math.floor(contextWindow * AUTO_DETAIL_LEVEL_SAFETY_RATIO);
-  const remaining = contextWindow - lastObservedTokens - safetyReserve;
+  const remaining = contextWindow - observedTokens - safetyReserve;
   if (remaining <= 0) return 0;
   for (const tier of AUTO_DETAIL_LEVEL_THRESHOLDS) {
     if (remaining >= tier.minTokens) return tier.level;
@@ -1259,18 +1467,22 @@ export function createLcmRecentTool(input: {
 
       // Smart detailLevel auto-pick: when caller didn't specify and we know the
       // agent's last observed prompt size + model, pick a detailLevel that
-      // fits the agent's remaining context room. Falls through to the static
-      // default (1) if telemetry or model registry data is unavailable.
+      // fits the agent's remaining context room. Pulls runtime data via the
+      // gateway's `status` RPC (same data /status returns), with `models.list`
+      // and LCM telemetry as graceful fallbacks. Falls through to the static
+      // default (1) if all tiers fail.
       if (
         p.detailLevel == null &&
         conversationScope.conversationId != null
       ) {
         const rollupStoreForAuto = getLcmRollupStore(lcm, input.rollupStore);
         const dbForAuto = rollupStoreForAuto.db;
-        const autoLevel = computeAutoDetailLevel(
+        const autoLevel = await computeAutoDetailLevel(
           dbForAuto,
           conversationScope.conversationId,
+          input.sessionKey,
           input.deps.getModelContextWindow,
+          input.deps.callGateway,
         );
         if (autoLevel != null && autoLevel !== budget.detailLevel) {
           budget = resolveRecallBudget({ ...p, detailLevel: autoLevel });
