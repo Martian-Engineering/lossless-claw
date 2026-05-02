@@ -4,6 +4,19 @@ import type { LcmDependencies } from "../types.js";
 export type LcmConversationScope = {
   conversationId?: number;
   allConversations: boolean;
+  /**
+   * All conversation IDs under the same session_key as the resolved
+   * conversationId, ordered newest-first by created_at. Includes
+   * `conversationId` itself plus any archived/rotated predecessors.
+   *
+   * Used by lcm_recent and other read-side tools to span /new and /reset
+   * boundaries — the whole point of LCM is being lossless across session
+   * lifecycle events.
+   *
+   * Empty array if no session_key was used for resolution (eg. explicit
+   * `conversationId` parameter).
+   */
+  relatedConversationIds: number[];
 };
 
 type ConversationScopeStore = ReturnType<LcmContextEngine["getConversationStore"]> & {
@@ -12,6 +25,9 @@ type ConversationScopeStore = ReturnType<LcmContextEngine["getConversationStore"
     sessionKey?: string;
   }) => Promise<{ conversationId: number } | null>;
   getConversationBySessionKey?: (sessionKey: string) => Promise<{ conversationId: number } | null>;
+  listConversationsBySessionKey?: (
+    sessionKey: string,
+  ) => Promise<Array<{ conversationId: number }>>;
 };
 
 async function lookupConversationForSession(input: {
@@ -90,11 +106,19 @@ export async function resolveLcmConversationScope(input: {
       ? Math.trunc(params.conversationId)
       : undefined;
   if (explicitConversationId != null) {
-    return { conversationId: explicitConversationId, allConversations: false };
+    return {
+      conversationId: explicitConversationId,
+      allConversations: false,
+      relatedConversationIds: [],
+    };
   }
 
   if (params.allConversations === true) {
-    return { conversationId: undefined, allConversations: true };
+    return {
+      conversationId: undefined,
+      allConversations: true,
+      relatedConversationIds: [],
+    };
   }
 
   const normalizedSessionKey = input.sessionKey?.trim();
@@ -102,7 +126,12 @@ export async function resolveLcmConversationScope(input: {
     const bySessionKey =
       await lcm.getConversationStore().getConversationBySessionKey(normalizedSessionKey);
     if (bySessionKey) {
-      return { conversationId: bySessionKey.conversationId, allConversations: false };
+      const related = await collectRelatedConversationIds(lcm, normalizedSessionKey);
+      return {
+        conversationId: bySessionKey.conversationId,
+        allConversations: false,
+        relatedConversationIds: related,
+      };
     }
   }
 
@@ -111,7 +140,11 @@ export async function resolveLcmConversationScope(input: {
     normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(normalizedSessionKey);
   }
   if (!normalizedSessionId && !input.sessionKey?.trim()) {
-    return { conversationId: undefined, allConversations: false };
+    return {
+      conversationId: undefined,
+      allConversations: false,
+      relatedConversationIds: [],
+    };
   }
 
   const conversation = await lookupConversationForSession({
@@ -120,8 +153,36 @@ export async function resolveLcmConversationScope(input: {
     sessionKey: input.sessionKey,
   });
   if (!conversation) {
-    return { conversationId: undefined, allConversations: false };
+    return {
+      conversationId: undefined,
+      allConversations: false,
+      relatedConversationIds: [],
+    };
   }
 
-  return { conversationId: conversation.conversationId, allConversations: false };
+  const related = normalizedSessionKey
+    ? await collectRelatedConversationIds(lcm, normalizedSessionKey)
+    : [conversation.conversationId];
+  return {
+    conversationId: conversation.conversationId,
+    allConversations: false,
+    relatedConversationIds: related,
+  };
+}
+
+/**
+ * Get all conversation IDs under a given session_key (active + archived),
+ * ordered newest-first by created_at. Empty array if listing isn't supported
+ * by the store implementation.
+ */
+async function collectRelatedConversationIds(
+  lcm: LcmContextEngine,
+  sessionKey: string,
+): Promise<number[]> {
+  const store = lcm.getConversationStore() as ConversationScopeStore;
+  if (typeof store.listConversationsBySessionKey !== "function") {
+    return [];
+  }
+  const records = await store.listConversationsBySessionKey(sessionKey);
+  return records.map((record) => record.conversationId);
 }

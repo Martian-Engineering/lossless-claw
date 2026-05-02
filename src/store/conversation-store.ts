@@ -361,6 +361,29 @@ export class ConversationStore {
     return row ? toConversationRecord(row) : null;
   }
 
+  /**
+   * Return ALL conversations (active + archived) for a given session_key,
+   * ordered by created_at descending. Used by cross-conversation aggregation
+   * (eg. lcm_recent's "boundary crossing" reads, /lossless rebuild-rollups).
+   *
+   * The whole point of LCM is being able to span /new and /reset boundaries
+   * for the same agent.
+   */
+  async listConversationsBySessionKey(
+    sessionKey: string,
+  ): Promise<ConversationRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
+       FROM conversations
+       WHERE session_key = ?
+       ORDER BY created_at DESC`,
+      )
+      .all(sessionKey) as unknown as ConversationRow[];
+
+    return rows.map((row) => toConversationRecord(row));
+  }
+
   /** Resolve a conversation by stable session identity. */
   async getConversationForSession(input: {
     sessionId?: string;

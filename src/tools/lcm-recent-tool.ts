@@ -27,6 +27,57 @@ const DETAIL_LEVEL_TOKEN_HINTS = new Map<number, number>([
   [3, 180_000],
 ]);
 
+/**
+ * Auto-detail-level picker thresholds. When the agent has at least this many
+ * remaining context tokens (after a 20% safety buffer), use the corresponding
+ * detailLevel. Listed high-to-low so we pick the highest level we can afford.
+ */
+const AUTO_DETAIL_LEVEL_THRESHOLDS: Array<{ minTokens: number; level: number }> = [
+  { minTokens: 100_000, level: 3 },
+  { minTokens: 50_000, level: 2 },
+  { minTokens: 20_000, level: 1 },
+];
+
+/**
+ * Fraction of the model's context window reserved as a safety buffer when
+ * computing remaining context. Accounts for the fact that
+ * `last_observed_prompt_token_count` is the PREVIOUS turn's prompt size — the
+ * current turn may add tool results and system messages before our response
+ * arrives.
+ */
+const AUTO_DETAIL_LEVEL_SAFETY_RATIO = 0.2;
+
+/**
+ * Compute an auto-picked `detailLevel` for the calling agent based on its
+ * remaining context room. Returns null if telemetry or model registry data is
+ * unavailable; the caller should then fall back to the static default.
+ */
+function computeAutoDetailLevel(
+  db: DatabaseSync,
+  conversationId: number,
+  getModelContextWindow: ((model: string) => number | null) | undefined,
+): number | null {
+  if (!getModelContextWindow) return null;
+  const row = db
+    .prepare(
+      "SELECT last_observed_prompt_token_count AS tokens, model FROM conversation_compaction_telemetry WHERE conversation_id = ?",
+    )
+    .get(conversationId) as
+    | { tokens: number | null; model: string | null }
+    | undefined;
+  if (!row || !row.model) return null;
+  const lastObservedTokens = typeof row.tokens === "number" && row.tokens > 0 ? row.tokens : 0;
+  const contextWindow = getModelContextWindow(row.model);
+  if (!contextWindow || contextWindow <= 0) return null;
+  const safetyReserve = Math.floor(contextWindow * AUTO_DETAIL_LEVEL_SAFETY_RATIO);
+  const remaining = contextWindow - lastObservedTokens - safetyReserve;
+  if (remaining <= 0) return 0;
+  for (const tier of AUTO_DETAIL_LEVEL_THRESHOLDS) {
+    if (remaining >= tier.minTokens) return tier.level;
+  }
+  return 0;
+}
+
 const LcmRecentSchema = Type.Object({
   period: Type.String({
     description:
@@ -46,6 +97,15 @@ const LcmRecentSchema = Type.Object({
     Type.Boolean({
       description: "Include source summary IDs.",
     })
+  ),
+  mode: Type.Optional(
+    Type.Union(
+      [Type.Literal("summary"), Type.Literal("index")],
+      {
+        description:
+          "Response mode. \"summary\" (default) returns the full rollup content per detailLevel. \"index\" returns a navigation digest — one short bullet per rollup in the window, with builtAt/source IDs — for cheap exploration before drilling in with detailLevel:3 or lcm_expand_query.",
+      },
+    ),
   ),
   maxOutputTokens: Type.Optional(
     Type.Number({
@@ -120,6 +180,10 @@ type RecallBudget = {
   globalMaxOutputTokens: number;
   effectiveOutputTokens: number;
   detailLevel: number;
+  /** The detailLevel value the caller actually passed (pre-clamp). null if omitted. */
+  requestedDetailLevel: number | null;
+  /** Reason `detailLevel` differs from `requestedDetailLevel`, if any. */
+  clampReason: "above-max" | "below-min" | null;
   maxSourceSummaries: number;
 };
 
@@ -512,7 +576,16 @@ function formatDrilldownHint(
 }
 
 function resolveRecallBudget(params: Record<string, unknown>): RecallBudget {
+  const requestedDetailLevelRaw =
+    typeof params.detailLevel === "number" && Number.isFinite(params.detailLevel)
+      ? Math.floor(params.detailLevel)
+      : null;
   const detailLevel = clampInt(params.detailLevel, 1, 0, 3);
+  let clampReason: "above-max" | "below-min" | null = null;
+  if (requestedDetailLevelRaw != null) {
+    if (requestedDetailLevelRaw > 3) clampReason = "above-max";
+    else if (requestedDetailLevelRaw < 0) clampReason = "below-min";
+  }
   const requestedFromDetail =
     DETAIL_LEVEL_TOKEN_HINTS.get(detailLevel) ?? DEFAULT_RECENT_OUTPUT_TOKENS;
   const requestedOutputTokens = clampInt(
@@ -533,6 +606,8 @@ function resolveRecallBudget(params: Record<string, unknown>): RecallBudget {
     globalMaxOutputTokens,
     effectiveOutputTokens: Math.min(requestedOutputTokens, globalMaxOutputTokens),
     detailLevel,
+    requestedDetailLevel: requestedDetailLevelRaw,
+    clampReason,
     maxSourceSummaries: clampInt(
       params.maxSourceSummaries,
       maxSourceSummariesDefault,
@@ -614,6 +689,160 @@ function buildAccounting(
   };
 }
 
+/**
+ * Find the newest rollup for a given (periodKind, periodKey) across multiple
+ * conversation IDs. Used when a session_key spans multiple conversations
+ * (eg. after `/new` or `/reset`) — we want lossless coverage by reading the
+ * freshest rollup any of those conversations produced for the period.
+ *
+ * Single-conversation case: pass a one-element array.
+ */
+function getRollupAcrossConversations(
+  rollupStore: RollupStore,
+  conversationIds: number[],
+  periodKind: "day" | "week" | "month",
+  periodKey: string,
+  timezone: string,
+): import("../store/rollup-store.js").RollupRow | null {
+  let best: import("../store/rollup-store.js").RollupRow | null = null;
+  for (const cid of conversationIds) {
+    const row = rollupStore.getRollup(cid, periodKind, periodKey, timezone);
+    if (!row) continue;
+    if (
+      !best ||
+      new Date(row.built_at).getTime() > new Date(best.built_at).getTime()
+    ) {
+      best = row;
+    }
+  }
+  return best;
+}
+
+/**
+ * List all rollups of a given periodKind across multiple conversations,
+ * deduplicating by (periodKind, period_key, timezone) and keeping the row
+ * with the newest `built_at`. Used by lcm_recent when crossing /new and
+ * /reset boundaries.
+ */
+function listRollupsAcrossConversations(
+  rollupStore: RollupStore,
+  conversationIds: number[],
+  periodKind: "day" | "week" | "month",
+  perConvLimit: number,
+): import("../store/rollup-store.js").RollupRow[] {
+  const dedup = new Map<string, import("../store/rollup-store.js").RollupRow>();
+  for (const cid of conversationIds) {
+    const rows = rollupStore.listRollups(cid, periodKind, perConvLimit);
+    for (const row of rows) {
+      const key = `${row.period_kind}|${row.timezone}|${row.period_key}`;
+      const existing = dedup.get(key);
+      if (
+        !existing ||
+        new Date(row.built_at).getTime() >
+          new Date(existing.built_at).getTime()
+      ) {
+        dedup.set(key, row);
+      }
+    }
+  }
+  return Array.from(dedup.values());
+}
+
+/**
+ * Render an index/digest view of the rollups in the window. Each rollup gets
+ * a header (period_kind/period_key, status, builtAt, source counts) followed
+ * by a short digest extracted from its content. Used when caller passes
+ * `mode: "index"` — cheaper than full content, useful for navigation before
+ * drilling in with `mode: "summary"` and `detailLevel: 3`.
+ */
+function extractRollupDigest(content: string, maxChars: number): string {
+  // Prefer the "## Key Items" section if the rollup uses that structure
+  // (current daily rollup format does).
+  const keyItemsMatch = content.match(/##\s+Key Items[\s\S]*?(?=\n##\s|$)/);
+  if (keyItemsMatch) {
+    const section = keyItemsMatch[0].trim();
+    return section.length > maxChars
+      ? section.slice(0, maxChars).trimEnd() + "…"
+      : section;
+  }
+  const trimmed = content.trim();
+  return trimmed.length > maxChars
+    ? trimmed.slice(0, maxChars).trimEnd() + "…"
+    : trimmed;
+}
+
+function renderRollupsIndex(
+  rollups: RollupRecord[],
+  budget: RecallBudget,
+): {
+  content: string;
+  tokenCount: number;
+  status: "ready" | "stale";
+  sourceSummaryIds: string[];
+  truncated: boolean;
+  lastBuiltAt: Date | null;
+} {
+  if (rollups.length === 0) {
+    return {
+      content: "(no rollups in window)",
+      tokenCount: 0,
+      status: "ready",
+      sourceSummaryIds: [],
+      truncated: false,
+      lastBuiltAt: null,
+    };
+  }
+  const sortedRollups = [...rollups].sort(
+    (a, b) => a.periodStart.getTime() - b.periodStart.getTime(),
+  );
+  // Index entries get a per-rollup digest cap of ~600 chars (~150 tokens),
+  // so for a week's worth of dailies we stay well under typical detailLevel 0/1
+  // budgets (~12-24K tokens).
+  const perRollupDigestMax = 600;
+  const lines: string[] = [];
+  lines.push(
+    `### Rollup index (${sortedRollups.length} period${sortedRollups.length === 1 ? "" : "s"})`,
+  );
+  lines.push("");
+  for (const rollup of sortedRollups) {
+    lines.push(`#### ${rollup.periodKind}/${rollup.periodKey}`);
+    lines.push(
+      `- Status: ${rollup.status} | Built: ${rollup.builtAt.toISOString()}`,
+    );
+    lines.push(
+      `- Sources: ${rollup.sourceMessageCount} msgs, ${rollup.sourceTokenCount} src tokens, ${rollup.sourceSummaryIds.length} summaries`,
+    );
+    lines.push("");
+    lines.push(extractRollupDigest(rollup.content, perRollupDigestMax));
+    lines.push("");
+  }
+  let content = lines.join("\n");
+  let truncated = false;
+  if (estimateTokens(content) > budget.effectiveOutputTokens) {
+    content = truncateToEstimatedTokens(content, budget.effectiveOutputTokens);
+    truncated = true;
+  }
+  const sourceSummaryIds = [
+    ...new Set(sortedRollups.flatMap((r) => r.sourceSummaryIds)),
+  ];
+  const status: "ready" | "stale" = sortedRollups.every(
+    (r) => r.status === "ready",
+  )
+    ? "ready"
+    : "stale";
+  const lastBuiltAt = new Date(
+    Math.max(...sortedRollups.map((r) => r.builtAt.getTime())),
+  );
+  return {
+    content,
+    tokenCount: estimateTokens(content),
+    status,
+    sourceSummaryIds,
+    truncated,
+    lastBuiltAt,
+  };
+}
+
 function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
   content: string;
   tokenCount: number;
@@ -624,6 +853,8 @@ function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
   sourceCount: number;
   omittedRollups: number;
   truncated: boolean;
+  /** Latest build timestamp across the retained rollups. null if none retained. */
+  lastBuiltAt: Date | null;
 } {
   let retained = [...rollups];
   let omittedRollups = 0;
@@ -651,6 +882,12 @@ function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
   const status = retained.every((rollup) => rollup.status === "ready")
     ? "ready"
     : "stale";
+  const lastBuiltAt =
+    retained.length > 0
+      ? new Date(
+          Math.max(...retained.map((rollup) => rollup.builtAt.getTime()))
+        )
+      : null;
   return {
     content,
     tokenCount,
@@ -661,6 +898,7 @@ function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
     sourceCount: retained.reduce((sum, rollup) => sum + rollup.sourceSummaryIds.length, 0),
     omittedRollups,
     truncated: omittedRollups > 0 || exceededBudget,
+    lastBuiltAt,
   };
 }
 
@@ -1008,7 +1246,8 @@ export function createLcmRecentTool(input: {
 
       const p = params as Record<string, unknown>;
       const includeSources = p.includeSources === true;
-      const budget = resolveRecallBudget(p);
+      const mode: "summary" | "index" = p.mode === "index" ? "index" : "summary";
+      let budget = resolveRecallBudget(p);
       const timezone = lcm.timezone;
       const conversationScope = await resolveLcmConversationScope({
         lcm,
@@ -1017,6 +1256,29 @@ export function createLcmRecentTool(input: {
         sessionKey: input.sessionKey,
         params: p,
       });
+
+      // Smart detailLevel auto-pick: when caller didn't specify and we know the
+      // agent's last observed prompt size + model, pick a detailLevel that
+      // fits the agent's remaining context room. Falls through to the static
+      // default (1) if telemetry or model registry data is unavailable.
+      if (
+        p.detailLevel == null &&
+        conversationScope.conversationId != null
+      ) {
+        const rollupStoreForAuto = getLcmRollupStore(lcm, input.rollupStore);
+        const dbForAuto = rollupStoreForAuto.db;
+        const autoLevel = computeAutoDetailLevel(
+          dbForAuto,
+          conversationScope.conversationId,
+          input.deps.getModelContextWindow,
+        );
+        if (autoLevel != null && autoLevel !== budget.detailLevel) {
+          budget = resolveRecallBudget({ ...p, detailLevel: autoLevel });
+          // Reset requestedDetailLevel + clampReason: caller didn't explicitly
+          // request this level — it was auto-picked.
+          budget = { ...budget, requestedDetailLevel: null, clampReason: null };
+        }
+      }
 
       if (
         !conversationScope.allConversations &&
@@ -1101,6 +1363,7 @@ export function createLcmRecentTool(input: {
               fallback.sqlTruncated,
             summaryIds: includeSources ? rendered.summaryIds : [],
             sourceIds: includeSources ? rendered.sourceIds : [],
+            lastBuiltAt: null,
           },
         };
       }
@@ -1115,6 +1378,7 @@ export function createLcmRecentTool(input: {
       let usedFallback = false;
       let truncated = false;
       let degradedReason: string | undefined;
+      let lastBuiltAt: Date | null = null;
 
       const currentDayKey = getZonedDayString(new Date(), timezone);
       const rollupState = rollupStore.getState(conversationId);
@@ -1158,21 +1422,62 @@ export function createLcmRecentTool(input: {
         !resolution.window &&
         canUseStoredResolvedRollup
       ) {
-        const rollup = rollupStore.getRollup(
-          conversationId,
+        // Cross-conversation: prefer the freshest rollup across all
+        // conversations under the same session_key (boundary crossing).
+        const conversationIdsForLookup =
+          conversationScope.relatedConversationIds.length > 0
+            ? conversationScope.relatedConversationIds
+            : [conversationId];
+        const rollup = getRollupAcrossConversations(
+          rollupStore,
+          conversationIdsForLookup,
           resolution.kind,
           resolution.periodKey,
-          timezone
+          timezone,
         );
         if (
           rollup &&
           (rollup.status === "ready" || rollup.status === "stale")
         ) {
-          rollupContent = rollup.content;
-          tokenCount = rollup.token_count;
-          status = rollup.status === "ready" ? "ready" : "stale";
-          sourceSummaryIds = parseJsonStringArray(rollup.source_summary_ids);
-          sourceIds = sourceSummaryIds;
+          if (mode === "index") {
+            const record: RollupRecord = {
+              rollupId: rollup.rollup_id,
+              conversationId: rollup.conversation_id,
+              periodKind: rollup.period_kind,
+              periodKey: rollup.period_key,
+              periodStart: new Date(rollup.period_start),
+              periodEnd: new Date(rollup.period_end),
+              timezone: rollup.timezone,
+              content: rollup.content,
+              tokenCount: rollup.token_count,
+              sourceSummaryIds: parseJsonStringArray(rollup.source_summary_ids),
+              sourceMessageCount: rollup.source_message_count,
+              sourceTokenCount: rollup.source_token_count,
+              status: rollup.status,
+              coverageStart: rollup.coverage_start ? new Date(rollup.coverage_start) : null,
+              coverageEnd: rollup.coverage_end ? new Date(rollup.coverage_end) : null,
+              summarizerModel: rollup.summarizer_model,
+              sourceFingerprint: rollup.source_fingerprint,
+              builtAt: rollup.built_at ? new Date(rollup.built_at) : new Date(),
+              invalidatedAt: rollup.invalidated_at ? new Date(rollup.invalidated_at) : null,
+              errorText: rollup.error_text,
+            };
+            const indexed = renderRollupsIndex([record], budget);
+            rollupContent = indexed.content;
+            tokenCount = indexed.tokenCount;
+            status = indexed.status;
+            sourceSummaryIds = indexed.sourceSummaryIds;
+            sourceIds = sourceSummaryIds;
+            truncated = truncated || indexed.truncated;
+            lastBuiltAt = indexed.lastBuiltAt;
+          } else {
+            rollupContent = rollup.content;
+            tokenCount = rollup.token_count;
+            status = rollup.status === "ready" ? "ready" : "stale";
+            sourceSummaryIds = parseJsonStringArray(rollup.source_summary_ids);
+            sourceIds = sourceSummaryIds;
+            lastBuiltAt = rollup.built_at ? new Date(rollup.built_at) : null;
+          }
         } else if (rollup) {
           degradedReason = `Stored ${resolution.kind} rollup is ${rollup.status}${
             rollup.error_text ? `: ${rollup.error_text}` : ""
@@ -1183,8 +1488,18 @@ export function createLcmRecentTool(input: {
         !resolution.window &&
         (resolution.kind === "day" || !hasPendingRebuild)
       ) {
-        const rollups = rollupStore
-          .listRollups(conversationId, resolution.kind, 200)
+        // Cross-conversation: gather rollups across all conversations under
+        // the same session_key, dedupe by period_key keeping the freshest.
+        const conversationIdsForListing =
+          conversationScope.relatedConversationIds.length > 0
+            ? conversationScope.relatedConversationIds
+            : [conversationId];
+        const rollups = listRollupsAcrossConversations(
+          rollupStore,
+          conversationIdsForListing,
+          resolution.kind,
+          200,
+        )
           .filter((rollup) => rollup.timezone === timezone)
           .filter(
             (rollup) =>
@@ -1272,48 +1587,60 @@ export function createLcmRecentTool(input: {
                   (left, right) =>
                     left.periodStart.getTime() - right.periodStart.getTime()
                 );
-          const combined = combineRollups(orderedRollups, budget);
-          truncated = truncated || combined.truncated;
-          const liveSections: string[] = [];
-          const liveSummaryIds: string[] = [];
-          const liveSourceIds: string[] = [];
-          for (const liveDayKey of liveFallbackKeys) {
-            const currentStart = getUtcDateForZonedMidnight(
-              liveDayKey,
-              timezone
-            );
-            const currentEnd = new Date(
-              Math.min(
-                resolution.end.getTime(),
-                getUtcDateForZonedMidnight(
-                  addDays(liveDayKey, 1),
-                  timezone
-                ).getTime()
-              )
-            );
-            const live = renderFallbackRollupSection(
-              liveDayKey,
-              getRecentSummaryFallback(db, conversationId, currentStart, currentEnd),
-              timezone,
-              budget,
-              includeSources
-            );
-            liveSections.push(live.content);
-            liveSummaryIds.push(...live.summaryIds);
-            liveSourceIds.push(...live.sourceIds);
-            usedFallback = true;
-            truncated = truncated || live.accounting.truncated;
+          if (mode === "index") {
+            const indexed = renderRollupsIndex(orderedRollups, budget);
+            rollupContent = indexed.content;
+            tokenCount = indexed.tokenCount;
+            status = indexed.status;
+            sourceSummaryIds = indexed.sourceSummaryIds;
+            sourceIds = sourceSummaryIds;
+            truncated = truncated || indexed.truncated;
+            lastBuiltAt = indexed.lastBuiltAt;
+          } else {
+            const combined = combineRollups(orderedRollups, budget);
+            truncated = truncated || combined.truncated;
+            const liveSections: string[] = [];
+            const liveSummaryIds: string[] = [];
+            const liveSourceIds: string[] = [];
+            for (const liveDayKey of liveFallbackKeys) {
+              const currentStart = getUtcDateForZonedMidnight(
+                liveDayKey,
+                timezone
+              );
+              const currentEnd = new Date(
+                Math.min(
+                  resolution.end.getTime(),
+                  getUtcDateForZonedMidnight(
+                    addDays(liveDayKey, 1),
+                    timezone
+                  ).getTime()
+                )
+              );
+              const live = renderFallbackRollupSection(
+                liveDayKey,
+                getRecentSummaryFallback(db, conversationId, currentStart, currentEnd),
+                timezone,
+                budget,
+                includeSources
+              );
+              liveSections.push(live.content);
+              liveSummaryIds.push(...live.summaryIds);
+              liveSourceIds.push(...live.sourceIds);
+              usedFallback = true;
+              truncated = truncated || live.accounting.truncated;
+            }
+            rollupContent = combined.content;
+            if (liveSections.length > 0) {
+              rollupContent = [rollupContent, ...liveSections]
+                .filter((section) => section.trim().length > 0)
+                .join("\n\n");
+            }
+            tokenCount = estimateTokens(rollupContent);
+            status = orderedRollups.length > 0 ? combined.status : "fallback";
+            sourceSummaryIds = [...combined.sourceSummaryIds, ...liveSummaryIds];
+            sourceIds = [...combined.sourceSummaryIds, ...liveSourceIds];
+            lastBuiltAt = combined.lastBuiltAt;
           }
-          rollupContent = combined.content;
-          if (liveSections.length > 0) {
-            rollupContent = [rollupContent, ...liveSections]
-              .filter((section) => section.trim().length > 0)
-              .join("\n\n");
-          }
-          tokenCount = estimateTokens(rollupContent);
-          status = orderedRollups.length > 0 ? combined.status : "fallback";
-          sourceSummaryIds = [...combined.sourceSummaryIds, ...liveSummaryIds];
-          sourceIds = [...combined.sourceSummaryIds, ...liveSourceIds];
         }
       }
 
@@ -1384,6 +1711,10 @@ export function createLcmRecentTool(input: {
               fallback.sqlTruncated,
             summaryIds: includeSources ? sourceSummaryIds : [],
             sourceIds: includeSources ? sourceIds : [],
+            detailLevel: budget.detailLevel,
+            requestedDetailLevel: budget.requestedDetailLevel,
+            clampReason: budget.clampReason,
+            lastBuiltAt: null,
           },
         };
       }
@@ -1423,6 +1754,10 @@ export function createLcmRecentTool(input: {
           truncated: response.truncated || truncated,
           summaryIds: includeSources ? sourceSummaryIds : [],
           sourceIds: includeSources ? sourceIds : [],
+          detailLevel: budget.detailLevel,
+          requestedDetailLevel: budget.requestedDetailLevel,
+          clampReason: budget.clampReason,
+          lastBuiltAt: lastBuiltAt ? lastBuiltAt.toISOString() : null,
         },
       };
     },

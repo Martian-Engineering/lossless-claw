@@ -173,4 +173,15 @@ export interface LcmDependencies {
     error: (msg: string) => void;
     debug: (msg: string) => void;
   };
+
+  /**
+   * Optional: look up the configured input context window (in tokens) for a given
+   * provider/model identifier. Used by lcm_recent to auto-pick `detailLevel` based
+   * on the agent's remaining context. Returns null if unknown.
+   *
+   * Implementation should consult the runtime's model registry (eg. openclaw.json
+   * `agents.defaults.models[id].contextWindow`). LCM never parses host config
+   * directly — this callback is the contract.
+   */
+  getModelContextWindow?: (model: string) => number | null;
 }
