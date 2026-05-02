@@ -23,8 +23,10 @@ type ConversationScopeStore = ReturnType<LcmContextEngine["getConversationStore"
   getConversationForSession?: (input: {
     sessionId?: string;
     sessionKey?: string;
-  }) => Promise<{ conversationId: number } | null>;
-  getConversationBySessionKey?: (sessionKey: string) => Promise<{ conversationId: number } | null>;
+  }) => Promise<{ conversationId: number; sessionKey?: string | null } | null>;
+  getConversationBySessionKey?: (
+    sessionKey: string,
+  ) => Promise<{ conversationId: number; sessionKey?: string | null } | null>;
   listConversationsBySessionKey?: (
     sessionKey: string,
   ) => Promise<Array<{ conversationId: number }>>;
@@ -34,7 +36,7 @@ async function lookupConversationForSession(input: {
   lcm: LcmContextEngine;
   sessionId?: string;
   sessionKey?: string;
-}): Promise<{ conversationId: number } | null> {
+}): Promise<{ conversationId: number; sessionKey?: string | null } | null> {
   const store = input.lcm.getConversationStore() as ConversationScopeStore;
 
   if (typeof store.getConversationForSession === "function") {
@@ -160,8 +162,16 @@ export async function resolveLcmConversationScope(input: {
     };
   }
 
-  const related = normalizedSessionKey
-    ? await collectRelatedConversationIds(lcm, normalizedSessionKey)
+  // Resolve a session_key for cross-conversation aggregation. We try the
+  // explicit input.sessionKey first, then fall back to the session_key on the
+  // resolved conversation row itself — this matters when the lookup happened
+  // via sessionId and we still want to span /new and /reset boundaries under
+  // the same agent. The whole point of LCM being lossless is crossing
+  // conversation lifecycle events.
+  const resolvedSessionKey =
+    normalizedSessionKey ?? conversation.sessionKey?.trim() ?? undefined;
+  const related = resolvedSessionKey
+    ? await collectRelatedConversationIds(lcm, resolvedSessionKey)
     : [conversation.conversationId];
   return {
     conversationId: conversation.conversationId,

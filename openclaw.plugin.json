@@ -213,6 +213,18 @@
       "label": "Rollup Debug Tool",
       "help": "Register the operator-facing lcm_rollup_debug tool; disabled by default"
     },
+    "rollupDailyMaxTokens": {
+      "label": "Rollup Daily Max Tokens",
+      "help": "Maximum tokens for daily rollup content. Default 40000."
+    },
+    "rollupWeeklyMaxTokens": {
+      "label": "Rollup Weekly Max Tokens",
+      "help": "Maximum tokens for weekly rollup content. Default 140000 (≈20K avg/day × 7 days)."
+    },
+    "rollupMonthlyMaxTokens": {
+      "label": "Rollup Monthly Max Tokens",
+      "help": "Maximum tokens for monthly rollup content. Default 560000 (≈4 weeks × 140K)."
+    },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
       "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
@@ -418,6 +430,18 @@
       },
       "rollupDebugEnabled": {
         "type": "boolean"
+      },
+      "rollupDailyMaxTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "rollupWeeklyMaxTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "rollupMonthlyMaxTokens": {
+        "type": "integer",
+        "minimum": 1
       },
       "proactiveThresholdCompactionMode": {
         "type": "string",

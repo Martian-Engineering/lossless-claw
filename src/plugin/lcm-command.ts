@@ -608,6 +608,10 @@ function buildHelpText(error?: string): string {
         "Delete approved high-confidence cleaner matches after creating a DB backup.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor apply`), "Repair broken summaries in the current conversation."),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} rebuild-rollups [days]`),
+        "Rebuild daily/weekly/monthly rollups for the last N days (default 7, max 365) across all conversations under this agent's session_key.",
+      ),
     ]),
     "",
     buildSection("🧭 Notes", [
