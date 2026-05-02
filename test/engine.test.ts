@@ -3725,6 +3725,58 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(reconcileSpy).not.toHaveBeenCalled();
   });
 
+  it("reconciles foreground transcript messages before assistant-only afterTurn deltas", async () => {
+    const sessionFile = createSessionFilePath("after-turn-foreground-transcript-reconcile");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "kick off workers" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "same status reply" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "after-turn-foreground-transcript-reconcile";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "You set up a monitor too right?" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "same status reply" }],
+    } as AgentMessage);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "same status reply" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "kick off workers",
+      "same status reply",
+      "You set up a monitor too right?",
+      "same status reply",
+    ]);
+
+    const sessionFileStats = statSync(sessionFile);
+    const bootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(bootstrapState?.lastProcessedOffset).toBe(sessionFileStats.size);
+  });
+
   it("falls back to full reconciliation when append-only checkpoint validation mismatches", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
     tempDirs.push(tempDir);
@@ -5796,22 +5848,18 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(toolResult.content?.[0]?.output).toEqual({ cwd: "/tmp" });
   });
 
-  it("maps unknown roles to assistant instead of silently coercing to user", async () => {
+  it("skips unknown roles instead of storing them as assistant messages", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();
 
-    await engine.ingest({
+    const result = await engine.ingest({
       sessionId,
       message: makeMessage({ role: "custom-event", content: "opaque payload" }),
     });
 
+    expect(result.ingested).toBe(false);
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
-    const storedMessages = await engine
-      .getConversationStore()
-      .getMessages(conversation!.conversationId);
-    expect(storedMessages).toHaveLength(1);
-    expect(storedMessages[0].role).toBe("assistant");
+    expect(conversation).toBeNull();
   });
 
   it("uses explicit compact tokenBudget over legacy tokenBudget", async () => {
@@ -9249,6 +9297,31 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     expect(conversation).not.toBeNull();
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((m) => m.content)).toEqual(["hello", "hi there"]);
+  });
+
+  it("does not persist custom transcript context as assistant messages", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-custom-context";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-custom-context"),
+      messages: [
+        {
+          type: "custom_message",
+          customType: "openclaw.runtime-context",
+          content: "Conversation info (untrusted metadata)",
+        } as unknown as AgentMessage,
+        makeMessage({ role: "assistant", content: "real reply" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["real reply"]);
   });
 
   it("ingests all genuinely new messages (normal afterTurn, no restart)", async () => {

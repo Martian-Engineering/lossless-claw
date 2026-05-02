@@ -1073,8 +1073,24 @@ function toDbRole(role: string): "user" | "assistant" | "system" | "tool" {
   if (role === "assistant") {
     return "assistant";
   }
-  // Unknown roles are preserved via message_parts metadata and treated as assistant.
+  // Direct callers should filter unknown roles before storage. Preserve the
+  // historical fallback for typed AgentMessage values that reach this helper.
   return "assistant";
+}
+
+function hasPersistableMessageRole(message: AgentMessage): boolean {
+  const role = (message as { role?: unknown }).role;
+  return (
+    role === "user" ||
+    role === "assistant" ||
+    role === "system" ||
+    role === "tool" ||
+    role === "toolResult"
+  );
+}
+
+function filterPersistableMessages(messages: AgentMessage[]): AgentMessage[] {
+  return messages.filter(hasPersistableMessageRole);
 }
 
 type StoredMessage = {
@@ -4496,6 +4512,105 @@ export class LcmContextEngine implements ContextEngine {
     return { blockedByImportCap: false, importedMessages, hasOverlap: true };
   }
 
+  private async reconcileTranscriptTailForAfterTurn(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+  }): Promise<void> {
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    await this.withSessionQueue(
+      queueKey,
+      async () => {
+        const conversation = await this.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+        if (!conversation) {
+          return;
+        }
+
+        // OpenClaw can submit the foreground prompt outside the mutable
+        // messages array passed to afterTurn. The transcript has the complete
+        // turn by this point, so reconcile it before accepting assistant-only
+        // deltas from the runtime snapshot.
+        const checkpoint = await this.summaryStore.getConversationBootstrapState(
+          conversation.conversationId,
+        );
+        if (
+          checkpoint &&
+          checkpoint.sessionFilePath === params.sessionFile &&
+          checkpoint.lastProcessedOffset >= 0
+        ) {
+          const appended = await readAppendedLeafPathMessages({
+            sessionFile: params.sessionFile,
+            offset: checkpoint.lastProcessedOffset,
+          });
+          if (appended.canUseAppendOnly) {
+            let importedMessages = 0;
+            for (const message of appended.messages) {
+              const result = await this.ingestSingle({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                message,
+              });
+              if (result.ingested) {
+                importedMessages += 1;
+              }
+            }
+            if (importedMessages > 0) {
+              this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
+              this.recordRecentBootstrapImport(
+                conversation.conversationId,
+                importedMessages,
+                "reconciled missing session messages",
+              );
+              await this.refreshBootstrapState({
+                conversationId: conversation.conversationId,
+                sessionFile: params.sessionFile,
+              });
+            }
+            return;
+          }
+        }
+
+        const historicalMessages = await readLeafPathMessages(params.sessionFile);
+        if (historicalMessages.length === 0) {
+          return;
+        }
+        const reconcile = await this.reconcileSessionTail({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          conversationId: conversation.conversationId,
+          historicalMessages,
+        });
+        if (reconcile.blockedByImportCap) {
+          return;
+        }
+        if (reconcile.importedMessages > 0) {
+          this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
+          this.recordRecentBootstrapImport(
+            conversation.conversationId,
+            reconcile.importedMessages,
+            "reconciled missing session messages",
+          );
+        }
+        if (reconcile.importedMessages > 0) {
+          await this.refreshBootstrapState({
+            conversationId: conversation.conversationId,
+            sessionFile: params.sessionFile,
+          });
+        }
+      },
+      {
+        operationName: "afterTurnTranscriptReconcile",
+        context: [
+          `session=${params.sessionId}`,
+          ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
+        ].join(" "),
+      },
+    );
+  }
+
   /**
    * Persist bootstrap checkpoint metadata anchored to the current DB frontier.
    *
@@ -5413,6 +5528,9 @@ export class LcmContextEngine implements ContextEngine {
     if (isHeartbeat) {
       return { ingested: false };
     }
+    if (!hasPersistableMessageRole(message)) {
+      return { ingested: false };
+    }
 
     // Skip assistant messages that failed with an error and have no useful content.
     // These occur when an API call returns a 500 or similar transient error.
@@ -5736,7 +5854,20 @@ export class LcmContextEngine implements ContextEngine {
     // Dedup guard: prevent duplicate ingestion when gateway restart replays
     // full history. Run on newMessages BEFORE prepending autoCompactionSummary
     // so synthetic summaries cannot interfere with replay detection.
-    const newMessages = params.messages.slice(params.prePromptMessageCount);
+    const newMessages = filterPersistableMessages(
+      params.messages.slice(params.prePromptMessageCount),
+    );
+    try {
+      await this.reconcileTranscriptTailForAfterTurn({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionFile,
+      });
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
+      );
+    }
     const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
       params.sessionId,
       params.sessionKey,
