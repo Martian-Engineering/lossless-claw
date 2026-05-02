@@ -6035,6 +6035,61 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ]);
   });
 
+  it("afterTurn skips new-message content already covered by auto-compaction summary", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-summary-overlap";
+    const repeatedInstruction =
+      "kick off workers to review all of these pull requests and report back";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-overlap"),
+      messages: [
+        makeMessage({ role: "user", content: repeatedInstruction }),
+        makeMessage({ role: "assistant", content: "Workers are running now." }),
+      ],
+      prePromptMessageCount: 0,
+      autoCompactionSummary: `Summary of compacted context: the user said "${repeatedInstruction}" and the assistant began coordinating the work.`,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      `Summary of compacted context: the user said "${repeatedInstruction}" and the assistant began coordinating the work.`,
+      "Workers are running now.",
+    ]);
+  });
+
+  it("afterTurn does not drop short messages just because they appear in auto-compaction summary", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-summary-short-overlap";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-short-overlap"),
+      messages: [
+        makeMessage({ role: "user", content: "yes" }),
+        makeMessage({ role: "assistant", content: "Proceeding." }),
+      ],
+      prePromptMessageCount: 0,
+      autoCompactionSummary: "Summary: the user previously said yes to the plan.",
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "Summary: the user previously said yes to the plan.",
+      "yes",
+      "Proceeding.",
+    ]);
+  });
+
   it("afterTurn runs proactive threshold compaction when tokenBudget is provided", async () => {
     const engine = createEngineWithConfig({
       proactiveThresholdCompactionMode: "inline",

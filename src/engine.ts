@@ -1648,6 +1648,22 @@ function messageIdentity(role: string, content: string): string {
   return `${role}\u0000${content}`;
 }
 
+function normalizeSummaryOverlapText(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function messageContentCoveredBySummary(params: {
+  message: AgentMessage;
+  summary: string;
+}): boolean {
+  const content = normalizeSummaryOverlapText(toStoredMessage(params.message).content);
+  if (content.length < 24) {
+    return false;
+  }
+  const summary = normalizeSummaryOverlapText(params.summary);
+  return summary.includes(content);
+}
+
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
 export class LcmContextEngine implements ContextEngine {
@@ -5873,6 +5889,29 @@ export class LcmContextEngine implements ContextEngine {
       params.sessionKey,
       newMessages,
     );
+    const summaryCoveredMessages: AgentMessage[] = [];
+    const summaryDedupedNewMessages: AgentMessage[] = [];
+    if (params.autoCompactionSummary) {
+      for (const message of dedupedNewMessages) {
+        if (
+          messageContentCoveredBySummary({
+            message,
+            summary: params.autoCompactionSummary,
+          })
+        ) {
+          summaryCoveredMessages.push(message);
+        } else {
+          summaryDedupedNewMessages.push(message);
+        }
+      }
+    } else {
+      summaryDedupedNewMessages.push(...dedupedNewMessages);
+    }
+    if (summaryCoveredMessages.length > 0) {
+      this.deps.log.info(
+        `[lcm] afterTurn: skipped ${summaryCoveredMessages.length} messages already covered by autoCompactionSummary ${sessionLabel}`,
+      );
+    }
 
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
@@ -5882,7 +5921,7 @@ export class LcmContextEngine implements ContextEngine {
       } as AgentMessage);
     }
 
-    ingestBatch.push(...dedupedNewMessages);
+    ingestBatch.push(...summaryDedupedNewMessages);
     if (ingestBatch.length === 0) {
       this.deps.log.info(
         `[lcm] afterTurn: nothing to ingest ${sessionLabel} newMessages=${newMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
