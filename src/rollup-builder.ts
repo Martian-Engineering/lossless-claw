@@ -18,8 +18,14 @@ import type {
 export { getLocalDateKey, getLocalDayBounds } from "./timezone-windows.js";
 
 const DEFAULT_DAILY_TARGET_TOKENS = 5_000;
-const DEFAULT_DAILY_MAX_TOKENS = 15_000;
-const DEFAULT_AGGREGATE_MAX_TOKENS = 20_000;
+// Default storage caps follow the user's design math: daily 40K → weekly
+// 140K (≈20K avg per day × 7) → monthly 560K (≈4 weeks × 140K). These are
+// STORAGE caps; the per-call response size is bounded separately by
+// lcm_recent's detailLevel + maxOutputTokens so the agent's prompt stays
+// well under the model's context window.
+const DEFAULT_DAILY_MAX_TOKENS = 40_000;
+const DEFAULT_WEEKLY_MAX_TOKENS = 140_000;
+const DEFAULT_MONTHLY_MAX_TOKENS = 560_000;
 const TIMELINE_SENTENCE_LIMIT = 3;
 const TIMELINE_MAX_CHARS = 500;
 const DAY_PERIOD_KIND = "day";
@@ -30,6 +36,8 @@ export interface RollupBuilderConfig {
   timezone: string;
   dailyTargetTokens?: number;
   dailyMaxTokens?: number;
+  weeklyMaxTokens?: number;
+  monthlyMaxTokens?: number;
 }
 
 export interface BuildResult {
@@ -77,6 +85,8 @@ type RollupDraft = {
 
 export class RollupBuilder {
   private readonly dailyMaxTokens: number;
+  private readonly weeklyMaxTokens: number;
+  private readonly monthlyMaxTokens: number;
 
   constructor(private store: RollupStore, private config: RollupBuilderConfig) {
     const dailyTargetTokens = normalizePositiveInt(
@@ -86,6 +96,14 @@ export class RollupBuilder {
     this.dailyMaxTokens = Math.max(
       dailyTargetTokens,
       normalizePositiveInt(config.dailyMaxTokens, DEFAULT_DAILY_MAX_TOKENS)
+    );
+    this.weeklyMaxTokens = normalizePositiveInt(
+      config.weeklyMaxTokens,
+      DEFAULT_WEEKLY_MAX_TOKENS
+    );
+    this.monthlyMaxTokens = normalizePositiveInt(
+      config.monthlyMaxTokens,
+      DEFAULT_MONTHLY_MAX_TOKENS
     );
   }
 
@@ -314,7 +332,10 @@ export class RollupBuilder {
       periodKind,
       periodKey,
       sourceRollups,
-      maxTokens: DEFAULT_AGGREGATE_MAX_TOKENS,
+      maxTokens:
+        periodKind === WEEK_PERIOD_KIND
+          ? this.weeklyMaxTokens
+          : this.monthlyMaxTokens,
     });
     const rollupId =
       existing?.rollup_id ?? buildRollupId(periodKind, periodKey);
@@ -773,16 +794,25 @@ function renderAggregateRollup(
 ): string {
   const title =
     periodKind === WEEK_PERIOD_KIND ? "Weekly Summary" : "Monthly Summary";
-  const lines = [`# ${title}: ${periodKey}`, "", "## Daily Rollups"];
+  const lines: string[] = [`# ${title}: ${periodKey}`, ""];
   if (omittedEntries > 0) {
-    lines.push(`- (${omittedEntries} earlier daily rollups omitted)`);
-  }
-  for (const rollup of rollups) {
     lines.push(
-      `- ${rollup.period_key}: ${summariseTimelineContent(rollup.content)}`
+      `(${omittedEntries} earlier daily rollups omitted to fit budget)`,
+      "",
     );
   }
-  lines.push("", "## Statistics");
+  // Embed each day's FULL rollup content. Per-day truncation has been
+  // replaced by a total-budget cap in buildAggregateRollupContent's outer
+  // trim loop — when the budget is exceeded it drops oldest days entirely
+  // instead of stripping per-day detail. This produces a real aggregate
+  // (~10-20K per day × N days) rather than a 200-char-per-day TOC.
+  for (const rollup of rollups) {
+    lines.push(`## ${rollup.period_key}`);
+    lines.push("");
+    lines.push(rollup.content.trim());
+    lines.push("");
+  }
+  lines.push("---", "## Statistics");
   lines.push(`- Source daily rollups: ${rollups.length}`);
   lines.push(
     `- Total source tokens: ${rollups.reduce(

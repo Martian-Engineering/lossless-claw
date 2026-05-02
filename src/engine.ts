@@ -1800,6 +1800,9 @@ export class LcmContextEngine implements ContextEngine {
     this.rollupStore = new RollupStore(this.db);
     this.rollupBuilder = new RollupBuilder(this.rollupStore, {
       timezone: this.timezone,
+      dailyMaxTokens: this.config.rollupDailyMaxTokens,
+      weeklyMaxTokens: this.config.rollupWeeklyMaxTokens,
+      monthlyMaxTokens: this.config.rollupMonthlyMaxTokens,
     });
 
     if (!this.fts5Available) {

@@ -123,6 +123,12 @@ export type LcmConfig = {
   transcriptGcEnabled: boolean;
   /** When true, register the operator-facing lcm_rollup_debug tool. */
   rollupDebugEnabled: boolean;
+  /** Maximum tokens for daily rollup content. Default 40000. */
+  rollupDailyMaxTokens: number;
+  /** Maximum tokens for weekly rollup content. Default 140000 (≈20K avg/day × 7). */
+  rollupWeeklyMaxTokens: number;
+  /** Maximum tokens for monthly rollup content. Default 560000 (≈4 weeks × 140K). */
+  rollupMonthlyMaxTokens: number;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
@@ -472,6 +478,15 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_ROLLUP_DEBUG_ENABLED !== undefined
           ? env.LCM_ROLLUP_DEBUG_ENABLED === "true"
           : toBool(pc.rollupDebugEnabled) ?? false,
+      rollupDailyMaxTokens:
+        parseFiniteInt(env.LCM_ROLLUP_DAILY_MAX_TOKENS)
+          ?? toNumber(pc.rollupDailyMaxTokens) ?? 40000,
+      rollupWeeklyMaxTokens:
+        parseFiniteInt(env.LCM_ROLLUP_WEEKLY_MAX_TOKENS)
+          ?? toNumber(pc.rollupWeeklyMaxTokens) ?? 140000,
+      rollupMonthlyMaxTokens:
+        parseFiniteInt(env.LCM_ROLLUP_MONTHLY_MAX_TOKENS)
+          ?? toNumber(pc.rollupMonthlyMaxTokens) ?? 560000,
       proactiveThresholdCompactionMode,
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)
