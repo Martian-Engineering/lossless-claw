@@ -1578,8 +1578,14 @@ async function buildRebuildRollupsText(params: {
         `- ${tag}: built=${built}, skipped=${skipped}, errors=${errors}`,
       );
       if (errors > 0) {
-        for (const err of [...dailyResult.errors, ...aggResult.errors].slice(0, 3)) {
+        const allErrors = [...dailyResult.errors, ...aggResult.errors];
+        for (const err of allErrors.slice(0, 3)) {
           perConversationLines.push(`    ↪ ${err}`);
+        }
+        if (allErrors.length > 3) {
+          perConversationLines.push(
+            `    ↪ (...${allErrors.length - 3} more suppressed)`,
+          );
         }
       }
     } catch (error) {

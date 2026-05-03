@@ -150,6 +150,69 @@ describe("/lossless rebuild-rollups", () => {
     expect(aggArgs?.[1]).toEqual({ daysBack: 7 });
   });
 
+  it("appends a (...N more suppressed) marker when error totals exceed 3 (P3)", async () => {
+    const fixture = createRebuildFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    await fixture.conversationStore.createConversation({
+      sessionId: "rebuild-suppressed",
+      sessionKey: "agent:rebuild:main",
+    });
+
+    fixture.buildDailyRollups.mockResolvedValueOnce({
+      built: 0,
+      skipped: 0,
+      errors: ["d-err-1", "d-err-2", "d-err-3"],
+    });
+    fixture.buildWeeklyMonthlyRollups.mockResolvedValueOnce({
+      built: 0,
+      skipped: 0,
+      errors: ["w-err-1", "w-err-2", "m-err-1"],
+    });
+
+    const result = await fixture.command.handler(
+      makeContext("rebuild-rollups 7"),
+    );
+
+    expect(result.text).toContain("d-err-1");
+    expect(result.text).toContain("d-err-2");
+    expect(result.text).toContain("d-err-3");
+    expect(result.text).not.toContain("w-err-1");
+    expect(result.text).toContain("(...3 more suppressed)");
+  });
+
+  it("does not emit the suppression marker when error count is at most 3 (P3)", async () => {
+    const fixture = createRebuildFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    await fixture.conversationStore.createConversation({
+      sessionId: "rebuild-suppressed-edge",
+      sessionKey: "agent:rebuild:main",
+    });
+
+    fixture.buildDailyRollups.mockResolvedValueOnce({
+      built: 0,
+      skipped: 0,
+      errors: ["only-1", "only-2"],
+    });
+    fixture.buildWeeklyMonthlyRollups.mockResolvedValueOnce({
+      built: 0,
+      skipped: 0,
+      errors: ["only-3"],
+    });
+
+    const result = await fixture.command.handler(
+      makeContext("rebuild-rollups 7"),
+    );
+
+    expect(result.text).toContain("only-1");
+    expect(result.text).toContain("only-2");
+    expect(result.text).toContain("only-3");
+    expect(result.text).not.toMatch(/more suppressed/);
+  });
+
   it("passes daysBack=30 to buildWeeklyMonthlyRollups when requested", async () => {
     const fixture = createRebuildFixture();
     tempDirs.add(fixture.tempDir);
