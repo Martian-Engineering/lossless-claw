@@ -362,7 +362,7 @@ type RollupRecord = {
   coverageEnd: Date | null;
   summarizerModel: string | null;
   sourceFingerprint: string | null;
-  builtAt: Date;
+  builtAt: Date | null;
   invalidatedAt: Date | null;
   errorText: string | null;
 };
@@ -1032,7 +1032,7 @@ function renderRollupsIndex(
   for (const rollup of sortedRollups) {
     lines.push(`#### ${rollup.periodKind}/${rollup.periodKey}`);
     lines.push(
-      `- Status: ${rollup.status} | Built: ${rollup.builtAt.toISOString()}`,
+      `- Status: ${rollup.status} | Built: ${rollup.builtAt ? rollup.builtAt.toISOString() : "(unknown)"}`,
     );
     lines.push(
       `- Sources: ${rollup.sourceMessageCount} msgs, ${rollup.sourceTokenCount} src tokens, ${rollup.sourceSummaryIds.length} summaries`,
@@ -1057,9 +1057,11 @@ function renderRollupsIndex(
   )
     ? "ready"
     : "stale";
-  const lastBuiltAt = new Date(
-    Math.max(...sortedRollups.map((r) => r.builtAt.getTime())),
-  );
+  const builtTimes = sortedRollups
+    .map((r) => r.builtAt?.getTime())
+    .filter((t): t is number => typeof t === "number");
+  const lastBuiltAt =
+    builtTimes.length > 0 ? new Date(Math.max(...builtTimes)) : null;
   return {
     content,
     tokenCount: estimateTokens(content),
@@ -1109,11 +1111,12 @@ function combineRollups(rollups: RollupRecord[], budget: RecallBudget): {
   const status = retained.every((rollup) => rollup.status === "ready")
     ? "ready"
     : "stale";
+  const retainedBuiltTimes = retained
+    .map((rollup) => rollup.builtAt?.getTime())
+    .filter((t): t is number => typeof t === "number");
   const lastBuiltAt =
-    retained.length > 0
-      ? new Date(
-          Math.max(...retained.map((rollup) => rollup.builtAt.getTime()))
-        )
+    retainedBuiltTimes.length > 0
+      ? new Date(Math.max(...retainedBuiltTimes))
       : null;
   return {
     content,
@@ -1728,7 +1731,7 @@ export function createLcmRecentTool(input: {
               coverageEnd: rollup.coverage_end ? new Date(rollup.coverage_end) : null,
               summarizerModel: rollup.summarizer_model,
               sourceFingerprint: rollup.source_fingerprint,
-              builtAt: rollup.built_at ? new Date(rollup.built_at) : new Date(),
+              builtAt: rollup.built_at ? new Date(rollup.built_at) : null,
               invalidatedAt: rollup.invalidated_at ? new Date(rollup.invalidated_at) : null,
               errorText: rollup.error_text,
             };
@@ -1802,7 +1805,7 @@ export function createLcmRecentTool(input: {
               : null,
             summarizerModel: rollup.summarizer_model,
             sourceFingerprint: rollup.source_fingerprint,
-            builtAt: new Date(rollup.built_at),
+            builtAt: rollup.built_at ? new Date(rollup.built_at) : null,
             invalidatedAt: rollup.invalidated_at
               ? new Date(rollup.invalidated_at)
               : null,

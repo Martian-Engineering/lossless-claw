@@ -1062,6 +1062,66 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("returns null lastBuiltAt for index mode when built_at is missing (P2-9)", async () => {
+    const { db, conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "built-at-missing",
+      sessionKey: "agent:main:built-at-missing",
+      title: "built_at missing",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_built_at_missing",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Source for built_at-missing index test.",
+      tokenCount: 7,
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+    // Force built_at to empty string — pre-fix the index mode would coerce
+    // this to a wall-clock new Date() and taint replay determinism.
+    db.prepare(
+      `UPDATE lcm_rollups
+       SET built_at = ''
+       WHERE conversation_id = ? AND period_kind = 'day' AND period_key = ?`
+    ).run(conversation.conversationId, "2026-04-27");
+
+    const lcm = {
+      timezone: "UTC",
+      getRollupStore: () => rollupStore,
+      getConversationStore: () => ({
+        getConversationBySessionId: async () => ({
+          conversationId: conversation.conversationId,
+          sessionId: "built-at-missing",
+          title: null,
+          bootstrappedAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+        getConversationBySessionKey: async () => null,
+      }),
+    };
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: lcm as never,
+      sessionId: "built-at-missing",
+    });
+
+    const result = await tool.execute("call-built-at-missing", {
+      period: "date:2026-04-27",
+      mode: "index",
+      includeSources: true,
+    });
+    const details = result.details as { lastBuiltAt?: Date | null };
+    expect(details.lastBuiltAt).toBeNull();
+    const text = (result.content[0] as { text: string }).text;
+    // Index entry header should fall back to "(unknown)" rather than a fake
+    // wall-clock timestamp.
+    expect(text).toMatch(/Built:\s*\(unknown\)/);
+  });
+
   it("uses BEGIN IMMEDIATE in replaceRollupSources to acquire write lock upfront (P2-4)", async () => {
     // Smoke: with no outer transaction, replaceRollupSources should still
     // succeed. The fix (BEGIN -> BEGIN IMMEDIATE) only changes lock-acquisition
