@@ -110,6 +110,36 @@ type PromptCacheSnapshot = {
   provider?: string;
   model?: string;
 };
+type LcmAssemblyFallbackReason =
+  | "ignored_session"
+  | "conversation_miss"
+  | "no_context_items"
+  | "db_trails_live"
+  | "empty_assembled"
+  | "no_user_turn"
+  | "error";
+type LcmAssemblyProvenance = {
+  engine: "lossless-claw";
+  mode: "assembled" | "live_fallback";
+  fallbackReason?: LcmAssemblyFallbackReason;
+  inputMessageCount: number;
+  outputMessageCount: number;
+  contextItemCount?: number;
+  rawContextItemCount?: number;
+  summaryContextItemCount?: number;
+  estimatedTokens: number;
+  cacheState?: CacheState;
+  selectionMode?: "full-fit" | "prompt-aware" | "chronological";
+  hashes?: {
+    finalMessages?: string;
+    preSanitizeMessages?: string;
+    commonPrefix?: string;
+  };
+};
+type LcmAssembleResult = AssembleResult & {
+  promptAuthority: "assembled";
+  lcmAssembly: LcmAssemblyProvenance;
+};
 type IncrementalCompactionDecision = {
   shouldCompact: boolean;
   cacheState: CacheState;
@@ -6340,18 +6370,69 @@ export class LcmContextEngine implements ContextEngine {
     /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
     prompt?: string;
   }): Promise<AssembleResult> {
+    const buildAssembleResult = (input: {
+      messages: AgentMessage[];
+      estimatedTokens: number;
+      mode: LcmAssemblyProvenance["mode"];
+      fallbackReason?: LcmAssemblyFallbackReason;
+      contextItemCount?: number;
+      rawContextItemCount?: number;
+      summaryContextItemCount?: number;
+      cacheState?: CacheState;
+      selectionMode?: LcmAssemblyProvenance["selectionMode"];
+      hashes?: LcmAssemblyProvenance["hashes"];
+    }): LcmAssembleResult => ({
+      messages: input.messages,
+      estimatedTokens: input.estimatedTokens,
+      promptAuthority: "assembled",
+      lcmAssembly: {
+        engine: "lossless-claw",
+        mode: input.mode,
+        ...(input.fallbackReason ? { fallbackReason: input.fallbackReason } : {}),
+        inputMessageCount: params.messages.length,
+        outputMessageCount: input.messages.length,
+        ...(input.contextItemCount !== undefined
+          ? { contextItemCount: input.contextItemCount }
+          : {}),
+        ...(input.rawContextItemCount !== undefined
+          ? { rawContextItemCount: input.rawContextItemCount }
+          : {}),
+        ...(input.summaryContextItemCount !== undefined
+          ? { summaryContextItemCount: input.summaryContextItemCount }
+          : {}),
+        estimatedTokens: input.estimatedTokens,
+        ...(input.cacheState ? { cacheState: input.cacheState } : {}),
+        ...(input.selectionMode ? { selectionMode: input.selectionMode } : {}),
+        ...(input.hashes ? { hashes: input.hashes } : {}),
+      },
+    });
     // Return a new fallback array so the runtime hook treats this as assembled
     // context, and remove assistant prefill tails from fallback-only paths.
-    const safeFallback = (): AssembleResult => {
+    const safeFallback = (
+      fallbackReason: LcmAssemblyFallbackReason,
+      diagnostics: {
+        contextItemCount?: number;
+        rawContextItemCount?: number;
+        summaryContextItemCount?: number;
+        cacheState?: CacheState;
+      } = {},
+    ): LcmAssembleResult => {
       const msgs = params.messages.slice();
       while (msgs.length > 0 && msgs[msgs.length - 1]?.role === "assistant") {
         msgs.pop();
       }
-      return { messages: msgs, estimatedTokens: 0 };
+      const estimatedTokens = estimateSessionTokenCountForAfterTurn(msgs);
+      return buildAssembleResult({
+        messages: msgs,
+        estimatedTokens,
+        mode: "live_fallback",
+        fallbackReason,
+        ...diagnostics,
+      });
     };
 
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      return safeFallback();
+      return safeFallback("ignored_session");
     }
     try {
       this.ensureMigrated();
@@ -6369,7 +6450,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: conversation lookup missed ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return safeFallback();
+        return safeFallback("conversation_miss");
       }
 
       const tokenBudget = this.applyAssemblyBudgetCap(
@@ -6411,22 +6492,35 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+      let summaryContextItemCount = 0;
+      for (const item of contextItems) {
+        if (item.itemType === "summary") {
+          summaryContextItemCount += 1;
+        }
+      }
+      const rawContextItemCount = contextItems.length - summaryContextItemCount;
+      const contextDiagnostics = {
+        contextItemCount: contextItems.length,
+        rawContextItemCount,
+        summaryContextItemCount,
+        cacheState: cacheAwareState,
+      };
       if (contextItems.length === 0) {
         this.deps.log.info(
           `[lcm] assemble: no context items conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return safeFallback();
+        return safeFallback("no_context_items", contextDiagnostics);
       }
 
       // Guard against incomplete bootstrap/coverage: if the DB only has
       // raw context items and clearly trails the current live history, keep
       // the live path to avoid dropping prompt context.
-      const hasSummaryItems = contextItems.some((item) => item.itemType === "summary");
+      const hasSummaryItems = summaryContextItemCount > 0;
       if (!hasSummaryItems && contextItems.length < params.messages.length) {
         this.deps.log.info(
           `[lcm] assemble: falling back to live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${params.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return safeFallback();
+        return safeFallback("db_trails_live", contextDiagnostics);
       }
 
       const assembled = await this.assembler.assemble({
@@ -6451,7 +6545,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: empty assembled output, using live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return safeFallback();
+        return safeFallback("empty_assembled", contextDiagnostics);
       }
 
       // Guard: if assembled context contains no user turns at all (e.g. a new session
@@ -6464,10 +6558,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: assembled context has no user turns, falling back to live context to prevent prefill errors conversation=${conversation.conversationId} ${sessionLabel} assembledMessages=${assembled.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return {
-          messages: params.messages,
-          estimatedTokens: 0,
-        };
+        return safeFallback("no_user_turn", contextDiagnostics);
       }
 
       this.deps.log.info(
@@ -6503,16 +6594,26 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
 
-      const result: AssembleResult = {
+      const result = buildAssembleResult({
         messages: assembled.messages,
         estimatedTokens: assembled.estimatedTokens,
-      };
+        mode: "assembled",
+        ...contextDiagnostics,
+        selectionMode: assembled.debug?.selectionMode,
+        hashes: assembled.debug
+          ? {
+              finalMessages: assembled.debug.finalMessagesHash,
+              preSanitizeMessages: assembled.debug.preSanitizeMessagesHash,
+              commonPrefix: prefixChange.commonPrefixHash,
+            }
+          : undefined,
+      });
       return result;
     } catch (err) {
       this.deps.log.info(
         `[lcm] assemble: failed for session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} error=${describeLogError(err)}`,
       );
-      return safeFallback();
+      return safeFallback("error");
     }
   }
 
