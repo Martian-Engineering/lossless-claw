@@ -97,6 +97,11 @@ type DelegatedExpandQueryReply = {
   citedIds: string[];
   expandedSummaryCount: number;
   totalSourceTokens: number;
+  /** Just the `lcm_expand` portion of the parent-computed token total —
+   *  excludes describe-only contributions. The cross-conversation bucket
+   *  loop deducts THIS from the global expansion budget so describe-only
+   *  buckets don't wrongly exhaust it. */
+  expandTokens: number;
   truncated: boolean;
 };
 
@@ -390,6 +395,41 @@ function recordExpandTokens(
   input: unknown,
   output: unknown,
 ): void {
+  // Inspect the input for `includeMessages: false` — when an expand call sets
+  // that flag and targets a single leaf, the expand output's `totalTokens` is
+  // 0 (the call returns the manifest, not the message body). The actual
+  // token contribution for that leaf comes from `lcm_describe`'s `tok`, so
+  // we must NOT add the leaf to `expandedSummaryIds` (which would suppress
+  // its describe-tok in `computeDeterministicTotalSourceTokens`).
+  let suppressExpandedTracking = false;
+  const detectIncludeMessagesFalse = (value: unknown, depth: number): void => {
+    if (suppressExpandedTracking || depth > 4 || value == null) return;
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          detectIncludeMessagesFalse(JSON.parse(trimmed), depth + 1);
+        } catch {
+          /* not JSON */
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const v of value) detectIncludeMessagesFalse(v, depth + 1);
+      return;
+    }
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      if (record.includeMessages === false) {
+        suppressExpandedTracking = true;
+        return;
+      }
+      for (const v of Object.values(record)) detectIncludeMessagesFalse(v, depth + 1);
+    }
+  };
+  detectIncludeMessagesFalse(input, 0);
+
   // Track which summaryIds were expanded so we can avoid double-counting their tok.
   // The visitor descends into objects/arrays AND tries to JSON.parse strings —
   // OpenAI-style function_call blocks reassemble `arguments` as a JSON string
@@ -402,7 +442,9 @@ function recordExpandTokens(
     }
     if (typeof value === "string") {
       if (value.startsWith("sum_")) {
-        account.expandedSummaryIds.add(value);
+        if (!suppressExpandedTracking) {
+          account.expandedSummaryIds.add(value);
+        }
         return;
       }
       // Try to parse JSON string (function_call.arguments shape). Bail
@@ -432,10 +474,13 @@ function recordExpandTokens(
   };
   visitInput(input, 0);
 
-  // Find totalTokens in the output. Could be on details.totalTokens or a top-level totalTokens.
+  // Find totalTokens in the output AND track every descendant `summaryId`
+  // surfaced in the expansion result so cited descendants don't get
+  // double-counted.  We continue walking the tree even after `total` is set
+  // so deeper `summaryId` fields still get recorded.
   let total: number | undefined;
   const visitOutput = (value: unknown, depth: number): void => {
-    if (total !== undefined || depth > 4 || value == null) {
+    if (depth > 5 || value == null) {
       return;
     }
     if (typeof value === "string") {
@@ -469,14 +514,21 @@ function recordExpandTokens(
     }
     if (typeof value === "object") {
       const record = value as Record<string, unknown>;
+      // Capture every `summaryId: "sum_…"` field as descendant-expanded.  When
+      // a child expands a parent and then cites a returned descendant, the
+      // descendant must be tracked here so its describe-tok isn't added on
+      // top of the expand `totalTokens` (which already includes the
+      // descendant's content).
+      const summaryId = record.summaryId;
+      if (typeof summaryId === "string" && summaryId.startsWith("sum_")) {
+        account.expandedSummaryIds.add(summaryId);
+      }
       const direct = coerceFiniteNumber(record.totalTokens);
-      if (typeof direct === "number") {
+      if (typeof direct === "number" && total === undefined) {
         total = direct;
-        return;
       }
       for (const child of Object.values(record)) {
         visitOutput(child, depth + 1);
-        if (total !== undefined) return;
       }
     }
   };
@@ -1150,8 +1202,8 @@ async function runDelegatedExpandQuery(
 
       // Deterministic parent-side accountant: recompute totalSourceTokens from
       // observed lcm_expand / lcm_describe invocations rather than trusting the
-      // LLM-reported value (PR #513 relied on a prompt rule alone).  Override
-      // the child's number; emit a drift log when the two diverge by >10%.
+      // LLM-reported value (PR #513 relied on a prompt rule alone).  Emit a
+      // drift log when the two diverge by >10%.
       const observedAccount = buildObservedTokenAccount(messages);
       const childReportedTokens = parsed.value.totalSourceTokens;
       const parentComputedTokens = computeDeterministicTotalSourceTokens(
@@ -1172,9 +1224,22 @@ async function runDelegatedExpandQuery(
         );
       }
 
+      // Soft-fail: if the parent-side recompute saw zero observable evidence
+      // but the child reported nonzero work, keep the child's value.  This
+      // covers the case where tool results were externalized as
+      // `[LCM Tool Output: file_…]` references before the parent could read
+      // them — the accountant can't see file content, so a 0 here is more
+      // likely "blind spot" than "drift".  The drift log already fired so the
+      // signal is preserved.
+      const finalTotalSourceTokens =
+        parentComputedTokens === 0 && childReportedTokens > 0
+          ? childReportedTokens
+          : parentComputedTokens;
+
       return {
         ...parsed.value,
-        totalSourceTokens: parentComputedTokens,
+        totalSourceTokens: finalTotalSourceTokens,
+        expandTokens: observedAccount.expandTotalTokens,
       };
     } finally {
       try {
@@ -1479,9 +1544,14 @@ export function createLcmExpandQueryTool(input: {
               candidateCount: bucket.candidateCount,
               reply: delegatedReply,
             });
+            // Deduct only the `lcm_expand` portion, not the full
+            // `totalSourceTokens` — describe-only contributions don't actually
+            // consume `expansionTokenCap` (which gates expand-pass cost), so
+            // a bucket answered from `lcm_describe` alone shouldn't exhaust
+            // the global expansion budget for later buckets.
             remainingTokenCap = Math.max(
               0,
-              remainingTokenCap - Math.max(0, delegatedReply.totalSourceTokens),
+              remainingTokenCap - Math.max(0, delegatedReply.expandTokens),
             );
           } catch (error) {
             const failure = formatExpansionFailure(error);

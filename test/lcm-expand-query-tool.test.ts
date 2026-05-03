@@ -245,11 +245,14 @@ describe("createLcmExpandQueryTool", () => {
       citedIds: ["sum_a"],
       sourceConversationId: 42,
       expandedSummaryCount: 1,
-      // Parent-side accountant overrides child-reported tokens with the
-      // deterministic value computed from observed lcm_describe / lcm_expand
-      // tool calls in the child transcript.  The mock transcript carries no
-      // tool calls, so the parent computes 0.
-      totalSourceTokens: 0,
+      // Parent-side accountant recomputes from observed lcm_describe /
+      // lcm_expand tool calls in the child transcript.  When the mock
+      // transcript carries no observable tool calls AND the child reports
+      // nonzero work, the soft-fail keeps the child's value rather than
+      // forcing 0 — externalized tool results (`[LCM Tool Output: …]`)
+      // hide their token counts from the accountant, so a parent-computed
+      // 0 is more likely "blind spot" than "actual zero".
+      totalSourceTokens: 45000,
       truncated: false,
     });
 
@@ -1126,9 +1129,11 @@ describe("createLcmExpandQueryTool", () => {
       sourceConversationIds: [7, 9],
       citedIds: ["sum_beta", "sum_gamma", "sum_alpha"],
       expandedSummaryCount: 3,
-      // Parent-side accountant overrides child reports; mock transcript has no
-      // tool calls so each bucket contributes 0 to the deterministic total.
-      totalSourceTokens: 0,
+      // Parent-side accountant recomputes from observed tool calls; the mock
+      // transcript has no observable tool calls so the parent computes 0 per
+      // bucket, but the soft-fail keeps each bucket's child-reported value
+      // (700 + 300 = 1000).  See `runDelegatedExpandQuery` finalTotalSourceTokens.
+      totalSourceTokens: 1000,
       truncated: false,
       conversationBreakdown: [
         {
@@ -1251,9 +1256,10 @@ describe("createLcmExpandQueryTool", () => {
       sourceConversationIds: [7, 11],
       citedIds: ["sum_b", "sum_a"],
       expandedSummaryCount: 2,
-      // Parent-side accountant overrides child reports with the deterministic
-      // total observed in the child transcript (no tool calls in this mock).
-      totalSourceTokens: 0,
+      // Parent-side accountant recomputes from observed tool calls; mock
+      // transcript has none, so the soft-fall-back keeps each bucket's
+      // child-reported value (400 + 250 = 650).
+      totalSourceTokens: 650,
       truncated: false,
     });
     expect(result.details).not.toHaveProperty("sourceConversationId");
@@ -1359,9 +1365,9 @@ describe("createLcmExpandQueryTool", () => {
     expect(result.details).toMatchObject({
       sourceConversationIds: [20, 30, 40],
       expandedSummaryCount: 3,
-      // Parent-side accountant overrides child reports; mock transcript carries
-      // no observable tool calls so deterministic total is 0.
-      totalSourceTokens: 0,
+      // 3 buckets × 100 child-reported tokens; parent-observed is 0 per
+      // bucket so the soft-fall-back keeps the child values.
+      totalSourceTokens: 300,
       truncated: true,
     });
     expect(result.details).toMatchObject({
@@ -1456,9 +1462,9 @@ describe("createLcmExpandQueryTool", () => {
       sourceConversationIds: [7],
       citedIds: ["sum_ok"],
       expandedSummaryCount: 1,
-      // Parent-side accountant overrides child reports; mock transcript carries
-      // no observable tool calls so deterministic total is 0.
-      totalSourceTokens: 0,
+      // Single successful bucket with child-reported 250; parent-observed
+      // is 0 so the soft-fall-back keeps the child value.
+      totalSourceTokens: 250,
       truncated: true,
     });
     expect(result.details).toMatchObject({
@@ -2116,9 +2122,9 @@ describe("createLcmExpandQueryTool", () => {
       citedIds: ["sum_a"],
       sourceConversationId: 42,
       expandedSummaryCount: 1,
-      // Parent-side deterministic accountant; mock transcript has no observable
-      // tool calls so the override yields 0.
-      totalSourceTokens: 0,
+      // Soft-fall-back: parent observed no tool calls in the mock, so it
+      // keeps the child-reported value (1200) rather than overriding to 0.
+      totalSourceTokens: 1200,
       truncated: false,
     });
 
@@ -2132,9 +2138,8 @@ describe("createLcmExpandQueryTool", () => {
       citedIds: ["sum_a"],
       sourceConversationId: 42,
       expandedSummaryCount: 1,
-      // Parent-side deterministic accountant; mock transcript has no observable
-      // tool calls so the override yields 0.
-      totalSourceTokens: 0,
+      // Soft-fall-back keeps the child-reported value (1200).
+      totalSourceTokens: 1200,
       truncated: false,
     });
 
