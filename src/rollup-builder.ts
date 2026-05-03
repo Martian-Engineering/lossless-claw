@@ -473,18 +473,33 @@ export class RollupBuilder {
         .sort(compareSummariesChronologically);
       if (leafSummaries.length === 0) {
         try {
-          const existing = this.store.getRollup(
-            conversationId,
-            DAY_PERIOD_KIND,
-            dateKey,
-            this.config.timezone
+          // R3-FIX-2: read getRollup INSIDE the transaction so a concurrent
+          // rebuild that upserts a fresh rollup at the same slot cannot have
+          // its work destroyed by a stale-empty-snapshot delete from this
+          // racing caller. Mirrors P1-8's pattern in the non-empty branch
+          // (buildAggregateRollup + buildDayRollup).
+          let cleaned = false;
+          await withDatabaseTransaction(
+            this.store.db,
+            "BEGIN IMMEDIATE",
+            async () => {
+              const existing = this.store.getRollup(
+                conversationId,
+                DAY_PERIOD_KIND,
+                dateKey,
+                this.config.timezone
+              );
+              if (existing) {
+                this.store.deleteRollup(existing.rollup_id);
+                cleaned = true;
+              }
+            }
           );
-          if (existing) {
-            this.store.deleteRollup(existing.rollup_id);
+          if (cleaned) {
             result.built += 1;
-            continue;
+          } else {
+            result.skipped += 1;
           }
-          result.skipped += 1;
         } catch (error) {
           result.errors.push(
             `${dateKey}: empty-day cleanup failed: ${formatError(error)}`
@@ -580,17 +595,28 @@ export class RollupBuilder {
       .sort(compareSummariesChronologically);
 
     if (summaries.length === 0) {
-      const existing = this.store.getRollup(
-        conversationId,
-        DAY_PERIOD_KIND,
-        dateKey,
-        this.config.timezone
+      // R3-FIX-2: read getRollup INSIDE the transaction so a concurrent
+      // builder that upserts a fresh rollup at the same slot cannot have
+      // its work destroyed by a stale-empty-snapshot delete from this
+      // racing caller. Mirrors P1-8's pattern in the non-empty branch.
+      let cleaned = false;
+      await withDatabaseTransaction(
+        this.store.db,
+        "BEGIN IMMEDIATE",
+        async () => {
+          const existing = this.store.getRollup(
+            conversationId,
+            DAY_PERIOD_KIND,
+            dateKey,
+            this.config.timezone
+          );
+          if (existing) {
+            this.store.deleteRollup(existing.rollup_id);
+            cleaned = true;
+          }
+        }
       );
-      if (existing) {
-        this.store.deleteRollup(existing.rollup_id);
-        return true;
-      }
-      return false;
+      return cleaned;
     }
 
     const totalSourceTokens = summaries.reduce(

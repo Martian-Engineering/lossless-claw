@@ -1358,6 +1358,66 @@ describe("LCM sub-day window retrieval", () => {
     expect(firstGetRollup).toBeGreaterThan(txStart);
   });
 
+  it("wraps both buildDayRollup empty-day cleanup branches in a transaction (R3-FIX-2)", async () => {
+    // Structural assertion mirroring P1-8's: P1-8 closed the FK-consistency
+    // hole in buildAggregateRollup and the non-empty buildDayRollup path, but
+    // the empty-day cleanup branches still ran getRollup + deleteRollup
+    // outside any transaction. A concurrent rebuild that upserts a fresh
+    // rollup at the same (conv, kind, key) slot had its work destroyed by a
+    // stale-empty-snapshot delete from a racing caller. The fix wraps both
+    // empty-day branches (one in buildDailyRollups' loop, one in
+    // buildDayRollup itself) in withDatabaseTransaction("BEGIN IMMEDIATE", …)
+    // and reads getRollup INSIDE the transaction.
+    //
+    // A deterministic concurrency repro is hard; the structural assertion
+    // is acceptable per the Round-1 spec (matches P1-8's approach).
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = url.fileURLToPath(import.meta.url);
+    const source = fs.readFileSync(
+      path.join(path.dirname(here), "..", "src", "rollup-builder.ts"),
+      "utf8"
+    );
+
+    // Site 1: buildDailyRollups' empty-day branch.
+    const dailyStart = source.indexOf("async buildDailyRollups(");
+    expect(dailyStart).toBeGreaterThan(-1);
+    const dailyBody = source.slice(dailyStart);
+    const emptyBranch1 = dailyBody.indexOf("if (leafSummaries.length === 0)");
+    expect(emptyBranch1).toBeGreaterThan(-1);
+    // Bound the slice so we don't fall through into the non-empty branch's
+    // own withDatabaseTransaction(...) (would mask a missing tx in the
+    // empty-day branch).
+    const branch1Region = dailyBody.slice(
+      emptyBranch1,
+      dailyBody.indexOf("\n      const fingerprint = computeFingerprint(", emptyBranch1)
+    );
+    const tx1 = branch1Region.indexOf("withDatabaseTransaction(");
+    const get1 = branch1Region.indexOf("this.store.getRollup(");
+    const del1 = branch1Region.indexOf("this.store.deleteRollup(");
+    expect(tx1).toBeGreaterThan(-1);
+    expect(get1).toBeGreaterThan(tx1);
+    expect(del1).toBeGreaterThan(tx1);
+
+    // Site 2: buildDayRollup's empty-day branch.
+    const dayStart = source.indexOf("async buildDayRollup(");
+    expect(dayStart).toBeGreaterThan(-1);
+    const dayBody = source.slice(dayStart);
+    const emptyBranch2 = dayBody.indexOf("if (summaries.length === 0)");
+    expect(emptyBranch2).toBeGreaterThan(-1);
+    const branch2Region = dayBody.slice(
+      emptyBranch2,
+      dayBody.indexOf("\n    const totalSourceTokens", emptyBranch2)
+    );
+    const tx2 = branch2Region.indexOf("withDatabaseTransaction(");
+    const get2 = branch2Region.indexOf("this.store.getRollup(");
+    const del2 = branch2Region.indexOf("this.store.deleteRollup(");
+    expect(tx2).toBeGreaterThan(-1);
+    expect(get2).toBeGreaterThan(tx2);
+    expect(del2).toBeGreaterThan(tx2);
+  });
+
   it("does not extract just the first nested day's Key Items section for weekly/monthly aggregate rollups", () => {
     // The regex `/##\s+Key Items[\s\S]*?(?=\n##\s|$)/` extracts up to the next
     // ## header, so the FIRST nested day's bullets — and only those — would
