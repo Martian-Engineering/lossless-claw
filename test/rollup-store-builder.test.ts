@@ -1062,6 +1062,73 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("includes live-fallback digest entries when mode:'index' covers today's window", async () => {
+    const now = new Date("2026-04-27T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "today-index-live",
+        sessionKey: "agent:main:today-index-live",
+        title: "Today index live",
+      });
+
+      await summaryStore.insertSummary({
+        summaryId: "sum_today_live_index",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content:
+          "Live fallback digest content from same-day work that should appear in index mode.",
+        tokenCount: 14,
+        latestAt: now,
+      });
+
+      // No stored rollup at all for today — index mode previously returned
+      // "(no rollups in window)" because liveFallbackKeys were ignored.
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "today-index-live",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "today-index-live",
+      });
+
+      const result = await tool.execute("call-today-index", {
+        period: "today",
+        mode: "index",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain("Live fallback digest content");
+      expect(text).not.toContain("(no rollups in window)");
+      expect(text).toContain("(live fallback)");
+      expect(
+        (result.details as { status?: string; usedFallback?: boolean }).status
+      ).toBe("fallback");
+      expect(
+        (result.details as { status?: string; usedFallback?: boolean })
+          .usedFallback
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports failed stored rollups as degraded fallback responses", async () => {
     const { db, conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({

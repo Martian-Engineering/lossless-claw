@@ -1801,11 +1801,63 @@ export function createLcmRecentTool(input: {
                 );
           if (mode === "index") {
             const indexed = renderRollupsIndex(orderedRollups, budget);
-            rollupContent = indexed.content;
-            tokenCount = indexed.tokenCount;
-            status = indexed.status;
-            sourceSummaryIds = indexed.sourceSummaryIds;
-            sourceIds = sourceSummaryIds;
+            const liveDigestSections: string[] = [];
+            const liveSummaryIds: string[] = [];
+            const liveSourceIds: string[] = [];
+            for (const liveDayKey of liveFallbackKeys) {
+              const currentStart = getUtcDateForZonedMidnight(
+                liveDayKey,
+                timezone
+              );
+              const currentEnd = new Date(
+                Math.min(
+                  resolution.end.getTime(),
+                  getUtcDateForZonedMidnight(
+                    addDays(liveDayKey, 1),
+                    timezone
+                  ).getTime()
+                )
+              );
+              const live = renderFallbackRollupSection(
+                liveDayKey,
+                getRecentSummaryFallback(db, conversationId, currentStart, currentEnd),
+                timezone,
+                budget,
+                includeSources
+              );
+              const digest = extractRollupDigest(live.content, 600);
+              const digestSection = [
+                `#### day/${liveDayKey} (live fallback)`,
+                `- Status: fallback | Built: (live)`,
+                `- Sources: ${live.retainedSummaries.length} summaries`,
+                "",
+                digest,
+                "",
+              ].join("\n");
+              liveDigestSections.push(digestSection);
+              liveSummaryIds.push(...live.summaryIds);
+              liveSourceIds.push(...live.sourceIds);
+              usedFallback = true;
+              truncated = truncated || live.accounting.truncated;
+            }
+            const baseContent =
+              orderedRollups.length === 0 && liveDigestSections.length > 0
+                ? `### Rollup index (${liveDigestSections.length} period${liveDigestSections.length === 1 ? "" : "s"})`
+                : indexed.content;
+            const combinedContent = [
+              baseContent,
+              ...liveDigestSections,
+            ]
+              .filter((section) => section.trim().length > 0)
+              .join("\n\n");
+            rollupContent = combinedContent;
+            tokenCount = estimateTokens(combinedContent);
+            status =
+              orderedRollups.length === 0 && liveDigestSections.length > 0
+                ? "fallback"
+                : indexed.status;
+            sourceSummaryIds = [...indexed.sourceSummaryIds, ...liveSummaryIds];
+            sourceIds = [...indexed.sourceSummaryIds, ...liveSourceIds];
             truncated = truncated || indexed.truncated;
             lastBuiltAt = indexed.lastBuiltAt;
           } else {
