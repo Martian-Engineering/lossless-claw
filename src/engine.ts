@@ -5365,13 +5365,18 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    // Fall back to suffix matching.
+    // Fall back to suffix matching. If the DB is already longer than the
+    // incoming afterTurn batch and no suffix overlap exists, fail closed:
+    // importing the whole short batch as new would duplicate/pollute LCM with
+    // stale runtime tail snapshots. The transcript reconcile path runs before
+    // this and is responsible for importing genuine missing JSONL tail turns.
     return this.deduplicateSuffixFallback(
       conversationId,
       batch,
       storedBatch,
       storedMessageCount,
       "oversized",
+      { onNoOverlap: "skip" },
     );
   }
 
@@ -5386,6 +5391,7 @@ export class LcmContextEngine implements ContextEngine {
     storedBatch: ReturnType<typeof toStoredMessage>[],
     storedMessageCount: number,
     context: string,
+    options?: { onNoOverlap?: "ingest" | "skip" },
   ): Promise<AgentMessage[]> {
     const allStored = await this.conversationStore.getMessages(conversationId, {
       limit: storedMessageCount,
@@ -5430,6 +5436,14 @@ export class LcmContextEngine implements ContextEngine {
         );
         return newSlice;
       }
+    }
+
+    if (options?.onNoOverlap === "skip") {
+      this.deps.log.warn(
+        `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
+          `no overlap found — fail-closed skipping full batch`,
+      );
+      return [];
     }
 
     this.deps.log.warn(

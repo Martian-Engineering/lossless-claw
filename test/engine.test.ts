@@ -9803,6 +9803,54 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     expect(stored.map((m) => m.content)).toEqual(["hello", "world"]);
   });
 
+  it("fails closed for oversized no-overlap afterTurn batches", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "dedup-oversized-no-overlap-fail-closed";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-fail-closed"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "tool", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Simulates a short afterTurn runtime snapshot that has no overlap with
+    // the longer stored LCM conversation. Before this guard, LCM imported the
+    // whole batch as fresh rows and polluted context; the transcript reconcile
+    // path is responsible for genuine missing JSONL tail imports before this
+    // dedup check runs.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-fail-closed-2"),
+      messages: [
+        makeMessage({ role: "user", content: "unanchored user" }),
+        makeMessage({ role: "assistant", content: "unanchored assistant" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "old C"]);
+    expect(warnLog).toHaveBeenCalledWith(
+      `[lcm] dedup: oversized, storedCount=3 batchLen=2, no overlap found — fail-closed skipping full batch`,
+    );
+  });
+
   it("preserves a legitimate repeated first new message", async () => {
     const engine = createEngine();
     const sessionId = "dedup-repeated-first-new-message";
