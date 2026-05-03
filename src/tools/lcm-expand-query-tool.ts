@@ -97,6 +97,11 @@ type DelegatedExpandQueryReply = {
   citedIds: string[];
   expandedSummaryCount: number;
   totalSourceTokens: number;
+  /** Just the `lcm_expand` portion of the parent-computed token total —
+   *  excludes describe-only contributions. The cross-conversation bucket
+   *  loop deducts THIS from the global expansion budget so describe-only
+   *  buckets don't wrongly exhaust it. */
+  expandTokens: number;
   truncated: boolean;
 };
 
@@ -311,6 +316,491 @@ function formatInvalidDelegatedReply(reply: string, reason: string): string {
   const compact = reply.replace(/\s+/g, " ").trim();
   const snippet = compact.length <= 240 ? compact : `${compact.slice(0, 240)}...`;
   return `Delegated expansion query returned ${reason}: ${snippet}`;
+}
+
+type ObservedTokenAccount = {
+  expandTotalTokens: number;
+  describedSummaryTokens: Map<string, number>;
+  expandedSummaryIds: Set<string>;
+};
+
+function coerceFiniteNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return value;
+}
+
+/** Extract the summaryIds passed to a `lcm_describe` call (the "explicit
+ *  describe target" — usually a single ID, occasionally a small list).  Only
+ *  these summaries' content is actually retrieved by the call; manifest
+ *  entries returned alongside are just family/sibling pointers and their
+ *  `tok` should NOT be billed against `totalSourceTokens` if the child later
+ *  cites them. */
+function extractDescribeTargets(input: unknown): Set<string> {
+  const targets = new Set<string>();
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 4 || value == null) return;
+    if (typeof value === "string") {
+      if (value.startsWith("sum_")) {
+        targets.add(value);
+        return;
+      }
+      const trimmed = value.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          visit(JSON.parse(trimmed), depth + 1);
+        } catch {
+          /* not JSON */
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) visit(entry, depth + 1);
+      return;
+    }
+    if (typeof value === "object") {
+      for (const child of Object.values(value as Record<string, unknown>)) {
+        visit(child, depth + 1);
+      }
+    }
+  };
+  visit(input, 0);
+  return targets;
+}
+
+function recordDescribeTokens(
+  account: ObservedTokenAccount,
+  input: unknown,
+  output: unknown,
+): void {
+  const targets = extractDescribeTargets(input);
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 4 || value == null) {
+      return;
+    }
+    if (typeof value === "string") {
+      // Parse text-form describe output: "LCM_SUMMARY sum_xxx" + "meta ... tok=N".
+      // Only record tok for the header-described summary (the call's explicit
+      // target).  Manifest lines like "d0 sum_yyy k=leaf tok=N" surface
+      // related summaries' metadata, but `lcm_describe` does NOT retrieve their
+      // content — billing those tokens against `totalSourceTokens` when the
+      // child later cites them would prematurely exhaust the cross-conversation
+      // budget for evidence the child never actually consumed.
+      const headerMatch = value.match(/LCM_SUMMARY\s+(sum_[A-Za-z0-9_-]+)[\s\S]*?\btok=(\d+)/);
+      if (headerMatch) {
+        const summaryId = headerMatch[1];
+        const tok = Number(headerMatch[2]);
+        if (Number.isFinite(tok) && !account.describedSummaryTokens.has(summaryId)) {
+          account.describedSummaryTokens.set(summaryId, tok);
+        }
+      }
+      // Also accept manifest-line `tok` values, but ONLY for IDs that were
+      // explicit input targets (a multi-id `lcm_describe` call returns the
+      // header for one and manifest lines for the others).
+      if (targets.size > 0) {
+        const manifestRe = /\b(sum_[A-Za-z0-9_-]+)\s+k=\w+\s+tok=(\d+)/g;
+        let match: RegExpExecArray | null;
+        while ((match = manifestRe.exec(value)) !== null) {
+          const summaryId = match[1];
+          if (!targets.has(summaryId)) continue;
+          const tok = Number(match[2]);
+          if (Number.isFinite(tok) && !account.describedSummaryTokens.has(summaryId)) {
+            account.describedSummaryTokens.set(summaryId, tok);
+          }
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visit(entry, depth + 1);
+      }
+      return;
+    }
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      // Structured details: only record when the summary is a describe target.
+      // The structured shape can include a manifest (`{ manifest: { nodes: [...]
+      // {summaryId, tokenCount} ... ] } }`) listing siblings whose content
+      // wasn't retrieved — same gating as the text path.
+      const summaryId =
+        typeof record.summaryId === "string"
+          ? record.summaryId
+          : typeof record.id === "string" && (record.id as string).startsWith("sum_")
+            ? (record.id as string)
+            : undefined;
+      const tokenCount = coerceFiniteNumber(record.tokenCount);
+      if (
+        summaryId &&
+        typeof tokenCount === "number" &&
+        (targets.size === 0 || targets.has(summaryId))
+      ) {
+        if (!account.describedSummaryTokens.has(summaryId)) {
+          account.describedSummaryTokens.set(summaryId, tokenCount);
+        }
+      }
+      for (const child of Object.values(record)) {
+        visit(child, depth + 1);
+      }
+    }
+  };
+  visit(output, 0);
+}
+
+/** Parse text blocks for `[LCM Tool Output: file_<id> | ... | <N> bytes]`
+ *  references (oversized tool results that were externalized into the
+ *  large_files store before the parent could read them).  These reach the
+ *  child transcript as plain text blocks, NOT as `tool_result`/
+ *  `function_call_output` shapes — so without this parser the accountant
+ *  would conclude the bucket consumed 0 tokens even when the child actually
+ *  read substantial source content.
+ *
+ *  The byte count from the externalized reference is converted to an
+ *  approximate token count (`bytes / 4`) — a coarse heuristic that is
+ *  intentionally conservative so a real consumed-content signal isn't lost
+ *  to a 0 floor.  Where this matters most is the soft-fall-back in
+ *  `runDelegatedExpandQuery`: a non-zero parent total prevents the soft-fall-
+ *  back from surfacing a 'parent saw nothing' undercount when the bucket
+ *  actually consumed source content via an externalized tool result. */
+function recordExternalizedToolOutputs(
+  account: ObservedTokenAccount,
+  text: string,
+): void {
+  const re = /\[LCM Tool Output: (file_[a-f0-9]{16})\b[^\]]*?(\d{1,3}(?:,\d{3})*)\s+bytes\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const fileId = match[1];
+    const bytes = Number(match[2].replace(/,/g, ""));
+    if (Number.isFinite(bytes) && bytes > 0 && !account.describedSummaryTokens.has(fileId)) {
+      // Approximate token estimate: ~4 bytes/token for typical English text.
+      // Coarse but conservative — we'd rather slightly overcount than
+      // silently zero out a bucket that consumed real source content.
+      const approxTokens = Math.max(1, Math.floor(bytes / 4));
+      account.expandTotalTokens += approxTokens;
+    }
+  }
+}
+
+function recordExpandTokens(
+  account: ObservedTokenAccount,
+  input: unknown,
+  output: unknown,
+): void {
+  // Inspect the input for `includeMessages: false` — when an expand call sets
+  // that flag and targets a single leaf, the expand output's `totalTokens` is
+  // 0 (the call returns the manifest, not the message body). The actual
+  // token contribution for that leaf comes from `lcm_describe`'s `tok`, so
+  // we must NOT add the leaf to `expandedSummaryIds` (which would suppress
+  // its describe-tok in `computeDeterministicTotalSourceTokens`).
+  let suppressExpandedTracking = false;
+  const detectIncludeMessagesFalse = (value: unknown, depth: number): void => {
+    if (suppressExpandedTracking || depth > 4 || value == null) return;
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          detectIncludeMessagesFalse(JSON.parse(trimmed), depth + 1);
+        } catch {
+          /* not JSON */
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const v of value) detectIncludeMessagesFalse(v, depth + 1);
+      return;
+    }
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      if (record.includeMessages === false) {
+        suppressExpandedTracking = true;
+        return;
+      }
+      for (const v of Object.values(record)) detectIncludeMessagesFalse(v, depth + 1);
+    }
+  };
+  detectIncludeMessagesFalse(input, 0);
+
+  // Track which summaryIds were expanded so we can avoid double-counting their tok.
+  // The visitor descends into objects/arrays AND tries to JSON.parse strings —
+  // OpenAI-style function_call blocks reassemble `arguments` as a JSON string
+  // in this codebase, so a structured-input-only walker would miss the
+  // expanded summary IDs and a described leaf would later be counted twice
+  // (once as expanded, once as cited-described).
+  const visitInput = (value: unknown, depth: number): void => {
+    if (depth > 4 || value == null) {
+      return;
+    }
+    if (typeof value === "string") {
+      if (value.startsWith("sum_")) {
+        if (!suppressExpandedTracking) {
+          account.expandedSummaryIds.add(value);
+        }
+        return;
+      }
+      // Try to parse JSON string (function_call.arguments shape). Bail
+      // silently on parse error — the value is just a plain string.
+      const trimmed = value.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          visitInput(parsed, depth + 1);
+        } catch {
+          /* not JSON, ignore */
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visitInput(entry, depth + 1);
+      }
+      return;
+    }
+    if (typeof value === "object") {
+      for (const child of Object.values(value as Record<string, unknown>)) {
+        visitInput(child, depth + 1);
+      }
+    }
+  };
+  visitInput(input, 0);
+
+  // Find totalTokens in the output AND track every descendant `summaryId`
+  // surfaced in the expansion result so cited descendants don't get
+  // double-counted.  We continue walking the tree even after `total` is set
+  // so deeper `summaryId` fields still get recorded.
+  let total: number | undefined;
+  const visitOutput = (value: unknown, depth: number): void => {
+    if (depth > 5 || value == null) {
+      return;
+    }
+    if (typeof value === "string") {
+      // Text-form lcm_expand output uses `distillForSubagent`, which renders
+      // the heading `## Expansion Results (N summaries, M total tokens)`.
+      // Older shapes also surface `totalTokens=N` / `totalTokens: N`.
+      const distilledMatch = value.match(
+        /##\s+Expansion Results\s*\([^)]*?(\d+)\s+total tokens?\)/i,
+      );
+      if (distilledMatch) {
+        const n = Number(distilledMatch[1]);
+        if (Number.isFinite(n)) {
+          total = n;
+          return;
+        }
+      }
+      // Match `totalTokens=N`, `totalTokens: N`, AND JSON-form
+      // `"totalTokens":N` (the OpenAI function_call_output shape stringifies
+      // its output as JSON, where the key is double-quoted).
+      const m = value.match(/(?:\btotalTokens|"totalTokens")\s*[=:]\s*(\d+)/);
+      if (m) {
+        const n = Number(m[1]);
+        if (Number.isFinite(n)) {
+          total = n;
+        }
+      }
+      // Also try JSON.parse the string and recurse — covers structured
+      // `function_call_output.output` payloads where we want to pick up
+      // descendant `summaryId` fields too.
+      const trimmed = value.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          visitOutput(JSON.parse(trimmed), depth + 1);
+        } catch {
+          /* not JSON, ignore */
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visitOutput(entry, depth + 1);
+      }
+      return;
+    }
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      // Capture every `summaryId: "sum_…"` field as descendant-expanded.  When
+      // a child expands a parent and then cites a returned descendant, the
+      // descendant must be tracked here so its describe-tok isn't added on
+      // top of the expand `totalTokens` (which already includes the
+      // descendant's content).
+      const summaryId = record.summaryId;
+      if (typeof summaryId === "string" && summaryId.startsWith("sum_")) {
+        account.expandedSummaryIds.add(summaryId);
+      }
+      const direct = coerceFiniteNumber(record.totalTokens);
+      if (typeof direct === "number" && total === undefined) {
+        total = direct;
+      }
+      for (const child of Object.values(record)) {
+        visitOutput(child, depth + 1);
+      }
+    }
+  };
+  visitOutput(output, 0);
+  if (typeof total === "number") {
+    account.expandTotalTokens += Math.max(0, total);
+  }
+}
+
+/**
+ * Walk the delegated child session transcript and observe lcm_expand /
+ * lcm_describe tool invocations so the parent can deterministically recompute
+ * totalSourceTokens regardless of what the child reports.
+ */
+function buildObservedTokenAccount(messages: unknown[]): ObservedTokenAccount {
+  const account: ObservedTokenAccount = {
+    expandTotalTokens: 0,
+    describedSummaryTokens: new Map(),
+    expandedSummaryIds: new Set(),
+  };
+  if (!Array.isArray(messages)) {
+    return account;
+  }
+
+  // First pass: collect tool_use blocks keyed by their id, capturing tool name and input.
+  type ToolUseRecord = { name: string; input: unknown };
+  const toolUses = new Map<string, ToolUseRecord>();
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const content = (message as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const record = block as Record<string, unknown>;
+      const type = typeof record.type === "string" ? record.type : "";
+      const isToolCall =
+        type === "tool_use" ||
+        type === "tool-use" ||
+        type === "toolUse" ||
+        type === "toolCall" ||
+        type === "function_call" ||
+        type === "functionCall";
+      if (!isToolCall) continue;
+      const name =
+        typeof record.name === "string"
+          ? record.name
+          : typeof record.toolName === "string"
+            ? (record.toolName as string)
+            : "";
+      const id =
+        typeof record.id === "string"
+          ? record.id
+          : typeof record.tool_use_id === "string"
+            ? (record.tool_use_id as string)
+            : typeof record.call_id === "string"
+              ? (record.call_id as string)
+              : "";
+      if (!name || !id) continue;
+      if (name !== "lcm_expand" && name !== "lcm_describe") continue;
+      const input = record.input ?? record.arguments;
+      toolUses.set(id, { name, input });
+    }
+  }
+
+  // Second pass: match tool_result blocks back to their tool_use by id, AND
+  // scan plain text blocks for `[LCM Tool Output: file_… | … | <N> bytes]`
+  // externalized references (oversized tool results that were swapped for a
+  // placeholder text block before reaching the child transcript — without
+  // this scan the accountant would silently undercount any bucket whose
+  // tool result was externalized).
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const content = (message as { content?: unknown }).content;
+    if (typeof content === "string") {
+      recordExternalizedToolOutputs(account, content);
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const record = block as Record<string, unknown>;
+      const type = typeof record.type === "string" ? record.type : "";
+      // Plain text blocks may carry the `[LCM Tool Output: ...]` placeholder
+      // when an oversized tool result was externalized.  Scan those first;
+      // it's a separate signal from the structured-tool-result branch below.
+      if (type === "text") {
+        const text = (record as { text?: unknown }).text;
+        if (typeof text === "string") {
+          recordExternalizedToolOutputs(account, text);
+        }
+        continue;
+      }
+      const isToolResult =
+        type === "tool_result" ||
+        type === "toolResult" ||
+        type === "function_call_output";
+      if (!isToolResult) continue;
+      const useId =
+        typeof record.tool_use_id === "string"
+          ? record.tool_use_id
+          : typeof record.call_id === "string"
+            ? (record.call_id as string)
+            : typeof record.toolCallId === "string"
+              ? (record.toolCallId as string)
+              : "";
+      const matchedUse = useId ? toolUses.get(useId) : undefined;
+      // Fall back to name-on-result if id linkage is missing.
+      const resolvedName =
+        matchedUse?.name ??
+        (typeof record.name === "string" &&
+        (record.name === "lcm_expand" || record.name === "lcm_describe")
+          ? (record.name as string)
+          : "");
+      if (resolvedName !== "lcm_expand" && resolvedName !== "lcm_describe") continue;
+      const output = record.output ?? record.content ?? record.result;
+      // Tool result content can ALSO be an externalized text shape — scan
+      // it for `[LCM Tool Output: ...]` references in addition to whatever
+      // structured token info the recordX functions can extract.
+      if (typeof output === "string") {
+        recordExternalizedToolOutputs(account, output);
+      }
+      if (resolvedName === "lcm_expand") {
+        recordExpandTokens(account, matchedUse?.input, output);
+      } else {
+        recordDescribeTokens(account, matchedUse?.input, output);
+      }
+    }
+  }
+
+  return account;
+}
+
+/**
+ * Compute the deterministic parent-side totalSourceTokens from observed
+ * tool calls and the child's declared cited summaries.
+ */
+function computeDeterministicTotalSourceTokens(
+  account: ObservedTokenAccount,
+  citedIds: string[],
+): number {
+  let total = account.expandTotalTokens;
+  for (const id of citedIds) {
+    if (account.expandedSummaryIds.has(id)) {
+      continue;
+    }
+    const tok = account.describedSummaryTokens.get(id);
+    if (typeof tok === "number" && tok > 0) {
+      total += tok;
+    }
+  }
+  return Math.max(0, Math.floor(total));
+}
+
+const TOKEN_COUNT_DRIFT_TOLERANCE = 0.1;
+
+function isTokenCountDrift(childReported: number, parentComputed: number): boolean {
+  if (childReported === parentComputed) {
+    return false;
+  }
+  if (parentComputed === 0) {
+    // Any nonzero child count when parent saw zero observable evidence is drift.
+    return childReported !== 0;
+  }
+  const ratio = Math.abs(childReported - parentComputed) / parentComputed;
+  return ratio > TOKEN_COUNT_DRIFT_TOLERANCE;
 }
 
 function buildConversationBuckets(candidates: SummaryCandidate[]): ConversationBucket[] {
@@ -814,14 +1304,19 @@ async function runDelegatedExpandQuery(
         throw new Error(formatExpansionFailure(wait?.error));
       }
 
+      // Fetch the entire delegated child transcript (no `limit`) so the
+      // parent-side accountant in `buildObservedTokenAccount` doesn't drop
+      // older `lcm_describe`/`lcm_expand` calls when the child emits more
+      // than ~80 transcript entries.  An undercount on `totalSourceTokens`
+      // would let cross-conversation buckets exceed the global expansion
+      // budget.
       const replyPayload = (await params.deps.callGateway({
         method: "sessions.get",
-        params: { key: childSessionKey, limit: 80 },
+        params: { key: childSessionKey },
         timeoutMs: GATEWAY_TIMEOUT_MS,
       })) as { messages?: unknown[] };
-      const reply = params.deps.readLatestAssistantReply(
-        Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
-      );
+      const messages = Array.isArray(replyPayload.messages) ? replyPayload.messages : [];
+      const reply = params.deps.readLatestAssistantReply(messages);
       const parsed = parseDelegatedExpandQueryReply(reply, params.bucket.summaryIds.length);
       if (!parsed.ok) {
         throw new Error(parsed.error);
@@ -837,7 +1332,47 @@ async function runDelegatedExpandQuery(
         runId,
       });
 
-      return parsed.value;
+      // Deterministic parent-side accountant: recompute totalSourceTokens from
+      // observed lcm_expand / lcm_describe invocations rather than trusting the
+      // LLM-reported value (PR #513 relied on a prompt rule alone).  Emit a
+      // drift log when the two diverge by >10%.
+      const observedAccount = buildObservedTokenAccount(messages);
+      const childReportedTokens = parsed.value.totalSourceTokens;
+      const parentComputedTokens = computeDeterministicTotalSourceTokens(
+        observedAccount,
+        parsed.value.citedIds,
+      );
+      if (isTokenCountDrift(childReportedTokens, parentComputedTokens)) {
+        params.deps.log.info(
+          `[lcm] lcm.expand_query.token_count_drift requestId=${params.requestId} ` +
+            `conversationId=${params.bucket.conversationId} ` +
+            `childReported=${childReportedTokens} parentComputed=${parentComputedTokens} ` +
+            `expandTotal=${observedAccount.expandTotalTokens} ` +
+            `citedLeafContribCount=${parsed.value.citedIds.filter(
+              (id) =>
+                !observedAccount.expandedSummaryIds.has(id) &&
+                observedAccount.describedSummaryTokens.has(id),
+            ).length}`,
+        );
+      }
+
+      // Soft-fail: if the parent-side recompute saw zero observable evidence
+      // but the child reported nonzero work, keep the child's value.  This
+      // covers the case where tool results were externalized as
+      // `[LCM Tool Output: file_…]` references before the parent could read
+      // them — the accountant can't see file content, so a 0 here is more
+      // likely "blind spot" than "drift".  The drift log already fired so the
+      // signal is preserved.
+      const finalTotalSourceTokens =
+        parentComputedTokens === 0 && childReportedTokens > 0
+          ? childReportedTokens
+          : parentComputedTokens;
+
+      return {
+        ...parsed.value,
+        totalSourceTokens: finalTotalSourceTokens,
+        expandTokens: observedAccount.expandTotalTokens,
+      };
     } finally {
       try {
         await params.deps.callGateway({
@@ -1141,9 +1676,14 @@ export function createLcmExpandQueryTool(input: {
               candidateCount: bucket.candidateCount,
               reply: delegatedReply,
             });
+            // Deduct only the `lcm_expand` portion, not the full
+            // `totalSourceTokens` — describe-only contributions don't actually
+            // consume `expansionTokenCap` (which gates expand-pass cost), so
+            // a bucket answered from `lcm_describe` alone shouldn't exhaust
+            // the global expansion budget for later buckets.
             remainingTokenCap = Math.max(
               0,
-              remainingTokenCap - Math.max(0, delegatedReply.totalSourceTokens),
+              remainingTokenCap - Math.max(0, delegatedReply.expandTokens),
             );
           } catch (error) {
             const failure = formatExpansionFailure(error);
