@@ -4,6 +4,14 @@
   "skills": [
     "skills/lossless-claw"
   ],
+  "contracts": {
+    "tools": [
+      "lcm_grep",
+      "lcm_describe",
+      "lcm_expand",
+      "lcm_expand_query"
+    ]
+  },
   "uiHints": {
     "enabled": {
       "label": "Enabled",
