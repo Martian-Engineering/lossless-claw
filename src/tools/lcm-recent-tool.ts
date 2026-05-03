@@ -11,7 +11,7 @@ import {
   getUtcDateForZonedMidnight,
   getZonedDayString,
 } from "../timezone-windows.js";
-import type { LcmDependencies } from "../types.js";
+import type { Clock, LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
@@ -408,7 +408,8 @@ function parseBaseDay(
 function resolveWindowPeriod(
   normalized: string,
   timezone: string,
-  today: string
+  today: string,
+  clock: Clock
 ): PeriodResolution | null {
   const relative =
     /^last\s+(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)$/.exec(
@@ -421,7 +422,7 @@ function resolveWindowPeriod(
     if (!Number.isFinite(minutes) || minutes <= 0) {
       return null;
     }
-    const end = new Date();
+    const end = clock.now();
     const start = new Date(end.getTime() - minutes * 60_000);
     return {
       label: `last ${amount}${unit.startsWith("h") ? "h" : "m"}`,
@@ -477,11 +478,11 @@ function resolveWindowPeriod(
   };
 }
 
-function resolvePeriod(period: string, timezone: string): PeriodResolution {
+function resolvePeriod(period: string, timezone: string, clock: Clock): PeriodResolution {
   const normalized = period.trim().toLowerCase().replace(/\s+/g, " ");
-  const now = new Date();
+  const now = clock.now();
   const today = getZonedDayString(now, timezone);
-  const windowPeriod = resolveWindowPeriod(normalized, timezone, today);
+  const windowPeriod = resolveWindowPeriod(normalized, timezone, today, clock);
   if (windowPeriod) {
     return windowPeriod;
   }
@@ -1375,7 +1376,7 @@ export function createLcmRecentTool(input: {
 
       let resolution: PeriodResolution;
       try {
-        resolution = resolvePeriod(String(p.period ?? ""), timezone);
+        resolution = resolvePeriod(String(p.period ?? ""), timezone, input.deps.clock);
       } catch (error) {
         return jsonResult({
           error: error instanceof Error ? error.message : "Invalid period.",
@@ -1463,7 +1464,7 @@ export function createLcmRecentTool(input: {
       let degradedReason: string | undefined;
       let lastBuiltAt: Date | null = null;
 
-      const currentDayKey = getZonedDayString(new Date(), timezone);
+      const currentDayKey = getZonedDayString(input.deps.clock.now(), timezone);
       const rollupState = rollupStore.getState(conversationId);
       const lastPendingMessageAt =
         rollupState?.pending_rebuild === 1 && rollupState.last_message_at

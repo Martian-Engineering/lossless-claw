@@ -337,6 +337,7 @@ import type { LcmDependencies } from "../src/types.js";
 
 function makeRecentDeps(): LcmDependencies {
   return {
+    clock: { now: () => new Date() },
     config: {
       enabled: true,
       databasePath: ":memory:",
@@ -418,9 +419,11 @@ function makeLcmForConversation(input: {
 
 describe("LCM sub-day window retrieval", () => {
   it("parses deterministic local-time windows with DST-safe UTC bounds", () => {
+    const liveClock = { now: () => new Date() };
     const dateWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-03-08 1:30-3:30",
-      "America/New_York"
+      "America/New_York",
+      liveClock
     );
     expect(dateWindow.label).toBe("2026-03-08 1:30-3:30");
     expect(dateWindow.window?.startMinutes).toBe(90);
@@ -430,7 +433,8 @@ describe("LCM sub-day window retrieval", () => {
 
     const namedWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 morning",
-      "Asia/Bangkok"
+      "Asia/Bangkok",
+      liveClock
     );
     expect(namedWindow.label).toBe("2026-04-27 morning");
     expect(namedWindow.start.toISOString()).toBe("2026-04-26T23:00:00.000Z");
@@ -438,7 +442,8 @@ describe("LCM sub-day window retrieval", () => {
 
     const meridiemWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 4-8pm",
-      "Asia/Bangkok"
+      "Asia/Bangkok",
+      liveClock
     );
     expect(meridiemWindow.window?.startMinutes).toBe(16 * 60);
     expect(meridiemWindow.window?.endMinutes).toBe(20 * 60);
@@ -446,20 +451,23 @@ describe("LCM sub-day window retrieval", () => {
     expect(() =>
       __lcmRecentTestInternals.resolvePeriod(
         "date:2026-03-08 2:30-3:30",
-        "America/New_York"
+        "America/New_York",
+        liveClock
       )
     ).toThrow(/Nonexistent local time/);
 
     const nightWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 night",
-      "Pacific/Auckland"
+      "Pacific/Auckland",
+      liveClock
     );
     expect(nightWindow.start.toISOString()).toBe("2026-04-27T10:00:00.000Z");
     expect(nightWindow.end.toISOString()).toBe("2026-04-27T12:00:00.000Z");
 
     const midnightTransition = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-03-28",
-      "Asia/Gaza"
+      "Asia/Gaza",
+      liveClock
     );
     expect(midnightTransition.start.toISOString()).toBe(
       "2026-03-27T22:00:00.000Z"
@@ -467,7 +475,8 @@ describe("LCM sub-day window retrieval", () => {
 
     const skippedMidnight = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-24",
-      "Africa/Cairo"
+      "Africa/Cairo",
+      liveClock
     );
     expect(skippedMidnight.start.toISOString()).toBe(
       "2026-04-23T22:00:00.000Z"
@@ -475,7 +484,8 @@ describe("LCM sub-day window retrieval", () => {
 
     const skippedMidnightNight = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-23 night",
-      "Africa/Cairo"
+      "Africa/Cairo",
+      liveClock
     );
     expect(skippedMidnightNight.start.toISOString()).toBe(
       "2026-04-23T20:00:00.000Z"
@@ -486,7 +496,8 @@ describe("LCM sub-day window retrieval", () => {
 
     const explicitEndOfDay = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-23 22:00-24:00",
-      "Africa/Cairo"
+      "Africa/Cairo",
+      liveClock
     );
     expect(explicitEndOfDay.window?.endMinutes).toBe(24 * 60);
     expect(explicitEndOfDay.start.toISOString()).toBe(
@@ -2507,12 +2518,29 @@ describe("LCM weekly and monthly rollups", () => {
   });
 
   it("rejects invalid plain dates", async () => {
+    const liveClock = { now: () => new Date() };
     expect(() =>
-      __lcmRecentTestInternals.resolvePeriod("date:2026-02-30", "UTC")
+      __lcmRecentTestInternals.resolvePeriod("date:2026-02-30", "UTC", liveClock)
     ).toThrow(/real calendar date/i);
     expect(() =>
-      __lcmRecentTestInternals.resolvePeriod("date:2026-13-01", "UTC")
+      __lcmRecentTestInternals.resolvePeriod("date:2026-13-01", "UTC", liveClock)
     ).toThrow(/real calendar date/i);
+  });
+
+  it("anchors 'today' off the injected clock — B3 regression", () => {
+    // Frozen clock independent of wall time. resolvePeriod("today") must
+    // produce the day key for 2026-04-15 in UTC, regardless of the real
+    // wall clock when the test runs. Pins the Clock-injection contract.
+    const frozen = { now: () => new Date("2026-04-15T12:00:00Z") };
+    const today = __lcmRecentTestInternals.resolvePeriod("today", "UTC", frozen);
+    expect(today.periodKey).toBe("2026-04-15");
+    expect(today.start.toISOString()).toBe("2026-04-15T00:00:00.000Z");
+    expect(today.end.toISOString()).toBe("2026-04-16T00:00:00.000Z");
+
+    // 'last 1h' must terminate at the frozen now.
+    const window = __lcmRecentTestInternals.resolvePeriod("last 1h", "UTC", frozen);
+    expect(window.end.toISOString()).toBe("2026-04-15T12:00:00.000Z");
+    expect(window.start.toISOString()).toBe("2026-04-15T11:00:00.000Z");
   });
 
   it("builds week and month aggregates whose boundaries skip local midnight", async () => {
