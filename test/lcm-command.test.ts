@@ -1024,6 +1024,7 @@ describe("lcm command", () => {
     const config = resolveLcmConfig({}, { dbPath: "/tmp/unused.db" });
     const deps: LcmDependencies = {
       config,
+      clock: { now: () => new Date() },
       complete: runtimeComplete as LcmDependencies["complete"],
       callGateway: vi.fn(async () => ({})) as LcmDependencies["callGateway"],
       resolveModel: vi.fn((modelRef?: string) => {

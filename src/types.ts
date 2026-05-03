@@ -101,12 +101,34 @@ export type ParseAgentSessionKeyFn = (sessionKey: string) => {
 export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 
 /**
+ * Clock service injected through LcmDependencies. Every read-path wall-clock
+ * read in the LCM engine and tools MUST go through this — never `new Date()`
+ * or `Date.now()` directly.
+ *
+ * The plugin's default implementation returns the live wall clock. A future
+ * deterministic-replay harness in the openclaw host substitutes an impl that
+ * returns the recorded turn-start timestamp, making `lcm_recent` output a
+ * pure function of the recorded inputs.
+ */
+export interface Clock {
+  /** Current wall-clock time. */
+  now(): Date;
+}
+
+/**
  * Dependencies injected into the LCM engine at registration time.
  * These replace all direct imports from OpenClaw core.
  */
 export interface LcmDependencies {
   /** LCM configuration (from env vars + plugin config) */
   config: LcmConfig;
+
+  /**
+   * Clock service. REQUIRED — every read-path wall-clock read goes through
+   * `deps.clock.now()` rather than `new Date()` directly. The plugin always
+   * populates this with a live-clock impl; tests inject a frozen clock.
+   */
+  clock: Clock;
 
   /** Optional config resolution metadata for startup diagnostics. */
   configDiagnostics?: LcmConfigDiagnostics;
@@ -173,4 +195,15 @@ export interface LcmDependencies {
     error: (msg: string) => void;
     debug: (msg: string) => void;
   };
+
+  /**
+   * Optional: look up the configured input context window (in tokens) for a given
+   * provider/model identifier. Used by lcm_recent to auto-pick `detailLevel` based
+   * on the agent's remaining context. Returns null if unknown.
+   *
+   * Implementation should consult the runtime's model registry (eg. openclaw.json
+   * `agents.defaults.models[id].contextWindow`). LCM never parses host config
+   * directly — this callback is the contract.
+   */
+  getModelContextWindow?: (model: string) => number | null;
 }

@@ -96,6 +96,7 @@ function createTestDeps(
 ): LcmDependencies {
   return {
     config,
+    clock: { now: () => new Date() },
     complete: vi.fn(async () => ({
       content: [{ type: "text", text: "summary output" }],
     })),
@@ -284,6 +285,31 @@ describe("LcmContextEngine metadata", () => {
   it("advertises ownsCompaction capability", () => {
     const engine = createEngine();
     expect(engine.info.ownsCompaction).toBe(true);
+  });
+
+  it("sums deferredCompactionResult and transcript-GC bytesFreed/rewrittenEntries in combinedResult (P3)", async () => {
+    // Structural assertion: pre-fix the combinedResult branch in
+    // engine.ts:5606-5613 set bytesFreed/rewrittenEntries directly from
+    // `result` (transcript GC) and silently dropped the deferred-compaction
+    // metrics. Setting up a real maintain run where both phases fire is
+    // expensive; instead read the source and confirm the sum.
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = url.fileURLToPath(import.meta.url);
+    const source = fs.readFileSync(
+      path.join(path.dirname(here), "..", "src", "engine.ts"),
+      "utf8",
+    );
+    const idx = source.indexOf("const combinedResult = deferredCompactionResult");
+    expect(idx).toBeGreaterThan(-1);
+    const block = source.slice(idx, idx + 800);
+    expect(block).toMatch(
+      /bytesFreed:[\s\S]*deferredCompactionResult\.bytesFreed[\s\S]*\+[\s\S]*result\.bytesFreed/,
+    );
+    expect(block).toMatch(
+      /rewrittenEntries:[\s\S]*deferredCompactionResult\.rewrittenEntries[\s\S]*\+[\s\S]*result\.rewrittenEntries/,
+    );
   });
 
   it("configures file-backed sqlite connections with WAL and busy_timeout", () => {
@@ -2389,6 +2415,165 @@ describe("LcmContextEngine.ingest content extraction", () => {
       });
       expect(rewriteTranscriptEntries).not.toHaveBeenCalled();
       expect(await engine.getConversationStore().getConversationBySessionId(sessionId)).not.toBeNull();
+    });
+  });
+
+  it("maintain() narrows rollup rebuild sweeps from the last check time", async () => {
+    const engine = createEngineWithConfig({
+      transcriptGcEnabled: false,
+    });
+    const sessionId = randomUUID();
+    const sessionFile = createSessionFilePath("rollup-maintenance-window");
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed rollup maintenance" }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    engine.getRollupStore().upsertState(conversation!.conversationId, {
+      timezone: "UTC",
+      last_rollup_check_at: "2026-04-29T10:00:00.000Z",
+      pending_rebuild: 1,
+    });
+    const buildDailySpy = vi.spyOn(engine.getRollupBuilder(), "buildDailyRollups");
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-29T12:00:00.000Z"));
+    try {
+      await engine.maintain({
+        sessionId,
+        sessionFile,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(buildDailySpy).toHaveBeenCalledWith(conversation!.conversationId, {
+      daysBack: 2,
+      forceCurrentDay: true,
+    });
+  });
+
+  it("timezone getter is strict ('UTC' default + one-time warning) — B5 regression", () => {
+    const warnSpy = vi.fn();
+    const engine = createEngineWithDeps(
+      { timezone: "" },
+      {
+        log: {
+          info: vi.fn(),
+          warn: warnSpy,
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+
+    // Strict fallback to UTC, no Intl resolvedOptions().
+    expect(engine.timezone).toBe("UTC");
+    // Repeated reads do not re-emit the warning — debounced via construction.
+    expect(engine.timezone).toBe("UTC");
+    expect(engine.timezone).toBe("UTC");
+
+    const tzWarnings = warnSpy.mock.calls.filter((args) =>
+      typeof args[0] === "string" && args[0].includes("config.timezone is unset"),
+    );
+    expect(tzWarnings.length).toBe(1);
+  });
+
+  it("timezone getter does not warn when config.timezone is set — B5 regression", () => {
+    const warnSpy = vi.fn();
+    const engine = createEngineWithDeps(
+      { timezone: "America/Los_Angeles" },
+      {
+        log: {
+          info: vi.fn(),
+          warn: warnSpy,
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+
+    expect(engine.timezone).toBe("America/Los_Angeles");
+    const tzWarnings = warnSpy.mock.calls.filter((args) =>
+      typeof args[0] === "string" && args[0].includes("config.timezone is unset"),
+    );
+    expect(tzWarnings.length).toBe(0);
+  });
+
+  it("timezone getter treats whitespace-only config.timezone as unset (RD-FIX-1 regression)", () => {
+    // A whitespace-only timezone string (e.g. accidentally-quoted env var like
+    // LCM_TIMEZONE='   ') previously bypassed BOTH the strict-UTC fallback and
+    // the construction-time warning, leaving Intl.DateTimeFormat to throw
+    // RangeError on the first rollup-maintenance pass.
+    const warnSpy = vi.fn();
+    const engine = createEngineWithDeps(
+      { timezone: "   " },
+      {
+        log: {
+          info: vi.fn(),
+          warn: warnSpy,
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+
+    // (a) Construction-time warning fires exactly once for whitespace.
+    const tzWarnings = warnSpy.mock.calls.filter((args) =>
+      typeof args[0] === "string" && args[0].includes("config.timezone is unset"),
+    );
+    expect(tzWarnings.length).toBe(1);
+
+    // (b) Getter returns 'UTC', not the whitespace verbatim.
+    expect(engine.timezone).toBe("UTC");
+
+    // (c) Downstream Intl.DateTimeFormat does not throw with the resolved tz.
+    expect(() =>
+      new Intl.DateTimeFormat("en-CA", { timeZone: engine.timezone }),
+    ).not.toThrow();
+  });
+
+  it("maintain() uses deps.clock.now() to compute rollup-maintenance daysBack — B4 regression", async () => {
+    // Inject a frozen clock at engine construction. computeRollupMaintenanceDaysBack
+    // must use it, not wall time. Without vi.setSystemTime — proves the
+    // clock injection threads through, not that vi.useFakeTimers happens to
+    // catch \`new Date()\`.
+    const frozenAt = new Date("2026-04-29T12:00:00.000Z");
+    const engine = createEngineWithDeps(
+      { transcriptGcEnabled: false },
+      { clock: { now: () => frozenAt } },
+    );
+    const sessionId = randomUUID();
+    const sessionFile = createSessionFilePath("rollup-maintenance-clock-injection");
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed rollup maintenance" }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    // last_rollup_check_at = frozenAt - 2d 2h, so elapsedDays = ceil(2.083) = 3.
+    // daysBack = min(30, max(1, 3 + 1)) = 4.
+    engine.getRollupStore().upsertState(conversation!.conversationId, {
+      timezone: "UTC",
+      last_rollup_check_at: "2026-04-27T10:00:00.000Z",
+      pending_rebuild: 1,
+    });
+    const buildDailySpy = vi.spyOn(engine.getRollupBuilder(), "buildDailyRollups");
+
+    await engine.maintain({ sessionId, sessionFile });
+
+    expect(buildDailySpy).toHaveBeenCalledWith(conversation!.conversationId, {
+      daysBack: 4,
+      forceCurrentDay: true,
     });
   });
 

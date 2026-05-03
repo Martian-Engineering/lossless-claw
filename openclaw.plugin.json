@@ -83,11 +83,7 @@
     },
     "largeFilesDir": {
       "label": "Large Files Directory",
-      "help": "Directory for persisting large-file text payloads (default: <stateDir>/lcm-files). Uses OPENCLAW_STATE_DIR when set."
-    },
-    "largeFilesDir": {
-      "label": "Large Files Directory",
-      "help": "Directory for externalized large files and inline-image payloads (default: ~/.openclaw/lcm-files)"
+      "help": "Directory for externalized large files and inline-image payloads (default: <OPENCLAW_STATE_DIR>/lcm-files; falls back to ~/.openclaw/lcm-files)"
     },
     "ignoreSessionPatterns": {
       "label": "Ignored Sessions",
@@ -209,6 +205,22 @@
       "label": "Transcript GC",
       "help": "Enable transcript rewrite GC during maintain(); disabled by default"
     },
+    "rollupDebugEnabled": {
+      "label": "Rollup Debug Tool",
+      "help": "Register the operator-facing lcm_rollup_debug tool; disabled by default"
+    },
+    "rollupDailyMaxTokens": {
+      "label": "Rollup Daily Max Tokens",
+      "help": "Maximum tokens for daily rollup content. Default 40000."
+    },
+    "rollupWeeklyMaxTokens": {
+      "label": "Rollup Weekly Max Tokens",
+      "help": "Maximum tokens for weekly rollup content. Default 140000 (≈20K avg/day × 7 days)."
+    },
+    "rollupMonthlyMaxTokens": {
+      "label": "Rollup Monthly Max Tokens",
+      "help": "Maximum tokens for monthly rollup content. Default 560000 (≈4 weeks × 140K)."
+    },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
       "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
@@ -285,6 +297,7 @@
         "type": "string"
       },
       "largeFilesDir": {
+        "description": "Directory for externalized large files and inline-image payloads (default: <OPENCLAW_STATE_DIR>/lcm-files; falls back to ~/.openclaw/lcm-files)",
         "type": "string"
       },
       "ignoreSessionPatterns": {
@@ -412,6 +425,21 @@
       "transcriptGcEnabled": {
         "type": "boolean"
       },
+      "rollupDebugEnabled": {
+        "type": "boolean"
+      },
+      "rollupDailyMaxTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "rollupWeeklyMaxTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "rollupMonthlyMaxTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
       "proactiveThresholdCompactionMode": {
         "type": "string",
         "enum": [
@@ -421,10 +449,6 @@
       },
       "databasePath": {
         "description": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)",
-        "type": "string"
-      },
-      "largeFilesDir": {
-        "description": "Directory for persisting large-file text payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)",
         "type": "string"
       },
       "fallbackProviders": {

@@ -19,6 +19,8 @@ import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
+import { createLcmRecentTool } from "../tools/lcm-recent-tool.js";
+import { createLcmRollupDebugTool } from "../tools/lcm-rollup-debug-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type { LcmDependencies } from "../types.js";
 
@@ -171,9 +173,16 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "",
   "**Tool escalation:**",
   "Recall order for compacted conversation history:",
-  "1. `lcm_grep` — search by regex or full-text across messages and summaries",
-  "2. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
-  "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
+  "1. `lcm_recent` — use for time-bounded recaps and likely-window entry (`today`, `yesterday`, `week`, `month`, `date:YYYY-MM-DD`, `yesterday 4-8pm`, `last 3h`)",
+  "2. `lcm_grep` — use for keyword/topic/identifier discovery when the time window is unknown",
+  "3. `lcm_describe` — inspect a specific summary or source ID (cheap, no sub-agent)",
+  "4. `lcm_expand_query` — exact proof/deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited IDs in tool output for follow-up (~120s, don't ration it)",
+  "",
+  "**`lcm_recent` routing guidance:**",
+  "- Use `lcm_recent` first for questions anchored by time rather than topic: what happened today/yesterday/this week/this month, a specific date, a local-time window, or a relative range like `last 90m`.",
+  "- Treat `lcm_recent` as recap/window entry, not proof. For exact commands, paths, timestamps, root cause, shipped/decided claims, or causal chains, verify returned IDs with `lcm_describe` or `lcm_expand_query` before asserting specifics.",
+  "- Event-bounded questions like `after restart` require anchoring the event time/window first with logs, diagnostics, `lcm_grep`, or other evidence, then run `lcm_recent` over that known window.",
+  "- `lcm_recent` may return prebuilt rollups or bounded leaf-summary fallback; both are coverage-limited and should preserve source IDs when `includeSources=true`.",
   "",
   "**`lcm_grep` routing guidance:**",
   '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for literal patterns.',
@@ -212,8 +221,8 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "State uncertainty instead of guessing from compacted summaries.",
   "",
   "**Precision flow:**",
-  "1. `lcm_grep` to find the relevant summaries or messages",
-  "2. `lcm_expand_query` when you need exact evidence before answering",
+  "1. `lcm_recent` for a known time window, or `lcm_grep` when you need topic/identifier discovery",
+  "2. `lcm_describe` or `lcm_expand_query` when you need exact evidence before answering",
   "3. Answer from the retrieved evidence instead of summary paraphrase",
   "",
   "**Uncertainty checklist:**",
@@ -941,6 +950,56 @@ export function resolveModelApiFromRuntimeConfig(
     return typeof api === "string" && api.trim() ? api.trim() : undefined;
   }
   return undefined;
+}
+
+/**
+ * Build a synchronous (model) → contextWindow resolver from a runtime config
+ * snapshot. The resulting closure is a pure function over the snapshot —
+ * suitable for replay determinism (no live RPCs, no TTL caches).
+ *
+ * Walks `runtimeConfig.models.providers[*].models[*]` for `{ id, contextWindow }`
+ * and records the value per model id (last-write-wins across object iteration
+ * order, which is well-defined for own string keys in object literals).
+ *
+ * Returns `(model: string) => number | null`. Returns null when the model is
+ * unknown, when contextWindow is missing or non-positive, or when the runtime
+ * config is malformed.
+ */
+export function buildModelContextWindowResolver(
+  runtimeConfig: unknown,
+): (model: string) => number | null {
+  const map = new Map<string, number>();
+
+  const providers = isRecord(runtimeConfig)
+    ? (runtimeConfig as { models?: { providers?: unknown } }).models?.providers
+    : undefined;
+
+  if (isRecord(providers)) {
+    // Explicit overrides from runtimeConfig.
+    for (const provider of Object.values(providers)) {
+      if (!isRecord(provider)) continue;
+      const models = (provider as { models?: unknown }).models;
+      if (!Array.isArray(models)) continue;
+      for (const entry of models) {
+        if (!isRecord(entry)) continue;
+        const id = typeof entry.id === "string" ? entry.id.trim() : null;
+        const ctx =
+          typeof entry.contextWindow === "number" &&
+          Number.isFinite(entry.contextWindow) &&
+          entry.contextWindow > 0
+            ? entry.contextWindow
+            : null;
+        if (id && ctx) map.set(id, ctx);
+      }
+    }
+  }
+
+  return (model: string) => {
+    if (typeof model !== "string") return null;
+    const trimmed = model.trim();
+    if (!trimmed) return null;
+    return map.get(trimmed) ?? null;
+  };
 }
 
 /** Resolve runtime.modelAuth from plugin runtime when available. */
@@ -1690,6 +1749,7 @@ function createLcmDependencies(
   return {
     config,
     configDiagnostics: diagnostics,
+    clock: { now: () => new Date() },
     isRuntimeManagedAuthProvider: (provider: string, providerApi?: string) => {
       const normalizedProvider = normalizeProviderId(provider);
       if (normalizedProvider === "openai-codex" || normalizedProvider === "github-copilot") {
@@ -2043,6 +2103,9 @@ function createLcmDependencies(
         };
       }
     },
+    getModelContextWindow: buildModelContextWindowResolver(
+      registrationConfig.openClawConfig,
+    ),
     callGateway: async (params) => {
       const sub = api.runtime.subagent;
       switch (params.method) {
@@ -2234,6 +2297,22 @@ function wirePluginHandlers(
       requesterSessionKey: ctx.sessionKey,
     }),
   );
+  api.registerTool((ctx) =>
+    createLcmRecentTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+    }),
+  );
+  if (deps.config.rollupDebugEnabled) {
+    api.registerTool((ctx) =>
+      createLcmRollupDebugTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+      }),
+    );
+  }
 
   api.registerCommand(
     createLcmCommand({

@@ -369,6 +369,8 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(allIndexNames.has("conversations_session_id_active_created_idx")).toBe(true);
     expect(allIndexNames.has("summary_messages_message_idx")).toBe(true);
     expect(allIndexNames.has("summaries_conv_depth_kind_idx")).toBe(true);
+    expect(allIndexNames.has("messages_conversation_created_at_jd_idx")).toBe(true);
+    expect(allIndexNames.has("messages_created_at_jd_idx")).toBe(true);
 
     const queryPlanRows = db
       .prepare(
@@ -1109,6 +1111,20 @@ describe("runLcmMigrations summary depth backfill", () => {
       "[lcm] migration step skipped: step=backfillSummaryMetadata algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillToolCallColumns algorithmVersion=1 reason=already-complete",
     ]);
+  });
+
+  it("creates summary_messages_message_idx exactly once in the migration source (P3 dupe index)", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = url.fileURLToPath(import.meta.url);
+    const source = fs.readFileSync(
+      path.join(path.dirname(here), "..", "src", "db", "migration.ts"),
+      "utf8",
+    );
+    const matches = source.match(/CREATE INDEX IF NOT EXISTS summary_messages_message_idx/g);
+    expect(matches).not.toBeNull();
+    expect(matches?.length).toBe(1);
   });
 
   it("wraps the full migration in one exclusive transaction", () => {

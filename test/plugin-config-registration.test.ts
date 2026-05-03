@@ -180,6 +180,29 @@ describe("lcm plugin registration", () => {
     tempDirs.clear();
   });
 
+  it("openclaw.plugin.json has no duplicate top-level keys in uiHints or configSchema.properties (P3)", async () => {
+    // JSON.parse silently accepts duplicate keys (last-wins) so a structural
+    // assertion against the parsed object catches nothing. Read the source
+    // text and count occurrences of `"largeFilesDir":` — once per object
+    // level (uiHints + configSchema.properties) is acceptable, more is a
+    // dupe.
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = url.fileURLToPath(import.meta.url);
+    const source = fs.readFileSync(
+      path.join(path.dirname(here), "..", "openclaw.plugin.json"),
+      "utf8",
+    );
+    const dupSentinels = ["largeFilesDir"] as const;
+    for (const key of dupSentinels) {
+      const matches = source.match(new RegExp(`"${key}":`, "g"));
+      // Allowed: one in uiHints, one in configSchema.properties.
+      expect(matches).not.toBeNull();
+      expect(matches?.length).toBe(2);
+    }
+  });
+
   it("registers only the lossless-claw context engine id", () => {
     const { api, getRegisteredContextEngines } = buildApi({ enabled: true });
 

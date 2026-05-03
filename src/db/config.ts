@@ -121,6 +121,14 @@ export type LcmConfig = {
   pruneHeartbeatOk: boolean;
   /** When true, maintain() may rewrite transcript entries for transcript GC. */
   transcriptGcEnabled: boolean;
+  /** When true, register the operator-facing lcm_rollup_debug tool. */
+  rollupDebugEnabled: boolean;
+  /** Maximum tokens for daily rollup content. Default 40000. */
+  rollupDailyMaxTokens: number;
+  /** Maximum tokens for weekly rollup content. Default 140000 (≈20K avg/day × 7). */
+  rollupWeeklyMaxTokens: number;
+  /** Maximum tokens for monthly rollup content. Default 560000 (≈4 weeks × 140K). */
+  rollupMonthlyMaxTokens: number;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
@@ -151,12 +159,30 @@ function toNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+/** Like toNumber but rejects 0 and negative values. Mirrors
+ *  parseFinitePositiveInt for the plugin-config path so manifest's
+ *  `minimum:1` invariant holds across BOTH config sources. */
+function toPositiveNumber(value: unknown): number | undefined {
+  const parsed = toNumber(value);
+  if (parsed === undefined || parsed < 1) return undefined;
+  return parsed;
+}
+
 /** Safely parse a finite integer from an environment string, or return undefined.
  *  Unlike raw parseInt(), this returns undefined for NaN so ?? fallback works. */
 function parseFiniteInt(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const parsed = parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/** Like parseFiniteInt but rejects 0 and negative values, so the env path
+ *  honors the manifest's `minimum:1` invariant. The plugin config and default
+ *  remain reachable when the env var is set to garbage like "0" or "-5". */
+function parseFinitePositiveInt(value: string | undefined): number | undefined {
+  const parsed = parseFiniteInt(value);
+  if (parsed === undefined || parsed < 1) return undefined;
+  return parsed;
 }
 
 /** Safely parse a finite float from an environment string, or return undefined. */
@@ -466,6 +492,19 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
           ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"
           : toBool(pc.transcriptGcEnabled) ?? false,
+      rollupDebugEnabled:
+        env.LCM_ROLLUP_DEBUG_ENABLED !== undefined
+          ? env.LCM_ROLLUP_DEBUG_ENABLED === "true"
+          : toBool(pc.rollupDebugEnabled) ?? false,
+      rollupDailyMaxTokens:
+        parseFinitePositiveInt(env.LCM_ROLLUP_DAILY_MAX_TOKENS)
+          ?? toPositiveNumber(pc.rollupDailyMaxTokens) ?? 40000,
+      rollupWeeklyMaxTokens:
+        parseFinitePositiveInt(env.LCM_ROLLUP_WEEKLY_MAX_TOKENS)
+          ?? toPositiveNumber(pc.rollupWeeklyMaxTokens) ?? 140000,
+      rollupMonthlyMaxTokens:
+        parseFinitePositiveInt(env.LCM_ROLLUP_MONTHLY_MAX_TOKENS)
+          ?? toPositiveNumber(pc.rollupMonthlyMaxTokens) ?? 560000,
       proactiveThresholdCompactionMode,
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)

@@ -4,6 +4,8 @@ import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
 import type { RotateSessionStorageWithBackupResult } from "../engine.js";
+import type { BuildResult, RollupBuilder } from "../rollup-builder.js";
+import type { ConversationStore } from "../store/conversation-store.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
 import type { OpenClawPluginCommandDefinition, PluginCommandContext } from "../openclaw-bridge.js";
@@ -72,6 +74,7 @@ type ParsedLcmCommand =
   | { kind: "rotate" }
   | { kind: "doctor"; apply: boolean }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
+  | { kind: "rebuild_rollups"; daysBack: number }
   | { kind: "help"; error?: string };
 
 type RotateCommandEngine = {
@@ -81,6 +84,10 @@ type RotateCommandEngine = {
     sessionFile: string;
     lockTimeoutMs: number;
   }): Promise<RotateSessionStorageWithBackupResult>;
+  /** Optional: get the rollup builder for /lossless rebuild-rollups. */
+  getRollupBuilder?(): RollupBuilder;
+  /** Optional: get the conversation store for cross-session listing. */
+  getConversationStore?(): ConversationStore;
 };
 
 const DOCTOR_CLEANER_IDS = new Set<DoctorCleanerId>(getDoctorCleanerFilterIds());
@@ -246,14 +253,49 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
         error:
           `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, or \`apply\` for the scoped summary repair path.`,
       };
+    case "rebuild":
+    case "rebuild-rollups":
+      return parseRebuildRollupsArgs(rest);
     case "help":
       return { kind: "help" };
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, doctor, doctor clean, doctor apply, rebuild-rollups, help.`,
       };
   }
+}
+
+/**
+ * Parse `/lossless rebuild-rollups [days]` arguments.
+ * - No args → default 7 days
+ * - One numeric arg in (0, 365] → that many days
+ * - Anything else → help with error
+ */
+function parseRebuildRollupsArgs(rest: string[]): ParsedLcmCommand {
+  if (rest.length === 0) {
+    return { kind: "rebuild_rollups", daysBack: 7 };
+  }
+  if (rest.length === 1) {
+    const arg = rest[0]?.trim() ?? "";
+    const n = parseInt(arg, 10);
+    if (Number.isFinite(n) && n > 0 && n <= 365 && String(n) === arg) {
+      return { kind: "rebuild_rollups", daysBack: n };
+    }
+  }
+  // Echo the offending input so operators can tell "got 366" from "got +7"
+  // from "got 7.0" without re-typing. Strip backticks from the echoed value
+  // so a malicious-looking input like `foo\`bar\`` doesn't break the
+  // surrounding inline code span and bleed markdown into the error.
+  const rawOffending = rest.length === 1
+    ? rest[0]?.trim() ?? ""
+    : rest.join(" ");
+  const safeOffending = rawOffending.replace(/`/g, "");
+  return {
+    kind: "help",
+    error:
+      `\`${VISIBLE_COMMAND} rebuild-rollups\` expects an integer in [1, 365] (got \`${safeOffending}\`). Example: \`${VISIBLE_COMMAND} rebuild-rollups 14\`.`,
+  };
 }
 
 function getLcmStatusStats(db: DatabaseSync): LcmStatusStats {
@@ -574,6 +616,10 @@ function buildHelpText(error?: string): string {
         "Delete approved high-confidence cleaner matches after creating a DB backup.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor apply`), "Repair broken summaries in the current conversation."),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} rebuild-rollups [days]`),
+        "Rebuild daily/weekly/monthly rollups for the last N days (must be an integer in [1, 365]; default 7) across all conversations under this agent's session_key.",
+      ),
     ]),
     "",
     buildSection("🧭 Notes", [
@@ -1440,11 +1486,132 @@ export function createLcmCommand(params: {
                 }),
               }
             : { text: await buildDoctorCleanersText({ db: await getDb() }) };
+        case "rebuild_rollups":
+          return {
+            text: await buildRebuildRollupsText({
+              ctx,
+              getLcm: params.getLcm,
+              daysBack: parsed.daysBack,
+            }),
+          };
         case "help":
           return { text: buildHelpText(parsed.error) };
       }
     },
   };
+}
+
+/**
+ * Handler for `/lossless rebuild-rollups [days]`.
+ *
+ * Sequentially walks every conversation under the calling agent's session_key
+ * (active + archived — LCM crosses /new and /reset boundaries) and rebuilds
+ * the daily/weekly/monthly rollups for the requested window.
+ *
+ * Sequential by design — each call to `buildDailyRollups` already iterates
+ * its own days serially with `await`, and we iterate conversations serially
+ * too. Concurrent writers serialize on the per-conversation DB transaction
+ * mutex (BEGIN IMMEDIATE inside buildDayRollup / buildAggregateRollup);
+ * idempotent fingerprints make redundant rebuilds cheap no-ops. There is
+ * no in-process single-flight Map — naming it "single-flight" was sloppy.
+ */
+async function buildRebuildRollupsText(params: {
+  ctx: PluginCommandContext;
+  getLcm?: () => Promise<RotateCommandEngine>;
+  daysBack: number;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🔁 Lossless Claw Rebuild Rollups",
+    "",
+  ];
+
+  const sessionKey = normalizeIdentity(params.ctx.sessionKey);
+  if (!sessionKey) {
+    lines.push("⚠️ No session key in context — cannot scope rebuild.");
+    return lines.join("\n");
+  }
+
+  if (!params.getLcm) {
+    lines.push("⚠️ LCM engine accessor unavailable — rebuild not supported in this build.");
+    return lines.join("\n");
+  }
+
+  const engine = await params.getLcm();
+  const rollupBuilder = engine.getRollupBuilder?.();
+  const conversationStore = engine.getConversationStore?.();
+  if (!rollupBuilder || !conversationStore) {
+    lines.push("⚠️ This LCM build does not expose the rollup builder or conversation store accessors.");
+    return lines.join("\n");
+  }
+
+  const conversations = await conversationStore.listConversationsBySessionKey(
+    sessionKey,
+  );
+  if (conversations.length === 0) {
+    lines.push(`No conversations found for session key \`${sessionKey}\`.`);
+    return lines.join("\n");
+  }
+
+  lines.push(
+    `Session key: \`${sessionKey}\``,
+    `Conversations to process: ${conversations.length} (active + archived)`,
+    `Window: last ${params.daysBack} day${params.daysBack === 1 ? "" : "s"}`,
+    "",
+    "Rebuilding sequentially (DB transaction mutex serializes writes; idempotent fingerprints skip no-ops)...",
+    "",
+  );
+
+  const totals = { built: 0, skipped: 0, errors: 0 };
+  const perConversationLines: string[] = [];
+
+  for (const conversation of conversations) {
+    const tag =
+      `\`#${conversation.conversationId}\` (${conversation.active ? "active" : "archived"})`;
+    try {
+      const dailyResult: BuildResult = await rollupBuilder.buildDailyRollups(
+        conversation.conversationId,
+        { daysBack: params.daysBack, forceCurrentDay: true },
+      );
+      const aggResult: BuildResult = await rollupBuilder.buildWeeklyMonthlyRollups(
+        conversation.conversationId,
+        { daysBack: params.daysBack },
+      );
+      const built = dailyResult.built + aggResult.built;
+      const skipped = dailyResult.skipped + aggResult.skipped;
+      const errors = dailyResult.errors.length + aggResult.errors.length;
+      totals.built += built;
+      totals.skipped += skipped;
+      totals.errors += errors;
+      perConversationLines.push(
+        `- ${tag}: built=${built}, skipped=${skipped}, errors=${errors}`,
+      );
+      if (errors > 0) {
+        const allErrors = [...dailyResult.errors, ...aggResult.errors];
+        for (const err of allErrors.slice(0, 3)) {
+          perConversationLines.push(`    ↪ ${err}`);
+        }
+        if (allErrors.length > 3) {
+          perConversationLines.push(
+            `    ↪ (...${allErrors.length - 3} more suppressed)`,
+          );
+        }
+      }
+    } catch (error) {
+      totals.errors += 1;
+      perConversationLines.push(
+        `- ${tag}: rebuild failed: ${describeLogError(error)}`,
+      );
+    }
+  }
+
+  lines.push(...perConversationLines);
+  lines.push(
+    "",
+    `**Total:** built=${totals.built}, skipped=${totals.skipped}, errors=${totals.errors}`,
+  );
+  return lines.join("\n");
 }
 
 export const __testing = {
