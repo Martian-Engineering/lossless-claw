@@ -309,8 +309,19 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
   return textFragments;
 }
 
-/** Normalize message content down to human-readable text, excluding binary/media payloads. */
-function extractMeaningfulMessageText(content: string): string {
+/**
+ * Normalize message content down to human-readable text, excluding
+ * binary/media payloads and provider reasoning/thinking blocks.
+ *
+ * Shared by every summarizer entry point (leaf input, condensed input,
+ * prior-summary context) so reasoning blocks introduced at any level —
+ * including legacy data persisted before #503 — are stripped before they
+ * reach the summarizer.
+ *
+ * @internal Exported for tests; production code reaches it via the
+ * compaction-engine entry points.
+ */
+export function extractMeaningfulMessageText(content: string): string {
   if (typeof content !== "string") return "";
   const trimmed = content.trim();
   if (!trimmed) {
@@ -1312,7 +1323,12 @@ export class CompactionEngine {
       if (!summary || summary.depth !== targetDepth) {
         continue;
       }
-      const content = typeof summary.content === "string" ? summary.content.trim() : "";
+      const rawContent = typeof summary.content === "string" ? summary.content : "";
+      // Apply the same reasoning/thinking-block sanitizer used at the leaf
+      // input (PR #503) so prior-summary context fed back into the summarizer
+      // can never reintroduce raw thinking blocks at higher levels.  See #564.
+      const sanitized = extractMeaningfulMessageText(rawContent).trim();
+      const content = sanitized || rawContent.trim();
       if (content) {
         summaryContents.push(content);
       }
@@ -1609,14 +1625,21 @@ export class CompactionEngine {
       }
     }
 
+    // Sanitize stored summary content before re-summarizing.  Leaves persisted
+    // before #503 (and any future leak from a reasoning-capable summaryModel)
+    // may carry embedded thinking/reasoning blocks; strip them at every
+    // summarizer boundary, not only at the leaf input.  See #564.
     const concatenated = summaryRecords
       .map((summary) => {
         const earliestAt = summary.earliestAt ?? summary.createdAt;
         const latestAt = summary.latestAt ?? summary.createdAt;
         const tz = this.config.timezone;
         const header = `[${formatTimestamp(earliestAt, tz)} - ${formatTimestamp(latestAt, tz)}]`;
-        return `${header}\n${summary.content}`;
+        const sanitized = extractMeaningfulMessageText(summary.content);
+        const body = sanitized || summary.content;
+        return `${header}\n${body}`;
       })
+      .filter((entry) => entry.trim().length > 0)
       .join("\n\n");
     const fileIds = dedupeOrderedIds(
       summaryRecords.flatMap((summary) => [
