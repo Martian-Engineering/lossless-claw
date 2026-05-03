@@ -687,7 +687,10 @@ describe("LCM sub-day window retrieval", () => {
     const emptyFallbackText = (emptyFallback.content[0] as { text: string })
       .text;
     expect(emptyFallbackText).toContain("**Confidence:** none");
-    expect(emptyFallbackText).toContain("*Sources: omitted*");
+    // P3 fix: an empty source list emits "none" regardless of
+    // includeSources — saying "omitted" would falsely imply hidden ids exist.
+    expect(emptyFallbackText).toContain("*Sources: none*");
+    expect(emptyFallbackText).not.toContain("*Sources: omitted*");
     expect(
       (emptyFallback.details as { confidence?: string; usedFallback?: boolean })
         .confidence
@@ -1060,6 +1063,18 @@ describe("LCM sub-day window retrieval", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("formatSourcesLine emits 'none' for empty list regardless of includeSources (P3)", () => {
+    const fmt = __lcmRecentTestInternals.formatSourcesLine;
+    // Pre-fix `includeSources=false && empty` returned "omitted" which lied:
+    // there was nothing to omit.
+    expect(fmt([], false)).toBe("*Sources: none*");
+    expect(fmt([], true)).toBe("*Sources: none*");
+    // Hidden ids when caller asked to suppress.
+    expect(fmt(["sum_a", "sum_b"], false)).toBe("*Sources: omitted*");
+    // Visible ids when caller asked to include.
+    expect(fmt(["sum_a", "sum_b"], true)).toBe("*Sources: sum_a, sum_b*");
   });
 
   it("returns null lastBuiltAt for index mode when built_at is missing (P2-9)", async () => {

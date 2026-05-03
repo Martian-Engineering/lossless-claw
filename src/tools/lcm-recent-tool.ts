@@ -760,11 +760,13 @@ function formatSourcesLine(
   sourceIds: string[],
   includeSources: boolean
 ): string {
-  if (!includeSources) {
-    return "*Sources: omitted*";
-  }
+  // When there's actually nothing to show, "none" is the truth regardless of
+  // includeSources — saying "omitted" would imply hidden source ids exist.
   if (sourceIds.length === 0) {
     return "*Sources: none*";
+  }
+  if (!includeSources) {
+    return "*Sources: omitted*";
   }
   return `*Sources: ${sourceIds.join(", ")}*`;
 }
@@ -1491,6 +1493,7 @@ export const __lcmRecentTestInternals = {
   getUtcDateForZonedMidnight,
   getUtcDateForZonedLocalTime,
   extractRollupDigest,
+  formatSourcesLine,
 };
 
 export function createLcmRecentTool(input: {
