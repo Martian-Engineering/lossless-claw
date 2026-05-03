@@ -101,12 +101,34 @@ export type ParseAgentSessionKeyFn = (sessionKey: string) => {
 export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 
 /**
+ * Clock service injected through LcmDependencies. Every read-path wall-clock
+ * read in the LCM engine and tools MUST go through this — never `new Date()`
+ * or `Date.now()` directly.
+ *
+ * The plugin's default implementation returns the live wall clock. A future
+ * deterministic-replay harness in the openclaw host substitutes an impl that
+ * returns the recorded turn-start timestamp, making `lcm_recent` output a
+ * pure function of the recorded inputs.
+ */
+export interface Clock {
+  /** Current wall-clock time. */
+  now(): Date;
+}
+
+/**
  * Dependencies injected into the LCM engine at registration time.
  * These replace all direct imports from OpenClaw core.
  */
 export interface LcmDependencies {
   /** LCM configuration (from env vars + plugin config) */
   config: LcmConfig;
+
+  /**
+   * Clock service. REQUIRED — every read-path wall-clock read goes through
+   * `deps.clock.now()` rather than `new Date()` directly. The plugin always
+   * populates this with a live-clock impl; tests inject a frozen clock.
+   */
+  clock: Clock;
 
   /** Optional config resolution metadata for startup diagnostics. */
   configDiagnostics?: LcmConfigDiagnostics;

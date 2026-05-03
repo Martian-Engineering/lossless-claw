@@ -1780,6 +1780,7 @@ function createLcmDependencies(
   return {
     config,
     configDiagnostics: diagnostics,
+    clock: { now: () => new Date() },
     isRuntimeManagedAuthProvider: (provider: string, providerApi?: string) => {
       const normalizedProvider = normalizeProviderId(provider);
       if (normalizedProvider === "openai-codex" || normalizedProvider === "github-copilot") {

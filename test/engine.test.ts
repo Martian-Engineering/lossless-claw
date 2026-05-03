@@ -96,6 +96,7 @@ function createTestDeps(
 ): LcmDependencies {
   return {
     config,
+    clock: { now: () => new Date() },
     complete: vi.fn(async () => ({
       content: [{ type: "text", text: "summary output" }],
     })),

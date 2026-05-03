@@ -77,6 +77,7 @@ function createTestConfig(databasePath: string): LcmConfig {
 function createTestDeps(config: LcmConfig): LcmDependencies {
   return {
     config,
+    clock: { now: () => new Date() },
     complete: vi.fn(async () => ({
       content: [{ type: "text", text: "summary output" }],
     })),

@@ -660,4 +660,24 @@ describe("createLcmDependencies.complete provider config resolution", () => {
       },
     });
   });
+
+  it("wires a live clock impl whose now() returns a Date", () => {
+    const { api, getFactory } = buildApi({});
+    lcmPlugin.register(api);
+    const factory = getFactory();
+    if (!factory) {
+      throw new Error("Expected LCM engine factory to be registered.");
+    }
+    const engine = factory() as {
+      deps: { clock: { now: () => Date } };
+      config: { databasePath: string };
+    };
+    try {
+      const tick = engine.deps.clock.now();
+      expect(tick).toBeInstanceOf(Date);
+      expect(Number.isFinite(tick.getTime())).toBe(true);
+    } finally {
+      closeLcmConnection(engine.config.databasePath);
+    }
+  });
 });
