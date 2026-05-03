@@ -177,6 +177,10 @@
       "label": "Cold Cache Observation Threshold",
       "help": "Consecutive cold observations required before non-explicit cache misses are treated as truly cold"
     },
+    "cacheAwareCompaction.criticalBudgetPressureRatio": {
+      "label": "Critical Budget Pressure Ratio",
+      "help": "Fraction of token budget at which deferred compaction fires regardless of prompt-cache state. Defaults to 0.70 — set to 1 to disable the override and let cache-aware throttling fully control deferral."
+    },
     "dynamicLeafChunkTokens.enabled": {
       "label": "Dynamic Leaf Chunk Tokens",
       "help": "When enabled, incremental compaction uses a larger working leaf chunk in busy sessions and keeps the static floor in quieter sessions"
@@ -370,6 +374,11 @@
           "coldCacheObservationThreshold": {
             "type": "integer",
             "minimum": 1
+          },
+          "criticalBudgetPressureRatio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
           }
         }
       },

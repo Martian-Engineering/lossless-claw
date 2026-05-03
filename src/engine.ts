@@ -46,7 +46,10 @@ import {
   parseFileBlocks,
 } from "./large-files.js";
 import { describeLogError } from "./lcm-log.js";
-import { describeLcmConfigSource } from "./db/config.js";
+import {
+  DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
+  describeLcmConfigSource,
+} from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
@@ -2191,20 +2194,112 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
-  /** Delay prompt-mutating deferred compaction while a mutation-sensitive prompt cache is hot. */
+  /**
+   * Delay prompt-mutating deferred compaction while a mutation-sensitive prompt
+   * cache is hot.
+   *
+   * Two bypass conditions:
+   *
+   * 1. `cacheAwareCompaction.enabled === false` — the operator explicitly
+   *    opted out of cache-aware throttling. Without this check the dispatcher
+   *    would silently keep deferring even though every other cache-aware code
+   *    path correctly respects the flag.
+   *
+   * 2. Critical token-budget pressure — when the prompt is approaching
+   *    overflow we MUST allow compaction regardless of cache state. Otherwise
+   *    high-velocity sessions can livelock the dispatcher: each turn refreshes
+   *    `lastCacheTouchAt`, the TTL window never expires, deferred work never
+   *    fires, and the runtime emergency overflow handler is left to do all
+   *    the work. The default 0.70 threshold (configurable via
+   *    `cacheAwareCompaction.criticalBudgetPressureRatio`) leaves a ~30%
+   *    headroom band (0–70%) where cache-aware throttling still applies;
+   *    above that band the cache hold is broken so deferred compaction can
+   *    drag the prompt back down before the runtime emergency overflow
+   *    handler is needed.
+   */
   private shouldDelayPromptMutatingDeferredCompaction(
     telemetry: ConversationCompactionTelemetryRecord | null,
     now: Date = new Date(),
+    currentTokenCount?: number,
+    tokenBudget?: number,
   ): boolean {
+    // Use explicit `=== false` (not falsy) so undefined/null don't silently
+    // bypass the entire cache-aware gate. With falsy `!enabled`, a config
+    // missing the field altogether (e.g. constructed via partial literal in
+    // a test or downstream caller) would skip cache-aware logic — defense
+    // in depth even though resolveLcmConfig always normalizes `enabled` to
+    // a boolean via `... ?? true`.
+    if (this.config.cacheAwareCompaction.enabled === false) {
+      return false;
+    }
+    if (this.isUnderCriticalBudgetPressure({ currentTokenCount, tokenBudget })) {
+      return false;
+    }
     return this.isPromptCacheMutationSensitiveFamily(telemetry)
       && !this.hasFreshPromptCacheBreak(telemetry)
       && this.isPromptCacheStillHot(telemetry, now);
   }
 
-  /** Keep deferred mutation-sensitive leaf debt moving once the TTL-safe cache hold has expired. */
+  /**
+   * Return true when the live prompt is critically full relative to the
+   * token budget. Used to bypass cache-aware deferral so compaction can fire
+   * before the runtime falls back to emergency overflow truncation.
+   */
+  private isUnderCriticalBudgetPressure(params: {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  }): boolean {
+    if (
+      typeof params.currentTokenCount !== "number"
+      || !Number.isFinite(params.currentTokenCount)
+      || params.currentTokenCount <= 0
+      || typeof params.tokenBudget !== "number"
+      || !Number.isFinite(params.tokenBudget)
+      || params.tokenBudget <= 0
+    ) {
+      return false;
+    }
+    const ratio =
+      this.config.cacheAwareCompaction.criticalBudgetPressureRatio
+        ?? DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO;
+    // Honor the documented "set to >= 1 to disable" semantics. Without this
+    // explicit no-op, ratio=1 would still bypass deferral once
+    // currentTokenCount >= tokenBudget — which contradicts the help text in
+    // openclaw.plugin.json and the JSDoc on CacheAwareCompactionConfig.
+    if (ratio >= 1) {
+      return false;
+    }
+    // Symmetric guard: ratio <= 0 would make `currentTokenCount >= 0 * budget`
+    // always true once any tokens are observed → silently disables ALL
+    // cache-aware throttling on every dispatch, defeating the gate. Treat
+    // ratio <= 0 as a misconfig and refuse the bypass instead.
+    if (ratio <= 0) {
+      return false;
+    }
+    // Compare against the raw product (not floored) so the bypass triggers
+    // exactly at `currentTokenCount >= ratio * tokenBudget` per the docs.
+    // Using Math.floor here would shift the trigger up to almost 1 token
+    // earlier than documented (e.g. budget=10, ratio=0.85 trips at 8 instead
+    // of 9 because floor(10*0.85)=8.5→8).
+    return params.currentTokenCount >= params.tokenBudget * ratio;
+  }
+
+  /**
+   * Keep deferred mutation-sensitive leaf debt moving once the TTL-safe cache
+   * hold has expired.
+   *
+   * Plumbs `currentTokenCount`/`tokenBudget` through to
+   * `shouldDelayPromptMutatingDeferredCompaction` so the critical-pressure
+   * escape correctly applies to the deferred-leaf path. Without these args,
+   * the gate sees `currentTokenCount === undefined`, the pressure check
+   * short-circuits to `false`, and the system can stay cache-throttled past
+   * critical pressure — recreating the livelock this PR was meant to fix.
+   */
   private shouldForceDeferredPromptCacheLeafCompaction(
     telemetry: ConversationCompactionTelemetryRecord | null,
     leafDecision: IncrementalCompactionDecision,
+    currentTokenCount?: number,
+    tokenBudget?: number,
   ): boolean {
     if (leafDecision.shouldCompact) {
       return false;
@@ -2218,15 +2313,27 @@ export class LcmContextEngine implements ContextEngine {
     if (!this.isPromptCacheMutationSensitiveFamily(telemetry)) {
       return false;
     }
-    return !this.shouldDelayPromptMutatingDeferredCompaction(telemetry);
+    return !this.shouldDelayPromptMutatingDeferredCompaction(
+      telemetry,
+      new Date(),
+      currentTokenCount,
+      tokenBudget,
+    );
   }
 
   /** Use the post-TTL catch-up envelope when stale cache debt must override hot-cache smoothing. */
   private resolveDeferredLeafCompactionExecutionDecision(params: {
     telemetry: ConversationCompactionTelemetryRecord | null;
     leafDecision: IncrementalCompactionDecision;
+    currentTokenCount?: number;
+    tokenBudget?: number;
   }): IncrementalCompactionDecision {
-    if (!this.shouldForceDeferredPromptCacheLeafCompaction(params.telemetry, params.leafDecision)) {
+    if (!this.shouldForceDeferredPromptCacheLeafCompaction(
+      params.telemetry,
+      params.leafDecision,
+      params.currentTokenCount,
+      params.tokenBudget,
+    )) {
       return params.leafDecision;
     }
     return {
@@ -2864,7 +2971,23 @@ export class LcmContextEngine implements ContextEngine {
           await this.compactionTelemetryStore.getConversationCompactionTelemetry(
             params.conversationId,
           );
-        if (this.shouldDelayPromptMutatingDeferredCompaction(telemetry)) {
+        // Apply the assembly cap once and use the SAME capped value for both
+        // the gate's pressure check and `consumeDeferredCompactionDebt`. The
+        // maintain() path was patched for this; the drain path needs symmetric
+        // treatment, otherwise when `maxAssemblyTokenBudget` is configured
+        // smaller than the runtime-supplied budget, the gate evaluates the
+        // pressure ratio against a larger budget than execution actually
+        // enforces — which can let the bypass fail to trip at pressures
+        // execution would consider critical.
+        const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
+        if (
+          this.shouldDelayPromptMutatingDeferredCompaction(
+            telemetry,
+            new Date(),
+            params.currentTokenCount,
+            cappedTokenBudget,
+          )
+        ) {
           this.deps.log.info(
             `[lcm] background deferred compaction skipped conversation=${params.conversationId} ${sessionLabel} reason=hot-cache retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"} debtReason=${maintenance.reason ?? params.reason}`,
           );
@@ -2882,7 +3005,7 @@ export class LcmContextEngine implements ContextEngine {
           conversationId: params.conversationId,
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
-          tokenBudget: params.tokenBudget,
+          tokenBudget: cappedTokenBudget,
           currentTokenCount: params.currentTokenCount,
           legacyParams,
         });
@@ -2969,6 +3092,8 @@ export class LcmContextEngine implements ContextEngine {
                 this.resolveDeferredLeafCompactionExecutionDecision({
                   telemetry,
                   leafDecision,
+                  currentTokenCount: resolvedCurrentTokenCount,
+                  tokenBudget: resolvedTokenBudget,
                 });
               if (!leafDecision.shouldCompact) {
                 const deferredLeafStillNeeded =
@@ -3065,11 +3190,27 @@ export class LcmContextEngine implements ContextEngine {
           await this.compactionTelemetryStore.getConversationCompactionTelemetry(
             params.conversationId,
           );
+        // Apply the assembly cap once and use the SAME capped value for both
+        // the gate's pressure check and consumeDeferredCompactionDebt — same
+        // pattern as drain/maintain. Without this, when maxAssemblyTokenBudget
+        // is configured smaller than the runtime-supplied budget, the gate
+        // evaluates pressure against a larger budget than execution actually
+        // enforces, and the bypass can fail to trip at pressures execution
+        // would consider critical.
+        const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
+        const normalizedCurrentTokenCount = this.normalizeObservedTokenCount(
+          params.currentTokenCount,
+        );
         const promptOverflowEmergency =
-          (params.currentTokenCount ?? 0) > params.tokenBudget;
+          (normalizedCurrentTokenCount ?? 0) > cappedTokenBudget;
         if (
           promptOverflowEmergency
-          || !this.shouldDelayPromptMutatingDeferredCompaction(telemetry)
+          || !this.shouldDelayPromptMutatingDeferredCompaction(
+            telemetry,
+            new Date(),
+            normalizedCurrentTokenCount,
+            cappedTokenBudget,
+          )
         ) {
           const deferredLegacyParams =
             telemetry?.provider || telemetry?.model
@@ -3082,8 +3223,8 @@ export class LcmContextEngine implements ContextEngine {
             conversationId: params.conversationId,
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
-            tokenBudget: params.tokenBudget,
-            currentTokenCount: params.currentTokenCount,
+            tokenBudget: cappedTokenBudget,
+            currentTokenCount: normalizedCurrentTokenCount,
             legacyParams: deferredLegacyParams,
           });
           return;
@@ -5397,8 +5538,25 @@ export class LcmContextEngine implements ContextEngine {
             }
             return 128_000;
           })();
+          // Apply the assembly cap once and use the SAME capped value for both
+          // the gate's pressure check and the actual compaction execution.
+          // Otherwise, when maxAssemblyTokenBudget is configured lower than
+          // the runtime-supplied tokenBudget, the pressure ratio would be
+          // computed against the larger uncapped budget and could fail to
+          // trip even when the prompt is approaching the capped budget that
+          // execution actually enforces.
+          const cappedTokenBudget = this.applyAssemblyBudgetCap(runtimeTokenBudget);
+          const maintainCurrentTokenCount =
+            typeof params.runtimeContext?.currentTokenCount === "number"
+              ? Math.floor(params.runtimeContext.currentTokenCount as number)
+              : undefined;
           if ((maintenance?.pending || maintenance?.running)
-            && this.shouldDelayPromptMutatingDeferredCompaction(telemetry)) {
+            && this.shouldDelayPromptMutatingDeferredCompaction(
+              telemetry,
+              new Date(),
+              maintainCurrentTokenCount,
+              cappedTokenBudget,
+            )) {
             this.deps.log.info(
               `[lcm] maintain: deferred compaction debt still hot-cache deferred conversation=${conversation.conversationId} ${sessionLabel} retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"}`,
             );
@@ -5407,11 +5565,8 @@ export class LcmContextEngine implements ContextEngine {
               conversationId: conversation.conversationId,
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
-              tokenBudget: this.applyAssemblyBudgetCap(runtimeTokenBudget),
-              currentTokenCount:
-                typeof params.runtimeContext?.currentTokenCount === "number"
-                  ? Math.floor(params.runtimeContext.currentTokenCount as number)
-                  : undefined,
+              tokenBudget: cappedTokenBudget,
+              currentTokenCount: maintainCurrentTokenCount,
               runtimeContext: params.runtimeContext,
               legacyParams: asRecord(params.runtimeContext),
             });

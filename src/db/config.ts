@@ -17,6 +17,14 @@ export function resolveOpenclawStateDir(env: NodeJS.ProcessEnv = process.env): s
   return explicit || join(homedir(), ".openclaw");
 }
 
+/**
+ * Default for `criticalBudgetPressureRatio` — single source of truth so
+ * resolver fallback, runtime fallback, and tests can all reference the same
+ * value. Mirrored to `src/engine.ts`'s `?? DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO`
+ * usage.
+ */
+export const DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO = 0.70;
+
 export type CacheAwareCompactionConfig = {
   enabled: boolean;
   cacheTTLSeconds: number;
@@ -24,6 +32,26 @@ export type CacheAwareCompactionConfig = {
   hotCachePressureFactor: number;
   hotCacheBudgetHeadroomRatio: number;
   coldCacheObservationThreshold: number;
+  /**
+   * Token-budget ratio that bypasses cache-aware deferral when the prompt is
+   * critically full. Defaults to 0.70 — once `currentTokenCount >= 0.70 *
+   * tokenBudget`, deferred compaction fires regardless of prompt-cache
+   * temperature so the runtime never has to fall back to emergency overflow
+   * truncation.
+   *
+   * The 0.70 default leaves a 30% headroom band (0–70%) where cache-aware
+   * throttling can defer up to the configured cache TTL window per dispatch
+   * (default 5 minutes via `cacheTTLSeconds: 300`).
+   * Above 70%, the bypass fires every turn regardless of cache state — that
+   * 30% buffer is enough room for a heavily-deferred backlog to drain before
+   * the runtime emergency overflow handler is needed. Set to `>= 1` to
+   * disable the bypass entirely (cache-aware throttling fully controls
+   * deferral).
+   *
+   * Optional for backward compatibility — runtime defaults to 0.70 when this
+   * field is absent.
+   */
+  criticalBudgetPressureRatio?: number;
 };
 
 export type DynamicLeafChunkTokensConfig = {
@@ -326,6 +354,18 @@ export function resolveLcmConfigWithDiagnostics(
         ?? 3,
     ),
   );
+  // parseFiniteNumber and toNumber both filter out non-finite values, so the
+  // `?? DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO` fallback always yields a
+  // finite number. Just clamp to [0, 1].
+  const resolvedCriticalBudgetPressureRatio = Math.min(
+    1,
+    Math.max(
+      0,
+      parseFiniteNumber(env.LCM_CRITICAL_BUDGET_PRESSURE_RATIO)
+        ?? toNumber(cacheAwareCompaction?.criticalBudgetPressureRatio)
+        ?? DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
+    ),
+  );
 
   const ignoreSessionPatterns = resolvePatternArray({
     envValue: env.LCM_IGNORE_SESSION_PATTERNS,
@@ -460,6 +500,7 @@ export function resolveLcmConfigWithDiagnostics(
         hotCachePressureFactor: resolvedHotCachePressureFactor,
         hotCacheBudgetHeadroomRatio: resolvedHotCacheBudgetHeadroomRatio,
         coldCacheObservationThreshold: resolvedColdCacheObservationThreshold,
+        criticalBudgetPressureRatio: resolvedCriticalBudgetPressureRatio,
       },
       dynamicLeafChunkTokens: {
         enabled:

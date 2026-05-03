@@ -66,6 +66,7 @@ function createTestConfig(databasePath: string): LcmConfig {
       hotCachePressureFactor: 4,
       hotCacheBudgetHeadroomRatio: 0.2,
       coldCacheObservationThreshold: 3,
+      criticalBudgetPressureRatio: 0.70,
     },
     dynamicLeafChunkTokens: {
       enabled: true,
@@ -6884,7 +6885,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
       sessionFile: createSessionFilePath("after-turn-background-hot-cache-deferred"),
       messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
       prePromptMessageCount: 0,
-      tokenBudget: 4_096,
+      // Budget chosen so observed input (8K) is far below the critical pressure
+      // ratio (0.70 default). 8K / 200K = 4% — cache-aware path is the only
+      // gate the test should be probing.
+      tokenBudget: 200_000,
       runtimeContext: {
         provider: "anthropic",
         model: "claude-sonnet-4-6",
@@ -6960,7 +6964,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
       sessionFile: createSessionFilePath("after-turn-background-codex-cache-write-deferred"),
       messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
       prePromptMessageCount: 0,
-      tokenBudget: 4_096,
+      // Budget chosen so observed input (8K) is far below the critical pressure
+      // ratio. The test is verifying cache-write-only Codex telemetry remains
+      // mutation-sensitive — keep the budget-pressure escape out of scope.
+      tokenBudget: 200_000,
       runtimeContext: {
         provider: "openai-codex-responses",
         model: "gpt-5.5",

@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
 import {
+  DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
   resolveLcmConfig,
   resolveLcmConfigWithDiagnostics,
   resolveOpenclawStateDir,
@@ -48,6 +49,7 @@ describe("resolveLcmConfig", () => {
       hotCachePressureFactor: 4,
       hotCacheBudgetHeadroomRatio: 0.2,
       coldCacheObservationThreshold: 3,
+      criticalBudgetPressureRatio: DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
     });
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
@@ -112,6 +114,7 @@ describe("resolveLcmConfig", () => {
       hotCachePressureFactor: 6,
       hotCacheBudgetHeadroomRatio: 0.35,
       coldCacheObservationThreshold: 4,
+      criticalBudgetPressureRatio: DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
     });
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
@@ -193,6 +196,7 @@ describe("resolveLcmConfig", () => {
       hotCachePressureFactor: 5.5,
       hotCacheBudgetHeadroomRatio: 0.25,
       coldCacheObservationThreshold: 5,
+      criticalBudgetPressureRatio: DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
     });
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
@@ -368,6 +372,7 @@ describe("resolveLcmConfig", () => {
       hotCachePressureFactor: 6,
       hotCacheBudgetHeadroomRatio: 0.35,
       coldCacheObservationThreshold: 4,
+      criticalBudgetPressureRatio: DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
     });
   });
 
@@ -605,6 +610,11 @@ describe("resolveLcmConfig", () => {
         coldCacheObservationThreshold: {
           type: "integer",
           minimum: 1,
+        },
+        criticalBudgetPressureRatio: {
+          type: "number",
+          minimum: 0,
+          maximum: 1,
         },
       },
     });
