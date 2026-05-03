@@ -88,49 +88,19 @@ describe("buildModelContextWindowResolver", () => {
     expect(resolver("   ")).toBeNull();
   });
 
-  it("seeds from pi-ai catalog when mod.getModels is provided; runtime overrides win", () => {
-    const mod = {
-      getModels: (provider: string): unknown[] => {
-        if (provider === "openai") {
-          return [
-            { id: "gpt-4o", contextWindow: 128_000 },
-            { id: "gpt-3.5", contextWindow: 16_000 },
-          ];
-        }
-        return [];
-      },
-    };
-    const resolver = buildModelContextWindowResolver(
-      {
-        models: {
-          providers: {
-            openai: {
-              // Runtime override for gpt-4o; gpt-3.5 only in catalog.
-              models: [{ id: "gpt-4o", contextWindow: 200_000 }],
-            },
-          },
+  it("last provider in object iteration order wins for cross-provider id collision (RD-FIX-2 regression)", () => {
+    // When the same model id appears under multiple providers, the
+    // last-iterated provider's value wins. Object literal own-string-key
+    // iteration order is well-defined in JS (insertion order for non-numeric
+    // keys), so this is deterministic given a stable runtimeConfig shape.
+    const resolver = buildModelContextWindowResolver({
+      models: {
+        providers: {
+          openai: { models: [{ id: "gpt-4o", contextWindow: 128_000 }] },
+          "azure-openai": { models: [{ id: "gpt-4o", contextWindow: 64_000 }] },
         },
       },
-      mod,
-    );
-    // Runtime override wins.
-    expect(resolver("gpt-4o")).toBe(200_000);
-    // Catalog fallback fills the gap.
-    expect(resolver("gpt-3.5")).toBe(16_000);
-  });
-
-  it("does not throw when mod.getModels throws on unknown provider", () => {
-    const mod = {
-      getModels: (provider: string): unknown[] => {
-        if (provider === "unknown") throw new Error("unknown provider");
-        return [];
-      },
-    };
-    expect(() =>
-      buildModelContextWindowResolver(
-        { models: { providers: { unknown: { models: [] } } } },
-        mod,
-      ),
-    ).not.toThrow();
+    });
+    expect(resolver("gpt-4o")).toBe(64_000);
   });
 });

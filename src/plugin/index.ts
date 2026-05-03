@@ -958,10 +958,8 @@ export function resolveModelApiFromRuntimeConfig(
  * suitable for replay determinism (no live RPCs, no TTL caches).
  *
  * Walks `runtimeConfig.models.providers[*].models[*]` for `{ id, contextWindow }`
- * and stores the highest precedence value per model id. When a `mod` with
- * `getModels()` is provided, providers from the runtime config seed additional
- * entries from the pi-ai catalog at lower precedence (catalog values only fill
- * gaps; runtime overrides win).
+ * and records the value per model id (last-write-wins across object iteration
+ * order, which is well-defined for own string keys in object literals).
  *
  * Returns `(model: string) => number | null`. Returns null when the model is
  * unknown, when contextWindow is missing or non-positive, or when the runtime
@@ -969,7 +967,6 @@ export function resolveModelApiFromRuntimeConfig(
  */
 export function buildModelContextWindowResolver(
   runtimeConfig: unknown,
-  mod?: { getModels?: (provider: string) => unknown[] } | undefined,
 ): (model: string) => number | null {
   const map = new Map<string, number>();
 
@@ -978,35 +975,7 @@ export function buildModelContextWindowResolver(
     : undefined;
 
   if (isRecord(providers)) {
-    // Lower precedence: pi-ai catalog (filled first; runtime overrides win
-    // because they're written after).
-    if (mod && typeof mod.getModels === "function") {
-      for (const providerId of Object.keys(providers)) {
-        let catalogModels: unknown[] = [];
-        try {
-          catalogModels = mod.getModels(providerId) ?? [];
-        } catch {
-          // Unknown provider id — pi-ai may throw; ignore.
-          catalogModels = [];
-        }
-        for (const entry of catalogModels) {
-          if (!isRecord(entry)) continue;
-          const id = typeof entry.id === "string" ? entry.id.trim() : null;
-          const ctx =
-            typeof entry.contextWindow === "number" &&
-            Number.isFinite(entry.contextWindow) &&
-            entry.contextWindow > 0
-              ? entry.contextWindow
-              : null;
-          if (id && ctx) {
-            // Only set if not already in the map — runtime overrides win.
-            if (!map.has(id)) map.set(id, ctx);
-          }
-        }
-      }
-    }
-
-    // Higher precedence: explicit overrides from runtimeConfig.
+    // Explicit overrides from runtimeConfig.
     for (const provider of Object.values(providers)) {
       if (!isRecord(provider)) continue;
       const models = (provider as { models?: unknown }).models;
@@ -2136,7 +2105,6 @@ function createLcmDependencies(
     },
     getModelContextWindow: buildModelContextWindowResolver(
       registrationConfig.openClawConfig,
-      undefined,
     ),
     callGateway: async (params) => {
       const sub = api.runtime.subagent;
