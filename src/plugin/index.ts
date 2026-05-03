@@ -791,7 +791,10 @@ export function shouldOmitTemperatureForApi(api: string | undefined): boolean {
  *  and self-hosted setups both rely on explicit baseUrl configuration; a
  *  silent `http://localhost:11434` fallback would silently route cloud
  *  configs to localhost and produce confusing connection errors. Returning
- *  undefined here forces an explicit baseUrl. */
+ *  undefined here drops the inferred default — `resolveProviderModelBaseUrl`
+ *  still passes `""` through to the dispatcher when no other source yields
+ *  a baseUrl, which surfaces a clearer downstream error than a silent
+ *  wrong-target connect. */
 function inferBaseUrlFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
   const map: Record<string, string> = {
