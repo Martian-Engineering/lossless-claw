@@ -377,7 +377,7 @@ export class ConversationStore {
         `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
        FROM conversations
        WHERE session_key = ?
-       ORDER BY created_at DESC`,
+       ORDER BY created_at DESC, conversation_id DESC`,
       )
       .all(sessionKey) as unknown as ConversationRow[];
 

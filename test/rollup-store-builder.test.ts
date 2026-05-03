@@ -1062,6 +1062,45 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("returns deterministic order from listConversationsBySessionKey when created_at ties (P1-9)", async () => {
+    const { db, conversationStore } = createStores();
+    const sessionKey = "agent:main:tiebreak-stability";
+
+    // Insert two conversations sharing both session_key and created_at,
+    // simulating the low-resolution clock case (e.g. SQLite second-precision
+    // ties under load). The unique active+session_key index forces one to be
+    // archived; both rows still come back from listConversationsBySessionKey.
+    const archived = await conversationStore.createConversation({
+      sessionId: "tiebreak-A",
+      sessionKey,
+    });
+    db.prepare(
+      `UPDATE conversations SET active = 0, archived_at = datetime('now') WHERE conversation_id = ?`,
+    ).run(archived.conversationId);
+    await conversationStore.createConversation({
+      sessionId: "tiebreak-B",
+      sessionKey,
+    });
+    db.prepare(
+      `UPDATE conversations
+       SET created_at = '2026-04-27 12:00:00'
+       WHERE session_key = ?`,
+    ).run(sessionKey);
+
+    const list1 = await conversationStore.listConversationsBySessionKey(sessionKey);
+    const list2 = await conversationStore.listConversationsBySessionKey(sessionKey);
+    const list3 = await conversationStore.listConversationsBySessionKey(sessionKey);
+
+    expect(list1.length).toBe(2);
+    const ids1 = list1.map((c) => c.conversationId);
+    const ids2 = list2.map((c) => c.conversationId);
+    const ids3 = list3.map((c) => c.conversationId);
+    expect(ids2).toEqual(ids1);
+    expect(ids3).toEqual(ids1);
+    // Deterministic tiebreak puts the higher conversation_id first.
+    expect(ids1[0]).toBeGreaterThan(ids1[1]);
+  });
+
   it("performs the existing-row read inside the transaction in buildAggregateRollup (P1-8)", async () => {
     // Structural assertion: reading rollup-builder.ts source must show that
     // the FIRST `this.store.getRollup(` call inside buildAggregateRollup
