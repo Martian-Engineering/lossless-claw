@@ -283,10 +283,13 @@ function parseRebuildRollupsArgs(rest: string[]): ParsedLcmCommand {
       return { kind: "rebuild_rollups", daysBack: n };
     }
   }
+  // Echo the offending input so operators can tell "got 366" from "got +7"
+  // from "got 7.0" without re-typing.
+  const offending = rest.length === 1 ? `\`${rest[0]?.trim() ?? ""}\`` : `\`${rest.join(" ")}\``;
   return {
     kind: "help",
     error:
-      `\`${VISIBLE_COMMAND} rebuild-rollups\` accepts an optional positive day count (default 7, max 365). Example: \`${VISIBLE_COMMAND} rebuild-rollups 14\`.`,
+      `\`${VISIBLE_COMMAND} rebuild-rollups\` expects an integer in [1, 365] (got ${offending}). Example: \`${VISIBLE_COMMAND} rebuild-rollups 14\`.`,
   };
 }
 
@@ -610,7 +613,7 @@ function buildHelpText(error?: string): string {
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor apply`), "Repair broken summaries in the current conversation."),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} rebuild-rollups [days]`),
-        "Rebuild daily/weekly/monthly rollups for the last N days (default 7, max 365) across all conversations under this agent's session_key.",
+        "Rebuild daily/weekly/monthly rollups for the last N days (must be an integer in [1, 365]; default 7) across all conversations under this agent's session_key.",
       ),
     ]),
     "",

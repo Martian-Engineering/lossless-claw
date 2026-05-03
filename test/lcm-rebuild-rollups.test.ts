@@ -150,6 +150,33 @@ describe("/lossless rebuild-rollups", () => {
     expect(aggArgs?.[1]).toEqual({ daysBack: 7 });
   });
 
+  it("echoes the rejected input in the error text on invalid daysBack (P3)", async () => {
+    const fixture = createRebuildFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const tooLarge = await fixture.command.handler(
+      makeContext("rebuild-rollups 366"),
+    );
+    expect(tooLarge.text).toContain("[1, 365]");
+    expect(tooLarge.text).toContain("`366`");
+
+    const nonInt = await fixture.command.handler(
+      makeContext("rebuild-rollups 7.0"),
+    );
+    expect(nonInt.text).toContain("`7.0`");
+
+    const negative = await fixture.command.handler(
+      makeContext("rebuild-rollups -3"),
+    );
+    expect(negative.text).toContain("`-3`");
+
+    const garbage = await fixture.command.handler(
+      makeContext("rebuild-rollups abc"),
+    );
+    expect(garbage.text).toContain("`abc`");
+  });
+
   it("appends a (...N more suppressed) marker when error totals exceed 3 (P3)", async () => {
     const fixture = createRebuildFixture();
     tempDirs.add(fixture.tempDir);
