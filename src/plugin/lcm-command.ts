@@ -1505,8 +1505,10 @@ export function createLcmCommand(params: {
  *
  * Sequential by design — each call to `buildDailyRollups` already iterates
  * its own days serially with `await`, and we iterate conversations serially
- * too. This naturally rate-limits at the summarizer level (one model call at
- * a time) without needing a separate scheduler.
+ * too. Concurrent writers serialize on the per-conversation DB transaction
+ * mutex (BEGIN IMMEDIATE inside buildDayRollup / buildAggregateRollup);
+ * idempotent fingerprints make redundant rebuilds cheap no-ops. There is
+ * no in-process single-flight Map — naming it "single-flight" was sloppy.
  */
 async function buildRebuildRollupsText(params: {
   ctx: PluginCommandContext;
@@ -1552,7 +1554,7 @@ async function buildRebuildRollupsText(params: {
     `Conversations to process: ${conversations.length} (active + archived)`,
     `Window: last ${params.daysBack} day${params.daysBack === 1 ? "" : "s"}`,
     "",
-    "Rebuilding sequentially (rate-limited by single-flight summarizer)...",
+    "Rebuilding sequentially (DB transaction mutex serializes writes; idempotent fingerprints skip no-ops)...",
     "",
   );
 
