@@ -391,12 +391,31 @@ function recordExpandTokens(
   output: unknown,
 ): void {
   // Track which summaryIds were expanded so we can avoid double-counting their tok.
+  // The visitor descends into objects/arrays AND tries to JSON.parse strings —
+  // OpenAI-style function_call blocks reassemble `arguments` as a JSON string
+  // in this codebase, so a structured-input-only walker would miss the
+  // expanded summary IDs and a described leaf would later be counted twice
+  // (once as expanded, once as cited-described).
   const visitInput = (value: unknown, depth: number): void => {
-    if (depth > 3 || value == null) {
+    if (depth > 4 || value == null) {
       return;
     }
-    if (typeof value === "string" && value.startsWith("sum_")) {
-      account.expandedSummaryIds.add(value);
+    if (typeof value === "string") {
+      if (value.startsWith("sum_")) {
+        account.expandedSummaryIds.add(value);
+        return;
+      }
+      // Try to parse JSON string (function_call.arguments shape). Bail
+      // silently on parse error — the value is just a plain string.
+      const trimmed = value.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          visitInput(parsed, depth + 1);
+        } catch {
+          /* not JSON, ignore */
+        }
+      }
       return;
     }
     if (Array.isArray(value)) {
@@ -420,7 +439,19 @@ function recordExpandTokens(
       return;
     }
     if (typeof value === "string") {
-      // Text form may include "total=N" or "totalTokens=N".
+      // Text-form lcm_expand output uses `distillForSubagent`, which renders
+      // the heading `## Expansion Results (N summaries, M total tokens)`.
+      // Older shapes also surface `totalTokens=N` / `totalTokens: N`.
+      const distilledMatch = value.match(
+        /##\s+Expansion Results\s*\([^)]*?(\d+)\s+total tokens?\)/i,
+      );
+      if (distilledMatch) {
+        const n = Number(distilledMatch[1]);
+        if (Number.isFinite(n)) {
+          total = n;
+          return;
+        }
+      }
       const m = value.match(/\btotalTokens[=:]\s*(\d+)/);
       if (m) {
         const n = Number(m[1]);
@@ -1089,9 +1120,15 @@ async function runDelegatedExpandQuery(
         throw new Error(formatExpansionFailure(wait?.error));
       }
 
+      // Fetch the entire delegated child transcript (no `limit`) so the
+      // parent-side accountant in `buildObservedTokenAccount` doesn't drop
+      // older `lcm_describe`/`lcm_expand` calls when the child emits more
+      // than ~80 transcript entries.  An undercount on `totalSourceTokens`
+      // would let cross-conversation buckets exceed the global expansion
+      // budget.
       const replyPayload = (await params.deps.callGateway({
         method: "sessions.get",
-        params: { key: childSessionKey, limit: 80 },
+        params: { key: childSessionKey },
         timeoutMs: GATEWAY_TIMEOUT_MS,
       })) as { messages?: unknown[] };
       const messages = Array.isArray(replyPayload.messages) ? replyPayload.messages : [];
