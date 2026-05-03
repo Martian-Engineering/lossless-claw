@@ -53,6 +53,12 @@ Most installations only need to override a handful of keys. If you want a comple
   "circuitBreakerCooldownMs": 1800000,
   "fallbackProviders": [],
   "proactiveThresholdCompactionMode": "deferred",
+  "autoRotateSessionFiles": {
+    "enabled": true,
+    "sizeBytes": 2097152,
+    "startup": "rotate",
+    "runtime": "rotate"
+  },
   "cacheAwareCompaction": {
     "enabled": true,
     "cacheTTLSeconds": 300,
@@ -117,8 +123,16 @@ openclaw plugins install --link /path/to/lossless-claw
 | `pruneHeartbeatOk` | `boolean` | `false` | `LCM_PRUNE_HEARTBEAT_OK` | Retroactively removes `HEARTBEAT_OK` turn cycles from persisted storage. |
 | `transcriptGcEnabled` | `boolean` | `false` | `LCM_TRANSCRIPT_GC_ENABLED` | Enables transcript rewrite GC during `maintain()`; disabled by default so transcript rewrites stay opt-in. |
 | `proactiveThresholdCompactionMode` | `"deferred" \| "inline"` | `"deferred"` | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | Controls whether proactive threshold compaction is deferred into maintenance debt by default or run inline for legacy behavior. |
+| `autoRotateSessionFiles.enabled` | `boolean` | `true` | `LCM_AUTO_ROTATE_SESSION_FILES_ENABLED` | Enables automatic rotation for oversized LCM-managed session JSONL files. |
+| `autoRotateSessionFiles.sizeBytes` | `integer` | `2097152` | `LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES` | Byte threshold that triggers automatic session-file rotation. |
+| `autoRotateSessionFiles.startup` | `"rotate" \| "warn" \| "off"` | `"rotate"` | `LCM_AUTO_ROTATE_SESSION_FILES_STARTUP` | Startup behavior for oversized known active LCM transcripts. |
+| `autoRotateSessionFiles.runtime` | `"rotate" \| "warn" \| "off"` | `"rotate"` | `LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME` | Runtime behavior after `afterTurn()` and `maintain()` check the current transcript size. |
 
 > **Multi-profile note:** `OPENCLAW_STATE_DIR` (set by the host OpenClaw gateway) controls where state is stored. When two gateways run on the same host (e.g. separate bot personas), each gateway sets its own `OPENCLAW_STATE_DIR` and lossless-claw automatically uses that directory for the database, large-file payloads, auth-profile lookups, and legacy secrets — no per-profile plugin config is needed.
+
+Automatic session-file rotation uses the same safe path as `/lcm rotate`: it replaces the rolling `rotate-latest` SQLite backup, rewrites only the live session transcript, keeps the active LCM conversation and durable history intact, and refreshes the bootstrap checkpoint. It never runs for ignored sessions, stateless sessions, or sessions without an active LCM conversation. The preserved JSONL tail follows the existing rotate behavior, which is controlled by `freshTailCount`.
+
+Every automatic decision emits a grep-able log line prefixed with `[lcm] auto-rotate:`. Rotation lines include `phase`, `action`, `sessionId`, `sessionKey`, `sessionFile`, `sizeBytes`, `thresholdBytes`, `durationMs`, `backupPath`, `bytesRemoved`, `preservedTailMessageCount`, and `checkpointSize`; skip/warn lines include the same available context plus `reason` or `error`.
 
 ### Compaction thresholds and summary sizing
 

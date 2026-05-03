@@ -51,6 +51,12 @@ function createTestConfig(databasePath: string): LcmConfig {
     pruneHeartbeatOk: false,
     transcriptGcEnabled: false,
     proactiveThresholdCompactionMode: "deferred",
+    autoRotateSessionFiles: {
+      enabled: true,
+      sizeBytes: 2 * 1024 * 1024,
+      startup: "rotate",
+      runtime: "rotate",
+    },
     summaryMaxOverageFactor: 3,
     expansionProvider: "",
     expansionModel: "",

@@ -54,6 +54,12 @@ function createTestConfig(databasePath: string): LcmConfig {
     pruneHeartbeatOk: false,
     transcriptGcEnabled: false,
     proactiveThresholdCompactionMode: "deferred",
+    autoRotateSessionFiles: {
+      enabled: true,
+      sizeBytes: 2 * 1024 * 1024,
+      startup: "rotate",
+      runtime: "rotate",
+    },
     summaryMaxOverageFactor: 3,
     customInstructions: "",
     circuitBreakerThreshold: 5,
@@ -215,6 +221,27 @@ function makeMessage(params: { role?: string; content: unknown }): AgentMessage 
     content: params.content,
     timestamp: Date.now(),
   } as AgentMessage;
+}
+
+function readSessionMessages(sessionFile: string): AgentMessage[] {
+  return SessionManager.open(sessionFile)
+    .getBranch()
+    .filter((entry) => entry.type === "message")
+    .map((entry) => entry.message as AgentMessage);
+}
+
+function createBulkySession(sessionFile: string, messageCount: number): AgentMessage[] {
+  const sm = SessionManager.open(sessionFile);
+  const messages: AgentMessage[] = [];
+  for (let index = 0; index < messageCount; index += 1) {
+    const message = makeMessage({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: [{ type: "text", text: `auto rotate payload ${index} ${"x".repeat(160)}` }],
+    });
+    sm.appendMessage(message);
+    messages.push(message);
+  }
+  return messages;
 }
 
 async function flushImmediate(): Promise<void> {
@@ -3353,6 +3380,255 @@ describe("LcmContextEngine.bootstrap", () => {
 
     expect(result.kind).toBe("unavailable");
     expect(result.reason).toContain("could not rotate the current session transcript");
+  });
+
+  it("auto-rotates oversized LCM-managed session files after runtime turns", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-runtime");
+    const messages = createBulkySession(sessionFile, 14);
+    const beforeSize = statSync(sessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+    const sessionId = "auto-rotate-runtime-session";
+    const sessionKey = "agent:main:test:auto-rotate-runtime";
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+
+    const afterSize = statSync(sessionFile).size;
+    expect(beforeSize).toBeGreaterThan(1_500);
+    expect(afterSize).toBeLessThan(beforeSize);
+    const autoRotateLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    const rotateLog = autoRotateLogs.find((message) =>
+      message.includes("phase=runtime action=rotate"),
+    );
+    expect(rotateLog).toContain(`sessionId=${sessionId}`);
+    expect(rotateLog).toContain(`sessionKey=${sessionKey}`);
+    expect(rotateLog).toContain(`sessionFile=${sessionFile}`);
+    expect(rotateLog).toContain("sizeBytes=");
+    expect(rotateLog).toContain("thresholdBytes=1500");
+    expect(rotateLog).toContain("durationMs=");
+    expect(rotateLog).toContain("backupPath=");
+    expect(rotateLog).toContain("bytesRemoved=");
+    expect(rotateLog).toContain("preservedTailMessageCount=1");
+    expect(rotateLog).toContain("checkpointSize=");
+  });
+
+  it("leaves below-threshold session files alone while logging the decision", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-below-threshold");
+    const messages = createBulkySession(sessionFile, 4);
+    const beforeSize = statSync(sessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: beforeSize + 1_000,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+    const sessionId = "auto-rotate-below-session";
+    const sessionKey = "agent:main:test:auto-rotate-below";
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+
+    expect(statSync(sessionFile).size).toBe(beforeSize);
+    const autoRotateLogs = log.info.mock.calls.map(([message]) => String(message));
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("phase=runtime action=skip"),
+        expect.stringContaining("reason=below-threshold"),
+      ]),
+    );
+  });
+
+  it("skips ignored, stateless, and untracked runtime sessions", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-skip-guards");
+    const messages = createBulkySession(sessionFile, 10);
+    const original = readFileSync(sessionFile, "utf8");
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        ignoreSessionPatterns: ["agent:*:cron:**"],
+        statelessSessionPatterns: ["agent:*:subagent:**"],
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 500,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+
+    await engine.afterTurn({
+      sessionId: "auto-rotate-ignored-session",
+      sessionKey: "agent:main:cron:nightly",
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+    await engine.afterTurn({
+      sessionId: "auto-rotate-stateless-session",
+      sessionKey: "agent:main:subagent:worker",
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+    await engine.afterTurn({
+      sessionId: "auto-rotate-untracked-session",
+      sessionKey: "agent:main:test:auto-rotate-untracked",
+      sessionFile,
+      messages: [messages[0]!],
+      prePromptMessageCount: 0,
+      isHeartbeat: true,
+    });
+
+    expect(readFileSync(sessionFile, "utf8")).toBe(original);
+    const autoRotateLogs = log.info.mock.calls.map(([message]) => String(message));
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("reason=session-excluded"),
+        expect.stringContaining("reason=stateless-session"),
+        expect.stringContaining("reason=no-active-conversation"),
+      ]),
+    );
+  });
+
+  it("startup scan rotates oversized active conversations with checkpointed files", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-startup");
+    const messages = createBulkySession(sessionFile, 14);
+    const beforeSize = statSync(sessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "rotate",
+          runtime: "off",
+        },
+      },
+      { log },
+    );
+    const sessionId = "auto-rotate-startup-session";
+    const sessionKey = "agent:main:test:auto-rotate-startup";
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.autoRotateManagedSessionFilesAtStartup();
+
+    expect(beforeSize).toBeGreaterThan(1_500);
+    expect(statSync(sessionFile).size).toBeLessThan(beforeSize);
+    const autoRotateLogs = log.info.mock.calls.map(([message]) => String(message));
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("phase=startup action=rotate"),
+        expect.stringContaining("backupPath="),
+      ]),
+    );
+    expect(readSessionMessages(sessionFile)).toHaveLength(1);
+    expect(readSessionMessages(sessionFile)[0]?.role).toBe(messages[messages.length - 1]?.role);
+  });
+
+  it("does not repeatedly rotate once the transcript has been compacted below threshold", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-no-loop");
+    const messages = createBulkySession(sessionFile, 14);
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+    const sessionId = "auto-rotate-no-loop-session";
+    const sessionKey = "agent:main:test:auto-rotate-no-loop";
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+    const compactedMessages = readSessionMessages(sessionFile);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: compactedMessages,
+      prePromptMessageCount: compactedMessages.length,
+    });
+
+    const autoRotateLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    expect(
+      autoRotateLogs.filter((message) => message.includes("action=rotate")),
+    ).toHaveLength(1);
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([expect.stringContaining("reason=below-threshold")]),
+    );
   });
 
   it("reconciles missing tail messages when JSONL advanced past LCM", async () => {

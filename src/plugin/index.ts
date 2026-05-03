@@ -2292,6 +2292,15 @@ const lcmPlugin = {
       return error instanceof Error ? error : new Error(String(error));
     }
 
+    /** Start the non-blocking startup scan for oversized LCM-managed transcripts. */
+    function scheduleStartupAutoRotate(nextEngine: LcmContextEngine): void {
+      void nextEngine.autoRotateManagedSessionFilesAtStartup().catch((error) => {
+        deps.log.warn(
+          `[lcm] auto-rotate: phase=startup action=warn durationMs=0 reason=startup-scan-failed error=${describeLogError(error).replace(/\s+/g, "_")}`,
+        );
+      });
+    }
+
     /** Build a live DB+engine pair and roll back the DB handle if engine init fails. */
     function initializeEngine(): LcmContextEngine {
       const startedAt = Date.now();
@@ -2304,6 +2313,7 @@ const lcmPlugin = {
         deps.log.info(
           `[lcm] Engine initialized for db=${normalizedDbPath} duration=${Date.now() - startedAt}ms`,
         );
+        scheduleStartupAutoRotate(nextEngine);
         return nextEngine;
       } catch (error) {
         closeLcmConnection(nextDatabase);
