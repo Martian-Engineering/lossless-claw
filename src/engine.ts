@@ -3609,6 +3609,12 @@ export class LcmContextEngine implements ContextEngine {
         return "webp";
       case "image/svg+xml":
         return "svg";
+      case "image/heic":
+        return "heic";
+      case "image/avif":
+        return "avif";
+      case "image/bmp":
+        return "bmp";
       default:
         return null;
     }
@@ -3663,6 +3669,7 @@ export class LcmContextEngine implements ContextEngine {
     content: unknown[];
     imageIndex: number;
     extension: string;
+    role?: string;
   }): string {
     for (let index = params.imageIndex - 1; index >= 0; index -= 1) {
       const entry = asRecord(params.content[index]);
@@ -3680,14 +3687,20 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    return `user-image.${params.extension}`;
+    const rolePrefix =
+      params.role === "assistant"
+        ? "assistant"
+        : params.role === "system"
+          ? "system"
+          : params.role === "tool" || params.role === "toolResult"
+            ? "tool"
+            : "user";
+    return `${rolePrefix}-image.${params.extension}`;
   }
 
   private static isExternalizedImageReference(value: string): boolean {
     if (typeof value !== "string") return false;
-    return /^\[(?:User|Tool|Assistant|Image) image: .*LCM file: file_[a-f0-9]{16}\]$/.test(
-      value.trim(),
-    );
+    return LcmContextEngine.IMAGE_REFERENCE_REGEX.test(value.trim());
   }
 
   private static isExternalizedReferenceContent(value: string): boolean {
@@ -3696,10 +3709,49 @@ export class LcmContextEngine implements ContextEngine {
       trimmed.startsWith("[LCM File:") ||
       trimmed.startsWith("[LCM Tool Output:") ||
       trimmed.includes("LCM file: file_") ||
-      /\[(?:User|Tool|Assistant|Image) image: [^\]]*LCM file: file_[a-f0-9]{16}\]/.test(
-        trimmed,
-      )
+      LcmContextEngine.IMAGE_REFERENCE_REGEX_GLOBAL.test(trimmed)
     );
+  }
+
+  /** Image references emitted by `externalizeImage` come in two label
+   *  shapes:
+   *    - `[<Role> image: ...]` from `interceptNativeImageBlocks` (label is
+   *      "User image" / "Assistant image" / "System image" / "Tool image")
+   *    - `[Image: ...]` from `interceptPureBase64Image` for the user/system
+   *      pure-base64 fast path (label is just "Image", no second "image"
+   *      word)
+   *  The regex must match both — a previous shape required the literal
+   *  word "image:" after the label, which silently dropped the
+   *  `[Image: ...]` case and let those references fall through into raw-
+   *  payload externalization. */
+  private static readonly IMAGE_REFERENCE_REGEX =
+    /^\[(?:(?:User|System|Tool|Assistant) image|Image): [^\]]*LCM file: file_[a-f0-9]{16}\]$/;
+  private static readonly IMAGE_REFERENCE_REGEX_GLOBAL =
+    /\[(?:(?:User|System|Tool|Assistant) image|Image): [^\]]*LCM file: file_[a-f0-9]{16}\]/;
+
+  /** Stricter form of `isExternalizedReferenceContent` used by the
+   *  raw-payload externalizer's skip gate. Returns true when the message's
+   *  stored content was produced by a *wholesale-replacement* externalizer
+   *  (large-file / tool-output / raw-payload — each emits content that
+   *  starts with the canonical reference header, optionally followed by an
+   *  exploration-summary preamble), or when the whole trimmed content is a
+   *  single image-only reference (rare).
+   *
+   *  Mixed content like `"...intro... [User image: file_xyz] ... long body
+   *  text..."` is NOT considered wholly externalized — those messages must
+   *  remain eligible for raw-payload externalization when they exceed the
+   *  size threshold. */
+  private static isWhollyExternalizedReferenceContent(value: string): boolean {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return false;
+    if (
+      trimmed.startsWith("[LCM File:") ||
+      trimmed.startsWith("[LCM Tool Output:") ||
+      trimmed.startsWith("[LCM Raw Payload:")
+    ) {
+      return true;
+    }
+    return LcmContextEngine.IMAGE_REFERENCE_REGEX.test(trimmed);
   }
 
   /** Resolve the configured externalized-payload directory for one conversation. */
@@ -3755,16 +3807,40 @@ export class LcmContextEngine implements ContextEngine {
     return { fileId, byteSize, summary, reference };
   }
 
-  private async interceptNativeUserImageBlocks(params: {
+  private async interceptNativeImageBlocks(params: {
     conversationId: number;
     message: AgentMessage;
   }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
-    if (params.message.role !== "user" || !("content" in params.message)) {
+    if (!("content" in params.message)) {
+      return null;
+    }
+    const role = (params.message as { role?: unknown }).role;
+    // Cover every persistable role — `hasPersistableMessageRole` accepts
+    // user/assistant/system/tool/toolResult, so this gate must too. A system
+    // message carrying native `{type:"image"}` blocks would otherwise fall
+    // through to the generic raw-payload externalizer and be stored as a
+    // `raw-system-payload.json` blob with embedded base64.
+    if (
+      role !== "user" &&
+      role !== "assistant" &&
+      role !== "system" &&
+      role !== "tool" &&
+      role !== "toolResult"
+    ) {
       return null;
     }
     if (!Array.isArray(params.message.content)) {
       return null;
     }
+
+    const label =
+      role === "assistant"
+        ? "Assistant image"
+        : role === "system"
+          ? "System image"
+          : role === "tool" || role === "toolResult"
+            ? "Tool image"
+            : "User image";
 
     const rewrittenContent: unknown[] = [];
     const fileIds: string[] = [];
@@ -3785,10 +3861,11 @@ export class LcmContextEngine implements ContextEngine {
           content: params.message.content,
           imageIndex: index,
           extension: image.extension,
+          role: typeof role === "string" ? role : undefined,
         }),
         extension: image.extension,
         mimeType: image.mimeType,
-        label: "User image",
+        label,
       });
 
       rewrittenContent.push({ type: "text", text: externalized.reference });
@@ -4457,7 +4534,23 @@ export class LcmContextEngine implements ContextEngine {
     if (params.stored.role === "tool") {
       return null;
     }
-    if (LcmContextEngine.isExternalizedReferenceContent(params.stored.content)) {
+    // Skip when this message has already been raw-payload-externalized OR
+    // when its stored content is — by itself — *just* an externalized
+    // reference. The previous loose substring check
+    // (`isExternalizedReferenceContent` matching anywhere via
+    // `includes("LCM file: file_")`) tripped on mixed content like
+    // `"...intro... [User image: file_xyz] ... long body text..."`,
+    // blocking legitimate raw-payload externalization for messages that
+    // embed an image reference alongside other oversized content. The
+    // tightened helper requires the WHOLE trimmed content to be a single
+    // externalized-reference shape.
+    const externalizedFlag = (
+      params.message as { rawPayloadExternalized?: unknown }
+    ).rawPayloadExternalized;
+    if (externalizedFlag === true) {
+      return null;
+    }
+    if (LcmContextEngine.isWhollyExternalizedReferenceContent(params.stored.content)) {
       return null;
     }
     if ("content" in params.message && hasReplayCriticalRawBlock(params.message.content)) {
@@ -5740,6 +5833,15 @@ export class LcmContextEngine implements ContextEngine {
 
     let messageForParts = message;
 
+    const nativeImageIntercepted = await this.interceptNativeImageBlocks({
+      conversationId,
+      message: messageForParts,
+    });
+    if (nativeImageIntercepted) {
+      messageForParts = nativeImageIntercepted.rewrittenMessage;
+      stored = toStoredMessage(messageForParts);
+    }
+
     if (stored.role === "tool") {
       const imageIntercepted = await this.interceptInlineImagesInToolMessage({
         conversationId,
@@ -5750,15 +5852,6 @@ export class LcmContextEngine implements ContextEngine {
         stored = toStoredMessage(messageForParts);
       }
     } else {
-      const nativeImageIntercepted = await this.interceptNativeUserImageBlocks({
-        conversationId,
-        message: messageForParts,
-      });
-      if (nativeImageIntercepted) {
-        messageForParts = nativeImageIntercepted.rewrittenMessage;
-        stored = toStoredMessage(messageForParts);
-      }
-
       const imageIntercepted = await this.interceptInlineImages({
         conversationId,
         content: stored.content,
