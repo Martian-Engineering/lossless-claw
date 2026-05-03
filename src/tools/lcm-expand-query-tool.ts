@@ -331,17 +331,63 @@ function coerceFiniteNumber(value: unknown): number | undefined {
   return value;
 }
 
+/** Extract the summaryIds passed to a `lcm_describe` call (the "explicit
+ *  describe target" — usually a single ID, occasionally a small list).  Only
+ *  these summaries' content is actually retrieved by the call; manifest
+ *  entries returned alongside are just family/sibling pointers and their
+ *  `tok` should NOT be billed against `totalSourceTokens` if the child later
+ *  cites them. */
+function extractDescribeTargets(input: unknown): Set<string> {
+  const targets = new Set<string>();
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 4 || value == null) return;
+    if (typeof value === "string") {
+      if (value.startsWith("sum_")) {
+        targets.add(value);
+        return;
+      }
+      const trimmed = value.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          visit(JSON.parse(trimmed), depth + 1);
+        } catch {
+          /* not JSON */
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) visit(entry, depth + 1);
+      return;
+    }
+    if (typeof value === "object") {
+      for (const child of Object.values(value as Record<string, unknown>)) {
+        visit(child, depth + 1);
+      }
+    }
+  };
+  visit(input, 0);
+  return targets;
+}
+
 function recordDescribeTokens(
   account: ObservedTokenAccount,
+  input: unknown,
   output: unknown,
 ): void {
+  const targets = extractDescribeTargets(input);
   const visit = (value: unknown, depth: number): void => {
     if (depth > 4 || value == null) {
       return;
     }
     if (typeof value === "string") {
-      // Parse text-form describe output: "LCM_SUMMARY sum_xxx" + "meta ... tok=N"
-      // and manifest lines "d0 sum_yyy k=leaf tok=N".
+      // Parse text-form describe output: "LCM_SUMMARY sum_xxx" + "meta ... tok=N".
+      // Only record tok for the header-described summary (the call's explicit
+      // target).  Manifest lines like "d0 sum_yyy k=leaf tok=N" surface
+      // related summaries' metadata, but `lcm_describe` does NOT retrieve their
+      // content — billing those tokens against `totalSourceTokens` when the
+      // child later cites them would prematurely exhaust the cross-conversation
+      // budget for evidence the child never actually consumed.
       const headerMatch = value.match(/LCM_SUMMARY\s+(sum_[A-Za-z0-9_-]+)[\s\S]*?\btok=(\d+)/);
       if (headerMatch) {
         const summaryId = headerMatch[1];
@@ -350,13 +396,19 @@ function recordDescribeTokens(
           account.describedSummaryTokens.set(summaryId, tok);
         }
       }
-      const manifestRe = /\b(sum_[A-Za-z0-9_-]+)\s+k=\w+\s+tok=(\d+)/g;
-      let match: RegExpExecArray | null;
-      while ((match = manifestRe.exec(value)) !== null) {
-        const summaryId = match[1];
-        const tok = Number(match[2]);
-        if (Number.isFinite(tok) && !account.describedSummaryTokens.has(summaryId)) {
-          account.describedSummaryTokens.set(summaryId, tok);
+      // Also accept manifest-line `tok` values, but ONLY for IDs that were
+      // explicit input targets (a multi-id `lcm_describe` call returns the
+      // header for one and manifest lines for the others).
+      if (targets.size > 0) {
+        const manifestRe = /\b(sum_[A-Za-z0-9_-]+)\s+k=\w+\s+tok=(\d+)/g;
+        let match: RegExpExecArray | null;
+        while ((match = manifestRe.exec(value)) !== null) {
+          const summaryId = match[1];
+          if (!targets.has(summaryId)) continue;
+          const tok = Number(match[2]);
+          if (Number.isFinite(tok) && !account.describedSummaryTokens.has(summaryId)) {
+            account.describedSummaryTokens.set(summaryId, tok);
+          }
         }
       }
       return;
@@ -369,7 +421,10 @@ function recordDescribeTokens(
     }
     if (typeof value === "object") {
       const record = value as Record<string, unknown>;
-      // Structured details: { summary: { summaryId, tokenCount }, manifest: { nodes: [...] } }
+      // Structured details: only record when the summary is a describe target.
+      // The structured shape can include a manifest (`{ manifest: { nodes: [...]
+      // {summaryId, tokenCount} ... ] } }`) listing siblings whose content
+      // wasn't retrieved — same gating as the text path.
       const summaryId =
         typeof record.summaryId === "string"
           ? record.summaryId
@@ -377,7 +432,11 @@ function recordDescribeTokens(
             ? (record.id as string)
             : undefined;
       const tokenCount = coerceFiniteNumber(record.tokenCount);
-      if (summaryId && typeof tokenCount === "number") {
+      if (
+        summaryId &&
+        typeof tokenCount === "number" &&
+        (targets.size === 0 || targets.has(summaryId))
+      ) {
         if (!account.describedSummaryTokens.has(summaryId)) {
           account.describedSummaryTokens.set(summaryId, tokenCount);
         }
@@ -388,6 +447,40 @@ function recordDescribeTokens(
     }
   };
   visit(output, 0);
+}
+
+/** Parse text blocks for `[LCM Tool Output: file_<id> | ... | <N> bytes]`
+ *  references (oversized tool results that were externalized into the
+ *  large_files store before the parent could read them).  These reach the
+ *  child transcript as plain text blocks, NOT as `tool_result`/
+ *  `function_call_output` shapes — so without this parser the accountant
+ *  would conclude the bucket consumed 0 tokens even when the child actually
+ *  read substantial source content.
+ *
+ *  The byte count from the externalized reference is converted to an
+ *  approximate token count (`bytes / 4`) — a coarse heuristic that is
+ *  intentionally conservative so a real consumed-content signal isn't lost
+ *  to a 0 floor.  Where this matters most is the soft-fall-back in
+ *  `runDelegatedExpandQuery`: a non-zero parent total prevents the soft-fall-
+ *  back from surfacing a 'parent saw nothing' undercount when the bucket
+ *  actually consumed source content via an externalized tool result. */
+function recordExternalizedToolOutputs(
+  account: ObservedTokenAccount,
+  text: string,
+): void {
+  const re = /\[LCM Tool Output: (file_[a-f0-9]{16})\b[^\]]*?(\d{1,3}(?:,\d{3})*)\s+bytes\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const fileId = match[1];
+    const bytes = Number(match[2].replace(/,/g, ""));
+    if (Number.isFinite(bytes) && bytes > 0 && !account.describedSummaryTokens.has(fileId)) {
+      // Approximate token estimate: ~4 bytes/token for typical English text.
+      // Coarse but conservative — we'd rather slightly overcount than
+      // silently zero out a bucket that consumed real source content.
+      const approxTokens = Math.max(1, Math.floor(bytes / 4));
+      account.expandTotalTokens += approxTokens;
+    }
+  }
 }
 
 function recordExpandTokens(
@@ -497,11 +590,25 @@ function recordExpandTokens(
           return;
         }
       }
-      const m = value.match(/\btotalTokens[=:]\s*(\d+)/);
+      // Match `totalTokens=N`, `totalTokens: N`, AND JSON-form
+      // `"totalTokens":N` (the OpenAI function_call_output shape stringifies
+      // its output as JSON, where the key is double-quoted).
+      const m = value.match(/(?:\btotalTokens|"totalTokens")\s*[=:]\s*(\d+)/);
       if (m) {
         const n = Number(m[1]);
         if (Number.isFinite(n)) {
           total = n;
+        }
+      }
+      // Also try JSON.parse the string and recurse — covers structured
+      // `function_call_output.output` payloads where we want to pick up
+      // descendant `summaryId` fields too.
+      const trimmed = value.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          visitOutput(JSON.parse(trimmed), depth + 1);
+        } catch {
+          /* not JSON, ignore */
         }
       }
       return;
@@ -593,15 +700,34 @@ function buildObservedTokenAccount(messages: unknown[]): ObservedTokenAccount {
     }
   }
 
-  // Second pass: match tool_result blocks back to their tool_use by id.
+  // Second pass: match tool_result blocks back to their tool_use by id, AND
+  // scan plain text blocks for `[LCM Tool Output: file_… | … | <N> bytes]`
+  // externalized references (oversized tool results that were swapped for a
+  // placeholder text block before reaching the child transcript — without
+  // this scan the accountant would silently undercount any bucket whose
+  // tool result was externalized).
   for (const message of messages) {
     if (!message || typeof message !== "object") continue;
     const content = (message as { content?: unknown }).content;
+    if (typeof content === "string") {
+      recordExternalizedToolOutputs(account, content);
+      continue;
+    }
     if (!Array.isArray(content)) continue;
     for (const block of content) {
       if (!block || typeof block !== "object") continue;
       const record = block as Record<string, unknown>;
       const type = typeof record.type === "string" ? record.type : "";
+      // Plain text blocks may carry the `[LCM Tool Output: ...]` placeholder
+      // when an oversized tool result was externalized.  Scan those first;
+      // it's a separate signal from the structured-tool-result branch below.
+      if (type === "text") {
+        const text = (record as { text?: unknown }).text;
+        if (typeof text === "string") {
+          recordExternalizedToolOutputs(account, text);
+        }
+        continue;
+      }
       const isToolResult =
         type === "tool_result" ||
         type === "toolResult" ||
@@ -625,10 +751,16 @@ function buildObservedTokenAccount(messages: unknown[]): ObservedTokenAccount {
           : "");
       if (resolvedName !== "lcm_expand" && resolvedName !== "lcm_describe") continue;
       const output = record.output ?? record.content ?? record.result;
+      // Tool result content can ALSO be an externalized text shape — scan
+      // it for `[LCM Tool Output: ...]` references in addition to whatever
+      // structured token info the recordX functions can extract.
+      if (typeof output === "string") {
+        recordExternalizedToolOutputs(account, output);
+      }
       if (resolvedName === "lcm_expand") {
         recordExpandTokens(account, matchedUse?.input, output);
       } else {
-        recordDescribeTokens(account, output);
+        recordDescribeTokens(account, matchedUse?.input, output);
       }
     }
   }

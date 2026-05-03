@@ -2400,5 +2400,267 @@ describe("createLcmExpandQueryTool", () => {
       expect(driftLogs[0]).toContain("parentComputed=500");
       expect(driftLogs[0]).toContain("expandTotal=500");
     });
+
+    it("recognizes OpenAI function_call / function_call_output transcript shapes", async () => {
+      // Regression: the parent accountant must parse OpenAI-style
+      // function_call (input as JSON-string `arguments`) and
+      // function_call_output (output as `output`/`content`) transcripts,
+      // not only Anthropic-style tool_use / tool_result. Without this the
+      // parent recompute drops to 0 on OpenAI providers.
+      const retrieval = makeRetrieval();
+      retrieval.describe.mockResolvedValue({
+        type: "summary",
+        summary: { conversationId: 42 },
+      });
+
+      const openaiMessages: unknown[] = [
+        // First: a function_call invoking lcm_expand with summaryIds.
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "function_call",
+              call_id: "call_oa_expand_1",
+              name: "lcm_expand",
+              arguments: JSON.stringify({ summaryIds: ["sum_oa1"] }),
+            },
+          ],
+        },
+        // Then: function_call_output with structured details.totalTokens.
+        {
+          role: "tool",
+          content: [
+            {
+              type: "function_call_output",
+              call_id: "call_oa_expand_1",
+              name: "lcm_expand",
+              output: JSON.stringify({
+                expansionCount: 1,
+                citedIds: ["sum_oa1"],
+                totalTokens: 350,
+                truncated: false,
+              }),
+            },
+          ],
+        },
+        // Final reply with citedIds + child-reported total.
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                answer: "From OpenAI-shape expand.",
+                citedIds: ["sum_oa1"],
+                expandedSummaryCount: 1,
+                totalSourceTokens: 0, // child reports 0 — parent must override
+                truncated: false,
+              }),
+            },
+          ],
+        },
+      ];
+
+      callGatewayMock.mockImplementation(async (opts: unknown) => {
+        const request = opts as { method?: string };
+        if (request.method === "agent") return { runId: "run-pr7-oa" };
+        if (request.method === "agent.wait") return { status: "ok" };
+        if (request.method === "sessions.get") return { messages: openaiMessages };
+        if (request.method === "sessions.delete") return { ok: true };
+        return {};
+      });
+
+      const tool = createLcmExpandQueryTool({
+        deps: makeDeps(),
+        lcm: makeEngine({ retrieval }),
+        sessionId: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+      });
+      const result = await tool.execute("call-pr7-oa", {
+        summaryIds: ["sum_oa1"],
+        prompt: "OpenAI shape.",
+        conversationId: 42,
+      });
+
+      // Parent-side recompute extracts totalTokens=350 from the OpenAI
+      // function_call_output payload's stringified JSON (NOT the Anthropic
+      // tool_result shape). Override of the child-reported 0 lands.
+      expect(result.details).toMatchObject({
+        totalSourceTokens: 350,
+      });
+    });
+
+    it("recovers token estimate from `[LCM Tool Output: file_… | … | <bytes> bytes]` text-block placeholders", async () => {
+      // Regression: oversized tool results are externalized into the
+      // large_files store and reach the child transcript as plain text
+      // blocks containing a placeholder reference. Without parsing those
+      // text blocks the parent would conclude the bucket consumed 0
+      // tokens even when the child read substantial source content via
+      // the externalized result.
+      const retrieval = makeRetrieval();
+      retrieval.describe.mockResolvedValue({
+        type: "summary",
+        summary: { conversationId: 42 },
+      });
+
+      const messages: unknown[] = [
+        // Tool call with normal Anthropic shape — but its result was
+        // externalized (the message content is a text block carrying the
+        // placeholder rather than a structured tool_result with output).
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_ext_1",
+              name: "lcm_expand",
+              input: { summaryIds: ["sum_ext1"] },
+            },
+          ],
+        },
+        // Externalized tool result reaches child as a TEXT block — not as
+        // tool_result/function_call_output, so the structured walker can't
+        // see its token count.
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "[LCM Tool Output: file_abcdef0123456789 | role=tool | reason=large_tool_result | 8,000 bytes]",
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                answer: "Read from externalized output.",
+                citedIds: ["sum_ext1"],
+                expandedSummaryCount: 1,
+                totalSourceTokens: 0, // child reports 0 — parent must NOT pass through
+                truncated: false,
+              }),
+            },
+          ],
+        },
+      ];
+
+      callGatewayMock.mockImplementation(async (opts: unknown) => {
+        const request = opts as { method?: string };
+        if (request.method === "agent") return { runId: "run-pr7-ext" };
+        if (request.method === "agent.wait") return { status: "ok" };
+        if (request.method === "sessions.get") return { messages };
+        if (request.method === "sessions.delete") return { ok: true };
+        return {};
+      });
+
+      const tool = createLcmExpandQueryTool({
+        deps: makeDeps(),
+        lcm: makeEngine({ retrieval }),
+        sessionId: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+      });
+      const result = await tool.execute("call-pr7-ext", {
+        summaryIds: ["sum_ext1"],
+        prompt: "Externalized output.",
+        conversationId: 42,
+      });
+
+      // 8000 bytes → ~2000 tokens (bytes/4). Parent recompute extracts a
+      // non-zero estimate from the placeholder text, so totalSourceTokens
+      // is non-zero rather than passing through child's 0.
+      expect((result.details as { totalSourceTokens?: number }).totalSourceTokens)
+        .toBeGreaterThan(0);
+    });
+
+    it("does not bill manifest-only summaries that lcm_describe never retrieved content for", async () => {
+      // Regression: the previous accountant recorded `tok` for EVERY
+      // sum_xxx listed in a `lcm_describe` manifest, but lcm_describe
+      // only retrieves full content for the summary that was the explicit
+      // input. If the child later cited a manifest-only descendant, that
+      // descendant's tokens would be added to totalSourceTokens even
+      // though its content was never read. Now only the input summary's
+      // tok is recorded.
+      const retrieval = makeRetrieval();
+      retrieval.describe.mockResolvedValue({
+        type: "summary",
+        summary: { conversationId: 42 },
+      });
+
+      // describe sum_a, but its manifest also lists sum_b (sibling, not
+      // retrieved). Then the child cites sum_b in its final answer.
+      const messages: unknown[] = [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_describe_a",
+              name: "lcm_describe",
+              input: { id: "sum_a" },
+            },
+          ],
+        },
+        {
+          role: "toolResult",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_describe_a",
+              name: "lcm_describe",
+              output:
+                "LCM_SUMMARY sum_a\n" +
+                "meta conv=42 kind=condensed depth=1 tok=400 descTok=0 srcTok=0 desc=0\n" +
+                "manifest:\n" +
+                "  d0 sum_b k=leaf tok=900",
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                answer: "Cited the unretrieved sibling.",
+                citedIds: ["sum_b"], // NOT sum_a — bot's exact concern
+                expandedSummaryCount: 0,
+                totalSourceTokens: 0,
+                truncated: false,
+              }),
+            },
+          ],
+        },
+      ];
+
+      callGatewayMock.mockImplementation(async (opts: unknown) => {
+        const request = opts as { method?: string };
+        if (request.method === "agent") return { runId: "run-pr7-manifest" };
+        if (request.method === "agent.wait") return { status: "ok" };
+        if (request.method === "sessions.get") return { messages };
+        if (request.method === "sessions.delete") return { ok: true };
+        return {};
+      });
+
+      const tool = createLcmExpandQueryTool({
+        deps: makeDeps(),
+        lcm: makeEngine({ retrieval }),
+        sessionId: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+      });
+      const result = await tool.execute("call-pr7-manifest", {
+        summaryIds: ["sum_a"],
+        prompt: "Manifest-only cite.",
+        conversationId: 42,
+      });
+
+      // Parent should NOT bill 900 tokens for sum_b — its content was
+      // never retrieved by lcm_describe (only listed in the manifest).
+      // With the soft-fall-back, parent computes 0 (no observable
+      // evidence for sum_b) and keeps child's 0 as well.
+      expect((result.details as { totalSourceTokens?: number }).totalSourceTokens).toBe(0);
+    });
   });
 });
