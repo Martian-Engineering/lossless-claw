@@ -277,6 +277,42 @@ describe("createLcmSummarizeFromLegacyParams (B1: reasoning-leak guardrail)", ()
     expect(callCount).toBe(2);
   });
 
+  it("preserves a closed-think-block summary followed by real summary text", async () => {
+    // Regression: an earlier shape returned reasoning-only=true on ANY input
+    // starting with `<think>`/`<thinking>`/`<reasoning>`, even when a closed
+    // tag was followed by a valid summary body. That dropped usable output and
+    // forced unnecessary retries / fallbacks. The new logic strips closed
+    // reasoning blocks first and only treats the result as reasoning-only when
+    // nothing meaningful remains — so `<think>plan</think>Actual summary.`
+    // must pass through as `Actual summary.` (or the full text, depending on
+    // downstream block parsing).
+    let callCount = 0;
+    const deps = makeDeps({
+      complete: vi.fn(async () => {
+        callCount += 1;
+        return {
+          content: [
+            {
+              type: "text",
+              text: "<think>The user wants a digest.</think>Recovered clean summary follow-on.",
+            },
+          ],
+        };
+      }),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: { provider: "openrouter", model: "qwen/qwen3-235b" },
+    });
+    const summary = await summarize!("Source text.", false);
+
+    // Only one provider call — guardrail must NOT have rejected this.
+    expect(callCount).toBe(1);
+    // The follow-on summary text must survive.
+    expect(summary).toContain("Recovered clean summary follow-on.");
+  });
+
   it("does not drop a clean summary that merely mentions the word 'reasoning'", async () => {
     const deps = makeDeps({
       complete: vi.fn(async () => ({
