@@ -95,6 +95,12 @@ type BootstrapImportObservation = {
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const MAX_STABLE_ORPHAN_STRIPPING_BOUNDARIES = 100;
 const MIN_OBSERVED_CACHE_READ_SHARE_FOR_HOT = 0.2;
+
+/** TTL for `recentBootstrapImportsByConversation` entries in overflow diagnostics. */
+const BOOTSTRAP_IMPORT_OBSERVATION_TTL_MS = 30 * 60_000;
+
+/** Yield every K bootstrap-ingest messages so the worker doesn't monopolise the loop. */
+const BOOTSTRAP_INGEST_CHUNK_SIZE = 100;
 type CircuitBreakerState = {
   failures: number;
   openSince: number | null;
@@ -349,12 +355,19 @@ function shouldLogOverflowDiagnostics(params: {
 function formatOverflowDiagnosticsForLog(params: {
   diagnostics: AssemblyOverflowDiagnostics;
   recentBootstrapImport?: BootstrapImportObservation;
+  now?: number;
 }): string {
+  // Drop stale observations: the LRU only evicts at 100 conversations, so
+  // without a TTL a "7 imports" tag could trail a conversation indefinitely.
   const recent = params.recentBootstrapImport;
+  const nowMs = params.now ?? Date.now();
+  const isFresh =
+    recent !== undefined &&
+    nowMs - recent.observedAt.getTime() <= BOOTSTRAP_IMPORT_OBSERVATION_TTL_MS;
   return JSON.stringify({
     ...params.diagnostics,
-    recentBootstrapImportCount: recent?.importedMessages ?? null,
-    recentBootstrapImportReason: recent?.reason ?? null,
+    recentBootstrapImportCount: isFresh ? recent!.importedMessages : null,
+    recentBootstrapImportReason: isFresh ? recent!.reason : null,
   });
 }
 
@@ -1101,6 +1114,57 @@ type StoredMessage = {
   content: string;
   tokenCount: number;
 };
+
+/**
+ * Cheap pre-scan: would `ingestSingle` fire ANY interceptor for this message?
+ * Used by bootstrap to choose between the v0.9.2 bulk-insert fast path and
+ * the per-message ingest path. False positives are acceptable (slower path);
+ * false negatives would skip externalization, so be conservative when unsure.
+ */
+function bootstrapMessageWouldTriggerInterceptor(
+  message: AgentMessage,
+  largeFileTokenThreshold: number,
+): boolean {
+  const threshold = Math.max(1, largeFileTokenThreshold);
+  const content = "content" in message ? message.content : undefined;
+
+  // Image blocks (interceptNativeUserImageBlocks / inline-image-in-tool).
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === "object" && (block as { type?: unknown }).type === "image") {
+        return true;
+      }
+    }
+  }
+
+  if (typeof content === "string") {
+    // interceptInlineImages: explicit media marker or a long base64 run.
+    if (content.startsWith("[media attached:")) return true;
+    if (content.length >= 80 && /[A-Za-z0-9+/]{80,}={0,2}/.test(content)) return true;
+    // interceptLargeFiles: presence of a file block — interceptor decides on size.
+    if (content.includes("<file ")) return true;
+  }
+
+  // Size gate for interceptLargeRawPayload / interceptLargeToolResults.
+  // Bytes is an upper bound on tokens; if even a 1:1 mapping doesn't hit
+  // the threshold, no size-driven interceptor can fire.
+  let approxBytes = 0;
+  if (typeof content === "string") {
+    approxBytes = content.length;
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (typeof block === "string") {
+        approxBytes += block.length;
+      } else if (block && typeof block === "object") {
+        const text = (block as { text?: unknown }).text;
+        approxBytes += typeof text === "string" ? text.length : 1024;
+      }
+    }
+  } else if (content && typeof content === "object") {
+    approxBytes += 1024;
+  }
+  return approxBytes >= threshold;
+}
 
 /**
  * Normalize AgentMessage variants into the storage shape used by LCM.
@@ -5081,15 +5145,49 @@ export class LcmContextEngine implements ContextEngine {
               };
             }
 
+            // Pre-scan: PR #510 moved bootstrap to N×ingestSingle so
+            // interceptors could fire on first import. Restore the v0.9.2
+            // bulk-insert fast path when no message would trigger any
+            // interceptor; otherwise per-message ingest with K=100 yields.
+            const threshold = this.config.largeFileTokenThreshold;
+            const requiresPerMessageIngest = bootstrapMessages.some((message) =>
+              bootstrapMessageWouldTriggerInterceptor(message, threshold),
+            );
+
             let importedMessages = 0;
-            for (const message of bootstrapMessages) {
-              const result = await this.ingestSingle({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                message,
+            if (!requiresPerMessageIngest) {
+              const nextSeq =
+                (await this.conversationStore.getMaxSeq(conversationId)) + 1;
+              const bulkInput = bootstrapMessages.map((message, index) => {
+                const stored = toStoredMessage(message);
+                return {
+                  conversationId,
+                  seq: nextSeq + index,
+                  role: stored.role,
+                  content: stored.content,
+                  tokenCount: stored.tokenCount,
+                };
               });
-              if (result.ingested) {
-                importedMessages += 1;
+              const inserted =
+                await this.conversationStore.createMessagesBulk(bulkInput);
+              await this.summaryStore.appendContextMessages(
+                conversationId,
+                inserted.map((record) => record.messageId),
+              );
+              importedMessages = inserted.length;
+            } else {
+              for (let i = 0; i < bootstrapMessages.length; i += 1) {
+                const result = await this.ingestSingle({
+                  sessionId: params.sessionId,
+                  sessionKey: params.sessionKey,
+                  message: bootstrapMessages[i],
+                });
+                if (result.ingested) {
+                  importedMessages += 1;
+                }
+                if ((i + 1) % BOOTSTRAP_INGEST_CHUNK_SIZE === 0) {
+                  await Promise.resolve();
+                }
               }
             }
             await this.conversationStore.markConversationBootstrapped(conversationId);
