@@ -1062,6 +1062,67 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("does not extract just the first nested day's Key Items section for weekly/monthly aggregate rollups", () => {
+    // The regex `/##\s+Key Items[\s\S]*?(?=\n##\s|$)/` extracts up to the next
+    // ## header, so the FIRST nested day's bullets — and only those — would
+    // be returned for a weekly/monthly. The post-fix path emits a generic
+    // content prefix instead.
+    const weekly = [
+      "# Weekly summary skeleton",
+      "",
+      "## 2026-04-20",
+      "",
+      "Day 1 narrative paragraph.",
+      "",
+      "## Key Items",
+      "- day one bullet alpha",
+      "- day one bullet beta",
+      "",
+      "## 2026-04-21",
+      "",
+      "Day 2 narrative paragraph.",
+      "",
+      "## Key Items",
+      "- day two bullet gamma",
+      "- day two bullet delta",
+    ].join("\n");
+
+    // PRE-FIX behavior would be: digest === "## Key Items\n- day one bullet alpha\n- day one bullet beta"
+    // POST-FIX: digest is a generic prefix that ALSO includes the weekly skeleton header.
+    const digestWithKind =
+      __lcmRecentTestInternals.extractRollupDigest(weekly, 600, "week");
+    expect(digestWithKind.startsWith("## Key Items")).toBe(false);
+    expect(digestWithKind).toContain("Weekly summary skeleton");
+    expect(digestWithKind).toContain("2026-04-20");
+
+    // Defensive: even without the periodKind hint, embedded `## YYYY-MM-DD`
+    // headers should trigger the same generic-prefix path.
+    const digestWithoutKind = __lcmRecentTestInternals.extractRollupDigest(
+      weekly,
+      600,
+    );
+    expect(digestWithoutKind.startsWith("## Key Items")).toBe(false);
+    expect(digestWithoutKind).toContain("Weekly summary skeleton");
+
+    // Sanity: a real daily rollup's Key Items still flows through the
+    // section-extraction branch and starts with "## Key Items".
+    const daily = [
+      "# Daily 2026-04-20",
+      "",
+      "Narrative.",
+      "",
+      "## Key Items",
+      "- single-day bullet stays in digest",
+    ].join("\n");
+    const dailyDigest = __lcmRecentTestInternals.extractRollupDigest(
+      daily,
+      600,
+      "day",
+    );
+    expect(dailyDigest.startsWith("## Key Items")).toBe(true);
+    expect(dailyDigest).toContain("single-day bullet stays in digest");
+  });
+
   it("includes sibling-conversation leaf content via relatedConversationIds for today fallback", async () => {
     const now = new Date("2026-04-27T12:00:00.000Z");
     vi.useFakeTimers();

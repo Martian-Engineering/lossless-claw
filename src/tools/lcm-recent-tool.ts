@@ -963,15 +963,32 @@ function listRollupsAcrossConversations(
  * `mode: "index"` — cheaper than full content, useful for navigation before
  * drilling in with `mode: "summary"` and `detailLevel: 3`.
  */
-function extractRollupDigest(content: string, maxChars: number): string {
-  // Prefer the "## Key Items" section if the rollup uses that structure
-  // (current daily rollup format does).
-  const keyItemsMatch = content.match(/##\s+Key Items[\s\S]*?(?=\n##\s|$)/);
-  if (keyItemsMatch) {
-    const section = keyItemsMatch[0].trim();
-    return section.length > maxChars
-      ? section.slice(0, maxChars).trimEnd() + "…"
-      : section;
+function extractRollupDigest(
+  content: string,
+  maxChars: number,
+  periodKind?: string,
+): string {
+  // Aggregate (weekly/monthly) rollups embed each daily verbatim, including
+  // each daily's own "## Key Items" section. Matching the first one would
+  // surface the FIRST nested day's bullets and pretend they're the whole
+  // week/month digest — actively misleading. Skip the regex for aggregates
+  // and emit a generic content prefix instead. Also fall back to a generic
+  // prefix when periodKind is unknown but the content includes embedded
+  // "## YYYY-MM-DD" day headers (sibling defensive check).
+  const isAggregate =
+    periodKind === "week" ||
+    periodKind === "month" ||
+    /(?:^|\n)##\s+\d{4}-\d{2}-\d{2}\b/.test(content);
+  if (!isAggregate) {
+    // Prefer the "## Key Items" section if the rollup uses that structure
+    // (current daily rollup format does).
+    const keyItemsMatch = content.match(/##\s+Key Items[\s\S]*?(?=\n##\s|$)/);
+    if (keyItemsMatch) {
+      const section = keyItemsMatch[0].trim();
+      return section.length > maxChars
+        ? section.slice(0, maxChars).trimEnd() + "…"
+        : section;
+    }
   }
   const trimmed = content.trim();
   return trimmed.length > maxChars
@@ -1021,7 +1038,9 @@ function renderRollupsIndex(
       `- Sources: ${rollup.sourceMessageCount} msgs, ${rollup.sourceTokenCount} src tokens, ${rollup.sourceSummaryIds.length} summaries`,
     );
     lines.push("");
-    lines.push(extractRollupDigest(rollup.content, perRollupDigestMax));
+    lines.push(
+      extractRollupDigest(rollup.content, perRollupDigestMax, rollup.periodKind),
+    );
     lines.push("");
   }
   let content = lines.join("\n");
@@ -1468,6 +1487,7 @@ export const __lcmRecentTestInternals = {
   resolvePeriod,
   getUtcDateForZonedMidnight,
   getUtcDateForZonedLocalTime,
+  extractRollupDigest,
 };
 
 export function createLcmRecentTool(input: {
