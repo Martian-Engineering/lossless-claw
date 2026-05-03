@@ -95,7 +95,10 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
     expect(declared).toEqual(expected);
   });
 
-  it("declares context-engine kind so the Windows installer's hook-pack detector sees a kind discriminator (#451)", () => {
-    expect(manifest.kind).toBe("context-engine");
-  });
+  // Note: `manifest.kind === "context-engine"` is asserted in
+  // `test/config.test.ts` ("declares context-engine kind so OpenClaw core
+  // binds the contextEngine slot on install"). That assertion also covers
+  // the Windows-installer hook-pack-detector concern from #451 since the
+  // `kind` field is the same discriminator in both cases — no duplicate
+  // assertion needed here.
 });
