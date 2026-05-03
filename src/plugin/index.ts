@@ -952,6 +952,87 @@ export function resolveModelApiFromRuntimeConfig(
   return undefined;
 }
 
+/**
+ * Build a synchronous (model) → contextWindow resolver from a runtime config
+ * snapshot. The resulting closure is a pure function over the snapshot —
+ * suitable for replay determinism (no live RPCs, no TTL caches).
+ *
+ * Walks `runtimeConfig.models.providers[*].models[*]` for `{ id, contextWindow }`
+ * and stores the highest precedence value per model id. When a `mod` with
+ * `getModels()` is provided, providers from the runtime config seed additional
+ * entries from the pi-ai catalog at lower precedence (catalog values only fill
+ * gaps; runtime overrides win).
+ *
+ * Returns `(model: string) => number | null`. Returns null when the model is
+ * unknown, when contextWindow is missing or non-positive, or when the runtime
+ * config is malformed.
+ */
+export function buildModelContextWindowResolver(
+  runtimeConfig: unknown,
+  mod?: { getModels?: (provider: string) => unknown[] } | undefined,
+): (model: string) => number | null {
+  const map = new Map<string, number>();
+
+  const providers = isRecord(runtimeConfig)
+    ? (runtimeConfig as { models?: { providers?: unknown } }).models?.providers
+    : undefined;
+
+  if (isRecord(providers)) {
+    // Lower precedence: pi-ai catalog (filled first; runtime overrides win
+    // because they're written after).
+    if (mod && typeof mod.getModels === "function") {
+      for (const providerId of Object.keys(providers)) {
+        let catalogModels: unknown[] = [];
+        try {
+          catalogModels = mod.getModels(providerId) ?? [];
+        } catch {
+          // Unknown provider id — pi-ai may throw; ignore.
+          catalogModels = [];
+        }
+        for (const entry of catalogModels) {
+          if (!isRecord(entry)) continue;
+          const id = typeof entry.id === "string" ? entry.id.trim() : null;
+          const ctx =
+            typeof entry.contextWindow === "number" &&
+            Number.isFinite(entry.contextWindow) &&
+            entry.contextWindow > 0
+              ? entry.contextWindow
+              : null;
+          if (id && ctx) {
+            // Only set if not already in the map — runtime overrides win.
+            if (!map.has(id)) map.set(id, ctx);
+          }
+        }
+      }
+    }
+
+    // Higher precedence: explicit overrides from runtimeConfig.
+    for (const provider of Object.values(providers)) {
+      if (!isRecord(provider)) continue;
+      const models = (provider as { models?: unknown }).models;
+      if (!Array.isArray(models)) continue;
+      for (const entry of models) {
+        if (!isRecord(entry)) continue;
+        const id = typeof entry.id === "string" ? entry.id.trim() : null;
+        const ctx =
+          typeof entry.contextWindow === "number" &&
+          Number.isFinite(entry.contextWindow) &&
+          entry.contextWindow > 0
+            ? entry.contextWindow
+            : null;
+        if (id && ctx) map.set(id, ctx);
+      }
+    }
+  }
+
+  return (model: string) => {
+    if (typeof model !== "string") return null;
+    const trimmed = model.trim();
+    if (!trimmed) return null;
+    return map.get(trimmed) ?? null;
+  };
+}
+
 /** Resolve runtime.modelAuth from plugin runtime when available. */
 function getRuntimeModelAuth(api: OpenClawPluginApi): RuntimeModelAuth | undefined {
   const runtime = api.runtime as OpenClawPluginApi["runtime"] & {
@@ -2052,6 +2133,10 @@ function createLcmDependencies(
         };
       }
     },
+    getModelContextWindow: buildModelContextWindowResolver(
+      registrationConfig.openClawConfig,
+      undefined,
+    ),
     callGateway: async (params) => {
       const sub = api.runtime.subagent;
       switch (params.method) {
