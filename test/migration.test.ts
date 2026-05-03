@@ -1113,6 +1113,20 @@ describe("runLcmMigrations summary depth backfill", () => {
     ]);
   });
 
+  it("creates summary_messages_message_idx exactly once in the migration source (P3 dupe index)", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = url.fileURLToPath(import.meta.url);
+    const source = fs.readFileSync(
+      path.join(path.dirname(here), "..", "src", "db", "migration.ts"),
+      "utf8",
+    );
+    const matches = source.match(/CREATE INDEX IF NOT EXISTS summary_messages_message_idx/g);
+    expect(matches).not.toBeNull();
+    expect(matches?.length).toBe(1);
+  });
+
   it("wraps the full migration in one exclusive transaction", () => {
     const db = createTestDb("exclusive-transaction.db");
     seedLegacySummaryGraph(db);

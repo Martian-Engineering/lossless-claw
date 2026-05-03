@@ -1011,9 +1011,6 @@ export function runLcmMigrations(
       ON conversation_bootstrap_state (session_file_path, updated_at);
     CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
       ON conversation_compaction_telemetry (cache_state, updated_at);
-
-    -- Speed up summary_messages lookups by message_id (PK is summary_id,message_id)
-    CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
   `);
 
     // Forward-compatible conversations migration for existing DBs.
