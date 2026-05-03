@@ -5761,8 +5761,14 @@ export class LcmContextEngine implements ContextEngine {
         const combinedResult = deferredCompactionResult
           ? {
               changed: deferredCompactionResult.changed || result.changed,
-              bytesFreed: result.bytesFreed,
-              rewrittenEntries: result.rewrittenEntries,
+              // Sum metrics across both phases — pre-fix the deferred
+              // compaction's bytesFreed/rewrittenEntries were silently
+              // discarded when transcript GC also ran.
+              bytesFreed:
+                (deferredCompactionResult.bytesFreed ?? 0) + result.bytesFreed,
+              rewrittenEntries:
+                (deferredCompactionResult.rewrittenEntries ?? 0) +
+                result.rewrittenEntries,
               reason: result.reason ?? deferredCompactionResult.reason,
             }
           : result;

@@ -286,6 +286,31 @@ describe("LcmContextEngine metadata", () => {
     expect(engine.info.ownsCompaction).toBe(true);
   });
 
+  it("sums deferredCompactionResult and transcript-GC bytesFreed/rewrittenEntries in combinedResult (P3)", async () => {
+    // Structural assertion: pre-fix the combinedResult branch in
+    // engine.ts:5606-5613 set bytesFreed/rewrittenEntries directly from
+    // `result` (transcript GC) and silently dropped the deferred-compaction
+    // metrics. Setting up a real maintain run where both phases fire is
+    // expensive; instead read the source and confirm the sum.
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = url.fileURLToPath(import.meta.url);
+    const source = fs.readFileSync(
+      path.join(path.dirname(here), "..", "src", "engine.ts"),
+      "utf8",
+    );
+    const idx = source.indexOf("const combinedResult = deferredCompactionResult");
+    expect(idx).toBeGreaterThan(-1);
+    const block = source.slice(idx, idx + 800);
+    expect(block).toMatch(
+      /bytesFreed:[\s\S]*deferredCompactionResult\.bytesFreed[\s\S]*\+[\s\S]*result\.bytesFreed/,
+    );
+    expect(block).toMatch(
+      /rewrittenEntries:[\s\S]*deferredCompactionResult\.rewrittenEntries[\s\S]*\+[\s\S]*result\.rewrittenEntries/,
+    );
+  });
+
   it("configures file-backed sqlite connections with WAL and busy_timeout", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-db-"));
     tempDirs.push(tempDir);
