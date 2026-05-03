@@ -1916,10 +1916,20 @@ export function createLcmRecentTool(input: {
               usedFallback = true;
               truncated = truncated || live.accounting.truncated;
             }
+            // Recompute the index header to reflect the TOTAL number of
+            // emitted entries (stored + live). Pre-fix the header used
+            // `sortedRollups.length` from `renderRollupsIndex` even when N
+            // live entries were appended — operators saw "(3 periods)" but
+            // 5 `####` entries below it.
+            const totalEntries = orderedRollups.length + liveDigestSections.length;
+            const indexHeader = `### Rollup index (${totalEntries} period${totalEntries === 1 ? "" : "s"})`;
             const baseContent =
               orderedRollups.length === 0 && liveDigestSections.length > 0
-                ? `### Rollup index (${liveDigestSections.length} period${liveDigestSections.length === 1 ? "" : "s"})`
-                : indexed.content;
+                ? indexHeader
+                : indexed.content.replace(
+                    /^### Rollup index \([^)]*\)/,
+                    indexHeader,
+                  );
             let combinedContent = [
               baseContent,
               ...liveDigestSections,

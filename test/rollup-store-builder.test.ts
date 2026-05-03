@@ -1494,6 +1494,87 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("counts stored + live entries in the index header (R2-FIX-3)", async () => {
+    const now = new Date("2026-04-27T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "index-header-count",
+        sessionKey: "agent:main:index-header-count",
+        title: "Index header count",
+      });
+
+      // Two stored daily rollups + one live-fallback (today).
+      for (const day of ["2026-04-25", "2026-04-26"]) {
+        await summaryStore.insertSummary({
+          summaryId: `sum_${day}`,
+          conversationId: conversation.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content: `Stored leaf for ${day}.`,
+          tokenCount: 10,
+          sourceMessageTokenCount: 10,
+          earliestAt: new Date(`${day}T10:00:00.000Z`),
+          latestAt: new Date(`${day}T10:30:00.000Z`),
+        });
+      }
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await builder.buildDayRollup(conversation.conversationId, "2026-04-25");
+      await builder.buildDayRollup(conversation.conversationId, "2026-04-26");
+
+      // Today live-fallback leaf.
+      await summaryStore.insertSummary({
+        summaryId: "sum_today_live_hdr",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Today live fallback leaf for header-count test.",
+        tokenCount: 10,
+        latestAt: now,
+      });
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "index-header-count",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "index-header-count",
+      });
+
+      const result = await tool.execute("call-index-hdr", {
+        period: "7d",
+        mode: "index",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+
+      // 2 stored + 1 live = 3 emitted `####` entries.
+      const headerMatch = text.match(/### Rollup index \((\d+) periods?\)/);
+      expect(headerMatch).not.toBeNull();
+      expect(headerMatch?.[1]).toBe("3");
+
+      const entryCount = (text.match(/^#### /gm) ?? []).length;
+      expect(entryCount).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("re-truncates combined index output to effectiveOutputTokens after live-fallback append (R2-FIX-2)", async () => {
     const now = new Date("2026-04-27T12:00:00.000Z");
     vi.useFakeTimers();
