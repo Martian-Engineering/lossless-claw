@@ -1062,6 +1062,59 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("uses BEGIN IMMEDIATE in replaceRollupSources to acquire write lock upfront (P2-4)", async () => {
+    // Smoke: with no outer transaction, replaceRollupSources should still
+    // succeed. The fix (BEGIN -> BEGIN IMMEDIATE) only changes lock-acquisition
+    // semantics, not API surface.
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "begin-immediate-smoke",
+      sessionKey: "agent:main:begin-immediate-smoke",
+      title: "BEGIN IMMEDIATE smoke",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_begin_immediate",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Source for replaceRollupSources smoke.",
+      tokenCount: 6,
+      latestAt: new Date("2026-04-27T10:00:00.000Z"),
+    });
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+    await builder.buildDayRollup(conversation.conversationId, "2026-04-27");
+    const rollup = rollupStore.getRollup(
+      conversation.conversationId,
+      "day",
+      "2026-04-27",
+      "UTC"
+    );
+    expect(rollup).toBeTruthy();
+    if (!rollup) return;
+    await expect(
+      rollupStore.replaceRollupSources(rollup.rollup_id, [
+        { type: "summary", id: "sum_begin_immediate", ordinal: 0 },
+      ])
+    ).resolves.toBeUndefined();
+
+    // Source-level structural check: replaceRollupSources must declare
+    // BEGIN IMMEDIATE so concurrent writers serialize on lock acquisition,
+    // not at first write time.
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = url.fileURLToPath(import.meta.url);
+    const source = fs.readFileSync(
+      path.join(path.dirname(here), "..", "src", "store", "rollup-store.ts"),
+      "utf8"
+    );
+    const fnStart = source.indexOf("async replaceRollupSources(");
+    expect(fnStart).toBeGreaterThan(-1);
+    const fnBody = source.slice(fnStart, fnStart + 600);
+    expect(fnBody).toContain('"BEGIN IMMEDIATE"');
+    expect(fnBody).not.toMatch(/withDatabaseTransaction\(\s*this\.db\s*,\s*"BEGIN"\s*,/);
+  });
+
   it("clamps weeklyMaxTokens >= dailyMaxTokens and monthlyMaxTokens >= weeklyMaxTokens (P2-3)", () => {
     const { rollupStore } = createStores();
     // Pathological config: dailyMaxTokens > default weekly/monthly. Pre-fix

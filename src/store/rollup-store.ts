@@ -353,7 +353,7 @@ export class RollupStore {
     rollupId: string,
     sources: RollupSourceInput[]
   ): Promise<void> {
-    await withDatabaseTransaction(this.db, "BEGIN", () => {
+    await withDatabaseTransaction(this.db, "BEGIN IMMEDIATE", () => {
       this.db
         .prepare(`DELETE FROM lcm_rollup_sources WHERE rollup_id = ?`)
         .run(rollupId);
