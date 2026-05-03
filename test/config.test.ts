@@ -247,6 +247,43 @@ describe("resolveLcmConfig", () => {
     expect(config.leafMinFanout).toBe(8); // hardcoded default
   });
 
+  it("rejects 0 / negative env values for rollup token caps and falls back (P2-2)", () => {
+    const env = {
+      LCM_ROLLUP_DAILY_MAX_TOKENS: "0",
+      LCM_ROLLUP_WEEKLY_MAX_TOKENS: "-5",
+      LCM_ROLLUP_MONTHLY_MAX_TOKENS: "  ",
+    } as NodeJS.ProcessEnv;
+    const config = resolveLcmConfig(env, {});
+    // Default values from src/db/config.ts (40000/140000/560000) — env path
+    // dropped the bogus values rather than silently accepting "0" or "-5".
+    expect(config.rollupDailyMaxTokens).toBe(40000);
+    expect(config.rollupWeeklyMaxTokens).toBe(140000);
+    expect(config.rollupMonthlyMaxTokens).toBe(560000);
+
+    // Plugin config still wins over the discarded env value when set.
+    const fallback = resolveLcmConfig(env, {
+      rollupDailyMaxTokens: 12345,
+      rollupWeeklyMaxTokens: 23456,
+      rollupMonthlyMaxTokens: 34567,
+    });
+    expect(fallback.rollupDailyMaxTokens).toBe(12345);
+    expect(fallback.rollupWeeklyMaxTokens).toBe(23456);
+    expect(fallback.rollupMonthlyMaxTokens).toBe(34567);
+
+    // Sanity: positive env values still take effect.
+    const positive = resolveLcmConfig(
+      {
+        LCM_ROLLUP_DAILY_MAX_TOKENS: "1000",
+        LCM_ROLLUP_WEEKLY_MAX_TOKENS: "2000",
+        LCM_ROLLUP_MONTHLY_MAX_TOKENS: "3000",
+      } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(positive.rollupDailyMaxTokens).toBe(1000);
+    expect(positive.rollupWeeklyMaxTokens).toBe(2000);
+    expect(positive.rollupMonthlyMaxTokens).toBe(3000);
+  });
+
   it("handles string values in plugin config (from JSON)", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: "0.6",

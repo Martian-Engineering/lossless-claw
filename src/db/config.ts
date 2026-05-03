@@ -167,6 +167,15 @@ function parseFiniteInt(value: string | undefined): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+/** Like parseFiniteInt but rejects 0 and negative values, so the env path
+ *  honors the manifest's `minimum:1` invariant. The plugin config and default
+ *  remain reachable when the env var is set to garbage like "0" or "-5". */
+function parseFinitePositiveInt(value: string | undefined): number | undefined {
+  const parsed = parseFiniteInt(value);
+  if (parsed === undefined || parsed < 1) return undefined;
+  return parsed;
+}
+
 /** Safely parse a finite float from an environment string, or return undefined. */
 function parseFiniteNumber(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
@@ -479,13 +488,13 @@ export function resolveLcmConfigWithDiagnostics(
           ? env.LCM_ROLLUP_DEBUG_ENABLED === "true"
           : toBool(pc.rollupDebugEnabled) ?? false,
       rollupDailyMaxTokens:
-        parseFiniteInt(env.LCM_ROLLUP_DAILY_MAX_TOKENS)
+        parseFinitePositiveInt(env.LCM_ROLLUP_DAILY_MAX_TOKENS)
           ?? toNumber(pc.rollupDailyMaxTokens) ?? 40000,
       rollupWeeklyMaxTokens:
-        parseFiniteInt(env.LCM_ROLLUP_WEEKLY_MAX_TOKENS)
+        parseFinitePositiveInt(env.LCM_ROLLUP_WEEKLY_MAX_TOKENS)
           ?? toNumber(pc.rollupWeeklyMaxTokens) ?? 140000,
       rollupMonthlyMaxTokens:
-        parseFiniteInt(env.LCM_ROLLUP_MONTHLY_MAX_TOKENS)
+        parseFinitePositiveInt(env.LCM_ROLLUP_MONTHLY_MAX_TOKENS)
           ?? toNumber(pc.rollupMonthlyMaxTokens) ?? 560000,
       proactiveThresholdCompactionMode,
       maxAssemblyTokenBudget:
