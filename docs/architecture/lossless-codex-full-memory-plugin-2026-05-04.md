@@ -57,6 +57,7 @@ The sidecar schema is coding-work first:
 - `codex_tool_calls`
 - `codex_touched_files`
 - `codex_observations`
+- `codex_log_metadata`
 - `codex_summaries`
 - `codex_summary_events`
 - `codex_summary_parents`
@@ -90,10 +91,17 @@ evidence. It extracts deterministic coding facts first:
 - test or command outcome observations
 - subagent spawn edges from `thread_spawn_edges`
 - thread summaries and project/day rollups
+- `logs_2.sqlite` metadata such as level, target, file, line, and thread id,
+  with log bodies excluded by default and represented only by hashes
 
 The importer is idempotent. Re-importing the same source does not duplicate
 events. If a rollout JSONL source is truncated or rotated, the sidecar records a
 new source generation so old evidence and new evidence do not collide.
+
+Copied-DB rehearsals prefer rollout JSONL under the configured
+`LOSSLESS_CODEX_SOURCE_DIR` even when the copied `state_5.sqlite` still contains
+live absolute paths. That keeps production rehearsals from accidentally reading
+the user's active Codex session files.
 
 ```mermaid
 sequenceDiagram
@@ -122,7 +130,7 @@ The plugin exposes:
 - `lossless_codex_search`: bounded search over coding memory cues.
 - `lossless_codex_recent`: temporal project/day rollup lookup.
 - `lossless_codex_describe`: proof-oriented drilldown for threads, summaries,
-  observations, and refs.
+  observations, touched files, and refs.
 - `lossless_codex_worklog`: coding-work answer surface for "what did Codex build"
   with optional LCM enrichment write.
 
@@ -192,7 +200,32 @@ detail, it should call `lossless_codex_search` or `lossless_codex_describe`.
 - `LOSSLESS_CODEX_SUMMARY_MODEL=""`
 - `LOSSLESS_CODEX_SUMMARY_PROVIDER=""`
 - `LOSSLESS_CODEX_SUMMARY_MAX_CONCURRENCY=1`
+- `LOSSLESS_CODEX_TIMEZONE=UTC`
 - `LOSSLESS_CODEX_LCM_ENRICHMENT_ENABLED=false`
+
+Project/day rollups are built in `LOSSLESS_CODEX_TIMEZONE`. UTC remains the
+default for deterministic first-run behavior; local deployments can set an IANA
+timezone such as `America/New_York` or `Asia/Bangkok`.
+
+## Production Rehearsal Snapshot
+
+The current draft was rehearsed against copied local Codex and LCM databases
+rather than the live databases:
+
+- Copied Codex source: 429 threads, 406 active JSONL files, 23 archived JSONL
+  files, and 545,111 `logs_2.sqlite` rows.
+- Fresh sidecar import: 480,732 events, 103,129 tool calls, 6,426 touched files,
+  1,595 observations, 35 summaries, and 48 project/day rollups.
+- Second import over the same copied sources: 0 new threads, 0 new events, 0 new
+  touched files, 0 new observations, and 0 new log rows.
+- Privacy sentinels: 0 rows containing patch diffs, stdout/stderr payloads,
+  synthetic secret markers, or log bodies.
+- Tool exercise: direct module calls and MCP stdio calls succeeded for status,
+  import disabled/default behavior, explicit idempotent import, search, recent,
+  describe, and worklog.
+- LCM enrichment rehearsal: wrote one compact copied-LCM row with a 976-byte
+  payload, no raw transcript/tool output/log body content, and sidecar refs for
+  detail drilldown.
 
 ## PR Slicing Recommendation
 
@@ -212,4 +245,3 @@ detail, it should call `lossless_codex_search` or `lossless_codex_describe`.
 - No task, Cortex, reminder, or wake automation.
 - No unbounded all-history scans.
 - No claim that enrichment rows are proof.
-

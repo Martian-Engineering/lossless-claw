@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -53,11 +53,60 @@ function escapeLike(term) {
   return String(term).replace(/([\\%_])/g, "\\$1");
 }
 
+function searchTerms(query) {
+  return String(query)
+    .toLowerCase()
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function likeAllTerms(column, terms) {
+  return {
+    sql: terms.map(() => `${column} LIKE ? ESCAPE '\\'`).join(" AND "),
+    args: terms.map((term) => `%${escapeLike(term)}%`),
+  };
+}
+
 function normalizeDate(value) {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     throw new Error("period must be a YYYY-MM-DD date for this Lossless Codex slice.");
   }
   return value;
+}
+
+function normalizeTimezone(value = DEFAULT_TIMEZONE) {
+  const timezone = readString(value, DEFAULT_TIMEZONE);
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(new Date());
+  } catch {
+    throw new Error(`Invalid IANA timezone for Lossless Codex: ${timezone}`);
+  }
+  return timezone;
+}
+
+function createDateKeyFormatter(timezone) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+}
+
+function dateKeyInTimeZone(isoTimestamp, timezone, formatter = null) {
+  if (timezone === "UTC" || timezone === "Etc/UTC") {
+    return typeof isoTimestamp === "string" && isoTimestamp.length >= 10
+      ? isoTimestamp.slice(0, 10)
+      : null;
+  }
+  const date = new Date(isoTimestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  const parts = (formatter ?? createDateKeyFormatter(timezone)).formatToParts(date);
+  const lookup = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  if (!lookup.year || !lookup.month || !lookup.day) return null;
+  return `${lookup.year}-${lookup.month}-${lookup.day}`;
 }
 
 function isoOrNull(value) {
@@ -86,6 +135,10 @@ export function resolveSourceDir(env = process.env) {
 
 export function resolveStateDbPath(env = process.env) {
   return resolve(env.LOSSLESS_CODEX_STATE_DB_PATH?.trim() || join(resolveSourceDir(env), "state_5.sqlite"));
+}
+
+export function resolveLogsDbPath(env = process.env) {
+  return resolve(env.LOSSLESS_CODEX_LOGS_DB_PATH?.trim() || join(resolveSourceDir(env), "logs_2.sqlite"));
 }
 
 export function openSidecarDatabase(dbPath = resolveSidecarDatabasePath(), options = {}) {
@@ -257,6 +310,25 @@ export function runSidecarMigrations(db) {
       UNIQUE (thread_id, kind, summary)
     );
 
+    CREATE TABLE IF NOT EXISTS codex_log_metadata (
+      log_metadata_id TEXT PRIMARY KEY,
+      source_file_id TEXT NOT NULL REFERENCES codex_source_files(source_file_id) ON DELETE CASCADE,
+      source_row_id INTEGER NOT NULL,
+      ts INTEGER,
+      ts_nanos INTEGER,
+      level TEXT,
+      target TEXT,
+      module_path TEXT,
+      file TEXT,
+      line INTEGER,
+      thread_id TEXT,
+      process_uuid_hash TEXT,
+      estimated_bytes INTEGER,
+      body_sha256 TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE (source_file_id, source_row_id)
+    );
+
     CREATE TABLE IF NOT EXISTS codex_summaries (
       summary_id TEXT PRIMARY KEY,
       thread_id TEXT REFERENCES codex_threads(thread_id) ON DELETE CASCADE,
@@ -339,10 +411,20 @@ export function runSidecarMigrations(db) {
 
     CREATE INDEX IF NOT EXISTS codex_events_thread_time_idx
       ON codex_events (thread_id, timestamp, source_line);
+    CREATE INDEX IF NOT EXISTS codex_events_time_thread_idx
+      ON codex_events (timestamp, thread_id);
+    CREATE INDEX IF NOT EXISTS codex_events_source_idx
+      ON codex_events (source_file_id);
     CREATE INDEX IF NOT EXISTS codex_observations_project_kind_idx
       ON codex_observations (project_id, kind, status);
     CREATE INDEX IF NOT EXISTS codex_touched_files_path_idx
       ON codex_touched_files (path_hash);
+    CREATE INDEX IF NOT EXISTS codex_log_metadata_thread_idx
+      ON codex_log_metadata (thread_id, ts);
+    CREATE INDEX IF NOT EXISTS codex_log_metadata_source_idx
+      ON codex_log_metadata (source_file_id);
+    CREATE INDEX IF NOT EXISTS codex_log_metadata_target_idx
+      ON codex_log_metadata (target, level, ts);
     CREATE INDEX IF NOT EXISTS codex_project_day_rollups_period_idx
       ON codex_project_day_rollups (period_key, project_key);
   `);
@@ -399,6 +481,14 @@ function statFile(path) {
 function safePayload(raw) {
   const payload = raw && typeof raw === "object" ? raw : {};
   const out = {};
+  const copySafeScalar = (key) => {
+    const value = payload[key];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      out[key] = value;
+    } else if (value !== undefined && key === "status") {
+      out[key] = "[object_redacted]";
+    }
+  };
   for (const key of [
     "type",
     "role",
@@ -412,7 +502,7 @@ function safePayload(raw) {
     "exit_code",
     "duration_ms",
   ]) {
-    if (payload[key] !== undefined) out[key] = payload[key];
+    copySafeScalar(key);
   }
   if (payload.changes && typeof payload.changes === "object") {
     out.changed_files = Object.keys(payload.changes);
@@ -442,6 +532,77 @@ function readJsonl(path) {
     }
   }
   return rows;
+}
+
+function listJsonlFiles(dir) {
+  if (!existsSync(dir)) return [];
+  const out = [];
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(path);
+      } else if (entry.isFile() && path.endsWith(".jsonl")) {
+        out.push(path);
+      }
+    }
+  }
+  return out.sort();
+}
+
+function remapRolloutPath(storedPath, sourceDir) {
+  if (!storedPath) return null;
+  const normalized = String(storedPath).replace(/\\/g, "/");
+  for (const marker of ["/sessions/", "/archived_sessions/"]) {
+    const index = normalized.indexOf(marker);
+    if (index < 0) continue;
+    const candidate = join(sourceDir, normalized.slice(index + 1));
+    if (existsSync(candidate)) return candidate;
+  }
+  if (existsSync(storedPath)) return storedPath;
+  return storedPath;
+}
+
+function readSessionMeta(rows) {
+  for (const row of rows) {
+    if (row.value?.type !== "session_meta") continue;
+    const payload = row.value.payload && typeof row.value.payload === "object" ? row.value.payload : {};
+    return payload;
+  }
+  return {};
+}
+
+function buildSyntheticThreadFromJsonl(path, sourceDir, rows) {
+  const meta = readSessionMeta(rows);
+  const firstTimestamp = rows.find((row) => isoOrNull(row.value?.timestamp))?.value.timestamp;
+  const lastTimestamp = [...rows].reverse().find((row) => isoOrNull(row.value?.timestamp))?.value.timestamp;
+  const createdAtMs = firstTimestamp ? new Date(firstTimestamp).getTime() : Date.now();
+  const updatedAtMs = lastTimestamp ? new Date(lastTimestamp).getTime() : createdAtMs;
+  const threadId = readString(meta.id) ?? id("cthread", path);
+  const sourceKind = path.replace(/\\/g, "/").includes("/archived_sessions/")
+    ? "archived_jsonl"
+    : "session_jsonl";
+  return {
+    id: threadId,
+    rollout_path: path,
+    created_at: Math.floor(createdAtMs / 1000),
+    updated_at: Math.floor(updatedAtMs / 1000),
+    created_at_ms: createdAtMs,
+    updated_at_ms: updatedAtMs,
+    source: sourceKind,
+    model_provider: readString(meta.model_provider) ?? "unknown",
+    cwd: readString(meta.cwd) ?? sourceDir,
+    title: readString(meta.title) ?? `Codex session ${threadId}`,
+    sandbox_policy: readString(meta.sandbox_policy) ?? "unknown",
+    approval_mode: readString(meta.approval_mode) ?? "unknown",
+    git_branch: readString(meta.git_branch) ?? null,
+    git_origin_url: readString(meta.git_origin_url) ?? null,
+    model: readString(meta.model) ?? null,
+    reasoning_effort: readString(meta.reasoning_effort) ?? null,
+    archived: sourceKind === "archived_jsonl" ? 1 : 0,
+  };
 }
 
 function ensureSourceFile(db, kind, path) {
@@ -478,6 +639,57 @@ function ensureSourceFile(db, kind, path) {
       status = 'active'`,
   ).run(sourceId, kind, path, sha(path), stat.device, stat.inode, generation, stat.size, stat.mtimeMs, nowIso());
   return { sourceId, generation, ...stat };
+}
+
+function sourceWatermarkCurrent(db, source) {
+  const row = db
+    .prepare(
+      `SELECT last_size, last_mtime_ms
+       FROM codex_import_watermarks
+       WHERE source_file_id = ?`,
+    )
+    .get(source.sourceId);
+  return (
+    row &&
+    Number(row.last_size) === Number(source.size) &&
+    Number(row.last_mtime_ms) === Number(source.mtimeMs)
+  );
+}
+
+function sourceHasImportedRows(db, source, kind) {
+  const table = kind === "logs" ? "codex_log_metadata" : "codex_events";
+  const row = db
+    .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE source_file_id = ?`)
+    .get(source.sourceId);
+  return Number(row?.count ?? 0) > 0;
+}
+
+function shouldSkipSourceImport(db, source, kind) {
+  return Boolean(sourceWatermarkCurrent(db, source) && sourceHasImportedRows(db, source, kind));
+}
+
+function markSourceWatermark(db, source, rows = []) {
+  const lastRow = rows.length > 0 ? rows[rows.length - 1] : null;
+  db.prepare(
+    `INSERT INTO codex_import_watermarks (
+      source_file_id, last_size, last_mtime_ms, last_offset, last_line, last_event_hash, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(source_file_id) DO UPDATE SET
+      last_size = excluded.last_size,
+      last_mtime_ms = excluded.last_mtime_ms,
+      last_offset = excluded.last_offset,
+      last_line = excluded.last_line,
+      last_event_hash = excluded.last_event_hash,
+      updated_at = excluded.updated_at`,
+  ).run(
+    source.sourceId,
+    source.size,
+    source.mtimeMs,
+    lastRow?.offset ?? 0,
+    lastRow?.lineNo ?? 0,
+    lastRow?.raw ? sha(lastRow.raw) : null,
+    nowIso(),
+  );
 }
 
 function upsertProject(db, row) {
@@ -743,51 +955,116 @@ function buildThreadSummary(db, threadId, projectId) {
   );
 }
 
+function runImmediateTransaction(db, fn) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 function rebuildProjectDayRollups(db, timezone = DEFAULT_TIMEZONE) {
-  const rows = db.prepare(
-    `SELECT p.project_id, p.project_key, substr(e.timestamp, 1, 10) AS period_key
+  const normalizedTimezone = normalizeTimezone(timezone);
+  const dateKeyFormatter =
+    normalizedTimezone === "UTC" || normalizedTimezone === "Etc/UTC"
+      ? null
+      : createDateKeyFormatter(normalizedTimezone);
+  db.prepare("DELETE FROM codex_project_day_rollups WHERE timezone = ?").run(normalizedTimezone);
+  const groups = new Map();
+  const groupFor = (row, timestamp) => {
+    const periodKey = dateKeyInTimeZone(timestamp, normalizedTimezone, dateKeyFormatter);
+    if (!periodKey) return null;
+    const key = `${row.project_id}:${periodKey}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        project_id: row.project_id,
+        project_key: row.project_key,
+        period_key: periodKey,
+        threadIds: new Set(),
+        fileIds: new Set(),
+        observations: {
+          decisions: 0,
+          tradeoffs: 0,
+          architectureNotes: 0,
+          openQuestions: 0,
+        },
+      });
+    }
+    return groups.get(key);
+  };
+
+  const eventRows = db.prepare(
+    `SELECT p.project_id, p.project_key, e.thread_id, e.timestamp
      FROM codex_events e
      JOIN codex_threads t ON t.thread_id = e.thread_id
      JOIN codex_projects p ON p.project_id = t.project_id
-     WHERE e.timestamp IS NOT NULL
-     GROUP BY p.project_id, p.project_key, substr(e.timestamp, 1, 10)`,
-  ).all();
+     WHERE e.timestamp IS NOT NULL`,
+  );
+  const eventsIterable = typeof eventRows.iterate === "function" ? eventRows.iterate() : eventRows.all();
+  for (const row of eventsIterable) {
+    const group = groupFor(row, row.timestamp);
+    if (group) group.threadIds.add(row.thread_id);
+  }
+
+  const touchedRows = db.prepare(
+    `SELECT p.project_id, p.project_key, f.touched_file_id, e.timestamp
+     FROM codex_touched_files f
+     JOIN codex_threads t ON t.thread_id = f.thread_id
+     JOIN codex_projects p ON p.project_id = t.project_id
+     JOIN codex_events e ON e.event_id = f.event_id
+     WHERE e.timestamp IS NOT NULL`,
+  );
+  const touchedIterable = typeof touchedRows.iterate === "function" ? touchedRows.iterate() : touchedRows.all();
+  for (const row of touchedIterable) {
+    const group = groupFor(row, row.timestamp);
+    if (group) group.fileIds.add(row.touched_file_id);
+  }
+
+  const observationRows = db.prepare(
+    `SELECT p.project_id, p.project_key, o.kind, e.timestamp
+     FROM codex_observations o
+     JOIN codex_threads t ON t.thread_id = o.thread_id
+     JOIN codex_projects p ON p.project_id = t.project_id
+     JOIN codex_events e ON e.event_id = o.first_event_id
+     WHERE e.timestamp IS NOT NULL`,
+  );
+  const observationIterable =
+    typeof observationRows.iterate === "function" ? observationRows.iterate() : observationRows.all();
+  for (const row of observationIterable) {
+    const group = groupFor(row, row.timestamp);
+    if (!group) continue;
+    if (row.kind === "decision") group.observations.decisions += 1;
+    if (row.kind === "tradeoff") group.observations.tradeoffs += 1;
+    if (row.kind === "architecture_note") group.observations.architectureNotes += 1;
+    if (row.kind === "follow_up") group.observations.openQuestions += 1;
+  }
+
   let rebuilt = 0;
-  for (const row of rows) {
-    const counts = db.prepare(
-      `SELECT
-        COUNT(DISTINCT t.thread_id) AS thread_count,
-        COUNT(DISTINCT f.touched_file_id) AS files_touched,
-        SUM(CASE WHEN o.kind = 'decision' THEN 1 ELSE 0 END) AS decisions,
-        SUM(CASE WHEN o.kind = 'tradeoff' THEN 1 ELSE 0 END) AS tradeoffs,
-        SUM(CASE WHEN o.kind = 'architecture_note' THEN 1 ELSE 0 END) AS architecture_notes,
-        SUM(CASE WHEN o.kind = 'follow_up' THEN 1 ELSE 0 END) AS open_questions,
-        COUNT(DISTINCT o.observation_id) AS observations
-       FROM codex_threads t
-       LEFT JOIN codex_events e ON e.thread_id = t.thread_id
-       LEFT JOIN codex_touched_files f ON f.thread_id = t.thread_id
-       LEFT JOIN codex_observations o ON o.thread_id = t.thread_id
-       WHERE t.project_id = ? AND substr(e.timestamp, 1, 10) = ?`,
-    ).get(row.project_id, row.period_key);
-    const threadRefs = db.prepare(
-      `SELECT DISTINCT t.thread_id
-       FROM codex_threads t
-       JOIN codex_events e ON e.thread_id = t.thread_id
-       WHERE t.project_id = ? AND substr(e.timestamp, 1, 10) = ?
-       ORDER BY t.thread_id LIMIT 20`,
-    ).all(row.project_id, row.period_key).map((thread) => `lossless-codex://thread/${thread.thread_id}`);
+  for (const row of [...groups.values()].sort((a, b) => {
+    const periodCmp = String(a.period_key).localeCompare(String(b.period_key));
+    if (periodCmp !== 0) return periodCmp;
+    return String(a.project_key).localeCompare(String(b.project_key));
+  })) {
+    const threadIds = [...row.threadIds].sort();
+    const threadCount = threadIds.length;
+    const filesTouched = row.fileIds.size;
+    const threadRefs = threadIds.slice(0, 20).map((threadId) => `lossless-codex://thread/${threadId}`);
     const payload = {
       projectsWorked: [
         {
           projectKey: row.project_key,
-          threadCount: counts.thread_count ?? 0,
-          summary: `Codex worked on ${row.project_key} across ${counts.thread_count ?? 0} thread(s).`,
+          threadCount,
+          summary: `Codex worked on ${row.project_key} across ${threadCount} thread(s).`,
           observations: {
-            decisions: counts.decisions ?? 0,
-            tradeoffs: counts.tradeoffs ?? 0,
-            architectureNotes: counts.architecture_notes ?? 0,
-            filesTouched: counts.files_touched ?? 0,
-            openQuestions: counts.open_questions ?? 0,
+            decisions: row.observations.decisions,
+            tradeoffs: row.observations.tradeoffs,
+            architectureNotes: row.observations.architectureNotes,
+            filesTouched,
+            openQuestions: row.observations.openQuestions,
           },
           sidecarRefs: [
             `lossless-codex://project-day/${row.project_key}/${row.period_key}`,
@@ -796,8 +1073,8 @@ function rebuildProjectDayRollups(db, timezone = DEFAULT_TIMEZONE) {
         },
       ],
     };
-    const summary = `Codex worked on ${row.project_key} across ${counts.thread_count ?? 0} thread(s), touching ${counts.files_touched ?? 0} file(s).`;
-    const rollupId = id("croll", `${row.project_key}:${row.period_key}:${timezone}`);
+    const summary = `Codex worked on ${row.project_key} across ${threadCount} thread(s), touching ${filesTouched} file(s).`;
+    const rollupId = id("croll", `${row.project_key}:${row.period_key}:${normalizedTimezone}`);
     db.prepare(
       `INSERT INTO codex_project_day_rollups (
         rollup_id, project_id, project_key, period_key, timezone, summary, payload_json,
@@ -814,7 +1091,7 @@ function rebuildProjectDayRollups(db, timezone = DEFAULT_TIMEZONE) {
       row.project_id,
       row.project_key,
       row.period_key,
-      timezone,
+      normalizedTimezone,
       summary,
       JSON.stringify(payload),
       `lossless-codex://project-day/${row.project_key}/${row.period_key}`,
@@ -826,6 +1103,154 @@ function rebuildProjectDayRollups(db, timezone = DEFAULT_TIMEZONE) {
   return rebuilt;
 }
 
+function importThreadJsonl(db, params) {
+  const { thread, source, rows, sourceDir } = params;
+  const project = upsertProject(db, thread);
+  const insertedThread = upsertThread(db, thread, project, source.sourceId);
+  let importedEvents = 0;
+  let turnSeq = 0;
+  let currentTurnId = null;
+  const fallbackTurnId = `${thread.id}:turn:${turnSeq}`;
+  ensureTurn(db, thread.id, fallbackTurnId, turnSeq, {
+    status: "unknown",
+    timezone: DEFAULT_TIMEZONE,
+    cwdHash: sha(String(thread.cwd ?? "")),
+    model: thread.model ?? null,
+  });
+  currentTurnId = fallbackTurnId;
+  for (const row of rows) {
+    const payload = row.value.payload && typeof row.value.payload === "object" ? row.value.payload : {};
+    if (payload.turn_id && String(payload.type ?? "") === "task_started") {
+      turnSeq += 1;
+      currentTurnId = String(payload.turn_id);
+      ensureTurn(db, thread.id, currentTurnId, turnSeq, {
+        startedAt: isoOrNull(payload.started_at) ?? isoOrNull(row.value.timestamp),
+        status: "running",
+        lineStart: row.lineNo,
+        timezone: DEFAULT_TIMEZONE,
+        cwdHash: sha(String(thread.cwd ?? "")),
+        model: thread.model ?? null,
+      });
+    }
+    const event = insertEvent(db, thread.id, currentTurnId, source.sourceId, thread.rollout_path, row);
+    if (event.inserted) importedEvents += 1;
+    const rawRef = `jsonl://${thread.rollout_path}#line=${row.lineNo}`;
+    upsertToolCall(db, thread.id, currentTurnId, event.eventId, payload, rawRef);
+    if (payload.type === "patch_apply_end" && payload.changes && typeof payload.changes === "object") {
+      for (const filePath of Object.keys(payload.changes)) {
+        insertTouchedFileAndObservation(db, {
+          threadId: thread.id,
+          turnId: currentTurnId,
+          projectId: project.projectId,
+          callId: payload.call_id ? String(payload.call_id) : null,
+          eventId: event.eventId,
+          sourceDir,
+          filePath,
+          sourceKind: "patch_apply",
+        });
+      }
+    }
+    if (payload.turn_id && String(payload.type ?? "") === "task_complete") {
+      ensureTurn(db, thread.id, String(payload.turn_id), turnSeq, {
+        completedAt: isoOrNull(payload.completed_at) ?? isoOrNull(row.value.timestamp),
+        status: "complete",
+        lineEnd: row.lineNo,
+      });
+    }
+  }
+  buildThreadSummary(db, thread.id, project.projectId);
+  return { insertedThread, importedEvents };
+}
+
+function upsertThreadMetadataOnly(db, thread, source) {
+  const project = upsertProject(db, thread);
+  return upsertThread(db, thread, project, source.sourceId);
+}
+
+function importLogsMetadata(db, logsDbPath) {
+  if (!logsDbPath || !existsSync(logsDbPath)) {
+    return 0;
+  }
+  const logsDb = new DatabaseSync(logsDbPath, { readOnly: true });
+  let imported = 0;
+  try {
+    logsDb.exec("PRAGMA query_only = ON");
+    if (!tableExists(logsDb, "logs")) {
+      return 0;
+    }
+    const source = ensureSourceFile(db, "logs_db", logsDbPath);
+    if (shouldSkipSourceImport(db, source, "logs")) {
+      return 0;
+    }
+    const rows = logsDb.prepare(
+      `SELECT id, ts, ts_nanos, level, target, feedback_log_body, module_path, file,
+              line, thread_id, process_uuid, estimated_bytes
+       FROM logs
+       ORDER BY id ASC`,
+    );
+    const insert = db.prepare(
+      `INSERT OR IGNORE INTO codex_log_metadata (
+        log_metadata_id, source_file_id, source_row_id, ts, ts_nanos, level, target,
+        module_path, file, line, thread_id, process_uuid_hash, estimated_bytes,
+        body_sha256, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const iterable = typeof rows.iterate === "function" ? rows.iterate() : rows.all();
+    let batchCount = 0;
+    let transactionOpen = false;
+    const commitBatch = () => {
+      if (!transactionOpen) return;
+      db.exec("COMMIT");
+      transactionOpen = false;
+    };
+    try {
+      for (const row of iterable) {
+        if (!transactionOpen) {
+          db.exec("BEGIN IMMEDIATE");
+          transactionOpen = true;
+        }
+        const body =
+          typeof row.feedback_log_body === "string" && row.feedback_log_body.length > 0
+            ? row.feedback_log_body
+            : null;
+        const result = insert.run(
+          id("clog", `${source.sourceId}:${row.id}`),
+          source.sourceId,
+          row.id,
+          row.ts ?? null,
+          row.ts_nanos ?? null,
+          row.level ?? null,
+          row.target ?? null,
+          row.module_path ?? null,
+          row.file ?? null,
+          row.line ?? null,
+          row.thread_id ?? null,
+          row.process_uuid ? sha(row.process_uuid) : null,
+          row.estimated_bytes ?? null,
+          body ? sha(body) : null,
+          nowIso(),
+        );
+        imported += result.changes;
+        batchCount += 1;
+        if (batchCount >= 5000) {
+          commitBatch();
+          batchCount = 0;
+        }
+      }
+      commitBatch();
+    } catch (error) {
+      if (transactionOpen) db.exec("ROLLBACK");
+      throw error;
+    }
+    runImmediateTransaction(db, () => {
+      markSourceWatermark(db, source);
+    });
+    return imported;
+  } finally {
+    logsDb.close();
+  }
+}
+
 export async function importCodexArtifacts(options) {
   if (!options?.allowWrite) {
     throw new Error("Lossless Codex import requires explicit allowWrite=true.");
@@ -833,6 +1258,8 @@ export async function importCodexArtifacts(options) {
   const dbPath = options.dbPath ?? resolveSidecarDatabasePath(options.env);
   const sourceDir = options.sourceDir ?? resolveSourceDir(options.env);
   const stateDbPath = options.stateDbPath ?? resolveStateDbPath(options.env);
+  const logsDbPath = options.logsDbPath ?? resolveLogsDbPath({ ...options.env, LOSSLESS_CODEX_SOURCE_DIR: sourceDir });
+  const timezone = normalizeTimezone(options.timezone ?? options.env?.LOSSLESS_CODEX_TIMEZONE ?? DEFAULT_TIMEZONE);
   if (!existsSync(stateDbPath)) {
     throw new Error(`Codex state database not found at ${stateDbPath}.`);
   }
@@ -842,6 +1269,8 @@ export async function importCodexArtifacts(options) {
   let importedEvents = 0;
   let importedTouchedFiles = 0;
   let importedObservations = 0;
+  let importedLogRows = 0;
+  let rebuiltRollups = 0;
   try {
     runSidecarMigrations(db);
     const stateSource = ensureSourceFile(db, "state_db", stateDbPath);
@@ -850,65 +1279,61 @@ export async function importCodexArtifacts(options) {
     const ox = db.prepare("SELECT COUNT(*) AS count FROM codex_observations");
     const touchedBefore = tx.get().count;
     const observationsBefore = ox.get().count;
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      for (const thread of threads) {
-        if (!thread.rollout_path || !existsSync(thread.rollout_path)) continue;
-        const source = ensureSourceFile(db, "session_jsonl", thread.rollout_path);
-        const project = upsertProject(db, thread);
-        if (upsertThread(db, thread, project, source.sourceId)) importedThreads += 1;
-        let turnSeq = 0;
-        let currentTurnId = null;
-        const fallbackTurnId = `${thread.id}:turn:${turnSeq}`;
-        ensureTurn(db, thread.id, fallbackTurnId, turnSeq, {
-          status: "unknown",
-          timezone: DEFAULT_TIMEZONE,
-          cwdHash: sha(String(thread.cwd ?? "")),
-          model: thread.model ?? null,
-        });
-        currentTurnId = fallbackTurnId;
-        for (const row of readJsonl(thread.rollout_path)) {
-          const payload = row.value.payload && typeof row.value.payload === "object" ? row.value.payload : {};
-          if (payload.turn_id && String(payload.type ?? "") === "task_started") {
-            turnSeq += 1;
-            currentTurnId = String(payload.turn_id);
-            ensureTurn(db, thread.id, currentTurnId, turnSeq, {
-              startedAt: isoOrNull(payload.started_at) ?? isoOrNull(row.value.timestamp),
-              status: "running",
-              lineStart: row.lineNo,
-              timezone: DEFAULT_TIMEZONE,
-              cwdHash: sha(String(thread.cwd ?? "")),
-              model: thread.model ?? null,
-            });
-          }
-          const event = insertEvent(db, thread.id, currentTurnId, source.sourceId, thread.rollout_path, row);
-          if (event.inserted) importedEvents += 1;
-          const rawRef = `jsonl://${thread.rollout_path}#line=${row.lineNo}`;
-          upsertToolCall(db, thread.id, currentTurnId, event.eventId, payload, rawRef);
-          if (payload.type === "patch_apply_end" && payload.changes && typeof payload.changes === "object") {
-            for (const filePath of Object.keys(payload.changes)) {
-              insertTouchedFileAndObservation(db, {
-                threadId: thread.id,
-                turnId: currentTurnId,
-                projectId: project.projectId,
-                callId: payload.call_id ? String(payload.call_id) : null,
-                eventId: event.eventId,
-                sourceDir,
-                filePath,
-                sourceKind: "patch_apply",
-              });
-            }
-          }
-          if (payload.turn_id && String(payload.type ?? "") === "task_complete") {
-            ensureTurn(db, thread.id, String(payload.turn_id), turnSeq, {
-              completedAt: isoOrNull(payload.completed_at) ?? isoOrNull(row.value.timestamp),
-              status: "complete",
-              lineEnd: row.lineNo,
-            });
-          }
+    const importedRolloutPaths = new Set();
+    const stateThreadIds = new Set();
+    for (const thread of threads) {
+      stateThreadIds.add(String(thread.id));
+      const rolloutPath = remapRolloutPath(thread.rollout_path, sourceDir);
+      if (!rolloutPath || !existsSync(rolloutPath)) continue;
+      importedRolloutPaths.add(rolloutPath);
+      const result = runImmediateTransaction(db, () => {
+        const source = ensureSourceFile(db, "session_jsonl", rolloutPath);
+        if (shouldSkipSourceImport(db, source, "events")) {
+          return {
+            insertedThread: upsertThreadMetadataOnly(db, { ...thread, rollout_path: rolloutPath }, source),
+            importedEvents: 0,
+          };
         }
-        buildThreadSummary(db, thread.id, project.projectId);
-      }
+        const rows = readJsonl(rolloutPath);
+        const result = importThreadJsonl(db, {
+          thread: { ...thread, rollout_path: rolloutPath },
+          source,
+          rows,
+          sourceDir,
+        });
+        markSourceWatermark(db, source, rows);
+        return result;
+      });
+      if (result.insertedThread) importedThreads += 1;
+      importedEvents += result.importedEvents;
+    }
+    const jsonlFiles = [
+      ...listJsonlFiles(join(sourceDir, "sessions")),
+      ...listJsonlFiles(join(sourceDir, "archived_sessions")),
+    ];
+    for (const path of jsonlFiles) {
+      if (importedRolloutPaths.has(path)) continue;
+      const source = runImmediateTransaction(db, () => ensureSourceFile(db, "session_jsonl", path));
+      if (shouldSkipSourceImport(db, source, "events")) continue;
+      const rows = readJsonl(path);
+      const thread = buildSyntheticThreadFromJsonl(path, sourceDir, rows);
+      if (stateThreadIds.has(String(thread.id))) continue;
+      const result = runImmediateTransaction(db, () => {
+        const activeSource = ensureSourceFile(db, "session_jsonl", path);
+        const result = importThreadJsonl(db, {
+          thread,
+          source: activeSource,
+          rows,
+          sourceDir,
+        });
+        markSourceWatermark(db, activeSource, rows);
+        return result;
+      });
+      if (result.insertedThread) importedThreads += 1;
+      importedEvents += result.importedEvents;
+    }
+    importedLogRows = importLogsMetadata(db, logsDbPath);
+    runImmediateTransaction(db, () => {
       if (tableExists(stateDb, "thread_spawn_edges")) {
         const edges = stateDb.prepare("SELECT * FROM thread_spawn_edges").all();
         for (const edge of edges) {
@@ -929,10 +1354,7 @@ export async function importCodexArtifacts(options) {
           );
         }
       }
-      const rebuiltRollups = rebuildProjectDayRollups(db);
-      db.exec("COMMIT");
-      importedTouchedFiles = tx.get().count - touchedBefore;
-      importedObservations = ox.get().count - observationsBefore;
+      rebuiltRollups = rebuildProjectDayRollups(db, timezone);
       db.prepare(
         `INSERT INTO codex_import_watermarks (
           source_file_id, last_size, last_mtime_ms, last_offset, last_line, last_event_hash, updated_at
@@ -942,18 +1364,18 @@ export async function importCodexArtifacts(options) {
           last_mtime_ms = excluded.last_mtime_ms,
           updated_at = excluded.updated_at`,
       ).run(stateSource.sourceId, stateSource.size, stateSource.mtimeMs, nowIso());
-      return {
-        importedThreads,
-        importedEvents,
-        importedTouchedFiles,
-        importedObservations,
-        rebuiltRollups,
-        databasePath: dbPath,
-      };
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
+    });
+    importedTouchedFiles = tx.get().count - touchedBefore;
+    importedObservations = ox.get().count - observationsBefore;
+    return {
+      importedThreads,
+      importedEvents,
+      importedTouchedFiles,
+      importedObservations,
+      importedLogRows,
+      rebuiltRollups,
+      databasePath: dbPath,
+    };
   } finally {
     stateDb.close();
     db.close();
@@ -1063,6 +1485,7 @@ function toolStatus(args, options) {
         projects: db.prepare("SELECT COUNT(*) AS c FROM codex_projects").get().c,
         threads: db.prepare("SELECT COUNT(*) AS c FROM codex_threads").get().c,
         events: db.prepare("SELECT COUNT(*) AS c FROM codex_events").get().c,
+        logMetadata: db.prepare("SELECT COUNT(*) AS c FROM codex_log_metadata").get().c,
         observations: db.prepare("SELECT COUNT(*) AS c FROM codex_observations").get().c,
         rollups: db.prepare("SELECT COUNT(*) AS c FROM codex_project_day_rollups").get().c,
       };
@@ -1082,6 +1505,7 @@ function toolStatus(args, options) {
       readOnly: readBool(options.env?.LOSSLESS_CODEX_READ_ONLY, true),
       summaryProvider: options.env?.LOSSLESS_CODEX_SUMMARY_PROVIDER?.trim() || null,
       summaryModel: options.env?.LOSSLESS_CODEX_SUMMARY_MODEL?.trim() || null,
+      timezone: normalizeTimezone(options.env?.LOSSLESS_CODEX_TIMEZONE ?? DEFAULT_TIMEZONE),
       summaryMaxConcurrency: clampInt(
         options.env?.LOSSLESS_CODEX_SUMMARY_MAX_CONCURRENCY,
         1,
@@ -1120,6 +1544,7 @@ async function toolImport(args, options) {
     dbPath: options.dbPath ?? args.dbPath ?? resolveSidecarDatabasePath(env),
     sourceDir: options.sourceDir ?? args.sourceDir ?? resolveSourceDir(env),
     stateDbPath: options.stateDbPath ?? args.stateDbPath ?? resolveStateDbPath(env),
+    timezone: args.timezone ?? env.LOSSLESS_CODEX_TIMEZONE,
     allowWrite: true,
     env,
   });
@@ -1132,24 +1557,28 @@ function toolSearch(args, options) {
     const query = readString(args.query ?? args.pattern, "");
     if (!query) throw new Error("query is required.");
     const limit = clampInt(args.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-    const like = `%${escapeLike(query.toLowerCase())}%`;
+    const terms = searchTerms(query);
+    if (terms.length === 0) throw new Error("query is required.");
+    const fileWhere = likeAllTerms("LOWER(path_display)", terms);
+    const observationWhere = likeAllTerms("LOWER(summary)", terms);
+    const summaryWhere = likeAllTerms("LOWER(content)", terms);
     const includeSummaries = readBool(args.includeSummaries, false);
     const primaryRows = db.prepare(
       `SELECT 'file' AS type, touched_file_id AS id, path_display AS text, confidence,
               'lossless-codex://file/' || touched_file_id AS ref,
               1 AS rank
        FROM codex_touched_files
-       WHERE LOWER(path_display) LIKE ? ESCAPE '\\'
+       WHERE ${fileWhere.sql}
        UNION ALL
        SELECT 'observation' AS type, observation_id AS id, summary AS text, confidence,
               'lossless-codex://observation/' || observation_id AS ref,
               2 AS rank
        FROM codex_observations
        WHERE kind != 'file_change'
-         AND LOWER(summary) LIKE ? ESCAPE '\\'
+         AND ${observationWhere.sql}
        ORDER BY rank ASC, confidence DESC, text ASC
        LIMIT ?`,
-    ).all(like, like, limit);
+    ).all(...fileWhere.args, ...observationWhere.args, limit);
     const summaryRows =
       includeSummaries || primaryRows.length === 0
         ? db
@@ -1158,11 +1587,11 @@ function toolSearch(args, options) {
                       'lossless-codex://summary/' || summary_id AS ref,
                       3 AS rank
                FROM codex_summaries
-               WHERE LOWER(content) LIKE ? ESCAPE '\\'
+               WHERE ${summaryWhere.sql}
                ORDER BY created_at DESC
                LIMIT ?`,
             )
-            .all(like, Math.max(0, limit - primaryRows.length))
+            .all(...summaryWhere.args, Math.max(0, limit - primaryRows.length))
         : [];
     const rows = [...primaryRows, ...summaryRows]
       .slice(0, limit)
@@ -1237,6 +1666,34 @@ function toolDescribe(args, options) {
       const observation = db.prepare("SELECT * FROM codex_observations WHERE observation_id = ?").get(value);
       if (!observation) throw new Error(`No Lossless Codex observation found for ${value}`);
       return jsonTextResult({ tool: "lossless_codex_describe", type: "observation", observation });
+    }
+    if (kind === "file") {
+      const file = db.prepare(
+        `SELECT f.*, t.title_display, p.project_key
+         FROM codex_touched_files f
+         JOIN codex_threads t ON t.thread_id = f.thread_id
+         JOIN codex_projects p ON p.project_id = t.project_id
+         WHERE f.touched_file_id = ?`,
+      ).get(value);
+      if (!file) throw new Error(`No Lossless Codex touched file found for ${value}`);
+      const observations = db.prepare(
+        `SELECT observation_id, kind, status, summary, confidence, first_event_id, last_event_id
+         FROM codex_observations
+         WHERE thread_id = ?
+           AND first_event_id = ?
+         ORDER BY created_at`,
+      ).all(file.thread_id, file.event_id);
+      return jsonTextResult({
+        tool: "lossless_codex_describe",
+        type: "file",
+        file,
+        observations,
+        sidecarRefs: [
+          `lossless-codex://file/${value}`,
+          `lossless-codex://thread/${file.thread_id}`,
+          ...observations.map((observation) => `lossless-codex://observation/${observation.observation_id}`),
+        ],
+      });
     }
     throw new Error(`Unsupported Lossless Codex describe id: ${rawId}`);
   } finally {

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { dirname, join, relative } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
@@ -9,6 +9,7 @@ import { getLcmDbFeatures } from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 
 const pluginModulePath = "../plugins/lossless-codex/scripts/mcp-server.mjs";
+const rehearsalScriptPath = "plugins/lossless-codex/scripts/rehearsal.mjs";
 
 type PluginModule = {
   createTools: () => Array<{ name: string }>;
@@ -33,7 +34,9 @@ type PluginModule = {
     dbPath: string;
     sourceDir: string;
     stateDbPath: string;
+    logsDbPath?: string;
     allowWrite?: boolean;
+    env?: Record<string, string | undefined>;
   }) => Promise<Record<string, unknown>>;
 };
 
@@ -310,6 +313,258 @@ describe("Lossless Codex full memory plugin", () => {
     }
   });
 
+  it("redacts object status payloads from raw metadata snapshots", async () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    writeFileSync(
+      fixture.rolloutPath,
+      readFileSync(fixture.rolloutPath, "utf8") +
+        `${JSON.stringify({
+          timestamp: "2026-05-03T17:33:00.000Z",
+          type: "event_msg",
+          payload: {
+            type: "collab_close_end",
+            status: {
+              completed: "SECRET SUBAGENT FINAL REPORT WITH stdout AND unified_diff",
+              usage: { total_tokens: 1000 },
+            },
+          },
+        })}\n`,
+    );
+
+    await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+    });
+
+    const db = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: true });
+    try {
+      const leaked = db
+        .prepare("SELECT COUNT(*) AS count FROM codex_events WHERE raw_payload_json LIKE '%SECRET SUBAGENT%'")
+        .get() as { count: number };
+      expect(leaked.count).toBe(0);
+      const redacted = db
+        .prepare(
+          `SELECT raw_payload_json
+           FROM codex_events
+           WHERE payload_type = 'collab_close_end'`,
+        )
+        .get() as { raw_payload_json: string };
+      expect(JSON.parse(redacted.raw_payload_json)).toEqual({
+        type: "collab_close_end",
+        status: "[object_redacted]",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("remaps copied state DB rollout paths through the rehearsal sourceDir", async () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    const originalSourceDir = join(fixture.tempDir, "original-codex-home");
+    const copiedRelativePath = relative(fixture.sourceDir, fixture.rolloutPath);
+    const originalRolloutPath = join(originalSourceDir, copiedRelativePath);
+    const stateDb = new DatabaseSync(fixture.stateDbPath);
+    try {
+      stateDb
+        .prepare("UPDATE threads SET rollout_path = ? WHERE id = ?")
+        .run(originalRolloutPath, "019lossless-codex-thread");
+    } finally {
+      stateDb.close();
+    }
+
+    mkdirSync(dirname(originalRolloutPath), { recursive: true });
+    writeFileSync(
+      originalRolloutPath,
+      `${JSON.stringify({
+        timestamp: "2026-05-03T17:00:00.000Z",
+        type: "session_meta",
+        payload: { id: "019lossless-codex-thread", source: "live-original" },
+      })}\n`,
+    );
+    expect(existsSync(originalRolloutPath)).toBe(true);
+
+    const result = await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+    });
+
+    expect(result.importedThreads).toBe(1);
+    expect(result.importedEvents).toBe(5);
+    const db = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: true });
+    try {
+      const source = db
+        .prepare("SELECT path FROM codex_source_files WHERE kind = 'session_jsonl'")
+        .get() as { path: string };
+      expect(source.path).toBe(fixture.rolloutPath);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("imports archived JSONL sessions that are not present in state_5 threads", async () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    const archivedDir = join(fixture.sourceDir, "archived_sessions");
+    mkdirSync(archivedDir, { recursive: true });
+    const archivedPath = join(archivedDir, "rollout-2026-05-04T01-00-00-019archived-thread.jsonl");
+    writeFileSync(
+      archivedPath,
+      [
+        {
+          timestamp: "2026-05-03T18:00:00.000Z",
+          type: "session_meta",
+          payload: {
+            id: "019archived-thread",
+            cwd: "/Volumes/LEXAR/Codex/worktrees/lossless-codex-full-memory",
+            model_provider: "openai",
+            source: "vscode",
+          },
+        },
+        {
+          timestamp: "2026-05-03T18:01:00.000Z",
+          type: "event_msg",
+          payload: { type: "task_started", turn_id: "archived-turn" },
+        },
+        {
+          timestamp: "2026-05-03T18:02:00.000Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: "archived-turn" },
+        },
+      ].map((line) => JSON.stringify(line)).join("\n") + "\n",
+    );
+
+    const result = await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+    });
+
+    expect(result.importedThreads).toBe(2);
+    expect(result.importedEvents).toBe(8);
+    const second = await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+    });
+    expect(second.importedThreads).toBe(0);
+    expect(second.importedEvents).toBe(0);
+    const db = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: true });
+    try {
+      const archivedThread = db
+        .prepare("SELECT thread_id, source FROM codex_threads WHERE thread_id = ?")
+        .get("019archived-thread") as { thread_id: string; source: string };
+      expect(archivedThread).toEqual({ thread_id: "019archived-thread", source: "archived_jsonl" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("imports logs_2 sqlite metadata without log bodies", async () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    const logsDbPath = join(fixture.sourceDir, "logs_2.sqlite");
+    const logsDb = new DatabaseSync(logsDbPath);
+    try {
+      logsDb.exec(`
+        CREATE TABLE logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER,
+          ts_nanos INTEGER,
+          level TEXT,
+          target TEXT,
+          feedback_log_body TEXT,
+          module_path TEXT,
+          file TEXT,
+          line INTEGER,
+          thread_id TEXT,
+          process_uuid TEXT,
+          estimated_bytes INTEGER
+        )
+      `);
+      logsDb
+        .prepare(
+          `INSERT INTO logs (
+            ts, ts_nanos, level, target, feedback_log_body, module_path, file,
+            line, thread_id, process_uuid, estimated_bytes
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          1777829000,
+          123,
+          "INFO",
+          "codex_core::worker",
+          "SECRET LOG BODY SHOULD NOT BE STORED",
+          "codex_core::worker",
+          "worker.rs",
+          42,
+          "019lossless-codex-thread",
+          "process-1",
+          128,
+        );
+    } finally {
+      logsDb.close();
+    }
+
+    await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      logsDbPath,
+      allowWrite: true,
+    });
+
+    const db = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: true });
+    try {
+      const columns = db
+        .prepare("PRAGMA table_info(codex_log_metadata)")
+        .all()
+        .map((row) => String((row as { name: string }).name));
+      expect(columns).not.toContain("feedback_log_body");
+      const row = db
+        .prepare("SELECT level, target, file, line, thread_id, body_sha256 FROM codex_log_metadata")
+        .get() as {
+        level: string;
+        target: string;
+        file: string;
+        line: number;
+        thread_id: string;
+        body_sha256: string;
+      };
+      expect(row).toEqual(
+        expect.objectContaining({
+          level: "INFO",
+          target: "codex_core::worker",
+          file: "worker.rs",
+          line: 42,
+          thread_id: "019lossless-codex-thread",
+        }),
+      );
+      expect(row.body_sha256).toMatch(/^[a-f0-9]{64}$/);
+      const leaked = db
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM codex_events
+           WHERE raw_payload_json LIKE '%SECRET LOG BODY SHOULD NOT BE STORED%'`,
+        )
+        .get() as { count: number };
+      expect(leaked.count).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
   it("creates a new source generation when rollout JSONL is truncated or rotated", async () => {
     const fixture = createCodexFixture();
     tempDirs.add(fixture.tempDir);
@@ -378,6 +633,18 @@ describe("Lossless Codex full memory plugin", () => {
     );
     expect(search.structuredContent?.count).toBe(1);
     expect(JSON.stringify(search.structuredContent)).toContain("src/lossless-codex/example.ts");
+    const fileRef = (
+      search.structuredContent?.results as Array<{ ref: string }> | undefined
+    )?.[0]?.ref;
+    expect(fileRef).toMatch(/^lossless-codex:\/\/file\//);
+
+    const phraseSearch = await plugin.callTool(
+      "lossless_codex_search",
+      { query: "Lossless Codex", limit: 5 },
+      { dbPath: fixture.sidecarDbPath },
+    );
+    expect(Number(phraseSearch.structuredContent?.count)).toBeGreaterThan(0);
+    expect(JSON.stringify(phraseSearch.structuredContent)).toContain("src/lossless-codex/example.ts");
 
     const worklog = await plugin.callTool(
       "lossless_codex_worklog",
@@ -400,6 +667,42 @@ describe("Lossless Codex full memory plugin", () => {
     );
     expect(describe.structuredContent?.type).toBe("thread");
     expect(JSON.stringify(describe.structuredContent)).toContain("sidecarRefs");
+
+    const describeFile = await plugin.callTool(
+      "lossless_codex_describe",
+      { id: fileRef },
+      { dbPath: fixture.sidecarDbPath },
+    );
+    expect(describeFile.structuredContent?.type).toBe("file");
+    expect(JSON.stringify(describeFile.structuredContent)).toContain("src/lossless-codex/example.ts");
+  });
+
+  it("builds project-day rollups in the configured local timezone", async () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+      env: { LOSSLESS_CODEX_TIMEZONE: "Asia/Bangkok" },
+    });
+
+    const recentUtcDate = await plugin.callTool(
+      "lossless_codex_recent",
+      { projectKey: "lossless-claw", period: "2026-05-03" },
+      { dbPath: fixture.sidecarDbPath },
+    );
+    expect(recentUtcDate.structuredContent?.count).toBe(0);
+
+    const recentLocalDate = await plugin.callTool(
+      "lossless_codex_recent",
+      { projectKey: "lossless-claw", period: "2026-05-04" },
+      { dbPath: fixture.sidecarDbPath },
+    );
+    expect(recentLocalDate.structuredContent?.count).toBe(1);
+    expect(JSON.stringify(recentLocalDate.structuredContent)).toContain('"timezone":"Asia/Bangkok"');
   });
 
   it("writes compact temporal enrichment rows to LCM only when explicitly enabled", async () => {
@@ -520,5 +823,44 @@ describe("Lossless Codex full memory plugin", () => {
     expect(messages.map((message) => message.id)).toEqual([1, 2]);
     expect(JSON.stringify(messages[0])).toContain("lossless_codex_worklog");
     expect(JSON.stringify(messages[1])).toContain("src/lossless-codex/example.ts");
+  });
+
+  it("runs the production rehearsal CLI against copied fixtures", () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const result = spawnSync(
+      process.execPath,
+      [
+        rehearsalScriptPath,
+        "--source-dir",
+        fixture.sourceDir,
+        "--state-db",
+        fixture.stateDbPath,
+        "--sidecar-db",
+        fixture.sidecarDbPath,
+        "--query",
+        "example",
+        "--json",
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+      },
+    );
+
+    expect(result.status).toBe(0);
+    const payload = JSON.parse(result.stdout) as {
+      imports: Array<{ importedThreads: number; importedEvents: number }>;
+      tools: Record<string, { ok: boolean; count?: number }>;
+      integrity: { rawPatchInputRows: number };
+    };
+    expect(payload.imports[0]).toEqual(expect.objectContaining({ importedThreads: 1, importedEvents: 5 }));
+    expect(payload.imports[1]).toEqual(expect.objectContaining({ importedThreads: 0, importedEvents: 0 }));
+    expect(payload.tools.lossless_codex_status.ok).toBe(true);
+    expect(payload.tools.lossless_codex_search.count).toBe(1);
+    expect(payload.tools.lossless_codex_recent.ok).toBe(true);
+    expect(payload.tools.lossless_codex_describe.ok).toBe(true);
+    expect(payload.tools.lossless_codex_worklog.ok).toBe(true);
+    expect(payload.integrity.rawPatchInputRows).toBe(0);
   });
 });
