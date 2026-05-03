@@ -1062,6 +1062,30 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("clamps weeklyMaxTokens >= dailyMaxTokens and monthlyMaxTokens >= weeklyMaxTokens (P2-3)", () => {
+    const { rollupStore } = createStores();
+    // Pathological config: dailyMaxTokens > default weekly/monthly. Pre-fix
+    // the constructor accepted this, leaving weeklyMaxTokens < dailyMaxTokens
+    // — the aggregate trim path's `length > 1` exit then silently produced
+    // a weekly that exceeded its declared cap (single oversized day case).
+    const builder = new RollupBuilder(rollupStore, {
+      timezone: "UTC",
+      dailyMaxTokens: 200_000,
+    });
+    type Mut = {
+      dailyMaxTokens: number;
+      weeklyMaxTokens: number;
+      monthlyMaxTokens: number;
+    };
+    const introspect = builder as unknown as Mut;
+    expect(introspect.weeklyMaxTokens).toBeGreaterThanOrEqual(
+      introspect.dailyMaxTokens
+    );
+    expect(introspect.monthlyMaxTokens).toBeGreaterThanOrEqual(
+      introspect.weeklyMaxTokens
+    );
+  });
+
   it("returns deterministic order from listConversationsBySessionKey when created_at ties (P1-9)", async () => {
     const { db, conversationStore } = createStores();
     const sessionKey = "agent:main:tiebreak-stability";

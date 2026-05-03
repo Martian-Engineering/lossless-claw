@@ -97,13 +97,17 @@ export class RollupBuilder {
       dailyTargetTokens,
       normalizePositiveInt(config.dailyMaxTokens, DEFAULT_DAILY_MAX_TOKENS)
     );
-    this.weeklyMaxTokens = normalizePositiveInt(
-      config.weeklyMaxTokens,
-      DEFAULT_WEEKLY_MAX_TOKENS
+    // Aggregates embed dailies, so the weekly cap MUST be at least as large
+    // as the daily cap or a single oversized day will fail to fit. Same for
+    // monthly vs weekly. Pre-fix the trim path's `length > 1` exit silently
+    // produced a weekly that exceeded its declared cap.
+    this.weeklyMaxTokens = Math.max(
+      this.dailyMaxTokens,
+      normalizePositiveInt(config.weeklyMaxTokens, DEFAULT_WEEKLY_MAX_TOKENS)
     );
-    this.monthlyMaxTokens = normalizePositiveInt(
-      config.monthlyMaxTokens,
-      DEFAULT_MONTHLY_MAX_TOKENS
+    this.monthlyMaxTokens = Math.max(
+      this.weeklyMaxTokens,
+      normalizePositiveInt(config.monthlyMaxTokens, DEFAULT_MONTHLY_MAX_TOKENS)
     );
   }
 
