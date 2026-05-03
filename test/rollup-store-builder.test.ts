@@ -335,9 +335,9 @@ import {
 import { createLcmRollupDebugTool } from "../src/tools/lcm-rollup-debug-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
-function makeRecentDeps(): LcmDependencies {
+function makeRecentDeps(overrides?: { clock?: { now: () => Date } }): LcmDependencies {
   return {
-    clock: { now: () => new Date() },
+    clock: overrides?.clock ?? { now: () => new Date() },
     config: {
       enabled: true,
       databasePath: ":memory:",
@@ -419,11 +419,11 @@ function makeLcmForConversation(input: {
 
 describe("LCM sub-day window retrieval", () => {
   it("parses deterministic local-time windows with DST-safe UTC bounds", () => {
-    const liveClock = { now: () => new Date() };
+    const liveNow = new Date();
     const dateWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-03-08 1:30-3:30",
       "America/New_York",
-      liveClock
+      liveNow
     );
     expect(dateWindow.label).toBe("2026-03-08 1:30-3:30");
     expect(dateWindow.window?.startMinutes).toBe(90);
@@ -434,7 +434,7 @@ describe("LCM sub-day window retrieval", () => {
     const namedWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 morning",
       "Asia/Bangkok",
-      liveClock
+      liveNow
     );
     expect(namedWindow.label).toBe("2026-04-27 morning");
     expect(namedWindow.start.toISOString()).toBe("2026-04-26T23:00:00.000Z");
@@ -443,7 +443,7 @@ describe("LCM sub-day window retrieval", () => {
     const meridiemWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 4-8pm",
       "Asia/Bangkok",
-      liveClock
+      liveNow
     );
     expect(meridiemWindow.window?.startMinutes).toBe(16 * 60);
     expect(meridiemWindow.window?.endMinutes).toBe(20 * 60);
@@ -452,14 +452,14 @@ describe("LCM sub-day window retrieval", () => {
       __lcmRecentTestInternals.resolvePeriod(
         "date:2026-03-08 2:30-3:30",
         "America/New_York",
-        liveClock
+        liveNow
       )
     ).toThrow(/Nonexistent local time/);
 
     const nightWindow = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-27 night",
       "Pacific/Auckland",
-      liveClock
+      liveNow
     );
     expect(nightWindow.start.toISOString()).toBe("2026-04-27T10:00:00.000Z");
     expect(nightWindow.end.toISOString()).toBe("2026-04-27T12:00:00.000Z");
@@ -467,7 +467,7 @@ describe("LCM sub-day window retrieval", () => {
     const midnightTransition = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-03-28",
       "Asia/Gaza",
-      liveClock
+      liveNow
     );
     expect(midnightTransition.start.toISOString()).toBe(
       "2026-03-27T22:00:00.000Z"
@@ -476,7 +476,7 @@ describe("LCM sub-day window retrieval", () => {
     const skippedMidnight = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-24",
       "Africa/Cairo",
-      liveClock
+      liveNow
     );
     expect(skippedMidnight.start.toISOString()).toBe(
       "2026-04-23T22:00:00.000Z"
@@ -485,7 +485,7 @@ describe("LCM sub-day window retrieval", () => {
     const skippedMidnightNight = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-23 night",
       "Africa/Cairo",
-      liveClock
+      liveNow
     );
     expect(skippedMidnightNight.start.toISOString()).toBe(
       "2026-04-23T20:00:00.000Z"
@@ -497,7 +497,7 @@ describe("LCM sub-day window retrieval", () => {
     const explicitEndOfDay = __lcmRecentTestInternals.resolvePeriod(
       "date:2026-04-23 22:00-24:00",
       "Africa/Cairo",
-      liveClock
+      liveNow
     );
     expect(explicitEndOfDay.window?.endMinutes).toBe(24 * 60);
     expect(explicitEndOfDay.start.toISOString()).toBe(
@@ -2518,12 +2518,12 @@ describe("LCM weekly and monthly rollups", () => {
   });
 
   it("rejects invalid plain dates", async () => {
-    const liveClock = { now: () => new Date() };
+    const liveNow = new Date();
     expect(() =>
-      __lcmRecentTestInternals.resolvePeriod("date:2026-02-30", "UTC", liveClock)
+      __lcmRecentTestInternals.resolvePeriod("date:2026-02-30", "UTC", liveNow)
     ).toThrow(/real calendar date/i);
     expect(() =>
-      __lcmRecentTestInternals.resolvePeriod("date:2026-13-01", "UTC", liveClock)
+      __lcmRecentTestInternals.resolvePeriod("date:2026-13-01", "UTC", liveNow)
     ).toThrow(/real calendar date/i);
   });
 
@@ -2604,11 +2604,11 @@ describe("LCM weekly and monthly rollups", () => {
     expect(text).toContain("sum_la_window");
   });
 
-  it("anchors 'today' off the injected clock — B3 regression", () => {
-    // Frozen clock independent of wall time. resolvePeriod("today") must
+  it("anchors 'today' off the injected now — B3 regression", () => {
+    // Frozen now independent of wall time. resolvePeriod("today") must
     // produce the day key for 2026-04-15 in UTC, regardless of the real
-    // wall clock when the test runs. Pins the Clock-injection contract.
-    const frozen = { now: () => new Date("2026-04-15T12:00:00Z") };
+    // wall clock when the test runs. Pins the now-injection contract.
+    const frozen = new Date("2026-04-15T12:00:00Z");
     const today = __lcmRecentTestInternals.resolvePeriod("today", "UTC", frozen);
     expect(today.periodKey).toBe("2026-04-15");
     expect(today.start.toISOString()).toBe("2026-04-15T00:00:00.000Z");
@@ -2618,6 +2618,76 @@ describe("LCM weekly and monthly rollups", () => {
     const window = __lcmRecentTestInternals.resolvePeriod("last 1h", "UTC", frozen);
     expect(window.end.toISOString()).toBe("2026-04-15T12:00:00.000Z");
     expect(window.start.toISOString()).toBe("2026-04-15T11:00:00.000Z");
+  });
+
+  it("captures clock.now() exactly once per lcm_recent call (RD-FIX-4 regression)", async () => {
+    // Two read sites observe "now" within one execute(): resolvePeriod
+    // (for "today") and the currentDayKey check. A clock that advances
+    // across the local-day boundary between the two calls must NOT cause
+    // them to disagree — execute() must capture clock.now() once at entry
+    // and thread the captured Date through both sites.
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "rd-fix-4-day-boundary",
+      sessionKey: "agent:main:rd-fix-4-day-boundary",
+      title: "RD-FIX-4 day boundary",
+    });
+
+    // Seed a leaf summary on day 2026-04-15 so a fallback path exists for
+    // the "today" rollup-state miss. This ensures execute() reaches both
+    // read sites (resolvePeriod + currentDayKey gate).
+    await summaryStore.insertSummary({
+      summaryId: "sum_rd_fix_4",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Activity recorded on 2026-04-15.",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-15T18:00:00.000Z"),
+      latestAt: new Date("2026-04-15T18:30:00.000Z"),
+    });
+
+    // Stepper clock: first call returns 2026-04-15 23:59:59.500Z (still
+    // 2026-04-15 in UTC), second call returns 2026-04-16 00:00:00.500Z
+    // (crossed into 2026-04-16). Without the fix, resolvePeriod sees
+    // 2026-04-15 and currentDayKey sees 2026-04-16 — inconsistent.
+    let callIndex = 0;
+    const stepper = {
+      now: () => {
+        callIndex += 1;
+        return callIndex === 1
+          ? new Date("2026-04-15T23:59:59.500Z")
+          : new Date("2026-04-16T00:00:00.500Z");
+      },
+    };
+
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps({ clock: stepper }),
+      lcm: makeLcmForConversation({
+        conversationId: conversation.conversationId,
+        rollupStore,
+        sessionId: "rd-fix-4-day-boundary",
+        timezone: "UTC",
+      }) as never,
+      sessionId: "rd-fix-4-day-boundary",
+    });
+
+    const result = await tool.execute("call-rd-fix-4", {
+      period: "today",
+      includeSources: true,
+    });
+    const text = (result.content[0] as { text: string }).text;
+
+    // The "today" period must anchor at the captured callTime
+    // (2026-04-15 from the FIRST clock observation). Our seed at
+    // 2026-04-15T18:00 falls inside that day. With the bug, the two
+    // observations could disagree — the first day-key wins for the
+    // period, but the currentDayKey gate could read 2026-04-16.
+    // Net-effect of the fix: clock.now() is read exactly once, so the
+    // tool only consumes ONE step of the stepper.
+    expect(callIndex).toBe(1);
+    expect(text).toContain("2026-04-15");
   });
 
   it("builds week and month aggregates whose boundaries skip local midnight", async () => {

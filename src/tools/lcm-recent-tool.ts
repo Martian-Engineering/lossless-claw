@@ -11,7 +11,7 @@ import {
   getUtcDateForZonedMidnight,
   getZonedDayString,
 } from "../timezone-windows.js";
-import type { Clock, LcmDependencies } from "../types.js";
+import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
@@ -409,7 +409,7 @@ function resolveWindowPeriod(
   normalized: string,
   timezone: string,
   today: string,
-  clock: Clock
+  now: Date
 ): PeriodResolution | null {
   const relative =
     /^last\s+(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)$/.exec(
@@ -422,7 +422,7 @@ function resolveWindowPeriod(
     if (!Number.isFinite(minutes) || minutes <= 0) {
       return null;
     }
-    const end = clock.now();
+    const end = now;
     const start = new Date(end.getTime() - minutes * 60_000);
     return {
       label: `last ${amount}${unit.startsWith("h") ? "h" : "m"}`,
@@ -478,11 +478,10 @@ function resolveWindowPeriod(
   };
 }
 
-function resolvePeriod(period: string, timezone: string, clock: Clock): PeriodResolution {
+function resolvePeriod(period: string, timezone: string, now: Date): PeriodResolution {
   const normalized = period.trim().toLowerCase().replace(/\s+/g, " ");
-  const now = clock.now();
   const today = getZonedDayString(now, timezone);
-  const windowPeriod = resolveWindowPeriod(normalized, timezone, today, clock);
+  const windowPeriod = resolveWindowPeriod(normalized, timezone, today, now);
   if (windowPeriod) {
     return windowPeriod;
   }
@@ -1327,6 +1326,13 @@ export function createLcmRecentTool(input: {
         throw new Error("LCM engine is unavailable.");
       }
 
+      // Capture wall-clock once at entry: every "now" observation in this
+      // call uses the same Date instance. Otherwise resolvePeriod and the
+      // currentDayKey check below would each call deps.clock.now() separately
+      // and a request straddling local midnight could see two different days
+      // (RD-FIX-4).
+      const callTime = input.deps.clock.now();
+
       const p = params as Record<string, unknown>;
       const includeSources = p.includeSources === true;
       const mode: "summary" | "index" = p.mode === "index" ? "index" : "summary";
@@ -1385,7 +1391,7 @@ export function createLcmRecentTool(input: {
 
       let resolution: PeriodResolution;
       try {
-        resolution = resolvePeriod(String(p.period ?? ""), timezone, input.deps.clock);
+        resolution = resolvePeriod(String(p.period ?? ""), timezone, callTime);
       } catch (error) {
         return jsonResult({
           error: error instanceof Error ? error.message : "Invalid period.",
@@ -1473,7 +1479,7 @@ export function createLcmRecentTool(input: {
       let degradedReason: string | undefined;
       let lastBuiltAt: Date | null = null;
 
-      const currentDayKey = getZonedDayString(input.deps.clock.now(), timezone);
+      const currentDayKey = getZonedDayString(callTime, timezone);
       const rollupState = rollupStore.getState(conversationId);
       const lastPendingMessageAt =
         rollupState?.pending_rebuild === 1 && rollupState.last_message_at
