@@ -1705,9 +1705,8 @@ export class LcmContextEngine implements ContextEngine {
    * state wins over the engine default.
    */
   get timezone(): string {
-    return this.config.timezone && this.config.timezone.length > 0
-      ? this.config.timezone
-      : "UTC";
+    const tz = this.config.timezone?.trim();
+    return tz && tz.length > 0 ? tz : "UTC";
   }
 
   private conversationStore: ConversationStore;
@@ -1757,7 +1756,7 @@ export class LcmContextEngine implements ContextEngine {
     // falls back to Intl.DateTimeFormat().resolvedOptions().timeZone — read
     // paths must be reproducible across machines, so we force 'UTC' when
     // unset and yell about it once instead of silently using the host TZ.
-    if (!this.config.timezone || this.config.timezone.length === 0) {
+    if (!this.config.timezone?.trim()) {
       this.deps.log.warn(
         "[lcm] config.timezone is unset; defaulting to 'UTC'. " +
           "Set plugin config 'timezone' or LCM_TIMEZONE to silence this warning.",

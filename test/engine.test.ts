@@ -2505,6 +2505,39 @@ describe("LcmContextEngine.ingest content extraction", () => {
     expect(tzWarnings.length).toBe(0);
   });
 
+  it("timezone getter treats whitespace-only config.timezone as unset (RD-FIX-1 regression)", () => {
+    // A whitespace-only timezone string (e.g. accidentally-quoted env var like
+    // LCM_TIMEZONE='   ') previously bypassed BOTH the strict-UTC fallback and
+    // the construction-time warning, leaving Intl.DateTimeFormat to throw
+    // RangeError on the first rollup-maintenance pass.
+    const warnSpy = vi.fn();
+    const engine = createEngineWithDeps(
+      { timezone: "   " },
+      {
+        log: {
+          info: vi.fn(),
+          warn: warnSpy,
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+
+    // (a) Construction-time warning fires exactly once for whitespace.
+    const tzWarnings = warnSpy.mock.calls.filter((args) =>
+      typeof args[0] === "string" && args[0].includes("config.timezone is unset"),
+    );
+    expect(tzWarnings.length).toBe(1);
+
+    // (b) Getter returns 'UTC', not the whitespace verbatim.
+    expect(engine.timezone).toBe("UTC");
+
+    // (c) Downstream Intl.DateTimeFormat does not throw with the resolved tz.
+    expect(() =>
+      new Intl.DateTimeFormat("en-CA", { timeZone: engine.timezone }),
+    ).not.toThrow();
+  });
+
   it("maintain() uses deps.clock.now() to compute rollup-maintenance daysBack — B4 regression", async () => {
     // Inject a frozen clock at engine construction. computeRollupMaintenanceDaysBack
     // must use it, not wall time. Without vi.setSystemTime — proves the
