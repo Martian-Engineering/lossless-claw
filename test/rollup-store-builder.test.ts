@@ -1716,30 +1716,42 @@ describe("LCM sub-day window retrieval", () => {
         title: "Index budget overflow",
       });
 
-      // Stored rollup for yesterday (long-ish content via several leaves).
-      // The rollup body itself includes the leaf bullets, so each leaf
-      // contributes characters into the eventual index digest.
-      for (let i = 0; i < 6; i += 1) {
-        await summaryStore.insertSummary({
-          summaryId: `sum_yest_${i}`,
-          conversationId: conversation.conversationId,
-          kind: "leaf",
-          depth: 0,
-          content:
-            `Yesterday-leaf-${i} ` + "L".repeat(220),
-          tokenCount: 80,
-          sourceMessageTokenCount: 80,
-          earliestAt: new Date(`2026-04-26T1${i}:00:00.000Z`),
-          latestAt: new Date(`2026-04-26T1${i}:30:00.000Z`),
-        });
-      }
+      // Stored rollups across SIX prior days. We need enough indexed.content
+      // bulk that the combined output (indexed.content + live-fallback
+      // digest sections) genuinely overflows the 500-token budget — i.e.
+      // the post-fix re-truncation path at lcm-recent-tool.ts:1944 actually
+      // FIRES, rather than the test silently passing because the content
+      // happens to fit. Each stored day digest contributes ~one block to
+      // indexed.content; the live-fallback day adds another.
       const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
-      await builder.buildDayRollup(conversation.conversationId, "2026-04-26");
+      for (let day = 21; day <= 26; day += 1) {
+        for (let i = 0; i < 6; i += 1) {
+          await summaryStore.insertSummary({
+            summaryId: `sum_d${day}_${i}`,
+            conversationId: conversation.conversationId,
+            kind: "leaf",
+            depth: 0,
+            content: `Day-${day}-leaf-${i} ` + "L".repeat(220),
+            tokenCount: 80,
+            sourceMessageTokenCount: 80,
+            earliestAt: new Date(`2026-04-${day}T1${i}:00:00.000Z`),
+            latestAt: new Date(`2026-04-${day}T1${i}:30:00.000Z`),
+          });
+        }
+        await builder.buildDayRollup(
+          conversation.conversationId,
+          `2026-04-${day}`,
+        );
+      }
 
-      // Today: leaves that the live-fallback path will splice in AFTER the
-      // already-truncated `indexed.content`. Pre-fix this could push the
-      // total over `effectiveOutputTokens` because the live entries were
-      // appended without re-truncation.
+      // Today: live-fallback leaves the index path will splice in AFTER the
+      // already-truncated `indexed.content`. Pre-fix this pushed the total
+      // over `effectiveOutputTokens` because the live entries were appended
+      // without re-truncation; the outer enforceResponseBudget then clamped
+      // the WHOLE response (header + structure + sources line + hint),
+      // stripping trailing structural lines like the `*Sources: ...*`
+      // footer. Post-fix the inner re-truncation cuts only combinedContent
+      // before outer wrapping is added, so the structure survives.
       for (let i = 0; i < 4; i += 1) {
         await summaryStore.insertSummary({
           summaryId: `sum_today_${i}`,
@@ -1783,13 +1795,55 @@ describe("LCM sub-day window retrieval", () => {
         globalMaxOutputTokens: 500,
         includeSources: true,
       });
+      const text = (result.content[0] as { text: string }).text;
       const details = result.details as {
         tokenCount: number;
         truncated?: boolean;
       };
-      // The whole response must respect the 500-token budget; pre-fix the
-      // appended live-digest sections could push the total above the cap.
+
+      // (1) Budget honored. Pre-fix the outer enforceResponseBudget would
+      //     also clamp this — so this assertion alone was tautological
+      //     (R3-H ⚠ flagged this).
       expect(details.tokenCount).toBeLessThanOrEqual(500);
+
+      // (2) The structural assembly survives the truncation pipeline.
+      //     The inner re-truncation cuts combinedContent (rollup body)
+      //     to fit `effectiveOutputTokens` BEFORE outer wrappers are
+      //     added. We discriminate from a degenerate pipeline where the
+      //     inner combined-assembly was skipped entirely (no header, no
+      //     live-fallback section) by asserting both elements are still
+      //     present in the body of the response.
+      const indexHeader = text.match(/### Rollup index \((\d+) periods?\)/);
+      expect(indexHeader).not.toBeNull();
+      // R2-FIX-3 invariant: header period count matches the number of
+      // emitted `####` entries. Re-asserted here so a future refactor
+      // that broke either fix would surface in this test rather than
+      // only the R2-FIX-3 test.
+      const claimedCount = Number(indexHeader?.[1] ?? "0");
+      const entryCount = (text.match(/^#### /gm) ?? []).length;
+      expect(claimedCount).toBeGreaterThan(0);
+      expect(claimedCount).toBe(entryCount);
+
+      // (3) The live-fallback section header for today is present —
+      //     proves the index-mode + live-fallback combined-content path
+      //     was actually exercised (rather than e.g. silently falling
+      //     through to a different rendering). Pre-R2-FIX-2 the
+      //     truncation could still emit this header; the value of this
+      //     assertion is that a refactor which accidentally re-routed
+      //     index-mode to a path that drops the live-fallback header
+      //     entirely would now fail the test.
+      expect(text).toContain("(live fallback)");
+
+      // (4) The truncated flag survived. With six prior-day digests +
+      //     a live-fallback today, combinedContent overflows 500 tokens
+      //     and SOMETHING in the truncation pipeline must have flipped
+      //     `truncated`. Whether the inner re-truncation (R2-FIX-2) or
+      //     the outer enforceResponseBudget set it is implementation
+      //     detail; what matters externally is that the caller sees an
+      //     accurate truncation signal. (The R2-H finding was that the
+      //     pre-R2-FIX-2 path could under-report `truncated` when the
+      //     outer happened to not fire — see audit/pr516/round2-B-*.md.)
+      expect(details.truncated).toBe(true);
     } finally {
       vi.useRealTimers();
     }
