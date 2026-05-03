@@ -58,6 +58,187 @@ const VERSIONED_BACKFILL_STEPS = {
 
 type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
 
+/**
+ * Initial schema statements — exec'd one at a time inside the BEGIN EXCLUSIVE
+ * wrapper in `runLcmMigrations` so a SQL error throws instead of silently
+ * aborting a multi-statement bulk block. See PR #482 / issue #569.
+ */
+const LCM_INITIAL_SCHEMA_STATEMENTS: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    session_key TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    archived_at TEXT,
+    title TEXT,
+    bootstrapped_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS messages (
+    message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+    content TEXT NOT NULL,
+    token_count INTEGER NOT NULL,
+    identity_hash TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (conversation_id, seq)
+  )`,
+  `CREATE TABLE IF NOT EXISTS summaries (
+    summary_id TEXT PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
+    depth INTEGER NOT NULL DEFAULT 0,
+    content TEXT NOT NULL,
+    token_count INTEGER NOT NULL,
+    earliest_at TEXT,
+    latest_at TEXT,
+    descendant_count INTEGER NOT NULL DEFAULT 0,
+    descendant_token_count INTEGER NOT NULL DEFAULT 0,
+    source_message_token_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    file_ids TEXT NOT NULL DEFAULT '[]'
+  )`,
+  `CREATE TABLE IF NOT EXISTS message_parts (
+    part_id TEXT PRIMARY KEY,
+    message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    part_type TEXT NOT NULL CHECK (part_type IN (
+      'text', 'reasoning', 'tool', 'patch', 'file',
+      'subtask', 'compaction', 'step_start', 'step_finish',
+      'snapshot', 'agent', 'retry'
+    )),
+    ordinal INTEGER NOT NULL,
+    text_content TEXT,
+    is_ignored INTEGER,
+    is_synthetic INTEGER,
+    tool_call_id TEXT,
+    tool_name TEXT,
+    tool_status TEXT,
+    tool_input TEXT,
+    tool_output TEXT,
+    tool_error TEXT,
+    tool_title TEXT,
+    patch_hash TEXT,
+    patch_files TEXT,
+    file_mime TEXT,
+    file_name TEXT,
+    file_url TEXT,
+    subtask_prompt TEXT,
+    subtask_desc TEXT,
+    subtask_agent TEXT,
+    step_reason TEXT,
+    step_cost REAL,
+    step_tokens_in INTEGER,
+    step_tokens_out INTEGER,
+    snapshot_hash TEXT,
+    compaction_auto INTEGER,
+    metadata TEXT,
+    UNIQUE (message_id, ordinal)
+  )`,
+  `CREATE TABLE IF NOT EXISTS summary_messages (
+    summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (summary_id, message_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS summary_parents (
+    summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+    parent_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (summary_id, parent_summary_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS context_items (
+    conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary')),
+    message_id INTEGER REFERENCES messages(message_id) ON DELETE RESTRICT,
+    summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (conversation_id, ordinal),
+    CHECK (
+      (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL) OR
+      (item_type = 'summary' AND summary_id IS NOT NULL AND message_id IS NULL)
+    )
+  )`,
+  `CREATE TABLE IF NOT EXISTS large_files (
+    file_id TEXT PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    file_name TEXT,
+    mime_type TEXT,
+    byte_size INTEGER,
+    storage_uri TEXT NOT NULL,
+    exploration_summary TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS conversation_bootstrap_state (
+    conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    session_file_path TEXT NOT NULL,
+    last_seen_size INTEGER NOT NULL,
+    last_seen_mtime_ms INTEGER NOT NULL,
+    last_processed_offset INTEGER NOT NULL,
+    last_processed_entry_hash TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS conversation_compaction_telemetry (
+    conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    last_observed_cache_read INTEGER,
+    last_observed_cache_write INTEGER,
+    last_observed_prompt_token_count INTEGER,
+    last_observed_cache_hit_at TEXT,
+    last_observed_cache_break_at TEXT,
+    cache_state TEXT NOT NULL DEFAULT 'unknown'
+      CHECK (cache_state IN ('hot', 'cold', 'unknown')),
+    consecutive_cold_observations INTEGER NOT NULL DEFAULT 0,
+    retention TEXT,
+    last_leaf_compaction_at TEXT,
+    turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
+    tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
+    last_activity_band TEXT NOT NULL DEFAULT 'low'
+      CHECK (last_activity_band IN ('low', 'medium', 'high')),
+    last_api_call_at TEXT,
+    last_cache_touch_at TEXT,
+    provider TEXT,
+    model TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS conversation_compaction_maintenance (
+    conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    pending INTEGER NOT NULL DEFAULT 0,
+    requested_at TEXT,
+    reason TEXT,
+    running INTEGER NOT NULL DEFAULT 0,
+    last_started_at TEXT,
+    last_finished_at TEXT,
+    last_failure_summary TEXT,
+    token_budget INTEGER,
+    current_token_count INTEGER,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS lcm_migration_state (
+    step_name TEXT NOT NULL,
+    algorithm_version INTEGER NOT NULL,
+    completed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (step_name, algorithm_version)
+  )`,
+  // Indexes — each created individually so a single index failure can't take
+  // out the rest.
+  `CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq)`,
+  `CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id)`,
+  `CREATE INDEX IF NOT EXISTS summary_parents_parent_summary_idx ON summary_parents (parent_summary_id)`,
+  `CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts (message_id)`,
+  `CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type)`,
+  `CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal)`,
+  `CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
+    ON conversation_bootstrap_state (session_file_path, updated_at)`,
+  `CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
+    ON conversation_compaction_telemetry (cache_state, updated_at)`,
+];
+
 function ensureSummaryDepthColumn(db: DatabaseSync): void {
   const summaryColumns = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
   const hasDepth = summaryColumns.some((col) => col.name === "depth");
@@ -812,195 +993,16 @@ export function runLcmMigrations(
   transactionActive = true;
 
   try {
-    db.exec(`
-    CREATE TABLE IF NOT EXISTS conversations (
-      conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL,
-      session_key TEXT,
-      active INTEGER NOT NULL DEFAULT 1,
-      archived_at TEXT,
-      title TEXT,
-      bootstrapped_at TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS messages (
-      message_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-      seq INTEGER NOT NULL,
-      role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
-      content TEXT NOT NULL,
-      token_count INTEGER NOT NULL,
-      identity_hash TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE (conversation_id, seq)
-    );
-
-    CREATE TABLE IF NOT EXISTS summaries (
-      summary_id TEXT PRIMARY KEY,
-      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-      kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
-      depth INTEGER NOT NULL DEFAULT 0,
-      content TEXT NOT NULL,
-      token_count INTEGER NOT NULL,
-      earliest_at TEXT,
-      latest_at TEXT,
-      descendant_count INTEGER NOT NULL DEFAULT 0,
-      descendant_token_count INTEGER NOT NULL DEFAULT 0,
-      source_message_token_count INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      file_ids TEXT NOT NULL DEFAULT '[]'
-    );
-
-    CREATE TABLE IF NOT EXISTS message_parts (
-      part_id TEXT PRIMARY KEY,
-      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
-      session_id TEXT NOT NULL,
-      part_type TEXT NOT NULL CHECK (part_type IN (
-        'text', 'reasoning', 'tool', 'patch', 'file',
-        'subtask', 'compaction', 'step_start', 'step_finish',
-        'snapshot', 'agent', 'retry'
-      )),
-      ordinal INTEGER NOT NULL,
-      text_content TEXT,
-      is_ignored INTEGER,
-      is_synthetic INTEGER,
-      tool_call_id TEXT,
-      tool_name TEXT,
-      tool_status TEXT,
-      tool_input TEXT,
-      tool_output TEXT,
-      tool_error TEXT,
-      tool_title TEXT,
-      patch_hash TEXT,
-      patch_files TEXT,
-      file_mime TEXT,
-      file_name TEXT,
-      file_url TEXT,
-      subtask_prompt TEXT,
-      subtask_desc TEXT,
-      subtask_agent TEXT,
-      step_reason TEXT,
-      step_cost REAL,
-      step_tokens_in INTEGER,
-      step_tokens_out INTEGER,
-      snapshot_hash TEXT,
-      compaction_auto INTEGER,
-      metadata TEXT,
-      UNIQUE (message_id, ordinal)
-    );
-
-    CREATE TABLE IF NOT EXISTS summary_messages (
-      summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
-      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE RESTRICT,
-      ordinal INTEGER NOT NULL,
-      PRIMARY KEY (summary_id, message_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS summary_parents (
-      summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
-      parent_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE RESTRICT,
-      ordinal INTEGER NOT NULL,
-      PRIMARY KEY (summary_id, parent_summary_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS context_items (
-      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-      ordinal INTEGER NOT NULL,
-      item_type TEXT NOT NULL CHECK (item_type IN ('message', 'summary')),
-      message_id INTEGER REFERENCES messages(message_id) ON DELETE RESTRICT,
-      summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      PRIMARY KEY (conversation_id, ordinal),
-      CHECK (
-        (item_type = 'message' AND message_id IS NOT NULL AND summary_id IS NULL) OR
-        (item_type = 'summary' AND summary_id IS NOT NULL AND message_id IS NULL)
-      )
-    );
-
-    CREATE TABLE IF NOT EXISTS large_files (
-      file_id TEXT PRIMARY KEY,
-      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-      file_name TEXT,
-      mime_type TEXT,
-      byte_size INTEGER,
-      storage_uri TEXT NOT NULL,
-      exploration_summary TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS conversation_bootstrap_state (
-      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-      session_file_path TEXT NOT NULL,
-      last_seen_size INTEGER NOT NULL,
-      last_seen_mtime_ms INTEGER NOT NULL,
-      last_processed_offset INTEGER NOT NULL,
-      last_processed_entry_hash TEXT,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS conversation_compaction_telemetry (
-      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-      last_observed_cache_read INTEGER,
-      last_observed_cache_write INTEGER,
-      last_observed_prompt_token_count INTEGER,
-      last_observed_cache_hit_at TEXT,
-      last_observed_cache_break_at TEXT,
-      cache_state TEXT NOT NULL DEFAULT 'unknown'
-        CHECK (cache_state IN ('hot', 'cold', 'unknown')),
-      consecutive_cold_observations INTEGER NOT NULL DEFAULT 0,
-      retention TEXT,
-      last_leaf_compaction_at TEXT,
-      turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
-      tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
-      last_activity_band TEXT NOT NULL DEFAULT 'low'
-        CHECK (last_activity_band IN ('low', 'medium', 'high')),
-      last_api_call_at TEXT,
-      last_cache_touch_at TEXT,
-      provider TEXT,
-      model TEXT,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS conversation_compaction_maintenance (
-      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-      pending INTEGER NOT NULL DEFAULT 0,
-      requested_at TEXT,
-      reason TEXT,
-      running INTEGER NOT NULL DEFAULT 0,
-      last_started_at TEXT,
-      last_finished_at TEXT,
-      last_failure_summary TEXT,
-      token_budget INTEGER,
-      current_token_count INTEGER,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS lcm_migration_state (
-      step_name TEXT NOT NULL,
-      algorithm_version INTEGER NOT NULL,
-      completed_at TEXT NOT NULL DEFAULT (datetime('now')),
-      PRIMARY KEY (step_name, algorithm_version)
-    );
-
-    -- Indexes
-    CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
-    CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
-    CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
-    CREATE INDEX IF NOT EXISTS summary_parents_parent_summary_idx ON summary_parents (parent_summary_id);
-    CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts (message_id);
-    CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type);
-    CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal);
-    CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
-    CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
-      ON conversation_bootstrap_state (session_file_path, updated_at);
-    CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
-      ON conversation_compaction_telemetry (cache_state, updated_at);
-
-    -- Speed up summary_messages lookups by message_id (PK is summary_id,message_id)
-    CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
-  `);
+    // Each schema statement is exec'd individually so a SQL error throws on
+    // its own. Node's db.exec() can silently abort partway through a
+    // multi-statement block when one statement fails, leaving subsequent
+    // tables/indexes unmade — see PR #482 (ensureMessagePartsTable belt-and-
+    // suspenders) and issue #569. Splitting the bulk exec addresses the root
+    // cause for every table and index in the initial schema. Each statement
+    // is still inside the BEGIN EXCLUSIVE wrapper above (cf. PR #455).
+    for (const statement of LCM_INITIAL_SCHEMA_STATEMENTS) {
+      db.exec(statement);
+    }
 
     // Forward-compatible conversations migration for existing DBs.
     const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
