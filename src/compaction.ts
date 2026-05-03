@@ -469,6 +469,10 @@ export class CompactionEngine {
     force?: boolean;
     hardTrigger?: boolean;
     summaryModel?: string;
+    /** Optional sweep target ratio (fraction of tokenBudget) — see compactFullSweep. */
+    targetRatio?: number;
+    /** Optional cap on combined leaf+condensed passes per dispatch. */
+    maxPasses?: number;
   }): Promise<CompactionResult> {
     return this.withContextCache(() => this.compactFullSweep(input));
   }
@@ -630,14 +634,48 @@ export class CompactionEngine {
     force?: boolean;
     hardTrigger?: boolean;
     summaryModel?: string;
+    /**
+     * Optional sweep target ratio (fraction of `tokenBudget`) — if provided,
+     * the sweep loop continues until `currentTokens <= targetRatio * tokenBudget`,
+     * decoupling the sweep stopping point from `contextThreshold`. When omitted,
+     * the legacy behavior applies (sweep exits at `contextThreshold`).
+     *
+     * The trigger condition is still evaluated against `contextThreshold` —
+     * `targetRatio` only affects when the loop STOPS, not whether it starts.
+     */
+    targetRatio?: number;
+    /**
+     * Optional cap on the number of leaf+condensed passes per dispatch. Used
+     * to implement pressure-tiered pass count: tier-1 caps at 2, tier-2 caps
+     * at 3, sweep mode (≥ sweepTriggerThreshold) leaves this unset for
+     * unlimited passes. When omitted, the loop's existing exit conditions
+     * (under target / no progress / no candidates) are the only stops.
+     */
+    maxPasses?: number;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
-    const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
+    // Trigger threshold (when sweep is allowed to RUN) — always uses contextThreshold.
+    const triggerThreshold = Math.floor(this.config.contextThreshold * tokenBudget);
+    // Target threshold (where sweep STOPS) — defaults to triggerThreshold for
+    // backward compatibility (no targetRatio supplied). Otherwise honors the
+    // configured ratio across the full [0, 1] range:
+    //   ratio = 0   → maximum sweep (loop's empty-candidate / no-progress
+    //                 bails are the only stopping conditions)
+    //   ratio = 1   → equivalent to triggerThreshold (legacy behavior)
+    //   ratio in (0, 1) → fraction of tokenBudget
+    // This matches the [0, 1] clamp that the config resolver applies.
+    const targetThreshold =
+      typeof input.targetRatio === "number"
+        && Number.isFinite(input.targetRatio)
+        && input.targetRatio >= 0
+        && input.targetRatio <= 1
+        ? Math.min(triggerThreshold, Math.floor(input.targetRatio * tokenBudget))
+        : triggerThreshold;
     const leafTrigger = await this.evaluateLeafTrigger(conversationId);
 
-    if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
+    if (!force && tokensBefore <= triggerThreshold && !leafTrigger.shouldCompact) {
       return {
         actionTaken: false,
         tokensBefore,
@@ -664,11 +702,23 @@ export class CompactionEngine {
     let previousTokens = tokensBefore;
     let hadAuthFailure = false;
 
+    // Pressure-tiered pass cap (pre-PR-558 behavior is unbounded). When
+    // `input.maxPasses` is supplied, the leaf+condensed phases combined will
+    // not exceed this many summary calls. Tier-1 callers pass 2, tier-2
+    // pass 3, sweep mode passes undefined (unlimited).
+    const passCap =
+      typeof input.maxPasses === "number"
+        && Number.isFinite(input.maxPasses)
+        && input.maxPasses >= 1
+        ? Math.floor(input.maxPasses)
+        : Infinity;
+    let passesUsed = 0;
+
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
     // Delta tracking: maintain a running token count instead of re-querying DB
     // after each pass. The arithmetic is exact: tokensAfter = tokensBefore - removed + added.
     let runningTokens = tokensBefore;
-    while (true) {
+    while (passesUsed < passCap) {
       const leafChunk = await this.selectOldestLeafChunk(conversationId);
       if (leafChunk.items.length === 0) {
         break;
@@ -686,6 +736,7 @@ export class CompactionEngine {
         hadAuthFailure = true;
         break;
       }
+      passesUsed++;
       const passTokensAfter = passTokensBefore - leafResult.removedTokens + leafResult.addedTokens;
       await this.persistCompactionEvents({
         conversationId,
@@ -702,7 +753,7 @@ export class CompactionEngine {
       previousSummaryContent = leafResult.content;
       runningTokens = passTokensAfter;
 
-      if (!force && passTokensAfter <= threshold) {
+      if (!force && passTokensAfter <= targetThreshold) {
         previousTokens = passTokensAfter;
         break;
       }
@@ -713,7 +764,10 @@ export class CompactionEngine {
     }
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.
-    while (force || previousTokens > threshold) {
+    // Uses the same targetThreshold so condensed passes also stop at the configured
+    // sweep depth rather than the trigger threshold. The pass cap (passesUsed
+    // counter) is shared with phase 1.
+    while ((force || previousTokens > targetThreshold) && passesUsed < passCap) {
       const candidate = await this.selectShallowestCondensationCandidate({
         conversationId,
         hardTrigger: hardTrigger === true,
@@ -734,6 +788,7 @@ export class CompactionEngine {
         hadAuthFailure = true;
         break;
       }
+      passesUsed++;
       const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
       await this.persistCompactionEvents({
         conversationId,
@@ -750,7 +805,7 @@ export class CompactionEngine {
       level = condenseResult.level;
       runningTokens = passTokensAfter;
 
-      if (!force && passTokensAfter <= threshold) {
+      if (!force && passTokensAfter <= targetThreshold) {
         previousTokens = passTokensAfter;
         break;
       }

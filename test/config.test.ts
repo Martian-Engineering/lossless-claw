@@ -25,7 +25,13 @@ describe("resolveLcmConfig", () => {
     expect(config.ignoreSessionPatterns).toEqual([]);
     expect(config.statelessSessionPatterns).toEqual([]);
     expect(config.skipStatelessSessions).toBe(true);
-    expect(config.contextThreshold).toBe(0.75);
+    expect(config.contextThreshold).toBe(0.60);
+    expect(config.sweepTargetThreshold).toBe(0.50);
+    expect(config.sweepTriggerThreshold).toBe(0.91);
+    expect(config.pressureTiers).toEqual([
+      { ratio: 0.70, maxPasses: 2 },
+      { ratio: 0.80, maxPasses: 3 },
+    ]);
     expect(config.freshTailCount).toBe(64);
     expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.promptAwareEviction).toBe(false);
@@ -281,7 +287,7 @@ describe("resolveLcmConfig", () => {
       newSessionRetainDepth: "nope",
       enabled: "maybe",
     });
-    expect(config.contextThreshold).toBe(0.75); // falls through to default
+    expect(config.contextThreshold).toBe(0.60); // falls through to default
     expect(config.freshTailCount).toBe(64); // falls through to default
     expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.promptAwareEviction).toBe(false); // falls through to default
