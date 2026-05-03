@@ -159,6 +159,15 @@ function toNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+/** Like toNumber but rejects 0 and negative values. Mirrors
+ *  parseFinitePositiveInt for the plugin-config path so manifest's
+ *  `minimum:1` invariant holds across BOTH config sources. */
+function toPositiveNumber(value: unknown): number | undefined {
+  const parsed = toNumber(value);
+  if (parsed === undefined || parsed < 1) return undefined;
+  return parsed;
+}
+
 /** Safely parse a finite integer from an environment string, or return undefined.
  *  Unlike raw parseInt(), this returns undefined for NaN so ?? fallback works. */
 function parseFiniteInt(value: string | undefined): number | undefined {
@@ -489,13 +498,13 @@ export function resolveLcmConfigWithDiagnostics(
           : toBool(pc.rollupDebugEnabled) ?? false,
       rollupDailyMaxTokens:
         parseFinitePositiveInt(env.LCM_ROLLUP_DAILY_MAX_TOKENS)
-          ?? toNumber(pc.rollupDailyMaxTokens) ?? 40000,
+          ?? toPositiveNumber(pc.rollupDailyMaxTokens) ?? 40000,
       rollupWeeklyMaxTokens:
         parseFinitePositiveInt(env.LCM_ROLLUP_WEEKLY_MAX_TOKENS)
-          ?? toNumber(pc.rollupWeeklyMaxTokens) ?? 140000,
+          ?? toPositiveNumber(pc.rollupWeeklyMaxTokens) ?? 140000,
       rollupMonthlyMaxTokens:
         parseFinitePositiveInt(env.LCM_ROLLUP_MONTHLY_MAX_TOKENS)
-          ?? toNumber(pc.rollupMonthlyMaxTokens) ?? 560000,
+          ?? toPositiveNumber(pc.rollupMonthlyMaxTokens) ?? 560000,
       proactiveThresholdCompactionMode,
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)

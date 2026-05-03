@@ -284,6 +284,31 @@ describe("resolveLcmConfig", () => {
     expect(positive.rollupMonthlyMaxTokens).toBe(3000);
   });
 
+  it("rejects 0 / negative plugin-config values for rollup token caps and falls back (R2-FIX-5)", () => {
+    // Mirror of P2-2 for the plugin-config path. Pre-fix the env path was
+    // clamped via parseFinitePositiveInt but plugin-config went through
+    // plain toNumber, so a manifest value of 0 / -5 still won over the
+    // default and silently violated `minimum:1`.
+    const config = resolveLcmConfig({} as NodeJS.ProcessEnv, {
+      rollupDailyMaxTokens: 0,
+      rollupWeeklyMaxTokens: -5,
+      rollupMonthlyMaxTokens: "0",
+    });
+    expect(config.rollupDailyMaxTokens).toBe(40000);
+    expect(config.rollupWeeklyMaxTokens).toBe(140000);
+    expect(config.rollupMonthlyMaxTokens).toBe(560000);
+
+    // Sanity: positive plugin-config values still win over the default.
+    const positive = resolveLcmConfig({} as NodeJS.ProcessEnv, {
+      rollupDailyMaxTokens: 1234,
+      rollupWeeklyMaxTokens: "2345",
+      rollupMonthlyMaxTokens: 3456,
+    });
+    expect(positive.rollupDailyMaxTokens).toBe(1234);
+    expect(positive.rollupWeeklyMaxTokens).toBe(2345);
+    expect(positive.rollupMonthlyMaxTokens).toBe(3456);
+  });
+
   it("handles string values in plugin config (from JSON)", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: "0.6",
