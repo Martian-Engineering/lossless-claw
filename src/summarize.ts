@@ -340,28 +340,35 @@ function looksLikeReasoningOnlySummary(value: string): boolean {
   const trimmed = value.trim();
   if (!trimmed) return false;
 
-  // Wrapped or opened with an explicit reasoning marker (`<think>`,
-  // `<thinking>`, `<reasoning>`, or DeepSeek-style `<|reasoning|>`).
-  if (/^<\s*(think|thinking|reasoning)(\s[^>]*)?>/i.test(trimmed)) {
-    return true;
-  }
-  if (/^<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>/i.test(trimmed)) {
-    return true;
-  }
-
-  // Bracketed labels like `[thinking]` / `[reasoning]` at the very start.
-  if (/^\[\s*(think|thinking|reasoning)\s*\]/i.test(trimmed)) {
-    return true;
-  }
-
-  // Strip a leading `<think>...</think>` block; if nothing meaningful
-  // remains, treat as reasoning-only.  This catches partial leaks where the
-  // provider closed the reasoning tag but emitted no follow-on summary.
-  const withoutThinkBlock = trimmed.replace(
+  // Strip every CLOSED `<think>...</think>` / `<thinking>...</thinking>` /
+  // `<reasoning>...</reasoning>` block.  A closed reasoning block followed
+  // by a non-empty summary body (the common pattern when the provider
+  // emits a reasoning trace and then a normal answer, e.g.
+  // `<think>...</think>Actual summary text`) is NOT reasoning-only —
+  // returning true here would force an unnecessary retry/fallback.
+  const withoutClosedThink = trimmed.replace(
     /<\s*(think|thinking|reasoning)\s*>[\s\S]*?<\s*\/\s*\1\s*>/gi,
     "",
   );
-  if (!withoutThinkBlock.trim()) {
+  const remainder = withoutClosedThink.trim();
+  if (!remainder) {
+    // Either the entire body was a closed reasoning block (no summary
+    // text after) or the input was empty — both are reasoning-only.
+    return true;
+  }
+
+  // Remainder still starts with an UNCLOSED reasoning marker — the
+  // provider opened a `<think>`-style block but never closed it (often a
+  // truncated stream / max_tokens cutoff before the answer began).
+  if (/^<\s*(think|thinking|reasoning)(\s[^>]*)?>/i.test(remainder)) {
+    return true;
+  }
+  if (/^<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>/i.test(remainder)) {
+    return true;
+  }
+  // Bracketed labels at the very start (`[thinking]…` with no obvious
+  // body separation) — same shape as the unclosed-tag case.
+  if (/^\[\s*(think|thinking|reasoning)\s*\]/i.test(remainder)) {
     return true;
   }
 
