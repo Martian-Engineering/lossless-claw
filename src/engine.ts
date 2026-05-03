@@ -1115,23 +1115,69 @@ type StoredMessage = {
   tokenCount: number;
 };
 
+/** Block types that require structural persistence into the `message_parts`
+ *  table (tool calls, tool results, reasoning/thinking traces, function-call
+ *  shapes).  Bootstrap must NOT take the bulk-insert fast path when any
+ *  message contains these — bulk insert only writes the `messages` row, so
+ *  structural blocks would be lost on replay. */
+const STRUCTURAL_BLOCK_TYPES = new Set([
+  "tool_use",
+  "toolUse",
+  "toolCall",
+  "tool-use",
+  "tool_result",
+  "toolResult",
+  "tool-result",
+  "function_call",
+  "functionCall",
+  "function_call_output",
+  "thinking",
+  "redacted_thinking",
+  "reasoning",
+  "image",
+]);
+
 /**
- * Cheap pre-scan: would `ingestSingle` fire ANY interceptor for this message?
- * Used by bootstrap to choose between the v0.9.2 bulk-insert fast path and
- * the per-message ingest path. False positives are acceptable (slower path);
- * false negatives would skip externalization, so be conservative when unsure.
+ * Cheap pre-scan: should bootstrap take the bulk-insert fast path for this
+ * message, or fall through to the per-message `ingestSingle` path?
+ *
+ * Returns true (slower per-message path required) when:
+ *   - the message carries any structural block (tool/reasoning/image/etc.)
+ *     that needs `message_parts` rows
+ *   - the role is `tool` or `toolResult` (those go through a separate
+ *     interceptor/parts pipeline)
+ *   - any size-driven interceptor would fire (large file/raw-payload/tool-
+ *     result)
+ *   - the content shows the textual markers `interceptInlineImages` /
+ *     `interceptLargeFiles` look for
+ *
+ * False positives are acceptable (slower path); false negatives would skip
+ * externalization or drop `message_parts`, so the helper errs on the side of
+ * "use the safe per-message path".
  */
 function bootstrapMessageWouldTriggerInterceptor(
   message: AgentMessage,
   largeFileTokenThreshold: number,
 ): boolean {
   const threshold = Math.max(1, largeFileTokenThreshold);
+  const role = (message as { role?: unknown }).role;
   const content = "content" in message ? message.content : undefined;
 
-  // Image blocks (interceptNativeUserImageBlocks / inline-image-in-tool).
+  // Tool/toolResult roles need the per-message path regardless of payload —
+  // they go through `interceptInlineImagesInToolMessage` and have their own
+  // parts pipeline that the bulk-insert fast path does not reproduce.
+  if (role === "tool" || role === "toolResult") {
+    return true;
+  }
+
+  // Structural blocks (tool calls/results, reasoning, thinking, function
+  // calls, images) need `message_parts` rows for replay; bulk-insert only
+  // writes the `messages` row, so any such block forces per-message ingest.
   if (Array.isArray(content)) {
     for (const block of content) {
-      if (block && typeof block === "object" && (block as { type?: unknown }).type === "image") {
+      if (!block || typeof block !== "object") continue;
+      const blockType = (block as { type?: unknown }).type;
+      if (typeof blockType === "string" && STRUCTURAL_BLOCK_TYPES.has(blockType)) {
         return true;
       }
     }
@@ -1141,29 +1187,33 @@ function bootstrapMessageWouldTriggerInterceptor(
     // interceptInlineImages: explicit media marker or a long base64 run.
     if (content.startsWith("[media attached:")) return true;
     if (content.length >= 80 && /[A-Za-z0-9+/]{80,}={0,2}/.test(content)) return true;
-    // interceptLargeFiles: presence of a file block — interceptor decides on size.
-    if (content.includes("<file ")) return true;
+    // interceptLargeFiles: presence of a file block — match `<file>`,
+    // `<file ...>`, and `<file\n...>` forms. The interceptor decides on
+    // size; we only need a robust open-tag detector here.
+    if (/<file(?:\s|>)/.test(content)) return true;
   }
 
   // Size gate for interceptLargeRawPayload / interceptLargeToolResults.
-  // Bytes is an upper bound on tokens; if even a 1:1 mapping doesn't hit
-  // the threshold, no size-driven interceptor can fire.
-  let approxBytes = 0;
+  // `content.length` is a UTF-16 code-unit count, NOT bytes — but it is a
+  // safe upper bound on the tokenized length too (a single token is at
+  // least one code unit), so if even a 1:1 mapping doesn't hit the
+  // threshold, no size-driven interceptor can fire.
+  let approxCodeUnits = 0;
   if (typeof content === "string") {
-    approxBytes = content.length;
+    approxCodeUnits = content.length;
   } else if (Array.isArray(content)) {
     for (const block of content) {
       if (typeof block === "string") {
-        approxBytes += block.length;
+        approxCodeUnits += block.length;
       } else if (block && typeof block === "object") {
         const text = (block as { text?: unknown }).text;
-        approxBytes += typeof text === "string" ? text.length : 1024;
+        approxCodeUnits += typeof text === "string" ? text.length : 1024;
       }
     }
   } else if (content && typeof content === "object") {
-    approxBytes += 1024;
+    approxCodeUnits += 1024;
   }
-  return approxBytes >= threshold;
+  return approxCodeUnits >= threshold;
 }
 
 /**
@@ -5148,7 +5198,9 @@ export class LcmContextEngine implements ContextEngine {
             // Pre-scan: PR #510 moved bootstrap to N×ingestSingle so
             // interceptors could fire on first import. Restore the v0.9.2
             // bulk-insert fast path when no message would trigger any
-            // interceptor; otherwise per-message ingest with K=100 yields.
+            // interceptor AND has no structural blocks (`message_parts` is
+            // not populated by the bulk path); otherwise stay on the
+            // per-message ingest path with periodic event-loop yields.
             const threshold = this.config.largeFileTokenThreshold;
             const requiresPerMessageIngest = bootstrapMessages.some((message) =>
               bootstrapMessageWouldTriggerInterceptor(message, threshold),
@@ -5186,7 +5238,12 @@ export class LcmContextEngine implements ContextEngine {
                   importedMessages += 1;
                 }
                 if ((i + 1) % BOOTSTRAP_INGEST_CHUNK_SIZE === 0) {
-                  await Promise.resolve();
+                  // setImmediate yields a macrotask boundary so timer/IO
+                  // callbacks can run before the next ingest batch — a
+                  // bare `Promise.resolve()` only schedules a microtask,
+                  // which can still starve the event loop on long
+                  // bootstraps.
+                  await new Promise<void>((resolve) => setImmediate(resolve));
                 }
               }
             }

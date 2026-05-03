@@ -4082,6 +4082,78 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(singleSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("forces per-message ingest when bootstrap messages carry tool_use / tool_result / reasoning blocks", async () => {
+    // Regression: the bulk-insert fast path writes `messages` rows but does
+    // NOT populate `message_parts`, so any structural block (tool calls,
+    // tool results, reasoning/thinking, function calls, images) would be
+    // silently dropped on replay if the pre-scan let it through. The
+    // pre-scan must force per-message ingest for these shapes.
+    const sessionFile = createSessionFilePath("bootstrap-structural-blocks");
+    const lines = [
+      JSON.stringify({
+        role: "assistant",
+        content: [
+          { type: "text", text: "Calling the tool now." },
+          {
+            type: "tool_use",
+            id: "tu_boot_1",
+            name: "ls",
+            input: { path: "/tmp" },
+          },
+        ],
+      }),
+      JSON.stringify({
+        role: "tool",
+        toolCallId: "tu_boot_1",
+        content: [{ type: "tool_result", tool_use_id: "tu_boot_1", content: "ok" }],
+      }),
+      JSON.stringify({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "consider the result" },
+          { type: "text", text: "Done." },
+        ],
+      }),
+    ];
+    writeFileSync(sessionFile, `${lines.join("\n")}\n`, "utf8");
+
+    // Realistic threshold so SIZE-based interceptors don't fire — we want
+    // to verify that STRUCTURAL blocks alone force the per-message path.
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-structural-blocks",
+      sessionFile,
+    });
+    expect(result.bootstrapped).toBe(true);
+
+    // Bulk path must NOT have been used — structural blocks force per-message
+    // ingest so `message_parts` rows get populated by the standard pipeline.
+    expect(bulkSpy).not.toHaveBeenCalled();
+    expect(singleSpy).toHaveBeenCalled();
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId("bootstrap-structural-blocks");
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    // tool_use / tool_result / thinking blocks all need parts rows — at least
+    // one stored message should have non-empty parts.
+    let totalParts = 0;
+    for (const m of stored) {
+      const parts = await engine
+        .getConversationStore()
+        .getMessageParts(m.messageId);
+      totalParts += parts.length;
+    }
+    expect(totalParts).toBeGreaterThan(0);
+  });
+
   it("externalizes oversized file blocks during first-time bootstrap and still reconciles later tail messages", async () => {
     await withTempHome(async () => {
       const sessionFile = createSessionFilePath("bootstrap-large-file-parity");
