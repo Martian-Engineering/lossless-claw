@@ -1,0 +1,46 @@
+{
+  "name": "lossless-codex",
+  "version": "0.1.0",
+  "description": "Codex-native coding-work memory sidecar with project, thread, worklog, and LCM enrichment tools.",
+  "author": {
+    "name": "Martian Engineering",
+    "email": "support@martian.engineering",
+    "url": "https://github.com/Martian-Engineering"
+  },
+  "homepage": "https://github.com/Martian-Engineering/lossless-claw",
+  "repository": "https://github.com/Martian-Engineering/lossless-claw",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "lossless-codex",
+    "lossless-claw",
+    "memory",
+    "sqlite",
+    "coding-work"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Lossless Codex",
+    "shortDescription": "Search Codex coding work memory",
+    "longDescription": "Lossless Codex indexes local Codex Desktop thread metadata and rollout JSONL into a separate coding-work memory sidecar. It exposes bounded tools for status, import, search, recent work, describe, and worklog recall without mutating Codex live prompt context.",
+    "developerName": "Martian Engineering",
+    "category": "Engineering",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "websiteURL": "https://github.com/Martian-Engineering/lossless-claw",
+    "privacyPolicyURL": "https://github.com/Martian-Engineering/lossless-claw",
+    "termsOfServiceURL": "https://github.com/Martian-Engineering/lossless-claw",
+    "defaultPrompt": [
+      "Search my Codex coding work",
+      "What did Codex build yesterday?",
+      "Find decisions for this repo"
+    ],
+    "brandColor": "#0F766E",
+    "composerIcon": "./assets/lossless-codex.svg",
+    "logo": "./assets/lossless-codex.svg",
+    "screenshots": []
+  }
+}

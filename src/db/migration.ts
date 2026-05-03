@@ -977,6 +977,22 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS lcm_temporal_enrichments (
+      enrichment_id TEXT PRIMARY KEY,
+      source_system TEXT NOT NULL,
+      period_kind TEXT NOT NULL CHECK (period_kind IN ('day', 'week', 'month')),
+      period_key TEXT NOT NULL,
+      timezone TEXT NOT NULL,
+      project_key TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      source_ref TEXT NOT NULL,
+      coverage_status TEXT NOT NULL DEFAULT 'complete',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (source_system, period_kind, period_key, timezone, project_key)
+    );
+
     CREATE TABLE IF NOT EXISTS lcm_migration_state (
       step_name TEXT NOT NULL,
       algorithm_version INTEGER NOT NULL,
@@ -997,6 +1013,10 @@ export function runLcmMigrations(
       ON conversation_bootstrap_state (session_file_path, updated_at);
     CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
       ON conversation_compaction_telemetry (cache_state, updated_at);
+    CREATE INDEX IF NOT EXISTS lcm_temporal_enrichments_period_idx
+      ON lcm_temporal_enrichments (period_kind, period_key, timezone);
+    CREATE INDEX IF NOT EXISTS lcm_temporal_enrichments_project_period_idx
+      ON lcm_temporal_enrichments (project_key, period_kind, period_key);
 
     -- Speed up summary_messages lookups by message_id (PK is summary_id,message_id)
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
