@@ -11,7 +11,19 @@
     },
     "contextThreshold": {
       "label": "Context Threshold",
-      "help": "Fraction of context window that triggers compaction (0.0–1.0)"
+      "help": "Fraction of effective token budget that TRIGGERS compaction (default 0.60). Trigger threshold only — the sweep stopping point is configured separately via sweepTargetThreshold and the pressure tier ladder is in pressureTiers."
+    },
+    "sweepTargetThreshold": {
+      "label": "Sweep Target Threshold",
+      "help": "Fraction of effective token budget that a SWEEP targets when it fires (default 0.50). Sweep mode only fires above sweepTriggerThreshold (default 0.91); below that, dispatched compaction targets contextThreshold instead."
+    },
+    "sweepTriggerThreshold": {
+      "label": "Sweep Trigger Threshold",
+      "help": "Fraction of effective token budget at which dispatched compaction switches into deep SWEEP mode (default 0.91). Below this, dispatches use the pressure-tier ladder (1/2/3 passes per dispatch by tier). Above this, dispatches run unlimited passes targeting sweepTargetThreshold."
+    },
+    "pressureTiers": {
+      "label": "Pressure Tiers",
+      "help": "Ordered ladder of pressure ratios → maxPasses caps that govern dispatched compaction below sweepTriggerThreshold. Default: [{ratio:0.70,maxPasses:2},{ratio:0.80,maxPasses:3}] giving 1 pass at the trigger, 2 passes at 70%, 3 passes at 80%. Multi-pass amortizes prefix-cache invalidation across more reduction per dispatch."
     },
     "incrementalMaxDepth": {
       "label": "Incremental Max Depth",
@@ -217,6 +229,35 @@
         "type": "number",
         "minimum": 0,
         "maximum": 1
+      },
+      "sweepTargetThreshold": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "sweepTriggerThreshold": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "pressureTiers": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ratio", "maxPasses"],
+          "properties": {
+            "ratio": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "exclusiveMaximum": 1
+            },
+            "maxPasses": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
       },
       "incrementalMaxDepth": {
         "type": "integer",

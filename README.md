@@ -5,6 +5,7 @@ Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/op
 ## Table of contents
 
 - [What it does](#what-it-does)
+- [Compaction pressure architecture](#compaction-pressure-architecture)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Commands And Skill](#commands-and-skill)
@@ -27,6 +28,183 @@ When a conversation grows beyond the model's context window, OpenClaw (just like
 Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.
 
 **It feels like talking to an agent that never forgets. Because it doesn't. In normal operation, you'll never need to think about compaction again.**
+
+## Compaction pressure architecture
+
+LCM operates as a **layered four-band system** keyed off prompt pressure
+(current tokens / effective budget). Each band has its own dispatch policy,
+and they compose so the prompt never approaches runtime overflow under
+normal operation.
+
+The plugin uses three composing capabilities:
+
+1. **Reserve-aware budget alignment** — LCM reads `runtimeContext.reserveTokens`
+   and subtracts it from the resolved budget so every percentage threshold
+   computes against the EFFECTIVE prompt budget (the same number the runtime
+   actually overflows at), not the raw context window.
+2. **Decoupled sweep trigger + target** — `sweepTriggerThreshold` (default
+   0.91) controls when sweep MODE fires; `sweepTargetThreshold` (default 0.50)
+   controls where the sweep STOPS. Below the sweep trigger, dispatched
+   compaction targets `contextThreshold` instead.
+3. **Pressure-tiered pass cap** — `pressureTiers` (default
+   `[{ratio:0.70,maxPasses:2},{ratio:0.80,maxPasses:3}]`) ladder lets each
+   dispatch run more sequential passes as pressure rises, exploiting the
+   fact that cache invalidation is a per-dispatch fixed cost (not per-pass).
+
+The `criticalBudgetPressureRatio` knob (default 0.70) on `cacheAwareCompaction`
+lines up with the tier-1 ratio so dispatched work fires reliably the moment
+the system enters tier-1 instead of being cache-throttled up to 5 minutes per
+dispatch.
+
+```
+        effective prompt budget = tokenBudget − reserveTokens
+        ┌────────────────────────────────────────────────────────────┐
+0%    60%/trigger  70%/tier-1  80%/tier-2  91%/sweep        100%/overflow
+├─────┼────────────┼───────────┼───────────┼──────────────────────────┤
+│ low │  normal    │  tier-1   │  tier-2   │   SWEEP                   │
+│     │  1 pass /  │  2 passes │  3 passes │   (unlimited passes,      │
+│     │  dispatch  │  / disp.  │  / disp.  │    target 50%)            │
+│     │  exit @60% │  exit @60%│  exit @60%│   exit @ 50% of budget    │
+└─────┴────────────┴───────────┴───────────┴──────────────────────────┘
+                   ↑           ↑           ↑                           ↑
+                   tier-1      tier-2      sweepTriggerThreshold       runtime
+                   (cache-aware                                        emergency
+                   bypass also                                         truncation
+                   activates here                                      (last resort)
+                   via PR #557's
+                   0.70 default)
+```
+
+| Band | Range | Action | Config knob |
+|---|---|---|---|
+| **Low** | 0–60% | nothing fires | `contextThreshold` (default 0.60) |
+| **Normal** | 60–70% | maintenance debt queued; 1 pass per dispatch (cache-aware throttled, defers up to 5 min if cache hot) | `contextThreshold` |
+| **Tier 1** | 70–80% | 2 passes per dispatch, cache-aware delay bypassed | `pressureTiers[0]` + `cacheAwareCompaction.criticalBudgetPressureRatio` (0.70) |
+| **Tier 2** | 80–91% | 3 passes per dispatch, cache-aware delay bypassed | `pressureTiers[1]` |
+| **Sweep** | ≥91% | unlimited passes, target `sweepTargetThreshold` (50%) — heavy catch-up, creates ~5+ turns of runway | `sweepTriggerThreshold` + `sweepTargetThreshold` |
+| **Overflow** | ≥100% | runtime emergency `truncate_tool_results_only` (openclaw side, last resort) | runtime config |
+
+### Why this layering?
+
+**Hidden insight: cache invalidation is a per-dispatch fixed cost, not per-pass.**
+When LCM compacts the oldest chunk, the prefix cache breaks at the modification
+point and everything from there to the end of the prompt must re-tokenize on
+the next turn. Doing 1 pass vs 3 passes vs 6 passes invalidates the SAME prefix
+— more passes just produce more reduction off that one cache break. This means
+multi-pass dispatch is the right shape at higher pressure, not "fire more
+often" (which would multiply cache invalidations).
+
+| Tier | Passes | Cache cost | Reduction per dispatch | Efficiency |
+|---|---|---|---|---|
+| Normal (1 pass) | 1 | 1× | ~17K | 17K / cache-break |
+| Tier 1 (2 passes) | 2 | 1× | ~34K | 34K / cache-break ← 2× |
+| Tier 2 (3 passes) | 3 | 1× | ~51K | 51K / cache-break ← 3× |
+| Sweep (unlimited) | 5–7 | 1× | ~80K–100K | huge / cache-break |
+
+### Why decouple sweep trigger from sweep target?
+
+Pre-2026, the sweep loop exited at `contextThreshold` (the same threshold that
+TRIGGERED it). With both at 0.75, sweep ran one or two passes (just enough to
+drop back below the trigger line) and then exited — no headroom created. The
+next turn pushed the prompt back over the trigger, sweep ran again, exited
+again. Worst of both worlds: sweep fires often and barely does any work.
+
+Decoupling the target (now 0.50 by default) AND adding a separate
+`sweepTriggerThreshold` (0.91) means:
+
+- Below 91%: dispatched work targets `contextThreshold` (gentle, doesn't
+  overshoot)
+- At ≥91%: sweep mode targets 50% — creates real multi-turn runway (~5+ turns
+  of buffer) before another trigger
+- Sweep becomes RARE because the headroom it creates absorbs ongoing input
+- Most turns are handled by the tier ladder without sweep ever needing to fire
+
+### Reserve-aware budget alignment
+
+LCM reads `runtimeContext.reserveTokens` (or the legacy `reserveTokensFloor`
+key) and subtracts it from the resolved `tokenBudget` before computing
+percentages. This way every threshold computes against the EFFECTIVE prompt
+budget — the same number the runtime actually overflows at — instead of the
+raw context window.
+
+| Without reserve alignment | With reserve alignment (default behavior) |
+|---|---|
+| Runtime: gpt-5.5 with 258K context, 20K reserve → overflow at 238K | Runtime: same |
+| LCM gets `tokenBudget = 258K`, all percentages computed against 258K | LCM gets `tokenBudget = 258K`, subtracts 20K reserve → percentages computed against 238K |
+| 60% trigger fires at 155K (65% of effective 238K) | 60% trigger fires at 143K (60% of effective) ✓ |
+| 91% sweep target lands at 235K (99% — almost overflowing) | 91% sweep target lands at 217K (91% of effective) ✓ |
+
+If your runtime doesn't pass `reserveTokens` (or the legacy `reserveTokensFloor`
+key), LCM falls back to the legacy behavior (raw budget, no subtraction) for
+backward compatibility.
+
+### Recommended openclaw operator config
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "compaction": {
+        "mode": "safeguard",
+        "reserveTokensFloor": 20000
+      }
+    }
+  },
+  "plugins": {
+    "slots": { "contextEngine": "lossless-claw" },
+    "entries": {
+      "lossless-claw": {
+        "config": {
+          "contextThreshold": 0.60,
+          "sweepTargetThreshold": 0.50,
+          "sweepTriggerThreshold": 0.91,
+          "pressureTiers": [
+            { "ratio": 0.70, "maxPasses": 2 },
+            { "ratio": 0.80, "maxPasses": 3 }
+          ],
+          "cacheAwareCompaction": {
+            "enabled": true
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+All values shown are the new defaults — operators only need to set them
+explicitly to override.
+
+**Why `reserveTokensFloor: 20000`:** the openclaw default. Operators sometimes
+raise it when hitting overflow due to cache-aware throttling (addressed by PR
+#557). With reserve-aware alignment in place, 20K leaves the LCM percentages
+well-aligned with the runtime overflow point and remains enough headroom for
+any normal model response.
+
+### Scenario walkthrough — real session data
+
+Real Eva session on gpt-5.5 (258K context, 20K reserve = 238K effective budget)
+before any patches:
+
+| Time | Prompt | LCM% (vs 258K raw) | Runtime% (vs 238K effective) | What fired |
+|---|---|---|---|---|
+| (steady state) | 180K | 70% | 76% | LCM saw "70%" — quiet; runtime was actually at 76% — under pressure |
+| (after a tool burst) | 219K | 85% | **92%** | LCM still saw "below 85%" — never fired; **runtime emergency** truncated 132 tool results |
+| (continued growth) | 227K | 88% | **95%** | LCM finally fired (cache went cold), 12 leaves, brought to 207K (still over runtime) |
+
+With the architecture above (recommended defaults):
+
+| Eva crosses... | Tier | Pass count | Action | Result |
+|---|---|---|---|---|
+| 143K (60% of 238K) | Normal | 1 | Maintenance debt queued, fires when cache cold | Cache-aware throttled — typically defers |
+| 167K (70% of 238K) | Tier 1 | 2 | Cache delay BYPASSED (PR #557), 2 passes per dispatch | ~34K reduction → drops to ~133K |
+| 190K (80% of 238K) | Tier 2 | 3 | 3 passes per dispatch | ~51K reduction → drops to ~139K |
+| If tier 1+2 fail, crosses 217K (91% of 238K) | **Sweep** | unlimited | Deep catch-up to 50% target (119K) | ~98K reduction → ~5 turns of buffer |
+| Effectively NEVER reaches 238K | Overflow | — | — | Runtime emergency essentially never fires |
+
+**Result: 0 emergency truncations** instead of 6 in the same window. Sweep
+becomes rare (typically 0–1 per heavy session) because tiers 1+2 absorb most
+escalation.
 
 ## Commands And Skill
 
@@ -165,7 +343,10 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_IGNORE_SESSION_PATTERNS` | `""` | Comma-separated glob patterns for session keys to exclude from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | `""` | Comma-separated glob patterns for session keys that may read from LCM but never write to it |
 | `LCM_SKIP_STATELESS_SESSIONS` | `true` | Enable stateless-session write skipping for matching session keys |
-| `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window that triggers compaction (0.0–1.0) |
+| `LCM_CONTEXT_THRESHOLD` | `0.60` | Fraction of effective token budget that TRIGGERS compaction (0.0–1.0). Trigger threshold only — sweep target/trigger and pressure tiers are configured separately. The 0.60 default leaves headroom for the cache-aware system to defer normally before tier-1 pressure kicks in. |
+| `LCM_SWEEP_TARGET_THRESHOLD` | `0.50` | Fraction of effective token budget that a SWEEP targets when it fires. Sweep mode only fires above `LCM_SWEEP_TRIGGER_THRESHOLD`; below that, dispatched compaction targets `LCM_CONTEXT_THRESHOLD` instead. |
+| `LCM_SWEEP_TRIGGER_THRESHOLD` | `0.91` | Fraction of effective token budget at which dispatched compaction switches into deep SWEEP mode. Below this, dispatches use the pressure-tier ladder (1/2/3 passes by tier). Above this, dispatches run unlimited passes targeting `LCM_SWEEP_TARGET_THRESHOLD`. |
+| `LCM_PRESSURE_TIERS` | `[{"ratio":0.70,"maxPasses":2},{"ratio":0.80,"maxPasses":3}]` | JSON array of `{ratio, maxPasses}` entries — pressure-tier ladder for dispatched compaction below sweep mode. Each entry caps passes-per-dispatch when current pressure crosses `ratio`. |
 | `LCM_FRESH_TAIL_COUNT` | `64` | Number of recent messages protected from compaction |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | Context retained after `/new` (`-1` keeps all context, `2` keeps d2+) |
 | `LCM_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |

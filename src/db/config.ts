@@ -54,6 +54,44 @@ export type LcmConfig = {
   /** When true, stateless session pattern matching is enforced. */
   skipStatelessSessions: boolean;
   contextThreshold: number;
+  /**
+   * Sweep target threshold (fraction of token budget) — when a deep sweep
+   * fires, it compacts until the prompt is at or below this fraction of the
+   * effective token budget. Defaults to 0.50.
+   *
+   * Optional for backward-compatibility: callers that construct LcmConfig
+   * literals without this field will see runtime fall back to the default
+   * (0.50) at use sites. Operators going through `resolveLcmConfig` get the
+   * default automatically.
+   */
+  sweepTargetThreshold?: number;
+  /**
+   * Sweep trigger threshold (fraction of token budget) — only when current
+   * pressure reaches this ratio does dispatched compaction switch into "sweep
+   * mode" and target `sweepTargetThreshold`. Below this ratio, dispatched
+   * compaction targets `contextThreshold` (gentle, exits at trigger line).
+   * Defaults to 0.91.
+   *
+   * Optional for backward compatibility — same rationale as `sweepTargetThreshold`.
+   */
+  sweepTriggerThreshold?: number;
+  /**
+   * Pressure-tiered pass count multipliers. Each entry is `{ ratio, maxPasses }`
+   * — when current pressure crosses `ratio` and stays below the next tier (or
+   * below `sweepTriggerThreshold`), dispatched compaction runs up to
+   * `maxPasses` sequential passes per dispatch. Tiers must be sorted by
+   * `ratio` ascending.
+   *
+   * Multi-pass amortizes the prefix-cache invalidation cost — every pass in a
+   * single dispatch invalidates the SAME cache prefix (modification point
+   * forward), so doing 3 passes per dispatch costs the same cache-wise as
+   * doing 1, but reduces 3× as many tokens.
+   *
+   * Defaults to `[{ ratio: 0.70, maxPasses: 2 }, { ratio: 0.80, maxPasses: 3 }]`.
+   *
+   * Optional for backward compatibility — same rationale as `sweepTargetThreshold`.
+   */
+  pressureTiers?: Array<{ ratio: number; maxPasses: number }>;
   freshTailCount: number;
   /** Optional token cap for the protected fresh tail; newest message is always preserved. */
   freshTailMaxTokens?: number;
@@ -169,6 +207,56 @@ function toFallbackProviderArray(value: unknown): Array<{ provider: string; mode
     }
   }
   return entries.length > 0 ? entries : undefined;
+}
+
+/**
+ * Single source of truth for the layered pressure architecture defaults.
+ * Engine-side fallbacks (`src/engine.ts`) import these constants instead of
+ * mirroring them, so the resolver and the engine can never drift.
+ */
+export const DEFAULT_CONTEXT_THRESHOLD = 0.60;
+export const DEFAULT_SWEEP_TARGET_THRESHOLD = 0.50;
+export const DEFAULT_SWEEP_TRIGGER_THRESHOLD = 0.91;
+export const DEFAULT_PRESSURE_TIERS: ReadonlyArray<{ ratio: number; maxPasses: number }> = [
+  { ratio: 0.70, maxPasses: 2 },
+  { ratio: 0.80, maxPasses: 3 },
+];
+
+/**
+ * Resolve pressure-tier ladder from env (`LCM_PRESSURE_TIERS` as JSON) or
+ * plugin config (`pressureTiers` as array). Each entry must have a finite
+ * `ratio` in (0, 1) and a finite `maxPasses` >= 1. Returns the default ladder
+ * if input is missing, malformed, or empty after filtering. Output is sorted
+ * ascending by ratio so callers can early-exit when comparing pressure.
+ */
+function resolvePressureTiers(
+  env: NodeJS.ProcessEnv,
+  pc: Record<string, unknown>,
+): Array<{ ratio: number; maxPasses: number }> {
+  const fromEnv = (() => {
+    const raw = env.LCM_PRESSURE_TIERS?.trim();
+    if (!raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+  const candidates = fromEnv ?? (Array.isArray(pc.pressureTiers) ? pc.pressureTiers : undefined);
+  if (!candidates) return [...DEFAULT_PRESSURE_TIERS];
+  const tiers: Array<{ ratio: number; maxPasses: number }> = [];
+  for (const item of candidates) {
+    if (!item || typeof item !== "object") continue;
+    const ratio = toNumber((item as Record<string, unknown>).ratio);
+    const maxPasses = toNumber((item as Record<string, unknown>).maxPasses);
+    if (ratio === undefined || ratio <= 0 || ratio >= 1) continue;
+    if (maxPasses === undefined || maxPasses < 1) continue;
+    tiers.push({ ratio, maxPasses: Math.floor(maxPasses) });
+  }
+  if (tiers.length === 0) return [...DEFAULT_PRESSURE_TIERS];
+  tiers.sort((a, b) => a.ratio - b.ratio);
+  return tiers;
 }
 
 /** Safely coerce an unknown value to a boolean, or return undefined. */
@@ -357,9 +445,34 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_SKIP_STATELESS_SESSIONS !== undefined
           ? env.LCM_SKIP_STATELESS_SESSIONS === "true"
           : toBool(pc.skipStatelessSessions) ?? true,
-      contextThreshold:
-        parseFiniteNumber(env.LCM_CONTEXT_THRESHOLD)
-          ?? toNumber(pc.contextThreshold) ?? 0.75,
+      contextThreshold: Math.min(
+        1,
+        Math.max(
+          0,
+          parseFiniteNumber(env.LCM_CONTEXT_THRESHOLD)
+            ?? toNumber(pc.contextThreshold)
+            ?? DEFAULT_CONTEXT_THRESHOLD,
+        ),
+      ),
+      sweepTargetThreshold: Math.min(
+        1,
+        Math.max(
+          0,
+          parseFiniteNumber(env.LCM_SWEEP_TARGET_THRESHOLD)
+            ?? toNumber(pc.sweepTargetThreshold)
+            ?? DEFAULT_SWEEP_TARGET_THRESHOLD,
+        ),
+      ),
+      sweepTriggerThreshold: Math.min(
+        1,
+        Math.max(
+          0,
+          parseFiniteNumber(env.LCM_SWEEP_TRIGGER_THRESHOLD)
+            ?? toNumber(pc.sweepTriggerThreshold)
+            ?? DEFAULT_SWEEP_TRIGGER_THRESHOLD,
+        ),
+      ),
+      pressureTiers: resolvePressureTiers(env, pc),
       freshTailCount:
         parseFiniteInt(env.LCM_FRESH_TAIL_COUNT)
           ?? toNumber(pc.freshTailCount) ?? 64,
