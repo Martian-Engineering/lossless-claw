@@ -2527,6 +2527,83 @@ describe("LCM weekly and monthly rollups", () => {
     ).toThrow(/real calendar date/i);
   });
 
+  it("RollupStore.getTimezone returns the persisted state row tz — B6 regression", async () => {
+    const { conversationStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "tz-persistence",
+      sessionKey: "agent:main:tz-persistence",
+      title: "TZ persistence",
+    });
+
+    // No state row yet: returns null so callers fall back to engine default.
+    expect(rollupStore.getTimezone(conversation.conversationId)).toBeNull();
+
+    // Persist LA tz; reads should pick it up regardless of engine config.
+    rollupStore.upsertState(conversation.conversationId, {
+      timezone: "America/Los_Angeles",
+    });
+    expect(rollupStore.getTimezone(conversation.conversationId)).toBe(
+      "America/Los_Angeles",
+    );
+  });
+
+  it("lcm_recent reads persisted tz over engine default — B6 regression", async () => {
+    const { db, conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "tz-pref-state",
+      sessionKey: "agent:main:tz-pref-state",
+      title: "TZ pref state",
+    });
+
+    // Persist LA tz on the rollup-state row. Engine default below is UTC.
+    rollupStore.upsertState(conversation.conversationId, {
+      timezone: "America/Los_Angeles",
+    });
+
+    // Seed a summary at 2026-04-27 23:00 UTC. This is 2026-04-27 16:00 LA
+    // and 2026-04-27 (UTC). period "date:2026-04-27 16:00-17:00" with the LA
+    // tz pointing at the row should match — proving LA was used. With UTC,
+    // it would also match (no tz contrast). Use a tz-sensitive window
+    // instead: 02:00-03:00 LA = 09:00-10:00 UTC. Engine UTC would NOT match
+    // this window for our seed, but LA WILL.
+    await summaryStore.insertSummary({
+      summaryId: "sum_la_window",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Recorded at 2026-04-27 02:30 LA local",
+      tokenCount: 10,
+      sourceMessageTokenCount: 10,
+      earliestAt: new Date("2026-04-27T09:30:00.000Z"),
+      latestAt: new Date("2026-04-27T09:45:00.000Z"),
+    });
+    void db; // suppress unused-var
+    void summaryStore; // suppress unused-var
+
+    // Engine default = UTC, but persisted state = LA. Tool should pick LA.
+    const tool = createLcmRecentTool({
+      deps: makeRecentDeps(),
+      lcm: makeLcmForConversation({
+        conversationId: conversation.conversationId,
+        rollupStore,
+        sessionId: "tz-pref-state",
+        timezone: "UTC",
+      }) as never,
+      sessionId: "tz-pref-state",
+    });
+
+    // 02:00-03:00 LA on 2026-04-27 = 09:00-10:00 UTC. Our seed at 09:30 UTC
+    // falls inside. If the tool incorrectly used engine UTC, the same
+    // window string ("date:2026-04-27 02:00-03:00") would resolve to
+    // 02:00-03:00 UTC (= 19:00-20:00 LA the prior day) and miss the seed.
+    const result = await tool.execute("call-tz", {
+      period: "date:2026-04-27 02:00-03:00",
+      includeSources: true,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("sum_la_window");
+  });
+
   it("anchors 'today' off the injected clock — B3 regression", () => {
     // Frozen clock independent of wall time. resolvePeriod("today") must
     // produce the day key for 2026-04-15 in UTC, regardless of the real

@@ -1330,7 +1330,6 @@ export function createLcmRecentTool(input: {
       const includeSources = p.includeSources === true;
       const mode: "summary" | "index" = p.mode === "index" ? "index" : "summary";
       let budget = resolveRecallBudget(p);
-      const timezone = lcm.timezone;
       const conversationScope = await resolveLcmConversationScope({
         lcm,
         deps: input.deps,
@@ -1338,6 +1337,15 @@ export function createLcmRecentTool(input: {
         sessionKey: input.sessionKey,
         params: p,
       });
+      // Read timezone from per-conversation rollup state first, falling back
+      // to the engine-wide default. Persisted state wins so a conversation
+      // recorded in America/Los_Angeles keeps its day-keys even if the
+      // engine default later changes (e.g. operator updates plugin config).
+      const rollupStoreForTz = getLcmRollupStore(lcm, input.rollupStore);
+      const timezone =
+        (conversationScope.conversationId != null
+          ? rollupStoreForTz.getTimezone(conversationScope.conversationId)
+          : null) ?? lcm.timezone;
 
       // Smart detailLevel auto-pick: when caller didn't specify and we know the
       // agent's last observed prompt size + model, pick a detailLevel that
