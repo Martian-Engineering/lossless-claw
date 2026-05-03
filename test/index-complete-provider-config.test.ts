@@ -324,6 +324,41 @@ describe("createLcmDependencies.complete provider config resolution", () => {
     );
   });
 
+  it("preserves an explicit api.openai.com/v1 baseUrl for paid OpenAI API-key Codex users", async () => {
+    // Regression: v0.9.3's #549 added OPENAI_CODEX_NATIVE_BASE_URLS which would
+    // rewrite an explicitly-configured `https://api.openai.com/v1` to
+    // `chatgpt.com/backend-api/codex` whenever api was `openai-codex-responses`.
+    // That broke users on a paid OpenAI API key who set baseUrl deliberately.
+    // shouldUseNativeCodexBaseUrl now respects an explicit configured baseUrl.
+    const runtimeConfig = {
+      models: {
+        providers: {
+          "openai-codex": {
+            baseUrl: "https://api.openai.com/v1",
+          },
+        },
+      },
+    };
+
+    await callComplete({
+      loadConfigResult: runtimeConfig,
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      runtimeConfig,
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "gpt-5.4",
+        provider: "openai-codex",
+        api: "openai-codex-responses",
+        baseUrl: "https://api.openai.com/v1",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
   it("keeps custom Codex proxy baseUrl when openai-codex uses native transport", async () => {
     const runtimeConfig = {
       models: {
@@ -488,12 +523,46 @@ describe("createLcmDependencies.complete provider config resolution", () => {
       runtimeConfig: {},
     });
 
+    // ollama is intentionally absent from inferBaseUrlFromProvider — cloud
+    // ollama (`https://ollama.com`) and self-hosted setups both rely on
+    // explicit baseUrl. A silent localhost fallback would route cloud
+    // configs to localhost and produce confusing connection errors.
     expect(piAiMock.completeSimple).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "kimi-k2.5:cloud",
         provider: "ollama",
         api: "openai-completions",
-        baseUrl: "http://localhost:11434",
+        baseUrl: "",
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it("preserves a user-configured ollama cloud baseUrl instead of overriding to localhost", async () => {
+    const runtimeConfig = {
+      models: {
+        providers: {
+          ollama: {
+            baseUrl: "https://ollama.com",
+          },
+        },
+      },
+    };
+
+    await callComplete({
+      loadConfigResult: runtimeConfig,
+      provider: "ollama",
+      model: "kimi-k2.5:cloud",
+      runtimeConfig,
+    });
+
+    expect(piAiMock.completeSimple).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "kimi-k2.5:cloud",
+        provider: "ollama",
+        api: "openai-completions",
+        baseUrl: "https://ollama.com",
       }),
       expect.any(Object),
       expect.any(Object),

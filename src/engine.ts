@@ -6464,10 +6464,12 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: assembled context has no user turns, falling back to live context to prevent prefill errors conversation=${conversation.conversationId} ${sessionLabel} assembledMessages=${assembled.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return {
-          messages: params.messages,
-          estimatedTokens: 0,
-        };
+        // Use safeFallback() so the result is a *new* array; otherwise the
+        // gateway's `assembled.messages !== sourceMessages` reference-equality
+        // check falls through to raw sourceMessages (still ending in assistant)
+        // and re-introduces the prefill-rejection bug fixed by safeFallback in
+        // the other early-return paths.
+        return safeFallback();
       }
 
       this.deps.log.info(

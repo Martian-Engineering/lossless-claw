@@ -683,6 +683,12 @@ function shouldUseNativeCodexBaseUrl(params: {
   provider: string;
   api: string | undefined;
   baseUrl: string | undefined;
+  /** True when the user explicitly set baseUrl via runtime config. When
+   *  explicit, do not rewrite `https://api.openai.com/v1` to the ChatGPT
+   *  Codex backend — that breaks paid OpenAI API-key users who chose that
+   *  endpoint deliberately. The native rewrite still applies when the
+   *  baseUrl is empty (default) or already a ChatGPT Codex variant. */
+  isExplicitlyConfigured?: boolean;
 }): boolean {
   if (!isOpenAICodexProvider(params.provider) || !isOpenAICodexResponsesApi(params.api)) {
     return false;
@@ -694,6 +700,9 @@ function shouldUseNativeCodexBaseUrl(params: {
   }
 
   const normalized = normalizeBaseUrl(baseUrl);
+  if (params.isExplicitlyConfigured && normalized === OPENAI_API_BASE_URL) {
+    return false;
+  }
   return normalized === OPENAI_API_BASE_URL || OPENAI_CODEX_NATIVE_BASE_URLS.has(normalized);
 }
 
@@ -709,7 +718,12 @@ function resolveProviderModelBaseUrl(params: {
     typeof params.fallbackBaseUrl === "string" ? params.fallbackBaseUrl : undefined;
   const baseUrl =
     configuredBaseUrl ?? fallbackBaseUrl ?? inferBaseUrlFromProvider(params.provider) ?? "";
-  return shouldUseNativeCodexBaseUrl({ provider: params.provider, api: params.api, baseUrl })
+  return shouldUseNativeCodexBaseUrl({
+    provider: params.provider,
+    api: params.api,
+    baseUrl,
+    isExplicitlyConfigured: configuredBaseUrl !== undefined,
+  })
     ? OPENAI_CODEX_RESPONSES_BASE_URL
     : baseUrl;
 }
@@ -771,7 +785,13 @@ export function shouldOmitTemperatureForApi(api: string | undefined): boolean {
   return isOpenAICodexResponsesApi(api);
 }
 
-/** Resolve known provider base URLs when model lookup misses. */
+/** Resolve known provider base URLs when model lookup misses.
+ *
+ *  Note: ollama is intentionally absent. Cloud Ollama (`https://ollama.com`)
+ *  and self-hosted setups both rely on explicit baseUrl configuration; a
+ *  silent `http://localhost:11434` fallback would silently route cloud
+ *  configs to localhost and produce confusing connection errors. Returning
+ *  undefined here forces an explicit baseUrl. */
 function inferBaseUrlFromProvider(provider: string): string | undefined {
   const normalized = normalizeProviderId(provider);
   const map: Record<string, string> = {
@@ -784,7 +804,6 @@ function inferBaseUrlFromProvider(provider: string): string | undefined {
     mistral: "https://api.mistral.ai",
     together: "https://api.together.xyz",
     openrouter: "https://openrouter.ai/api/v1",
-    ollama: "http://localhost:11434",
   };
   return map[normalized];
 }

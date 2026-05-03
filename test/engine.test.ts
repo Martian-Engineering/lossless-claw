@@ -4636,8 +4636,13 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 10_000,
     });
 
-    // Should fall back to live context, not return the assistant-only DB context
-    expect(result.messages).toBe(liveMessages);
+    // Should fall back to live context, not return the assistant-only DB context.
+    // The fallback must be a *new* array so the gateway hook's reference-equality
+    // check (`assembled.messages !== sourceMessages`) treats it as assembled —
+    // returning the same reference falls through to raw sourceMessages and
+    // re-introduces the prefill-rejection bug fixed by safeFallback.
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
     expect(result.estimatedTokens).toBe(0);
   });
 
@@ -5247,6 +5252,57 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[1]?.role).toBe("toolResult");
     expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("fc_1");
     expect(result.messages[2]?.role).toBe("user");
+  });
+
+  it("filters assistant messages with blank-text content during assembly", async () => {
+    // Regression: v0.9.3's #506 added an isThinkingOnlyContent filter for the
+    // Bedrock empty-content rejection, but did not handle the
+    // [{type:"text", text:""}] blank-text shape — Bedrock still rejects with
+    // "The text field in the ContentBlock object at messages.N.content.0 is
+    // blank". The cleanedEntries filter must also strip these.
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "Question?" }),
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "   \n\t  " }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Real answer." }],
+      } as AgentMessage,
+    });
+
+    const assembled = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(assembled.messages).toHaveLength(2);
+    expect(assembled.messages[0]?.role).toBe("user");
+    const assistant = assembled.messages[1] as {
+      role: string;
+      content?: Array<{ type?: string; text?: string }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content?.[0]?.text).toBe("Real answer.");
   });
 
   it("filters thinking-only assistant messages during assembly", async () => {

@@ -104,6 +104,22 @@ function isThinkingOnlyContent(content: unknown[]): boolean {
   );
 }
 
+/** Returns true when every block in the content array is a text block whose
+ *  text is empty or whitespace-only. Bedrock rejects messages whose content
+ *  is a `[{type:"text", text:""}]` shape with `The text field in the
+ *  ContentBlock object at messages.N.content.0 is blank`, so they must be
+ *  filtered before the cleaned tail is handed to the provider. */
+function isBlankContent(content: unknown[]): boolean {
+  if (content.length === 0) return false;
+  return content.every((block) => {
+    if (!block || typeof block !== "object") return false;
+    const record = block as Record<string, unknown>;
+    if (record.type !== "text") return false;
+    if (typeof record.text !== "string") return false;
+    return record.text.trim() === "";
+  });
+}
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface AssembleContextInput {
@@ -1242,20 +1258,22 @@ export class ContextAssembler {
       return entry;
     });
 
-    // Filter out assistant messages with empty or thinking-only content —
-    // these can occur when tool-use-only turns are stored with content=""
-    // and zero message_parts, when filterNonFreshAssistantToolCalls strips
-    // all tool_use blocks, or when a turn contains only thinking/reasoning
-    // blocks that will be stripped by the provider layer, leaving an empty
-    // content array. Anthropic/Bedrock reject empty content arrays/strings.
+    // Filter out assistant messages with empty, blank, or thinking-only
+    // content — these can occur when tool-use-only turns are stored with
+    // content="" and zero message_parts, when filterNonFreshAssistantToolCalls
+    // strips all tool_use blocks, when a turn contains only thinking/reasoning
+    // blocks that will be stripped by the provider layer, or when the stored
+    // content is a `[{type:"text", text:""}]` blank-text shape. Anthropic and
+    // Bedrock reject any of these as empty.
     const cleanedEntries = normalizedEntries.filter(
       (entry) =>
         !(
           entry.message?.role === "assistant" &&
           (Array.isArray(entry.message.content)
             ? entry.message.content.length === 0 ||
-              isThinkingOnlyContent(entry.message.content)
-            : !entry.message.content)
+              isThinkingOnlyContent(entry.message.content) ||
+              isBlankContent(entry.message.content)
+            : !entry.message.content || entry.message.content.trim() === "")
         ),
     );
     const cleaned = cleanedEntries.map((entry) => entry.message);
