@@ -245,7 +245,11 @@ describe("createLcmExpandQueryTool", () => {
       citedIds: ["sum_a"],
       sourceConversationId: 42,
       expandedSummaryCount: 1,
-      totalSourceTokens: 45000,
+      // Parent-side accountant overrides child-reported tokens with the
+      // deterministic value computed from observed lcm_describe / lcm_expand
+      // tool calls in the child transcript.  The mock transcript carries no
+      // tool calls, so the parent computes 0.
+      totalSourceTokens: 0,
       truncated: false,
     });
 
@@ -1122,7 +1126,9 @@ describe("createLcmExpandQueryTool", () => {
       sourceConversationIds: [7, 9],
       citedIds: ["sum_beta", "sum_gamma", "sum_alpha"],
       expandedSummaryCount: 3,
-      totalSourceTokens: 1000,
+      // Parent-side accountant overrides child reports; mock transcript has no
+      // tool calls so each bucket contributes 0 to the deterministic total.
+      totalSourceTokens: 0,
       truncated: false,
       conversationBreakdown: [
         {
@@ -1245,7 +1251,9 @@ describe("createLcmExpandQueryTool", () => {
       sourceConversationIds: [7, 11],
       citedIds: ["sum_b", "sum_a"],
       expandedSummaryCount: 2,
-      totalSourceTokens: 650,
+      // Parent-side accountant overrides child reports with the deterministic
+      // total observed in the child transcript (no tool calls in this mock).
+      totalSourceTokens: 0,
       truncated: false,
     });
     expect(result.details).not.toHaveProperty("sourceConversationId");
@@ -1351,7 +1359,9 @@ describe("createLcmExpandQueryTool", () => {
     expect(result.details).toMatchObject({
       sourceConversationIds: [20, 30, 40],
       expandedSummaryCount: 3,
-      totalSourceTokens: 300,
+      // Parent-side accountant overrides child reports; mock transcript carries
+      // no observable tool calls so deterministic total is 0.
+      totalSourceTokens: 0,
       truncated: true,
     });
     expect(result.details).toMatchObject({
@@ -1446,7 +1456,9 @@ describe("createLcmExpandQueryTool", () => {
       sourceConversationIds: [7],
       citedIds: ["sum_ok"],
       expandedSummaryCount: 1,
-      totalSourceTokens: 250,
+      // Parent-side accountant overrides child reports; mock transcript carries
+      // no observable tool calls so deterministic total is 0.
+      totalSourceTokens: 0,
       truncated: true,
     });
     expect(result.details).toMatchObject({
@@ -1504,6 +1516,35 @@ describe("createLcmExpandQueryTool", () => {
         sessionGetCalls += 1;
         return {
           messages: [
+            // Simulate the child agent's lcm_expand tool call so the parent-side
+            // accountant observes 500 tokens consumed and exhausts the budget.
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_expand_1",
+                  name: "lcm_expand",
+                  input: { summaryIds: ["sum_large"] },
+                },
+              ],
+            },
+            {
+              role: "toolResult",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_expand_1",
+                  name: "lcm_expand",
+                  output: {
+                    expansionCount: 1,
+                    citedIds: ["sum_large"],
+                    totalTokens: 500,
+                    truncated: false,
+                  },
+                },
+              ],
+            },
             {
               role: "assistant",
               content: [
@@ -2075,7 +2116,9 @@ describe("createLcmExpandQueryTool", () => {
       citedIds: ["sum_a"],
       sourceConversationId: 42,
       expandedSummaryCount: 1,
-      totalSourceTokens: 1200,
+      // Parent-side deterministic accountant; mock transcript has no observable
+      // tool calls so the override yields 0.
+      totalSourceTokens: 0,
       truncated: false,
     });
 
@@ -2089,7 +2132,9 @@ describe("createLcmExpandQueryTool", () => {
       citedIds: ["sum_a"],
       sourceConversationId: 42,
       expandedSummaryCount: 1,
-      totalSourceTokens: 1200,
+      // Parent-side deterministic accountant; mock transcript has no observable
+      // tool calls so the override yields 0.
+      totalSourceTokens: 0,
       truncated: false,
     });
 
@@ -2102,6 +2147,253 @@ describe("createLcmExpandQueryTool", () => {
       block: 1,
       timeout: 0,
       success: 2,
+    });
+  });
+
+  // PR-7 (#567): deterministic parent-side totalSourceTokens.  PR #513 fixed
+  // the symptom of `totalSourceTokens: 0` for explicit leaf-summary use by
+  // editing the delegated child agent's prompt; correctness then depended on
+  // the LLM obeying a natural-language instruction.  These tests pin the
+  // post-validation: the parent recomputes the value from observed
+  // lcm_describe / lcm_expand invocations, overrides the child-reported value,
+  // and emits a drift log when the two diverge by more than 10%.
+  describe("deterministic parent-side totalSourceTokens (PR-7)", () => {
+    function makeChildTranscript(params: {
+      describeBlocks?: Array<{ summaryId: string; tok: number; useId?: string }>;
+      expandBlocks?: Array<{ summaryIds: string[]; totalTokens: number; useId?: string }>;
+      reply: {
+        answer: string;
+        citedIds: string[];
+        expandedSummaryCount?: number;
+        totalSourceTokens?: number;
+        truncated?: boolean;
+      };
+    }): unknown[] {
+      const messages: unknown[] = [];
+      for (const [i, describe] of (params.describeBlocks ?? []).entries()) {
+        const useId = describe.useId ?? `toolu_describe_${i}`;
+        messages.push({
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: useId,
+              name: "lcm_describe",
+              input: { id: describe.summaryId },
+            },
+          ],
+        });
+        messages.push({
+          role: "toolResult",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: useId,
+              name: "lcm_describe",
+              output: `LCM_SUMMARY ${describe.summaryId}\nmeta conv=42 kind=leaf depth=0 tok=${describe.tok} descTok=0 srcTok=0 desc=0`,
+            },
+          ],
+        });
+      }
+      for (const [i, expand] of (params.expandBlocks ?? []).entries()) {
+        const useId = expand.useId ?? `toolu_expand_${i}`;
+        messages.push({
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: useId,
+              name: "lcm_expand",
+              input: { summaryIds: expand.summaryIds },
+            },
+          ],
+        });
+        messages.push({
+          role: "toolResult",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: useId,
+              name: "lcm_expand",
+              output: {
+                expansionCount: expand.summaryIds.length,
+                citedIds: expand.summaryIds,
+                totalTokens: expand.totalTokens,
+                truncated: false,
+              },
+            },
+          ],
+        });
+      }
+      messages.push({
+        role: "assistant",
+        content: [
+          { type: "text", text: JSON.stringify(params.reply) },
+        ],
+      });
+      return messages;
+    }
+
+    it("overrides child-reported zero when the cited leaf was described but not expanded", async () => {
+      const retrieval = makeRetrieval();
+      retrieval.describe.mockResolvedValue({
+        type: "summary",
+        summary: { conversationId: 42 },
+      });
+
+      const messages = makeChildTranscript({
+        describeBlocks: [{ summaryId: "sum_a", tok: 200 }],
+        // No lcm_expand: child relied entirely on the leaf summary content.
+        reply: {
+          answer: "Recovered from describe-only path.",
+          citedIds: ["sum_a"],
+          expandedSummaryCount: 1,
+          totalSourceTokens: 0, // The bug PR #513 was masking.
+          truncated: false,
+        },
+      });
+
+      callGatewayMock.mockImplementation(async (opts: unknown) => {
+        const request = opts as { method?: string };
+        if (request.method === "agent") return { runId: "run-pr7-leaf" };
+        if (request.method === "agent.wait") return { status: "ok" };
+        if (request.method === "sessions.get") return { messages };
+        if (request.method === "sessions.delete") return { ok: true };
+        return {};
+      });
+
+      const deps = makeDeps();
+      const tool = createLcmExpandQueryTool({
+        deps,
+        lcm: makeEngine({ retrieval }),
+        sessionId: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+      });
+      const result = await tool.execute("call-pr7-leaf", {
+        summaryIds: ["sum_a"],
+        prompt: "What did the leaf say?",
+        conversationId: 42,
+      });
+
+      // Parent-side override replaces child's reported 0 with 200.
+      expect(result.details).toMatchObject({
+        citedIds: ["sum_a"],
+        totalSourceTokens: 200,
+      });
+
+      // Drift was material (0 vs 200) so a structured drift log was emitted.
+      const driftLogs = (deps.log.info as ReturnType<typeof vi.fn>).mock.calls
+        .map(([msg]) => String(msg))
+        .filter((line) => line.includes("lcm.expand_query.token_count_drift"));
+      expect(driftLogs).toHaveLength(1);
+      expect(driftLogs[0]).toContain("childReported=0");
+      expect(driftLogs[0]).toContain("parentComputed=200");
+      expect(driftLogs[0]).toContain("conversationId=42");
+    });
+
+    it("does not log drift when child report matches parent computation within 10%", async () => {
+      const retrieval = makeRetrieval();
+      retrieval.describe.mockResolvedValue({
+        type: "summary",
+        summary: { conversationId: 42 },
+      });
+
+      const messages = makeChildTranscript({
+        expandBlocks: [{ summaryIds: ["sum_a"], totalTokens: 1000 }],
+        reply: {
+          answer: "Fully expanded.",
+          citedIds: ["sum_a"],
+          expandedSummaryCount: 1,
+          // Child reports 1050; parent computes 1000.  5% drift, below the
+          // 10% tolerance, so no drift log should be emitted.
+          totalSourceTokens: 1050,
+          truncated: false,
+        },
+      });
+
+      callGatewayMock.mockImplementation(async (opts: unknown) => {
+        const request = opts as { method?: string };
+        if (request.method === "agent") return { runId: "run-pr7-match" };
+        if (request.method === "agent.wait") return { status: "ok" };
+        if (request.method === "sessions.get") return { messages };
+        if (request.method === "sessions.delete") return { ok: true };
+        return {};
+      });
+
+      const deps = makeDeps();
+      const tool = createLcmExpandQueryTool({
+        deps,
+        lcm: makeEngine({ retrieval }),
+        sessionId: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+      });
+      const result = await tool.execute("call-pr7-match", {
+        summaryIds: ["sum_a"],
+        prompt: "Within tolerance.",
+        conversationId: 42,
+      });
+
+      // Parent override still wins, but no drift log.
+      expect(result.details).toMatchObject({
+        totalSourceTokens: 1000,
+      });
+      const driftLogs = (deps.log.info as ReturnType<typeof vi.fn>).mock.calls
+        .map(([msg]) => String(msg))
+        .filter((line) => line.includes("lcm.expand_query.token_count_drift"));
+      expect(driftLogs).toHaveLength(0);
+    });
+
+    it("logs drift when child report diverges from parent computation by more than 10%", async () => {
+      const retrieval = makeRetrieval();
+      retrieval.describe.mockResolvedValue({
+        type: "summary",
+        summary: { conversationId: 42 },
+      });
+
+      const messages = makeChildTranscript({
+        expandBlocks: [{ summaryIds: ["sum_a"], totalTokens: 500 }],
+        reply: {
+          answer: "Hallucinated count.",
+          citedIds: ["sum_a"],
+          expandedSummaryCount: 1,
+          // Child claims 1200; parent observed 500 — a 2.4x divergence.
+          totalSourceTokens: 1200,
+          truncated: false,
+        },
+      });
+
+      callGatewayMock.mockImplementation(async (opts: unknown) => {
+        const request = opts as { method?: string };
+        if (request.method === "agent") return { runId: "run-pr7-drift" };
+        if (request.method === "agent.wait") return { status: "ok" };
+        if (request.method === "sessions.get") return { messages };
+        if (request.method === "sessions.delete") return { ok: true };
+        return {};
+      });
+
+      const deps = makeDeps();
+      const tool = createLcmExpandQueryTool({
+        deps,
+        lcm: makeEngine({ retrieval }),
+        sessionId: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+      });
+      const result = await tool.execute("call-pr7-drift", {
+        summaryIds: ["sum_a"],
+        prompt: "Drift case.",
+        conversationId: 42,
+      });
+
+      expect(result.details).toMatchObject({
+        totalSourceTokens: 500,
+      });
+      const driftLogs = (deps.log.info as ReturnType<typeof vi.fn>).mock.calls
+        .map(([msg]) => String(msg))
+        .filter((line) => line.includes("lcm.expand_query.token_count_drift"));
+      expect(driftLogs).toHaveLength(1);
+      expect(driftLogs[0]).toContain("childReported=1200");
+      expect(driftLogs[0]).toContain("parentComputed=500");
+      expect(driftLogs[0]).toContain("expandTotal=500");
     });
   });
 });

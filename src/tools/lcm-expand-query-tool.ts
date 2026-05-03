@@ -313,6 +313,281 @@ function formatInvalidDelegatedReply(reply: string, reason: string): string {
   return `Delegated expansion query returned ${reason}: ${snippet}`;
 }
 
+type ObservedTokenAccount = {
+  expandTotalTokens: number;
+  describedSummaryTokens: Map<string, number>;
+  expandedSummaryIds: Set<string>;
+};
+
+function coerceFiniteNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return value;
+}
+
+function recordDescribeTokens(
+  account: ObservedTokenAccount,
+  output: unknown,
+): void {
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 4 || value == null) {
+      return;
+    }
+    if (typeof value === "string") {
+      // Parse text-form describe output: "LCM_SUMMARY sum_xxx" + "meta ... tok=N"
+      // and manifest lines "d0 sum_yyy k=leaf tok=N".
+      const headerMatch = value.match(/LCM_SUMMARY\s+(sum_[A-Za-z0-9_-]+)[\s\S]*?\btok=(\d+)/);
+      if (headerMatch) {
+        const summaryId = headerMatch[1];
+        const tok = Number(headerMatch[2]);
+        if (Number.isFinite(tok) && !account.describedSummaryTokens.has(summaryId)) {
+          account.describedSummaryTokens.set(summaryId, tok);
+        }
+      }
+      const manifestRe = /\b(sum_[A-Za-z0-9_-]+)\s+k=\w+\s+tok=(\d+)/g;
+      let match: RegExpExecArray | null;
+      while ((match = manifestRe.exec(value)) !== null) {
+        const summaryId = match[1];
+        const tok = Number(match[2]);
+        if (Number.isFinite(tok) && !account.describedSummaryTokens.has(summaryId)) {
+          account.describedSummaryTokens.set(summaryId, tok);
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visit(entry, depth + 1);
+      }
+      return;
+    }
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      // Structured details: { summary: { summaryId, tokenCount }, manifest: { nodes: [...] } }
+      const summaryId =
+        typeof record.summaryId === "string"
+          ? record.summaryId
+          : typeof record.id === "string" && (record.id as string).startsWith("sum_")
+            ? (record.id as string)
+            : undefined;
+      const tokenCount = coerceFiniteNumber(record.tokenCount);
+      if (summaryId && typeof tokenCount === "number") {
+        if (!account.describedSummaryTokens.has(summaryId)) {
+          account.describedSummaryTokens.set(summaryId, tokenCount);
+        }
+      }
+      for (const child of Object.values(record)) {
+        visit(child, depth + 1);
+      }
+    }
+  };
+  visit(output, 0);
+}
+
+function recordExpandTokens(
+  account: ObservedTokenAccount,
+  input: unknown,
+  output: unknown,
+): void {
+  // Track which summaryIds were expanded so we can avoid double-counting their tok.
+  const visitInput = (value: unknown, depth: number): void => {
+    if (depth > 3 || value == null) {
+      return;
+    }
+    if (typeof value === "string" && value.startsWith("sum_")) {
+      account.expandedSummaryIds.add(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visitInput(entry, depth + 1);
+      }
+      return;
+    }
+    if (typeof value === "object") {
+      for (const child of Object.values(value as Record<string, unknown>)) {
+        visitInput(child, depth + 1);
+      }
+    }
+  };
+  visitInput(input, 0);
+
+  // Find totalTokens in the output. Could be on details.totalTokens or a top-level totalTokens.
+  let total: number | undefined;
+  const visitOutput = (value: unknown, depth: number): void => {
+    if (total !== undefined || depth > 4 || value == null) {
+      return;
+    }
+    if (typeof value === "string") {
+      // Text form may include "total=N" or "totalTokens=N".
+      const m = value.match(/\btotalTokens[=:]\s*(\d+)/);
+      if (m) {
+        const n = Number(m[1]);
+        if (Number.isFinite(n)) {
+          total = n;
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visitOutput(entry, depth + 1);
+      }
+      return;
+    }
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      const direct = coerceFiniteNumber(record.totalTokens);
+      if (typeof direct === "number") {
+        total = direct;
+        return;
+      }
+      for (const child of Object.values(record)) {
+        visitOutput(child, depth + 1);
+        if (total !== undefined) return;
+      }
+    }
+  };
+  visitOutput(output, 0);
+  if (typeof total === "number") {
+    account.expandTotalTokens += Math.max(0, total);
+  }
+}
+
+/**
+ * Walk the delegated child session transcript and observe lcm_expand /
+ * lcm_describe tool invocations so the parent can deterministically recompute
+ * totalSourceTokens regardless of what the child reports.
+ */
+function buildObservedTokenAccount(messages: unknown[]): ObservedTokenAccount {
+  const account: ObservedTokenAccount = {
+    expandTotalTokens: 0,
+    describedSummaryTokens: new Map(),
+    expandedSummaryIds: new Set(),
+  };
+  if (!Array.isArray(messages)) {
+    return account;
+  }
+
+  // First pass: collect tool_use blocks keyed by their id, capturing tool name and input.
+  type ToolUseRecord = { name: string; input: unknown };
+  const toolUses = new Map<string, ToolUseRecord>();
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const content = (message as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const record = block as Record<string, unknown>;
+      const type = typeof record.type === "string" ? record.type : "";
+      const isToolCall =
+        type === "tool_use" ||
+        type === "tool-use" ||
+        type === "toolUse" ||
+        type === "toolCall" ||
+        type === "function_call" ||
+        type === "functionCall";
+      if (!isToolCall) continue;
+      const name =
+        typeof record.name === "string"
+          ? record.name
+          : typeof record.toolName === "string"
+            ? (record.toolName as string)
+            : "";
+      const id =
+        typeof record.id === "string"
+          ? record.id
+          : typeof record.tool_use_id === "string"
+            ? (record.tool_use_id as string)
+            : typeof record.call_id === "string"
+              ? (record.call_id as string)
+              : "";
+      if (!name || !id) continue;
+      if (name !== "lcm_expand" && name !== "lcm_describe") continue;
+      const input = record.input ?? record.arguments;
+      toolUses.set(id, { name, input });
+    }
+  }
+
+  // Second pass: match tool_result blocks back to their tool_use by id.
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const content = (message as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const record = block as Record<string, unknown>;
+      const type = typeof record.type === "string" ? record.type : "";
+      const isToolResult =
+        type === "tool_result" ||
+        type === "toolResult" ||
+        type === "function_call_output";
+      if (!isToolResult) continue;
+      const useId =
+        typeof record.tool_use_id === "string"
+          ? record.tool_use_id
+          : typeof record.call_id === "string"
+            ? (record.call_id as string)
+            : typeof record.toolCallId === "string"
+              ? (record.toolCallId as string)
+              : "";
+      const matchedUse = useId ? toolUses.get(useId) : undefined;
+      // Fall back to name-on-result if id linkage is missing.
+      const resolvedName =
+        matchedUse?.name ??
+        (typeof record.name === "string" &&
+        (record.name === "lcm_expand" || record.name === "lcm_describe")
+          ? (record.name as string)
+          : "");
+      if (resolvedName !== "lcm_expand" && resolvedName !== "lcm_describe") continue;
+      const output = record.output ?? record.content ?? record.result;
+      if (resolvedName === "lcm_expand") {
+        recordExpandTokens(account, matchedUse?.input, output);
+      } else {
+        recordDescribeTokens(account, output);
+      }
+    }
+  }
+
+  return account;
+}
+
+/**
+ * Compute the deterministic parent-side totalSourceTokens from observed
+ * tool calls and the child's declared cited summaries.
+ */
+function computeDeterministicTotalSourceTokens(
+  account: ObservedTokenAccount,
+  citedIds: string[],
+): number {
+  let total = account.expandTotalTokens;
+  for (const id of citedIds) {
+    if (account.expandedSummaryIds.has(id)) {
+      continue;
+    }
+    const tok = account.describedSummaryTokens.get(id);
+    if (typeof tok === "number" && tok > 0) {
+      total += tok;
+    }
+  }
+  return Math.max(0, Math.floor(total));
+}
+
+const TOKEN_COUNT_DRIFT_TOLERANCE = 0.1;
+
+function isTokenCountDrift(childReported: number, parentComputed: number): boolean {
+  if (childReported === parentComputed) {
+    return false;
+  }
+  if (parentComputed === 0) {
+    // Any nonzero child count when parent saw zero observable evidence is drift.
+    return childReported !== 0;
+  }
+  const ratio = Math.abs(childReported - parentComputed) / parentComputed;
+  return ratio > TOKEN_COUNT_DRIFT_TOLERANCE;
+}
+
 function buildConversationBuckets(candidates: SummaryCandidate[]): ConversationBucket[] {
   const buckets = new Map<
     number,
@@ -819,9 +1094,8 @@ async function runDelegatedExpandQuery(
         params: { key: childSessionKey, limit: 80 },
         timeoutMs: GATEWAY_TIMEOUT_MS,
       })) as { messages?: unknown[] };
-      const reply = params.deps.readLatestAssistantReply(
-        Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
-      );
+      const messages = Array.isArray(replyPayload.messages) ? replyPayload.messages : [];
+      const reply = params.deps.readLatestAssistantReply(messages);
       const parsed = parseDelegatedExpandQueryReply(reply, params.bucket.summaryIds.length);
       if (!parsed.ok) {
         throw new Error(parsed.error);
@@ -837,7 +1111,34 @@ async function runDelegatedExpandQuery(
         runId,
       });
 
-      return parsed.value;
+      // Deterministic parent-side accountant: recompute totalSourceTokens from
+      // observed lcm_expand / lcm_describe invocations rather than trusting the
+      // LLM-reported value (PR #513 relied on a prompt rule alone).  Override
+      // the child's number; emit a drift log when the two diverge by >10%.
+      const observedAccount = buildObservedTokenAccount(messages);
+      const childReportedTokens = parsed.value.totalSourceTokens;
+      const parentComputedTokens = computeDeterministicTotalSourceTokens(
+        observedAccount,
+        parsed.value.citedIds,
+      );
+      if (isTokenCountDrift(childReportedTokens, parentComputedTokens)) {
+        params.deps.log.info(
+          `[lcm] lcm.expand_query.token_count_drift requestId=${params.requestId} ` +
+            `conversationId=${params.bucket.conversationId} ` +
+            `childReported=${childReportedTokens} parentComputed=${parentComputedTokens} ` +
+            `expandTotal=${observedAccount.expandTotalTokens} ` +
+            `citedLeafContribCount=${parsed.value.citedIds.filter(
+              (id) =>
+                !observedAccount.expandedSummaryIds.has(id) &&
+                observedAccount.describedSummaryTokens.has(id),
+            ).length}`,
+        );
+      }
+
+      return {
+        ...parsed.value,
+        totalSourceTokens: parentComputedTokens,
+      };
     } finally {
       try {
         await params.deps.callGateway({
