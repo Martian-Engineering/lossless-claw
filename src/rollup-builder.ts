@@ -556,25 +556,38 @@ export class RollupBuilder {
 
     try {
       const finishedAt = new Date();
-      const latestState = this.store.getState(conversationId);
-      const latestSummaryCreatedAt =
-        this.store.getLatestLeafSummaryCreatedAt(conversationId);
-      const latestSummaryFingerprint =
-        this.store.getLeafSummarySweepFingerprint(conversationId);
-      const shouldClearPending =
-        result.errors.length === 0 &&
-        isTimestampAtOrBefore(latestState?.last_message_at, scannedAt) &&
-        isTimestampAtOrBefore(latestSummaryCreatedAt, scannedAt) &&
-        latestSummaryFingerprint === scanFingerprint;
-      this.store.upsertState(conversationId, {
-        timezone: this.config.timezone,
-        last_rollup_check_at: laterDate(
-          finishedAt,
-          latestState?.last_rollup_check_at
-        ).toISOString(),
-        pending_rebuild:
-          result.errors.length === 0 && shouldClearPending ? 0 : 1,
-      });
+      // P1-3 race fix: re-read latestState / latestSummaryCreatedAt /
+      // latestSummaryFingerprint INSIDE a BEGIN IMMEDIATE transaction so a
+      // concurrent ingest writer that flips pending_rebuild=1 between the
+      // builder's outer read and the post-build write cannot be silently
+      // clobbered. The CAS-style read inside the txn observes the freshest
+      // value the writer committed; if the ingest moved last_message_at
+      // past scannedAt, we re-arm pending_rebuild instead of clearing.
+      await withDatabaseTransaction(
+        this.store.db,
+        "BEGIN IMMEDIATE",
+        async () => {
+          const latestState = this.store.getState(conversationId);
+          const latestSummaryCreatedAt =
+            this.store.getLatestLeafSummaryCreatedAt(conversationId);
+          const latestSummaryFingerprint =
+            this.store.getLeafSummarySweepFingerprint(conversationId);
+          const shouldClearPending =
+            result.errors.length === 0 &&
+            isTimestampAtOrBefore(latestState?.last_message_at, scannedAt) &&
+            isTimestampAtOrBefore(latestSummaryCreatedAt, scannedAt) &&
+            latestSummaryFingerprint === scanFingerprint;
+          this.store.upsertState(conversationId, {
+            timezone: this.config.timezone,
+            last_rollup_check_at: laterDate(
+              finishedAt,
+              latestState?.last_rollup_check_at
+            ).toISOString(),
+            pending_rebuild:
+              result.errors.length === 0 && shouldClearPending ? 0 : 1,
+          });
+        }
+      );
     } catch (error) {
       result.errors.push(`final sweep state update failed: ${formatError(error)}`);
     }

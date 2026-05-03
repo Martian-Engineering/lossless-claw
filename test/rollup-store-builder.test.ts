@@ -3537,4 +3537,146 @@ describe("LCM weekly and monthly rollups", () => {
       100
     );
   });
+
+  it("re-reads rollup state INSIDE a BEGIN IMMEDIATE transaction in buildDailyRollups (P1-3)", async () => {
+    // Structural pin (mirrors P1-8 / R3-FIX-2 patterns). Pre-fix, the
+    // post-build state-update block read latestState / latestSummaryCreatedAt /
+    // latestSummaryFingerprint OUTSIDE any transaction, decided
+    // shouldClearPending, then wrote pending_rebuild=0 — a concurrent ingest
+    // that flipped pending_rebuild=1 between our read and our write was
+    // silently clobbered. The fix wraps read-decide-write in
+    // withDatabaseTransaction("BEGIN IMMEDIATE", …) and re-reads INSIDE the
+    // txn. A deterministic concurrency repro is hard once BEGIN IMMEDIATE is
+    // in place (the race is now serialized by the SQLite write lock); the
+    // structural assertion is acceptable.
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = url.fileURLToPath(import.meta.url);
+    const source = fs.readFileSync(
+      path.join(path.dirname(here), "..", "src", "rollup-builder.ts"),
+      "utf8"
+    );
+
+    const dailyStart = source.indexOf("async buildDailyRollups(");
+    expect(dailyStart).toBeGreaterThan(-1);
+    const dailyBody = source.slice(dailyStart);
+
+    // Locate the post-build "final sweep state update" block — anchored on
+    // the catch's error-message string, which is unique in the file.
+    const finalSweepCatch = dailyBody.indexOf(
+      "final sweep state update failed:"
+    );
+    expect(finalSweepCatch).toBeGreaterThan(-1);
+
+    // Walk backwards to the enclosing try-block so we can scan it.
+    const tryStart = dailyBody.lastIndexOf("try {", finalSweepCatch);
+    expect(tryStart).toBeGreaterThan(-1);
+    const blockRegion = dailyBody.slice(tryStart, finalSweepCatch);
+
+    // Inside that try-block, every wall-state read must come AFTER
+    // withDatabaseTransaction("BEGIN IMMEDIATE", …).
+    const txStart = blockRegion.indexOf('withDatabaseTransaction(');
+    expect(txStart).toBeGreaterThan(-1);
+    const beginImmediate = blockRegion.indexOf('"BEGIN IMMEDIATE"');
+    expect(beginImmediate).toBeGreaterThan(txStart);
+
+    const getStateRead = blockRegion.indexOf("this.store.getState(");
+    expect(getStateRead).toBeGreaterThan(txStart);
+    const fingerprintRead = blockRegion.indexOf(
+      "this.store.getLeafSummarySweepFingerprint("
+    );
+    expect(fingerprintRead).toBeGreaterThan(txStart);
+    const summaryAtRead = blockRegion.indexOf(
+      "this.store.getLatestLeafSummaryCreatedAt("
+    );
+    expect(summaryAtRead).toBeGreaterThan(txStart);
+
+    // The upsertState write must also be inside the txn.
+    const upsertWrite = blockRegion.indexOf("this.store.upsertState(");
+    expect(upsertWrite).toBeGreaterThan(txStart);
+  });
+
+  it("clears pending_rebuild on a clean build and re-arms when state advanced mid-sweep (P1-3)", async () => {
+    // End-to-end: a clean build without concurrent writers clears the flag.
+    // A simulated concurrent writer that advances last_message_at past
+    // scannedAt before the post-build txn runs causes shouldClearPending to
+    // observe the fresh value INSIDE the txn and re-arm pending_rebuild=1.
+    const { conversationStore, summaryStore, rollupStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "race-pending-rebuild",
+      sessionKey: "agent:main:race",
+      title: "race",
+    });
+
+    await summaryStore.insertSummary({
+      summaryId: "race_sum_a",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Leaf alpha",
+      tokenCount: 5,
+      sourceMessageTokenCount: 5,
+      earliestAt: new Date("2026-04-27T10:00:00.000Z"),
+      latestAt: new Date("2026-04-27T10:30:00.000Z"),
+    });
+
+    const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+
+    // Happy path — no concurrent writer.
+    rollupStore.upsertState(conversation.conversationId, {
+      timezone: "UTC",
+      pending_rebuild: 1,
+      last_message_at: "2026-04-27T10:30:00.000Z",
+    });
+    await builder.buildDailyRollups(conversation.conversationId, {
+      forceCurrentDay: true,
+    });
+    const cleanState = rollupStore.getState(conversation.conversationId);
+    expect(cleanState?.pending_rebuild).toBe(0);
+
+    // Race path — patch the store's getState to simulate a concurrent ingest
+    // writing last_message_at AFTER scannedAt right before the builder's
+    // post-build txn body reads state. The builder's BEGIN IMMEDIATE serializes
+    // this, but we model the "writer committed before txn started" case by
+    // mutating the row inside the same txn at the moment getState fires —
+    // which is exactly what the OLD code missed.
+    rollupStore.upsertState(conversation.conversationId, {
+      timezone: "UTC",
+      pending_rebuild: 1,
+      last_message_at: "2026-04-27T10:30:00.000Z",
+    });
+
+    const originalGetState = rollupStore.getState.bind(rollupStore);
+    let stateCallCount = 0;
+    const spy = vi
+      .spyOn(rollupStore, "getState")
+      .mockImplementation((convId: number) => {
+        stateCallCount += 1;
+        // On the post-build txn read (the SECOND call from this test path),
+        // simulate a concurrent ingest that just advanced last_message_at
+        // far past scannedAt. With the fix, the builder observes this
+        // advance INSIDE its own txn and re-arms pending_rebuild=1.
+        if (stateCallCount === 2) {
+          rollupStore.db
+            .prepare(
+              `UPDATE lcm_rollup_state
+                 SET last_message_at = ?
+               WHERE conversation_id = ?`
+            )
+            .run("2099-12-31T23:59:59.000Z", convId);
+        }
+        return originalGetState(convId);
+      });
+
+    await builder.buildDailyRollups(conversation.conversationId, {
+      forceCurrentDay: true,
+    });
+    spy.mockRestore();
+
+    // The fresh last_message_at observed inside the txn is well after
+    // scannedAt, so the builder must re-arm rather than clear.
+    const racedState = rollupStore.getState(conversation.conversationId);
+    expect(racedState?.pending_rebuild).toBe(1);
+  });
 });
