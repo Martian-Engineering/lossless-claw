@@ -53,6 +53,16 @@ jobs:
       - name: Build plugin bundle
         run: npm run build
 
+      - name: Prune devDependencies (drop pinned `pi-*` so import resolves against host)
+        # `npm ci` installs the pinned `@mariozechner/pi-*` devDependencies that
+        # the build needs.  Once the bundle is built, those devDeps must be
+        # removed so the smoke import doesn't accidentally satisfy
+        # `import "@mariozechner/pi-ai"` from the pinned 0.66.1 we ship for
+        # local builds — instead it must resolve against whatever
+        # `openclaw@latest` brings transitively, which is the install-time
+        # surface real users see.
+        run: npm prune --omit=dev
+
       - name: Install latest openclaw alongside
         run: npm install --no-save openclaw@latest
 

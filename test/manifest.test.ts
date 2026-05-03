@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const SRC_TOOLS_DIR = resolve(HERE, "..", "src", "tools");
 const PLUGIN_INDEX = resolve(HERE, "..", "src", "plugin", "index.ts");
 
 /**
@@ -24,23 +25,24 @@ const PLUGIN_INDEX = resolve(HERE, "..", "src", "plugin", "index.ts");
  *     canonical id (e.g. "lcm_grep").
  *   - `openclaw.plugin.json#contracts.tools` is the static declaration.
  *
- * To keep the test robust to refactors, we walk the registerTool factories
- * forward to the source files that define each tool's `name:` and grep those
- * for the canonical strings. This catches both manifest-side drift (forgot to
- * add a name) and source-side drift (renamed a tool).
+ * To keep the test robust to refactors:
+ *   - Tool source files are discovered by scanning `src/tools/lcm-*-tool.ts`,
+ *     so adding a new tool file doesn't require editing this test.
+ *   - The `registerTool` matcher accepts both arrow-expression bodies (`(ctx)
+ *     => createXTool(...)`) and arrow-block bodies (`(ctx) => { return
+ *     createXTool(...) }`), so a refactor to a block body doesn't fail
+ *     spuriously.
  */
 
-const TOOL_FACTORY_FILES = [
-  "src/tools/lcm-grep-tool.ts",
-  "src/tools/lcm-describe-tool.ts",
-  "src/tools/lcm-expand-tool.ts",
-  "src/tools/lcm-expand-query-tool.ts",
-] as const;
+function discoverToolFactoryFiles(): string[] {
+  return readdirSync(SRC_TOOLS_DIR)
+    .filter((name) => /^lcm-[a-z0-9-]+-tool\.ts$/.test(name))
+    .map((name) => resolve(SRC_TOOLS_DIR, name));
+}
 
 function extractToolNames(): string[] {
   const names = new Set<string>();
-  for (const rel of TOOL_FACTORY_FILES) {
-    const abs = resolve(HERE, "..", rel);
+  for (const abs of discoverToolFactoryFiles()) {
     const src = readFileSync(abs, "utf8");
     // Match e.g. `name: "lcm_grep",` or `name: 'lcm_grep'`. The tool name is
     // a tightly-constrained identifier (lcm_<word>), so the regex is narrow on
@@ -55,9 +57,15 @@ function extractToolNames(): string[] {
 function extractRegisterToolFactoryCallSites(): string[] {
   const src = readFileSync(PLUGIN_INDEX, "utf8");
   // Find each `api.registerTool(...)` call and capture the inner factory
-  // identifier (e.g. createLcmGrepTool). This catches the case where a new
-  // registerTool call is added but the contracts.tools array isn't updated.
-  const matches = src.matchAll(/api\.registerTool\s*\(\s*\([^)]*\)\s*=>\s*\n?\s*(create[A-Za-z]+Tool)\b/g);
+  // identifier (e.g. createLcmGrepTool). Tolerates both expression-body and
+  // block-body arrow forms, optional async, and any whitespace/newlines:
+  //
+  //   api.registerTool((ctx) => createLcmGrepTool(...))
+  //   api.registerTool((ctx) => { return createLcmGrepTool(...) })
+  //   api.registerTool(async (ctx) => createLcmGrepTool(...))
+  const pattern =
+    /api\.registerTool\s*\(\s*(?:async\s+)?\([^)]*\)\s*=>\s*\{?\s*(?:return\s+)?(create[A-Za-z]+Tool)\b/g;
+  const matches = src.matchAll(pattern);
   return [...matches].map((m) => m[1]).sort();
 }
 
