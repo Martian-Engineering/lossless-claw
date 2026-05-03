@@ -46,7 +46,12 @@ import {
   parseFileBlocks,
 } from "./large-files.js";
 import { describeLogError } from "./lcm-log.js";
-import { describeLcmConfigSource } from "./db/config.js";
+import {
+  DEFAULT_PRESSURE_TIERS,
+  DEFAULT_SWEEP_TARGET_THRESHOLD,
+  DEFAULT_SWEEP_TRIGGER_THRESHOLD,
+  describeLcmConfigSource,
+} from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
@@ -149,7 +154,13 @@ type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
   sessionKey?: string;
-  tokenBudget: number;
+  /**
+   * Optional — when undefined, executeCompactionCore returns
+   * `{ ok: false, reason: "missing token budget in compact params" }`.
+   * Public callers should resolve and reserve-adjust budget BEFORE calling
+   * (see compact() public API for the pattern).
+   */
+  tokenBudget?: number;
   currentTokenCount?: number;
   compactionTarget?: "budget" | "threshold";
   customInstructions?: string;
@@ -2001,29 +2012,178 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget?: number;
     runtimeContext?: Record<string, unknown>;
     legacyParams?: Record<string, unknown>;
+    /**
+     * When `true`, treat `params.tokenBudget` (if provided) as ALREADY
+     * reserve-adjusted and skip subtraction. Internal helpers like
+     * `executeCompactionCore` set this to avoid double-subtraction along the
+     * deferred-compaction drain path:
+     *   afterTurn → resolveTokenBudget(raw) → adjusted → record debt
+     *   maintain → reads adjusted from debt → executeCompactionCore(adjusted)
+     *   ↑ if executeCompactionCore re-applies reserve here, we lose 2× the
+     *   reserve from the budget LCM computes percentages against.
+     *
+     * Defaults to `false` so public entry points keep getting the adjusted
+     * value without changes.
+     */
+    alreadyReserveAdjusted?: boolean;
   }): number | undefined {
     const lp = asRecord(params.runtimeContext) ?? params.legacyParams ?? {};
+    let raw: number | undefined;
+    let explicit = false;
     if (
       typeof params.tokenBudget === "number" &&
       Number.isFinite(params.tokenBudget) &&
       params.tokenBudget > 0
     ) {
-      return Math.floor(params.tokenBudget);
-    }
-    if (
+      raw = Math.floor(params.tokenBudget);
+      explicit = true;
+    } else if (
       typeof lp.tokenBudget === "number" &&
       Number.isFinite(lp.tokenBudget) &&
       lp.tokenBudget > 0
     ) {
-      return Math.floor(lp.tokenBudget);
+      raw = Math.floor(lp.tokenBudget);
     }
-    return undefined;
+    if (raw === undefined) {
+      return undefined;
+    }
+    // Skip reserve subtraction when caller explicitly opts out (already
+    // adjusted). Otherwise apply normally so public entry points get the
+    // effective prompt budget.
+    if (params.alreadyReserveAdjusted && explicit) {
+      return raw;
+    }
+    return this.applyReserveTokens(raw, lp);
+  }
+
+  /**
+   * Subtract the runtime's response-output reserve from the resolved budget so
+   * LCM percentages (`contextThreshold`, `sweepTargetThreshold`, and any other
+   * downstream pressure thresholds) compute against the EFFECTIVE prompt
+   * budget — the same number the runtime actually overflows at.
+   *
+   * Without this, callers like the openclaw gateway pass `tokenBudget = full
+   * context window` while the runtime overflows at `tokenBudget - reserve`,
+   * making LCM's percentages too generous and letting the prompt grow past
+   * the overflow point before any compaction threshold fires.
+   *
+   * Reserve is read from `runtimeContext.reserveTokens` (preferred) or
+   * `runtimeContext.reserveTokensFloor` (legacy openclaw key) — both are
+   * passed through unchanged from the host. Defaults to 0 when neither is
+   * present so plugins that don't pass a reserve get the legacy behavior.
+   */
+  private applyReserveTokens(
+    rawBudget: number,
+    runtimeContext: Record<string, unknown>,
+  ): number {
+    const reserve =
+      this.normalizeOptionalCount(runtimeContext.reserveTokens)
+        ?? this.normalizeOptionalCount(runtimeContext.reserveTokensFloor)
+        ?? 0;
+    if (reserve <= 0) {
+      return rawBudget;
+    }
+    if (reserve >= rawBudget) {
+      // Misconfiguration: reserve consumes the entire budget. The legacy
+      // floor-at-1 silently produced a degenerate budget that propagated
+      // pathological 0-target loops through compactFullSweep. Log loudly and
+      // ignore the reserve so the caller's downstream safety checks see a
+      // realistic budget instead of `1`.
+      this.deps.log.warn(
+        `[lcm] applyReserveTokens: misconfigured reserve (${reserve}) >= rawBudget (${rawBudget}); ignoring reserve to avoid degenerate budget. Lower runtimeContext.reserveTokens (or the legacy reserveTokensFloor key) or raise the model's tokenBudget.`,
+      );
+      return rawBudget;
+    }
+    return rawBudget - reserve;
   }
 
   /** Cap a resolved token budget against the configured maxAssemblyTokenBudget. */
   private applyAssemblyBudgetCap(budget: number): number {
     const cap = this.config.maxAssemblyTokenBudget;
     return cap != null && cap > 0 ? Math.min(budget, cap) : budget;
+  }
+
+  /**
+   * Resolve the pressure-tiered dispatch policy for `compactFullSweep`.
+   *
+   * Layered architecture:
+   *   • current pressure < tier-1 ratio   → 1 pass (existing behavior),
+   *                                          target = contextThreshold
+   *   • tier-1 ≤ pressure < tier-2        → tier-1 maxPasses,
+   *                                          target = contextThreshold
+   *   • tier-2 ≤ pressure < sweepTrigger  → tier-2 maxPasses,
+   *                                          target = contextThreshold
+   *   • pressure ≥ sweepTriggerThreshold  → no pass cap (unlimited),
+   *                                          target = sweepTargetThreshold
+   *
+   * When `currentTokenCount` is unknown, falls back to the GENTLEST policy
+   * (1 pass, target = contextThreshold) rather than aggressive sweep mode.
+   * That used to be sweep semantics for "PR #558 backward compat" but we
+   * realized that's the opposite of safe defaults — under-instrumented
+   * callers should not silently get a deep multi-pass sweep.
+   */
+  private resolvePressureDispatchPolicy(input: {
+    currentTokenCount?: number;
+    tokenBudget: number;
+  }): { targetRatio: number; maxPasses?: number } {
+    // Sort tiers defensively in case a caller mutates config or constructs
+    // an LcmConfig literal without going through resolveLcmConfig.
+    // Treat an EMPTY array the same as `undefined` and fall back to the
+    // canonical ladder. Without this, an explicit `pressureTiers: []` would
+    // silently produce 1-pass-everywhere behavior — diverging from the
+    // documented "empty/malformed → defaults" semantics in the resolver.
+    const tiers =
+      Array.isArray(this.config.pressureTiers) && this.config.pressureTiers.length > 0
+        ? [...this.config.pressureTiers].sort((a, b) => a.ratio - b.ratio)
+        : DEFAULT_PRESSURE_TIERS;
+    const sweepTarget = this.config.sweepTargetThreshold ?? DEFAULT_SWEEP_TARGET_THRESHOLD;
+    const sweepTrigger = this.config.sweepTriggerThreshold ?? DEFAULT_SWEEP_TRIGGER_THRESHOLD;
+    const trigger = this.config.contextThreshold;
+
+    if (
+      typeof input.currentTokenCount !== "number"
+      || !Number.isFinite(input.currentTokenCount)
+      || input.currentTokenCount <= 0
+      || input.tokenBudget <= 0
+    ) {
+      // Unknown pressure — gentlest policy. Target the trigger line, cap to
+      // 1 pass so we don't surprise the caller with a multi-pass sweep on
+      // data they didn't provide.
+      return { targetRatio: trigger, maxPasses: 1 };
+    }
+
+    const currentRatio = input.currentTokenCount / input.tokenBudget;
+
+    if (currentRatio >= sweepTrigger) {
+      // Sweep mode: deep target, no per-dispatch pass cap.
+      return { targetRatio: sweepTarget };
+    }
+
+    // Walk tiers ascending; the LAST tier whose ratio is crossed wins.
+    // Validate per-tier defensively in case a malformed entry slipped past
+    // the resolver.
+    let activeMaxPasses: number | undefined;
+    for (const tier of tiers) {
+      if (
+        !tier
+        || typeof tier.ratio !== "number"
+        || !Number.isFinite(tier.ratio)
+        || typeof tier.maxPasses !== "number"
+        || !Number.isFinite(tier.maxPasses)
+        || tier.maxPasses < 1
+      ) {
+        continue;
+      }
+      if (currentRatio >= tier.ratio) {
+        activeMaxPasses = Math.floor(tier.maxPasses);
+      } else {
+        break;
+      }
+    }
+    return {
+      targetRatio: trigger, // gentle target (don't overshoot below trigger line)
+      maxPasses: activeMaxPasses ?? 1, // 1 pass if no tier crossed
+    };
   }
 
   /** Normalize token counters that may legitimately be zero. */
@@ -3045,6 +3205,13 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     tokenBudget: number;
     currentTokenCount?: number;
+    /**
+     * Optional runtimeContext passed through from `assemble()`. Threaded into
+     * `consumeDeferredCompactionDebt` so downstream `executeCompactionCore`
+     * can consume `provider`/`model`/`manualCompaction` fields rather than
+     * falling back to telemetry-only legacy params.
+     */
+    runtimeContext?: Record<string, unknown>;
   }): Promise<void> {
     const sessionLabel = [
       `session=${params.sessionId}`,
@@ -3084,6 +3251,7 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             tokenBudget: params.tokenBudget,
             currentTokenCount: params.currentTokenCount,
+            runtimeContext: params.runtimeContext,
             legacyParams: deferredLegacyParams,
           });
           return;
@@ -3112,10 +3280,15 @@ export class LcmContextEngine implements ContextEngine {
         }
       ).manualCompaction === true;
     const forceCompaction = force || manualCompactionRequested;
+    // Internal helper called from consumeDeferredCompactionDebt etc. — the
+    // explicit params.tokenBudget is already reserve-adjusted by the caller
+    // (see resolveTokenBudget JSDoc for the deferred-compaction drain path).
+    // Skip re-subtraction here to avoid losing 2× the reserve.
     const resolvedTokenBudget = this.resolveTokenBudget({
       tokenBudget: params.tokenBudget,
       runtimeContext: params.runtimeContext,
       legacyParams,
+      alreadyReserveAdjusted: true,
     });
     const tokenBudget = resolvedTokenBudget
       ? this.applyAssemblyBudgetCap(resolvedTokenBudget)
@@ -3174,6 +3347,23 @@ export class LcmContextEngine implements ContextEngine {
     // overflow counts can drive recovery even when persisted context is already small.
     const useSweep = manualCompactionRequested || params.compactionTarget === "threshold";
     if (useSweep) {
+      // Pressure-tiered dispatch policy:
+      //   • below sweepTriggerThreshold: pick a tier from `pressureTiers`
+      //     (default tier-1 at 0.70 → 2 passes, tier-2 at 0.80 → 3 passes)
+      //     and target contextThreshold (gentle, exits at trigger line).
+      //   • at or above sweepTriggerThreshold (default 0.91): sweep mode —
+      //     no pass cap, target sweepTargetThreshold (default 0.50, deep
+      //     headroom-creating compaction).
+      //
+      // Multi-pass amortizes cache invalidation: every pass in a single
+      // dispatch invalidates the SAME cache prefix (modification point
+      // forward), so 3 passes cost the same cache-wise as 1 but reduce 3×
+      // as many tokens. That's why higher pressure → more passes per
+      // dispatch is the right shape rather than "fire more often."
+      const dispatchPolicy = this.resolvePressureDispatchPolicy({
+        currentTokenCount: observedTokens,
+        tokenBudget,
+      });
       const sweepResult = await this.compaction.compact({
         conversationId,
         tokenBudget,
@@ -3181,6 +3371,10 @@ export class LcmContextEngine implements ContextEngine {
         force: forceCompaction,
         hardTrigger: false,
         summaryModel,
+        targetRatio: dispatchPolicy.targetRatio,
+        ...(dispatchPolicy.maxPasses !== undefined
+          ? { maxPasses: dispatchPolicy.maxPasses }
+          : {}),
       });
 
       if (sweepResult.authFailure && breakerKey) {
@@ -5386,7 +5580,7 @@ export class LcmContextEngine implements ContextEngine {
           conversation.conversationId,
         );
         if (params.runtimeContext?.allowDeferredCompactionExecution === true) {
-          const runtimeTokenBudget = (() => {
+          const runtimeTokenBudgetRaw = (() => {
             const tokenBudget = asRecord(params.runtimeContext)?.tokenBudget;
             if (
               typeof tokenBudget === "number"
@@ -5397,6 +5591,17 @@ export class LcmContextEngine implements ContextEngine {
             }
             return 128_000;
           })();
+          // Apply reserve subtraction here at the public-entry level so the
+          // value passed to consumeDeferredCompactionDebt is the EFFECTIVE
+          // prompt budget. Otherwise executeCompactionCore (which sets
+          // alreadyReserveAdjusted: true to avoid double-subtraction in the
+          // afterTurn-records-then-maintain-drains path) would skip
+          // subtraction here and silently bypass reserve alignment when
+          // recordedTokenBudget is null (fresh maintenance row).
+          const runtimeTokenBudget = this.applyReserveTokens(
+            runtimeTokenBudgetRaw,
+            asRecord(params.runtimeContext) ?? {},
+          );
           if ((maintenance?.pending || maintenance?.running)
             && this.shouldDelayPromptMutatingDeferredCompaction(telemetry)) {
             this.deps.log.info(
@@ -5989,7 +6194,17 @@ export class LcmContextEngine implements ContextEngine {
       runtimeContext: params.runtimeContext,
       legacyParams,
     });
-    const tokenBudget = this.applyAssemblyBudgetCap(resolvedTokenBudget ?? DEFAULT_AFTER_TURN_TOKEN_BUDGET);
+    // When neither params.tokenBudget nor runtimeContext.tokenBudget is
+    // supplied, resolveTokenBudget returns undefined and we fall back to the
+    // default. Apply reserve adjustment to the fallback too so percentages
+    // compute against the EFFECTIVE budget — matches the maintain() pattern
+    // and prevents reserve-aware alignment from being silently bypassed when
+    // a host calls afterTurn with reserveTokens but no tokenBudget.
+    const fallbackBudget = this.applyReserveTokens(
+      DEFAULT_AFTER_TURN_TOKEN_BUDGET,
+      asRecord(params.runtimeContext) ?? {},
+    );
+    const tokenBudget = this.applyAssemblyBudgetCap(resolvedTokenBudget ?? fallbackBudget);
     if (resolvedTokenBudget === undefined) {
       this.deps.log.warn(
         `[lcm] afterTurn: tokenBudget not provided; using default ${DEFAULT_AFTER_TURN_TOKEN_BUDGET}`,
@@ -6184,6 +6399,15 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget?: number;
     /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
     prompt?: string;
+    /**
+     * Optional runtime context — when supplied with `reserveTokens` (or the
+     * legacy `reserveTokensFloor` key), the deferred-compaction drain path
+     * triggered from this `assemble()` call computes pressure ratios against
+     * the EFFECTIVE prompt budget instead of the raw context window. Mirrors
+     * the reserve-aware semantics of `afterTurn()` / `maintain()`. Backward
+     * compatible: when omitted, the legacy raw-budget behavior is preserved.
+     */
+    runtimeContext?: Record<string, unknown>;
   }): Promise<AssembleResult> {
     // Return a new fallback array so the runtime hook treats this as assembled
     // context, and remove assistant prefill tails from fallback-only paths.
@@ -6217,13 +6441,22 @@ export class LcmContextEngine implements ContextEngine {
         return safeFallback();
       }
 
-      const tokenBudget = this.applyAssemblyBudgetCap(
+      const rawTokenBudget =
         typeof params.tokenBudget === "number" &&
         Number.isFinite(params.tokenBudget) &&
         params.tokenBudget > 0
           ? Math.floor(params.tokenBudget)
-          : 128_000,
+          : 128_000;
+      // Apply reserve subtraction at the public-entry level so the value
+      // passed downstream is the EFFECTIVE prompt budget. Without this, the
+      // assemble-driven deferred compaction drain path would compute pressure
+      // ratios against the raw context window — same class of bug as the
+      // maintain() path, surfaced by the final adversarial sweep.
+      const adjustedTokenBudget = this.applyReserveTokens(
+        rawTokenBudget,
+        asRecord(params.runtimeContext) ?? {},
       );
+      const tokenBudget = this.applyAssemblyBudgetCap(adjustedTokenBudget);
       const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
       const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
         conversation.conversationId,
@@ -6236,6 +6469,7 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             tokenBudget,
             currentTokenCount: liveContextTokens,
+            runtimeContext: asRecord(params.runtimeContext),
           });
         } catch (error) {
           this.deps.log.warn(
@@ -6664,11 +6898,26 @@ export class LcmContextEngine implements ContextEngine {
             reason: "no conversation found for session",
           };
         }
+        // Public entry — apply reserve subtraction here so the value passed
+        // to executeCompactionCore is the EFFECTIVE budget. executeCompactionCore
+        // then treats it as already-adjusted (alreadyReserveAdjusted: true) to
+        // avoid double-subtraction.
+        const legacyParamsForBudget = asRecord(params.runtimeContext) ?? params.legacyParams;
+        const adjustedBudget = this.resolveTokenBudget({
+          tokenBudget: params.tokenBudget,
+          runtimeContext: params.runtimeContext,
+          legacyParams: legacyParamsForBudget,
+        });
         return this.executeCompactionCore({
           conversationId: conversation.conversationId,
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
-          tokenBudget: params.tokenBudget,
+          // Don't fall back to params.tokenBudget here. If adjustedBudget is
+          // undefined (no budget was supplied anywhere), let
+          // executeCompactionCore return its "missing token budget" error
+          // rather than silently passing the RAW value through with
+          // alreadyReserveAdjusted: true (which would bypass reserve subtraction).
+          tokenBudget: adjustedBudget,
           currentTokenCount: params.currentTokenCount,
           compactionTarget: params.compactionTarget,
           customInstructions: params.customInstructions,
