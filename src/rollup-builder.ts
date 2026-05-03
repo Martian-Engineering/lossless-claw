@@ -273,86 +273,102 @@ export class RollupBuilder {
       )
       .sort((left, right) => left.period_key.localeCompare(right.period_key));
 
-    const existing = this.store.getRollup(
-      conversationId,
-      periodKind,
-      periodKey,
-      this.config.timezone
-    );
-    if (sourceRollups.length === 0) {
-      if (existing) {
-        this.store.deleteRollup(existing.rollup_id);
-        return true;
-      }
-      return false;
-    }
-    const expectedDayKeys = getAggregateDayKeys(periodKind, periodKey);
-    const sourceDayKeys = new Set(
-      sourceRollups.map((rollup) => rollup.period_key)
-    );
-    const missingActiveDayKeys = expectedDayKeys.filter((key) => {
-      if (sourceDayKeys.has(key)) {
-        return false;
-      }
-      const dayBounds = getLocalDayBoundsForDateKey(key, this.config.timezone);
-      return this.getLeafSummariesForDay(
-        conversationId,
-        dayBounds.start,
-        dayBounds.end
-      ).some((summary) => summary.kind === "leaf");
-    });
-    if (missingActiveDayKeys.length > 0) {
-      if (existing) {
-        this.store.deleteRollup(existing.rollup_id);
-      }
-      return false;
-    }
-
-    const sourceTokens = sourceRollups.reduce(
-      (sum, rollup) => sum + safeTokenCount(rollup.source_token_count),
-      0
-    );
-    const fingerprint = computeFingerprint(
-      sourceRollups.map((rollup) => ({
-        id: rollup.rollup_id,
-        tokenCount: rollup.source_token_count,
-        content: rollup.content,
-        earliestAt: rollup.coverage_start,
-        latestAt: rollup.coverage_end,
-        sourceCount: rollup.source_message_count,
-        sourceTokenCount: rollup.source_token_count,
-        sourceFingerprint: rollup.source_fingerprint,
-      }))
-    );
-    if (existing?.source_fingerprint === fingerprint && existing.status === "ready") {
-      return false;
-    }
-
-    const draft = buildAggregateRollupContent({
-      periodKind,
-      periodKey,
-      sourceRollups,
-      maxTokens:
-        periodKind === WEEK_PERIOD_KIND
-          ? this.weeklyMaxTokens
-          : this.monthlyMaxTokens,
-    });
-    const rollupId =
-      existing?.rollup_id ?? buildRollupId(periodKind, periodKey);
-    const sourceSummaryIds = uniqueStrings(
-      sourceRollups.flatMap((rollup) =>
-        parseJsonStringArray(rollup.source_summary_ids)
-      )
-    );
-    const sourceMessageCount = sourceRollups.reduce(
-      (sum, rollup) => sum + safeTokenCount(rollup.source_message_count),
-      0
-    );
-
+    // The existing-row decision and the upsertRollup/replaceRollupSources
+    // writes must happen atomically — otherwise a concurrent
+    // buildAggregateRollup can swap `existing` between the read and the
+    // write, leaving us with an FK reference to a row another writer
+    // already replaced (chunk A, G — race outside transaction).
+    let result = false;
     await withDatabaseTransaction(
       this.store.db,
       "BEGIN IMMEDIATE",
       async () => {
+        const existing = this.store.getRollup(
+          conversationId,
+          periodKind,
+          periodKey,
+          this.config.timezone
+        );
+        if (sourceRollups.length === 0) {
+          if (existing) {
+            this.store.deleteRollup(existing.rollup_id);
+            result = true;
+            return;
+          }
+          result = false;
+          return;
+        }
+        const expectedDayKeys = getAggregateDayKeys(periodKind, periodKey);
+        const sourceDayKeys = new Set(
+          sourceRollups.map((rollup) => rollup.period_key)
+        );
+        const missingActiveDayKeys = expectedDayKeys.filter((key) => {
+          if (sourceDayKeys.has(key)) {
+            return false;
+          }
+          const dayBounds = getLocalDayBoundsForDateKey(
+            key,
+            this.config.timezone
+          );
+          return this.getLeafSummariesForDay(
+            conversationId,
+            dayBounds.start,
+            dayBounds.end
+          ).some((summary) => summary.kind === "leaf");
+        });
+        if (missingActiveDayKeys.length > 0) {
+          if (existing) {
+            this.store.deleteRollup(existing.rollup_id);
+          }
+          result = false;
+          return;
+        }
+
+        const sourceTokens = sourceRollups.reduce(
+          (sum, rollup) => sum + safeTokenCount(rollup.source_token_count),
+          0
+        );
+        const fingerprint = computeFingerprint(
+          sourceRollups.map((rollup) => ({
+            id: rollup.rollup_id,
+            tokenCount: rollup.source_token_count,
+            content: rollup.content,
+            earliestAt: rollup.coverage_start,
+            latestAt: rollup.coverage_end,
+            sourceCount: rollup.source_message_count,
+            sourceTokenCount: rollup.source_token_count,
+            sourceFingerprint: rollup.source_fingerprint,
+          }))
+        );
+        if (
+          existing?.source_fingerprint === fingerprint &&
+          existing.status === "ready"
+        ) {
+          result = false;
+          return;
+        }
+
+        const draft = buildAggregateRollupContent({
+          periodKind,
+          periodKey,
+          sourceRollups,
+          maxTokens:
+            periodKind === WEEK_PERIOD_KIND
+              ? this.weeklyMaxTokens
+              : this.monthlyMaxTokens,
+        });
+        const rollupId =
+          existing?.rollup_id ?? buildRollupId(periodKind, periodKey);
+        const sourceSummaryIds = uniqueStrings(
+          sourceRollups.flatMap((rollup) =>
+            parseJsonStringArray(rollup.source_summary_ids)
+          )
+        );
+        const sourceMessageCount = sourceRollups.reduce(
+          (sum, rollup) => sum + safeTokenCount(rollup.source_message_count),
+          0
+        );
+
         this.store.upsertRollup({
           rollup_id: rollupId,
           conversation_id: conversationId,
@@ -387,10 +403,12 @@ export class RollupBuilder {
             ordinal: index,
           }))
         );
+
+        result = true;
       }
     );
 
-    return true;
+    return result;
   }
 
   async buildDailyRollups(

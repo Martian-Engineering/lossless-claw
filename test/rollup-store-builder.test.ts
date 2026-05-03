@@ -1062,6 +1062,42 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("performs the existing-row read inside the transaction in buildAggregateRollup (P1-8)", async () => {
+    // Structural assertion: reading rollup-builder.ts source must show that
+    // the FIRST `this.store.getRollup(` call inside buildAggregateRollup
+    // appears AFTER `withDatabaseTransaction(` — mirrors buildDayRollup's
+    // pattern. Pre-fix the call was outside the transaction, allowing a
+    // concurrent writer to swap the row between read and replaceRollupSources
+    // (FK violation rollback under load).
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const url = await import("node:url");
+    const here = url.fileURLToPath(import.meta.url);
+    const source = fs.readFileSync(
+      path.join(path.dirname(here), "..", "src", "rollup-builder.ts"),
+      "utf8"
+    );
+    const buildAggregateStart = source.indexOf("async buildAggregateRollup(");
+    expect(buildAggregateStart).toBeGreaterThan(-1);
+    // Find the next function declaration so we don't accidentally read
+    // beyond buildAggregateRollup.
+    const afterAggregate = source.slice(buildAggregateStart);
+    const nextFnIdx = (() => {
+      const candidates = [
+        afterAggregate.indexOf("\n  async build", 1),
+        afterAggregate.indexOf("\n  private ", 1),
+        afterAggregate.indexOf("\n}", 1),
+      ].filter((idx) => idx > 0);
+      return candidates.length > 0 ? Math.min(...candidates) : afterAggregate.length;
+    })();
+    const body = afterAggregate.slice(0, nextFnIdx);
+    const txStart = body.indexOf("withDatabaseTransaction(");
+    const firstGetRollup = body.indexOf("this.store.getRollup(");
+    expect(firstGetRollup).toBeGreaterThan(-1);
+    expect(txStart).toBeGreaterThan(-1);
+    expect(firstGetRollup).toBeGreaterThan(txStart);
+  });
+
   it("does not extract just the first nested day's Key Items section for weekly/monthly aggregate rollups", () => {
     // The regex `/##\s+Key Items[\s\S]*?(?=\n##\s|$)/` extracts up to the next
     // ## header, so the FIRST nested day's bullets — and only those — would
