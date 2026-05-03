@@ -1664,7 +1664,36 @@ function messageContentCoveredBySummary(params: {
     return false;
   }
   const summary = normalizeSummaryOverlapText(params.summary);
-  return summary.includes(content);
+  if (!summary.includes(content)) {
+    return false;
+  }
+  // Bare substring match is too loose: a 24+ char user instruction can
+  // coincidentally appear inside a long narrative summary and get silently
+  // dropped. Require one of:
+  //   1. content appears at the very start or end of the summary, OR
+  //   2. content appears inside a quoted block ("..." or backticks) — the
+  //      pattern emitted by our summarizer when it embeds verbatim user text.
+  // Otherwise treat it as a coincidental collision and keep the message.
+  if (summary.startsWith(content) || summary.endsWith(content)) {
+    return true;
+  }
+  // After whitespace normalization, both " and ' and `…` survive. Walk each
+  // quote-delimited span (cheap; summaries are bounded) and check membership.
+  for (const quoteChar of ['"', "'", "`"]) {
+    let cursor = 0;
+    while (cursor < summary.length) {
+      const open = summary.indexOf(quoteChar, cursor);
+      if (open < 0) break;
+      const close = summary.indexOf(quoteChar, open + 1);
+      if (close < 0) break;
+      const span = summary.slice(open + 1, close);
+      if (span.includes(content)) {
+        return true;
+      }
+      cursor = close + 1;
+    }
+  }
+  return false;
 }
 
 // ── LcmContextEngine ────────────────────────────────────────────────────────
@@ -1712,6 +1741,12 @@ export class LcmContextEngine implements ContextEngine {
 
   // ── Circuit breaker for compaction auth failures ──
   private circuitBreakerStates = new Map<string, CircuitBreakerState>();
+
+  // Per-process cap on `reconcileTranscriptTailForAfterTurn` slow-path full
+  // re-reads, keyed by `${sessionQueueKey} ${sessionFile}`. Long-running
+  // sessions where the bootstrap checkpoint is missing or path-mismatched
+  // would otherwise pay O(file-size) on every afterTurn.
+  private afterTurnReconcileFullReadKeys = new Set<string>();
 
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
@@ -4730,8 +4765,38 @@ export class LcmContextEngine implements ContextEngine {
           }
         }
 
+        // Slow path: checkpoint missing, path mismatched, or non-append-only.
+        // Cap full re-reads to once per (queueKey, sessionFile) per process;
+        // long-running sessions otherwise pay O(file-size) every afterTurn.
+        // Subsequent calls fall through to refreshBootstrapState below so the
+        // next afterTurn takes the fast (incremental) path.
+        const fullReadKey = `${queueKey} ${params.sessionFile}`;
+        const reason = !checkpoint
+          ? "checkpoint-missing"
+          : checkpoint.sessionFilePath !== params.sessionFile
+            ? "path-mismatch"
+            : "append-only-ineligible";
+        if (this.afterTurnReconcileFullReadKeys.has(fullReadKey)) {
+          this.deps.log.info(
+            `[lcm] afterTurn: transcript reconcile slow path skipped (already executed this process) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+          );
+          await this.refreshBootstrapState({
+            conversationId: conversation.conversationId,
+            sessionFile: params.sessionFile,
+          });
+          return;
+        }
+        this.afterTurnReconcileFullReadKeys.add(fullReadKey);
+        const slowPathStartedAt = Date.now();
+
         const historicalMessages = await readLeafPathMessages(params.sessionFile);
         if (historicalMessages.length === 0) {
+          // Nothing to reconcile, but still refresh the checkpoint so the next
+          // afterTurn takes the incremental path.
+          await this.refreshBootstrapState({
+            conversationId: conversation.conversationId,
+            sessionFile: params.sessionFile,
+          });
           return;
         }
         const reconcile = await this.reconcileSessionTail({
@@ -4751,12 +4816,17 @@ export class LcmContextEngine implements ContextEngine {
             "reconciled missing session messages",
           );
         }
-        if (reconcile.importedMessages > 0) {
-          await this.refreshBootstrapState({
-            conversationId: conversation.conversationId,
-            sessionFile: params.sessionFile,
-          });
-        }
+        // Always refresh the checkpoint after a slow-path read, even when no
+        // messages were imported. This pins the offset to the new sessionFile
+        // so the next afterTurn takes the incremental path instead of paying
+        // for another full re-read on every turn.
+        await this.refreshBootstrapState({
+          conversationId: conversation.conversationId,
+          sessionFile: params.sessionFile,
+        });
+        this.deps.log.warn(
+          `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${reconcile.importedMessages} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
+        );
       },
       {
         operationName: "afterTurnTranscriptReconcile",
@@ -6294,17 +6364,22 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
         });
-        if (compactionTelemetry?.provider || compactionTelemetry?.model) {
-          deferredCompactionDrain = {
-            tokenBudget,
-            currentTokenCount: observedCurrentTokenCount,
-            reason: deferredReason,
-          };
-        } else {
+        // CLI-backend sessions (#472) never observe provider/model telemetry,
+        // so the previous gate skipped scheduling and accumulated debt
+        // forever. Schedule the drain unconditionally and let the inner
+        // cache-aware gate (`shouldDelayPromptMutatingDeferredCompaction`)
+        // decide whether prompt mutation is actually safe — that gate is
+        // robust to missing telemetry.
+        if (!compactionTelemetry?.provider && !compactionTelemetry?.model) {
           this.deps.log.info(
-            `[lcm] background deferred compaction not scheduled conversation=${conversation.conversationId} ${sessionLabel} reason=cache-context-unknown debtReason=${deferredReason}`,
+            `[lcm] background deferred compaction scheduled without cache context conversation=${conversation.conversationId} ${sessionLabel} reason=cache-context-unknown debtReason=${deferredReason}`,
           );
         }
+        deferredCompactionDrain = {
+          tokenBudget,
+          currentTokenCount: observedCurrentTokenCount,
+          reason: deferredReason,
+        };
       }
     } catch (err) {
       this.deps.log.warn(

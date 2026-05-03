@@ -6091,6 +6091,70 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ]);
   });
 
+  it("afterTurn keeps a 24+ char user message that only collides as a substring of the summary narrative (F6)", async () => {
+    // PR-6 #566 / F6: bare summary.includes(content) was too loose. A medium-
+    // length user instruction that coincidentally appears inside a long
+    // narrative summary must NOT be silently dropped — only anchored or
+    // quoted matches count as covered.
+    const engine = createEngine();
+    const sessionId = "after-turn-summary-substring-collision";
+    const collidingInstruction = "please update the readme file"; // 30 chars
+    const summary =
+      "Summary of compacted context: the assistant was asked to please " +
+      "update the readme file with new sections, then verify CI passes " +
+      "and report back to the operator before EOD.";
+    expect(summary.toLowerCase()).toContain(collidingInstruction);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-substring-collision"),
+      messages: [
+        makeMessage({ role: "user", content: collidingInstruction }),
+        makeMessage({ role: "assistant", content: "Acknowledged." }),
+      ],
+      prePromptMessageCount: 0,
+      autoCompactionSummary: summary,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    // The user instruction must survive: it's only a coincidental substring,
+    // not anchored or quoted.
+    expect(stored.map((message) => message.content)).toEqual([
+      summary,
+      collidingInstruction,
+      "Acknowledged.",
+    ]);
+  });
+
+  it("afterTurn drops a user message when the summary ends with that exact content (F6 anchored)", async () => {
+    // Anchored truth case: content appears at the end of the summary's
+    // normalized text — that's a real coverage signal, drop the dup.
+    const engine = createEngine();
+    const sessionId = "after-turn-summary-suffix-anchored";
+    const repeatedInstruction = "kick off the workers and check back in an hour";
+    const summary = `Summary of compacted context. ${repeatedInstruction}`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-suffix-anchored"),
+      messages: [
+        makeMessage({ role: "user", content: repeatedInstruction }),
+        makeMessage({ role: "assistant", content: "On it." }),
+      ],
+      prePromptMessageCount: 0,
+      autoCompactionSummary: summary,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([summary, "On it."]);
+  });
+
   it("afterTurn runs proactive threshold compaction when tokenBudget is provided", async () => {
     const engine = createEngineWithConfig({
       proactiveThresholdCompactionMode: "inline",
@@ -6834,6 +6898,184 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenance?.running).toBe(false);
     expect(maintenance?.reason).toBe("threshold");
     expect(maintenance?.tokenBudget).toBe(400);
+  });
+
+  it("afterTurn schedules a deferred drain even when compactionTelemetry has no provider/model (D4)", async () => {
+    // PR-6 #566 / D4: CLI-backend sessions (#472) never observe provider/model
+    // telemetry. Previously the gate at the schedule site silently skipped
+    // and debt accumulated forever. Now we always schedule and let the inner
+    // cache-aware gate decide.
+    const infoLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: infoLog, warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-cli-backend-no-cache-context";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 50_000,
+      threshold: 20_000,
+    } as unknown as Record<string, unknown>);
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 1_024,
+      threshold: 3_072,
+    });
+    const scheduleSpy = vi.spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain");
+
+    // No legacyCompactionParams provided → updateCompactionTelemetry stores a
+    // record without provider/model — exactly the CLI-backend case.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-cli-backend-no-cache-context"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    // Drain MUST be scheduled even though provider/model are unknown.
+    expect(scheduleSpy).toHaveBeenCalledTimes(1);
+    expect(scheduleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        reason: "leaf-trigger",
+        tokenBudget: 4_096,
+      }),
+    );
+
+    // The new visibility log should be emitted, not the legacy "not
+    // scheduled" message.
+    const infoMessages = infoLog.mock.calls.map((c) => String(c[0]));
+    expect(
+      infoMessages.some((m) =>
+        m.includes("scheduled without cache context") && m.includes("cache-context-unknown"),
+      ),
+    ).toBe(true);
+    expect(
+      infoMessages.some((m) => m.includes("background deferred compaction not scheduled")),
+    ).toBe(false);
+
+    // And debt is still recorded — that part was already correct.
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance?.pending).toBe(true);
+  });
+
+  it("afterTurn caps the transcript-reconcile slow path to one full re-read per session+file (F7)", async () => {
+    // PR-6 #566 / F7: PR #551 added reconcileTranscriptTailForAfterTurn but
+    // its slow path called readLeafPathMessages on the entire session file
+    // every afterTurn when the checkpoint was missing or path-mismatched.
+    // After PR-6: the slow path runs once per (session-key|id, sessionFile),
+    // refreshes the checkpoint, and subsequent afterTurns take the
+    // incremental path or the cap branch.
+    const infoLog = vi.fn();
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: infoLog, warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-reconcile-slow-path-cap";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 0,
+      threshold: 3_072,
+    });
+
+    // Seed conversation by ingesting one turn through afterTurn first, with
+    // a DIFFERENT sessionFile so the next call has a path-mismatched
+    // checkpoint and is forced into the slow path.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-reconcile-slow-path-seed"),
+      messages: [makeMessage({ role: "assistant", content: "seed turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    // Spy on the (module-scoped) full reader by spying on the slow-path
+    // log, since readLeafPathMessages is a free function. The slow-path warn
+    // is the canonical signal that the full re-read happened.
+    warnLog.mockClear();
+    infoLog.mockClear();
+
+    // First call with a different sessionFile triggers the slow path.
+    // Pre-populate the target sessionFile with at least one historical
+    // message so readLeafPathMessages returns a non-empty list and the
+    // slow-path warn fires (the empty-file branch is a separate exit).
+    const targetSessionFile = createSessionFilePath("after-turn-reconcile-slow-path-target");
+    writeFileSync(
+      targetSessionFile,
+      `${JSON.stringify({
+        message: { role: "user", content: [{ type: "text", text: "historical user line" }] },
+      })}\n`,
+      "utf8",
+    );
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: targetSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "next turn one" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const slowPathWarns = warnLog.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes("transcript reconcile slow path"));
+    expect(slowPathWarns.length).toBe(1);
+
+    // Second call against the SAME (sessionId, sessionFile) tuple must NOT
+    // re-enter the slow path. After the first slow-path read we refresh the
+    // checkpoint, so this normally goes through the fast (incremental) path
+    // and emits no slow-path warn. If somehow the slow path is reached again
+    // (e.g. checkpoint not append-only-eligible), the cap log fires instead
+    // of a second full re-read.
+    warnLog.mockClear();
+    infoLog.mockClear();
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: targetSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "next turn two" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const secondSlowPathWarns = warnLog.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes("transcript reconcile slow path (full re-read)"));
+    expect(secondSlowPathWarns.length).toBe(0);
   });
 
   it("afterTurn does not background-compact prompt-mutating debt while Anthropic cache is hot", async () => {
