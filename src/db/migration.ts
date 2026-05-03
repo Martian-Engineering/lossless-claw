@@ -224,14 +224,14 @@ const LCM_INITIAL_SCHEMA_STATEMENTS: readonly string[] = [
     PRIMARY KEY (step_name, algorithm_version)
   )`,
   // Indexes — each created individually so a single index failure can't take
-  // out the rest.
-  `CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq)`,
+  // out the rest.  Note: messages.UNIQUE(conversation_id, seq) and
+  // context_items.PRIMARY KEY (conversation_id, ordinal) already create
+  // implicit indexes on those columns; we don't add explicit ones for them.
   `CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id)`,
   `CREATE INDEX IF NOT EXISTS summary_parents_parent_summary_idx ON summary_parents (parent_summary_id)`,
   `CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts (message_id)`,
   `CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type)`,
-  `CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal)`,
   `CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
     ON conversation_bootstrap_state (session_file_path, updated_at)`,
@@ -1043,6 +1043,13 @@ export function runLcmMigrations(
       ON conversations (session_id, active, created_at)
     `);
     db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
+    // Drop indexes that shadow implicit ones created by UNIQUE/PRIMARY KEY
+    // constraints — `messages.UNIQUE(conversation_id, seq)` and
+    // `context_items.PRIMARY KEY (conversation_id, ordinal)` both already
+    // produce an index on those exact columns, so the explicit indexes added
+    // by older migrations are pure write/maintenance overhead.
+    db.exec(`DROP INDEX IF EXISTS messages_conv_seq_idx`);
+    db.exec(`DROP INDEX IF EXISTS context_items_conv_idx`);
     runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
     runMigrationStep("ensureSummaryMetadataColumns", log, () =>
       ensureSummaryMetadataColumns(db),
