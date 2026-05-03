@@ -1636,8 +1636,11 @@ describe("LcmContextEngine.ingest content extraction", () => {
   it("stores externalized inline images under largeFilesDir", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
+    // Realistic threshold so the post-image-rewrite content (which is below
+    // it) doesn't also trigger raw-payload externalization — this test only
+    // verifies the image-externalizer path.
     const engine = createEngineWithConfig({
-      largeFileTokenThreshold: 20,
+      largeFileTokenThreshold: 1000,
       largeFilesDir,
     });
     const sessionId = randomUUID();
@@ -1676,8 +1679,13 @@ describe("LcmContextEngine.ingest content extraction", () => {
   it("externalizes native user image blocks before raw payload fallback", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
+    // Realistic threshold — the post-image-rewrite content is below it, so
+    // only the native-image-block path runs (raw-payload would otherwise
+    // also fire under the artificially-low 20-token threshold this test
+    // used to set, which is the scenario the new mixed-content test in
+    // this file deliberately exercises with a longer body).
     const engine = createEngineWithConfig({
-      largeFileTokenThreshold: 20,
+      largeFileTokenThreshold: 1000,
       largeFilesDir,
     });
     const sessionId = randomUUID();
@@ -1740,8 +1748,9 @@ describe("LcmContextEngine.ingest content extraction", () => {
   it("externalizes native assistant image blocks before raw payload fallback", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
+    // Realistic threshold — see the user-image variant above for rationale.
     const engine = createEngineWithConfig({
-      largeFileTokenThreshold: 20,
+      largeFileTokenThreshold: 1000,
       largeFilesDir,
     });
     const sessionId = randomUUID();
@@ -1781,7 +1790,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
     expect(largeFiles[0].fileName).toBe("assistant-image.png");
   });
 
-  it("externalizes native tool-result image blocks before raw payload fallback", async () => {
+  it("externalizes native tool-result image blocks instead of persisting them inline", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
     const engine = createEngineWithConfig({
@@ -1830,9 +1839,12 @@ describe("LcmContextEngine.ingest content extraction", () => {
     expect(messages).toHaveLength(2);
     const toolMessage = messages[1];
     expect(toolMessage.role).toBe("tool");
+    // The important behavior: toolResult native image is replaced by an
+    // externalized reference and the base64 payload never reaches the DB
+    // row inline. Tool messages skip raw-payload externalization entirely
+    // (see `interceptLargeRawPayload` early-return), so we don't assert on
+    // a `raw-tool-payload.json` shape.
     expect(toolMessage.content).toContain("[Tool image:");
-    expect(toolMessage.content).not.toContain("raw-tool-payload");
-    expect(toolMessage.content).not.toContain("[LCM Raw Payload:");
     expect(toolMessage.content).not.toContain(base64Image.slice(0, 32));
 
     const largeFiles = await engine
@@ -1843,11 +1855,104 @@ describe("LcmContextEngine.ingest content extraction", () => {
     expect(largeFiles[0].fileName).toBe("tool-image.png");
   });
 
-  it("infers extensions for heic, avif, and bmp native image blocks", async () => {
+  it("externalizes native system image blocks instead of falling through to raw-system-payload", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 1000,
+      largeFilesDir,
+    });
+    const sessionId = randomUUID();
+    const base64Image = `iVBORw0KGgo${"S".repeat(600)}`;
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "system",
+        content: [
+          { type: "text", text: "Workspace bootstrap." },
+          { type: "image", data: base64Image, mimeType: "image/png" },
+        ],
+      } as AgentMessage,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("Workspace bootstrap");
+    expect(messages[0].content).toContain("[System image:");
+    expect(messages[0].content).not.toContain("raw-system-payload");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+
+    const largeFiles = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(largeFiles).toHaveLength(1);
+    expect(largeFiles[0].fileName).toBe("system-image.png");
+  });
+
+  it("still externalizes large mixed-content messages that embed an image reference alongside oversized text", async () => {
+    // Regression for the substring-skip bug in `interceptLargeRawPayload`:
+    // a previous skip on `isExternalizedReferenceContent(stored.content)`
+    // tripped on any content containing `LCM file: file_...`, so a message
+    // with an image reference plus a large amount of other text was never
+    // externalized as a raw payload. The skip is now gated on the explicit
+    // `rawPayloadExternalized: true` flag set by the raw-payload pass itself.
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
     const engine = createEngineWithConfig({
       largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+    const sessionId = randomUUID();
+    const base64Image = `iVBORw0KGgo${"M".repeat(600)}`;
+    // 4_000-word body so the assistant message blows past the threshold
+    // even after the image is externalized to a short reference.
+    const longBody = "lorem ipsum ".repeat(2_000);
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "Render the chart please." }),
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Here's the rendered chart:" },
+          { type: "image", data: base64Image, mimeType: "image/png" },
+          { type: "text", text: longBody },
+        ],
+      } as AgentMessage,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const largeFiles = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    // Two large_files rows: one for the image and one for the
+    // raw-payload externalization that the substring-skip used to suppress.
+    expect(largeFiles.length).toBeGreaterThanOrEqual(2);
+    const mimeTypes = largeFiles.map((row) => row.mimeType);
+    expect(mimeTypes).toContain("image/png");
+    expect(mimeTypes.some((m) => m === "application/json" || m === "text/plain")).toBe(true);
+  });
+
+  it("infers extensions for heic, avif, and bmp native image blocks", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 1000,
       largeFilesDir,
     });
 
@@ -4291,7 +4396,7 @@ describe("LcmContextEngine.bootstrap", () => {
     );
 
     const engine = createEngineWithConfig({
-      largeFileTokenThreshold: 20,
+      largeFileTokenThreshold: 1000,
       largeFilesDir,
     });
     const sessionId = "bootstrap-inline-image-parity";

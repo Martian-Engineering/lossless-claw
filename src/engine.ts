@@ -3690,9 +3690,11 @@ export class LcmContextEngine implements ContextEngine {
     const rolePrefix =
       params.role === "assistant"
         ? "assistant"
-        : params.role === "tool" || params.role === "toolResult"
-          ? "tool"
-          : "user";
+        : params.role === "system"
+          ? "system"
+          : params.role === "tool" || params.role === "toolResult"
+            ? "tool"
+            : "user";
     return `${rolePrefix}-image.${params.extension}`;
   }
 
@@ -3709,9 +3711,36 @@ export class LcmContextEngine implements ContextEngine {
       trimmed.startsWith("[LCM File:") ||
       trimmed.startsWith("[LCM Tool Output:") ||
       trimmed.includes("LCM file: file_") ||
-      /\[(?:User|Tool|Assistant|Image) image: [^\]]*LCM file: file_[a-f0-9]{16}\]/.test(
+      /\[(?:User|System|Tool|Assistant|Image) image: [^\]]*LCM file: file_[a-f0-9]{16}\]/.test(
         trimmed,
       )
+    );
+  }
+
+  /** Stricter form of `isExternalizedReferenceContent` used by the
+   *  raw-payload externalizer's skip gate. Returns true when the message's
+   *  stored content was produced by a *wholesale-replacement* externalizer
+   *  (large-file / tool-output / raw-payload — each emits content that
+   *  starts with the canonical reference header, optionally followed by an
+   *  exploration-summary preamble), or when the whole trimmed content is a
+   *  single image-only reference (rare).
+   *
+   *  Mixed content like `"...intro... [User image: file_xyz] ... long body
+   *  text..."` is NOT considered wholly externalized — those messages must
+   *  remain eligible for raw-payload externalization when they exceed the
+   *  size threshold. */
+  private static isWhollyExternalizedReferenceContent(value: string): boolean {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return false;
+    if (
+      trimmed.startsWith("[LCM File:") ||
+      trimmed.startsWith("[LCM Tool Output:") ||
+      trimmed.startsWith("[LCM Raw Payload:")
+    ) {
+      return true;
+    }
+    return /^\[(?:User|System|Tool|Assistant|Image) image: [^\]]*LCM file: file_[a-f0-9]{16}\]$/.test(
+      trimmed,
     );
   }
 
@@ -3776,9 +3805,15 @@ export class LcmContextEngine implements ContextEngine {
       return null;
     }
     const role = (params.message as { role?: unknown }).role;
+    // Cover every persistable role — `hasPersistableMessageRole` accepts
+    // user/assistant/system/tool/toolResult, so this gate must too. A system
+    // message carrying native `{type:"image"}` blocks would otherwise fall
+    // through to the generic raw-payload externalizer and be stored as a
+    // `raw-system-payload.json` blob with embedded base64.
     if (
       role !== "user" &&
       role !== "assistant" &&
+      role !== "system" &&
       role !== "tool" &&
       role !== "toolResult"
     ) {
@@ -3791,9 +3826,11 @@ export class LcmContextEngine implements ContextEngine {
     const label =
       role === "assistant"
         ? "Assistant image"
-        : role === "tool" || role === "toolResult"
-          ? "Tool image"
-          : "User image";
+        : role === "system"
+          ? "System image"
+          : role === "tool" || role === "toolResult"
+            ? "Tool image"
+            : "User image";
 
     const rewrittenContent: unknown[] = [];
     const fileIds: string[] = [];
@@ -4487,7 +4524,23 @@ export class LcmContextEngine implements ContextEngine {
     if (params.stored.role === "tool") {
       return null;
     }
-    if (LcmContextEngine.isExternalizedReferenceContent(params.stored.content)) {
+    // Skip when this message has already been raw-payload-externalized OR
+    // when its stored content is — by itself — *just* an externalized
+    // reference. The previous loose substring check
+    // (`isExternalizedReferenceContent` matching anywhere via
+    // `includes("LCM file: file_")`) tripped on mixed content like
+    // `"...intro... [User image: file_xyz] ... long body text..."`,
+    // blocking legitimate raw-payload externalization for messages that
+    // embed an image reference alongside other oversized content. The
+    // tightened helper requires the WHOLE trimmed content to be a single
+    // externalized-reference shape.
+    const externalizedFlag = (
+      params.message as { rawPayloadExternalized?: unknown }
+    ).rawPayloadExternalized;
+    if (externalizedFlag === true) {
+      return null;
+    }
+    if (LcmContextEngine.isWhollyExternalizedReferenceContent(params.stored.content)) {
       return null;
     }
     if ("content" in params.message && hasReplayCriticalRawBlock(params.message.content)) {
