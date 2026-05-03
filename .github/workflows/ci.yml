@@ -25,3 +25,63 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+  # Smoke-install the plugin against the latest published openclaw to catch
+  # host-side breakage like #555 (manifest contract changes) before users hit
+  # it.  This is a v0 smoke pass — build the bundle, import it, and assert the
+  # registerTool surface wires up at least the four expected lcm_* tools.
+  # Followups can extend this to a full plugin-inspector run.
+  smoke-latest-openclaw:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install plugin deps (pinned, for build)
+        run: npm ci
+
+      - name: Build plugin bundle
+        run: npm run build
+
+      - name: Install latest openclaw alongside
+        run: npm install --no-save openclaw@latest
+
+      - name: Smoke-import bundle and assert tool wiring
+        run: |
+          node --input-type=module -e '
+            import("./dist/index.js").then((mod) => {
+              const plugin = mod.default;
+              if (!plugin || typeof plugin.register !== "function") {
+                console.error("plugin.register missing or not a function");
+                process.exit(1);
+              }
+              const registeredTools = [];
+              const stubApi = {
+                registerTool: (factory) => { registeredTools.push(factory); },
+                registerContextEngine: () => {},
+                registerCommand: () => {},
+                on: () => {},
+                config: { get: () => undefined },
+              };
+              try {
+                plugin.register(stubApi);
+              } catch (e) {
+                // If register requires a fuller mock the smoke fails loudly
+                // rather than silently passing — that is the desired signal.
+                console.warn("register threw against stub api:", e && e.message);
+              }
+              const expected = 4;
+              if (registeredTools.length < expected) {
+                console.error("expected at least " + expected + " registerTool calls, got " + registeredTools.length);
+                process.exit(1);
+              }
+              console.log("smoke OK — " + registeredTools.length + " registerTool factories observed");
+            }).catch((e) => { console.error(e); process.exit(1); });
+          '

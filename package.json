@@ -44,10 +44,10 @@
     "vitest": "^3.0.0"
   },
   "peerDependencies": {
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "openclaw": "*"
+    "@mariozechner/pi-agent-core": ">=0.66 <1",
+    "@mariozechner/pi-ai": ">=0.66 <1",
+    "@mariozechner/pi-coding-agent": ">=0.66 <1",
+    "openclaw": ">=2026.2.17 <2026.6.0"
   },
   "peerDependenciesMeta": {
     "@mariozechner/pi-agent-core": {
@@ -68,8 +68,9 @@
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.2.17",
-      "minGatewayVersion": "2026.2.17"
+      "pluginApi": ">=2026.2.17 <2026.6.0",
+      "minGatewayVersion": "2026.2.17",
+      "tested": ["2026.5.2"]
     },
     "build": {
       "openclawVersion": "2026.2.17"
