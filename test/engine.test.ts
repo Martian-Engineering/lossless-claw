@@ -2458,6 +2458,53 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("timezone getter is strict ('UTC' default + one-time warning) — B5 regression", () => {
+    const warnSpy = vi.fn();
+    const engine = createEngineWithDeps(
+      { timezone: "" },
+      {
+        log: {
+          info: vi.fn(),
+          warn: warnSpy,
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+
+    // Strict fallback to UTC, no Intl resolvedOptions().
+    expect(engine.timezone).toBe("UTC");
+    // Repeated reads do not re-emit the warning — debounced via construction.
+    expect(engine.timezone).toBe("UTC");
+    expect(engine.timezone).toBe("UTC");
+
+    const tzWarnings = warnSpy.mock.calls.filter((args) =>
+      typeof args[0] === "string" && args[0].includes("config.timezone is unset"),
+    );
+    expect(tzWarnings.length).toBe(1);
+  });
+
+  it("timezone getter does not warn when config.timezone is set — B5 regression", () => {
+    const warnSpy = vi.fn();
+    const engine = createEngineWithDeps(
+      { timezone: "America/Los_Angeles" },
+      {
+        log: {
+          info: vi.fn(),
+          warn: warnSpy,
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+
+    expect(engine.timezone).toBe("America/Los_Angeles");
+    const tzWarnings = warnSpy.mock.calls.filter((args) =>
+      typeof args[0] === "string" && args[0].includes("config.timezone is unset"),
+    );
+    expect(tzWarnings.length).toBe(0);
+  });
+
   it("maintain() uses deps.clock.now() to compute rollup-maintenance daysBack — B4 regression", async () => {
     // Inject a frozen clock at engine construction. computeRollupMaintenanceDaysBack
     // must use it, not wall time. Without vi.setSystemTime — proves the
