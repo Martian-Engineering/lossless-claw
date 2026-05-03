@@ -1194,26 +1194,30 @@ function bootstrapMessageWouldTriggerInterceptor(
   }
 
   // Size gate for interceptLargeRawPayload / interceptLargeToolResults.
-  // `content.length` is a UTF-16 code-unit count, NOT bytes — but it is a
-  // safe upper bound on the tokenized length too (a single token is at
-  // least one code unit), so if even a 1:1 mapping doesn't hit the
-  // threshold, no size-driven interceptor can fire.
-  let approxCodeUnits = 0;
+  // Use the same `estimateTokens` heuristic the production token-count
+  // code path uses — `content.length` (UTF-16 code units) is NOT a safe
+  // upper bound on token count for CJK text, where `estimateTokens`
+  // weights per-codepoint at ~1.5 tokens/char, so long CJK text can have
+  // MORE tokens than code units and a code-unit upper-bound check would
+  // produce false negatives (slip past the structural pre-scan and into
+  // bulk-insert when a size-driven interceptor would have fired).
+  let estimatedTokens = 0;
   if (typeof content === "string") {
-    approxCodeUnits = content.length;
+    estimatedTokens = estimateTokens(content);
   } else if (Array.isArray(content)) {
     for (const block of content) {
       if (typeof block === "string") {
-        approxCodeUnits += block.length;
+        estimatedTokens += estimateTokens(block);
       } else if (block && typeof block === "object") {
         const text = (block as { text?: unknown }).text;
-        approxCodeUnits += typeof text === "string" ? text.length : 1024;
+        estimatedTokens +=
+          typeof text === "string" ? estimateTokens(text) : 1024;
       }
     }
   } else if (content && typeof content === "object") {
-    approxCodeUnits += 1024;
+    estimatedTokens += 1024;
   }
-  return approxCodeUnits >= threshold;
+  return estimatedTokens >= threshold;
 }
 
 /**

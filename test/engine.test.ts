@@ -4082,12 +4082,20 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(singleSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("forces per-message ingest when bootstrap messages carry tool_use / tool_result / reasoning blocks", async () => {
+  it("forces per-message ingest when bootstrap messages carry tool_use / reasoning blocks (no tool/toolResult role)", async () => {
     // Regression: the bulk-insert fast path writes `messages` rows but does
     // NOT populate `message_parts`, so any structural block (tool calls,
-    // tool results, reasoning/thinking, function calls, images) would be
-    // silently dropped on replay if the pre-scan let it through. The
-    // pre-scan must force per-message ingest for these shapes.
+    // reasoning/thinking, function calls, images) on a USER OR ASSISTANT
+    // message would be silently dropped on replay if the pre-scan let it
+    // through.
+    //
+    // This test deliberately includes NO `role: "tool"` / `role: "toolResult"`
+    // messages — `bootstrapMessageWouldTriggerInterceptor` returns true
+    // unconditionally for those roles, so a test that included one would
+    // pass even if the structural-block detection for assistant/user
+    // messages regressed.  All three messages here are
+    // `role: "assistant"` carrying structural blocks, so the per-message
+    // path is forced ONLY by the STRUCTURAL_BLOCK_TYPES detection.
     const sessionFile = createSessionFilePath("bootstrap-structural-blocks");
     const lines = [
       JSON.stringify({
@@ -4103,14 +4111,16 @@ describe("LcmContextEngine.bootstrap", () => {
         ],
       }),
       JSON.stringify({
-        role: "tool",
-        toolCallId: "tu_boot_1",
-        content: [{ type: "tool_result", tool_use_id: "tu_boot_1", content: "ok" }],
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "consider the result" },
+          { type: "text", text: "Acknowledged." },
+        ],
       }),
       JSON.stringify({
         role: "assistant",
         content: [
-          { type: "thinking", thinking: "consider the result" },
+          { type: "function_call", call_id: "fc_boot_1", name: "noop", arguments: "{}" },
           { type: "text", text: "Done." },
         ],
       }),
