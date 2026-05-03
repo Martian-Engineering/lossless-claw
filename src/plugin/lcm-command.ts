@@ -284,12 +284,17 @@ function parseRebuildRollupsArgs(rest: string[]): ParsedLcmCommand {
     }
   }
   // Echo the offending input so operators can tell "got 366" from "got +7"
-  // from "got 7.0" without re-typing.
-  const offending = rest.length === 1 ? `\`${rest[0]?.trim() ?? ""}\`` : `\`${rest.join(" ")}\``;
+  // from "got 7.0" without re-typing. Strip backticks from the echoed value
+  // so a malicious-looking input like `foo\`bar\`` doesn't break the
+  // surrounding inline code span and bleed markdown into the error.
+  const rawOffending = rest.length === 1
+    ? rest[0]?.trim() ?? ""
+    : rest.join(" ");
+  const safeOffending = rawOffending.replace(/`/g, "");
   return {
     kind: "help",
     error:
-      `\`${VISIBLE_COMMAND} rebuild-rollups\` expects an integer in [1, 365] (got ${offending}). Example: \`${VISIBLE_COMMAND} rebuild-rollups 14\`.`,
+      `\`${VISIBLE_COMMAND} rebuild-rollups\` expects an integer in [1, 365] (got \`${safeOffending}\`). Example: \`${VISIBLE_COMMAND} rebuild-rollups 14\`.`,
   };
 }
 

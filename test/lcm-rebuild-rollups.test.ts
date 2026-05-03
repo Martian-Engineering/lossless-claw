@@ -177,6 +177,27 @@ describe("/lossless rebuild-rollups", () => {
     expect(garbage.text).toContain("`abc`");
   });
 
+  it("strips backticks from echoed input so the error markdown stays balanced (R2-FIX-4)", async () => {
+    const fixture = createRebuildFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    // Pre-fix the offending input was wrapped in raw backticks. An input
+    // containing backticks broke the surrounding inline code span — the
+    // formatter saw `\`foo\`` and `bar\`` as separate spans and the error
+    // visible to operators was malformed markdown.
+    const result = await fixture.command.handler(
+      makeContext("rebuild-rollups `bad`"),
+    );
+    // Echoed input must not carry raw backticks into the rendered error.
+    expect(result.text).toContain("(got `bad`)");
+    expect(result.text).not.toMatch(/got `\`bad\``/);
+    // Number of backticks in the error must be even — every opening tick
+    // closes cleanly.
+    const backticks = (result.text.match(/`/g) ?? []).length;
+    expect(backticks % 2).toBe(0);
+  });
+
   it("appends a (...N more suppressed) marker when error totals exceed 3 (P3)", async () => {
     const fixture = createRebuildFixture();
     tempDirs.add(fixture.tempDir);
