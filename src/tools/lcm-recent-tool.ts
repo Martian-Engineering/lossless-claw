@@ -2026,6 +2026,24 @@ export function createLcmRecentTool(input: {
           lines.push(
             "No pre-built rollup available, and LCM captured no leaf summaries or unsummarized raw messages for this period."
           );
+        } else if (mode === "index") {
+          // mode:"index" must stay digest-style on the global fallback path
+          // too. Mirror the index live-fallback shape: a `### Rollup index`
+          // header plus a single `#### <kind>/<label>` entry whose body is
+          // an extractRollupDigest of the fallback content. Falling through
+          // to the full-content branch would silently violate the caller's
+          // index-mode contract.
+          const digest = extractRollupDigest(rendered.content, 600);
+          lines.push("### Rollup index (1 period)");
+          lines.push("");
+          lines.push(`#### ${resolution.kind ?? "window"}/${resolution.label} (live fallback)`);
+          lines.push(`- Status: fallback | Built: (live)`);
+          lines.push(`- Sources: ${rendered.retainedSummaries.length} summaries`);
+          lines.push("");
+          lines.push(digest);
+          lines.push("");
+          sourceSummaryIds = rendered.summaryIds;
+          sourceIds = rendered.sourceIds;
         } else {
           lines.push(
             "No pre-built rollup available. Here's what LCM captured for this period:"

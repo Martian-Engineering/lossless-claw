@@ -1494,6 +1494,79 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("renders digest-style listing for mode:'index' on the global fallback path (R2-FIX-1)", async () => {
+    const now = new Date("2026-04-27T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "global-fallback-index",
+        sessionKey: "agent:main:global-fallback-index",
+        title: "Global fallback index",
+      });
+
+      // Drop a leaf summary in the recent window. NO stored rollup at all,
+      // and we use a sub-day "last 30m" period whose resolution.kind is
+      // undefined — that bypasses every coverage path and falls through to
+      // the global fallback at `rollupContent == null`. Pre-fix that path
+      // unconditionally rendered renderFallbackRollupSection's full content,
+      // ignoring mode:'index'.
+      await summaryStore.insertSummary({
+        summaryId: "sum_global_fb_idx",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content:
+          "FALLBACK_LONG_BODY_THAT_SHOULD_BE_DIGESTED_NOT_FULLY_RENDERED_INTO_THE_RESPONSE_BECAUSE_INDEX_MODE_IS_DIGEST_STYLE",
+        tokenCount: 14,
+        latestAt: new Date("2026-04-27T11:55:00.000Z"),
+      });
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "global-fallback-index",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "global-fallback-index",
+      });
+
+      const result = await tool.execute("call-global-fb-index", {
+        period: "last 30m",
+        mode: "index",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+
+      // Index-mode shape: a `### Rollup index (1 period)` header plus a
+      // `#### <kind>/<label> (live fallback)` entry. Pre-fix the global
+      // fallback always rendered the full-content "No pre-built rollup
+      // available. Here's what LCM captured for this period:" preamble —
+      // index mode silently violated.
+      expect(text).toContain("### Rollup index (1 period)");
+      expect(text).toContain("(live fallback)");
+      expect(text).toContain("Status: fallback | Built: (live)");
+      expect(text).not.toContain(
+        "Here's what LCM captured for this period",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports failed stored rollups as degraded fallback responses", async () => {
     const { db, conversationStore, summaryStore, rollupStore } = createStores();
     const conversation = await conversationStore.createConversation({
