@@ -1566,6 +1566,7 @@ async function buildRebuildRollupsText(params: {
       );
       const aggResult: BuildResult = await rollupBuilder.buildWeeklyMonthlyRollups(
         conversation.conversationId,
+        { daysBack: params.daysBack },
       );
       const built = dailyResult.built + aggResult.built;
       const skipped = dailyResult.skipped + aggResult.skipped;
