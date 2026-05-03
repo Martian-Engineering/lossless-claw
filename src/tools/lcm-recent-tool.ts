@@ -62,7 +62,7 @@ const AUTO_DETAIL_LEVEL_SAFETY_RATIO = 0.2;
  * write-up. Output is a pure function of (telemetry-row, registry-snapshot)
  * — replay-clean by construction.
  */
-export function computeAutoDetailLevel(
+function computeAutoDetailLevel(
   db: DatabaseSync,
   conversationId: number,
   getModelContextWindow: ((model: string) => number | null) | undefined,
@@ -1304,6 +1304,7 @@ export const __lcmRecentTestInternals = {
   extractRollupDigest,
   formatSourcesLine,
   getRecentSummaryFallback,
+  computeAutoDetailLevel,
 };
 
 export function createLcmRecentTool(input: {

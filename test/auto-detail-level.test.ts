@@ -1,6 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { computeAutoDetailLevel } from "../src/tools/lcm-recent-tool.js";
+import { __lcmRecentTestInternals } from "../src/tools/lcm-recent-tool.js";
+
+const { computeAutoDetailLevel } = __lcmRecentTestInternals;
 
 /**
  * Unit tests for the Tier-1-only auto-detail-level picker. Builds a minimal
