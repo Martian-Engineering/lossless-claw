@@ -1569,6 +1569,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const normalized = normalizeCompletionSummary(result.content);
       let summary = normalized.summary;
       let summarySource: "content" | "envelope" | "retry" | "fallback" = "content";
+      let envelopeNormalized: ReturnType<typeof normalizeCompletionSummary> | undefined;
 
       // --- Empty-summary hardening: envelope → retry → deterministic fallback ---
       if (!summary) {
@@ -1576,7 +1577,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         // top-level response fields (output, message, response) rather than
         // inside the content array.  Re-run normalization against the full
         // response envelope before spending an API call on a retry.
-        const envelopeNormalized = normalizeCompletionSummary(result);
+        envelopeNormalized = normalizeCompletionSummary(result);
         if (envelopeNormalized.summary) {
           summary = envelopeNormalized.summary;
           summarySource = "envelope";
@@ -1593,9 +1594,18 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       // empty so the retry/fallback chain runs instead of persisting the
       // reasoning text verbatim as the summary body.
       if (summary && looksLikeReasoningOnlySummary(summary)) {
+        // Log the block_types from the source normalization that actually
+        // produced this summary text — `normalized` is content-path, but
+        // when the summary came from `envelopeNormalized` the relevant
+        // shape is the envelope's, not the content's.
+        const droppedBlockTypes =
+          summarySource === "envelope" && envelopeNormalized
+            ? envelopeNormalized.blockTypes
+            : normalized.blockTypes;
         params.deps.log.warn(
           `[lcm] dropped reasoning-shaped summary on first attempt; provider=${provider}; ` +
-            `model=${model}; block_types=${formatBlockTypes(normalized.blockTypes)}; ` +
+            `model=${model}; source=${summarySource}; ` +
+            `block_types=${formatBlockTypes(droppedBlockTypes)}; ` +
             `summary_preview=${formatDiagnosticPayload(summary.slice(0, 160))}`,
         );
         summary = "";
