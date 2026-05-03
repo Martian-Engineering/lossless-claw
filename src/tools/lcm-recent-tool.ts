@@ -1326,7 +1326,7 @@ function getRecentSummaryFallback(
          kind = 'leaf'
          AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
          AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
-       ORDER BY julianday(coalesce(latest_at, earliest_at, created_at)) DESC
+       ORDER BY julianday(coalesce(latest_at, earliest_at, created_at)) DESC, summary_id ASC
        LIMIT ${FALLBACK_SQL_LIMIT + 1}`
     )
     .all(...args) as unknown as RecentSummaryFallbackRow[];
@@ -1349,7 +1349,7 @@ function getRecentSummaryFallback(
            FROM summary_messages sm
            WHERE sm.message_id = m.message_id
          )
-       ORDER BY julianday(m.created_at) DESC
+       ORDER BY julianday(m.created_at) DESC, m.message_id ASC
        LIMIT ${FALLBACK_SQL_LIMIT + 1}`
     )
     .all(...args) as unknown as RecentSummaryFallbackRow[];
@@ -1494,6 +1494,7 @@ export const __lcmRecentTestInternals = {
   getUtcDateForZonedLocalTime,
   extractRollupDigest,
   formatSourcesLine,
+  getRecentSummaryFallback,
 };
 
 export function createLcmRecentTool(input: {

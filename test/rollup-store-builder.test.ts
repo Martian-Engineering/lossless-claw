@@ -1253,6 +1253,75 @@ describe("LCM sub-day window retrieval", () => {
     expect(ids1[0]).toBeGreaterThan(ids1[1]);
   });
 
+  it("returns deterministic order from getRecentSummaryFallback when timestamps tie (R3-FIX-1)", async () => {
+    // Pre-fix: ORDER BY julianday(...) DESC alone has no PK tiebreaker.
+    // Within one SQLite instance the rowid backstop usually keeps order
+    // stable, but a `.dump | sqlite3 newdb` reimport flips it. We assert
+    // the fix here by inserting two summaries with identical latest_at and
+    // checking that the SQL ordering puts the lexicographically smaller
+    // summary_id first (ASC tiebreak), the same property post-dump-restore
+    // would also satisfy. Mirrors the c192ee8 fix for P1-9.
+    const { db, conversationStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "fallback-tiebreak",
+      sessionKey: "agent:main:fallback-tiebreak",
+    });
+    const sharedTime = new Date("2026-04-27T10:00:00.000Z");
+    // Insert in "wrong" order so a missing tiebreaker would yield insertion-
+    // order DESC (i.e. zeta first); the ASC tiebreak must put alpha first.
+    await summaryStore.insertSummary({
+      summaryId: "sum_zeta_tiebreak",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Z entry sharing latest_at.",
+      tokenCount: 5,
+      latestAt: sharedTime,
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_alpha_tiebreak",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "A entry sharing latest_at.",
+      tokenCount: 5,
+      latestAt: sharedTime,
+    });
+    // Force-update both rows to share created_at as well, removing any
+    // chance of the strftime() coalesce sorting on a different field.
+    db.prepare(
+      `UPDATE summaries
+       SET created_at = '2026-04-27 10:00:00',
+           earliest_at = '2026-04-27T10:00:00.000Z'
+       WHERE summary_id IN ('sum_zeta_tiebreak', 'sum_alpha_tiebreak')`,
+    ).run();
+
+    const callFallback = () =>
+      __lcmRecentTestInternals.getRecentSummaryFallback(
+        db,
+        conversation.conversationId,
+        new Date("2026-04-27T09:00:00.000Z"),
+        new Date("2026-04-27T11:00:00.000Z"),
+      );
+
+    const a = callFallback();
+    const b = callFallback();
+    const c = callFallback();
+    const idsA = a.summaries.map((s) => s.summary_id);
+    const idsB = b.summaries.map((s) => s.summary_id);
+    const idsC = c.summaries.map((s) => s.summary_id);
+    expect(idsA).toContain("sum_alpha_tiebreak");
+    expect(idsA).toContain("sum_zeta_tiebreak");
+    expect(idsB).toEqual(idsA);
+    expect(idsC).toEqual(idsA);
+    // Deterministic ASC tiebreak puts the lexicographically smaller
+    // summary_id first when latest_at ties (the property that survives
+    // a SQL dump/restore round-trip, unlike rowid-backstop ordering).
+    const alphaIdx = idsA.indexOf("sum_alpha_tiebreak");
+    const zetaIdx = idsA.indexOf("sum_zeta_tiebreak");
+    expect(alphaIdx).toBeLessThan(zetaIdx);
+  });
+
   it("performs the existing-row read inside the transaction in buildAggregateRollup (P1-8)", async () => {
     // Structural assertion: reading rollup-builder.ts source must show that
     // the FIRST `this.store.getRollup(` call inside buildAggregateRollup
