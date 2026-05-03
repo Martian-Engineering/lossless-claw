@@ -5259,7 +5259,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
     // Bedrock empty-content rejection, but did not handle the
     // [{type:"text", text:""}] blank-text shape — Bedrock still rejects with
     // "The text field in the ContentBlock object at messages.N.content.0 is
-    // blank". The cleanedEntries filter must also strip these.
+    // blank". The cleanedEntries filter must strip all-blank messages and blank
+    // blocks inside otherwise valid assistant messages.
     const engine = createEngine();
     const sessionId = randomUUID();
 
@@ -5285,7 +5286,10 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId,
       message: {
         role: "assistant",
-        content: [{ type: "text", text: "Real answer." }],
+        content: [
+          { type: "text", text: "" },
+          { type: "text", text: "Real answer." },
+        ],
       } as AgentMessage,
     });
 
@@ -5302,6 +5306,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       content?: Array<{ type?: string; text?: string }>;
     };
     expect(assistant.role).toBe("assistant");
+    expect(assistant.content).toHaveLength(1);
     expect(assistant.content?.[0]?.text).toBe("Real answer.");
   });
 

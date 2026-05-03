@@ -2,7 +2,7 @@
 "@martian-engineering/lossless-claw": patch
 ---
 
-Fix three v0.9.3 regressions affecting prefill safety and provider routing:
+Fix v0.9.3 regressions affecting prefill safety and provider routing:
 
 - Restore the reference-inequality contract on the no-user-turn assemble fallback. PR #502's guard returned `params.messages` by reference, defeating the `installContextEngineLoopHook` `assembled.messages !== sourceMessages` check installed by PR #504; the guard now uses the same `safeFallback()` helper as the other fallback paths so the gateway treats the result as assembled context.
 - Strip assistant messages whose only blocks are blank text (`[{type:"text", text:""}]`) during assembly, complementing the existing thinking-only filter so Bedrock no longer rejects with `The text field in the ContentBlock object at messages.N.content.0 is blank`.

@@ -104,6 +104,15 @@ function isThinkingOnlyContent(content: unknown[]): boolean {
   );
 }
 
+/** Returns true when a content block is a blank or whitespace-only text block. */
+function isBlankTextBlock(block: unknown): boolean {
+  if (!block || typeof block !== "object") return false;
+  const record = block as Record<string, unknown>;
+  if (record.type !== "text") return false;
+  if (typeof record.text !== "string") return false;
+  return record.text.trim() === "";
+}
+
 /** Returns true when every block in the content array is a text block whose
  *  text is empty or whitespace-only. Bedrock rejects messages whose content
  *  is a `[{type:"text", text:""}]` shape with `The text field in the
@@ -111,13 +120,7 @@ function isThinkingOnlyContent(content: unknown[]): boolean {
  *  filtered before the cleaned tail is handed to the provider. */
 function isBlankContent(content: unknown[]): boolean {
   if (content.length === 0) return false;
-  return content.every((block) => {
-    if (!block || typeof block !== "object") return false;
-    const record = block as Record<string, unknown>;
-    if (record.type !== "text") return false;
-    if (typeof record.text !== "string") return false;
-    return record.text.trim() === "";
-  });
+  return content.every(isBlankTextBlock);
 }
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -1254,6 +1257,18 @@ export class ContextAssembler {
             content: [{ type: "text", text: msg.content }] as unknown as typeof msg.content,
           } as AgentMessage,
         };
+      }
+      if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+        const content = msg.content.filter((block) => !isBlankTextBlock(block));
+        if (content.length !== msg.content.length) {
+          return {
+            ...entry,
+            message: {
+              ...msg,
+              content: content as unknown as typeof msg.content,
+            } as AgentMessage,
+          };
+        }
       }
       return entry;
     });
