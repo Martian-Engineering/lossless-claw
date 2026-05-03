@@ -1673,7 +1673,7 @@ const MAX_ROLLUP_MAINTENANCE_DAYS_BACK = 30;
 
 function computeRollupMaintenanceDaysBack(
   lastRollupCheckAt: string | null | undefined,
-  now = new Date(),
+  now: Date,
 ): number {
   if (!lastRollupCheckAt) {
     return MAX_ROLLUP_MAINTENANCE_DAYS_BACK;
@@ -5577,6 +5577,7 @@ export class LcmContextEngine implements ContextEngine {
             ) {
               const daysBack = computeRollupMaintenanceDaysBack(
                 rollupState?.last_rollup_check_at,
+                this.deps.clock.now(),
               );
               const rollupResult = await this.rollupBuilder.buildDailyRollups(
                 conversation.conversationId,

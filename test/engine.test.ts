@@ -2458,6 +2458,45 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("maintain() uses deps.clock.now() to compute rollup-maintenance daysBack — B4 regression", async () => {
+    // Inject a frozen clock at engine construction. computeRollupMaintenanceDaysBack
+    // must use it, not wall time. Without vi.setSystemTime — proves the
+    // clock injection threads through, not that vi.useFakeTimers happens to
+    // catch \`new Date()\`.
+    const frozenAt = new Date("2026-04-29T12:00:00.000Z");
+    const engine = createEngineWithDeps(
+      { transcriptGcEnabled: false },
+      { clock: { now: () => frozenAt } },
+    );
+    const sessionId = randomUUID();
+    const sessionFile = createSessionFilePath("rollup-maintenance-clock-injection");
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed rollup maintenance" }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    // last_rollup_check_at = frozenAt - 2d 2h, so elapsedDays = ceil(2.083) = 3.
+    // daysBack = min(30, max(1, 3 + 1)) = 4.
+    engine.getRollupStore().upsertState(conversation!.conversationId, {
+      timezone: "UTC",
+      last_rollup_check_at: "2026-04-27T10:00:00.000Z",
+      pending_rebuild: 1,
+    });
+    const buildDailySpy = vi.spyOn(engine.getRollupBuilder(), "buildDailyRollups");
+
+    await engine.maintain({ sessionId, sessionFile });
+
+    expect(buildDailySpy).toHaveBeenCalledWith(conversation!.conversationId, {
+      daysBack: 4,
+      forceCurrentDay: true,
+    });
+  });
+
   it("serializes recycled session writes by stable sessionKey", async () => {
     const engine = createEngine();
     const sessionKey = "agent:main:main";
