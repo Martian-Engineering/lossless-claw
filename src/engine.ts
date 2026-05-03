@@ -95,6 +95,12 @@ type BootstrapImportObservation = {
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const MAX_STABLE_ORPHAN_STRIPPING_BOUNDARIES = 100;
 const MIN_OBSERVED_CACHE_READ_SHARE_FOR_HOT = 0.2;
+
+/** TTL for `recentBootstrapImportsByConversation` entries in overflow diagnostics. */
+const BOOTSTRAP_IMPORT_OBSERVATION_TTL_MS = 30 * 60_000;
+
+/** Yield every K bootstrap-ingest messages so the worker doesn't monopolise the loop. */
+const BOOTSTRAP_INGEST_CHUNK_SIZE = 100;
 type CircuitBreakerState = {
   failures: number;
   openSince: number | null;
@@ -349,12 +355,19 @@ function shouldLogOverflowDiagnostics(params: {
 function formatOverflowDiagnosticsForLog(params: {
   diagnostics: AssemblyOverflowDiagnostics;
   recentBootstrapImport?: BootstrapImportObservation;
+  now?: number;
 }): string {
+  // Drop stale observations: the LRU only evicts at 100 conversations, so
+  // without a TTL a "7 imports" tag could trail a conversation indefinitely.
   const recent = params.recentBootstrapImport;
+  const nowMs = params.now ?? Date.now();
+  const isFresh =
+    recent !== undefined &&
+    nowMs - recent.observedAt.getTime() <= BOOTSTRAP_IMPORT_OBSERVATION_TTL_MS;
   return JSON.stringify({
     ...params.diagnostics,
-    recentBootstrapImportCount: recent?.importedMessages ?? null,
-    recentBootstrapImportReason: recent?.reason ?? null,
+    recentBootstrapImportCount: isFresh ? recent!.importedMessages : null,
+    recentBootstrapImportReason: isFresh ? recent!.reason : null,
   });
 }
 
@@ -1101,6 +1114,111 @@ type StoredMessage = {
   content: string;
   tokenCount: number;
 };
+
+/** Block types that require structural persistence into the `message_parts`
+ *  table (tool calls, tool results, reasoning/thinking traces, function-call
+ *  shapes).  Bootstrap must NOT take the bulk-insert fast path when any
+ *  message contains these — bulk insert only writes the `messages` row, so
+ *  structural blocks would be lost on replay. */
+const STRUCTURAL_BLOCK_TYPES = new Set([
+  "tool_use",
+  "toolUse",
+  "toolCall",
+  "tool-use",
+  "tool_result",
+  "toolResult",
+  "tool-result",
+  "function_call",
+  "functionCall",
+  "function_call_output",
+  "thinking",
+  "redacted_thinking",
+  "reasoning",
+  "image",
+]);
+
+/**
+ * Cheap pre-scan: should bootstrap take the bulk-insert fast path for this
+ * message, or fall through to the per-message `ingestSingle` path?
+ *
+ * Returns true (slower per-message path required) when:
+ *   - the message carries any structural block (tool/reasoning/image/etc.)
+ *     that needs `message_parts` rows
+ *   - the role is `tool` or `toolResult` (those go through a separate
+ *     interceptor/parts pipeline)
+ *   - any size-driven interceptor would fire (large file/raw-payload/tool-
+ *     result)
+ *   - the content shows the textual markers `interceptInlineImages` /
+ *     `interceptLargeFiles` look for
+ *
+ * False positives are acceptable (slower path); false negatives would skip
+ * externalization or drop `message_parts`, so the helper errs on the side of
+ * "use the safe per-message path".
+ */
+function bootstrapMessageWouldTriggerInterceptor(
+  message: AgentMessage,
+  largeFileTokenThreshold: number,
+): boolean {
+  const threshold = Math.max(1, largeFileTokenThreshold);
+  const role = (message as { role?: unknown }).role;
+  const content = "content" in message ? message.content : undefined;
+
+  // Tool/toolResult roles need the per-message path regardless of payload —
+  // they go through `interceptInlineImagesInToolMessage` and have their own
+  // parts pipeline that the bulk-insert fast path does not reproduce.
+  if (role === "tool" || role === "toolResult") {
+    return true;
+  }
+
+  // Structural blocks (tool calls/results, reasoning, thinking, function
+  // calls, images) need `message_parts` rows for replay; bulk-insert only
+  // writes the `messages` row, so any such block forces per-message ingest.
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const blockType = (block as { type?: unknown }).type;
+      if (typeof blockType === "string" && STRUCTURAL_BLOCK_TYPES.has(blockType)) {
+        return true;
+      }
+    }
+  }
+
+  if (typeof content === "string") {
+    // interceptInlineImages: explicit media marker or a long base64 run.
+    if (content.startsWith("[media attached:")) return true;
+    if (content.length >= 80 && /[A-Za-z0-9+/]{80,}={0,2}/.test(content)) return true;
+    // interceptLargeFiles: presence of a file block — match `<file>`,
+    // `<file ...>`, and `<file\n...>` forms. The interceptor decides on
+    // size; we only need a robust open-tag detector here.
+    if (/<file(?:\s|>)/.test(content)) return true;
+  }
+
+  // Size gate for interceptLargeRawPayload / interceptLargeToolResults.
+  // Use the same `estimateTokens` heuristic the production token-count
+  // code path uses — `content.length` (UTF-16 code units) is NOT a safe
+  // upper bound on token count for CJK text, where `estimateTokens`
+  // weights per-codepoint at ~1.5 tokens/char, so long CJK text can have
+  // MORE tokens than code units and a code-unit upper-bound check would
+  // produce false negatives (slip past the structural pre-scan and into
+  // bulk-insert when a size-driven interceptor would have fired).
+  let estimatedTokens = 0;
+  if (typeof content === "string") {
+    estimatedTokens = estimateTokens(content);
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (typeof block === "string") {
+        estimatedTokens += estimateTokens(block);
+      } else if (block && typeof block === "object") {
+        const text = (block as { text?: unknown }).text;
+        estimatedTokens +=
+          typeof text === "string" ? estimateTokens(text) : 1024;
+      }
+    }
+  } else if (content && typeof content === "object") {
+    estimatedTokens += 1024;
+  }
+  return estimatedTokens >= threshold;
+}
 
 /**
  * Normalize AgentMessage variants into the storage shape used by LCM.
@@ -5081,15 +5199,56 @@ export class LcmContextEngine implements ContextEngine {
               };
             }
 
+            // Pre-scan: PR #510 moved bootstrap to N×ingestSingle so
+            // interceptors could fire on first import. Restore the v0.9.2
+            // bulk-insert fast path when no message would trigger any
+            // interceptor AND has no structural blocks (`message_parts` is
+            // not populated by the bulk path); otherwise stay on the
+            // per-message ingest path with periodic event-loop yields.
+            const threshold = this.config.largeFileTokenThreshold;
+            const requiresPerMessageIngest = bootstrapMessages.some((message) =>
+              bootstrapMessageWouldTriggerInterceptor(message, threshold),
+            );
+
             let importedMessages = 0;
-            for (const message of bootstrapMessages) {
-              const result = await this.ingestSingle({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                message,
+            if (!requiresPerMessageIngest) {
+              const nextSeq =
+                (await this.conversationStore.getMaxSeq(conversationId)) + 1;
+              const bulkInput = bootstrapMessages.map((message, index) => {
+                const stored = toStoredMessage(message);
+                return {
+                  conversationId,
+                  seq: nextSeq + index,
+                  role: stored.role,
+                  content: stored.content,
+                  tokenCount: stored.tokenCount,
+                };
               });
-              if (result.ingested) {
-                importedMessages += 1;
+              const inserted =
+                await this.conversationStore.createMessagesBulk(bulkInput);
+              await this.summaryStore.appendContextMessages(
+                conversationId,
+                inserted.map((record) => record.messageId),
+              );
+              importedMessages = inserted.length;
+            } else {
+              for (let i = 0; i < bootstrapMessages.length; i += 1) {
+                const result = await this.ingestSingle({
+                  sessionId: params.sessionId,
+                  sessionKey: params.sessionKey,
+                  message: bootstrapMessages[i],
+                });
+                if (result.ingested) {
+                  importedMessages += 1;
+                }
+                if ((i + 1) % BOOTSTRAP_INGEST_CHUNK_SIZE === 0) {
+                  // setImmediate yields a macrotask boundary so timer/IO
+                  // callbacks can run before the next ingest batch — a
+                  // bare `Promise.resolve()` only schedules a microtask,
+                  // which can still starve the event loop on long
+                  // bootstraps.
+                  await new Promise<void>((resolve) => setImmediate(resolve));
+                }
               }
             }
             await this.conversationStore.markConversationBootstrapped(conversationId);

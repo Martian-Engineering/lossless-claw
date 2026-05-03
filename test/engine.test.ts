@@ -4020,8 +4020,8 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(reconcileSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("uses the live ingest path for initial bootstrap", async () => {
-    const sessionFile = createSessionFilePath("bootstrap-ingest-path");
+  it("uses the bulk-insert fast path when no bootstrap message would trigger an interceptor", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-ingest-path-fast");
     const sm = SessionManager.open(sessionFile);
     sm.appendMessage({
       role: "user",
@@ -4045,14 +4045,123 @@ describe("LcmContextEngine.bootstrap", () => {
     const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
 
     const result = await engine.bootstrap({
-      sessionId: "bootstrap-ingest-path",
+      sessionId: "bootstrap-ingest-path-fast",
       sessionFile,
     });
 
     expect(result.bootstrapped).toBe(true);
     expect(result.importedMessages).toBe(2);
+    expect(bulkSpy).toHaveBeenCalledTimes(1);
+    expect(singleSpy).not.toHaveBeenCalled();
+  });
+
+  it("falls through to per-message ingest when a bootstrap message would trigger an interceptor", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-ingest-path-slow");
+    const fileText = `${"bootstrap fallthrough line\n".repeat(80)}done`;
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "user",
+        content: `<file name="boot.md" mime="text/markdown">${fileText}</file>`,
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-ingest-path-slow",
+      sessionFile,
+    });
+
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
     expect(bulkSpy).not.toHaveBeenCalled();
-    expect(singleSpy).toHaveBeenCalledTimes(2);
+    expect(singleSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("forces per-message ingest when bootstrap messages carry tool_use / reasoning blocks (no tool/toolResult role)", async () => {
+    // Regression: the bulk-insert fast path writes `messages` rows but does
+    // NOT populate `message_parts`, so any structural block (tool calls,
+    // reasoning/thinking, function calls, images) on a USER OR ASSISTANT
+    // message would be silently dropped on replay if the pre-scan let it
+    // through.
+    //
+    // This test deliberately includes NO `role: "tool"` / `role: "toolResult"`
+    // messages — `bootstrapMessageWouldTriggerInterceptor` returns true
+    // unconditionally for those roles, so a test that included one would
+    // pass even if the structural-block detection for assistant/user
+    // messages regressed.  All three messages here are
+    // `role: "assistant"` carrying structural blocks, so the per-message
+    // path is forced ONLY by the STRUCTURAL_BLOCK_TYPES detection.
+    const sessionFile = createSessionFilePath("bootstrap-structural-blocks");
+    const lines = [
+      JSON.stringify({
+        role: "assistant",
+        content: [
+          { type: "text", text: "Calling the tool now." },
+          {
+            type: "tool_use",
+            id: "tu_boot_1",
+            name: "ls",
+            input: { path: "/tmp" },
+          },
+        ],
+      }),
+      JSON.stringify({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "consider the result" },
+          { type: "text", text: "Acknowledged." },
+        ],
+      }),
+      JSON.stringify({
+        role: "assistant",
+        content: [
+          { type: "function_call", call_id: "fc_boot_1", name: "noop", arguments: "{}" },
+          { type: "text", text: "Done." },
+        ],
+      }),
+    ];
+    writeFileSync(sessionFile, `${lines.join("\n")}\n`, "utf8");
+
+    // Realistic threshold so SIZE-based interceptors don't fire — we want
+    // to verify that STRUCTURAL blocks alone force the per-message path.
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+    const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
+
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-structural-blocks",
+      sessionFile,
+    });
+    expect(result.bootstrapped).toBe(true);
+
+    // Bulk path must NOT have been used — structural blocks force per-message
+    // ingest so `message_parts` rows get populated by the standard pipeline.
+    expect(bulkSpy).not.toHaveBeenCalled();
+    expect(singleSpy).toHaveBeenCalled();
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId("bootstrap-structural-blocks");
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    // tool_use / tool_result / thinking blocks all need parts rows — at least
+    // one stored message should have non-empty parts.
+    let totalParts = 0;
+    for (const m of stored) {
+      const parts = await engine
+        .getConversationStore()
+        .getMessageParts(m.messageId);
+      totalParts += parts.length;
+    }
+    expect(totalParts).toBeGreaterThan(0);
   });
 
   it("externalizes oversized file blocks during first-time bootstrap and still reconciles later tail messages", async () => {
@@ -5193,6 +5302,177 @@ describe("LcmContextEngine.assemble canonical path", () => {
         selected: true,
       }),
     ]);
+  });
+
+  it("drops stale recentBootstrapImport observations from overflow diagnostics", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: infoLog,
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "session-overflow-stale-bootstrap";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: `large prompt ${"x".repeat(1200)}`,
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: `second ${"y".repeat(600)}`,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    // Inject a stale observation directly into the engine's Map. 31 minutes
+    // > the 30-minute TTL, so it must NOT surface in overflow diagnostics.
+    const recentMap = (
+      engine as unknown as {
+        recentBootstrapImportsByConversation: Map<
+          number,
+          { importedMessages: number; reason: string | null; observedAt: Date }
+        >;
+      }
+    ).recentBootstrapImportsByConversation;
+    const staleAt = new Date(Date.now() - 31 * 60_000);
+    recentMap.set(conversation!.conversationId, {
+      importedMessages: 99,
+      reason: "stale ghost",
+      observedAt: staleAt,
+    });
+
+    await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 100,
+    });
+
+    const assembleDebugLog = infoLog.mock.calls
+      .map((call: unknown[]) => call[0])
+      .find(
+        (entry: unknown) =>
+          typeof entry === "string" &&
+          entry.includes("[lcm] assemble-debug") &&
+          entry.includes("overflowDiagnostics="),
+      ) as string | undefined;
+
+    expect(assembleDebugLog).toEqual(expect.any(String));
+    const diagnostics = JSON.parse(
+      assembleDebugLog!
+        .slice(assembleDebugLog!.indexOf("overflowDiagnostics="))
+        .replace("overflowDiagnostics=", ""),
+    ) as Record<string, unknown>;
+    expect(diagnostics.recentBootstrapImportCount).toBeNull();
+    expect(diagnostics.recentBootstrapImportReason).toBeNull();
+  });
+
+  it("preserves a fresh recentBootstrapImport observation in overflow diagnostics", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: infoLog,
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "session-overflow-fresh-bootstrap";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: `large prompt ${"x".repeat(1200)}`,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    // 1-minute-old observation: well within the 30-minute TTL.
+    const recentMap = (
+      engine as unknown as {
+        recentBootstrapImportsByConversation: Map<
+          number,
+          { importedMessages: number; reason: string | null; observedAt: Date }
+        >;
+      }
+    ).recentBootstrapImportsByConversation;
+    recentMap.set(conversation!.conversationId, {
+      importedMessages: 12,
+      reason: "fresh-tag",
+      observedAt: new Date(Date.now() - 60_000),
+    });
+
+    await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 100,
+    });
+
+    const assembleDebugLog = infoLog.mock.calls
+      .map((call: unknown[]) => call[0])
+      .find(
+        (entry: unknown) =>
+          typeof entry === "string" &&
+          entry.includes("[lcm] assemble-debug") &&
+          entry.includes("overflowDiagnostics="),
+      ) as string | undefined;
+
+    expect(assembleDebugLog).toEqual(expect.any(String));
+    const diagnostics = JSON.parse(
+      assembleDebugLog!
+        .slice(assembleDebugLog!.indexOf("overflowDiagnostics="))
+        .replace("overflowDiagnostics=", ""),
+    ) as Record<string, unknown>;
+    expect(diagnostics.recentBootstrapImportCount).toBe(12);
+    expect(diagnostics.recentBootstrapImportReason).toBe("fresh-tag");
+  });
+
+  it("bootstrap fast path imports many plain messages well below per-message-ingest cost (perf regression guard)", async () => {
+    // Generous bound — large multiplier over the bulk-insert cost so that
+    // CI variance on slower hardware doesn't flake. The point is to catch a
+    // regression that reverts to N×ingestSingle for plain text transcripts,
+    // which on a 2k-message session takes orders of magnitude longer than
+    // the bulk path.
+    const sessionFile = createSessionFilePath("bootstrap-fast-path-perf");
+    const sm = SessionManager.open(sessionFile);
+    const messageCount = 400;
+    for (let i = 0; i < messageCount; i += 1) {
+      sm.appendMessage({
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: [{ type: "text", text: `plain message ${i}` }],
+      } as AgentMessage);
+    }
+
+    const engine = createEngine();
+    const bulkSpy = vi.spyOn(engine.getConversationStore(), "createMessagesBulk");
+
+    const startedAt = Date.now();
+    const result = await engine.bootstrap({
+      sessionId: "bootstrap-fast-path-perf",
+      sessionFile,
+    });
+    const durationMs = Date.now() - startedAt;
+
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(messageCount);
+    expect(bulkSpy).toHaveBeenCalledTimes(1);
+    // 15 seconds is wildly generous — local runs typically complete in well
+    // under a second. The bound guards against a regression to per-message
+    // ingest, which would scale O(N) summary-store appends and historically
+    // takes tens of seconds for this many messages.
+    expect(durationMs).toBeLessThan(15_000);
   });
 
   it("repairs OpenAI function_call transcripts without dropping reasoning blocks", async () => {
