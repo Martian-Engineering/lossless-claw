@@ -3609,6 +3609,12 @@ export class LcmContextEngine implements ContextEngine {
         return "webp";
       case "image/svg+xml":
         return "svg";
+      case "image/heic":
+        return "heic";
+      case "image/avif":
+        return "avif";
+      case "image/bmp":
+        return "bmp";
       default:
         return null;
     }
@@ -3663,6 +3669,7 @@ export class LcmContextEngine implements ContextEngine {
     content: unknown[];
     imageIndex: number;
     extension: string;
+    role?: string;
   }): string {
     for (let index = params.imageIndex - 1; index >= 0; index -= 1) {
       const entry = asRecord(params.content[index]);
@@ -3680,7 +3687,13 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    return `user-image.${params.extension}`;
+    const rolePrefix =
+      params.role === "assistant"
+        ? "assistant"
+        : params.role === "tool" || params.role === "toolResult"
+          ? "tool"
+          : "user";
+    return `${rolePrefix}-image.${params.extension}`;
   }
 
   private static isExternalizedImageReference(value: string): boolean {
@@ -3755,16 +3768,32 @@ export class LcmContextEngine implements ContextEngine {
     return { fileId, byteSize, summary, reference };
   }
 
-  private async interceptNativeUserImageBlocks(params: {
+  private async interceptNativeImageBlocks(params: {
     conversationId: number;
     message: AgentMessage;
   }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
-    if (params.message.role !== "user" || !("content" in params.message)) {
+    if (!("content" in params.message)) {
+      return null;
+    }
+    const role = (params.message as { role?: unknown }).role;
+    if (
+      role !== "user" &&
+      role !== "assistant" &&
+      role !== "tool" &&
+      role !== "toolResult"
+    ) {
       return null;
     }
     if (!Array.isArray(params.message.content)) {
       return null;
     }
+
+    const label =
+      role === "assistant"
+        ? "Assistant image"
+        : role === "tool" || role === "toolResult"
+          ? "Tool image"
+          : "User image";
 
     const rewrittenContent: unknown[] = [];
     const fileIds: string[] = [];
@@ -3785,10 +3814,11 @@ export class LcmContextEngine implements ContextEngine {
           content: params.message.content,
           imageIndex: index,
           extension: image.extension,
+          role: typeof role === "string" ? role : undefined,
         }),
         extension: image.extension,
         mimeType: image.mimeType,
-        label: "User image",
+        label,
       });
 
       rewrittenContent.push({ type: "text", text: externalized.reference });
@@ -5740,6 +5770,15 @@ export class LcmContextEngine implements ContextEngine {
 
     let messageForParts = message;
 
+    const nativeImageIntercepted = await this.interceptNativeImageBlocks({
+      conversationId,
+      message: messageForParts,
+    });
+    if (nativeImageIntercepted) {
+      messageForParts = nativeImageIntercepted.rewrittenMessage;
+      stored = toStoredMessage(messageForParts);
+    }
+
     if (stored.role === "tool") {
       const imageIntercepted = await this.interceptInlineImagesInToolMessage({
         conversationId,
@@ -5750,15 +5789,6 @@ export class LcmContextEngine implements ContextEngine {
         stored = toStoredMessage(messageForParts);
       }
     } else {
-      const nativeImageIntercepted = await this.interceptNativeUserImageBlocks({
-        conversationId,
-        message: messageForParts,
-      });
-      if (nativeImageIntercepted) {
-        messageForParts = nativeImageIntercepted.rewrittenMessage;
-        stored = toStoredMessage(messageForParts);
-      }
-
       const imageIntercepted = await this.interceptInlineImages({
         conversationId,
         content: stored.content,

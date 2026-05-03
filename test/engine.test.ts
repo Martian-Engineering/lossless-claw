@@ -1737,6 +1737,158 @@ describe("LcmContextEngine.ingest content extraction", () => {
     expect(JSON.stringify(assembled.messages)).not.toContain(base64Image.slice(0, 32));
   });
 
+  it("externalizes native assistant image blocks before raw payload fallback", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+    const sessionId = randomUUID();
+    const base64Image = `iVBORw0KGgo${"A".repeat(600)}`;
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({
+        role: "assistant",
+        content: [
+          { type: "text", text: "Here is the rendered chart:" },
+          { type: "image", data: base64Image, mimeType: "image/png" },
+        ],
+      }),
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("Here is the rendered chart");
+    expect(messages[0].content).toContain("[Assistant image:");
+    expect(messages[0].content).not.toContain("raw-assistant-payload");
+    expect(messages[0].content).not.toContain("[LCM Raw Payload:");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+
+    const largeFiles = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(largeFiles).toHaveLength(1);
+    expect(largeFiles[0].mimeType).toBe("image/png");
+    expect(largeFiles[0].fileName).toBe("assistant-image.png");
+  });
+
+  it("externalizes native tool-result image blocks before raw payload fallback", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+    const sessionId = randomUUID();
+    const base64Image = `iVBORw0KGgo${"B".repeat(600)}`;
+
+    // First the assistant tool call so the conversation has a corresponding tool message.
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_screenshot",
+            name: "take_screenshot",
+            input: {},
+          },
+        ],
+      } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_screenshot",
+        toolName: "take_screenshot",
+        content: [
+          { type: "image", data: base64Image, mimeType: "image/png" },
+        ],
+      } as AgentMessage,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(2);
+    const toolMessage = messages[1];
+    expect(toolMessage.role).toBe("tool");
+    expect(toolMessage.content).toContain("[Tool image:");
+    expect(toolMessage.content).not.toContain("raw-tool-payload");
+    expect(toolMessage.content).not.toContain("[LCM Raw Payload:");
+    expect(toolMessage.content).not.toContain(base64Image.slice(0, 32));
+
+    const largeFiles = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(largeFiles).toHaveLength(1);
+    expect(largeFiles[0].mimeType).toBe("image/png");
+    expect(largeFiles[0].fileName).toBe("tool-image.png");
+  });
+
+  it("infers extensions for heic, avif, and bmp native image blocks", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+
+    const cases: Array<{ mimeType: string; extension: string }> = [
+      { mimeType: "image/heic", extension: "heic" },
+      { mimeType: "image/avif", extension: "avif" },
+      { mimeType: "image/bmp", extension: "bmp" },
+    ];
+
+    for (const variant of cases) {
+      const sessionId = randomUUID();
+      // Use a base64 payload that will NOT match any magic-byte prefix so we
+      // exercise the declared mimeType -> extension fallback.
+      const base64Image = `ZZZZ${"C".repeat(600)}`;
+
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({
+          role: "user",
+          content: [
+            { type: "text", text: "look at this" },
+            { type: "image", data: base64Image, mimeType: variant.mimeType },
+          ],
+        }),
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(1);
+      expect(largeFiles[0].mimeType).toBe(variant.mimeType);
+      expect(largeFiles[0].storageUri.endsWith(`.${variant.extension}`)).toBe(true);
+      expect(largeFiles[0].fileName.endsWith(`.${variant.extension}`)).toBe(true);
+    }
+  });
+
   it("externalizes oversized tool-result payloads into large_files", async () => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
