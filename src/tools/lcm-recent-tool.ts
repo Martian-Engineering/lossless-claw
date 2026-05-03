@@ -1273,14 +1273,19 @@ function getRecentSummaryFallback(
   db: DatabaseSync,
   conversationId: number | undefined,
   start: Date,
-  end: Date
+  end: Date,
+  relatedConversationIds?: ReadonlyArray<number>
 ): RecentSummaryFallbackResult {
-  const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
+  const scope = normalizeConversationScope(conversationId, relatedConversationIds);
+  const placeholders = scope ? scope.map(() => "?").join(", ") : "";
+  const scopeClause =
+    scope == null ? "" : `conversation_id IN (${placeholders}) AND`;
+  const messageScopeClause =
+    scope == null ? "" : `m.conversation_id IN (${placeholders}) AND`;
   const args: Array<string | number> =
-    conversationId == null
+    scope == null
       ? [end.toISOString(), start.toISOString()]
-      : [conversationId, end.toISOString(), start.toISOString()];
-  const messageScopeClause = conversationId == null ? "" : "m.conversation_id = ? AND";
+      : [...scope, end.toISOString(), start.toISOString()];
 
   const summaryRows = db
     .prepare(
@@ -1371,17 +1376,48 @@ function getRecentSummaryFallback(
   };
 }
 
+/**
+ * Resolve a "scope" of conversation IDs into a normalized list. Callers pass
+ * either a single id, undefined (= unscoped, all conversations), or an
+ * explicit list (for cross-conversation reads under the same session_key).
+ *
+ * Returns null when the caller is unscoped, or a non-empty list otherwise.
+ * The returned list is deduped to avoid SQL placeholder waste.
+ */
+function normalizeConversationScope(
+  conversationId: number | undefined,
+  relatedConversationIds?: ReadonlyArray<number>,
+): number[] | null {
+  if (relatedConversationIds && relatedConversationIds.length > 0) {
+    return [...new Set(relatedConversationIds)];
+  }
+  if (conversationId == null) {
+    return null;
+  }
+  return [conversationId];
+}
+
 function hasFallbackSourceItemsInRange(
   db: DatabaseSync,
   conversationId: number | undefined,
   start: Date,
-  end: Date
+  end: Date,
+  relatedConversationIds?: ReadonlyArray<number>
 ): boolean {
-  const scopeClause = conversationId == null ? "" : "conversation_id = ? AND";
-  const args: Array<string | number> =
-    conversationId == null
+  const scope = normalizeConversationScope(conversationId, relatedConversationIds);
+  const placeholders = scope ? scope.map(() => "?").join(", ") : "";
+  const summaryScopeClause =
+    scope == null ? "" : `conversation_id IN (${placeholders}) AND`;
+  const messageScopeClause =
+    scope == null ? "" : `m.conversation_id IN (${placeholders}) AND`;
+  const summaryArgs: Array<string | number> =
+    scope == null
       ? [end.toISOString(), start.toISOString()]
-      : [conversationId, end.toISOString(), start.toISOString()];
+      : [...scope, end.toISOString(), start.toISOString()];
+  const messageArgs: Array<string | number> =
+    scope == null
+      ? [end.toISOString(), start.toISOString()]
+      : [...scope, end.toISOString(), start.toISOString()];
 
   const row = db
     .prepare(
@@ -1389,7 +1425,7 @@ function hasFallbackSourceItemsInRange(
          EXISTS (
            SELECT 1
            FROM summaries
-           WHERE ${scopeClause}
+           WHERE ${summaryScopeClause}
              kind = 'leaf'
              AND julianday(coalesce(earliest_at, latest_at, created_at)) < julianday(?)
              AND julianday(coalesce(latest_at, earliest_at, created_at)) >= julianday(?)
@@ -1397,7 +1433,7 @@ function hasFallbackSourceItemsInRange(
          OR EXISTS (
            SELECT 1
            FROM messages m
-           WHERE ${conversationId == null ? "" : "m.conversation_id = ? AND"}
+           WHERE ${messageScopeClause}
              julianday(m.created_at) < julianday(?)
              AND julianday(m.created_at) >= julianday(?)
              AND NOT EXISTS (
@@ -1408,7 +1444,7 @@ function hasFallbackSourceItemsInRange(
          ) AS present
        LIMIT 1`
     )
-    .get(...args, ...args) as { present: 0 | 1 } | undefined;
+    .get(...summaryArgs, ...messageArgs) as { present: 0 | 1 } | undefined;
   return row?.present === 1;
 }
 
@@ -1416,13 +1452,15 @@ function dayHasFallbackSourceItems(
   db: DatabaseSync,
   conversationId: number | undefined,
   dayKey: string,
-  timezone: string
+  timezone: string,
+  relatedConversationIds?: ReadonlyArray<number>
 ): boolean {
   return hasFallbackSourceItemsInRange(
     db,
     conversationId,
     getUtcDateForZonedMidnight(dayKey, timezone),
-    getUtcDateForZonedMidnight(addDays(dayKey, 1), timezone)
+    getUtcDateForZonedMidnight(addDays(dayKey, 1), timezone),
+    relatedConversationIds
   );
 }
 
@@ -1782,7 +1820,13 @@ export function createLcmRecentTool(input: {
             requiredKeys.every(
               (key) =>
                 usableKeys.has(key) ||
-                !dayHasFallbackSourceItems(db, conversationId, key, timezone)
+                !dayHasFallbackSourceItems(
+                  db,
+                  conversationId,
+                  key,
+                  timezone,
+                  conversationScope.relatedConversationIds
+                )
             ));
         const hasStoredCoverage =
           resolution.kind === "day"
@@ -1820,7 +1864,13 @@ export function createLcmRecentTool(input: {
               );
               const live = renderFallbackRollupSection(
                 liveDayKey,
-                getRecentSummaryFallback(db, conversationId, currentStart, currentEnd),
+                getRecentSummaryFallback(
+                  db,
+                  conversationId,
+                  currentStart,
+                  currentEnd,
+                  conversationScope.relatedConversationIds
+                ),
                 timezone,
                 budget,
                 includeSources
@@ -1882,7 +1932,13 @@ export function createLcmRecentTool(input: {
               );
               const live = renderFallbackRollupSection(
                 liveDayKey,
-                getRecentSummaryFallback(db, conversationId, currentStart, currentEnd),
+                getRecentSummaryFallback(
+                  db,
+                  conversationId,
+                  currentStart,
+                  currentEnd,
+                  conversationScope.relatedConversationIds
+                ),
                 timezone,
                 budget,
                 includeSources
@@ -1913,7 +1969,8 @@ export function createLcmRecentTool(input: {
           db,
           conversationId,
           resolution.start,
-          resolution.end
+          resolution.end,
+          conversationScope.relatedConversationIds
         );
         const rendered = renderFallbackRollupSection(
           resolution.label,

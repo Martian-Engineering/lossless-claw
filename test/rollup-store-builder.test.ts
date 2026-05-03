@@ -1062,6 +1062,83 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("includes sibling-conversation leaf content via relatedConversationIds for today fallback", async () => {
+    const now = new Date("2026-04-27T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const sharedSessionKey = "agent:main:cross-conv-fallback";
+
+      // Older sibling holds the actual leaf summaries for today.
+      const sibling = await conversationStore.createConversation({
+        sessionId: "cross-conv-fallback-sibling",
+        sessionKey: sharedSessionKey,
+        title: "Cross-conv sibling",
+      });
+      // Active conversation (created via /new) is empty.
+      const active = await conversationStore.createConversation({
+        sessionId: "cross-conv-fallback-active",
+        sessionKey: sharedSessionKey,
+        title: "Cross-conv active",
+      });
+
+      await summaryStore.insertSummary({
+        summaryId: "sum_sibling_today",
+        conversationId: sibling.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content:
+          "Sibling conversation captured today's work BEFORE /new fired, must surface on the active side.",
+        tokenCount: 16,
+        latestAt: now,
+      });
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: active.conversationId,
+            sessionId: "cross-conv-fallback-active",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => ({
+            conversationId: active.conversationId,
+            sessionKey: sharedSessionKey,
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          listConversationsBySessionKey: async () => [
+            { conversationId: active.conversationId },
+            { conversationId: sibling.conversationId },
+          ],
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "cross-conv-fallback-active",
+        sessionKey: sharedSessionKey,
+      });
+
+      const result = await tool.execute("call-cross-conv", {
+        period: "today",
+        includeSources: true,
+      });
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain("Sibling conversation captured today's work");
+      expect(text).toContain("sum_sibling_today");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("includes live-fallback digest entries when mode:'index' covers today's window", async () => {
     const now = new Date("2026-04-27T12:00:00.000Z");
     vi.useFakeTimers();
