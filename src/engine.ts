@@ -3700,9 +3700,7 @@ export class LcmContextEngine implements ContextEngine {
 
   private static isExternalizedImageReference(value: string): boolean {
     if (typeof value !== "string") return false;
-    return /^\[(?:User|Tool|Assistant|Image) image: .*LCM file: file_[a-f0-9]{16}\]$/.test(
-      value.trim(),
-    );
+    return LcmContextEngine.IMAGE_REFERENCE_REGEX.test(value.trim());
   }
 
   private static isExternalizedReferenceContent(value: string): boolean {
@@ -3711,11 +3709,25 @@ export class LcmContextEngine implements ContextEngine {
       trimmed.startsWith("[LCM File:") ||
       trimmed.startsWith("[LCM Tool Output:") ||
       trimmed.includes("LCM file: file_") ||
-      /\[(?:User|System|Tool|Assistant|Image) image: [^\]]*LCM file: file_[a-f0-9]{16}\]/.test(
-        trimmed,
-      )
+      LcmContextEngine.IMAGE_REFERENCE_REGEX_GLOBAL.test(trimmed)
     );
   }
+
+  /** Image references emitted by `externalizeImage` come in two label
+   *  shapes:
+   *    - `[<Role> image: ...]` from `interceptNativeImageBlocks` (label is
+   *      "User image" / "Assistant image" / "System image" / "Tool image")
+   *    - `[Image: ...]` from `interceptPureBase64Image` for the user/system
+   *      pure-base64 fast path (label is just "Image", no second "image"
+   *      word)
+   *  The regex must match both — a previous shape required the literal
+   *  word "image:" after the label, which silently dropped the
+   *  `[Image: ...]` case and let those references fall through into raw-
+   *  payload externalization. */
+  private static readonly IMAGE_REFERENCE_REGEX =
+    /^\[(?:(?:User|System|Tool|Assistant) image|Image): [^\]]*LCM file: file_[a-f0-9]{16}\]$/;
+  private static readonly IMAGE_REFERENCE_REGEX_GLOBAL =
+    /\[(?:(?:User|System|Tool|Assistant) image|Image): [^\]]*LCM file: file_[a-f0-9]{16}\]/;
 
   /** Stricter form of `isExternalizedReferenceContent` used by the
    *  raw-payload externalizer's skip gate. Returns true when the message's
@@ -3739,9 +3751,7 @@ export class LcmContextEngine implements ContextEngine {
     ) {
       return true;
     }
-    return /^\[(?:User|System|Tool|Assistant|Image) image: [^\]]*LCM file: file_[a-f0-9]{16}\]$/.test(
-      trimmed,
-    );
+    return LcmContextEngine.IMAGE_REFERENCE_REGEX.test(trimmed);
   }
 
   /** Resolve the configured externalized-payload directory for one conversation. */
