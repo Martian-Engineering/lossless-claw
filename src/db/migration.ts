@@ -352,16 +352,22 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
 /**
  * Belt-and-suspenders guard: create `message_parts` if it does not yet exist.
  *
- * `message_parts` is defined inside the large `db.exec()` block in
- * `runLcmMigrations`.  On some Node.js SQLite builds (particularly
+ * Historically, `message_parts` was defined inside a single bulk `db.exec()`
+ * block in `runLcmMigrations`.  On some Node.js SQLite builds (particularly
  * `node:sqlite` before v22.12) a syntax error or constraint-check mismatch
- * anywhere in that block causes the exec to stop early, silently leaving
- * tables that appear later in the string uncreated.  Any subsequent INSERT
- * into `message_parts` then throws "no such table".
+ * anywhere in that block could cause the exec to stop early, silently
+ * leaving tables that appeared later in the string uncreated.
  *
- * This function probes `sqlite_master` directly and creates the table +
- * indexes when absent, matching the pattern used for column guards
- * (`ensureSummaryDepthColumn`, `ensureMessageIdentityHashColumn`, …).
+ * The split-bulk approach (introduced for #569) now exec's each schema
+ * statement individually, so a SQL error on any one statement throws
+ * directly instead of silently aborting subsequent statements.  This guard
+ * is kept as a defense-in-depth against legacy databases that were
+ * upgraded across the silent-abort window — `message_parts` is the highest-
+ * impact table because every ingested message that has structured parts
+ * INSERTs into it.  This function probes `sqlite_master` directly and
+ * creates the table + indexes when absent, matching the pattern used for
+ * column guards (`ensureSummaryDepthColumn`,
+ * `ensureMessageIdentityHashColumn`, …).
  */
 function ensureMessagePartsTable(db: DatabaseSync): void {
   const tables = db
@@ -1058,8 +1064,13 @@ export function runLcmMigrations(
     runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
       ensureMessageIdentityHashColumn(db),
     );
-    // Belt-and-suspenders: ensure message_parts exists even if the bulk
-    // CREATE TABLE block above was interrupted before reaching it.
+    // Belt-and-suspenders: defense-in-depth against legacy databases that
+    // were upgraded across the pre-#569 silent-abort window.  The
+    // split-bulk schema loop above now exec's each statement individually
+    // so a SQL error on any new install/upgrade throws directly, but any
+    // existing DB that ran the old bulk path before the split could still
+    // have a missing `message_parts`.  This step is cheap and keeps the
+    // critical-path table always present.
     runMigrationStep("ensureMessagePartsTable", log, () => ensureMessagePartsTable(db));
     runMigrationStep("backfillMessageIdentityHashes", log, () =>
       backfillMessageIdentityHashes(db, { managesOwnTransaction: false }),

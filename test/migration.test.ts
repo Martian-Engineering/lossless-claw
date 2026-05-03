@@ -813,12 +813,13 @@ describe("runLcmMigrations summary depth backfill", () => {
         return db.prepare(sql);
       },
       exec(sql: string) {
-        // After PR #9's split-bulk migration, each schema statement is exec'd
-        // individually. Simulate Node sqlite's silent-abort failure mode by
-        // dropping the message_parts CREATE TABLE statement (and its dependent
-        // indexes) the FIRST time they appear — i.e. inside the initial schema
-        // loop. The belt-and-suspenders `ensureMessagePartsTable` step runs
-        // afterwards and recreates the table + indexes; let those through.
+        // After the split-bulk migration change (#569), each schema statement
+        // is exec'd individually. Simulate Node sqlite's silent-abort failure
+        // mode by dropping the message_parts CREATE TABLE statement (and its
+        // dependent indexes) the FIRST time they appear — i.e. inside the
+        // initial schema loop. The belt-and-suspenders `ensureMessagePartsTable`
+        // step (introduced in #482) runs afterwards and recreates the table
+        // + indexes; let those through.
         if (
           !skippedBulkMessagePartsCreate &&
           sql.trimStart().startsWith("CREATE TABLE IF NOT EXISTS message_parts")
