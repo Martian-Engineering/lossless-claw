@@ -323,6 +323,58 @@ function normalizeCompletionSummary(content: unknown): { summary: string; blockT
   };
 }
 
+/**
+ * Detect summary text that is actually a provider reasoning/thinking payload
+ * leaking through as the summary body.
+ *
+ * Some reasoning-capable summary models (vLLM+Qwen3 per #471, Kimi K2.6 per
+ * #542) sometimes return reasoning text shaped so it slips past the
+ * type-tagged filtering in `collectTextLikeFields` — e.g. the entire
+ * summary body is wrapped in `<think>...</think>` tags, or starts with
+ * `<think>` and never closes.  Treat those as empty so the empty-summary
+ * hardening (envelope → retry → deterministic fallback) kicks in instead
+ * of silently persisting reasoning text as the summary.  See #564.
+ */
+function looksLikeReasoningOnlySummary(value: string): boolean {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+
+  // Strip every CLOSED `<think>...</think>` / `<thinking>...</thinking>` /
+  // `<reasoning>...</reasoning>` block.  A closed reasoning block followed
+  // by a non-empty summary body (the common pattern when the provider
+  // emits a reasoning trace and then a normal answer, e.g.
+  // `<think>...</think>Actual summary text`) is NOT reasoning-only —
+  // returning true here would force an unnecessary retry/fallback.
+  const withoutClosedThink = trimmed.replace(
+    /<\s*(think|thinking|reasoning)\s*>[\s\S]*?<\s*\/\s*\1\s*>/gi,
+    "",
+  );
+  const remainder = withoutClosedThink.trim();
+  if (!remainder) {
+    // Either the entire body was a closed reasoning block (no summary
+    // text after) or the input was empty — both are reasoning-only.
+    return true;
+  }
+
+  // Remainder still starts with an UNCLOSED reasoning marker — the
+  // provider opened a `<think>`-style block but never closed it (often a
+  // truncated stream / max_tokens cutoff before the answer began).
+  if (/^<\s*(think|thinking|reasoning)(\s[^>]*)?>/i.test(remainder)) {
+    return true;
+  }
+  if (/^<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>/i.test(remainder)) {
+    return true;
+  }
+  // Bracketed labels at the very start (`[thinking]…` with no obvious
+  // body separation) — same shape as the unclosed-tag case.
+  if (/^\[\s*(think|thinking|reasoning)\s*\]/i.test(remainder)) {
+    return true;
+  }
+
+  return false;
+}
+
 /** Format normalized block types for concise diagnostics. */
 function formatBlockTypes(blockTypes: string[]): string {
   if (blockTypes.length === 0) {
@@ -1517,6 +1569,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const normalized = normalizeCompletionSummary(result.content);
       let summary = normalized.summary;
       let summarySource: "content" | "envelope" | "retry" | "fallback" = "content";
+      let envelopeNormalized: ReturnType<typeof normalizeCompletionSummary> | undefined;
 
       // --- Empty-summary hardening: envelope → retry → deterministic fallback ---
       if (!summary) {
@@ -1524,7 +1577,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         // top-level response fields (output, message, response) rather than
         // inside the content array.  Re-run normalization against the full
         // response envelope before spending an API call on a retry.
-        const envelopeNormalized = normalizeCompletionSummary(result);
+        envelopeNormalized = normalizeCompletionSummary(result);
         if (envelopeNormalized.summary) {
           summary = envelopeNormalized.summary;
           summarySource = "envelope";
@@ -1533,6 +1586,30 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               `block_types=${formatBlockTypes(envelopeNormalized.blockTypes)}; source=envelope`,
           );
         }
+      }
+
+      // Reasoning-leak guardrail (#564, refs #471, #542): if the extracted
+      // summary text is itself a provider reasoning/thinking payload (wrapped
+      // in <think>…</think>, opened with `[thinking]`, etc.), treat it as
+      // empty so the retry/fallback chain runs instead of persisting the
+      // reasoning text verbatim as the summary body.
+      if (summary && looksLikeReasoningOnlySummary(summary)) {
+        // Log the block_types from the source normalization that actually
+        // produced this summary text — `normalized` is content-path, but
+        // when the summary came from `envelopeNormalized` the relevant
+        // shape is the envelope's, not the content's.
+        const droppedBlockTypes =
+          summarySource === "envelope" && envelopeNormalized
+            ? envelopeNormalized.blockTypes
+            : normalized.blockTypes;
+        params.deps.log.warn(
+          `[lcm] dropped reasoning-shaped summary on first attempt; provider=${provider}; ` +
+            `model=${model}; source=${summarySource}; ` +
+            `block_types=${formatBlockTypes(droppedBlockTypes)}; ` +
+            `summary_preview=${formatDiagnosticPayload(summary.slice(0, 160))}`,
+        );
+        summary = "";
+        summarySource = "content";
       }
 
       const incompleteSignals = extractIncompleteResponseSignals(result);
@@ -1568,6 +1645,18 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             ? retryNormalized
             : normalizeCompletionSummary(retryResult);
           summary = retryEnvelopeNormalized.summary;
+
+          // Re-apply the reasoning-leak guardrail to the retry result so a
+          // reasoning-shaped retry response also drops to deterministic
+          // fallback rather than persisting as the summary body.  See #564.
+          if (summary && looksLikeReasoningOnlySummary(summary)) {
+            params.deps.log.warn(
+              `[lcm] dropped reasoning-shaped summary on retry; provider=${provider}; ` +
+                `model=${model}; block_types=${formatBlockTypes(retryEnvelopeNormalized.blockTypes)}; ` +
+                `summary_preview=${formatDiagnosticPayload(summary.slice(0, 160))}`,
+            );
+            summary = "";
+          }
 
           if (summary) {
             summarySource = "retry";
