@@ -1494,6 +1494,97 @@ describe("LCM sub-day window retrieval", () => {
     }
   });
 
+  it("re-truncates combined index output to effectiveOutputTokens after live-fallback append (R2-FIX-2)", async () => {
+    const now = new Date("2026-04-27T12:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { conversationStore, summaryStore, rollupStore } = createStores();
+      const conversation = await conversationStore.createConversation({
+        sessionId: "index-budget-overflow",
+        sessionKey: "agent:main:index-budget-overflow",
+        title: "Index budget overflow",
+      });
+
+      // Stored rollup for yesterday (long-ish content via several leaves).
+      // The rollup body itself includes the leaf bullets, so each leaf
+      // contributes characters into the eventual index digest.
+      for (let i = 0; i < 6; i += 1) {
+        await summaryStore.insertSummary({
+          summaryId: `sum_yest_${i}`,
+          conversationId: conversation.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content:
+            `Yesterday-leaf-${i} ` + "L".repeat(220),
+          tokenCount: 80,
+          sourceMessageTokenCount: 80,
+          earliestAt: new Date(`2026-04-26T1${i}:00:00.000Z`),
+          latestAt: new Date(`2026-04-26T1${i}:30:00.000Z`),
+        });
+      }
+      const builder = new RollupBuilder(rollupStore, { timezone: "UTC" });
+      await builder.buildDayRollup(conversation.conversationId, "2026-04-26");
+
+      // Today: leaves that the live-fallback path will splice in AFTER the
+      // already-truncated `indexed.content`. Pre-fix this could push the
+      // total over `effectiveOutputTokens` because the live entries were
+      // appended without re-truncation.
+      for (let i = 0; i < 4; i += 1) {
+        await summaryStore.insertSummary({
+          summaryId: `sum_today_${i}`,
+          conversationId: conversation.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content: `Today-leaf-${i} ` + "T".repeat(220),
+          tokenCount: 60,
+          sourceMessageTokenCount: 60,
+          earliestAt: new Date(`2026-04-27T0${i}:00:00.000Z`),
+          latestAt: new Date(`2026-04-27T0${i}:30:00.000Z`),
+        });
+      }
+
+      const lcm = {
+        timezone: "UTC",
+        getRollupStore: () => rollupStore,
+        getConversationStore: () => ({
+          getConversationBySessionId: async () => ({
+            conversationId: conversation.conversationId,
+            sessionId: "index-budget-overflow",
+            title: null,
+            bootstrappedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          }),
+          getConversationBySessionKey: async () => null,
+        }),
+      };
+      const tool = createLcmRecentTool({
+        deps: makeRecentDeps(),
+        lcm: lcm as never,
+        sessionId: "index-budget-overflow",
+      });
+
+      // Tight budget: maxOutputTokens=500 forces effectiveOutputTokens=500.
+      const result = await tool.execute("call-index-budget", {
+        period: "7d",
+        mode: "index",
+        maxOutputTokens: 500,
+        globalMaxOutputTokens: 500,
+        includeSources: true,
+      });
+      const details = result.details as {
+        tokenCount: number;
+        truncated?: boolean;
+      };
+      // The whole response must respect the 500-token budget; pre-fix the
+      // appended live-digest sections could push the total above the cap.
+      expect(details.tokenCount).toBeLessThanOrEqual(500);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("renders digest-style listing for mode:'index' on the global fallback path (R2-FIX-1)", async () => {
     const now = new Date("2026-04-27T12:00:00.000Z");
     vi.useFakeTimers();

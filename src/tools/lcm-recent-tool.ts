@@ -1920,12 +1920,25 @@ export function createLcmRecentTool(input: {
               orderedRollups.length === 0 && liveDigestSections.length > 0
                 ? `### Rollup index (${liveDigestSections.length} period${liveDigestSections.length === 1 ? "" : "s"})`
                 : indexed.content;
-            const combinedContent = [
+            let combinedContent = [
               baseContent,
               ...liveDigestSections,
             ]
               .filter((section) => section.trim().length > 0)
               .join("\n\n");
+            // `indexed.content` was already truncated to effectiveOutputTokens,
+            // but appending live-fallback digest sections AFTER that truncation
+            // can overflow the caller-declared budget. Re-truncate the
+            // combined output as a unit before publishing.
+            if (
+              estimateTokens(combinedContent) > budget.effectiveOutputTokens
+            ) {
+              combinedContent = truncateToEstimatedTokens(
+                combinedContent,
+                budget.effectiveOutputTokens,
+              );
+              truncated = true;
+            }
             rollupContent = combinedContent;
             tokenCount = estimateTokens(combinedContent);
             status =
