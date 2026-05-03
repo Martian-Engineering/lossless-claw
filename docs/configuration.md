@@ -55,9 +55,12 @@ Most installations only need to override a handful of keys. If you want a comple
   "proactiveThresholdCompactionMode": "deferred",
   "cacheAwareCompaction": {
     "enabled": true,
+    "cacheTTLSeconds": 300,
     "maxColdCacheCatchupPasses": 2,
     "hotCachePressureFactor": 4,
-    "hotCacheBudgetHeadroomRatio": 0.2
+    "hotCacheBudgetHeadroomRatio": 0.2,
+    "coldCacheObservationThreshold": 3,
+    "criticalBudgetPressureRatio": 0.70
   },
   "dynamicLeafChunkTokens": {
     "enabled": true,
@@ -173,6 +176,7 @@ openclaw plugins install --link /path/to/lossless-claw
 | `cacheAwareCompaction.hotCachePressureFactor` | `number` | `4` | `LCM_HOT_CACHE_PRESSURE_FACTOR` | Multiplier applied to the hot-cache leaf trigger before raw-history pressure overrides cache preservation. |
 | `cacheAwareCompaction.hotCacheBudgetHeadroomRatio` | `number` | `0.2` | `LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO` | Minimum fraction of the real token budget that must remain free before hot-cache incremental compaction is skipped entirely. |
 | `cacheAwareCompaction.coldCacheObservationThreshold` | `integer` | `3` | `LCM_COLD_CACHE_OBSERVATION_THRESHOLD` | Consecutive cold observations required before non-explicit cache misses are treated as truly cold. This dampens one-off routing noise and provider failover blips. |
+| `cacheAwareCompaction.criticalBudgetPressureRatio` | `number` | `0.70` | `LCM_CRITICAL_BUDGET_PRESSURE_RATIO` | Fraction of the token budget at which deferred compaction bypasses hot-cache delay so prompt-mutating debt can run before overflow. Set to `1` to disable this bypass. |
 
 #### `dynamicLeafChunkTokens`
 
@@ -189,6 +193,7 @@ When cache-aware compaction is enabled:
 - hot cache skips incremental maintenance entirely when the assembled context is still comfortably below the real token budget
 - hot cache also gets a short hysteresis window so one ambiguous turn does not immediately discard a recently healthy cache signal
 - cold cache still allows bounded catch-up passes via `cacheAwareCompaction.maxColdCacheCatchupPasses`
+- once `currentTokenCount >= criticalBudgetPressureRatio * tokenBudget`, deferred compaction bypasses hot-cache delay so prompt-mutating debt can run before emergency overflow handling
 
 When incremental leaf compaction still runs on a hot cache, follow-on condensed passes are suppressed so the maintenance cycle only pays for the leaf pass that was explicitly justified.
 

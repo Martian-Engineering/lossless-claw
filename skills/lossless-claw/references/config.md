@@ -103,12 +103,14 @@ Good defaults:
 - `hotCachePressureFactor: 4`
 - `hotCacheBudgetHeadroomRatio: 0.2`
 - `coldCacheObservationThreshold: 3`
+- `criticalBudgetPressureRatio: 0.70`
 
 Operationally:
 
 - hot cache stretches the incremental leaf trigger to `dynamicLeafChunkTokens.max`
 - hot cache skips incremental maintenance entirely when the assembled context is comfortably below the real token budget
 - hot cache gets a short hysteresis window so a recent cache hit stays "hot" briefly unless telemetry shows a break
+- critical token-budget pressure bypasses hot-cache delay once the live prompt reaches `criticalBudgetPressureRatio * tokenBudget`
 - if hot-cache maintenance still runs, it stays leaf-only and suppresses follow-on condensed passes
 
 ### `dynamicLeafChunkTokens`
@@ -427,6 +429,24 @@ Why it matters:
 Default:
 
 - `3`
+
+#### `cacheAwareCompaction.criticalBudgetPressureRatio`
+
+Fraction of the token budget at which deferred compaction bypasses hot-cache delay.
+
+Why it matters:
+
+- lets prompt-mutating deferred compaction run before the runtime falls back to emergency overflow handling
+- preserves cache-aware throttling below the pressure threshold
+- can be set to `1` to disable this pressure bypass
+
+Default:
+
+- `0.70`
+
+Env override:
+
+- `LCM_CRITICAL_BUDGET_PRESSURE_RATIO`
 
 ### `dynamicLeafChunkTokens`
 
