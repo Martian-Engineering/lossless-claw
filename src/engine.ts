@@ -5525,6 +5525,25 @@ export class LcmContextEngine implements ContextEngine {
       stored = rawPayloadIntercepted.stored;
     }
 
+    // ── Time-window content-hash dedup ────────────────────────────────────────
+    // Prevent duplicate assistant messages caused by sessions_yield() replay.
+    // When the agent produces a message and then yields, the runtime re-persists
+    // the same content into LCM. Skip if the last message in this conversation
+    // has the exact same role + content and was written within the last 60s.
+    if (stored.role === "assistant" || stored.role === "user") {
+      const lastMsg = await this.conversationStore.getLastMessage(conversationId);
+      if (lastMsg && lastMsg.role === stored.role) {
+        const now = Date.now();
+        if (
+          (now - lastMsg.createdAt.getTime()) < 60_000 &&
+          messageIdentity(lastMsg.role, lastMsg.content) === messageIdentity(stored.role, stored.content)
+        ) {
+          return { ingested: false };
+        }
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────────────
+
     // Determine next sequence number
     const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
     const seq = maxSeq + 1;
