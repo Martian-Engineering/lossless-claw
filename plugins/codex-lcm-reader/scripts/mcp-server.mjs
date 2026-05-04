@@ -16,6 +16,7 @@ const DEFAULT_MAX_EXPAND_NODES = 200;
 const MAX_EXPAND_NODES = 1_000;
 const DEFAULT_DESCRIBE_CHARS = 24_000;
 const MAX_DESCRIBE_CHARS = 120_000;
+const MAX_QUERY_ECHO_CHARS = 1_000;
 
 function textResult(text, details = undefined) {
   return {
@@ -695,6 +696,8 @@ function lcmExpandQuery(db, params) {
     ? params.summaryIds.filter((id) => typeof id === "string" && id.trim()).map((id) => id.trim())
     : [];
   const query = readString(params.query);
+  const promptEcho = truncateChars(prompt, MAX_QUERY_ECHO_CHARS);
+  const queryEcho = truncateChars(query ?? "", MAX_QUERY_ECHO_CHARS);
   if (summaryIds.length === 0) {
     if (!query) throw new Error("summaryIds or query is required.");
     const matches = searchSummaries(db, {
@@ -720,15 +723,30 @@ function lcmExpandQuery(db, params) {
     }
   }
   if (summaryIds.length === 0) {
-    return jsonTextResult({ tool: "lcm_expand_query", prompt, query, summaryIds: [], text: "", note: "No seed summaries matched." });
+    return jsonTextResult({
+      tool: "lcm_expand_query",
+      prompt: promptEcho.text,
+      prompt_truncated: promptEcho.truncated,
+      prompt_original_length: promptEcho.originalLength,
+      query: query ? queryEcho.text : undefined,
+      query_truncated: query ? queryEcho.truncated : undefined,
+      query_original_length: query ? queryEcho.originalLength : undefined,
+      summaryIds: [],
+      text: "",
+      note: "No seed summaries matched.",
+    });
   }
   summaryIds = summaryIds.slice(0, MAX_SUMMARY_IDS);
   const expansion = lcmExpand(db, { ...params, summaryIds });
   const details = expansion.structuredContent;
   return jsonTextResult({
     tool: "lcm_expand_query",
-    prompt,
-    query,
+    prompt: promptEcho.text,
+    prompt_truncated: promptEcho.truncated,
+    prompt_original_length: promptEcho.originalLength,
+    query: query ? queryEcho.text : undefined,
+    query_truncated: query ? queryEcho.truncated : undefined,
+    query_original_length: query ? queryEcho.originalLength : undefined,
     summaryIds,
     text: details.text,
     expanded: details.expanded,

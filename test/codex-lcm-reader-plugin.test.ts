@@ -516,6 +516,27 @@ describe("Codex LCM Reader plugin", () => {
     expect((result.structuredContent?.expanded as unknown[])).toHaveLength(20);
   });
 
+  it("bounds lcm_expand_query echoed prompt/query inputs", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    const prompt = "p".repeat(10_000);
+    const query = "Lexar " + "q".repeat(10_000);
+
+    const result = await plugin.callTool(
+      "lcm_expand_query",
+      { query, prompt, tokenCap: 4000 },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(String(result.structuredContent?.prompt).length).toBeLessThanOrEqual(1_020);
+    expect(result.structuredContent?.prompt_truncated).toBe(true);
+    expect(result.structuredContent?.prompt_original_length).toBe(prompt.length);
+    expect(String(result.structuredContent?.query).length).toBeLessThanOrEqual(1_020);
+    expect(result.structuredContent?.query_truncated).toBe(true);
+    expect(result.structuredContent?.query_original_length).toBe(query.length);
+  });
+
   it("decodes MCP frames by byte length for non-ASCII payloads", () => {
     const first = { jsonrpc: "2.0", id: 1, result: { text: "Eva 🖤" } };
     const second = { jsonrpc: "2.0", id: 2, result: { text: "ok" } };
