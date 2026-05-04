@@ -56,7 +56,7 @@ cp -R plugins/codex-lcm-reader ~/plugins/codex-lcm-reader
         "path": "./plugins/codex-lcm-reader"
       },
       "policy": {
-        "installation": "INSTALLED_BY_DEFAULT",
+        "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
       },
       "category": "Engineering"

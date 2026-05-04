@@ -71,7 +71,7 @@ export function resolveDatabasePath(env = process.env) {
 export function openReadOnlyDatabase(dbPath = resolveDatabasePath()) {
   if (!existsSync(dbPath)) {
     throw new Error(
-      `LCM database not found at ${dbPath}. Set LCM_CODEX_DB_PATH or LCM_DATABASE_PATH.`,
+      `LCM database not found at ${dbPath}. Set LCM_CODEX_DB_PATH, LCM_DATABASE_PATH, LOSSLESS_CLAW_DB_PATH, or OPENCLAW_LCM_DB_PATH.`,
     );
   }
   const db = new DatabaseSync(dbPath, { readOnly: true });
@@ -99,12 +99,21 @@ function ftsTableUsable(db, tableName) {
   }
 }
 
+function tableColumns(db, tableName) {
+  try {
+    return db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => row.name);
+  } catch {
+    return [];
+  }
+}
+
 function ftsRankedScopeUsable(db, scope) {
   try {
     if (scope === "messages") {
       if (!ftsTableUsable(db, "messages_fts")) return false;
+      if (!tableColumns(db, "messages_fts").includes("content")) return false;
       db.prepare(
-        `SELECT m.message_id
+        `SELECT m.message_id, snippet(messages_fts, 0, '', '', '...', 32) AS snippet
          FROM messages_fts
          JOIN messages m ON m.message_id = messages_fts.rowid
          WHERE messages_fts MATCH ?
@@ -114,8 +123,10 @@ function ftsRankedScopeUsable(db, scope) {
     }
     if (scope === "summaries") {
       if (!ftsTableUsable(db, "summaries_fts")) return false;
+      const columns = tableColumns(db, "summaries_fts");
+      if (!columns.includes("summary_id") || !columns.includes("content")) return false;
       db.prepare(
-        `SELECT s.summary_id
+        `SELECT s.summary_id, snippet(summaries_fts, 1, '', '', '...', 32) AS snippet
          FROM summaries_fts
          JOIN summaries s ON s.summary_id = summaries_fts.summary_id
          WHERE summaries_fts MATCH ?
@@ -279,7 +290,7 @@ function searchMessages(db, params) {
   const terms = mode === "full_text" ? likeTerms(query) : [];
   if (mode === "full_text" && terms.length === 0) return [];
 
-  if (mode === "full_text" && tableExists(db, "messages_fts")) {
+  if (mode === "full_text" && ftsRankedScopeUsable(db, "messages")) {
     try {
       const where = ["messages_fts MATCH ?", ...scope.where];
       const args = [sanitizeFts5Query(query), ...scope.args];
@@ -374,7 +385,7 @@ function searchSummaries(db, params) {
   const terms = mode === "full_text" ? likeTerms(query) : [];
   if (mode === "full_text" && terms.length === 0) return [];
 
-  if (mode === "full_text" && tableExists(db, "summaries_fts")) {
+  if (mode === "full_text" && ftsRankedScopeUsable(db, "summaries")) {
     try {
       const where = ["summaries_fts MATCH ?", ...scope.where];
       const args = [sanitizeFts5Query(query), ...scope.args];
@@ -794,6 +805,7 @@ const currentTools = [
         pattern: { type: "string" },
         mode: { type: "string", enum: ["regex", "full_text"], default: "regex" },
         scope: { type: "string", enum: ["messages", "summaries", "both"], default: "both" },
+        caseSensitive: { type: "boolean", default: false },
         limit: { type: "number", default: DEFAULT_LIMIT },
         scanLimit: { type: "number", default: DEFAULT_SCAN_LIMIT },
         conversationId: { type: "number" },
@@ -832,6 +844,7 @@ const currentTools = [
         maxDepth: { type: "number", default: 4 },
         maxNodes: { type: "number", default: DEFAULT_MAX_EXPAND_NODES },
         tokenCap: { type: "number", default: 24000 },
+        conversationId: { type: "number" },
       },
       additionalProperties: true,
     },
@@ -846,10 +859,14 @@ const currentTools = [
         prompt: { type: "string" },
         query: { type: "string" },
         summaryIds: { type: "array", items: { type: "string" } },
+        mode: { type: "string", enum: ["regex", "full_text"], default: "full_text" },
         seedLimit: { type: "number", default: 12 },
         tokenCap: { type: "number", default: 24000 },
         maxNodes: { type: "number", default: DEFAULT_MAX_EXPAND_NODES },
+        maxDepth: { type: "number", default: 4 },
         conversationId: { type: "number" },
+        since: { type: "string" },
+        before: { type: "string" },
       },
       additionalProperties: true,
     },
