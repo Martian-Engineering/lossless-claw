@@ -931,7 +931,7 @@ class McpServer {
     try {
       if (message.method === "initialize") {
         this.respond(message.id, {
-          protocolVersion: message.params?.protocolVersion ?? "2024-11-05",
+          protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
           serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
         });
