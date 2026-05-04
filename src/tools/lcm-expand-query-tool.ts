@@ -47,7 +47,7 @@ const LcmExpandQuerySchema = Type.Object({
   conversationId: Type.Optional(
     Type.Number({
       description:
-        "Conversation ID to scope expansion to. If omitted, uses the current session conversation.",
+        "Physical conversation ID to scope expansion to. If omitted, uses the current session family.",
     }),
   ),
   allConversations: Type.Optional(

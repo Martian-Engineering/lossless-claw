@@ -44,7 +44,7 @@ const LcmGrepSchema = Type.Object({
   conversationId: Type.Optional(
     Type.Number({
       description:
-        "Conversation ID to search within. If omitted, defaults to the current session conversation.",
+        "Physical conversation ID to search within. If omitted, defaults to the current session family.",
     }),
   ),
   allConversations: Type.Optional(

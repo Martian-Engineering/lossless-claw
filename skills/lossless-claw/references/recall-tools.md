@@ -50,6 +50,12 @@ Treat as a specialized sub-agent flow, not the default first step.
 2. Use `lcm_describe` when you have a summary or file ID.
 3. Use `lcm_expand_query` when the answer requires precise recovery rather than a high-level summary.
 
+## Conversation scope
+
+When `conversationId` is omitted, recall tools use the current session family: the active conversation plus archived segments that share the same stable session identity. This preserves recall across session rotation and `/reset` replacement rows.
+
+Use `conversationId` only when you need one specific physical conversation. Use `allConversations: true` for broad discovery across unrelated sessions.
+
 ## Important guardrail
 
 Do not infer exact details from summaries alone when the user needs evidence. Expand first or state that the answer still needs expansion.
