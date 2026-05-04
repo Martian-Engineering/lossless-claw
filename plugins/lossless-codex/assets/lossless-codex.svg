@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Lossless Codex">
+  <rect width="128" height="128" rx="24" fill="#0f766e"/>
+  <path d="M30 36h68v12H30zM30 58h42v12H30zM30 80h68v12H30z" fill="#ecfeff"/>
+  <path d="M82 52l16 12-16 12V52z" fill="#99f6e4"/>
+</svg>

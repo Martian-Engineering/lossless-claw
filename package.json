@@ -25,6 +25,8 @@
   "files": [
     "dist/",
     "skills/",
+    "plugins/",
+    ".agents/plugins/marketplace.json",
     "openclaw.plugin.json",
     "docs/",
     "README.md",
