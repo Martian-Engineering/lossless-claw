@@ -1,5 +1,11 @@
 # @martian-engineering/lossless-claw
 
+## 0.10.0
+
+### Minor Changes
+
+- [#338](https://github.com/Martian-Engineering/lossless-claw/pull/338) [`a05b9e4`](https://github.com/Martian-Engineering/lossless-claw/commit/a05b9e4c83a21c22e9279f66e848e84eed389fe8) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Search and expansion tools now treat rotated conversation segments that share a stable session identity as one recall scope by default.
+
 ## 0.9.4
 
 ### Patch Changes
