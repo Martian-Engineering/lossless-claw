@@ -3634,7 +3634,12 @@ export class LcmContextEngine implements ContextEngine {
     try {
       const result = await createLcmSummarizeFromLegacyParams({
         deps: this.deps,
-        legacyParams: { provider, model },
+        legacyParams: {
+          provider,
+          model,
+          modelConfigField: "largeFileSummaryModel",
+          modelConfigPath: "plugins.entries.lossless-claw.config.largeFileSummaryModel",
+        },
         customInstructions: this.config.customInstructions || undefined,
       });
       if (!result) {

@@ -8,6 +8,8 @@ type StartupBannerKey =
   | "stateless-session-patterns"
   | "ignore-session-patterns-env-override"
   | "stateless-session-patterns-env-override"
+  | "runtime-llm-unavailable"
+  | "runtime-llm-policy-summary-models"
   | "state-dir";
 
 type StartupBannerLogState = {

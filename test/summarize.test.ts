@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createLcmSummarizeFromLegacyParams,
   LcmProviderAuthError,
+  LcmRuntimeLlmPolicyError,
   type LcmSummarizeFn,
 } from "../src/summarize.js";
 import type { LcmDependencies } from "../src/types.js";
@@ -1267,6 +1268,67 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).not.toContain("summarizer auth retry");
       expect(diagnostics).toContain("trying anthropic/claude-sonnet-4-6");
+    });
+
+    it("fails closed when runtime LLM policy denies a configured summary model override", async () => {
+      const baseConfig = makeDeps().config;
+      const deps = makeDeps({
+        config: {
+          ...baseConfig,
+          fallbackProviders: [{ provider: "anthropic", model: "claude-sonnet-4-6" }],
+        },
+        resolveModel: vi.fn((modelRef?: string, providerHint?: string) => {
+          if (modelRef === "gpt-5.5") {
+            return { provider: providerHint ?? "openai-codex", model: "gpt-5.5" };
+          }
+          if (modelRef === "anthropic/claude-sonnet-4-6") {
+            return { provider: "anthropic", model: "claude-sonnet-4-6" };
+          }
+          throw new Error(`unexpected modelRef: ${String(modelRef)}`);
+        }),
+        complete: vi.fn(async () => ({
+          content: [],
+          error: {
+            kind: "runtime_llm_policy",
+            configField: "summaryModel",
+            modelRef: "openai-codex/gpt-5.5",
+            message:
+              "[lcm] OpenClaw denied the Lossless runtime LLM model override from plugins.entries.lossless-claw.config.summaryModel. Configure plugins.entries.lossless-claw.llm.allowedModels.",
+          },
+        })),
+      });
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: {
+          provider: "openai-codex",
+          model: "gpt-5.5",
+          config: {
+            plugins: {
+              entries: {
+                "lossless-claw": {
+                  config: {
+                    summaryProvider: "openai-codex",
+                    summaryModel: "gpt-5.5",
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      await expect(summarize!("A".repeat(8_000), false)).rejects.toBeInstanceOf(
+        LcmRuntimeLlmPolicyError,
+      );
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
+        runtimeModelOverride: {
+          configField: "summaryModel",
+          configPath: "plugins.entries.lossless-claw.config.summaryModel",
+          modelRef: "openai-codex/gpt-5.5",
+        },
+      });
     });
 
     it("retries with conservative settings when first attempt returns empty content array", async () => {

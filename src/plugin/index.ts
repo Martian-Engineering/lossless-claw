@@ -8,6 +8,7 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "../openclaw-bridge.js";
 import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
+import type { LcmConfig } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
@@ -19,7 +20,11 @@ import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
-import type { LcmDependencies, StartupSessionFileCandidate } from "../types.js";
+import type {
+  LcmDependencies,
+  RuntimeLlmModelOverride,
+  StartupSessionFileCandidate,
+} from "../types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
@@ -168,10 +173,13 @@ const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
 const AUTH_ERROR_NESTED_KEYS = ["error", "response", "cause", "details", "data", "body"] as const;
 
 type CompletionBridgeErrorInfo = {
-  kind: "provider_auth" | "provider_error";
+  kind: "provider_auth" | "provider_error" | "runtime_llm_policy";
   statusCode?: number;
   code?: string;
   message?: string;
+  configField?: string;
+  configPath?: string;
+  modelRef?: string;
 };
 
 const LOSSLESS_RECALL_POLICY_PROMPT = [
@@ -671,6 +679,245 @@ function buildRuntimeModelRef(provider: string | undefined, model: string): stri
   return providerId ? `${providerId}/${modelId}` : modelId;
 }
 
+type RuntimeLlmPolicyRequirement = RuntimeLlmModelOverride;
+
+type RuntimeLlmPolicyCheck = {
+  required: RuntimeLlmPolicyRequirement[];
+  unresolved: Array<{ configField: string; configPath: string; reason: string }>;
+  missingAllowModelOverride: boolean;
+  missingAllowedModels: RuntimeLlmPolicyRequirement[];
+  policyAvailable: boolean;
+};
+
+/** Build the copy-paste config block for an explicitly requested model override. */
+function buildRuntimeLlmPolicySnippet(modelRef: string): string {
+  return JSON.stringify(
+    {
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            llm: {
+              allowModelOverride: true,
+              allowedModels: [modelRef],
+            },
+          },
+        },
+      },
+    },
+    null,
+    2,
+  );
+}
+
+/** Return true when OpenClaw denied a plugin runtime LLM model override. */
+function isRuntimeLlmModelPolicyDenial(error: unknown): boolean {
+  const text = describeLogError(error);
+  return /Plugin LLM completion (cannot override the target model|model override .*not allowlisted|model override allowlist|model override allowlist requires)/i.test(
+    text,
+  );
+}
+
+/** Build Lossless-specific guidance for runtime LLM model override policy errors. */
+function buildRuntimeLlmPolicyError(
+  override: RuntimeLlmModelOverride,
+  error: unknown,
+): CompletionBridgeErrorInfo {
+  const detail = truncateErrorMessage(describeLogError(error), 200);
+  return {
+    kind: "runtime_llm_policy",
+    code: "runtime_llm_model_override_denied",
+    configField: override.configField,
+    configPath: override.configPath,
+    modelRef: override.modelRef,
+    message:
+      `[lcm] OpenClaw denied the Lossless runtime LLM model override from ${override.configPath} (${override.configField}). ` +
+      `Requested model: ${override.modelRef}. ` +
+      `Configure plugins.entries.lossless-claw.llm.allowModelOverride and plugins.entries.lossless-claw.llm.allowedModels, or run "openclaw doctor --fix". ` +
+      `Minimal config:\n${buildRuntimeLlmPolicySnippet(override.modelRef)}\n` +
+      `Host error: ${detail}`,
+  };
+}
+
+/** Convert plugin config model/provider fields to canonical provider/model refs when possible. */
+function buildConfiguredModelRequirement(params: {
+  configField: string;
+  configPath: string;
+  provider?: unknown;
+  model?: unknown;
+}): RuntimeLlmPolicyRequirement | { unresolved: RuntimeLlmPolicyCheck["unresolved"][number] } | undefined {
+  const modelId = typeof params.model === "string" ? params.model.trim() : "";
+  if (!modelId) {
+    return undefined;
+  }
+  const modelRef = buildRuntimeModelRef(
+    typeof params.provider === "string" ? params.provider.trim() : undefined,
+    modelId,
+  );
+  if (!modelRef?.includes("/")) {
+    return {
+      unresolved: {
+        configField: params.configField,
+        configPath: params.configPath,
+        reason:
+          `${params.configPath} is a bare model without a provider. ` +
+          `Use provider/model or set the matching provider field so openclaw doctor --fix can update plugins.entries.lossless-claw.llm.allowedModels.`,
+      },
+    };
+  }
+  return {
+    configField: params.configField,
+    configPath: params.configPath,
+    modelRef,
+  };
+}
+
+/** Collect Lossless summary model overrides that require OpenClaw runtime LLM policy. */
+function collectRuntimeLlmPolicyRequirements(config: LcmDependencies["config"]): {
+  required: RuntimeLlmPolicyRequirement[];
+  unresolved: RuntimeLlmPolicyCheck["unresolved"];
+} {
+  const required: RuntimeLlmPolicyRequirement[] = [];
+  const unresolved: RuntimeLlmPolicyCheck["unresolved"] = [];
+  const add = (
+    candidate:
+      | RuntimeLlmPolicyRequirement
+      | { unresolved: RuntimeLlmPolicyCheck["unresolved"][number] }
+      | undefined,
+  ) => {
+    if (!candidate) {
+      return;
+    }
+    if ("unresolved" in candidate) {
+      unresolved.push(candidate.unresolved);
+      return;
+    }
+    required.push(candidate);
+  };
+
+  add(buildConfiguredModelRequirement({
+    configField: "summaryModel",
+    configPath: "plugins.entries.lossless-claw.config.summaryModel",
+    provider: config.summaryProvider,
+    model: config.summaryModel,
+  }));
+  add(buildConfiguredModelRequirement({
+    configField: "largeFileSummaryModel",
+    configPath: "plugins.entries.lossless-claw.config.largeFileSummaryModel",
+    provider: config.largeFileSummaryProvider,
+    model: config.largeFileSummaryModel,
+  }));
+  for (const [index, fallback] of config.fallbackProviders.entries()) {
+    add(buildConfiguredModelRequirement({
+      configField: "fallbackProviders",
+      configPath: `plugins.entries.lossless-claw.config.fallbackProviders[${index}]`,
+      provider: fallback.provider,
+      model: fallback.model,
+    }));
+  }
+
+  const seen = new Set<string>();
+  return {
+    required: required.filter((entry) => {
+      const key = `${entry.configField}\u0000${entry.modelRef}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    }),
+    unresolved,
+  };
+}
+
+/** Read the host policy currently visible to the plugin registration context. */
+function readRuntimeLlmPolicy(openClawConfig: unknown): {
+  allowModelOverride: boolean;
+  allowedModels: Set<string>;
+  allowAnyModel: boolean;
+  available: boolean;
+} {
+  const plugins = isRecord(openClawConfig) ? openClawConfig.plugins : undefined;
+  const entries = isRecord(plugins) ? plugins.entries : undefined;
+  const entry = isRecord(entries) ? entries["lossless-claw"] : undefined;
+  const llm = isRecord(entry) ? entry.llm : undefined;
+  if (!isRecord(llm)) {
+    return {
+      allowModelOverride: false,
+      allowedModels: new Set(),
+      allowAnyModel: false,
+      available: false,
+    };
+  }
+  const allowed = Array.isArray(llm.allowedModels)
+    ? llm.allowedModels.filter((model): model is string => typeof model === "string")
+    : [];
+  return {
+    allowModelOverride: llm.allowModelOverride === true,
+    allowedModels: new Set(allowed),
+    allowAnyModel: allowed.includes("*"),
+    available: true,
+  };
+}
+
+/** Compare configured Lossless model overrides against host runtime LLM policy. */
+function checkRuntimeLlmPolicyRequirements(params: {
+  config: LcmDependencies["config"];
+  openClawConfig: unknown;
+}): RuntimeLlmPolicyCheck {
+  const { required, unresolved } = collectRuntimeLlmPolicyRequirements(params.config);
+  const policy = readRuntimeLlmPolicy(params.openClawConfig);
+  return {
+    required,
+    unresolved,
+    missingAllowModelOverride: required.length > 0 && policy.allowModelOverride !== true,
+    missingAllowedModels: policy.allowAnyModel
+      ? []
+      : required.filter((entry) => !policy.allowedModels.has(entry.modelRef)),
+    policyAvailable: policy.available,
+  };
+}
+
+/** Format a one-time startup warning for incomplete runtime LLM model policy. */
+function formatRuntimeLlmPolicyStartupWarning(check: RuntimeLlmPolicyCheck): string | undefined {
+  if (
+    check.required.length === 0 &&
+    check.unresolved.length === 0
+  ) {
+    return undefined;
+  }
+  if (
+    check.policyAvailable &&
+    !check.missingAllowModelOverride &&
+    check.missingAllowedModels.length === 0 &&
+    check.unresolved.length === 0
+  ) {
+    return undefined;
+  }
+
+  const parts = [
+    "[lcm] Runtime LLM model override policy may block configured Lossless summary models.",
+    "Run \"openclaw doctor --fix\" to repair plugins.entries.lossless-claw.llm.",
+    "Required config path: plugins.entries.lossless-claw.llm.allowModelOverride and plugins.entries.lossless-claw.llm.allowedModels.",
+  ];
+  if (!check.policyAvailable) {
+    parts.push("Host policy was not visible in the plugin registration config; using best-effort validation.");
+  }
+  if (check.missingAllowModelOverride) {
+    parts.push("Missing: plugins.entries.lossless-claw.llm.allowModelOverride = true.");
+  }
+  if (check.missingAllowedModels.length > 0) {
+    parts.push(
+      `Missing allowedModels entries: ${check.missingAllowedModels.map((entry) => `${entry.configField}=${entry.modelRef}`).join(", ")}.`,
+    );
+  }
+  if (check.unresolved.length > 0) {
+    parts.push(
+      `Unresolved model refs: ${check.unresolved.map((entry) => `${entry.configPath} (${entry.reason})`).join("; ")}.`,
+    );
+  }
+  return parts.join(" ");
+}
+
 /** Construct LCM dependencies from plugin API/runtime surfaces. */
 function createLcmDependencies(
   api: OpenClawPluginApi,
@@ -731,6 +978,20 @@ function createLcmDependencies(
     });
   }
 
+  const runtimeLlmPolicyWarning = formatRuntimeLlmPolicyStartupWarning(
+    checkRuntimeLlmPolicyRequirements({
+      config,
+      openClawConfig: registrationConfig.openClawConfig,
+    }),
+  );
+  if (runtimeLlmPolicyWarning) {
+    logStartupBannerOnce({
+      key: "runtime-llm-policy-summary-models",
+      log: (message) => log.warn(message),
+      message: runtimeLlmPolicyWarning,
+    });
+  }
+
   const directCredentialLookupError =
     "[lcm] direct provider credential lookup has been removed; OpenClaw runtime.llm.complete owns model auth.";
 
@@ -741,6 +1002,7 @@ function createLcmDependencies(
     complete: async ({
       provider,
       model,
+      runtimeModelOverride,
       agentId,
       messages,
       system,
@@ -751,7 +1013,7 @@ function createLcmDependencies(
     }) => {
       const providerId = provider?.trim();
       const modelId = model.trim();
-      const modelRef = buildRuntimeModelRef(providerId, modelId);
+      const modelRef = runtimeModelOverride?.modelRef.trim();
       const runtimeLlm = getRuntimeLlm(api);
       const requestMetadata = {
         request_provider: providerId ?? "(runtime)",
@@ -799,6 +1061,13 @@ function createLcmDependencies(
         };
       } catch (err) {
         log.error(`[lcm] runtime.llm.complete error: ${describeLogError(err)}`);
+        if (runtimeModelOverride && isRuntimeLlmModelPolicyDenial(err)) {
+          return {
+            content: [],
+            error: buildRuntimeLlmPolicyError(runtimeModelOverride, err),
+            ...requestMetadata,
+          };
+        }
         const authError = detectProviderAuthError(err);
         return {
           content: [],

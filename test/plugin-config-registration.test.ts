@@ -555,6 +555,64 @@ describe("lcm plugin registration", () => {
     expect(sessionInfoLog).not.toHaveBeenCalled();
   });
 
+  it("warns when configured summary models need runtime LLM allowlist policy", () => {
+    const { api, warnLog } = buildApi({
+      enabled: true,
+      summaryModel: "openai-codex/gpt-5.5",
+    });
+    api.config = {
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              summaryModel: "openai-codex/gpt-5.5",
+            },
+          },
+        },
+      },
+    } as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(warnLog).toHaveBeenCalledWith(
+      expect.stringContaining("openclaw doctor --fix"),
+    );
+    expect(warnLog).toHaveBeenCalledWith(
+      expect.stringContaining("summaryModel=openai-codex/gpt-5.5"),
+    );
+    expect(warnLog).toHaveBeenCalledWith(
+      expect.stringContaining("plugins.entries.lossless-claw.llm.allowModelOverride"),
+    );
+  });
+
+  it("does not warn when configured summary models are allowlisted for runtime LLM", () => {
+    const { api, warnLog } = buildApi({
+      enabled: true,
+      summaryModel: "openai-codex/gpt-5.5",
+    });
+    api.config = {
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              summaryModel: "openai-codex/gpt-5.5",
+            },
+            llm: {
+              allowModelOverride: true,
+              allowedModels: ["openai-codex/gpt-5.5"],
+            },
+          },
+        },
+      },
+    } as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("Runtime LLM model override policy"),
+    );
+  });
+
   it("falls back to runtime plugin config for the startup banner when register runs before api.pluginConfig is populated", () => {
     const { api, infoLog } = buildApi(
       {},

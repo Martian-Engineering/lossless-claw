@@ -90,6 +90,11 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
       complete: (input: {
         provider?: string;
         model: string;
+        runtimeModelOverride?: {
+          configField: string;
+          configPath: string;
+          modelRef: string;
+        };
         agentId?: string;
         system?: string;
         messages: Array<{ role: string; content: unknown }>;
@@ -128,6 +133,11 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
       const result = await engine.deps.complete({
         provider: "openai-codex",
         model: "gpt-5.4",
+        runtimeModelOverride: {
+          configField: "summaryModel",
+          configPath: "plugins.entries.lossless-claw.config.summaryModel",
+          modelRef: "openai-codex/gpt-5.4",
+        },
         agentId: "research-agent",
         system: "System summary policy.",
         messages: [{ role: "user", content: "Summarize this." }],
@@ -153,6 +163,74 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
         agentId: "research-agent",
         request_api: "runtime.llm",
       });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it("does not request a runtime model override for session/default candidates", async () => {
+    const runtimeLlmComplete = vi.fn(async () => ({
+      text: "summary output",
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      agentId: "main",
+    }));
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
+    const engine = getRegisteredEngine(api, getFactory);
+
+    try {
+      await engine.deps.complete({
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "Summarize this." }],
+        maxTokens: 256,
+      });
+
+      expect(runtimeLlmComplete).toHaveBeenCalledWith(
+        expect.not.objectContaining({
+          model: expect.any(String),
+        }),
+      );
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it("returns an actionable Lossless error when runtime LLM denies a model override", async () => {
+    const runtimeLlmComplete = vi.fn(async () => {
+      throw new Error(
+        'Plugin LLM completion model override "openai-codex/gpt-5.5" is not allowlisted for plugin "lossless-claw".',
+      );
+    });
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
+    const engine = getRegisteredEngine(api, getFactory);
+
+    try {
+      const result = await engine.deps.complete({
+        provider: "openai-codex",
+        model: "gpt-5.5",
+        runtimeModelOverride: {
+          configField: "summaryModel",
+          configPath: "plugins.entries.lossless-claw.config.summaryModel",
+          modelRef: "openai-codex/gpt-5.5",
+        },
+        messages: [{ role: "user", content: "Summarize this." }],
+        maxTokens: 256,
+      });
+
+      expect(result).toMatchObject({
+        content: [],
+        error: {
+          kind: "runtime_llm_policy",
+          code: "runtime_llm_model_override_denied",
+          configField: "summaryModel",
+          configPath: "plugins.entries.lossless-claw.config.summaryModel",
+          modelRef: "openai-codex/gpt-5.5",
+          message: expect.stringContaining("openclaw doctor --fix"),
+        },
+      });
+      expect(String(result.error?.message)).toContain('"allowedModels": [');
+      expect(String(result.error?.message)).toContain('"openai-codex/gpt-5.5"');
     } finally {
       closeLcmConnection(dbPath);
     }

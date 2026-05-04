@@ -11043,6 +11043,10 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
         complete: completeSpy,
         getApiKey: getApiKeySpy,
         isRuntimeManagedAuthProvider: () => true,
+        resolveModel: vi.fn((modelRef?: string, providerHint?: string) => ({
+          provider: providerHint ?? "openai-codex",
+          model: modelRef ?? "gpt-5.4",
+        })),
       },
     );
     const privateEngine = engine as unknown as {
@@ -11056,6 +11060,15 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(summary).toBe("codex large-file summary");
     expect(getApiKeySpy).not.toHaveBeenCalled();
     expect(completeSpy).toHaveBeenCalledTimes(1);
+    expect(completeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeModelOverride: {
+          configField: "largeFileSummaryModel",
+          configPath: "plugins.entries.lossless-claw.config.largeFileSummaryModel",
+          modelRef: "openai-codex/gpt-5.4",
+        },
+      }),
+    );
   });
 
   it("forwards config customInstructions to large-file summarization", async () => {
