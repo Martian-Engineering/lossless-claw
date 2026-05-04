@@ -31,7 +31,7 @@ const LcmDescribeSchema = Type.Object({
   conversationId: Type.Optional(
     Type.Number({
       description:
-        "Conversation ID to scope describe lookups to. If omitted, uses the current session conversation.",
+        "Physical conversation ID to scope describe lookups to. If omitted, uses the current session family.",
     }),
   ),
   allConversations: Type.Optional(
@@ -105,9 +105,16 @@ export function createLcmDescribeTool(input: {
       if (conversationScope.conversationId != null) {
         const itemConversationId =
           result.type === "summary" ? result.summary?.conversationId : result.file?.conversationId;
-        if (itemConversationId != null && itemConversationId !== conversationScope.conversationId) {
+        const allowedConversationIds = new Set(
+          (conversationScope.conversationIds?.length ?? 0) > 0
+            ? conversationScope.conversationIds
+            : conversationScope.conversationId != null
+              ? [conversationScope.conversationId]
+              : [],
+        );
+        if (itemConversationId != null && !allowedConversationIds.has(itemConversationId)) {
           return jsonResult({
-            error: `Not found in conversation ${conversationScope.conversationId}: ${id}`,
+            error: `Not found in this session scope: ${id}`,
             hint: "Use allConversations=true for cross-conversation lookup.",
           });
         }

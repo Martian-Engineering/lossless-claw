@@ -137,6 +137,7 @@ function makeEngine(params: {
   retrieval: ReturnType<typeof makeRetrieval>;
   summaryStore?: ReturnType<typeof makeSummaryStore>;
   conversationId?: number;
+  conversationFamilyIds?: number[];
 }): LcmContextEngine {
   return {
     info: { id: "lcm", name: "LCM", version: "0.0.0" },
@@ -154,6 +155,13 @@ function makeEngine(params: {
               updatedAt: new Date("2026-01-01T00:00:00.000Z"),
             }
           : null,
+      ),
+      getConversationFamilyIds: vi.fn(async () =>
+        params.conversationFamilyIds && params.conversationFamilyIds.length > 0
+          ? params.conversationFamilyIds
+          : typeof params.conversationId === "number"
+            ? [params.conversationId]
+            : [],
       ),
     }),
   } as unknown as LcmContextEngine;
@@ -283,6 +291,128 @@ describe("createLcmExpandQueryTool", () => {
       timeout: 0,
       success: 1,
     });
+  });
+
+  it("resolves a single source conversation from a session family query", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_recent",
+          conversationId: 42,
+          kind: "leaf",
+          snippet: "recent snippet",
+          createdAt: new Date("2026-01-02T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_older",
+          conversationId: 21,
+          kind: "leaf",
+          snippet: "older snippet",
+          createdAt: new Date("2025-12-31T00:00:00.000Z"),
+        },
+      ],
+      totalMatches: 2,
+    });
+
+    let delegatedMessage = "";
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        delegatedMessage = String(request.params?.message ?? "");
+        return { runId: "run-family" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Recent segment wins.",
+                    citedIds: ["sum_recent"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 1200,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({
+        retrieval,
+        conversationId: 42,
+        conversationFamilyIds: [42, 21],
+      }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-family-query", {
+      query: "deployment",
+      prompt: "What changed recently?",
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: "summaries",
+        conversationIds: [42, 21],
+      }),
+    );
+    expect(delegatedMessage).toContain("Conversation scope: 42");
+    expect(result.details).toMatchObject({
+      answer: "Recent segment wins.",
+      citedIds: ["sum_recent"],
+      sourceConversationId: 42,
+    });
+  });
+
+  it("rejects explicit summaryIds that fall outside the allowed session family scope", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe
+      .mockResolvedValueOnce({
+        type: "summary",
+        summary: { conversationId: 42 },
+      })
+      .mockResolvedValueOnce({
+        type: "summary",
+        summary: { conversationId: 999 },
+      });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({
+        retrieval,
+        conversationId: 42,
+        conversationFamilyIds: [42, 21],
+      }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-family-out-of-scope", {
+      summaryIds: ["sum_recent", "sum_wrong"],
+      prompt: "What changed?",
+    });
+
+    expect(result.details).toMatchObject({
+      error: expect.stringContaining("outside the allowed conversation scope"),
+    });
+    expect(callGatewayMock).not.toHaveBeenCalled();
   });
 
   it("fails closed when the delegated child returns malformed JSON status instead of an answer", async () => {
@@ -1823,6 +1953,128 @@ describe("createLcmExpandQueryTool", () => {
     const message = typeof rawMessage === "string" ? rawMessage : "";
     expect(message).toContain("Seed summary IDs: sum_b, sum_a");
     expect(message).toContain("Seed summaries requiring raw message expansion: sum_b, sum_a");
+  });
+
+  it("falls back across session-family segments using per-conversation leaf links", async () => {
+    const retrieval = makeRetrieval();
+    const summaryStore = makeSummaryStore();
+    retrieval.grep
+      .mockResolvedValueOnce({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            messageId: 801,
+            conversationId: 42,
+            role: "assistant",
+            snippet: "latest rollout note",
+            createdAt: new Date("2026-01-02T00:03:00.000Z"),
+          },
+          {
+            messageId: 701,
+            conversationId: 21,
+            role: "user",
+            snippet: "older rollout note",
+            createdAt: new Date("2025-12-31T00:03:00.000Z"),
+          },
+        ],
+        summaries: [],
+        totalMatches: 2,
+      });
+    summaryStore.getConversationMaxSummaryDepth
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(1);
+    summaryStore.getLeafSummaryLinksForMessageIds
+      .mockResolvedValueOnce([
+        {
+          messageId: 801,
+          summaryId: "sum_recent",
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          messageId: 701,
+          summaryId: "sum_older",
+        },
+      ]);
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        return { runId: "run-family-fallback" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "Recent family segment captures the rollout note.",
+                    citedIds: ["sum_recent"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 700,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({
+        retrieval,
+        summaryStore,
+        conversationId: 42,
+        conversationFamilyIds: [42, 21],
+      }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-family-fallback", {
+      query: "rollout note",
+      prompt: "What changed recently?",
+    });
+
+    expect(retrieval.grep).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        scope: "summaries",
+        conversationIds: [42, 21],
+      }),
+    );
+    expect(retrieval.grep).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        scope: "messages",
+        conversationIds: [42, 21],
+      }),
+    );
+    expect(summaryStore.getConversationMaxSummaryDepth).toHaveBeenNthCalledWith(1, 42);
+    expect(summaryStore.getConversationMaxSummaryDepth).toHaveBeenNthCalledWith(2, 21);
+    expect(summaryStore.getLeafSummaryLinksForMessageIds).toHaveBeenNthCalledWith(1, 42, [801]);
+    expect(summaryStore.getLeafSummaryLinksForMessageIds).toHaveBeenNthCalledWith(2, 21, [701]);
+    expect(result.details).toMatchObject({
+      answer: "Recent family segment captures the rollout note.",
+      citedIds: ["sum_recent"],
+      sourceConversationId: 42,
+    });
   });
 
   it("excludes fresh-tail message hits that are not linked to any summary", async () => {

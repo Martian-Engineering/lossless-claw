@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
+import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { buildMessageIdentityHash } from "./message-identity.js";
@@ -92,6 +93,7 @@ export type ConversationRecord = {
 
 export type MessageSearchInput = {
   conversationId?: ConversationId;
+  conversationIds?: ConversationId[];
   query: string;
   mode: "regex" | "full_text";
   since?: Date;
@@ -359,6 +361,46 @@ export class ConversationStore {
       .get(sessionKey) as unknown as ConversationRow | undefined;
 
     return row ? toConversationRecord(row) : null;
+  }
+
+  async getConversationFamilyIds(input: {
+    conversationId?: ConversationId;
+    sessionId?: string;
+    sessionKey?: string;
+  }): Promise<ConversationId[]> {
+    const baseConversation =
+      input.conversationId != null
+        ? await this.getConversation(input.conversationId)
+        : await this.getConversationForSession({
+            sessionId: input.sessionId,
+            sessionKey: input.sessionKey,
+          });
+    if (!baseConversation) {
+      return [];
+    }
+
+    const normalizedSessionKey = baseConversation.sessionKey?.trim();
+    if (normalizedSessionKey) {
+      const rows = this.db
+        .prepare(
+          `SELECT conversation_id
+           FROM conversations
+           WHERE session_key = ?
+           ORDER BY active DESC, created_at DESC, conversation_id DESC`,
+        )
+        .all(normalizedSessionKey) as Array<{ conversation_id: number }>;
+      return rows.map((row) => row.conversation_id);
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT conversation_id
+         FROM conversations
+         WHERE session_id = ?
+         ORDER BY active DESC, created_at DESC, conversation_id DESC`,
+      )
+      .all(baseConversation.sessionId) as Array<{ conversation_id: number }>;
+    return rows.map((row) => row.conversation_id);
   }
 
   /** Resolve a conversation by stable session identity. */
@@ -752,6 +794,7 @@ export class ConversationStore {
           input.query,
           limit,
           input.conversationId,
+          input.conversationIds,
           input.since,
           input.before,
         );
@@ -762,6 +805,7 @@ export class ConversationStore {
             input.query,
             limit,
             input.conversationId,
+            input.conversationIds,
             input.since,
             input.before,
             input.sort,
@@ -771,14 +815,29 @@ export class ConversationStore {
             input.query,
             limit,
             input.conversationId,
+            input.conversationIds,
             input.since,
             input.before,
           );
         }
       }
-      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before);
+      return this.searchLike(
+        input.query,
+        limit,
+        input.conversationId,
+        input.conversationIds,
+        input.since,
+        input.before,
+      );
     }
-    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
+    return this.searchRegex(
+      input.query,
+      limit,
+      input.conversationId,
+      input.conversationIds,
+      input.since,
+      input.before,
+    );
   }
 
   private indexMessageForFullText(messageId: MessageId, content: string): void {
@@ -813,16 +872,20 @@ export class ConversationStore {
     query: string,
     limit: number,
     conversationId?: ConversationId,
+    conversationIds?: ConversationId[],
     since?: Date,
     before?: Date,
     sort?: SearchSort,
   ): MessageSearchResult[] {
     const where: string[] = ["messages_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
-    if (conversationId != null) {
-      where.push("m.conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "m.conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(m.created_at) >= julianday(?)");
       args.push(since.toISOString());
@@ -854,6 +917,7 @@ export class ConversationStore {
     query: string,
     limit: number,
     conversationId?: ConversationId,
+    conversationIds?: ConversationId[],
     since?: Date,
     before?: Date,
   ): MessageSearchResult[] {
@@ -864,10 +928,13 @@ export class ConversationStore {
 
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(created_at) >= julianday(?)");
       args.push(since.toISOString());
@@ -913,6 +980,7 @@ export class ConversationStore {
     pattern: string,
     limit: number,
     conversationId?: ConversationId,
+    conversationIds?: ConversationId[],
     since?: Date,
     before?: Date,
   ): MessageSearchResult[] {
@@ -930,10 +998,13 @@ export class ConversationStore {
 
     const where: string[] = [];
     const args: Array<string | number> = [];
-    if (conversationId != null) {
-      where.push("conversation_id = ?");
-      args.push(conversationId);
-    }
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId,
+      conversationIds,
+    });
     if (since) {
       where.push("julianday(created_at) >= julianday(?)");
       args.push(since.toISOString());

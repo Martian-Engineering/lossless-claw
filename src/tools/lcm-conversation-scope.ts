@@ -3,6 +3,7 @@ import type { LcmDependencies } from "../types.js";
 
 export type LcmConversationScope = {
   conversationId?: number;
+  conversationIds?: number[];
   allConversations: boolean;
 };
 
@@ -12,6 +13,11 @@ type ConversationScopeStore = ReturnType<LcmContextEngine["getConversationStore"
     sessionKey?: string;
   }) => Promise<{ conversationId: number } | null>;
   getConversationBySessionKey?: (sessionKey: string) => Promise<{ conversationId: number } | null>;
+  getConversationFamilyIds?: (input: {
+    conversationId?: number;
+    sessionId?: string;
+    sessionKey?: string;
+  }) => Promise<number[]>;
 };
 
 async function lookupConversationForSession(input: {
@@ -90,11 +96,15 @@ export async function resolveLcmConversationScope(input: {
       ? Math.trunc(params.conversationId)
       : undefined;
   if (explicitConversationId != null) {
-    return { conversationId: explicitConversationId, allConversations: false };
+    return {
+      conversationId: explicitConversationId,
+      conversationIds: [explicitConversationId],
+      allConversations: false,
+    };
   }
 
   if (params.allConversations === true) {
-    return { conversationId: undefined, allConversations: true };
+    return { conversationId: undefined, conversationIds: undefined, allConversations: true };
   }
 
   const normalizedSessionKey = input.sessionKey?.trim();
@@ -102,7 +112,18 @@ export async function resolveLcmConversationScope(input: {
     const bySessionKey =
       await lcm.getConversationStore().getConversationBySessionKey(normalizedSessionKey);
     if (bySessionKey) {
-      return { conversationId: bySessionKey.conversationId, allConversations: false };
+      const familyIds =
+        typeof (lcm.getConversationStore() as ConversationScopeStore).getConversationFamilyIds === "function"
+          ? await (lcm.getConversationStore() as ConversationScopeStore).getConversationFamilyIds({
+              conversationId: bySessionKey.conversationId,
+              sessionKey: normalizedSessionKey,
+            })
+          : [bySessionKey.conversationId];
+      return {
+        conversationId: bySessionKey.conversationId,
+        conversationIds: familyIds.length > 0 ? familyIds : [bySessionKey.conversationId],
+        allConversations: false,
+      };
     }
   }
 
@@ -111,7 +132,7 @@ export async function resolveLcmConversationScope(input: {
     normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(normalizedSessionKey);
   }
   if (!normalizedSessionId && !input.sessionKey?.trim()) {
-    return { conversationId: undefined, allConversations: false };
+    return { conversationId: undefined, conversationIds: undefined, allConversations: false };
   }
 
   const conversation = await lookupConversationForSession({
@@ -120,8 +141,22 @@ export async function resolveLcmConversationScope(input: {
     sessionKey: input.sessionKey,
   });
   if (!conversation) {
-    return { conversationId: undefined, allConversations: false };
+    return { conversationId: undefined, conversationIds: undefined, allConversations: false };
   }
 
-  return { conversationId: conversation.conversationId, allConversations: false };
+  const store = lcm.getConversationStore() as ConversationScopeStore;
+  const familyIds =
+    typeof store.getConversationFamilyIds === "function"
+      ? await store.getConversationFamilyIds({
+          conversationId: conversation.conversationId,
+          sessionId: normalizedSessionId,
+          sessionKey: input.sessionKey,
+        })
+      : [conversation.conversationId];
+
+  return {
+    conversationId: conversation.conversationId,
+    conversationIds: familyIds.length > 0 ? familyIds : [conversation.conversationId],
+    allConversations: false,
+  };
 }
