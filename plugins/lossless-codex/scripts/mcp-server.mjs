@@ -139,6 +139,13 @@ function isoOrNull(value) {
   return date.toISOString();
 }
 
+function timestampMs(value, fallback = Date.now()) {
+  if (value == null || value === "") return fallback;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return numeric > 0 && numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -793,7 +800,7 @@ function upsertProject(db, row) {
   const cwd = String(row.cwd ?? "");
   const rawOrigin = row.git_origin_url ? String(row.git_origin_url) : null;
   const origin = normalizeGitOrigin(rawOrigin);
-  const seen = new Date(Number(row.updated_at_ms ?? row.updated_at ?? Date.now())).toISOString();
+  const seen = new Date(timestampMs(row.updated_at_ms ?? row.updated_at)).toISOString();
   db.prepare(
     `INSERT INTO codex_projects (
       project_id, project_key, cwd_hash, cwd_display, cwd_display_policy,
@@ -820,8 +827,8 @@ function upsertProject(db, row) {
 }
 
 function upsertThread(db, row, project, rolloutSourceFileId) {
-  const createdAt = new Date(Number(row.created_at_ms ?? row.created_at ?? Date.now())).toISOString();
-  const updatedAt = new Date(Number(row.updated_at_ms ?? row.updated_at ?? Date.now())).toISOString();
+  const createdAt = new Date(timestampMs(row.created_at_ms ?? row.created_at)).toISOString();
+  const updatedAt = new Date(timestampMs(row.updated_at_ms ?? row.updated_at)).toISOString();
   const existed = Boolean(db.prepare("SELECT 1 AS present FROM codex_threads WHERE thread_id = ?").get(row.id));
   const result = db.prepare(
     `INSERT INTO codex_threads (
@@ -1040,11 +1047,14 @@ function buildThreadSummary(db, threadId, projectId) {
   if (files.length === 0 && observations.length === 0) return;
   const eventRange = db
     .prepare(
-      `SELECT MIN(event_id) AS first_event_id, MAX(event_id) AS last_event_id,
-              MIN(timestamp) AS earliest_at, MAX(timestamp) AS latest_at
+      `SELECT
+         (SELECT event_id FROM codex_events WHERE thread_id = ? ORDER BY source_line ASC, source_offset ASC LIMIT 1) AS first_event_id,
+         (SELECT event_id FROM codex_events WHERE thread_id = ? ORDER BY source_line DESC, source_offset DESC LIMIT 1) AS last_event_id,
+         MIN(timestamp) AS earliest_at,
+         MAX(timestamp) AS latest_at
        FROM codex_events WHERE thread_id = ?`,
     )
-    .get(threadId);
+    .get(threadId, threadId, threadId);
   const content = [
     `Codex coding-work summary for thread ${threadId}.`,
     files.length > 0 ? `Files touched: ${files.join(", ")}.` : "",
@@ -1606,7 +1616,7 @@ export function ensureLcmTemporalEnrichmentTable(db) {
     CREATE INDEX IF NOT EXISTS lcm_temporal_enrichments_period_idx
       ON lcm_temporal_enrichments (period_kind, period_key, timezone);
     CREATE INDEX IF NOT EXISTS lcm_temporal_enrichments_project_period_idx
-      ON lcm_temporal_enrichments (project_key, period_kind, period_key, timezone);
+      ON lcm_temporal_enrichments (project_key, period_kind, period_key);
   `);
 }
 
@@ -1615,8 +1625,9 @@ function openReadDb(dbPath) {
 }
 
 function toolStatus(args, options) {
-  const dbPath = options.dbPath ?? resolveSidecarDatabasePath(options.env);
-  const sourceDir = options.sourceDir ?? resolveSourceDir(options.env);
+  const env = options.env ?? process.env;
+  const dbPath = options.dbPath ?? resolveSidecarDatabasePath(env);
+  const sourceDir = options.sourceDir ?? resolveSourceDir(env);
   const exists = existsSync(dbPath);
   let counts = {};
   if (exists) {
@@ -1641,20 +1652,20 @@ function toolStatus(args, options) {
     exists,
     counts,
     config: {
-      enabled: readBool(options.env?.LOSSLESS_CODEX_ENABLED, false),
-      indexerEnabled: readBool(options.env?.LOSSLESS_CODEX_INDEXER_ENABLED, false),
-      readOnly: readBool(options.env?.LOSSLESS_CODEX_READ_ONLY, true),
-      summaryProvider: options.env?.LOSSLESS_CODEX_SUMMARY_PROVIDER?.trim() || null,
-      summaryModel: options.env?.LOSSLESS_CODEX_SUMMARY_MODEL?.trim() || null,
-      timezone: normalizeTimezone(options.env?.LOSSLESS_CODEX_TIMEZONE ?? DEFAULT_TIMEZONE),
+      enabled: readBool(env.LOSSLESS_CODEX_ENABLED, false),
+      indexerEnabled: readBool(env.LOSSLESS_CODEX_INDEXER_ENABLED, false),
+      readOnly: readBool(env.LOSSLESS_CODEX_READ_ONLY, true),
+      summaryProvider: env.LOSSLESS_CODEX_SUMMARY_PROVIDER?.trim() || null,
+      summaryModel: env.LOSSLESS_CODEX_SUMMARY_MODEL?.trim() || null,
+      timezone: normalizeTimezone(env.LOSSLESS_CODEX_TIMEZONE ?? DEFAULT_TIMEZONE),
       summaryMaxConcurrency: clampInt(
-        options.env?.LOSSLESS_CODEX_SUMMARY_MAX_CONCURRENCY,
+        env.LOSSLESS_CODEX_SUMMARY_MAX_CONCURRENCY,
         1,
         1,
         4,
       ),
       lcmEnrichmentEnabled: readBool(
-        options.env?.LOSSLESS_CODEX_LCM_ENRICHMENT_ENABLED,
+        env.LOSSLESS_CODEX_LCM_ENRICHMENT_ENABLED,
         false,
       ),
     },
@@ -1917,10 +1928,10 @@ function toolWorklog(args, options) {
     const projectsWorked = rollups.flatMap((rollup) => rollup.payload.projectsWorked ?? []);
     let lcmEnrichment = { written: false, reason: "not requested" };
     if (readBool(args.writeLcmEnrichment, false) && rollups[0]) {
-      if (!period || !args.projectKey || rollups.length !== 1) {
+      if (!period || !args.projectKey || !timezone || rollups.length !== 1) {
         lcmEnrichment = {
           written: false,
-          reason: "LCM enrichment requires a single projectKey and period match.",
+          reason: "LCM enrichment requires a single projectKey, period, and timezone match.",
         };
       } else {
         lcmEnrichment = writeLcmEnrichment(options.lcmDbPath ?? args.lcmDbPath, rollups[0], options.env ?? process.env);

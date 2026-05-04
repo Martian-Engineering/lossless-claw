@@ -176,7 +176,7 @@ The payload is compact and points back to Lossless Codex:
         "openQuestions": 2
       },
       "sidecarRefs": [
-        "lossless-codex://project-day/lossless-claw/2026-05-04",
+        "lossless-codex://project-day/github.com%2Fmartian-engineering%2Flossless-claw/2026-05-04/America%2FNew_York",
         "lossless-codex://thread/019dd3c9..."
       ]
     }

@@ -21,7 +21,7 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Lossless Codex",
+    "displayName": "Lossless Codex Memory",
     "shortDescription": "Search Codex coding work memory",
     "longDescription": "Lossless Codex indexes local Codex Desktop thread metadata and rollout JSONL into a separate coding-work memory sidecar. It exposes bounded tools for status, import, search, recent work, describe, and worklog recall without mutating Codex live prompt context.",
     "developerName": "Martian Engineering",
