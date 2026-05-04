@@ -85,6 +85,18 @@ function tableExists(db, tableName) {
   return !!row;
 }
 
+function ftsTableUsable(db, tableName) {
+  if (!tableExists(db, tableName)) return false;
+  try {
+    db.prepare(`SELECT rowid FROM ${tableName} WHERE ${tableName} MATCH ? LIMIT 1`).all(
+      '"__lossless_codex_probe_no_hit__"',
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function requiredSchema(db) {
   const required = ["conversations", "messages", "summaries", "summary_parents", "summary_messages"];
   const missing = required.filter((name) => !tableExists(db, name));
@@ -415,8 +427,14 @@ function searchSummaries(db, params) {
 function lcmGrep(db, params, context = {}) {
   const scope = params.scope === "messages" || params.scope === "summaries" ? params.scope : "both";
   const requestedSort = normalizeSort(params.sort);
+  const mode = params.mode === "full_text" ? "full_text" : "regex";
+  const rankedScopeAvailable =
+    mode === "full_text" &&
+    scope !== "both" &&
+    ((scope === "messages" && ftsTableUsable(db, "messages_fts")) ||
+      (scope === "summaries" && ftsTableUsable(db, "summaries_fts")));
   const effectiveSort =
-    scope === "both" && (requestedSort === "relevance" || requestedSort === "hybrid")
+    (requestedSort === "relevance" || requestedSort === "hybrid") && !rankedScopeAvailable
       ? "recency"
       : requestedSort;
   const searchParams = effectiveSort === requestedSort ? params : { ...params, sort: effectiveSort };
@@ -432,7 +450,7 @@ function lcmGrep(db, params, context = {}) {
   return jsonTextResult({
     tool: "lcm_grep",
     databasePath: context.databasePath ?? resolveDatabasePath(),
-    mode: params.mode === "full_text" ? "full_text" : "regex",
+    mode,
     scope,
     requestedSort,
     sort: effectiveSort,
@@ -514,10 +532,11 @@ function lcmDescribe(db, params) {
       hint: "Expected a summary ID like sum_..., a message:<id> or numeric message ID, or a file_... ID.",
     });
   }
-  if (params.conversationId != null && result.conversation_id !== Number(params.conversationId)) {
+  const conversationId = readPositiveInt(params.conversationId, "conversationId");
+  if (conversationId != null && result.conversation_id !== conversationId) {
     return jsonTextResult({
       tool: "lcm_describe",
-      error: `Not found in conversation ${params.conversationId}: ${id}`,
+      error: `Not found in conversation ${conversationId}: ${id}`,
       hint: "The ID exists outside the requested conversation or does not exist.",
     });
   }
@@ -703,6 +722,7 @@ function lcmExpandQuery(db, params) {
   if (summaryIds.length === 0) {
     return jsonTextResult({ tool: "lcm_expand_query", prompt, query, summaryIds: [], text: "", note: "No seed summaries matched." });
   }
+  summaryIds = summaryIds.slice(0, MAX_SUMMARY_IDS);
   const expansion = lcmExpand(db, { ...params, summaryIds });
   const details = expansion.structuredContent;
   return jsonTextResult({
@@ -814,7 +834,7 @@ class McpServer {
 
   start() {
     process.stdin.on("data", (chunk) => this.onData(chunk));
-    process.stdin.on("end", () => process.exit(0));
+    process.stdin.resume();
   }
 
   onData(chunk) {
