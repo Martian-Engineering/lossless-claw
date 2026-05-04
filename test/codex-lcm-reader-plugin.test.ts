@@ -472,6 +472,26 @@ describe("Codex LCM Reader plugin", () => {
     expect(result.structuredContent?.results).toEqual([]);
   });
 
+  it("bounds full-text LIKE fallback term count for very large pasted queries", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const db = createLcmDatabaseConnection(fixture.dbPath);
+    db.exec("DROP TABLE IF EXISTS messages_fts");
+    db.exec("DROP TABLE IF EXISTS summaries_fts");
+    closeLcmConnection(fixture.dbPath);
+    const plugin = await loadPlugin();
+    const query = Array.from({ length: 2_000 }, (_, index) => `term${index}`).join(" ");
+
+    const result = await plugin.callTool(
+      "lcm_grep",
+      { pattern: query, mode: "full_text", scope: "both", limit: 10 },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.count).toBe(0);
+    expect(result.structuredContent?.results).toEqual([]);
+  });
+
   it("rejects legacy databases with missing required columns before raw SQL failures", async () => {
     const fixture = await createLegacyLcmFixture();
     tempDirs.add(fixture.tempDir);
