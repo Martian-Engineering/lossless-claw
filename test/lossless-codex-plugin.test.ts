@@ -219,7 +219,8 @@ describe("Lossless Codex full memory plugin", () => {
 
   it("exposes the full memory tool surface separately from the LCM reader", async () => {
     const plugin = await loadPlugin();
-    expect(plugin.createTools().map((tool) => tool.name)).toEqual([
+    const tools = plugin.createTools();
+    expect(tools.map((tool) => tool.name)).toEqual([
       "lossless_codex_status",
       "lossless_codex_import",
       "lossless_codex_search",
@@ -227,6 +228,13 @@ describe("Lossless Codex full memory plugin", () => {
       "lossless_codex_describe",
       "lossless_codex_worklog",
     ]);
+    const searchTool = tools.find((tool) => tool.name === "lossless_codex_search");
+    expect(searchTool?.inputSchema?.properties).toHaveProperty("query");
+    const describeTool = tools.find((tool) => tool.name === "lossless_codex_describe");
+    expect(describeTool?.inputSchema?.required).toEqual(["id"]);
+    expect(describeTool?.inputSchema?.properties).toHaveProperty("maxChars");
+    const worklogTool = tools.find((tool) => tool.name === "lossless_codex_worklog");
+    expect(worklogTool?.inputSchema?.properties).toHaveProperty("writeLcmEnrichment");
   });
 
   it("creates the sidecar coding-work schema idempotently", async () => {
@@ -433,6 +441,46 @@ describe("Lossless Codex full memory plugin", () => {
     } finally {
       db.close();
     }
+  });
+
+  it("redacts credential-bearing git origins from project keys and display fields", async () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    const stateDb = new DatabaseSync(fixture.stateDbPath);
+    try {
+      stateDb
+        .prepare("UPDATE threads SET git_origin_url = ? WHERE id = ?")
+        .run("https://ghp_SECRET@github.com/Martian-Engineering/lossless-claw.git", "019lossless-codex-thread");
+    } finally {
+      stateDb.close();
+    }
+
+    await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+    });
+
+    const db = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: true });
+    try {
+      const project = db
+        .prepare("SELECT project_key, git_origin_display FROM codex_projects")
+        .get() as { project_key: string; git_origin_display: string };
+      expect(project.project_key).toBe(fixtureProjectKey);
+      expect(project.git_origin_display).toBe("https://github.com/Martian-Engineering/lossless-claw.git");
+      expect(JSON.stringify(project)).not.toContain("ghp_SECRET");
+    } finally {
+      db.close();
+    }
+
+    const recent = await plugin.callTool(
+      "lossless_codex_recent",
+      { projectKey: fixtureProjectKey, period: "2026-05-03" },
+      { dbPath: fixture.sidecarDbPath },
+    );
+    expect(JSON.stringify(recent.structuredContent)).not.toContain("ghp_SECRET");
   });
 
   it("redacts object status payloads from raw metadata snapshots", async () => {
@@ -767,7 +815,18 @@ describe("Lossless Codex full memory plugin", () => {
       allowWrite: true,
     });
 
-    expect(result.importedEvents).toBe(1);
+    expect(result.importedEvents).toBe(5);
+    const db = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: true });
+    try {
+      const payloadTypes = db
+        .prepare("SELECT payload_type FROM codex_events WHERE thread_id = ? ORDER BY source_line")
+        .all("019lossless-codex-thread")
+        .map((row) => String((row as { payload_type: string }).payload_type));
+      expect(payloadTypes).toContain("custom_tool_ping");
+      expect(payloadTypes).not.toContain("custom_tool_call");
+    } finally {
+      db.close();
+    }
   });
 
   it("keeps repeated provider call IDs separate per thread", async () => {
@@ -888,6 +947,42 @@ describe("Lossless Codex full memory plugin", () => {
 
     const sidecarDb = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: false });
     try {
+      const base = sidecarDb
+        .prepare("SELECT thread_id, turn_id, project_id, first_event_id AS event_id FROM codex_observations LIMIT 1")
+        .get() as { thread_id: string; turn_id: string; project_id: string; event_id: string };
+      for (let index = 0; index < 150; index += 1) {
+        sidecarDb
+          .prepare(
+            `INSERT OR IGNORE INTO codex_touched_files (
+              touched_file_id, thread_id, turn_id, call_id, path_hash, path_display,
+              path_display_policy, source_kind, confidence, event_id
+            ) VALUES (?, ?, ?, NULL, ?, ?, 'basename', 'test_fixture', 1, ?)`,
+          )
+          .run(
+            `ctouch_extra_${index}`,
+            base.thread_id,
+            base.turn_id,
+            `hash_${index}`,
+            `src/generated/${index}.ts`,
+            base.event_id,
+          );
+        sidecarDb
+          .prepare(
+            `INSERT OR IGNORE INTO codex_observations (
+              observation_id, thread_id, turn_id, project_id, kind, status, summary,
+              confidence, rationale, privacy_class, first_event_id, last_event_id, created_at
+            ) VALUES (?, ?, ?, ?, 'follow_up', 'observed', ?, 0.5, 'fixture', 'metadata', ?, ?, datetime('now'))`,
+          )
+          .run(
+            `cobs_extra_${index}`,
+            base.thread_id,
+            base.turn_id,
+            base.project_id,
+            `Generated observation ${index} ${"x".repeat(500)}`,
+            base.event_id,
+            base.event_id,
+          );
+      }
       sidecarDb
         .prepare(
           `INSERT INTO codex_summaries (
@@ -928,6 +1023,21 @@ describe("Lossless Codex full memory plugin", () => {
     const hugeSummary = hugeDescribe.structuredContent?.summary as { content: string; content_truncated: boolean };
     expect(hugeSummary.content.length).toBeLessThanOrEqual(1_520);
     expect(hugeSummary.content_truncated).toBe(true);
+
+    const boundedThread = await plugin.callTool(
+      "lossless_codex_describe",
+      { id: "lossless-codex://thread/019lossless-codex-thread", limit: 25, maxChars: 1000 },
+      { dbPath: fixture.sidecarDbPath },
+    );
+    const threadPayload = boundedThread.structuredContent as {
+      files: unknown[];
+      observations: unknown[];
+      limits: { filesOmitted: number; observationsOmitted: number };
+    };
+    expect(threadPayload.files).toHaveLength(25);
+    expect(threadPayload.observations).toHaveLength(25);
+    expect(threadPayload.limits.filesOmitted).toBeGreaterThan(0);
+    expect(threadPayload.limits.observationsOmitted).toBeGreaterThan(0);
 
     const describeProjectDay = await plugin.callTool(
       "lossless_codex_describe",

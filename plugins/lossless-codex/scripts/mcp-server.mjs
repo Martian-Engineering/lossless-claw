@@ -475,12 +475,33 @@ function columnExists(db, tableName, columnName) {
   return db.prepare(`PRAGMA table_info(${tableName})`).all().some((row) => row.name === columnName);
 }
 
+function normalizeGitOrigin(origin) {
+  const raw = readString(origin, "");
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    const parts = parsed.pathname.replace(/^\/+/, "").replace(/\.git$/i, "").split("/").filter(Boolean);
+    if (parsed.hostname && parts.length >= 2) {
+      return {
+        key: `${parsed.hostname}/${parts.at(-2)}/${parts.at(-1)}`.toLowerCase(),
+        display: `${parsed.protocol}//${parsed.hostname}/${parts.at(-2)}/${parts.at(-1)}.git`,
+      };
+    }
+  } catch {
+    // Fall through to SCP-like git remote parsing.
+  }
+  const scpLike = /^(?:([^@/:]+)@)?([^/:]+):([^/]+)\/([^/]+?)(?:\.git)?$/i.exec(raw);
+  if (scpLike) {
+    return {
+      key: `${scpLike[2]}/${scpLike[3]}/${scpLike[4]}`.toLowerCase(),
+      display: `git@${scpLike[2]}:${scpLike[3]}/${scpLike[4]}.git`,
+    };
+  }
+  return null;
+}
+
 function projectKeyFromThread(row) {
-  const origin = String(row.git_origin_url ?? "");
-  const originMatch = /^(?:(?:https?:\/\/|ssh:\/\/git@|git@)?)([^/:]+)[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(origin);
-  const fromOrigin = originMatch
-    ? `${originMatch[1]}/${originMatch[2]}/${originMatch[3]}`
-    : origin.split("/").pop()?.replace(/\.git$/, "");
+  const fromOrigin = normalizeGitOrigin(row.git_origin_url)?.key;
   const cwd = String(row.cwd ?? "");
   const fromCwd = cwd.split(/[\\/]/).filter(Boolean).pop();
   const cwdHashSuffix = cwd ? `-${sha(cwd).slice(0, 8)}` : "";
@@ -503,6 +524,22 @@ function statFile(path) {
   } catch {
     return { size: 0, mtimeMs: 0, device: null, inode: null };
   }
+}
+
+function purgeSourceEvidence(db, sourceId) {
+  const eventIds = db
+    .prepare("SELECT event_id FROM codex_events WHERE source_file_id = ?")
+    .all(sourceId)
+    .map((row) => row.event_id);
+  if (eventIds.length === 0) return;
+  const placeholders = eventIds.map(() => "?").join(", ");
+  db.prepare(`DELETE FROM codex_tool_calls WHERE input_event_id IN (${placeholders}) OR output_event_id IN (${placeholders})`)
+    .run(...eventIds, ...eventIds);
+  db.prepare(`DELETE FROM codex_touched_files WHERE event_id IN (${placeholders})`).run(...eventIds);
+  db.prepare(`DELETE FROM codex_observations WHERE first_event_id IN (${placeholders}) OR last_event_id IN (${placeholders})`)
+    .run(...eventIds, ...eventIds);
+  db.prepare(`DELETE FROM codex_summary_events WHERE event_id IN (${placeholders})`).run(...eventIds);
+  db.prepare("DELETE FROM codex_events WHERE source_file_id = ?").run(sourceId);
 }
 
 function safePayload(raw) {
@@ -636,7 +673,7 @@ function ensureSourceFile(db, kind, path) {
   const stat = statFile(path);
   const existingRows = db
     .prepare(
-      `SELECT source_file_id, generation, size, inode
+      `SELECT source_file_id, generation, size, mtime_ms, inode
        FROM codex_source_files
        WHERE path = ?
        ORDER BY generation DESC
@@ -644,10 +681,27 @@ function ensureSourceFile(db, kind, path) {
     )
     .all(path);
   const latest = existingRows[0];
+  const latestWatermark = latest
+    ? db.prepare("SELECT last_event_hash FROM codex_import_watermarks WHERE source_file_id = ?").get(latest.source_file_id)
+    : null;
+  const sameStat =
+    latest &&
+    Number(latest.size) === Number(stat.size) &&
+    Number(latest.mtime_ms) === Number(stat.mtimeMs);
+  const replacedSameStat =
+    sameStat &&
+    (kind === "session_jsonl" || kind === "archived_jsonl") &&
+    latestWatermark?.last_event_hash &&
+    String(latestWatermark.last_event_hash) !== String(sourceContentHash(path) ?? "");
   const rotated =
     latest &&
     ((typeof latest.size === "number" && stat.size < latest.size) ||
-      (latest.inode && stat.inode && latest.inode !== stat.inode));
+      (latest.inode && stat.inode && latest.inode !== stat.inode) ||
+      replacedSameStat);
+  if (replacedSameStat) {
+    purgeSourceEvidence(db, latest.source_file_id);
+    db.prepare("UPDATE codex_source_files SET status = 'rotated' WHERE source_file_id = ?").run(latest.source_file_id);
+  }
   const generation = latest ? Number(latest.generation) + (rotated ? 1 : 0) : 1;
   const sourceId = sourceFileId(path, generation);
   db.prepare(
@@ -733,7 +787,8 @@ function upsertProject(db, row) {
   const projectKey = projectKeyFromThread(row);
   const projectId = id("cproj", projectKey);
   const cwd = String(row.cwd ?? "");
-  const origin = row.git_origin_url ? String(row.git_origin_url) : null;
+  const rawOrigin = row.git_origin_url ? String(row.git_origin_url) : null;
+  const origin = normalizeGitOrigin(rawOrigin);
   const seen = new Date(Number(row.updated_at_ms ?? row.updated_at ?? Date.now())).toISOString();
   db.prepare(
     `INSERT INTO codex_projects (
@@ -747,7 +802,16 @@ function upsertProject(db, row) {
       git_origin_hash = excluded.git_origin_hash,
       git_origin_display = excluded.git_origin_display,
       last_seen_at = excluded.last_seen_at`,
-  ).run(projectId, projectKey, sha(cwd), cwd, origin ? sha(origin) : null, origin, seen, seen);
+  ).run(
+    projectId,
+    projectKey,
+    sha(cwd),
+    cwd,
+    rawOrigin ? sha(rawOrigin) : null,
+    origin?.display ?? null,
+    seen,
+    seen,
+  );
   return { projectId, projectKey };
 }
 
@@ -1146,6 +1210,7 @@ function importThreadJsonl(db, params) {
   const { thread, source, rows, sourceDir } = params;
   const project = upsertProject(db, thread);
   const insertedThread = upsertThread(db, thread, project, source.sourceId);
+  db.prepare("DELETE FROM codex_summaries WHERE thread_id = ? AND prompt_version = 'deterministic-v1'").run(thread.id);
   let importedEvents = 0;
   let turnSeq = 0;
   let currentTurnId = null;
@@ -1442,9 +1507,19 @@ function getRollups(db, params = {}) {
            coverage_status, source_ref, updated_at
     FROM codex_project_day_rollups
     ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
-    ORDER BY period_key DESC, project_key ASC
+    ORDER BY period_key DESC, project_key ASC, updated_at DESC
     LIMIT ?`;
-  return db.prepare(sql).all(...args, limit).map((row) => ({
+  const rows = db.prepare(sql).all(...args, params.timezone ? limit : MAX_LIMIT);
+  const deduped = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const key = `${row.project_key}:${row.period_key}`;
+    if (!params.timezone && seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(row);
+    if (deduped.length >= limit) break;
+  }
+  return deduped.map((row) => ({
     ...row,
     payload: JSON.parse(row.payload_json),
   }));
@@ -1690,6 +1765,7 @@ function toolDescribe(args, options) {
     const decodedParts = valueParts.map((part) => decodeURIComponent(part));
     const value = decodedParts.join("/");
     const maxChars = clampInt(args.maxChars, DEFAULT_DESCRIBE_CHARS, 1_000, MAX_DESCRIBE_CHARS);
+    const detailLimit = clampInt(args.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
     if (kind === "thread") {
       const thread = db.prepare(
         `SELECT t.*, p.project_key
@@ -1698,12 +1774,25 @@ function toolDescribe(args, options) {
          WHERE t.thread_id = ?`,
       ).get(value);
       if (!thread) throw new Error(`No Lossless Codex thread found for ${value}`);
-      const files = db.prepare("SELECT * FROM codex_touched_files WHERE thread_id = ? ORDER BY path_display").all(value);
-      const observations = db.prepare("SELECT * FROM codex_observations WHERE thread_id = ? ORDER BY created_at").all(value);
+      const files = db
+        .prepare("SELECT * FROM codex_touched_files WHERE thread_id = ? ORDER BY path_display LIMIT ?")
+        .all(value, detailLimit);
+      const observations = db
+        .prepare("SELECT * FROM codex_observations WHERE thread_id = ? ORDER BY created_at LIMIT ?")
+        .all(value, detailLimit)
+        .map((row) => boundTextRow(row, "summary", maxChars));
       const summaries = db
-        .prepare("SELECT summary_id, kind, content FROM codex_summaries WHERE thread_id = ?")
-        .all(value)
+        .prepare("SELECT summary_id, kind, content FROM codex_summaries WHERE thread_id = ? LIMIT ?")
+        .all(value, detailLimit)
         .map((row) => boundTextRow(row, "content", maxChars));
+      const counts = db
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM codex_touched_files WHERE thread_id = ?) AS files,
+             (SELECT COUNT(*) FROM codex_observations WHERE thread_id = ?) AS observations,
+             (SELECT COUNT(*) FROM codex_summaries WHERE thread_id = ?) AS summaries`,
+        )
+        .get(value, value, value);
       return jsonTextResult({
         tool: "lossless_codex_describe",
         type: "thread",
@@ -1711,6 +1800,12 @@ function toolDescribe(args, options) {
         files,
         observations,
         summaries,
+        limits: {
+          detailLimit,
+          filesOmitted: Math.max(0, Number(counts.files ?? 0) - files.length),
+          observationsOmitted: Math.max(0, Number(counts.observations ?? 0) - observations.length),
+          summariesOmitted: Math.max(0, Number(counts.summaries ?? 0) - summaries.length),
+        },
         sidecarRefs: [
           `lossless-codex://thread/${value}`,
           ...summaries.map((summary) => `lossless-codex://summary/${summary.summary_id}`),
@@ -1807,7 +1902,14 @@ function toolWorklog(args, options) {
     const projectsWorked = rollups.flatMap((rollup) => rollup.payload.projectsWorked ?? []);
     let lcmEnrichment = { written: false, reason: "not requested" };
     if (readBool(args.writeLcmEnrichment, false) && rollups[0]) {
-      lcmEnrichment = writeLcmEnrichment(options.lcmDbPath ?? args.lcmDbPath, rollups[0], options.env ?? process.env);
+      if (!period || !args.projectKey || rollups.length !== 1) {
+        lcmEnrichment = {
+          written: false,
+          reason: "LCM enrichment requires a single projectKey and period match.",
+        };
+      } else {
+        lcmEnrichment = writeLcmEnrichment(options.lcmDbPath ?? args.lcmDbPath, rollups[0], options.env ?? process.env);
+      }
     }
     return jsonTextResult({
       tool: "lossless_codex_worklog",
@@ -1822,14 +1924,93 @@ function toolWorklog(args, options) {
 }
 
 export function createTools() {
-  const inputSchema = { type: "object", additionalProperties: true, properties: {} };
+  const stringProp = (description) => ({ type: "string", description });
+  const boolProp = (description) => ({ type: "boolean", description });
+  const intProp = (description) => ({ type: "integer", description });
   return [
-    { name: "lossless_codex_status", description: "Inspect Lossless Codex sidecar status.", inputSchema },
-    { name: "lossless_codex_import", description: "Import local Codex coding-work evidence into the sidecar.", inputSchema },
-    { name: "lossless_codex_search", description: "Search Lossless Codex coding-work memory.", inputSchema },
-    { name: "lossless_codex_recent", description: "Read recent Codex work rollups.", inputSchema },
-    { name: "lossless_codex_describe", description: "Describe sidecar threads, summaries, and observations.", inputSchema },
-    { name: "lossless_codex_worklog", description: "Return project/day Codex worklogs and optional LCM enrichment.", inputSchema },
+    {
+      name: "lossless_codex_status",
+      description: "Inspect Lossless Codex sidecar status.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { dbPath: stringProp("Optional sidecar DB path override.") },
+      },
+    },
+    {
+      name: "lossless_codex_import",
+      description: "Import local Codex coding-work evidence into the sidecar.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          allowWrite: boolProp("Explicitly allow sidecar import writes."),
+          dbPath: stringProp("Optional sidecar DB path override."),
+          sourceDir: stringProp("Optional Codex home/source directory."),
+          stateDbPath: stringProp("Optional state_5.sqlite path."),
+          logsDbPath: stringProp("Optional logs_2.sqlite path."),
+          timezone: stringProp("Timezone used for project/day rollups."),
+        },
+      },
+    },
+    {
+      name: "lossless_codex_search",
+      description: "Search Lossless Codex coding-work memory.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          query: stringProp("Search query."),
+          pattern: stringProp("Alias for query."),
+          includeSummaries: boolProp("Include deterministic summaries when primary evidence also matches."),
+          limit: intProp("Maximum result count, capped by the plugin."),
+        },
+      },
+    },
+    {
+      name: "lossless_codex_recent",
+      description: "Read recent Codex work rollups.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          period: stringProp("Date period key, for example YYYY-MM-DD."),
+          projectKey: stringProp("Canonical project key such as github.com/org/repo."),
+          timezone: stringProp("Rollup timezone."),
+          limit: intProp("Maximum rollup count, capped by the plugin."),
+        },
+      },
+    },
+    {
+      name: "lossless_codex_describe",
+      description: "Describe sidecar threads, summaries, observations, files, or project-day refs.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id"],
+        properties: {
+          id: stringProp("Sidecar ref or raw thread id."),
+          maxChars: intProp("Maximum characters per summary text field."),
+          limit: intProp("Maximum repeated files/observations/summaries for thread describe."),
+        },
+      },
+    },
+    {
+      name: "lossless_codex_worklog",
+      description: "Return project/day Codex worklogs and optional LCM enrichment.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          period: stringProp("Date period key, for example YYYY-MM-DD."),
+          projectKey: stringProp("Canonical project key such as github.com/org/repo."),
+          timezone: stringProp("Rollup timezone."),
+          limit: intProp("Maximum rollup count, capped by the plugin."),
+          writeLcmEnrichment: boolProp("Opt in to writing one compact LCM enrichment row."),
+          lcmDbPath: stringProp("Optional LCM DB path for enrichment writes."),
+        },
+      },
+    },
   ];
 }
 
