@@ -137,21 +137,22 @@ function encodeMcp(payload: unknown): string {
   return `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`;
 }
 
-function decodeMcp(buffer: string): Array<Record<string, unknown>> {
+function decodeMcp(buffer: string | Buffer): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
-  let rest = buffer;
+  let rest = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer, "utf8");
+  const separator = Buffer.from("\r\n\r\n");
   while (rest.length > 0) {
-    const headerEnd = rest.indexOf("\r\n\r\n");
+    const headerEnd = rest.indexOf(separator);
     if (headerEnd < 0) break;
-    const header = rest.slice(0, headerEnd);
+    const header = rest.subarray(0, headerEnd).toString("utf8");
     const match = /Content-Length:\s*(\d+)/i.exec(header);
     if (!match) break;
     const length = Number(match[1]);
     const bodyStart = headerEnd + 4;
     const bodyEnd = bodyStart + length;
     if (rest.length < bodyEnd) break;
-    messages.push(JSON.parse(rest.slice(bodyStart, bodyEnd)) as Record<string, unknown>);
-    rest = rest.slice(bodyEnd);
+    messages.push(JSON.parse(rest.subarray(bodyStart, bodyEnd).toString("utf8")) as Record<string, unknown>);
+    rest = rest.subarray(bodyEnd);
   }
   return messages;
 }
@@ -264,6 +265,20 @@ describe("Codex LCM Reader plugin", () => {
     };
     expect(item.parentIds).toEqual(["sum_codex_reader_child"]);
     expect(item.childIds).toEqual([]);
+  });
+
+  it("rejects invalid describe conversationId values clearly", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    await expect(
+      plugin.callTool(
+        "lcm_describe",
+        { id: "sum_codex_reader_parent", conversationId: "not-a-number" },
+        { dbPath: fixture.dbPath },
+      ),
+    ).rejects.toThrow("conversationId must be a positive integer");
   });
 
   it("describes source messages and linked summaries", async () => {
@@ -415,11 +430,28 @@ describe("Codex LCM Reader plugin", () => {
 
     const result = await plugin.callTool(
       "lcm_grep",
-      { pattern: "Lexar", mode: "full_text", scope: "messages", limit: 10 },
+      { pattern: "Lexar", mode: "full_text", scope: "messages", sort: "relevance", limit: 10 },
       { dbPath: fixture.dbPath },
     );
 
     expect(result.structuredContent?.count).toBeGreaterThan(0);
+    expect(result.structuredContent?.requestedSort).toBe("relevance");
+    expect(result.structuredContent?.sort).toBe("recency");
+  });
+
+  it("reports recency as the effective sort when regex cannot rank relevance", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_grep",
+      { pattern: "Lexar", mode: "regex", scope: "messages", sort: "hybrid", limit: 10 },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.requestedSort).toBe("hybrid");
+    expect(result.structuredContent?.sort).toBe("recency");
   });
 
   it("does not turn punctuation-only full-text fallback into an unfiltered scan", async () => {
@@ -464,6 +496,34 @@ describe("Codex LCM Reader plugin", () => {
     expect(result.structuredContent?.tool).toBe("lcm_expand_query");
     expect(result.structuredContent?.text).toContain("Lexar test fixture");
     expect(result.structuredContent?.note).toContain("does not spawn an OpenClaw sub-agent");
+  });
+
+  it("reports only summary IDs that were actually expanded by expand-query", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    const summaryIds = Array.from({ length: 25 }, (_, index) => `sum_missing_${index}`);
+    summaryIds[0] = "sum_codex_reader_child";
+    summaryIds[1] = "sum_codex_reader_parent";
+
+    const result = await plugin.callTool(
+      "lcm_expand_query",
+      { summaryIds, prompt: "Expand capped IDs", tokenCap: 4000 },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.summaryIds).toEqual(summaryIds.slice(0, 20));
+    expect((result.structuredContent?.expanded as unknown[])).toHaveLength(20);
+  });
+
+  it("decodes MCP frames by byte length for non-ASCII payloads", () => {
+    const first = { jsonrpc: "2.0", id: 1, result: { text: "Eva 🖤" } };
+    const second = { jsonrpc: "2.0", id: 2, result: { text: "ok" } };
+
+    expect(decodeMcp(Buffer.from(`${encodeMcp(first)}${encodeMcp(second)}`, "utf8"))).toEqual([
+      first,
+      second,
+    ]);
   });
 
   it("responds to initialize, tools/list, and tools/call over MCP stdio", async () => {
