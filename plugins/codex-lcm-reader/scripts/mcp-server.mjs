@@ -17,6 +17,7 @@ const MAX_EXPAND_NODES = 1_000;
 const DEFAULT_DESCRIBE_CHARS = 24_000;
 const MAX_DESCRIBE_CHARS = 120_000;
 const MAX_QUERY_ECHO_CHARS = 1_000;
+const MAX_LIKE_TERMS = 32;
 
 function textResult(text, details = undefined) {
   return {
@@ -168,7 +169,7 @@ function likeTerms(query) {
     const normalized = (match[1] ?? match[2] ?? "").trim().replace(edge, "").toLowerCase();
     if (normalized && !terms.includes(normalized)) terms.push(normalized);
   }
-  return terms;
+  return terms.slice(0, MAX_LIKE_TERMS);
 }
 
 function createSnippet(content, query, maxLen = 220) {
