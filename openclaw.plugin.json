@@ -1,6 +1,9 @@
 {
   "id": "lossless-claw",
   "kind": "context-engine",
+  "activation": {
+    "onStartup": true
+  },
   "skills": [
     "skills/lossless-claw"
   ],
