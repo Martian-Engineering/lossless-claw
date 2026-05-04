@@ -439,6 +439,32 @@ describe("Codex LCM Reader plugin", () => {
     expect(result.structuredContent?.sort).toBe("recency");
   });
 
+  it("downgrades relevance sort when summaries FTS lacks required join columns", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const db = createLcmDatabaseConnection(fixture.dbPath);
+    db.exec("DROP TABLE IF EXISTS summaries_fts");
+    db.exec("CREATE VIRTUAL TABLE summaries_fts USING fts5(content)");
+    closeLcmConnection(fixture.dbPath);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_grep",
+      {
+        pattern: "Lexar",
+        mode: "full_text",
+        scope: "summaries",
+        sort: "relevance",
+        limit: 10,
+      },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.count).toBeGreaterThan(0);
+    expect(result.structuredContent?.requestedSort).toBe("relevance");
+    expect(result.structuredContent?.sort).toBe("recency");
+  });
+
   it("reports recency as the effective sort when regex cannot rank relevance", async () => {
     const fixture = await createLcmFixture();
     tempDirs.add(fixture.tempDir);

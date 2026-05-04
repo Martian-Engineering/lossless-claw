@@ -99,6 +99,36 @@ function ftsTableUsable(db, tableName) {
   }
 }
 
+function ftsRankedScopeUsable(db, scope) {
+  try {
+    if (scope === "messages") {
+      if (!ftsTableUsable(db, "messages_fts")) return false;
+      db.prepare(
+        `SELECT m.message_id
+         FROM messages_fts
+         JOIN messages m ON m.message_id = messages_fts.rowid
+         WHERE messages_fts MATCH ?
+         LIMIT 1`,
+      ).all('"__lossless_codex_probe_no_hit__"');
+      return true;
+    }
+    if (scope === "summaries") {
+      if (!ftsTableUsable(db, "summaries_fts")) return false;
+      db.prepare(
+        `SELECT s.summary_id
+         FROM summaries_fts
+         JOIN summaries s ON s.summary_id = summaries_fts.summary_id
+         WHERE summaries_fts MATCH ?
+         LIMIT 1`,
+      ).all('"__lossless_codex_probe_no_hit__"');
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 function requiredSchema(db) {
   const required = ["conversations", "messages", "summaries", "summary_parents", "summary_messages"];
   const missing = required.filter((name) => !tableExists(db, name));
@@ -433,8 +463,7 @@ function lcmGrep(db, params, context = {}) {
   const rankedScopeAvailable =
     mode === "full_text" &&
     scope !== "both" &&
-    ((scope === "messages" && ftsTableUsable(db, "messages_fts")) ||
-      (scope === "summaries" && ftsTableUsable(db, "summaries_fts")));
+    ftsRankedScopeUsable(db, scope);
   const effectiveSort =
     (requestedSort === "relevance" || requestedSort === "hybrid") && !rankedScopeAvailable
       ? "recency"
