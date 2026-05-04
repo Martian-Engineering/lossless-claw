@@ -35,9 +35,16 @@ export type CompletionResult = {
   [key: string]: unknown;
 };
 
+export type RuntimeLlmModelOverride = {
+  configField: string;
+  configPath: string;
+  modelRef: string;
+};
+
 export type CompleteFn = (params: {
   provider?: string;
   model: string;
+  runtimeModelOverride?: RuntimeLlmModelOverride;
   apiKey?: string;
   providerApi?: string;
   authProfileId?: string;

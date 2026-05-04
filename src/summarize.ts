@@ -1,5 +1,5 @@
 import { describeLogError } from "./lcm-log.js";
-import type { LcmDependencies } from "./types.js";
+import type { LcmDependencies, RuntimeLlmModelOverride } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 
 export type LcmSummarizeOptions = {
@@ -17,6 +17,8 @@ export type LcmSummarizeFn = (
 export type LcmSummarizerLegacyParams = {
   provider?: unknown;
   model?: unknown;
+  modelConfigField?: unknown;
+  modelConfigPath?: unknown;
   config?: unknown;
   agentDir?: unknown;
   authProfileId?: unknown;
@@ -30,12 +32,30 @@ type SummaryResolutionCandidate = {
   providerHint?: string;
   hasExplicitProvider: boolean;
   useLegacyAuthProfile: boolean;
+  runtimeModelOverrideField?: string;
+  runtimeModelOverrideConfigPath?: string;
 };
 
 type ResolvedSummaryCandidate = SummaryResolutionCandidate & {
   provider: string;
   model: string;
 };
+
+/** Build the explicit runtime LLM model override attached to configured LCM models. */
+function buildRuntimeModelOverride(
+  candidate: ResolvedSummaryCandidate,
+): RuntimeLlmModelOverride | undefined {
+  const configField = candidate.runtimeModelOverrideField?.trim();
+  const configPath = candidate.runtimeModelOverrideConfigPath?.trim();
+  if (!configField || !configPath) {
+    return undefined;
+  }
+  return {
+    configField,
+    configPath,
+    modelRef: `${candidate.provider}/${candidate.model}`,
+  };
+}
 
 function buildSummarizerBreakerKey(params: {
   candidate: ResolvedSummaryCandidate;
@@ -108,6 +128,32 @@ export class LcmProviderAuthError extends Error {
     this.provider = params.provider;
     this.model = params.model;
     this.failure = params.failure;
+  }
+}
+
+/**
+ * Signals that OpenClaw's runtime LLM policy denied an explicit model override
+ * requested by Lossless configuration. This must fail closed.
+ */
+export class LcmRuntimeLlmPolicyError extends Error {
+  readonly provider: string;
+  readonly model: string;
+  readonly configField: string;
+  readonly modelRef: string;
+
+  constructor(params: {
+    provider: string;
+    model: string;
+    configField: string;
+    modelRef: string;
+    message: string;
+  }) {
+    super(params.message);
+    this.name = "LcmRuntimeLlmPolicyError";
+    this.provider = params.provider;
+    this.model = params.model;
+    this.configField = params.configField;
+    this.modelRef = params.modelRef;
   }
 }
 
@@ -596,6 +642,27 @@ function extractProviderResponseFailure(value: unknown): ProviderResponseFailure
   };
 }
 
+function extractRuntimeLlmPolicyFailure(value: unknown): {
+  configField: string;
+  modelRef: string;
+  message: string;
+} | undefined {
+  if (!isRecord(value) || !isRecord(value.error)) {
+    return undefined;
+  }
+  const error = value.error;
+  if (error.kind !== "runtime_llm_policy") {
+    return undefined;
+  }
+  const configField = typeof error.configField === "string" ? error.configField.trim() : "";
+  const modelRef = typeof error.modelRef === "string" ? error.modelRef.trim() : "";
+  const message = typeof error.message === "string" ? error.message.trim() : "";
+  if (!configField || !modelRef || !message) {
+    return undefined;
+  }
+  return { configField, modelRef, message };
+}
+
 function buildProviderResponseWarning(params: {
   provider: string;
   model: string;
@@ -1067,6 +1134,16 @@ function resolveSummaryCandidates(params: {
     typeof params.legacyParams.provider === "string" ? params.legacyParams.provider.trim() : "";
   const modelHint =
     typeof params.legacyParams.model === "string" ? params.legacyParams.model.trim() : "";
+  const legacyModelConfigField =
+    typeof params.legacyParams.modelConfigField === "string" &&
+    params.legacyParams.modelConfigField.trim()
+      ? params.legacyParams.modelConfigField.trim()
+      : undefined;
+  const legacyModelConfigPath =
+    typeof params.legacyParams.modelConfigPath === "string" &&
+    params.legacyParams.modelConfigPath.trim()
+      ? params.legacyParams.modelConfigPath.trim()
+      : undefined;
   const runtimeConfig =
     params.legacyParams.config && typeof params.legacyParams.config === "object"
       ? (params.legacyParams.config as {
@@ -1103,6 +1180,8 @@ function resolveSummaryCandidates(params: {
         (providerHint || undefined),
       hasExplicitProvider: Boolean(process.env.LCM_SUMMARY_PROVIDER?.trim()),
       useLegacyAuthProfile: false,
+      runtimeModelOverrideField: "LCM_SUMMARY_MODEL",
+      runtimeModelOverrideConfigPath: "LCM_SUMMARY_MODEL",
     },
     {
       levelName: "plugin config (lossless-claw)",
@@ -1116,6 +1195,8 @@ function resolveSummaryCandidates(params: {
           nestedPluginConfig.summaryProvider.trim(),
       ),
       useLegacyAuthProfile: false,
+      runtimeModelOverrideField: "summaryModel",
+      runtimeModelOverrideConfigPath: "plugins.entries.lossless-claw.config.summaryModel",
     },
     {
       levelName: "OpenClaw agents.defaults.compaction.model",
@@ -1137,17 +1218,21 @@ function resolveSummaryCandidates(params: {
       providerHint: providerHint || undefined,
       hasExplicitProvider: Boolean(providerHint),
       useLegacyAuthProfile: true,
+      runtimeModelOverrideField: legacyModelConfigField,
+      runtimeModelOverrideConfigPath: legacyModelConfigPath,
     },
   ];
 
   // Append explicit fallback providers from config.
-  for (const fb of params.deps.config.fallbackProviders ?? []) {
+  for (const [fallbackIndex, fb] of (params.deps.config.fallbackProviders ?? []).entries()) {
     resolutionCandidates.push({
       levelName: `explicit fallback (${fb.provider}/${fb.model})`,
       modelRef: `${fb.provider}/${fb.model}`,
       providerHint: fb.provider,
       hasExplicitProvider: true,
       useLegacyAuthProfile: false,
+      runtimeModelOverrideField: "fallbackProviders",
+      runtimeModelOverrideConfigPath: `plugins.entries.lossless-claw.config.fallbackProviders[${fallbackIndex}]`,
     });
   }
 
@@ -1271,6 +1356,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const candidate = resolvedCandidates[index]!;
       const provider = candidate.provider;
       const model = candidate.model;
+      const runtimeModelOverride = buildRuntimeModelOverride(candidate);
       const nextCandidate = index < resolvedCandidates.length - 1 ? resolvedCandidates[index + 1]! : undefined;
       const runSummarizerCall = async (
         label: string,
@@ -1279,6 +1365,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         withTimeout(params.deps.complete({
           provider,
           model,
+          ...(runtimeModelOverride ? { runtimeModelOverride } : {}),
           ...(agentId ? { agentId } : {}),
           runtimeConfig: params.legacyParams.config,
           system: LCM_SUMMARIZER_SYSTEM_PROMPT,
@@ -1299,6 +1386,16 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
         try {
           const result = await runSummarizerCall(label, reasoning);
+          const policyFailure = extractRuntimeLlmPolicyFailure(result);
+          if (policyFailure) {
+            throw new LcmRuntimeLlmPolicyError({
+              provider,
+              model,
+              configField: policyFailure.configField,
+              modelRef: policyFailure.modelRef,
+              message: policyFailure.message,
+            });
+          }
           // Use requireStructuralSignal so that LLM summary text containing
           // auth-related words (e.g. "provider auth error") is NOT mistaken
           // for an actual API auth failure.
@@ -1319,7 +1416,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           }
           return result;
         } catch (err) {
-          if (err instanceof LcmProviderAuthError || err instanceof LcmProviderResponseError) {
+          if (
+            err instanceof LcmRuntimeLlmPolicyError ||
+            err instanceof LcmProviderAuthError ||
+            err instanceof LcmProviderResponseError
+          ) {
             throw err;
           }
           const authFailure = extractProviderAuthFailure(err);
@@ -1334,6 +1435,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       try {
         result = await attemptSummarizerCall("initial");
       } catch (err) {
+        if (err instanceof LcmRuntimeLlmPolicyError) {
+          params.deps.log.error(err.message);
+          throw err;
+        }
         if (err instanceof LcmProviderAuthError) {
           lastAuthError = err;
           params.deps.log.warn(err.message);
@@ -1464,6 +1569,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             summary = initialSummary;
           }
         } catch (retryErr) {
+          if (retryErr instanceof LcmRuntimeLlmPolicyError) {
+            params.deps.log.error(retryErr.message);
+            throw retryErr;
+          }
           if (retryErr instanceof LcmProviderAuthError) {
             lastAuthError = retryErr;
             params.deps.log.warn(retryErr.message);
