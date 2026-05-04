@@ -10,7 +10,10 @@ import type { LcmConfigDiagnostics } from "./db/config.js";
 
 /**
  * Minimal LLM completion interface needed by LCM for summarization.
- * Matches the signature of completeSimple from @mariozechner/pi-ai.
+ *
+ * The production implementation delegates model prep, auth, and dispatch to
+ * OpenClaw's host-owned runtime LLM API. Provider/model fields are retained as
+ * summary-model selection hints and diagnostics, not as direct auth inputs.
  */
 export type CompletionContentBlock = {
   type: string;
@@ -38,6 +41,7 @@ export type CompleteFn = (params: {
   apiKey?: string;
   providerApi?: string;
   authProfileId?: string;
+  agentId?: string;
   agentDir?: string;
   runtimeConfig?: unknown;
   skipModelAuth?: boolean;
@@ -131,10 +135,10 @@ export interface LcmDependencies {
   /** Resolve model alias to provider/model pair */
   resolveModel: ResolveModelFn;
 
-  /** Get API key for a provider/model pair */
+  /** Legacy direct API-key lookup; runtime LLM implementations should not call this. */
   getApiKey: GetApiKeyFn;
 
-  /** Require API key (throws if missing) */
+  /** Legacy direct API-key lookup; runtime LLM implementations should not call this. */
   requireApiKey: RequireApiKeyFn;
 
   /** Parse agent session key into components */

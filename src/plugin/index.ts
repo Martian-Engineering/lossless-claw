@@ -4,7 +4,6 @@
  * DAG-based conversation summarization with incremental compaction,
  * full-text search, and sub-agent expansion.
  */
-import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "../openclaw-bridge.js";
@@ -126,40 +125,32 @@ type PluginEnvSnapshot = {
   stateDir: string;
 };
 
-type ReadEnvFn = (key: string) => string | undefined;
+type RuntimeLlmCompleteMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+};
 
-type CompleteSimpleOptions = {
-  apiKey?: string;
-  maxTokens: number;
+type RuntimeLlmCompleteParams = {
+  messages: RuntimeLlmCompleteMessage[];
+  model?: string;
+  maxTokens?: number;
   temperature?: number;
-  reasoning?: string;
+  systemPrompt?: string;
+  purpose?: string;
+  agentId?: string;
 };
 
-type RuntimeModelAuthResult = {
-  apiKey?: string;
-  baseUrl?: string;
-  request?: RuntimeModelRequestTransportOverrides;
-  expiresAt?: number;
+type RuntimeLlmCompleteResult = {
+  text: string;
+  provider: string;
+  model: string;
+  agentId: string;
+  usage?: Record<string, unknown>;
+  audit?: Record<string, unknown>;
 };
 
-type RuntimeModelRequestAuthOverride =
-  | {
-      mode: "provider-default";
-    }
-  | {
-      mode: "authorization-bearer";
-      token: string;
-    }
-  | {
-      mode: "header";
-      headerName: string;
-      value: string;
-      prefix?: string;
-    };
-
-type RuntimeModelRequestTransportOverrides = {
-  headers?: Record<string, string>;
-  auth?: RuntimeModelRequestAuthOverride;
+type RuntimeLlm = {
+  complete: (params: RuntimeLlmCompleteParams) => Promise<RuntimeLlmCompleteResult>;
 };
 
 type SessionEndLifecycleEvent = {
@@ -170,49 +161,7 @@ type SessionEndLifecycleEvent = {
   nextSessionKey?: string;
 };
 
-type RuntimeModelAuthModel = {
-  id: string;
-  provider: string;
-  api: string;
-  name?: string;
-  reasoning?: boolean;
-  input?: string[];
-  cost?: {
-    input: number;
-    output: number;
-    cacheRead: number;
-    cacheWrite: number;
-  };
-  contextWindow?: number;
-  maxTokens?: number;
-};
-
-type RuntimeModelAuth = {
-  getApiKeyForModel: (params: {
-    model: RuntimeModelAuthModel;
-    cfg?: OpenClawPluginApi["config"];
-    profileId?: string;
-    preferredProfile?: string;
-  }) => Promise<RuntimeModelAuthResult | undefined>;
-  resolveApiKeyForProvider: (params: {
-    provider: string;
-    cfg?: OpenClawPluginApi["config"];
-    profileId?: string;
-    preferredProfile?: string;
-  }) => Promise<RuntimeModelAuthResult | undefined>;
-  getRuntimeAuthForModel?: (params: {
-    model: RuntimeModelAuthModel;
-    cfg?: OpenClawPluginApi["config"];
-    profileId?: string;
-    preferredProfile?: string;
-    workspaceDir?: string;
-  }) => Promise<RuntimeModelAuthResult | undefined>;
-};
-
-const MODEL_AUTH_PR_URL = "https://github.com/openclaw/openclaw/pull/41090";
-const MODEL_AUTH_MERGE_COMMIT = "4790e40";
-const MODEL_AUTH_REQUIRED_RELEASE = "the first OpenClaw release after 2026.3.8";
-const PROVIDER_API_RESOLUTION_ERROR_PREFIX = "[lcm] unable to resolve API family for provider ";
+const RUNTIME_LLM_PR_URL = "https://github.com/openclaw/openclaw/pull/64294";
 const AUTH_ERROR_TEXT_PATTERN =
   /\b401\b|unauthorized|unauthorised|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|authentication failed|authorization failed|missing scope|insufficient scope|model\.request\b/i;
 const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
@@ -315,6 +264,11 @@ function toPluginConfig(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+/** Narrow unknown values to plain object records. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 /** Resolve plugin config from direct runtime injection or the root OpenClaw config fallback. */
@@ -600,989 +554,6 @@ function buildCompactionModelLog(params: {
   })} (${usingOverride ? "override" : "default"})`;
 }
 
-/** Resolve common provider API keys from environment. */
-function resolveApiKey(provider: string, readEnv: ReadEnvFn): string | undefined {
-  const keyMap: Record<string, string[]> = {
-    openai: ["OPENAI_API_KEY"],
-    anthropic: ["ANTHROPIC_API_KEY"],
-    google: ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
-    groq: ["GROQ_API_KEY"],
-    xai: ["XAI_API_KEY"],
-    mistral: ["MISTRAL_API_KEY"],
-    together: ["TOGETHER_API_KEY"],
-    openrouter: ["OPENROUTER_API_KEY"],
-    "github-copilot": ["GITHUB_COPILOT_API_KEY", "GITHUB_TOKEN"],
-  };
-
-  const providerKey = provider.trim().toLowerCase();
-  const keys = keyMap[providerKey] ?? [];
-  const normalizedProviderEnv = `${providerKey.replace(/[^a-z0-9]/g, "_").toUpperCase()}_API_KEY`;
-  keys.push(normalizedProviderEnv);
-
-  for (const key of keys) {
-    const value = readEnv(key)?.trim();
-    if (value) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-/** A SecretRef pointing to a value inside secrets.json via a nested path. */
-type SecretRef = {
-  source?: string;
-  provider?: string;
-  id: string;
-};
-
-type SecretProviderConfig = {
-  source?: string;
-  path?: string;
-  mode?: string;
-};
-
-type AuthProfileCredential =
-  | { type: "api_key"; provider: string; key?: string; keyRef?: SecretRef; email?: string }
-  | { type: "token"; provider: string; token?: string; tokenRef?: SecretRef; expires?: number; email?: string }
-  | ({
-      type: "oauth";
-      provider: string;
-      access?: string;
-      refresh?: string;
-      expires?: number;
-      email?: string;
-    } & Record<string, unknown>);
-
-type AuthProfileStore = {
-  profiles: Record<string, AuthProfileCredential>;
-  order?: Record<string, string[]>;
-};
-
-type PiAiOAuthCredentials = {
-  refresh: string;
-  access: string;
-  expires: number;
-  [key: string]: unknown;
-};
-
-type PiAiModule = {
-  completeSimple?: (
-    model: {
-      id: string;
-      provider: string;
-      api: string;
-      name?: string;
-      reasoning?: boolean;
-      input?: string[];
-      cost?: {
-        input: number;
-        output: number;
-        cacheRead: number;
-        cacheWrite: number;
-      };
-      contextWindow?: number;
-      maxTokens?: number;
-    },
-    request: {
-      systemPrompt?: string;
-      messages: Array<{ role: string; content: unknown; timestamp?: number }>;
-    },
-    options: {
-      apiKey?: string;
-      maxTokens: number;
-      temperature?: number;
-      reasoning?: string;
-    },
-  ) => Promise<Record<string, unknown> & { content?: Array<{ type: string; text?: string }> }>;
-  getModel?: (provider: string, modelId: string) => unknown;
-  getModels?: (provider: string) => unknown[];
-  getEnvApiKey?: (provider: string) => string | undefined;
-  getOAuthApiKey?: (
-    providerId: string,
-    credentials: Record<string, PiAiOAuthCredentials>,
-  ) => Promise<{ apiKey: string; newCredentials: PiAiOAuthCredentials } | null>;
-};
-
-/** Narrow unknown values to plain objects. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-/** Normalize provider ids for case-insensitive matching. */
-function normalizeProviderId(provider: string): string {
-  return provider.trim().toLowerCase();
-}
-
-const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
-const OPENAI_CODEX_RESPONSES_API = "openai-codex-responses";
-const OPENAI_CODEX_RESPONSES_BASE_URL = "https://chatgpt.com/backend-api/codex";
-const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
-const OPENAI_CODEX_NATIVE_BASE_URLS = new Set([
-  "https://chatgpt.com/backend-api",
-  "https://chatgpt.com/backend-api/v1",
-  OPENAI_CODEX_RESPONSES_BASE_URL,
-  `${OPENAI_CODEX_RESPONSES_BASE_URL}/v1`,
-]);
-const OPENAI_CODEX_NATIVE_MODEL_IDS = new Set([
-  "gpt-5.2",
-  "gpt-5.2-codex",
-  "gpt-5.3-codex",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5.4-pro",
-  "gpt-5.5",
-  "gpt-5.5-pro",
-]);
-
-function isOpenAICodexProvider(provider: string): boolean {
-  return normalizeProviderId(provider) === OPENAI_CODEX_PROVIDER_ID;
-}
-
-function isOpenAICodexResponsesApi(api: string | undefined): boolean {
-  return (api ?? "").trim().toLowerCase() === OPENAI_CODEX_RESPONSES_API;
-}
-
-function normalizeBaseUrl(value: string): string {
-  return value.trim().replace(/\/+$/, "");
-}
-
-function shouldUseNativeCodexBaseUrl(params: {
-  provider: string;
-  api: string | undefined;
-  baseUrl: string | undefined;
-  /** True when the user explicitly set baseUrl via runtime config. When
-   *  explicit, do not rewrite `https://api.openai.com/v1` to the ChatGPT
-   *  Codex backend — that breaks paid OpenAI API-key users who chose that
-   *  endpoint deliberately. The native rewrite still applies when the
-   *  baseUrl is empty (default) or already a ChatGPT Codex variant. */
-  isExplicitlyConfigured?: boolean;
-}): boolean {
-  if (!isOpenAICodexProvider(params.provider) || !isOpenAICodexResponsesApi(params.api)) {
-    return false;
-  }
-
-  const baseUrl = params.baseUrl?.trim();
-  if (!baseUrl) {
-    return true;
-  }
-
-  const normalized = normalizeBaseUrl(baseUrl);
-  if (params.isExplicitlyConfigured && normalized === OPENAI_API_BASE_URL) {
-    return false;
-  }
-  return normalized === OPENAI_API_BASE_URL || OPENAI_CODEX_NATIVE_BASE_URLS.has(normalized);
-}
-
-function resolveProviderModelBaseUrl(params: {
-  provider: string;
-  api: string | undefined;
-  configuredBaseUrl: unknown;
-  fallbackBaseUrl: unknown;
-}): string {
-  const configuredBaseUrl =
-    typeof params.configuredBaseUrl === "string" ? params.configuredBaseUrl : undefined;
-  const fallbackBaseUrl =
-    typeof params.fallbackBaseUrl === "string" ? params.fallbackBaseUrl : undefined;
-  const baseUrl =
-    configuredBaseUrl ?? fallbackBaseUrl ?? inferBaseUrlFromProvider(params.provider) ?? "";
-  return shouldUseNativeCodexBaseUrl({
-    provider: params.provider,
-    api: params.api,
-    baseUrl,
-    isExplicitlyConfigured: configuredBaseUrl !== undefined,
-  })
-    ? OPENAI_CODEX_RESPONSES_BASE_URL
-    : baseUrl;
-}
-
-function getOpenAICodexNativeModelDefaults(params: {
-  provider: string;
-  model: string;
-  api: string | undefined;
-}): {
-  reasoning?: boolean;
-  input?: string[];
-  contextWindow?: number;
-  maxTokens?: number;
-} {
-  // OpenClaw can know about newer ChatGPT Codex models before the pi-ai
-  // package does.  Give those uncataloged models the same broad capabilities as
-  // the native Codex provider instead of falling back to a text-only stub.
-  if (
-    !isOpenAICodexProvider(params.provider) ||
-    !isOpenAICodexResponsesApi(params.api) ||
-    !OPENAI_CODEX_NATIVE_MODEL_IDS.has(params.model.trim().toLowerCase())
-  ) {
-    return {};
-  }
-
-  return {
-    reasoning: true,
-    input: ["text", "image"],
-    contextWindow: 1_000_000,
-    maxTokens: 128_000,
-  };
-}
-
-/** Resolve known provider API defaults when model lookup misses. */
-function inferApiFromProvider(provider: string): string | undefined {
-  const normalized = normalizeProviderId(provider);
-  const map: Record<string, string> = {
-    anthropic: "anthropic-messages",
-    deepseek: "openai-completions",
-    groq: "openai-completions",
-    mistral: "openai-completions",
-    openai: "openai-responses",
-    [OPENAI_CODEX_PROVIDER_ID]: OPENAI_CODEX_RESPONSES_API,
-    "github-copilot": OPENAI_CODEX_RESPONSES_API,
-    openrouter: "openai-completions",
-    together: "openai-completions",
-    google: "google-generative-ai",
-    "google-gemini-cli": "google-gemini-cli",
-    "google-antigravity": "google-gemini-cli",
-    "google-vertex": "google-vertex",
-    "amazon-bedrock": "bedrock-converse-stream",
-    ollama: "openai-completions",
-  };
-  return map[normalized];
-}
-
-/** Codex Responses rejects `temperature`; omit it for that API family. */
-export function shouldOmitTemperatureForApi(api: string | undefined): boolean {
-  return isOpenAICodexResponsesApi(api);
-}
-
-/** Resolve known provider base URLs when model lookup misses.
- *
- *  Note: ollama is intentionally absent. Cloud Ollama (`https://ollama.com`)
- *  and self-hosted setups both rely on explicit baseUrl configuration; a
- *  silent `http://localhost:11434` fallback would silently route cloud
- *  configs to localhost and produce confusing connection errors. Returning
- *  undefined here drops the inferred default — `resolveProviderModelBaseUrl`
- *  still passes `""` through to the dispatcher when no other source yields
- *  a baseUrl, which surfaces a clearer downstream error than a silent
- *  wrong-target connect. */
-function inferBaseUrlFromProvider(provider: string): string | undefined {
-  const normalized = normalizeProviderId(provider);
-  const map: Record<string, string> = {
-    anthropic: "https://api.anthropic.com",
-    deepseek: "https://api.deepseek.com",
-    openai: "https://api.openai.com/v1",
-    "openai-codex": "https://api.openai.com/v1",
-    google: "https://generativelanguage.googleapis.com/v1beta",
-    groq: "https://api.groq.com/openai/v1",
-    mistral: "https://api.mistral.ai",
-    together: "https://api.together.xyz",
-    openrouter: "https://openrouter.ai/api/v1",
-  };
-  return map[normalized];
-}
-
-/** Build provider-aware options for pi-ai completeSimple. */
-export function buildCompleteSimpleOptions(params: {
-  api: string | undefined;
-  apiKey: string | undefined;
-  maxTokens: number;
-  temperature: number | undefined;
-  reasoning: string | undefined;
-}): CompleteSimpleOptions {
-  const options: CompleteSimpleOptions = {
-    apiKey: params.apiKey,
-    maxTokens: params.maxTokens,
-  };
-
-  if (
-    typeof params.temperature === "number" &&
-    Number.isFinite(params.temperature) &&
-    !shouldOmitTemperatureForApi(params.api)
-  ) {
-    options.temperature = params.temperature;
-  }
-
-  if (typeof params.reasoning === "string" && params.reasoning.trim()) {
-    options.reasoning = params.reasoning.trim();
-  }
-
-  return options;
-}
-
-/**
- * Prefer an explicit reasoning setting, otherwise apply a caller-provided
- * default only when the resolved model advertises reasoning support.
- */
-export function resolveEffectiveReasoning(params: {
-  reasoning: string | undefined;
-  reasoningIfSupported: string | undefined;
-  modelSupportsReasoning: boolean | undefined;
-}): string | undefined {
-  if (typeof params.reasoning === "string" && params.reasoning.trim()) {
-    return params.reasoning.trim();
-  }
-
-  if (
-    params.modelSupportsReasoning === true &&
-    typeof params.reasoningIfSupported === "string" &&
-    params.reasoningIfSupported.trim()
-  ) {
-    return params.reasoningIfSupported.trim();
-  }
-
-  return undefined;
-}
-
-/** Select provider-specific config values with case-insensitive provider keys. */
-function findProviderConfigValue<T>(
-  map: Record<string, T> | undefined,
-  provider: string,
-): T | undefined {
-  if (!map) {
-    return undefined;
-  }
-  if (map[provider] !== undefined) {
-    return map[provider];
-  }
-  const normalizedProvider = normalizeProviderId(provider);
-  for (const [key, value] of Object.entries(map)) {
-    if (normalizeProviderId(key) === normalizedProvider) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-/** Resolve provider API from runtime config if available. */
-function resolveProviderApiFromRuntimeConfig(
-  runtimeConfig: unknown,
-  provider: string,
-): string | undefined {
-  if (!isRecord(runtimeConfig)) {
-    return undefined;
-  }
-  const providers = (runtimeConfig as { models?: { providers?: Record<string, unknown> } }).models
-    ?.providers;
-  if (!providers || !isRecord(providers)) {
-    return undefined;
-  }
-  const value = findProviderConfigValue(providers, provider);
-  if (!isRecord(value)) {
-    return undefined;
-  }
-  const api = value.api;
-  return typeof api === "string" && api.trim() ? api.trim() : undefined;
-}
-
-/**
- * Resolve the api family for a specific model from runtime config.
- *
- * Walks `models.providers.<provider>.models[]` looking for a matching id and
- * returns its `api` field if declared. Lets users override the api per model
- * (e.g. when a single provider name maps to differently-shaped endpoints).
- */
-export function resolveModelApiFromRuntimeConfig(
-  runtimeConfig: unknown,
-  provider: string,
-  model: string,
-): string | undefined {
-  if (!isRecord(runtimeConfig)) {
-    return undefined;
-  }
-  const providers = (runtimeConfig as { models?: { providers?: Record<string, unknown> } }).models
-    ?.providers;
-  if (!providers || !isRecord(providers)) {
-    return undefined;
-  }
-  const value = findProviderConfigValue(providers, provider);
-  if (!isRecord(value)) {
-    return undefined;
-  }
-  const models = value.models;
-  if (!Array.isArray(models)) {
-    return undefined;
-  }
-  const target = model.trim();
-  for (const entry of models) {
-    if (!isRecord(entry)) continue;
-    if (typeof entry.id !== "string") continue;
-    if (entry.id.trim() !== target) continue;
-    const api = entry.api;
-    return typeof api === "string" && api.trim() ? api.trim() : undefined;
-  }
-  return undefined;
-}
-
-/** Resolve runtime.modelAuth from plugin runtime when available. */
-function getRuntimeModelAuth(api: OpenClawPluginApi): RuntimeModelAuth | undefined {
-  const runtime = api.runtime as OpenClawPluginApi["runtime"] & {
-    modelAuth?: RuntimeModelAuth;
-  };
-  return runtime.modelAuth;
-}
-
-/** Build the minimal model shape required by runtime.modelAuth.getApiKeyForModel(). */
-function buildModelAuthLookupModel(params: {
-  provider: string;
-  model: string;
-  api?: string;
-  contextWindow?: number;
-}): RuntimeModelAuthModel {
-  const api = params.api?.trim() || inferApiFromProvider(params.provider) || "";
-  const codexDefaults = getOpenAICodexNativeModelDefaults({
-    provider: params.provider,
-    model: params.model,
-    api,
-  });
-  const contextWindow =
-    typeof params.contextWindow === "number" && Number.isFinite(params.contextWindow) && params.contextWindow > 0
-      ? params.contextWindow
-      : codexDefaults.contextWindow ?? 1_000_000;
-
-  return {
-    id: params.model,
-    name: params.model,
-    provider: params.provider,
-    api,
-    reasoning: codexDefaults.reasoning ?? false,
-    input: codexDefaults.input ?? ["text"],
-    cost: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-    },
-    contextWindow,
-    maxTokens: codexDefaults.maxTokens ?? 8_000,
-  };
-}
-
-/** Normalize an auth result down to the API key that pi-ai expects. */
-function resolveApiKeyFromAuthResult(auth: RuntimeModelAuthResult | undefined): string | undefined {
-  const apiKey = auth?.apiKey?.trim();
-  return apiKey ? apiKey : undefined;
-}
-
-/** Normalize a runtime auth override base URL when present. */
-function resolveBaseUrlFromAuthResult(auth: RuntimeModelAuthResult | undefined): string | undefined {
-  const baseUrl = auth?.baseUrl?.trim();
-  return baseUrl ? baseUrl : undefined;
-}
-
-/** Normalize raw runtime auth headers into plain string headers. */
-function resolveRuntimeAuthHeaders(
-  request: RuntimeModelRequestTransportOverrides | undefined,
-): Record<string, string> | undefined {
-  if (!request) {
-    return undefined;
-  }
-
-  const headers: Record<string, string> = {};
-  if (isRecord(request.headers)) {
-    for (const [key, value] of Object.entries(request.headers)) {
-      if (typeof value !== "string") {
-        continue;
-      }
-      const headerName = key.trim();
-      const headerValue = value.trim();
-      if (headerName && headerValue) {
-        headers[headerName] = headerValue;
-      }
-    }
-  }
-
-  const auth = request.auth;
-  if (auth?.mode === "authorization-bearer") {
-    const token = auth.token.trim();
-    if (token) {
-      for (const key of Object.keys(headers)) {
-        if (key.toLowerCase() === "authorization") {
-          delete headers[key];
-        }
-      }
-      headers.Authorization = `Bearer ${token}`;
-    }
-  } else if (auth?.mode === "header") {
-    const headerName = auth.headerName.trim();
-    const value = auth.value.trim();
-    if (headerName && value) {
-      const normalizedHeader = headerName.toLowerCase();
-      for (const key of Object.keys(headers)) {
-        if (
-          key.toLowerCase() === normalizedHeader ||
-          (normalizedHeader !== "authorization" && key.toLowerCase() === "authorization")
-        ) {
-          delete headers[key];
-        }
-      }
-      headers[headerName] = `${auth.prefix?.trim() ?? ""}${value}`;
-    }
-  }
-
-  return Object.keys(headers).length > 0 ? headers : undefined;
-}
-
-/** Attach OpenClaw transport overrides to a model for runtimes that inspect the shared symbol. */
-function attachRuntimeAuthRequestTransport<TModel extends object>(
-  model: TModel,
-  request: RuntimeModelRequestTransportOverrides | undefined,
-): TModel {
-  if (!request) {
-    return model;
-  }
-  const next = { ...model } as TModel & Record<symbol, unknown>;
-  next[Symbol.for("openclaw.modelProviderRequestTransport")] = request;
-  return next;
-}
-
-function buildLegacyAuthFallbackWarning(): string {
-  return [
-    "[lcm] OpenClaw runtime.modelAuth is unavailable; using legacy auth-profiles fallback.",
-    `Stock lossless-claw 0.2.7 expects OpenClaw plugin runtime support from PR #41090 (${MODEL_AUTH_PR_URL}).`,
-    `OpenClaw 2026.3.8 and 2026.3.8-beta.1 do not include merge commit ${MODEL_AUTH_MERGE_COMMIT};`,
-    `${MODEL_AUTH_REQUIRED_RELEASE} is required for stock lossless-claw 0.2.7 without this fallback patch.`,
-  ].join(" ");
-}
-
-/** Parse auth-profiles JSON into a minimal store shape. */
-function parseAuthProfileStore(raw: string): AuthProfileStore | undefined {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isRecord(parsed) || !isRecord(parsed.profiles)) {
-      return undefined;
-    }
-
-    const profiles: Record<string, AuthProfileCredential> = {};
-    for (const [profileId, value] of Object.entries(parsed.profiles)) {
-      if (!isRecord(value)) {
-        continue;
-      }
-      const type = value.type;
-      const provider = typeof value.provider === "string" ? value.provider.trim() : "";
-      if (!provider || (type !== "api_key" && type !== "token" && type !== "oauth")) {
-        continue;
-      }
-      profiles[profileId] = value as AuthProfileCredential;
-    }
-
-    const rawOrder = isRecord(parsed.order) ? parsed.order : undefined;
-    const order: Record<string, string[]> | undefined = rawOrder
-      ? Object.entries(rawOrder).reduce<Record<string, string[]>>((acc, [provider, value]) => {
-          if (!Array.isArray(value)) {
-            return acc;
-          }
-          const ids = value
-            .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
-            .filter(Boolean);
-          if (ids.length > 0) {
-            acc[provider] = ids;
-          }
-          return acc;
-        }, {})
-      : undefined;
-
-    return {
-      profiles,
-      ...(order && Object.keys(order).length > 0 ? { order } : {}),
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-/** Merge auth stores, letting later stores override earlier profiles/order. */
-function mergeAuthProfileStores(stores: AuthProfileStore[]): AuthProfileStore | undefined {
-  if (stores.length === 0) {
-    return undefined;
-  }
-  const merged: AuthProfileStore = { profiles: {} };
-  for (const store of stores) {
-    merged.profiles = { ...merged.profiles, ...store.profiles };
-    if (store.order) {
-      merged.order = { ...(merged.order ?? {}), ...store.order };
-    }
-  }
-  return merged;
-}
-
-/** Determine candidate auth store paths ordered by precedence. */
-function resolveAuthStorePaths(params: { agentDir?: string; envSnapshot: PluginEnvSnapshot }): string[] {
-  const paths: string[] = [];
-  const directAgentDir = params.agentDir?.trim();
-  if (directAgentDir) {
-    paths.push(join(directAgentDir, "auth-profiles.json"));
-  }
-
-  const envAgentDir = params.envSnapshot.agentDir;
-  if (envAgentDir) {
-    paths.push(join(envAgentDir, "auth-profiles.json"));
-  }
-
-  const stateDir = params.envSnapshot.stateDir;
-  if (stateDir) {
-    paths.push(join(stateDir, "agents", "main", "agent", "auth-profiles.json"));
-  }
-
-  return [...new Set(paths)];
-}
-
-/** Build profile selection order for provider auth lookup. */
-function resolveAuthProfileCandidates(params: {
-  provider: string;
-  store: AuthProfileStore;
-  authProfileId?: string;
-  runtimeConfig?: unknown;
-}): string[] {
-  const candidates: string[] = [];
-  const normalizedProvider = normalizeProviderId(params.provider);
-  const push = (value: string | undefined) => {
-    const profileId = value?.trim();
-    if (!profileId) {
-      return;
-    }
-    if (!candidates.includes(profileId)) {
-      candidates.push(profileId);
-    }
-  };
-
-  push(params.authProfileId);
-
-  const storeOrder = findProviderConfigValue(params.store.order, params.provider);
-  for (const profileId of storeOrder ?? []) {
-    push(profileId);
-  }
-
-  if (isRecord(params.runtimeConfig)) {
-    const auth = params.runtimeConfig.auth;
-    if (isRecord(auth)) {
-      const order = findProviderConfigValue(
-        isRecord(auth.order) ? (auth.order as Record<string, unknown>) : undefined,
-        params.provider,
-      );
-      if (Array.isArray(order)) {
-        for (const profileId of order) {
-          if (typeof profileId === "string") {
-            push(profileId);
-          }
-        }
-      }
-    }
-  }
-
-  for (const [profileId, credential] of Object.entries(params.store.profiles)) {
-    if (normalizeProviderId(credential.provider) === normalizedProvider) {
-      push(profileId);
-    }
-  }
-
-  return candidates;
-}
-
-/**
- * Resolve a SecretRef (tokenRef/keyRef) to a credential string.
- *
- * OpenClaw's auth-profiles support a level of indirection: instead of storing
- * the raw API key or token inline, a credential can reference it via a
- * SecretRef. Two resolution strategies are supported:
- *
- * 1. `source: "env"` — read the value from an environment variable whose
- *    name is `ref.id` (e.g. `{ source: "env", id: "ANTHROPIC_API_KEY" }`).
- *
- * 2. File-based — resolve against a configured `secrets.providers.<provider>`
- *    file provider when available. JSON-mode providers walk slash-delimited
- *    paths, while singleValue providers use the sentinel id `value`.
- *
- * 3. Legacy fallback — when no file provider config is available, fall back to
- *    `~/.openclaw/secrets.json` for backward compatibility.
- */
-function resolveSecretRef(params: {
-  ref: SecretRef | undefined;
-  home: string;
-  stateDir: string;
-  config?: unknown;
-}): string | undefined {
-  const ref = params.ref;
-  if (!ref?.id) return undefined;
-
-  // source: env — read directly from environment variable
-  if (ref.source === "env") {
-    const val = process.env[ref.id]?.trim();
-    return val || undefined;
-  }
-
-  // File-based provider config — use configured file provider when present.
-  try {
-    const providers = isRecord(params.config)
-      ? (params.config as { secrets?: { providers?: Record<string, unknown> } }).secrets?.providers
-      : undefined;
-    const providerName = ref.provider?.trim() || "default";
-    const provider =
-      providers && isRecord(providers)
-        ? providers[providerName]
-        : undefined;
-    if (isRecord(provider) && provider.source === "file" && typeof provider.path === "string") {
-      const configuredPath = provider.path.trim();
-      const filePath =
-        configuredPath.startsWith("~/") && params.home
-          ? join(params.home, configuredPath.slice(2))
-          : configuredPath;
-      if (!filePath) {
-        return undefined;
-      }
-      const raw = readFileSync(filePath, "utf8");
-      if (provider.mode === "singleValue") {
-        if (ref.id.trim() !== "value") {
-          return undefined;
-        }
-        const value = raw.trim();
-        return value || undefined;
-      }
-
-      const secrets = JSON.parse(raw) as Record<string, unknown>;
-      const parts = ref.id.replace(/^\//, "").split("/");
-      let current: unknown = secrets;
-      for (const part of parts) {
-        if (!current || typeof current !== "object") return undefined;
-        current = (current as Record<string, unknown>)[part];
-      }
-      return typeof current === "string" && current.trim() ? current.trim() : undefined;
-    }
-  } catch {
-    // Fall through to the legacy secrets.json lookup below.
-  }
-
-  // Legacy file fallback (source: "file" or unset) — read from secrets.json in the active state dir
-  try {
-    const secretsPath = join(params.stateDir, "secrets.json");
-    const raw = readFileSync(secretsPath, "utf8");
-    const secrets = JSON.parse(raw) as Record<string, unknown>;
-    const parts = ref.id.replace(/^\//, "").split("/");
-    let current: unknown = secrets;
-    for (const part of parts) {
-      if (!current || typeof current !== "object") return undefined;
-      current = (current as Record<string, unknown>)[part];
-    }
-    return typeof current === "string" && current.trim() ? current.trim() : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Resolve OAuth/api-key/token credentials from auth-profiles store. */
-async function resolveApiKeyFromAuthProfiles(params: {
-  provider: string;
-  authProfileId?: string;
-  agentDir?: string;
-  runtimeConfig?: unknown;
-  appConfig?: unknown;
-  piAiModule: PiAiModule;
-  envSnapshot: PluginEnvSnapshot;
-}): Promise<string | undefined> {
-  const storesWithPaths = resolveAuthStorePaths({
-    agentDir: params.agentDir,
-    envSnapshot: params.envSnapshot,
-  })
-    .map((path) => {
-      try {
-        const parsed = parseAuthProfileStore(readFileSync(path, "utf8"));
-        return parsed ? { path, store: parsed } : undefined;
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((entry): entry is { path: string; store: AuthProfileStore } => !!entry);
-  if (storesWithPaths.length === 0) {
-    return undefined;
-  }
-
-  const mergedStore = mergeAuthProfileStores(storesWithPaths.map((entry) => entry.store));
-  if (!mergedStore) {
-    return undefined;
-  }
-
-  const candidates = resolveAuthProfileCandidates({
-    provider: params.provider,
-    store: mergedStore,
-    authProfileId: params.authProfileId,
-    runtimeConfig: params.runtimeConfig,
-  });
-  if (candidates.length === 0) {
-    return undefined;
-  }
-
-  const persistPath =
-    params.agentDir?.trim() ? join(params.agentDir.trim(), "auth-profiles.json") : storesWithPaths[0]?.path;
-  const secretConfig = (() => {
-    if (isRecord(params.runtimeConfig)) {
-      const runtimeProviders = (params.runtimeConfig as {
-        secrets?: { providers?: Record<string, unknown> };
-      }).secrets?.providers;
-      if (isRecord(runtimeProviders) && Object.keys(runtimeProviders).length > 0) {
-        return params.runtimeConfig;
-      }
-    }
-    return params.appConfig ?? params.runtimeConfig;
-  })();
-
-  for (const profileId of candidates) {
-    const credential = mergedStore.profiles[profileId];
-    if (!credential) {
-      continue;
-    }
-    if (normalizeProviderId(credential.provider) !== normalizeProviderId(params.provider)) {
-      continue;
-    }
-
-    if (credential.type === "api_key") {
-      const key =
-        credential.key?.trim() ||
-        resolveSecretRef({
-          ref: credential.keyRef,
-          home: params.envSnapshot.home,
-          stateDir: params.envSnapshot.stateDir,
-          config: secretConfig,
-        });
-      if (key) {
-        return key;
-      }
-      continue;
-    }
-
-    if (credential.type === "token") {
-      const token =
-        credential.token?.trim() ||
-        resolveSecretRef({
-          ref: credential.tokenRef,
-          home: params.envSnapshot.home,
-          stateDir: params.envSnapshot.stateDir,
-          config: secretConfig,
-        });
-      if (!token) {
-        continue;
-      }
-      const expires = credential.expires;
-      if (typeof expires === "number" && Number.isFinite(expires) && expires > 0 && Date.now() >= expires) {
-        continue;
-      }
-      return token;
-    }
-
-    const access = credential.access?.trim();
-    const expires = credential.expires;
-    const isExpired =
-      typeof expires === "number" && Number.isFinite(expires) && expires > 0 && Date.now() >= expires;
-    const shouldPreferOAuthHelper =
-      typeof params.piAiModule.getOAuthApiKey === "function" &&
-      normalizeProviderId(params.provider) === "openai-codex";
-
-    if (shouldPreferOAuthHelper) {
-      try {
-        const oauthCredential = {
-          access: credential.access ?? "",
-          refresh: credential.refresh ?? "",
-          expires: typeof credential.expires === "number" ? credential.expires : 0,
-          ...(typeof credential.projectId === "string" ? { projectId: credential.projectId } : {}),
-          ...(typeof credential.accountId === "string" ? { accountId: credential.accountId } : {}),
-        };
-        const refreshed = await params.piAiModule.getOAuthApiKey(params.provider, {
-          [params.provider]: oauthCredential,
-        });
-        if (refreshed?.apiKey) {
-          mergedStore.profiles[profileId] = {
-            ...credential,
-            ...refreshed.newCredentials,
-            type: "oauth",
-          };
-          if (persistPath) {
-            try {
-              writeFileSync(
-                persistPath,
-                JSON.stringify(
-                  {
-                    version: 1,
-                    profiles: mergedStore.profiles,
-                    ...(mergedStore.order ? { order: mergedStore.order } : {}),
-                  },
-                  null,
-                  2,
-                ),
-                "utf8",
-              );
-            } catch {
-              // Ignore persistence errors: refreshed credentials remain usable in-memory for this run.
-            }
-          }
-          return refreshed.apiKey;
-        }
-      } catch {
-        // Fall back to the cached access token below when helper resolution fails.
-      }
-    }
-
-    if (!isExpired && access) {
-      if (
-        (credential.provider === "google-gemini-cli" || credential.provider === "google-antigravity") &&
-        typeof credential.projectId === "string" &&
-        credential.projectId.trim()
-      ) {
-        return JSON.stringify({
-          token: access,
-          projectId: credential.projectId.trim(),
-        });
-      }
-      return access;
-    }
-
-    if (typeof params.piAiModule.getOAuthApiKey !== "function") {
-      continue;
-    }
-
-    try {
-      const oauthCredential = {
-        access: credential.access ?? "",
-        refresh: credential.refresh ?? "",
-        expires: typeof credential.expires === "number" ? credential.expires : 0,
-        ...(typeof credential.projectId === "string" ? { projectId: credential.projectId } : {}),
-        ...(typeof credential.accountId === "string" ? { accountId: credential.accountId } : {}),
-      };
-      const refreshed = await params.piAiModule.getOAuthApiKey(params.provider, {
-        [params.provider]: oauthCredential,
-      });
-      if (!refreshed?.apiKey) {
-        continue;
-      }
-      mergedStore.profiles[profileId] = {
-        ...credential,
-        ...refreshed.newCredentials,
-        type: "oauth",
-      };
-      if (persistPath) {
-        try {
-          writeFileSync(
-            persistPath,
-            JSON.stringify(
-              {
-                version: 1,
-                profiles: mergedStore.profiles,
-                ...(mergedStore.order ? { order: mergedStore.order } : {}),
-              },
-              null,
-              2,
-            ),
-            "utf8",
-          );
-        } catch {
-          // Ignore persistence errors: refreshed credentials remain usable in-memory for this run.
-        }
-      }
-      return refreshed.apiKey;
-    } catch {
-      if (access) {
-        return access;
-      }
-    }
-  }
-
-  return undefined;
-}
-
 /** Build a minimal but useful sub-agent prompt. */
 function buildSubagentSystemPrompt(params: {
   depth: number;
@@ -1639,6 +610,67 @@ function readLatestAssistantReply(messages: unknown[]): string | undefined {
   return undefined;
 }
 
+/** Return OpenClaw's host-owned runtime LLM surface when this runtime supports it. */
+function getRuntimeLlm(api: OpenClawPluginApi): RuntimeLlm | undefined {
+  const runtime = api.runtime as unknown as { llm?: Partial<RuntimeLlm> };
+  return typeof runtime.llm?.complete === "function"
+    ? (runtime.llm as RuntimeLlm)
+    : undefined;
+}
+
+/** Build the clear failure returned on OpenClaw runtimes older than PR #64294. */
+function buildRuntimeLlmUnavailableError(): CompletionBridgeErrorInfo {
+  return {
+    kind: "provider_error",
+    message:
+      `[lcm] OpenClaw runtime.llm.complete is unavailable. ` +
+      `Install an OpenClaw build with Plugin SDK runtime LLM support (${RUNTIME_LLM_PR_URL}).`,
+  };
+}
+
+/** Convert internal completion messages to the string-only runtime LLM contract. */
+function toRuntimeLlmMessages(
+  messages: Array<{ role: string; content: unknown }>,
+): RuntimeLlmCompleteMessage[] {
+  return messages
+    .filter(
+      (message) =>
+        message.role === "system" || message.role === "user" || message.role === "assistant",
+    )
+    .map((message) => ({
+      role: message.role as RuntimeLlmCompleteMessage["role"],
+      content: stringifyRuntimeLlmContent(message.content),
+    }));
+}
+
+/** Normalize arbitrary internal message content into a runtime LLM text payload. */
+function stringifyRuntimeLlmContent(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (content === null || content === undefined) {
+    return "";
+  }
+  if (typeof content === "number" || typeof content === "boolean" || typeof content === "bigint") {
+    return String(content);
+  }
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
+}
+
+/** Build the optional provider/model override ref accepted by runtime.llm.complete. */
+function buildRuntimeModelRef(provider: string | undefined, model: string): string | undefined {
+  const modelId = model.trim();
+  if (!modelId) {
+    return undefined;
+  }
+  const providerId = provider?.trim();
+  return providerId ? `${providerId}/${modelId}` : modelId;
+}
+
 /** Construct LCM dependencies from plugin API/runtime surfaces. */
 function createLcmDependencies(
   api: OpenClawPluginApi,
@@ -1646,8 +678,6 @@ function createLcmDependencies(
 ): LcmDependencies {
   const envSnapshot = snapshotPluginEnv();
   envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(registrationConfig.openClawConfig);
-  const modelAuth = getRuntimeModelAuth(api);
-  const readEnv: ReadEnvFn = (key) => process.env[key];
   const pluginConfig = registrationConfig.pluginConfig;
   const log = createLcmLogger(api);
   const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
@@ -1681,10 +711,6 @@ function createLcmDependencies(
     }
   }
 
-  if (!modelAuth) {
-    log.warn(buildLegacyAuthFallbackWarning());
-  }
-
   logStartupBannerOnce({
     key: "transcript-gc-enabled",
     log: (message) => log.info(message),
@@ -1696,83 +722,26 @@ function createLcmDependencies(
     message: `[lcm] Proactive threshold compaction mode: ${config.proactiveThresholdCompactionMode} (default deferred)`,
   });
 
-  /** Resolve the best config object to hand to runtime.modelAuth for this lookup. */
-  const resolveModelAuthConfig = (runtimeConfig: unknown): OpenClawPluginApi["config"] => {
-    if (runtimeConfig && typeof runtimeConfig === "object") {
-      return runtimeConfig as OpenClawPluginApi["config"];
-    }
-    return api.config;
-  };
-
-  /** Resolve an API key without throwing so summarizer auth fallback can retry safely. */
-  const lookupApiKey = async (
-    provider: string,
-    model: string,
-    options?: {
-      profileId?: string;
-      preferredProfile?: string;
-      agentDir?: string;
-      runtimeConfig?: unknown;
-      skipModelAuth?: boolean;
-    },
-  ): Promise<string | undefined> => {
-    const modelAuthConfig = resolveModelAuthConfig(options?.runtimeConfig);
-
-    if (modelAuth && options?.skipModelAuth !== true) {
-      try {
-        const modelAuthKey = resolveApiKeyFromAuthResult(
-          await modelAuth.getApiKeyForModel({
-            model: buildModelAuthLookupModel({ provider, model, contextWindow: 1_000_000 }),
-            cfg: modelAuthConfig,
-            ...(options?.profileId ? { profileId: options.profileId } : {}),
-            ...(options?.preferredProfile ? { preferredProfile: options.preferredProfile } : {}),
-          }),
-        );
-        if (modelAuthKey) {
-          return modelAuthKey;
-        }
-      } catch {
-        // Fall through to env/auth-profile lookup for older or scope-limited runtimes.
-      }
-    }
-
-    const envKey = resolveApiKey(provider, readEnv);
-    if (envKey) {
-      return envKey;
-    }
-
-    const piAiModuleId = "@mariozechner/pi-ai";
-    const mod = (await import(piAiModuleId)) as PiAiModule;
-    return resolveApiKeyFromAuthProfiles({
-      provider,
-      authProfileId: options?.profileId,
-      agentDir: options?.agentDir ?? api.resolvePath("."),
-      runtimeConfig: options?.runtimeConfig,
-      appConfig: api.config,
-      piAiModule: mod,
-      envSnapshot,
+  const runtimeLlmUnavailableError = buildRuntimeLlmUnavailableError();
+  if (!getRuntimeLlm(api)) {
+    logStartupBannerOnce({
+      key: "runtime-llm-unavailable",
+      log: (message) => log.warn(message),
+      message: runtimeLlmUnavailableError.message ?? "[lcm] OpenClaw runtime.llm.complete is unavailable.",
     });
-  };
+  }
+
+  const directCredentialLookupError =
+    "[lcm] direct provider credential lookup has been removed; OpenClaw runtime.llm.complete owns model auth.";
 
   return {
     config,
     configDiagnostics: diagnostics,
-    isRuntimeManagedAuthProvider: (provider: string, providerApi?: string) => {
-      const normalizedProvider = normalizeProviderId(provider);
-      if (normalizedProvider === "openai-codex" || normalizedProvider === "github-copilot") {
-        return true;
-      }
-      return shouldOmitTemperatureForApi(providerApi);
-    },
+    isRuntimeManagedAuthProvider: () => true,
     complete: async ({
       provider,
       model,
-      apiKey,
-      providerApi,
-      authProfileId,
-      agentDir,
-      runtimeConfig,
-      skipModelAuth,
+      agentId,
       messages,
       system,
       maxTokens,
@@ -1780,335 +749,70 @@ function createLcmDependencies(
       reasoning,
       reasoningIfSupported,
     }) => {
-      try {
-        const piAiModuleId = "@mariozechner/pi-ai";
-        const mod = (await import(piAiModuleId)) as PiAiModule;
+      const providerId = provider?.trim();
+      const modelId = model.trim();
+      const modelRef = buildRuntimeModelRef(providerId, modelId);
+      const runtimeLlm = getRuntimeLlm(api);
+      const requestMetadata = {
+        request_provider: providerId ?? "(runtime)",
+        request_model: modelId || "(runtime)",
+        request_api: "runtime.llm",
+        request_reasoning: reasoning?.trim() || reasoningIfSupported?.trim() || "(host-managed)",
+        request_has_system: typeof system === "string" && system.trim().length > 0 ? "true" : "false",
+        request_temperature:
+          typeof temperature === "number" && Number.isFinite(temperature)
+            ? String(temperature)
+            : "(omitted)",
+        request_temperature_sent:
+          typeof temperature === "number" && Number.isFinite(temperature) ? "true" : "false",
+      };
 
-        if (typeof mod.completeSimple !== "function") {
-          return { content: [] };
-        }
-
-        const providerId = (provider ?? "").trim();
-        const modelId = model.trim();
-        if (!providerId || !modelId) {
-          return { content: [] };
-        }
-        const workspaceDir = agentDir?.trim() || api.resolvePath(".");
-
-        // When runtimeConfig is undefined (e.g. resolveLargeFileTextSummarizer
-        // passes legacyParams without config), fall back to the plugin API so
-        // provider-level baseUrl/headers/apiKey are always resolvable.
-        let effectiveRuntimeConfig = runtimeConfig;
-        if (!isRecord(effectiveRuntimeConfig)) {
-          try {
-            effectiveRuntimeConfig = api.runtime.config.loadConfig();
-          } catch {
-            // loadConfig may not be available in all contexts; leave undefined.
-          }
-        }
-
-        const knownModel =
-          typeof mod.getModel === "function" ? mod.getModel(providerId, modelId) : undefined;
-        const modelRuntimeApi = resolveModelApiFromRuntimeConfig(
-          effectiveRuntimeConfig,
-          providerId,
-          modelId,
-        );
-        const providerRuntimeApi =
-          providerApi?.trim() ||
-          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId);
-        const knownModelApi =
-          isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
-            ? knownModel.api.trim()
-            : undefined;
-        const fallbackApi =
-          modelRuntimeApi ||
-          providerRuntimeApi ||
-          knownModelApi ||
-          (() => {
-            if (typeof mod.getModels !== "function") {
-              return undefined;
-            }
-            const models = mod.getModels(providerId);
-            const first = Array.isArray(models) ? models[0] : undefined;
-            if (!isRecord(first) || typeof first.api !== "string" || !first.api.trim()) {
-              return undefined;
-            }
-            return first.api.trim();
-          })() ||
-          inferApiFromProvider(providerId);
-        if (!fallbackApi) {
-          throw new Error(
-            `[lcm] unable to resolve API family for provider ${providerId}; set models.providers.${providerId}.api explicitly instead of falling back implicitly.`,
-          );
-        }
-        const modelAuthConfig = resolveModelAuthConfig(effectiveRuntimeConfig);
-
-        // Resolve provider-level config (baseUrl, headers, etc.) from runtime config.
-        // Custom/proxy providers (e.g. bailian, local proxies) store their baseUrl and
-        // apiKey under models.providers.<provider> in openclaw.json.  Without this
-        // lookup the resolved model object lacks baseUrl, which crashes pi-ai's
-        // detectCompat() ("Cannot read properties of undefined (reading 'includes')"),
-        // and the apiKey is unresolvable, causing 401 errors.  See #19.
-        const providerLevelConfig: Record<string, unknown> = (() => {
-          if (!isRecord(effectiveRuntimeConfig)) return {};
-          const providers = (effectiveRuntimeConfig as { models?: { providers?: Record<string, unknown> } })
-            .models?.providers;
-          if (!providers) return {};
-          const cfg = findProviderConfigValue(providers, providerId);
-          return isRecord(cfg) ? cfg : {};
-        })();
-
-        const resolvedKnownApi =
-          isRecord(knownModel) && typeof knownModel.api === "string"
-            ? modelRuntimeApi || providerRuntimeApi || knownModel.api
-            : undefined;
-        const codexDefaults = getOpenAICodexNativeModelDefaults({
-          provider: providerId,
-          model: modelId,
-          api: fallbackApi,
-        });
-
-        let resolvedModel =
-          isRecord(knownModel) &&
-          typeof knownModel.api === "string" &&
-          typeof knownModel.provider === "string" &&
-          typeof knownModel.id === "string"
-            ? {
-                ...knownModel,
-                id: knownModel.id,
-                provider: knownModel.provider,
-                api: resolvedKnownApi ?? knownModel.api,
-                // Provider config must be able to override built-in transport defaults.
-                // Otherwise built-in providers like `openai` keep their catalog baseUrl
-                // (`https://api.openai.com/v1`) even when OpenClaw runtime config points
-                // that provider id at a custom proxy.
-                // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
-                // baseUrl is undefined.
-                baseUrl: resolveProviderModelBaseUrl({
-                  provider: providerId,
-                  api: resolvedKnownApi ?? knownModel.api,
-                  configuredBaseUrl: providerLevelConfig.baseUrl,
-                  fallbackBaseUrl: knownModel.baseUrl,
-                }),
-                ...(isRecord(providerLevelConfig.headers)
-                  ? {
-                      headers: {
-                        ...(isRecord(knownModel.headers) ? knownModel.headers : {}),
-                        ...providerLevelConfig.headers,
-                      },
-                    }
-                  : {}),
-              }
-            : {
-                id: modelId,
-                name: modelId,
-                provider: providerId,
-                api: fallbackApi,
-                reasoning: codexDefaults.reasoning ?? false,
-                input: codexDefaults.input ?? ["text"],
-                cost: {
-                  input: 0,
-                  output: 0,
-                  cacheRead: 0,
-                  cacheWrite: 0,
-                },
-                contextWindow: codexDefaults.contextWindow ?? 1_000_000,
-                maxTokens: codexDefaults.maxTokens ?? 8_000,
-                // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
-                // baseUrl is undefined.
-                baseUrl: resolveProviderModelBaseUrl({
-                  provider: providerId,
-                  api: fallbackApi,
-                  configuredBaseUrl: providerLevelConfig.baseUrl,
-                  fallbackBaseUrl: undefined,
-                }),
-                ...(isRecord(providerLevelConfig.headers)
-                  ? { headers: providerLevelConfig.headers }
-                  : {}),
-              };
-
-        let runtimeAuth: RuntimeModelAuthResult | undefined;
-        if (modelAuth && skipModelAuth !== true && typeof modelAuth.getRuntimeAuthForModel === "function") {
-          try {
-            runtimeAuth = await modelAuth.getRuntimeAuthForModel({
-              model: buildModelAuthLookupModel({
-                provider: providerId,
-                model: modelId,
-                api: resolvedModel.api,
-                contextWindow: resolvedModel.contextWindow,
-              }),
-              cfg: modelAuthConfig,
-              ...(authProfileId ? { profileId: authProfileId } : {}),
-              workspaceDir,
-            });
-          } catch (err) {
-            console.error(
-              `[lcm] modelAuth.getRuntimeAuthForModel FAILED:`,
-              err instanceof Error ? err.message : err,
-            );
-          }
-        }
-
-        const runtimeAuthBaseUrl = resolveBaseUrlFromAuthResult(runtimeAuth);
-        const runtimeAuthHeaders = resolveRuntimeAuthHeaders(runtimeAuth?.request);
-        resolvedModel = attachRuntimeAuthRequestTransport(
-          {
-            ...resolvedModel,
-            ...(runtimeAuthBaseUrl ? { baseUrl: runtimeAuthBaseUrl } : {}),
-            ...(runtimeAuthHeaders
-              ? {
-                  headers: {
-                    ...(isRecord(resolvedModel.headers) ? resolvedModel.headers : {}),
-                    ...runtimeAuthHeaders,
-                  },
-                }
-              : {}),
-          },
-          runtimeAuth?.request,
-        );
-
-        let resolvedApiKey = apiKey?.trim();
-        if (!resolvedApiKey) {
-          resolvedApiKey = resolveApiKeyFromAuthResult(runtimeAuth);
-        }
-        if (!resolvedApiKey && modelAuth && skipModelAuth !== true) {
-          try {
-            resolvedApiKey = resolveApiKeyFromAuthResult(
-              await modelAuth.getApiKeyForModel({
-                model: buildModelAuthLookupModel({
-                  provider: providerId,
-                  model: modelId,
-                  api: resolvedModel.api,
-                  contextWindow: resolvedModel.contextWindow,
-                }),
-                cfg: modelAuthConfig,
-                ...(authProfileId ? { profileId: authProfileId } : {}),
-              }),
-            );
-          } catch (err) {
-            log.warn(`[lcm] modelAuth.getApiKeyForModel FAILED: ${describeLogError(err)}`);
-          }
-        }
-        if (!resolvedApiKey && modelAuth && skipModelAuth !== true) {
-          try {
-            resolvedApiKey = resolveApiKeyFromAuthResult(
-              await modelAuth.resolveApiKeyForProvider({
-                provider: providerId,
-                cfg: modelAuthConfig,
-                ...(authProfileId ? { profileId: authProfileId } : {}),
-              }),
-            );
-          } catch (err) {
-            log.warn(`[lcm] modelAuth.resolveApiKeyForProvider FAILED: ${describeLogError(err)}`);
-          }
-        }
-        if (!resolvedApiKey) {
-          resolvedApiKey = resolveApiKey(providerId, readEnv);
-        }
-        if (!resolvedApiKey && typeof mod.getEnvApiKey === "function") {
-          resolvedApiKey = mod.getEnvApiKey(providerId)?.trim();
-        }
-        if (!resolvedApiKey) {
-          resolvedApiKey = await resolveApiKeyFromAuthProfiles({
-            provider: providerId,
-            authProfileId,
-            agentDir,
-            appConfig: api.config,
-            runtimeConfig: effectiveRuntimeConfig,
-            piAiModule: mod,
-            envSnapshot,
-          });
-        }
-        // Fallback: read apiKey from models.providers config (e.g. proxy providers
-        // with keys like "not-needed-for-cli-proxy").
-        if (!resolvedApiKey && isRecord(effectiveRuntimeConfig)) {
-          const providers = (effectiveRuntimeConfig as { models?: { providers?: Record<string, unknown> } })
-            .models?.providers;
-          if (providers) {
-            const providerCfg = findProviderConfigValue(providers, providerId);
-            if (isRecord(providerCfg) && typeof providerCfg.apiKey === "string") {
-              const cfgKey = providerCfg.apiKey.trim();
-              if (cfgKey) {
-                resolvedApiKey = cfgKey;
-              }
-            }
-          }
-        }
-
-        const effectiveReasoning = resolveEffectiveReasoning({
-          reasoning,
-          reasoningIfSupported,
-          modelSupportsReasoning: resolvedModel.reasoning,
-        });
-
-        const completeOptions = buildCompleteSimpleOptions({
-          api: resolvedModel.api,
-          apiKey: resolvedApiKey,
-          maxTokens,
-          temperature,
-          reasoning: effectiveReasoning,
-        });
-        const requestMetadata = {
-          request_provider: providerId,
-          request_model: modelId,
-          request_api: resolvedModel.api,
-          request_reasoning: effectiveReasoning ?? "(none)",
-          request_has_system: typeof system === "string" && system.trim().length > 0 ? "true" : "false",
-          request_temperature:
-            typeof completeOptions.temperature === "number"
-              ? String(completeOptions.temperature)
-              : "(omitted)",
-          request_temperature_sent: typeof completeOptions.temperature === "number" ? "true" : "false",
-        };
-
-        const result = await mod.completeSimple(
-          resolvedModel,
-          {
-            ...(typeof system === "string" && system.trim()
-              ? { systemPrompt: system.trim() }
-              : {}),
-            messages: messages.map((message) => ({
-              role: message.role,
-              content: message.content,
-              timestamp: Date.now(),
-            })),
-          },
-          completeOptions,
-        );
-
-        if (!isRecord(result)) {
-          return {
-            content: [],
-            ...requestMetadata,
-          };
-        }
-
+      if (!runtimeLlm) {
         return {
-          ...result,
-          content: Array.isArray(result.content) ? result.content : [],
+          content: [],
+          error: runtimeLlmUnavailableError,
+          ...requestMetadata,
+        };
+      }
+
+      try {
+        const result = await runtimeLlm.complete({
+          messages: toRuntimeLlmMessages(messages),
+          ...(modelRef ? { model: modelRef } : {}),
+          ...(typeof maxTokens === "number" && Number.isFinite(maxTokens) ? { maxTokens } : {}),
+          ...(typeof temperature === "number" && Number.isFinite(temperature)
+            ? { temperature }
+            : {}),
+          ...(typeof system === "string" && system.trim() ? { systemPrompt: system.trim() } : {}),
+          purpose: "lossless-claw compaction summarization",
+          ...(agentId?.trim() ? { agentId: agentId.trim() } : {}),
+        });
+        const text = typeof result.text === "string" ? result.text : "";
+        return {
+          content: text ? [{ type: "text", text }] : [],
+          provider: result.provider,
+          model: result.model,
+          agentId: result.agentId,
+          usage: result.usage,
+          audit: result.audit,
           ...requestMetadata,
         };
       } catch (err) {
-        log.error(`[lcm] completeSimple error: ${describeLogError(err)}`);
+        log.error(`[lcm] runtime.llm.complete error: ${describeLogError(err)}`);
         const authError = detectProviderAuthError(err);
-        const configError =
-          !authError &&
-          err instanceof Error &&
-          err.message.startsWith(PROVIDER_API_RESOLUTION_ERROR_PREFIX)
-            ? {
-                kind: "provider_config",
-                message: err.message,
-              }
-            : undefined;
-        const providerError = !authError && !configError ? detectProviderBridgeError(err) : undefined;
         return {
           content: [],
-          ...(authError ? { error: authError } : {}),
-          ...(configError ? { error: configError } : {}),
-          ...(providerError ? { error: providerError } : {}),
+          error: authError ?? detectProviderBridgeError(err),
+          ...requestMetadata,
         };
       }
+    },
+    getApiKey: async () => {
+      log.warn(directCredentialLookupError);
+      return undefined;
+    },
+    requireApiKey: async () => {
+      throw new Error(directCredentialLookupError);
     },
     callGateway: async (params) => {
       const sub = api.runtime.subagent;
@@ -2170,16 +874,6 @@ function createLcmDependencies(
         "openai"
       ).trim();
       return { provider, model: raw };
-    },
-    getApiKey: async (provider, model, options) => {
-      return lookupApiKey(provider, model, options);
-    },
-    requireApiKey: async (provider, model, options) => {
-      const key = await lookupApiKey(provider, model, options);
-      if (!key) {
-        throw new Error(`Missing API key for provider '${provider}' (model '${model}').`);
-      }
-      return key;
     },
     parseAgentSessionKey,
     isSubagentSessionKey: (sessionKey) => {
