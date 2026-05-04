@@ -88,7 +88,7 @@ evidence. It extracts deterministic coding facts first:
 - tool calls and statuses
 - patch/apply evidence
 - touched file paths
-- test or command outcome observations
+- command/test metadata through tool-call records
 - subagent spawn edges from `thread_spawn_edges`
 - thread summaries and project/day rollups
 - `logs_2.sqlite` metadata such as level, target, file, line, and thread id,

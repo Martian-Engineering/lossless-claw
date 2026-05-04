@@ -28,7 +28,8 @@
     "category": "Engineering",
     "capabilities": [
       "Interactive",
-      "Read"
+      "Read",
+      "Write"
     ],
     "websiteURL": "https://github.com/Martian-Engineering/lossless-claw",
     "privacyPolicyURL": "https://github.com/Martian-Engineering/lossless-claw",

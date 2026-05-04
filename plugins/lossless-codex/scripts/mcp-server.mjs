@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SERVER_NAME = "lossless-codex";
 const SERVER_VERSION = "0.1.0";
@@ -454,7 +455,10 @@ function columnExists(db, tableName, columnName) {
 
 function projectKeyFromThread(row) {
   const origin = String(row.git_origin_url ?? "");
-  const fromOrigin = origin.split("/").pop()?.replace(/\.git$/, "");
+  const originMatch = /^(?:https?:\/\/|git@)?([^/:]+)[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(origin);
+  const fromOrigin = originMatch
+    ? `${originMatch[1]}/${originMatch[2]}/${originMatch[3]}`
+    : origin.split("/").pop()?.replace(/\.git$/, "");
   const cwd = String(row.cwd ?? "");
   const fromCwd = cwd.split(/[\\/]/).filter(Boolean).pop();
   return (fromOrigin || fromCwd || "codex-project").toLowerCase();
@@ -638,22 +642,34 @@ function ensureSourceFile(db, kind, path) {
       last_scanned_at = excluded.last_scanned_at,
       status = 'active'`,
   ).run(sourceId, kind, path, sha(path), stat.device, stat.inode, generation, stat.size, stat.mtimeMs, nowIso());
-  return { sourceId, generation, ...stat };
+  return { sourceId, generation, kind, path, ...stat };
 }
 
-function sourceWatermarkCurrent(db, source) {
+function lastNonEmptyLineHash(path) {
+  try {
+    const lines = readFileSync(path, "utf8").trimEnd().split("\n");
+    const lastLine = [...lines].reverse().find((line) => line.trim().length > 0);
+    return lastLine ? sha(lastLine) : null;
+  } catch {
+    return null;
+  }
+}
+
+function sourceWatermarkCurrent(db, source, kind) {
   const row = db
     .prepare(
-      `SELECT last_size, last_mtime_ms
+      `SELECT last_size, last_mtime_ms, last_event_hash
        FROM codex_import_watermarks
        WHERE source_file_id = ?`,
     )
     .get(source.sourceId);
-  return (
-    row &&
-    Number(row.last_size) === Number(source.size) &&
-    Number(row.last_mtime_ms) === Number(source.mtimeMs)
-  );
+  if (!row) return false;
+  if (Number(row.last_size) !== Number(source.size)) return false;
+  if (Number(row.last_mtime_ms) !== Number(source.mtimeMs)) return false;
+  if (source.kind === "session_jsonl" || source.kind === "archived_jsonl" || kind === "events") {
+    return String(row.last_event_hash ?? "") === String(lastNonEmptyLineHash(source.path) ?? "");
+  }
+  return true;
 }
 
 function sourceHasImportedRows(db, source, kind) {
@@ -665,7 +681,7 @@ function sourceHasImportedRows(db, source, kind) {
 }
 
 function shouldSkipSourceImport(db, source, kind) {
-  return Boolean(sourceWatermarkCurrent(db, source) && sourceHasImportedRows(db, source, kind));
+  return Boolean(sourceWatermarkCurrent(db, source, kind) && sourceHasImportedRows(db, source, kind));
 }
 
 function markSourceWatermark(db, source, rows = []) {
@@ -1394,6 +1410,10 @@ function getRollups(db, params = {}) {
     where.push("period_key = ?");
     args.push(normalizeDate(String(params.period)));
   }
+  if (params.timezone) {
+    where.push("timezone = ?");
+    args.push(normalizeTimezone(params.timezone));
+  }
   const sql = `
     SELECT rollup_id, project_key, period_key, timezone, summary, payload_json,
            coverage_status, source_ref, updated_at
@@ -1416,8 +1436,9 @@ function writeLcmEnrichment(lcmDbPath, rollup, env = process.env) {
   }
   const db = new DatabaseSync(lcmDbPath);
   try {
+    db.exec("PRAGMA busy_timeout = 5000");
     ensureLcmTemporalEnrichmentTable(db);
-    const enrichmentId = id("lcmenr", `lossless_codex:day:${rollup.period_key}:${rollup.project_key}`);
+    const enrichmentId = id("lcmenr", `lossless_codex:day:${rollup.period_key}:${rollup.timezone}:${rollup.project_key}`);
     db.prepare(
       `INSERT INTO lcm_temporal_enrichments (
         enrichment_id, source_system, period_kind, period_key, timezone, project_key,
@@ -1442,6 +1463,11 @@ function writeLcmEnrichment(lcmDbPath, rollup, env = process.env) {
       nowIso(),
     );
     return { written: true, enrichmentId };
+  } catch (error) {
+    if (String(error?.message ?? error).toLowerCase().includes("database is locked")) {
+      return { written: false, reason: "lcm database is busy; try again later" };
+    }
+    throw error;
   } finally {
     db.close();
   }
@@ -1466,6 +1492,8 @@ export function ensureLcmTemporalEnrichmentTable(db) {
     );
     CREATE INDEX IF NOT EXISTS lcm_temporal_enrichments_period_idx
       ON lcm_temporal_enrichments (period_kind, period_key, timezone);
+    CREATE INDEX IF NOT EXISTS lcm_temporal_enrichments_project_period_idx
+      ON lcm_temporal_enrichments (project_key, period_kind, period_key, timezone);
   `);
 }
 
@@ -1544,6 +1572,7 @@ async function toolImport(args, options) {
     dbPath: options.dbPath ?? args.dbPath ?? resolveSidecarDatabasePath(env),
     sourceDir: options.sourceDir ?? args.sourceDir ?? resolveSourceDir(env),
     stateDbPath: options.stateDbPath ?? args.stateDbPath ?? resolveStateDbPath(env),
+    logsDbPath: options.logsDbPath ?? args.logsDbPath,
     timezone: args.timezone ?? env.LOSSLESS_CODEX_TIMEZONE,
     allowWrite: true,
     env,
@@ -1612,7 +1641,8 @@ function toolRecent(args, options) {
   const db = openReadDb(options.dbPath ?? resolveSidecarDatabasePath(options.env));
   try {
     const period = args.period ? normalizeDate(String(args.period)) : undefined;
-    const rollups = getRollups(db, { period, projectKey: args.projectKey, limit: args.limit });
+    const timezone = args.timezone ?? options.env?.LOSSLESS_CODEX_TIMEZONE;
+    const rollups = getRollups(db, { period, projectKey: args.projectKey, timezone, limit: args.limit });
     return jsonTextResult({
       tool: "lossless_codex_recent",
       period: period ?? "latest",
@@ -1630,9 +1660,11 @@ function toolDescribe(args, options) {
   try {
     const rawId = readString(args.id, "");
     if (!rawId) throw new Error("id is required.");
-    const [kind, value] = rawId.startsWith("lossless-codex://")
+    const parts = rawId.startsWith("lossless-codex://")
       ? rawId.slice("lossless-codex://".length).split("/")
       : ["thread", rawId];
+    const [kind, ...valueParts] = parts;
+    const value = valueParts.join("/");
     if (kind === "thread") {
       const thread = db.prepare(
         `SELECT t.*, p.project_key
@@ -1695,6 +1727,30 @@ function toolDescribe(args, options) {
         ],
       });
     }
+    if (kind === "project-day") {
+      const periodKey = valueParts.at(-1);
+      const projectKey = valueParts.slice(0, -1).join("/");
+      if (!projectKey || !periodKey) throw new Error(`Invalid project-day ref: ${rawId}`);
+      const rollup = db
+        .prepare(
+          `SELECT rollup_id, project_key, period_key, timezone, summary, payload_json,
+                  coverage_status, source_ref, updated_at
+           FROM codex_project_day_rollups
+           WHERE project_key = ? AND period_key = ?
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+        )
+        .get(projectKey, periodKey);
+      if (!rollup) throw new Error(`No Lossless Codex project-day rollup found for ${projectKey}/${periodKey}`);
+      return jsonTextResult({
+        tool: "lossless_codex_describe",
+        type: "project-day",
+        rollup: {
+          ...rollup,
+          payload: JSON.parse(rollup.payload_json),
+        },
+      });
+    }
     throw new Error(`Unsupported Lossless Codex describe id: ${rawId}`);
   } finally {
     db.close();
@@ -1705,7 +1761,8 @@ function toolWorklog(args, options) {
   const db = openReadDb(options.dbPath ?? resolveSidecarDatabasePath(options.env));
   try {
     const period = args.period ? normalizeDate(String(args.period)) : undefined;
-    const rollups = getRollups(db, { period, projectKey: args.projectKey, limit: args.limit });
+    const timezone = args.timezone ?? options.env?.LOSSLESS_CODEX_TIMEZONE;
+    const rollups = getRollups(db, { period, projectKey: args.projectKey, timezone, limit: args.limit });
     const projectsWorked = rollups.flatMap((rollup) => rollup.payload.projectsWorked ?? []);
     let lcmEnrichment = { written: false, reason: "not requested" };
     if (readBool(args.writeLcmEnrichment, false) && rollups[0]) {
@@ -1761,21 +1818,40 @@ function encodeMessage(payload) {
 
 function decodeMessages(buffer) {
   const messages = [];
-  let rest = buffer;
+  let rest = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer, "utf8");
   while (rest.length > 0) {
     const headerEnd = rest.indexOf("\r\n\r\n");
     if (headerEnd < 0) break;
-    const header = rest.slice(0, headerEnd);
+    const header = rest.subarray(0, headerEnd).toString("utf8");
     const match = /Content-Length:\s*(\d+)/i.exec(header);
     if (!match) break;
     const length = Number(match[1]);
     const bodyStart = headerEnd + 4;
     const bodyEnd = bodyStart + length;
     if (rest.length < bodyEnd) break;
-    messages.push(JSON.parse(rest.slice(bodyStart, bodyEnd)));
-    rest = rest.slice(bodyEnd);
+    messages.push(JSON.parse(rest.subarray(bodyStart, bodyEnd).toString("utf8")));
+    rest = rest.subarray(bodyEnd);
   }
   return messages;
+}
+
+function extractMessagesFromBuffer(buffer) {
+  const messages = [];
+  let rest = buffer;
+  while (rest.length > 0) {
+    const headerEnd = rest.indexOf("\r\n\r\n");
+    if (headerEnd < 0) break;
+    const header = rest.subarray(0, headerEnd).toString("utf8");
+    const match = /Content-Length:\s*(\d+)/i.exec(header);
+    if (!match) break;
+    const length = Number(match[1]);
+    const bodyStart = headerEnd + 4;
+    const bodyEnd = bodyStart + length;
+    if (rest.length < bodyEnd) break;
+    messages.push(JSON.parse(rest.subarray(bodyStart, bodyEnd).toString("utf8")));
+    rest = rest.subarray(bodyEnd);
+  }
+  return { messages, rest };
 }
 
 async function handleMcpMessage(message) {
@@ -1805,21 +1881,35 @@ async function handleMcpMessage(message) {
 }
 
 async function main() {
-  let stdin = "";
-  process.stdin.setEncoding("utf8");
-  for await (const chunk of process.stdin) {
-    stdin += chunk;
-  }
-  const responses = [];
-  for (const message of decodeMessages(stdin)) {
-    responses.push(await handleMcpMessage(message));
-  }
-  for (const response of responses) {
-    process.stdout.write(encodeMessage(response));
+  let buffer = Buffer.alloc(0);
+  let queue = Promise.resolve();
+  const processBuffer = async () => {
+    const decoded = extractMessagesFromBuffer(buffer);
+    buffer = decoded.rest;
+    for (const message of decoded.messages) {
+      process.stdout.write(encodeMessage(await handleMcpMessage(message)));
+    }
+  };
+  process.stdin.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+    queue = queue.then(processBuffer).catch((error) => {
+      console.error(error instanceof Error ? error.stack : String(error));
+      process.exitCode = 1;
+    });
+  });
+  process.stdin.resume();
+}
+
+function isEntrypoint() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntrypoint()) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.stack : String(error));
     process.exit(1);

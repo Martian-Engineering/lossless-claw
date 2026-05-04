@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -10,6 +10,7 @@ import { runLcmMigrations } from "../src/db/migration.js";
 
 const pluginModulePath = "../plugins/lossless-codex/scripts/mcp-server.mjs";
 const rehearsalScriptPath = "plugins/lossless-codex/scripts/rehearsal.mjs";
+const fixtureProjectKey = "github.com/martian-engineering/lossless-claw";
 
 type PluginModule = {
   createTools: () => Array<{ name: string }>;
@@ -22,6 +23,7 @@ type PluginModule = {
       stateDbPath?: string;
       lcmDbPath?: string;
       allowWrite?: boolean;
+      logsDbPath?: string;
       env?: Record<string, string | undefined>;
     },
   ) => Promise<{
@@ -49,21 +51,21 @@ function encodeMcp(payload: unknown): string {
   return `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`;
 }
 
-function decodeMcp(buffer: string): Array<Record<string, unknown>> {
+function decodeMcp(buffer: string | Buffer): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
-  let rest = buffer;
+  let rest = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer, "utf8");
   while (rest.length > 0) {
     const headerEnd = rest.indexOf("\r\n\r\n");
     if (headerEnd < 0) break;
-    const header = rest.slice(0, headerEnd);
+    const header = rest.subarray(0, headerEnd).toString("utf8");
     const match = /Content-Length:\s*(\d+)/i.exec(header);
     if (!match) break;
     const length = Number(match[1]);
     const bodyStart = headerEnd + 4;
     const bodyEnd = bodyStart + length;
     if (rest.length < bodyEnd) break;
-    messages.push(JSON.parse(rest.slice(bodyStart, bodyEnd)) as Record<string, unknown>);
-    rest = rest.slice(bodyEnd);
+    messages.push(JSON.parse(rest.subarray(bodyStart, bodyEnd).toString("utf8")) as Record<string, unknown>);
+    rest = rest.subarray(bodyEnd);
   }
   return messages;
 }
@@ -313,6 +315,86 @@ describe("Lossless Codex full memory plugin", () => {
     }
   });
 
+  it("keeps unrelated same-basename git origins in separate projects", async () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    const secondRolloutPath = join(
+      fixture.sourceDir,
+      "sessions",
+      "2026",
+      "05",
+      "04",
+      "rollout-2026-05-04T02-00-00-019other-api-thread.jsonl",
+    );
+    writeFileSync(
+      secondRolloutPath,
+      [
+        {
+          timestamp: "2026-05-03T19:00:00.000Z",
+          type: "session_meta",
+          payload: {
+            id: "019other-api-thread",
+            cwd: "/tmp/api",
+            git_origin_url: "https://github.com/other/api.git",
+          },
+        },
+      ].map((line) => JSON.stringify(line)).join("\n") + "\n",
+    );
+    const stateDb = new DatabaseSync(fixture.stateDbPath);
+    try {
+      stateDb
+        .prepare(
+          `INSERT INTO threads (
+            id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+            sandbox_policy, approval_mode, git_branch, git_origin_url, model, reasoning_effort,
+            created_at_ms, updated_at_ms
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "019other-api-thread",
+          secondRolloutPath,
+          1777834800,
+          1777834800,
+          "vscode",
+          "openai",
+          "/tmp/api",
+          "Other API work",
+          "danger-full-access",
+          "never",
+          "main",
+          "https://github.com/other/api.git",
+          "gpt-5.5",
+          "high",
+          1777834800000,
+          1777834800000,
+        );
+    } finally {
+      stateDb.close();
+    }
+
+    await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+    });
+
+    const db = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: true });
+    try {
+      const keys = db
+        .prepare("SELECT project_key FROM codex_projects ORDER BY project_key")
+        .all()
+        .map((row) => String((row as { project_key: string }).project_key));
+      expect(keys).toEqual([
+        "github.com/martian-engineering/lossless-claw",
+        "github.com/other/api",
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
   it("redacts object status payloads from raw metadata snapshots", async () => {
     const fixture = createCodexFixture();
     tempDirs.add(fixture.tempDir);
@@ -517,13 +599,17 @@ describe("Lossless Codex full memory plugin", () => {
       logsDb.close();
     }
 
-    await plugin.importCodexArtifacts({
-      dbPath: fixture.sidecarDbPath,
-      sourceDir: fixture.sourceDir,
-      stateDbPath: fixture.stateDbPath,
-      logsDbPath,
-      allowWrite: true,
-    });
+    await plugin.callTool(
+      "lossless_codex_import",
+      {
+        allowWrite: true,
+        dbPath: fixture.sidecarDbPath,
+        sourceDir: fixture.sourceDir,
+        stateDbPath: fixture.stateDbPath,
+        logsDbPath,
+      },
+      { env: { LOSSLESS_CODEX_READ_ONLY: "true" } },
+    );
 
     const db = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: true });
     try {
@@ -615,6 +701,35 @@ describe("Lossless Codex full memory plugin", () => {
     }
   });
 
+  it("does not skip same-size same-mtime rollout replacements with changed evidence hash", async () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+
+    await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+    });
+
+    const original = readFileSync(fixture.rolloutPath, "utf8");
+    const originalStat = statSync(fixture.rolloutPath);
+    const replacement = original.replace("task_complete", "task_failed__");
+    expect(Buffer.byteLength(replacement)).toBe(Buffer.byteLength(original));
+    writeFileSync(fixture.rolloutPath, replacement);
+    utimesSync(fixture.rolloutPath, originalStat.atime, originalStat.mtime);
+
+    const result = await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+    });
+
+    expect(result.importedEvents).toBe(1);
+  });
+
   it("searches, describes, and reports worklogs from imported coding memory", async () => {
     const fixture = createCodexFixture();
     tempDirs.add(fixture.tempDir);
@@ -648,13 +763,13 @@ describe("Lossless Codex full memory plugin", () => {
 
     const worklog = await plugin.callTool(
       "lossless_codex_worklog",
-      { projectKey: "lossless-claw", period: "2026-05-03" },
+      { projectKey: fixtureProjectKey, period: "2026-05-03" },
       { dbPath: fixture.sidecarDbPath },
     );
     expect(worklog.structuredContent?.projectsWorked).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          projectKey: "lossless-claw",
+          projectKey: fixtureProjectKey,
           threadCount: 1,
         }),
       ]),
@@ -675,6 +790,14 @@ describe("Lossless Codex full memory plugin", () => {
     );
     expect(describeFile.structuredContent?.type).toBe("file");
     expect(JSON.stringify(describeFile.structuredContent)).toContain("src/lossless-codex/example.ts");
+
+    const describeProjectDay = await plugin.callTool(
+      "lossless_codex_describe",
+      { id: `lossless-codex://project-day/${fixtureProjectKey}/2026-05-03` },
+      { dbPath: fixture.sidecarDbPath },
+    );
+    expect(describeProjectDay.structuredContent?.type).toBe("project-day");
+    expect(JSON.stringify(describeProjectDay.structuredContent)).toContain(fixtureProjectKey);
   });
 
   it("builds project-day rollups in the configured local timezone", async () => {
@@ -691,18 +814,33 @@ describe("Lossless Codex full memory plugin", () => {
 
     const recentUtcDate = await plugin.callTool(
       "lossless_codex_recent",
-      { projectKey: "lossless-claw", period: "2026-05-03" },
+      { projectKey: fixtureProjectKey, period: "2026-05-03" },
       { dbPath: fixture.sidecarDbPath },
     );
     expect(recentUtcDate.structuredContent?.count).toBe(0);
 
     const recentLocalDate = await plugin.callTool(
       "lossless_codex_recent",
-      { projectKey: "lossless-claw", period: "2026-05-04" },
+      { projectKey: fixtureProjectKey, period: "2026-05-04" },
       { dbPath: fixture.sidecarDbPath },
     );
     expect(recentLocalDate.structuredContent?.count).toBe(1);
     expect(JSON.stringify(recentLocalDate.structuredContent)).toContain('"timezone":"Asia/Bangkok"');
+
+    await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+      env: { LOSSLESS_CODEX_TIMEZONE: "UTC" },
+    });
+    const onlyBangkok = await plugin.callTool(
+      "lossless_codex_recent",
+      { projectKey: fixtureProjectKey, period: "2026-05-04" },
+      { dbPath: fixture.sidecarDbPath, env: { LOSSLESS_CODEX_TIMEZONE: "Asia/Bangkok" } },
+    );
+    expect(onlyBangkok.structuredContent?.count).toBe(1);
+    expect(JSON.stringify(onlyBangkok.structuredContent)).toContain('"timezone":"Asia/Bangkok"');
   });
 
   it("writes compact temporal enrichment rows to LCM only when explicitly enabled", async () => {
@@ -722,14 +860,14 @@ describe("Lossless Codex full memory plugin", () => {
 
     const disabled = await plugin.callTool(
       "lossless_codex_worklog",
-      { projectKey: "lossless-claw", period: "2026-05-03", writeLcmEnrichment: true },
+      { projectKey: fixtureProjectKey, period: "2026-05-03", writeLcmEnrichment: true },
       { dbPath: fixture.sidecarDbPath, lcmDbPath: fixture.lcmDbPath, env: {} },
     );
     expect(disabled.structuredContent?.lcmEnrichment?.written).toBe(false);
 
     const enabled = await plugin.callTool(
       "lossless_codex_worklog",
-      { projectKey: "lossless-claw", period: "2026-05-03", writeLcmEnrichment: true },
+      { projectKey: fixtureProjectKey, period: "2026-05-03", writeLcmEnrichment: true },
       {
         dbPath: fixture.sidecarDbPath,
         lcmDbPath: fixture.lcmDbPath,
@@ -753,9 +891,14 @@ describe("Lossless Codex full memory plugin", () => {
       expect(row.source_system).toBe("lossless_codex");
       expect(row.period_kind).toBe("day");
       expect(row.period_key).toBe("2026-05-03");
-      expect(row.project_key).toBe("lossless-claw");
-      expect(row.summary).toContain("Codex worked on lossless-claw");
+      expect(row.project_key).toBe(fixtureProjectKey);
+      expect(row.summary).toContain(`Codex worked on ${fixtureProjectKey}`);
       expect(row.payload_json).not.toContain("redacted patch");
+      const indexes = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'lcm_temporal_enrichments'")
+        .all()
+        .map((indexRow) => String((indexRow as { name: string }).name));
+      expect(indexes).toContain("lcm_temporal_enrichments_project_period_idx");
     } finally {
       db.close();
     }
@@ -780,10 +923,10 @@ describe("Lossless Codex full memory plugin", () => {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    let stdout = "";
+    let stdout = Buffer.alloc(0);
     let stderr = "";
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
+      stdout = Buffer.concat([stdout, Buffer.from(chunk)]);
     });
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString("utf8");
@@ -801,7 +944,6 @@ describe("Lossless Codex full memory plugin", () => {
         },
       }),
     );
-    child.stdin.end();
 
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -812,17 +954,77 @@ describe("Lossless Codex full memory plugin", () => {
         clearTimeout(timeout);
         reject(error);
       });
-      child.on("exit", (code) => {
-        clearTimeout(timeout);
-        if (code === 0) resolve();
-        else reject(new Error(`MCP server exited ${code}. stderr=${stderr}`));
+      child.stdout.on("data", () => {
+        if (decodeMcp(stdout).length >= 2) {
+          clearTimeout(timeout);
+          resolve();
+        }
       });
     });
+    child.stdin.end();
+    child.kill("SIGTERM");
 
     const messages = decodeMcp(stdout);
     expect(messages.map((message) => message.id)).toEqual([1, 2]);
     expect(JSON.stringify(messages[0])).toContain("lossless_codex_worklog");
     expect(JSON.stringify(messages[1])).toContain("src/lossless-codex/example.ts");
+  });
+
+  it("starts over MCP stdio when invoked through an installed symlink path", async () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+    });
+    const installDir = mkdtempSync(join(tmpdir(), "lossless-codex-install with spaces-"));
+    tempDirs.add(installDir);
+    const symlinkedPlugin = join(installDir, "lossless-codex");
+    symlinkSync(join(process.cwd(), "plugins/lossless-codex"), symlinkedPlugin, "dir");
+    const scriptPath = join(symlinkedPlugin, "scripts/mcp-server.mjs");
+
+    const child = spawn(process.execPath, [scriptPath], {
+      cwd: symlinkedPlugin,
+      env: { ...process.env, LOSSLESS_CODEX_DB_PATH: fixture.sidecarDbPath },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = Buffer.alloc(0);
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout = Buffer.concat([stdout, Buffer.from(chunk)]);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.stdin.write(encodeMcp({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill("SIGTERM");
+        reject(new Error(`MCP symlink server timed out. stderr=${stderr}`));
+      }, 5_000);
+      child.on("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.stdout.on("data", () => {
+        if (decodeMcp(stdout).length >= 1) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+    });
+    child.stdin.end();
+    child.kill("SIGTERM");
+
+    const messages = decodeMcp(stdout);
+    expect(messages).toHaveLength(1);
+    expect(JSON.stringify(messages[0])).toContain("lossless_codex_worklog");
   });
 
   it("runs the production rehearsal CLI against copied fixtures", () => {
