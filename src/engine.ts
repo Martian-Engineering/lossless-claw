@@ -1694,7 +1694,44 @@ function messageContentCoveredBySummary(params: {
     return false;
   }
   const summary = normalizeSummaryOverlapText(params.summary);
-  return summary.includes(content);
+  if (!summary.includes(content)) {
+    return false;
+  }
+  // Bare substring match is too loose: a 24+ char user instruction can
+  // coincidentally appear inside a long narrative summary and get silently
+  // dropped. Require one of:
+  //   1. content appears at the very start or end of the summary, OR
+  //   2. content appears inside a quoted block — double quotes ("..."),
+  //      single quotes ('...'), or backticks (`...`). All three quote
+  //      styles survive normalization and are emitted by the summarizer
+  //      when it embeds verbatim user text.
+  // Otherwise treat it as a coincidental collision and keep the message.
+  if (summary.startsWith(content) || summary.endsWith(content)) {
+    return true;
+  }
+  // Walk each quote-delimited span (cheap; summaries are bounded) and check
+  // membership. Use double-quoted literals to match the rest of the file.
+  for (const quoteChar of ["\"", "'", "`"]) {
+    let cursor = 0;
+    while (cursor < summary.length) {
+      const open = summary.indexOf(quoteChar, cursor);
+      if (open < 0) break;
+      const close = summary.indexOf(quoteChar, open + 1);
+      if (close < 0) {
+        // Unmatched opening quote: don't break out of the entire scan —
+        // a later well-formed quoted span may still contain the content.
+        // Skip past this lone opener and continue.
+        cursor = open + 1;
+        continue;
+      }
+      const span = summary.slice(open + 1, close);
+      if (span.includes(content)) {
+        return true;
+      }
+      cursor = close + 1;
+    }
+  }
+  return false;
 }
 
 // ── LcmContextEngine ────────────────────────────────────────────────────────
@@ -1743,6 +1780,30 @@ export class LcmContextEngine implements ContextEngine {
 
   // ── Circuit breaker for compaction auth failures ──
   private circuitBreakerStates = new Map<string, CircuitBreakerState>();
+
+  /** Last file state successfully covered by `reconcileTranscriptTailForAfterTurn`
+   *  slow-path full re-reads, keyed by `${sessionQueueKey}\u0000${sessionFile}`
+   *  (same NUL-escape separator pattern as `messageIdentity`). Long-running
+   *  sessions where the bootstrap checkpoint is missing or path-mismatched
+   *  would otherwise pay O(file-size) on every afterTurn; repeated attempts
+   *  for the same unchanged file state are skipped.
+   *
+   *  Bounded with FIFO eviction at `AFTER_TURN_RECONCILE_KEY_CAP` entries
+   *  so hosts churning through many sessions/files don't accumulate this
+   *  map indefinitely. When the cap is exceeded we drop the oldest entry
+   *  (Map iteration order is insertion order in JS); a session whose
+   *  entry eventually evicts may pay the slow path once again, which is
+   *  acceptable since the bound is well above realistic concurrent-session
+   *  counts. */
+  private afterTurnReconcileFullReadStates = new Map<string, { size: number; mtimeMs: number }>();
+  private static readonly AFTER_TURN_RECONCILE_KEY_CAP = 4096;
+
+  /** Per-process dedupe for the `cache-context-unknown` info-level log
+   *  (PR #557 added the diagnostic; on long-running sessions without
+   *  provider telemetry it would otherwise fire every afterTurn that
+   *  records deferred debt). Keyed by conversationId so each session
+   *  emits the visibility log AT MOST ONCE per process. */
+  private cacheContextUnknownLogged = new Set<number>();
 
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
@@ -4704,9 +4765,9 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     sessionKey?: string;
     sessionFile: string;
-  }): Promise<void> {
+  }): Promise<{ importedMessages: number; blockedByImportCap: boolean }> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
-    await this.withSessionQueue(
+    return await this.withSessionQueue(
       queueKey,
       async () => {
         const conversation = await this.conversationStore.getConversationForSession({
@@ -4714,7 +4775,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
         });
         if (!conversation) {
-          return;
+          return { importedMessages: 0, blockedByImportCap: false };
         }
 
         // OpenClaw can submit the foreground prompt outside the mutable
@@ -4757,13 +4818,85 @@ export class LcmContextEngine implements ContextEngine {
                 sessionFile: params.sessionFile,
               });
             }
-            return;
+            return { importedMessages, blockedByImportCap: false };
           }
         }
 
+        // Slow path: checkpoint missing, path mismatched, or non-append-only.
+        // Cap full re-reads only for unchanged file states. If the transcript
+        // changed since the last full read, reconcile again; if it did not,
+        // skip without advancing the checkpoint so stale state can be retried
+        // after a later file change, process restart, or cap eviction.
+        const fullReadKey = `${queueKey}\u0000${params.sessionFile}`;
+        const reason = !checkpoint
+          ? "checkpoint-missing"
+          : checkpoint.sessionFilePath !== params.sessionFile
+            ? "path-mismatch"
+            : "append-only-ineligible";
+        let sessionFileState: { size: number; mtimeMs: number } | undefined;
+        try {
+          const sessionFileStats = await stat(params.sessionFile);
+          sessionFileState = {
+            size: sessionFileStats.size,
+            mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
+          };
+        } catch {
+          // Leave undefined: without stat proof, do not use the slow-read cap.
+        }
+        const rememberedFileState = this.afterTurnReconcileFullReadStates.get(fullReadKey);
+        if (
+          rememberedFileState
+          && sessionFileState
+          && rememberedFileState.size === sessionFileState.size
+          && rememberedFileState.mtimeMs === sessionFileState.mtimeMs
+        ) {
+          this.deps.log.info(
+            `[lcm] afterTurn: transcript reconcile slow path skipped (file state already read this process) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+          );
+          return { importedMessages: 0, blockedByImportCap: false };
+        }
+
+        const rememberSlowReadState = (): void => {
+          if (!sessionFileState) {
+            return;
+          }
+          if (
+            !this.afterTurnReconcileFullReadStates.has(fullReadKey)
+            && this.afterTurnReconcileFullReadStates.size
+              >= LcmContextEngine.AFTER_TURN_RECONCILE_KEY_CAP
+          ) {
+            const oldest = this.afterTurnReconcileFullReadStates.keys().next().value;
+            if (typeof oldest === "string") {
+              this.afterTurnReconcileFullReadStates.delete(oldest);
+            }
+          }
+          this.afterTurnReconcileFullReadStates.set(fullReadKey, sessionFileState);
+        };
+        const slowPathStartedAt = Date.now();
+
+        // Distinguish empty-file from read/parse error: stat the file and
+        // only treat it as "actually empty" when size is 0. A non-zero file
+        // returning empty `historicalMessages` indicates the parser hit an
+        // error (and `readLeafPathMessages` swallows those into `[]`); in
+        // that case we must NOT mark the bootstrap checkpoint as fully
+        // processed, otherwise future afterTurns will skip reconciliation
+        // and we lose messages.
         const historicalMessages = await readLeafPathMessages(params.sessionFile);
         if (historicalMessages.length === 0) {
-          return;
+          if (sessionFileState?.size === 0) {
+            // File is genuinely empty — refresh the checkpoint so the next
+            // afterTurn takes the incremental path.
+            await this.refreshBootstrapState({
+              conversationId: conversation.conversationId,
+              sessionFile: params.sessionFile,
+            });
+            rememberSlowReadState();
+          } else {
+            this.deps.log.warn(
+              `[lcm] afterTurn: transcript reconcile slow path read empty messages from non-empty file (${sessionFileState?.size ?? "?"} bytes) — skipping checkpoint refresh to avoid dropping messages on parser failure conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+            );
+          }
+          return { importedMessages: 0, blockedByImportCap: false };
         }
         const reconcile = await this.reconcileSessionTail({
           sessionId: params.sessionId,
@@ -4772,7 +4905,7 @@ export class LcmContextEngine implements ContextEngine {
           historicalMessages,
         });
         if (reconcile.blockedByImportCap) {
-          return;
+          return { importedMessages: 0, blockedByImportCap: true };
         }
         if (reconcile.importedMessages > 0) {
           this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
@@ -4782,12 +4915,19 @@ export class LcmContextEngine implements ContextEngine {
             "reconciled missing session messages",
           );
         }
-        if (reconcile.importedMessages > 0) {
-          await this.refreshBootstrapState({
-            conversationId: conversation.conversationId,
-            sessionFile: params.sessionFile,
-          });
-        }
+        // Always refresh the checkpoint after a slow-path read, even when no
+        // messages were imported. This pins the offset to the new sessionFile
+        // so the next afterTurn takes the incremental path instead of paying
+        // for another full re-read on every turn.
+        await this.refreshBootstrapState({
+          conversationId: conversation.conversationId,
+          sessionFile: params.sessionFile,
+        });
+        rememberSlowReadState();
+        this.deps.log.warn(
+          `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${reconcile.importedMessages} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
+        );
+        return { importedMessages: reconcile.importedMessages, blockedByImportCap: false };
       },
       {
         operationName: "afterTurnTranscriptReconcile",
@@ -5278,6 +5418,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string,
     sessionKey: string | undefined,
     batch: AgentMessage[],
+    options?: { oversizedNoOverlap?: "ingest" | "skip" },
   ): Promise<AgentMessage[]> {
     if (batch.length === 0) return batch;
 
@@ -5306,6 +5447,7 @@ export class LcmContextEngine implements ContextEngine {
         storedBatch,
         storedMessageCount,
         lastDbMessage,
+        options,
       );
     }
 
@@ -5360,6 +5502,7 @@ export class LcmContextEngine implements ContextEngine {
     storedBatch: ReturnType<typeof toStoredMessage>[],
     storedMessageCount: number,
     lastDbMessage: { role: string; content: string },
+    options?: { oversizedNoOverlap?: "ingest" | "skip" },
   ): Promise<AgentMessage[]> {
     const lastBatchIdentity = messageIdentity(
       storedBatch[storedBatch.length - 1]!.role,
@@ -5407,7 +5550,7 @@ export class LcmContextEngine implements ContextEngine {
       storedBatch,
       storedMessageCount,
       "oversized",
-      { onNoOverlap: "skip" },
+      { onNoOverlap: options?.oversizedNoOverlap ?? "skip" },
     );
   }
 
@@ -6095,8 +6238,9 @@ export class LcmContextEngine implements ContextEngine {
     const newMessages = filterPersistableMessages(
       params.messages.slice(params.prePromptMessageCount),
     );
+    let transcriptReconcileResult = { importedMessages: 0, blockedByImportCap: false };
     try {
-      await this.reconcileTranscriptTailForAfterTurn({
+      transcriptReconcileResult = await this.reconcileTranscriptTailForAfterTurn({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         sessionFile: params.sessionFile,
@@ -6110,6 +6254,9 @@ export class LcmContextEngine implements ContextEngine {
       params.sessionId,
       params.sessionKey,
       newMessages,
+      {
+        oversizedNoOverlap: transcriptReconcileResult.importedMessages > 0 ? "ingest" : "skip",
+      },
     );
     const summaryCoveredMessages: AgentMessage[] = [];
     const summaryDedupedNewMessages: AgentMessage[] = [];
@@ -6376,17 +6523,28 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
         });
-        if (compactionTelemetry?.provider || compactionTelemetry?.model) {
-          deferredCompactionDrain = {
-            tokenBudget,
-            currentTokenCount: observedCurrentTokenCount,
-            reason: deferredReason,
-          };
-        } else {
-          this.deps.log.info(
-            `[lcm] background deferred compaction not scheduled conversation=${conversation.conversationId} ${sessionLabel} reason=cache-context-unknown debtReason=${deferredReason}`,
-          );
+        // CLI-backend sessions (#472) never observe provider/model telemetry,
+        // so the previous gate skipped scheduling and accumulated debt
+        // forever. Schedule the drain unconditionally and let the inner
+        // cache-aware gate (`shouldDelayPromptMutatingDeferredCompaction`)
+        // decide whether prompt mutation is actually safe — that gate is
+        // robust to missing telemetry.
+        if (!compactionTelemetry?.provider && !compactionTelemetry?.model) {
+          // Dedupe the visibility log to once per conversation per process —
+          // long-running CLI-backend sessions otherwise emit this line on
+          // every afterTurn that records deferred debt.
+          if (!this.cacheContextUnknownLogged.has(conversation.conversationId)) {
+            this.cacheContextUnknownLogged.add(conversation.conversationId);
+            this.deps.log.info(
+              `[lcm] background deferred compaction scheduled without cache context conversation=${conversation.conversationId} ${sessionLabel} reason=cache-context-unknown debtReason=${deferredReason}`,
+            );
+          }
         }
+        deferredCompactionDrain = {
+          tokenBudget,
+          currentTokenCount: observedCurrentTokenCount,
+          reason: deferredReason,
+        };
       }
     } catch (err) {
       this.deps.log.warn(
