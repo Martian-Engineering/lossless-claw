@@ -100,6 +100,14 @@ export type ParseAgentSessionKeyFn = (sessionKey: string) => {
 
 export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 
+export type StartupSessionFileCandidate = {
+  sessionId: string;
+  sessionKey: string;
+  sessionFile: string;
+  agentId?: string;
+  storePath?: string;
+};
+
 /**
  * Dependencies injected into the LCM engine at registration time.
  * These replace all direct imports from OpenClaw core.
@@ -162,6 +170,9 @@ export interface LcmDependencies {
     sessionId: string;
     sessionKey?: string;
   }) => Promise<string | undefined>;
+
+  /** List OpenClaw-indexed session files that startup recovery may enumerate. */
+  listStartupSessionFileCandidates?: () => Promise<StartupSessionFileCandidate[]>;
 
   /** Agent lane constant for subagents */
   agentLaneSubagent: string;
