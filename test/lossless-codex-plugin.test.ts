@@ -341,34 +341,73 @@ describe("Lossless Codex full memory plugin", () => {
         },
       ].map((line) => JSON.stringify(line)).join("\n") + "\n",
     );
+    const thirdRolloutPath = join(
+      fixture.sourceDir,
+      "sessions",
+      "2026",
+      "05",
+      "04",
+      "rollout-2026-05-04T03-00-00-019ssh-api-thread.jsonl",
+    );
+    writeFileSync(
+      thirdRolloutPath,
+      [
+        {
+          timestamp: "2026-05-03T20:00:00.000Z",
+          type: "session_meta",
+          payload: {
+            id: "019ssh-api-thread",
+            cwd: "/tmp/api",
+            git_origin_url: "ssh://git@gitlab.com/bar/api.git",
+          },
+        },
+      ].map((line) => JSON.stringify(line)).join("\n") + "\n",
+    );
     const stateDb = new DatabaseSync(fixture.stateDbPath);
     try {
-      stateDb
-        .prepare(
-          `INSERT INTO threads (
+      const insertThread = stateDb.prepare(
+        `INSERT INTO threads (
             id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
             sandbox_policy, approval_mode, git_branch, git_origin_url, model, reasoning_effort,
             created_at_ms, updated_at_ms
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          "019other-api-thread",
-          secondRolloutPath,
-          1777834800,
-          1777834800,
-          "vscode",
-          "openai",
-          "/tmp/api",
-          "Other API work",
-          "danger-full-access",
-          "never",
-          "main",
-          "https://github.com/other/api.git",
-          "gpt-5.5",
-          "high",
-          1777834800000,
-          1777834800000,
-        );
+      );
+      insertThread.run(
+        "019other-api-thread",
+        secondRolloutPath,
+        1777834800,
+        1777834800,
+        "vscode",
+        "openai",
+        "/tmp/api",
+        "Other API work",
+        "danger-full-access",
+        "never",
+        "main",
+        "https://github.com/other/api.git",
+        "gpt-5.5",
+        "high",
+        1777834800000,
+        1777834800000,
+      );
+      insertThread.run(
+        "019ssh-api-thread",
+        thirdRolloutPath,
+        1777838400,
+        1777838400,
+        "vscode",
+        "openai",
+        "/tmp/api",
+        "SSH API work",
+        "danger-full-access",
+        "never",
+        "main",
+        "ssh://git@gitlab.com/bar/api.git",
+        "gpt-5.5",
+        "high",
+        1777838400000,
+        1777838400000,
+      );
     } finally {
       stateDb.close();
     }
@@ -389,6 +428,7 @@ describe("Lossless Codex full memory plugin", () => {
       expect(keys).toEqual([
         "github.com/martian-engineering/lossless-claw",
         "github.com/other/api",
+        "gitlab.com/bar/api",
       ]);
     } finally {
       db.close();
@@ -715,7 +755,7 @@ describe("Lossless Codex full memory plugin", () => {
 
     const original = readFileSync(fixture.rolloutPath, "utf8");
     const originalStat = statSync(fixture.rolloutPath);
-    const replacement = original.replace("task_complete", "task_failed__");
+    const replacement = original.replace("custom_tool_call", "custom_tool_ping");
     expect(Buffer.byteLength(replacement)).toBe(Buffer.byteLength(original));
     writeFileSync(fixture.rolloutPath, replacement);
     utimesSync(fixture.rolloutPath, originalStat.atime, originalStat.mtime);
@@ -728,6 +768,61 @@ describe("Lossless Codex full memory plugin", () => {
     });
 
     expect(result.importedEvents).toBe(1);
+  });
+
+  it("keeps repeated provider call IDs separate per thread", async () => {
+    const fixture = createCodexFixture();
+    tempDirs.add(fixture.tempDir);
+    const plugin = await loadPlugin();
+    const archivedDir = join(fixture.sourceDir, "archived_sessions");
+    mkdirSync(archivedDir, { recursive: true });
+    const archivedPath = join(archivedDir, "rollout-2026-05-04T04-00-00-019same-call-thread.jsonl");
+    writeFileSync(
+      archivedPath,
+      [
+        {
+          timestamp: "2026-05-03T21:00:00.000Z",
+          type: "session_meta",
+          payload: {
+            id: "019same-call-thread",
+            cwd: "/Volumes/LEXAR/Codex/worktrees/lossless-codex-full-memory",
+            git_origin_url: "https://github.com/Martian-Engineering/lossless-claw.git",
+          },
+        },
+        {
+          timestamp: "2026-05-03T21:01:00.000Z",
+          type: "response_item",
+          payload: {
+            type: "custom_tool_call",
+            call_id: "call_patch",
+            name: "apply_patch",
+            status: "completed",
+          },
+        },
+      ].map((line) => JSON.stringify(line)).join("\n") + "\n",
+    );
+
+    await plugin.importCodexArtifacts({
+      dbPath: fixture.sidecarDbPath,
+      sourceDir: fixture.sourceDir,
+      stateDbPath: fixture.stateDbPath,
+      allowWrite: true,
+    });
+
+    const db = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: true });
+    try {
+      const rows = db
+        .prepare("SELECT call_id, thread_id FROM codex_tool_calls ORDER BY thread_id")
+        .all() as Array<{ call_id: string; thread_id: string }>;
+      expect(rows).toHaveLength(2);
+      expect(new Set(rows.map((row) => row.call_id)).size).toBe(2);
+      expect(rows.map((row) => row.thread_id)).toEqual([
+        "019lossless-codex-thread",
+        "019same-call-thread",
+      ]);
+    } finally {
+      db.close();
+    }
   });
 
   it("searches, describes, and reports worklogs from imported coding memory", async () => {
@@ -791,9 +886,52 @@ describe("Lossless Codex full memory plugin", () => {
     expect(describeFile.structuredContent?.type).toBe("file");
     expect(JSON.stringify(describeFile.structuredContent)).toContain("src/lossless-codex/example.ts");
 
+    const sidecarDb = plugin.openSidecarDatabase(fixture.sidecarDbPath, { readOnly: false });
+    try {
+      sidecarDb
+        .prepare(
+          `INSERT INTO codex_summaries (
+            summary_id, thread_id, project_id, kind, depth, content, token_count,
+            source_hash, created_at
+          )
+          SELECT ?, thread_id, project_id, 'thread', 0, ?, ?, ?, datetime('now')
+          FROM codex_threads
+          WHERE thread_id = ?`,
+        )
+        .run(
+          "csum_huge",
+          `huge-summary ${"x".repeat(1_000_000)}`,
+          250_000,
+          "huge-hash",
+          "019lossless-codex-thread",
+        );
+    } finally {
+      sidecarDb.close();
+    }
+
+    const hugeSearch = await plugin.callTool(
+      "lossless_codex_search",
+      { query: "huge-summary", includeSummaries: true, limit: 5 },
+      { dbPath: fixture.sidecarDbPath },
+    );
+    const hugeRow = (hugeSearch.structuredContent?.results as Array<{ text: string; text_truncated: boolean }>).find(
+      (row) => row.text.includes("huge-summary"),
+    );
+    expect(hugeRow?.text.length).toBeLessThanOrEqual(2_020);
+    expect(hugeRow?.text_truncated).toBe(true);
+
+    const hugeDescribe = await plugin.callTool(
+      "lossless_codex_describe",
+      { id: "lossless-codex://summary/csum_huge", maxChars: 1500 },
+      { dbPath: fixture.sidecarDbPath },
+    );
+    const hugeSummary = hugeDescribe.structuredContent?.summary as { content: string; content_truncated: boolean };
+    expect(hugeSummary.content.length).toBeLessThanOrEqual(1_520);
+    expect(hugeSummary.content_truncated).toBe(true);
+
     const describeProjectDay = await plugin.callTool(
       "lossless_codex_describe",
-      { id: `lossless-codex://project-day/${fixtureProjectKey}/2026-05-03` },
+      { id: `lossless-codex://project-day/${encodeURIComponent(fixtureProjectKey)}/2026-05-03/UTC` },
       { dbPath: fixture.sidecarDbPath },
     );
     expect(describeProjectDay.structuredContent?.type).toBe("project-day");
@@ -933,6 +1071,7 @@ describe("Lossless Codex full memory plugin", () => {
     });
 
     child.stdin.write(encodeMcp({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+    child.stdin.write(encodeMcp({ jsonrpc: "2.0", method: "notifications/initialized" }));
     child.stdin.write(
       encodeMcp({
         jsonrpc: "2.0",
@@ -966,6 +1105,7 @@ describe("Lossless Codex full memory plugin", () => {
 
     const messages = decodeMcp(stdout);
     expect(messages.map((message) => message.id)).toEqual([1, 2]);
+    expect(messages.some((message) => message.id == null)).toBe(false);
     expect(JSON.stringify(messages[0])).toContain("lossless_codex_worklog");
     expect(JSON.stringify(messages[1])).toContain("src/lossless-codex/example.ts");
   });

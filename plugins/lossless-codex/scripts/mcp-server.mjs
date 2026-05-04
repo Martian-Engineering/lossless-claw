@@ -11,6 +11,9 @@ const SERVER_VERSION = "0.1.0";
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const DEFAULT_TIMEZONE = "UTC";
+const MAX_SEARCH_TEXT_CHARS = 2_000;
+const DEFAULT_DESCRIBE_CHARS = 24_000;
+const MAX_DESCRIBE_CHARS = 120_000;
 
 function sha(value) {
   return createHash("sha256").update(String(value)).digest("hex");
@@ -68,6 +71,25 @@ function likeAllTerms(column, terms) {
     sql: terms.map(() => `${column} LIKE ? ESCAPE '\\'`).join(" AND "),
     args: terms.map((term) => `%${escapeLike(term)}%`),
   };
+}
+
+function truncateChars(text, maxChars) {
+  const value = String(text ?? "");
+  if (value.length <= maxChars) return { text: value, truncated: false, originalLength: value.length };
+  return {
+    text: `${value.slice(0, Math.max(0, maxChars - 32)).trimEnd()}\n...(truncated)`,
+    truncated: true,
+    originalLength: value.length,
+  };
+}
+
+function boundTextRow(row, field, maxChars = MAX_SEARCH_TEXT_CHARS) {
+  const bounded = { ...row };
+  const truncated = truncateChars(bounded[field], maxChars);
+  bounded[field] = truncated.text;
+  bounded[`${field}_truncated`] = truncated.truncated;
+  bounded[`${field}_original_length`] = truncated.originalLength;
+  return bounded;
 }
 
 function normalizeDate(value) {
@@ -455,13 +477,14 @@ function columnExists(db, tableName, columnName) {
 
 function projectKeyFromThread(row) {
   const origin = String(row.git_origin_url ?? "");
-  const originMatch = /^(?:https?:\/\/|git@)?([^/:]+)[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(origin);
+  const originMatch = /^(?:(?:https?:\/\/|ssh:\/\/git@|git@)?)([^/:]+)[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(origin);
   const fromOrigin = originMatch
     ? `${originMatch[1]}/${originMatch[2]}/${originMatch[3]}`
     : origin.split("/").pop()?.replace(/\.git$/, "");
   const cwd = String(row.cwd ?? "");
   const fromCwd = cwd.split(/[\\/]/).filter(Boolean).pop();
-  return (fromOrigin || fromCwd || "codex-project").toLowerCase();
+  const cwdHashSuffix = cwd ? `-${sha(cwd).slice(0, 8)}` : "";
+  return (fromOrigin || (fromCwd ? `${fromCwd}${cwdHashSuffix}` : "codex-project")).toLowerCase();
 }
 
 function sourceFileId(path, generation = 1) {
@@ -645,11 +668,9 @@ function ensureSourceFile(db, kind, path) {
   return { sourceId, generation, kind, path, ...stat };
 }
 
-function lastNonEmptyLineHash(path) {
+function sourceContentHash(path) {
   try {
-    const lines = readFileSync(path, "utf8").trimEnd().split("\n");
-    const lastLine = [...lines].reverse().find((line) => line.trim().length > 0);
-    return lastLine ? sha(lastLine) : null;
+    return sha(readFileSync(path, "utf8"));
   } catch {
     return null;
   }
@@ -667,7 +688,7 @@ function sourceWatermarkCurrent(db, source, kind) {
   if (Number(row.last_size) !== Number(source.size)) return false;
   if (Number(row.last_mtime_ms) !== Number(source.mtimeMs)) return false;
   if (source.kind === "session_jsonl" || source.kind === "archived_jsonl" || kind === "events") {
-    return String(row.last_event_hash ?? "") === String(lastNonEmptyLineHash(source.path) ?? "");
+    return String(row.last_event_hash ?? "") === String(sourceContentHash(source.path) ?? "");
   }
   return true;
 }
@@ -703,7 +724,7 @@ function markSourceWatermark(db, source, rows = []) {
     source.mtimeMs,
     lastRow?.offset ?? 0,
     lastRow?.lineNo ?? 0,
-    lastRow?.raw ? sha(lastRow.raw) : null,
+    sourceContentHash(source.path) ?? (lastRow?.raw ? sha(lastRow.raw) : null),
     nowIso(),
   );
 }
@@ -847,8 +868,9 @@ function insertEvent(db, threadId, turnId, sourceId, sourcePath, row) {
 }
 
 function upsertToolCall(db, threadId, turnId, eventId, payload, rawRef) {
-  const callId = payload.call_id;
-  if (!callId) return;
+  const providerCallId = payload.call_id;
+  if (!providerCallId) return;
+  const callId = id("ctool", `${threadId}:${providerCallId}`);
   const payloadType = String(payload.type ?? "");
   const isOutput = payloadType.endsWith("_output") || payloadType.endsWith("_end");
   const toolName = payload.name ? String(payload.name) : null;
@@ -1069,6 +1091,7 @@ function rebuildProjectDayRollups(db, timezone = DEFAULT_TIMEZONE) {
     const threadCount = threadIds.length;
     const filesTouched = row.fileIds.size;
     const threadRefs = threadIds.slice(0, 20).map((threadId) => `lossless-codex://thread/${threadId}`);
+    const projectDayRef = `lossless-codex://project-day/${encodeURIComponent(row.project_key)}/${row.period_key}/${encodeURIComponent(normalizedTimezone)}`;
     const payload = {
       projectsWorked: [
         {
@@ -1083,7 +1106,7 @@ function rebuildProjectDayRollups(db, timezone = DEFAULT_TIMEZONE) {
             openQuestions: row.observations.openQuestions,
           },
           sidecarRefs: [
-            `lossless-codex://project-day/${row.project_key}/${row.period_key}`,
+            projectDayRef,
             ...threadRefs,
           ],
         },
@@ -1110,7 +1133,7 @@ function rebuildProjectDayRollups(db, timezone = DEFAULT_TIMEZONE) {
       normalizedTimezone,
       summary,
       JSON.stringify(payload),
-      `lossless-codex://project-day/${row.project_key}/${row.period_key}`,
+      projectDayRef,
       nowIso(),
       nowIso(),
     );
@@ -1158,7 +1181,7 @@ function importThreadJsonl(db, params) {
           threadId: thread.id,
           turnId: currentTurnId,
           projectId: project.projectId,
-          callId: payload.call_id ? String(payload.call_id) : null,
+          callId: payload.call_id ? id("ctool", `${thread.id}:${payload.call_id}`) : null,
           eventId: event.eventId,
           sourceDir,
           filePath,
@@ -1624,7 +1647,7 @@ function toolSearch(args, options) {
         : [];
     const rows = [...primaryRows, ...summaryRows]
       .slice(0, limit)
-      .map(({ rank: _rank, ...row }) => row);
+      .map(({ rank: _rank, ...row }) => boundTextRow(row, "text"));
     return jsonTextResult({
       tool: "lossless_codex_search",
       query,
@@ -1664,7 +1687,9 @@ function toolDescribe(args, options) {
       ? rawId.slice("lossless-codex://".length).split("/")
       : ["thread", rawId];
     const [kind, ...valueParts] = parts;
-    const value = valueParts.join("/");
+    const decodedParts = valueParts.map((part) => decodeURIComponent(part));
+    const value = decodedParts.join("/");
+    const maxChars = clampInt(args.maxChars, DEFAULT_DESCRIBE_CHARS, 1_000, MAX_DESCRIBE_CHARS);
     if (kind === "thread") {
       const thread = db.prepare(
         `SELECT t.*, p.project_key
@@ -1675,7 +1700,10 @@ function toolDescribe(args, options) {
       if (!thread) throw new Error(`No Lossless Codex thread found for ${value}`);
       const files = db.prepare("SELECT * FROM codex_touched_files WHERE thread_id = ? ORDER BY path_display").all(value);
       const observations = db.prepare("SELECT * FROM codex_observations WHERE thread_id = ? ORDER BY created_at").all(value);
-      const summaries = db.prepare("SELECT summary_id, kind, content FROM codex_summaries WHERE thread_id = ?").all(value);
+      const summaries = db
+        .prepare("SELECT summary_id, kind, content FROM codex_summaries WHERE thread_id = ?")
+        .all(value)
+        .map((row) => boundTextRow(row, "content", maxChars));
       return jsonTextResult({
         tool: "lossless_codex_describe",
         type: "thread",
@@ -1692,7 +1720,11 @@ function toolDescribe(args, options) {
     if (kind === "summary") {
       const summary = db.prepare("SELECT * FROM codex_summaries WHERE summary_id = ?").get(value);
       if (!summary) throw new Error(`No Lossless Codex summary found for ${value}`);
-      return jsonTextResult({ tool: "lossless_codex_describe", type: "summary", summary });
+      return jsonTextResult({
+        tool: "lossless_codex_describe",
+        type: "summary",
+        summary: boundTextRow(summary, "content", maxChars),
+      });
     }
     if (kind === "observation") {
       const observation = db.prepare("SELECT * FROM codex_observations WHERE observation_id = ?").get(value);
@@ -1728,19 +1760,28 @@ function toolDescribe(args, options) {
       });
     }
     if (kind === "project-day") {
-      const periodKey = valueParts.at(-1);
-      const projectKey = valueParts.slice(0, -1).join("/");
+      const timezone = decodedParts.length >= 3 ? decodedParts.at(-1) : undefined;
+      const periodKey = decodedParts.length >= 3 ? decodedParts.at(-2) : decodedParts.at(-1);
+      const projectKey = decodedParts.length >= 3
+        ? decodedParts.slice(0, -2).join("/")
+        : decodedParts.slice(0, -1).join("/");
       if (!projectKey || !periodKey) throw new Error(`Invalid project-day ref: ${rawId}`);
+      const where = ["project_key = ?", "period_key = ?"];
+      const queryArgs = [projectKey, periodKey];
+      if (timezone) {
+        where.push("timezone = ?");
+        queryArgs.push(normalizeTimezone(timezone));
+      }
       const rollup = db
         .prepare(
           `SELECT rollup_id, project_key, period_key, timezone, summary, payload_json,
                   coverage_status, source_ref, updated_at
            FROM codex_project_day_rollups
-           WHERE project_key = ? AND period_key = ?
+           WHERE ${where.join(" AND ")}
            ORDER BY updated_at DESC
            LIMIT 1`,
         )
-        .get(projectKey, periodKey);
+        .get(...queryArgs);
       if (!rollup) throw new Error(`No Lossless Codex project-day rollup found for ${projectKey}/${periodKey}`);
       return jsonTextResult({
         tool: "lossless_codex_describe",
@@ -1856,6 +1897,7 @@ function extractMessagesFromBuffer(buffer) {
 
 async function handleMcpMessage(message) {
   const id = message.id;
+  if (id == null) return undefined;
   try {
     if (message.method === "initialize") {
       return { jsonrpc: "2.0", id, result: { protocolVersion: "2024-11-05", serverInfo: { name: SERVER_NAME, version: SERVER_VERSION }, capabilities: { tools: {} } } };
@@ -1887,7 +1929,8 @@ async function main() {
     const decoded = extractMessagesFromBuffer(buffer);
     buffer = decoded.rest;
     for (const message of decoded.messages) {
-      process.stdout.write(encodeMessage(await handleMcpMessage(message)));
+      const response = await handleMcpMessage(message);
+      if (response) process.stdout.write(encodeMessage(response));
     }
   };
   process.stdin.on("data", (chunk) => {
