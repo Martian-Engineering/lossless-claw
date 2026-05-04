@@ -465,6 +465,44 @@ describe("Codex LCM Reader plugin", () => {
     expect(result.structuredContent?.sort).toBe("recency");
   });
 
+  it("downgrades relevance sort when summaries FTS lacks searchable content", async () => {
+    const fixture = await createLcmFixture();
+    tempDirs.add(fixture.tempDir);
+    const db = createLcmDatabaseConnection(fixture.dbPath);
+    db.exec("DROP TABLE IF EXISTS summaries_fts");
+    db.exec("CREATE VIRTUAL TABLE summaries_fts USING fts5(summary_id UNINDEXED)");
+    db.prepare("INSERT INTO summaries_fts(rowid, summary_id) VALUES (?, ?)").run(1, "sum_codex_reader_child");
+    closeLcmConnection(fixture.dbPath);
+    const plugin = await loadPlugin();
+
+    const result = await plugin.callTool(
+      "lcm_grep",
+      {
+        pattern: "Lexar",
+        mode: "full_text",
+        scope: "summaries",
+        sort: "relevance",
+        limit: 10,
+      },
+      { dbPath: fixture.dbPath },
+    );
+
+    expect(result.structuredContent?.count).toBeGreaterThan(0);
+    expect(result.structuredContent?.requestedSort).toBe("relevance");
+    expect(result.structuredContent?.sort).toBe("recency");
+  });
+
+  it("exposes supported MCP tool parameters in schemas", async () => {
+    const plugin = await loadPlugin();
+    const grepTool = plugin.createTools().find((tool: { name: string }) => tool.name === "lcm_grep");
+    expect(grepTool?.inputSchema.properties).toHaveProperty("caseSensitive");
+    const expandTool = plugin.createTools().find((tool: { name: string }) => tool.name === "lcm_expand");
+    expect(expandTool?.inputSchema.properties).toHaveProperty("conversationId");
+    const expandQueryTool = plugin.createTools().find((tool: { name: string }) => tool.name === "lcm_expand_query");
+    expect(expandQueryTool?.inputSchema.properties).toHaveProperty("mode");
+    expect(expandQueryTool?.inputSchema.properties).toHaveProperty("maxDepth");
+  });
+
   it("reports recency as the effective sort when regex cannot rank relevance", async () => {
     const fixture = await createLcmFixture();
     tempDirs.add(fixture.tempDir);
