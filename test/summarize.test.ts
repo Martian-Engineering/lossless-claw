@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createLcmSummarizeFromLegacyParams,
   LcmProviderAuthError,
+  LcmRuntimeLlmPolicyError,
   type LcmSummarizeFn,
 } from "../src/summarize.js";
 import type { LcmDependencies } from "../src/types.js";
@@ -458,7 +459,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(requestOptions.reasoning).toBeUndefined();
   });
 
-  it("passes resolved API key to completion calls", async () => {
+  it("does not resolve direct API keys before completion calls", async () => {
     const deps = makeDeps({
       getApiKey: vi.fn(async () => "resolved-api-key"),
     });
@@ -474,10 +475,11 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     await summarize!("Summary input");
 
     const completeMock = vi.mocked(deps.complete);
-    expect(completeMock.mock.calls[0]?.[0]?.apiKey).toBe("resolved-api-key");
+    expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
+    expect(completeMock.mock.calls[0]?.[0]?.apiKey).toBeUndefined();
   });
 
-  it("passes authProfileId through to getApiKey", async () => {
+  it("does not pass authProfileId through a direct credential path", async () => {
     const deps = makeDeps({
       getApiKey: vi.fn(() => "resolved-api-key"),
     });
@@ -493,9 +495,8 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     await summarize!("Summary input");
 
-    expect(vi.mocked(deps.getApiKey)).toHaveBeenCalledWith("anthropic", "claude-opus-4-5", {
-      profileId: "profile-123",
-    });
+    expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
+    expect(vi.mocked(deps.complete).mock.calls[0]?.[0]?.authProfileId).toBeUndefined();
   });
 
   it("does not inherit runtime authProfileId when plugin summary provider/model are explicit", async () => {
@@ -532,15 +533,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     await summarize!("Summary input");
 
     expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("k2p5", "kimi-coding");
-
-    const getApiKeyOptions = vi.mocked(deps.getApiKey).mock.calls[0]?.[2];
-    expect(getApiKeyOptions?.runtimeConfig).toBe(runtimeConfig);
-    expect(getApiKeyOptions?.profileId).toBeUndefined();
+    expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
 
     const completeArgs = vi.mocked(deps.complete).mock.calls[0]?.[0];
     expect(completeArgs?.provider).toBe("kimi-coding");
     expect(completeArgs?.model).toBe("k2p5");
     expect(completeArgs?.authProfileId).toBeUndefined();
+    expect(completeArgs?.runtimeConfig).toBe(runtimeConfig);
   });
 
   it("falls back deterministically when model returns empty summary output after retry", async () => {
@@ -778,13 +777,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       await expect(result!.fn("A".repeat(8_000), false)).rejects.toBeInstanceOf(
         LcmProviderAuthError,
       );
-      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("provider auth error (401 / missing model.request scope)");
       expect(diagnostics).toContain("Check that the configured summaryProvider has valid API credentials.");
       expect(diagnostics).toContain("Current: openai-codex/gpt-5.4");
-      expect(diagnostics).toContain("summarizer auth retry");
+      expect(diagnostics).not.toContain("summarizer auth retry");
       expect(diagnostics).not.toContain("retrying with conservative settings");
       expect(diagnostics).not.toContain("falling back to truncation");
     });
@@ -823,7 +822,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(diagnostics).toContain("ALL PROVIDERS EXHAUSTED");
   });
 
-    it("preserves first-pass credential resolution but skips direct-credential retry for runtime-managed auth providers", async () => {
+    it("skips direct credential lookup for runtime-managed auth providers", async () => {
       const deps = makeDeps({
         config: { summaryTimeoutMs: 60_000 },
         resolveModel: vi.fn(() => ({
@@ -850,19 +849,14 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       await expect(result!.fn("R".repeat(8_000), false)).rejects.toBeInstanceOf(
         LcmProviderAuthError,
       );
-      expect(vi.mocked(deps.getApiKey)).toHaveBeenCalledTimes(1);
-      expect(vi.mocked(deps.getApiKey)).toHaveBeenCalledWith("openai-codex", "gpt-5.4", {
-        profileId: undefined,
-        agentDir: undefined,
-        runtimeConfig: undefined,
-      });
+      expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).not.toContain("summarizer auth retry");
     });
 
-    it("retries custom providers without runtime.modelAuth when scope auth failures occur", async () => {
+    it("surfaces custom provider auth failures without direct-credential retry", async () => {
       const deps = makeDeps({
         resolveModel: vi.fn(() => ({
           provider: "codex-gateway",
@@ -877,9 +871,6 @@ describe("createLcmSummarizeFromLegacyParams", () => {
               message: "Missing required scope: model.request",
             },
           })
-          .mockResolvedValueOnce({
-            content: [{ type: "text", text: "summary from direct credentials" }],
-          }),
       });
 
       const result = await createLcmSummarizeFromLegacyParams({
@@ -887,21 +878,15 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         legacyParams: { provider: "codex-gateway", model: "gpt-5.4" },
       });
 
-      await expect(result!.fn("B".repeat(8_000), false)).resolves.toBe(
-        "summary from direct credentials",
+      await expect(result!.fn("B".repeat(8_000), false)).rejects.toBeInstanceOf(
+        LcmProviderAuthError,
       );
-      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
-      expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
-        provider: "codex-gateway",
-        model: "gpt-5.4",
-        skipModelAuth: true,
-      });
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("provider auth error (401 / missing model.request scope)");
       expect(diagnostics).toContain("Current: codex-gateway/gpt-5.4");
-      expect(diagnostics).toContain("summarizer auth retry");
-      expect(diagnostics).toContain("summarizer auth retry succeeded");
+      expect(diagnostics).not.toContain("summarizer auth retry");
       expect(diagnostics).not.toContain("retrying with conservative settings");
     });
 
@@ -930,12 +915,12 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       await expect(result!.fn("B".repeat(8_000), false)).rejects.toBeInstanceOf(
         LcmProviderAuthError,
       );
-      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("provider auth error (401 / missing model.request scope)");
       expect(diagnostics).toContain("Current: openai-codex/gpt-5.4");
-      expect(diagnostics).toContain("summarizer auth retry");
+      expect(diagnostics).not.toContain("summarizer auth retry");
       expect(diagnostics).not.toContain("summarizer call failed");
       expect(diagnostics).not.toContain("retrying with conservative settings");
     });
@@ -963,7 +948,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       await expect(result!.fn("C".repeat(8_000), false)).rejects.toBeInstanceOf(
         LcmProviderAuthError,
       );
-      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("provider auth error (401 / missing model.request scope)");
@@ -1049,16 +1034,12 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       const summary = await summarize!("A".repeat(8_000), false);
 
       expect(summary).toBe("Recovered summary from fallback model.");
-      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(3);
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
       expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
         provider: "openai-codex",
         model: "gpt-5.4",
       });
       expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
-        provider: "openai-codex",
-        model: "gpt-5.4",
-      });
-      expect(vi.mocked(deps.complete).mock.calls[2]?.[0]).toMatchObject({
         provider: "anthropic",
         model: "claude-sonnet-4-6",
       });
@@ -1216,7 +1197,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(diagnostics).not.toContain("falling back to truncation");
     });
 
-    it("retries the same model with direct credentials before falling back to another provider", async () => {
+    it("falls back to the next provider instead of retrying with direct credentials", async () => {
       const deps = makeDeps({
           resolveModel: vi.fn((modelRef?: string, providerHint?: string) => {
             if (modelRef === "gpt-5.4") {
@@ -1227,15 +1208,9 @@ describe("createLcmSummarizeFromLegacyParams", () => {
             }
             throw new Error(`unexpected modelRef: ${String(modelRef)}`);
           }),
-          getApiKey: vi.fn(
-            async (
-              _provider: string,
-              _model: string,
-              options?: { skipModelAuth?: boolean },
-            ) => (options?.skipModelAuth ? "direct-key" : "scoped-token"),
-          ),
-          complete: vi.fn(async ({ provider, apiKey }: { provider?: string; apiKey?: string }) => {
-            if (provider === "openai-codex" && apiKey === "scoped-token") {
+          getApiKey: vi.fn(async () => "should-not-be-used"),
+          complete: vi.fn(async ({ provider }: { provider?: string }) => {
+            if (provider === "openai-codex") {
               return {
                 content: [],
                 error: {
@@ -1245,13 +1220,8 @@ describe("createLcmSummarizeFromLegacyParams", () => {
                 },
               };
             }
-            if (provider === "openai-codex" && apiKey === "direct-key") {
-              return {
-                content: [{ type: "text", text: "Recovered summary from direct credentials." }],
-              };
-            }
             return {
-              content: [{ type: "text", text: "Should not hit provider fallback." }],
+              content: [{ type: "text", text: "Recovered summary from provider fallback." }],
             };
           }),
         });
@@ -1283,67 +1253,82 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
       const summary = await summarize!("A".repeat(8_000), false);
 
-      expect(summary).toBe("Recovered summary from direct credentials.");
-      expect(vi.mocked(deps.getApiKey)).toHaveBeenNthCalledWith(1, "openai-codex", "gpt-5.4", {
-        profileId: undefined,
-        agentDir: undefined,
-        runtimeConfig: {
-          plugins: {
-            entries: {
-              "lossless-claw": {
-                config: {
-                  summaryProvider: "openai-codex",
-                  summaryModel: "gpt-5.4",
-                },
-              },
-            },
-          },
-          agents: {
-            defaults: {
-              model: "anthropic/claude-sonnet-4-6",
-            },
-          },
-        },
-      });
-      expect(vi.mocked(deps.getApiKey)).toHaveBeenNthCalledWith(2, "openai-codex", "gpt-5.4", {
-        profileId: undefined,
-        agentDir: undefined,
-        runtimeConfig: {
-          plugins: {
-            entries: {
-              "lossless-claw": {
-                config: {
-                  summaryProvider: "openai-codex",
-                  summaryModel: "gpt-5.4",
-                },
-              },
-            },
-          },
-          agents: {
-            defaults: {
-              model: "anthropic/claude-sonnet-4-6",
-            },
-          },
-        },
-        skipModelAuth: true,
-      });
+      expect(summary).toBe("Recovered summary from provider fallback.");
+      expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
       expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
         provider: "openai-codex",
         model: "gpt-5.4",
-        apiKey: "scoped-token",
       });
       expect(vi.mocked(deps.complete).mock.calls[1]?.[0]).toMatchObject({
-        provider: "openai-codex",
-        model: "gpt-5.4",
-        apiKey: "direct-key",
-        skipModelAuth: true,
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
       });
 
       const diagnostics = getDepsLogText(deps);
-      expect(diagnostics).toContain("summarizer auth retry");
-      expect(diagnostics).toContain("without runtime.modelAuth credentials");
-      expect(diagnostics).not.toContain("retrying with anthropic/claude-sonnet-4-6");
+      expect(diagnostics).not.toContain("summarizer auth retry");
+      expect(diagnostics).toContain("trying anthropic/claude-sonnet-4-6");
+    });
+
+    it("fails closed when runtime LLM policy denies a configured summary model override", async () => {
+      const baseConfig = makeDeps().config;
+      const deps = makeDeps({
+        config: {
+          ...baseConfig,
+          fallbackProviders: [{ provider: "anthropic", model: "claude-sonnet-4-6" }],
+        },
+        resolveModel: vi.fn((modelRef?: string, providerHint?: string) => {
+          if (modelRef === "gpt-5.5") {
+            return { provider: providerHint ?? "openai-codex", model: "gpt-5.5" };
+          }
+          if (modelRef === "anthropic/claude-sonnet-4-6") {
+            return { provider: "anthropic", model: "claude-sonnet-4-6" };
+          }
+          throw new Error(`unexpected modelRef: ${String(modelRef)}`);
+        }),
+        complete: vi.fn(async () => ({
+          content: [],
+          error: {
+            kind: "runtime_llm_policy",
+            configField: "summaryModel",
+            modelRef: "openai-codex/gpt-5.5",
+            message:
+              "[lcm] OpenClaw denied the Lossless runtime LLM model override from plugins.entries.lossless-claw.config.summaryModel. Configure plugins.entries.lossless-claw.llm.allowedModels.",
+          },
+        })),
+      });
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: {
+          provider: "openai-codex",
+          model: "gpt-5.5",
+          config: {
+            plugins: {
+              entries: {
+                "lossless-claw": {
+                  config: {
+                    summaryProvider: "openai-codex",
+                    summaryModel: "gpt-5.5",
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      await expect(summarize!("A".repeat(8_000), false)).rejects.toBeInstanceOf(
+        LcmRuntimeLlmPolicyError,
+      );
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
+        runtimeModelOverride: {
+          configField: "summaryModel",
+          configPath: "plugins.entries.lossless-claw.config.summaryModel",
+          modelRef: "openai-codex/gpt-5.5",
+        },
+      });
     });
 
     it("retries with conservative settings when first attempt returns empty content array", async () => {

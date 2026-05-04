@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +17,7 @@ function buildApi(
   pluginConfig: unknown,
   options?: {
     includeModelAuth?: boolean;
+    includeRuntimeLlm?: boolean;
     agentDir?: string;
     runtimeConfig?: Record<string, unknown>;
   },
@@ -56,6 +57,20 @@ function buildApi(
         getSession: vi.fn(),
         deleteSession: vi.fn(),
       },
+      ...(options?.includeRuntimeLlm === false
+        ? {}
+        : {
+            llm: {
+              complete: vi.fn(async () => ({
+                text: "summary output",
+                provider: "anthropic",
+                model: "claude-sonnet-4-6",
+                agentId: "main",
+                usage: {},
+                audit: { caller: { kind: "plugin", id: "lossless-claw" } },
+              })),
+            },
+          }),
       ...(options?.includeModelAuth === false
         ? {}
         : {
@@ -540,6 +555,64 @@ describe("lcm plugin registration", () => {
     expect(sessionInfoLog).not.toHaveBeenCalled();
   });
 
+  it("warns when configured summary models need runtime LLM allowlist policy", () => {
+    const { api, warnLog } = buildApi({
+      enabled: true,
+      summaryModel: "openai-codex/gpt-5.5",
+    });
+    api.config = {
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              summaryModel: "openai-codex/gpt-5.5",
+            },
+          },
+        },
+      },
+    } as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(warnLog).toHaveBeenCalledWith(
+      expect.stringContaining("openclaw doctor --fix"),
+    );
+    expect(warnLog).toHaveBeenCalledWith(
+      expect.stringContaining("summaryModel=openai-codex/gpt-5.5"),
+    );
+    expect(warnLog).toHaveBeenCalledWith(
+      expect.stringContaining("plugins.entries.lossless-claw.llm.allowModelOverride"),
+    );
+  });
+
+  it("does not warn when configured summary models are allowlisted for runtime LLM", () => {
+    const { api, warnLog } = buildApi({
+      enabled: true,
+      summaryModel: "openai-codex/gpt-5.5",
+    });
+    api.config = {
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              summaryModel: "openai-codex/gpt-5.5",
+            },
+            llm: {
+              allowModelOverride: true,
+              allowedModels: ["openai-codex/gpt-5.5"],
+            },
+          },
+        },
+      },
+    } as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("Runtime LLM model override policy"),
+    );
+  });
+
   it("falls back to runtime plugin config for the startup banner when register runs before api.pluginConfig is populated", () => {
     const { api, infoLog } = buildApi(
       {},
@@ -692,68 +765,29 @@ describe("lcm plugin registration", () => {
       expect.not.arrayContaining([expect.stringContaining("[lcm] Migration successful")]),
     );
   });
-  it("registers without runtime.modelAuth on older OpenClaw runtimes", () => {
+  it("registers with a clear warning when runtime.llm is unavailable", () => {
     const { api, getFactory, warnLog } = buildApi(
       {
         enabled: true,
       },
-      { includeModelAuth: false },
+      { includeRuntimeLlm: false },
     );
     api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
 
     expect(() => lcmPlugin.register(api)).not.toThrow();
     expect(getFactory()).toBeTypeOf("function");
-    expect(warnLog).toHaveBeenCalledWith(expect.stringContaining("runtime.modelAuth is unavailable"));
-  });
-
-  it("prefers runtime.modelAuth over provider env keys when available", async () => {
-    vi.stubEnv("ANTHROPIC_API_KEY", "env-anthropic-key");
-
-    const { api, getFactory } = buildApi({
-      enabled: true,
-    });
-    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
-    const modelAuth = (
-      api.runtime as OpenClawPluginApi["runtime"] & {
-        modelAuth: {
-          getApiKeyForModel: ReturnType<typeof vi.fn>;
-        };
-      }
-    ).modelAuth;
-    modelAuth.getApiKeyForModel.mockResolvedValue({
-      apiKey: "model-auth-key",
-    });
-
-    lcmPlugin.register(api);
-
-    const factory = getFactory();
-    expect(factory).toBeTypeOf("function");
-
-    const engine = factory!() as {
-      deps?: { getApiKey: (provider: string, model: string) => Promise<string | undefined> };
-    };
-    await expect(engine.deps?.getApiKey("anthropic", "claude-sonnet-4-6")).resolves.toBe(
-      "model-auth-key",
+    expect(warnLog).toHaveBeenCalledWith(
+      expect.stringContaining("runtime.llm.complete is unavailable"),
     );
   });
 
-  it("can bypass runtime.modelAuth and fall back to env credentials", async () => {
+  it("does not expose direct provider credential lookup through dependencies", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "env-anthropic-key");
 
     const { api, getFactory } = buildApi({
       enabled: true,
     });
     api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
-    const modelAuth = (
-      api.runtime as OpenClawPluginApi["runtime"] & {
-        modelAuth: {
-          getApiKeyForModel: ReturnType<typeof vi.fn>;
-        };
-      }
-    ).modelAuth;
-    modelAuth.getApiKeyForModel.mockResolvedValue({
-      apiKey: "model-auth-key",
-    });
 
     lcmPlugin.register(api);
 
@@ -762,114 +796,15 @@ describe("lcm plugin registration", () => {
 
     const engine = factory!() as {
       deps?: {
-        getApiKey: (
-          provider: string,
-          model: string,
-          options?: { skipModelAuth?: boolean },
-        ) => Promise<string | undefined>;
+        getApiKey: (provider: string, model: string) => Promise<string | undefined>;
+        requireApiKey: (provider: string, model: string) => Promise<string>;
       };
     };
-    await expect(
-      engine.deps?.getApiKey("anthropic", "claude-sonnet-4-6", { skipModelAuth: true }),
-    ).resolves.toBe("env-anthropic-key");
-    expect(modelAuth.getApiKeyForModel).not.toHaveBeenCalled();
-  });
-
-  it("passes per-call runtimeConfig through to runtime.modelAuth", async () => {
-    const { api, getFactory } = buildApi({
-      enabled: true,
-    });
-    api.config = defaultModelConfig("anthropic/claude-sonnet-4-6") as OpenClawPluginApi["config"];
-    const modelAuth = (
-      api.runtime as OpenClawPluginApi["runtime"] & {
-        modelAuth: {
-          getApiKeyForModel: ReturnType<typeof vi.fn>;
-        };
-      }
-    ).modelAuth;
-    modelAuth.getApiKeyForModel.mockResolvedValue({
-      apiKey: "model-auth-key",
-    });
-
-    lcmPlugin.register(api);
-
-    const factory = getFactory();
-    expect(factory).toBeTypeOf("function");
-
-    const runtimeConfig = {
-      auth: {
-        order: {
-          anthropic: ["anthropic:api-key"],
-        },
-      },
-    };
-    const engine = factory!() as {
-      deps?: {
-        getApiKey: (
-          provider: string,
-          model: string,
-          options?: { runtimeConfig?: unknown },
-        ) => Promise<string | undefined>;
-      };
-    };
-    await expect(
-      engine.deps?.getApiKey("anthropic", "claude-sonnet-4-6", { runtimeConfig }),
-    ).resolves.toBe("model-auth-key");
-
-    expect(modelAuth.getApiKeyForModel).toHaveBeenCalledWith(
-      expect.objectContaining({
-        cfg: runtimeConfig,
-      }),
+    await expect(engine.deps?.getApiKey("anthropic", "claude-sonnet-4-6")).resolves.toBeUndefined();
+    await expect(engine.deps?.requireApiKey("anthropic", "claude-sonnet-4-6")).rejects.toThrow(
+      "direct provider credential lookup has been removed",
     );
   });
-
-  it("falls back to auth-profiles.json when runtime.modelAuth is unavailable", { timeout: 20000 }, async () => {
-    const provider = "lossless-test-provider";
-    const agentDir = mkdtempSync(join(tmpdir(), "lossless-claw-auth-"));
-    tempDirs.add(agentDir);
-    writeFileSync(
-      join(agentDir, "auth-profiles.json"),
-      JSON.stringify(
-        {
-          version: 1,
-          profiles: {
-            "lossless-test-provider:test": {
-              type: "api_key",
-              provider,
-              key: "token-from-auth-store",
-            },
-          },
-          order: {
-            [provider]: ["lossless-test-provider:test"],
-          },
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-
-    const { api, getFactory } = buildApi(
-      {
-        enabled: true,
-      },
-      { includeModelAuth: false, agentDir },
-    );
-    api.config = defaultModelConfig(`${provider}/claude-sonnet-4-6`) as OpenClawPluginApi["config"];
-
-    lcmPlugin.register(api);
-
-    const factory = getFactory();
-    expect(factory).toBeTypeOf("function");
-
-    const engine = factory!() as {
-      deps?: { getApiKey: (provider: string, model: string) => Promise<string | undefined> };
-    };
-    await expect(engine.deps?.getApiKey(provider, "claude-sonnet-4-6")).resolves.toBe(
-      "token-from-auth-store",
-    );
-  });
-
   it("waits for gateway_start when eager init hits a lock", async () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);

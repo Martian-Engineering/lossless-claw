@@ -24,6 +24,8 @@
   },
   "files": [
     "dist/",
+    "doctor-contract-api.d.ts",
+    "doctor-contract-api.js",
     "skills/",
     "openclaw.plugin.json",
     "docs/",

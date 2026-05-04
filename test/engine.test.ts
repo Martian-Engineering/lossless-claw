@@ -11029,20 +11029,9 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(prompt).not.toContain("Write in third person.");
   });
 
-  it("supports openai-codex large-file summarization without direct-credential retry", async () => {
-    const completeSpy = vi.fn(async ({ apiKey }: { apiKey?: string }) => ({
-      content: apiKey === "scoped-token"
-        ? []
-        : [{ type: "text", text: "codex large-file summary" }],
-      ...(apiKey === "scoped-token"
-        ? {
-            error: {
-              kind: "provider_auth",
-              statusCode: 401,
-              message: "Missing required scope: model.request",
-            },
-          }
-        : {}),
+  it("supports openai-codex large-file summarization through runtime-owned auth", async () => {
+    const completeSpy = vi.fn(async () => ({
+      content: [{ type: "text", text: "codex large-file summary" }],
     }));
     const getApiKeySpy = vi.fn(async () => "scoped-token");
     const engine = createEngineWithDeps(
@@ -11054,6 +11043,10 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
         complete: completeSpy,
         getApiKey: getApiKeySpy,
         isRuntimeManagedAuthProvider: () => true,
+        resolveModel: vi.fn((modelRef?: string, providerHint?: string) => ({
+          provider: providerHint ?? "openai-codex",
+          model: modelRef ?? "gpt-5.4",
+        })),
       },
     );
     const privateEngine = engine as unknown as {
@@ -11064,9 +11057,18 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(summarizeText).toBeTypeOf("function");
 
     const summary = await summarizeText!("Large file prompt");
-    expect(summary).toBeNull();
-    expect(getApiKeySpy).toHaveBeenCalledTimes(1);
+    expect(summary).toBe("codex large-file summary");
+    expect(getApiKeySpy).not.toHaveBeenCalled();
     expect(completeSpy).toHaveBeenCalledTimes(1);
+    expect(completeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeModelOverride: {
+          configField: "largeFileSummaryModel",
+          configPath: "plugins.entries.lossless-claw.config.largeFileSummaryModel",
+          modelRef: "openai-codex/gpt-5.4",
+        },
+      }),
+    );
   });
 
   it("forwards config customInstructions to large-file summarization", async () => {
