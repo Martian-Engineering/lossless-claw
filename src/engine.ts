@@ -1750,21 +1750,21 @@ export class LcmContextEngine implements ContextEngine {
   // ── Circuit breaker for compaction auth failures ──
   private circuitBreakerStates = new Map<string, CircuitBreakerState>();
 
-  /** Per-process cap on `reconcileTranscriptTailForAfterTurn` slow-path full
-   *  re-reads, keyed by `${sessionQueueKey}\u0000${sessionFile}` (same
-   *  NUL-escape separator pattern as `messageIdentity`). Long-running
+  /** Last file state successfully covered by `reconcileTranscriptTailForAfterTurn`
+   *  slow-path full re-reads, keyed by `${sessionQueueKey}\u0000${sessionFile}`
+   *  (same NUL-escape separator pattern as `messageIdentity`). Long-running
    *  sessions where the bootstrap checkpoint is missing or path-mismatched
-   *  would otherwise pay O(file-size) on every afterTurn; one slow path
-   *  per (queueKey, sessionFile) is the bound.
+   *  would otherwise pay O(file-size) on every afterTurn; repeated attempts
+   *  for the same unchanged file state are skipped.
    *
    *  Bounded with FIFO eviction at `AFTER_TURN_RECONCILE_KEY_CAP` entries
    *  so hosts churning through many sessions/files don't accumulate this
-   *  set indefinitely. When the cap is exceeded we drop the oldest entry
-   *  (Set iteration order is insertion order in JS); a session whose
+   *  map indefinitely. When the cap is exceeded we drop the oldest entry
+   *  (Map iteration order is insertion order in JS); a session whose
    *  entry eventually evicts may pay the slow path once again, which is
    *  acceptable since the bound is well above realistic concurrent-session
    *  counts. */
-  private afterTurnReconcileFullReadKeys = new Set<string>();
+  private afterTurnReconcileFullReadStates = new Map<string, { size: number; mtimeMs: number }>();
   private static readonly AFTER_TURN_RECONCILE_KEY_CAP = 4096;
 
   /** Per-process dedupe for the `cache-context-unknown` info-level log
@@ -4792,38 +4792,55 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         // Slow path: checkpoint missing, path mismatched, or non-append-only.
-        // Cap full re-reads to once per (queueKey, sessionFile) per process;
-        // long-running sessions otherwise pay O(file-size) every afterTurn.
-        // Subsequent calls fall through to refreshBootstrapState below so the
-        // next afterTurn takes the fast (incremental) path.
+        // Cap full re-reads only for unchanged file states. If the transcript
+        // changed since the last full read, reconcile again; if it did not,
+        // skip without advancing the checkpoint so stale state can be retried
+        // after a later file change, process restart, or cap eviction.
         const fullReadKey = `${queueKey}\u0000${params.sessionFile}`;
         const reason = !checkpoint
           ? "checkpoint-missing"
           : checkpoint.sessionFilePath !== params.sessionFile
             ? "path-mismatch"
             : "append-only-ineligible";
-        if (this.afterTurnReconcileFullReadKeys.has(fullReadKey)) {
+        let sessionFileState: { size: number; mtimeMs: number } | undefined;
+        try {
+          const sessionFileStats = await stat(params.sessionFile);
+          sessionFileState = {
+            size: sessionFileStats.size,
+            mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
+          };
+        } catch {
+          // Leave undefined: without stat proof, do not use the slow-read cap.
+        }
+        const rememberedFileState = this.afterTurnReconcileFullReadStates.get(fullReadKey);
+        if (
+          rememberedFileState
+          && sessionFileState
+          && rememberedFileState.size === sessionFileState.size
+          && rememberedFileState.mtimeMs === sessionFileState.mtimeMs
+        ) {
           this.deps.log.info(
-            `[lcm] afterTurn: transcript reconcile slow path skipped (already executed this process) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+            `[lcm] afterTurn: transcript reconcile slow path skipped (file state already read this process) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
           );
-          await this.refreshBootstrapState({
-            conversationId: conversation.conversationId,
-            sessionFile: params.sessionFile,
-          });
           return;
         }
-        // FIFO-evict the oldest entry once we exceed the cap so the set is
-        // bounded across long-lived processes.
-        if (
-          this.afterTurnReconcileFullReadKeys.size
-            >= LcmContextEngine.AFTER_TURN_RECONCILE_KEY_CAP
-        ) {
-          const oldest = this.afterTurnReconcileFullReadKeys.values().next().value;
-          if (oldest !== undefined) {
-            this.afterTurnReconcileFullReadKeys.delete(oldest);
+
+        const rememberSlowReadState = (): void => {
+          if (!sessionFileState) {
+            return;
           }
-        }
-        this.afterTurnReconcileFullReadKeys.add(fullReadKey);
+          if (
+            !this.afterTurnReconcileFullReadStates.has(fullReadKey)
+            && this.afterTurnReconcileFullReadStates.size
+              >= LcmContextEngine.AFTER_TURN_RECONCILE_KEY_CAP
+          ) {
+            const oldest = this.afterTurnReconcileFullReadStates.keys().next().value;
+            if (typeof oldest === "string") {
+              this.afterTurnReconcileFullReadStates.delete(oldest);
+            }
+          }
+          this.afterTurnReconcileFullReadStates.set(fullReadKey, sessionFileState);
+        };
         const slowPathStartedAt = Date.now();
 
         // Distinguish empty-file from read/parse error: stat the file and
@@ -4833,26 +4850,19 @@ export class LcmContextEngine implements ContextEngine {
         // that case we must NOT mark the bootstrap checkpoint as fully
         // processed, otherwise future afterTurns will skip reconciliation
         // and we lose messages.
-        let sessionFileSize: number | undefined;
-        try {
-          const sessionFileStats = await stat(params.sessionFile);
-          sessionFileSize = sessionFileStats.size;
-        } catch {
-          /* surface as undefined → treat the empty-historical-messages branch
-             as a parse error path and skip the checkpoint refresh */
-        }
         const historicalMessages = await readLeafPathMessages(params.sessionFile);
         if (historicalMessages.length === 0) {
-          if (sessionFileSize === 0) {
+          if (sessionFileState?.size === 0) {
             // File is genuinely empty — refresh the checkpoint so the next
             // afterTurn takes the incremental path.
             await this.refreshBootstrapState({
               conversationId: conversation.conversationId,
               sessionFile: params.sessionFile,
             });
+            rememberSlowReadState();
           } else {
             this.deps.log.warn(
-              `[lcm] afterTurn: transcript reconcile slow path read empty messages from non-empty file (${sessionFileSize ?? "?"} bytes) — skipping checkpoint refresh to avoid dropping messages on parser failure conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+              `[lcm] afterTurn: transcript reconcile slow path read empty messages from non-empty file (${sessionFileState?.size ?? "?"} bytes) — skipping checkpoint refresh to avoid dropping messages on parser failure conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
             );
           }
           return;
@@ -4882,6 +4892,7 @@ export class LcmContextEngine implements ContextEngine {
           conversationId: conversation.conversationId,
           sessionFile: params.sessionFile,
         });
+        rememberSlowReadState();
         this.deps.log.warn(
           `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${reconcile.importedMessages} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
         );

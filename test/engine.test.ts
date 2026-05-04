@@ -7078,6 +7078,118 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(secondSlowPathWarns.length).toBe(0);
   });
 
+  it("afterTurn retries a capped reconcile when the transcript file changed with an append-only-ineligible suffix (F7)", async () => {
+    const infoLog = vi.fn();
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: infoLog, warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-reconcile-cap-retries-on-file-change";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 0,
+      threshold: 3_072,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-reconcile-cap-retry-seed"),
+      messages: [makeMessage({ role: "assistant", content: "seed turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const targetSessionFile = createSessionFilePath("after-turn-reconcile-cap-retry-target");
+    writeFileSync(
+      targetSessionFile,
+      `${JSON.stringify({
+        message: { role: "assistant", content: [{ type: "text", text: "seed turn" }] },
+      })}\n`,
+      "utf8",
+    );
+
+    warnLog.mockClear();
+    infoLog.mockClear();
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: targetSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "next turn one" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .filter((m) => m.includes("transcript reconcile slow path (full re-read)")),
+    ).toHaveLength(1);
+
+    appendFileSync(
+      targetSessionFile,
+      `not-json\n${JSON.stringify({
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "append-only-ineligible user" }],
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    warnLog.mockClear();
+    infoLog.mockClear();
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: targetSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "append-only-ineligible assistant" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      infoLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("transcript reconcile slow path skipped")),
+    ).toBe(false);
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .filter((m) => m.includes("transcript reconcile slow path (full re-read)")),
+    ).toHaveLength(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed turn",
+      "next turn one",
+      "append-only-ineligible user",
+      "append-only-ineligible assistant",
+    ]);
+
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(targetSessionFile).size);
+  });
+
   it("afterTurn does not background-compact prompt-mutating debt while Anthropic cache is hot", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-background-hot-cache-deferred";
