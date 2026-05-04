@@ -1,6 +1,9 @@
 {
   "id": "lossless-claw",
   "kind": "context-engine",
+  "activation": {
+    "onStartup": true
+  },
   "skills": [
     "skills/lossless-claw"
   ],
@@ -213,6 +216,22 @@
       "label": "Proactive Threshold Compaction Mode",
       "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
     },
+    "autoRotateSessionFiles.enabled": {
+      "label": "Auto-Rotate Session Files",
+      "help": "Automatically rotate oversized LCM-managed session JSONL files after startup and runtime checks"
+    },
+    "autoRotateSessionFiles.sizeBytes": {
+      "label": "Auto-Rotate Size Bytes",
+      "help": "Session JSONL byte threshold for automatic rotation (default: 2097152)"
+    },
+    "autoRotateSessionFiles.startup": {
+      "label": "Startup Auto-Rotate",
+      "help": "Startup behavior for oversized indexed OpenClaw session files with active LCM state: rotate, warn, or off"
+    },
+    "autoRotateSessionFiles.runtime": {
+      "label": "Runtime Auto-Rotate",
+      "help": "Runtime behavior for oversized current LCM session files: rotate, warn, or off"
+    },
     "fallbackProviders": {
       "label": "Fallback Providers",
       "help": "Explicit fallback provider/model pairs for compaction summarization (e.g., [{\"provider\": \"anthropic\", \"model\": \"claude-haiku-4-5\"}])"
@@ -418,6 +437,35 @@
           "deferred",
           "inline"
         ]
+      },
+      "autoRotateSessionFiles": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "startup": {
+            "type": "string",
+            "enum": [
+              "rotate",
+              "warn",
+              "off"
+            ]
+          },
+          "runtime": {
+            "type": "string",
+            "enum": [
+              "rotate",
+              "warn",
+              "off"
+            ]
+          }
+        }
       },
       "databasePath": {
         "description": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)",

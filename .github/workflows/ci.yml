@@ -25,3 +25,56 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+  # Smoke-install the plugin against the latest published openclaw to catch
+  # bundle-level breakage (esbuild externals, ESM resolution, missing default
+  # export) before users hit it.  Calling `plugin.register(...)` against a
+  # stub api would require a richer fixture than a unit-test stub can
+  # reasonably provide, so the deeper "register against a real loader" check
+  # is followup work — see #555 for the kind of failure that would warrant
+  # it.  This v0 smoke verifies the bundle loads and exposes the expected
+  # registerable plugin shape with `openclaw@latest` present alongside.
+  smoke-latest-openclaw:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install plugin deps (pinned, for build)
+        run: npm ci
+
+      - name: Build plugin bundle
+        run: npm run build
+
+      - name: Prune devDependencies (drop pinned `pi-*` so import resolves against host)
+        # `npm ci` installs the pinned `@mariozechner/pi-*` devDependencies that
+        # the build needs.  Once the bundle is built, those devDeps must be
+        # removed so the smoke import doesn't accidentally satisfy
+        # `import "@mariozechner/pi-ai"` from the pinned 0.66.1 we ship for
+        # local builds — instead it must resolve against whatever
+        # `openclaw@latest` brings transitively, which is the install-time
+        # surface real users see.
+        run: npm prune --omit=dev
+
+      - name: Install latest openclaw alongside
+        run: npm install --no-save openclaw@latest
+
+      - name: Smoke-import bundle against latest openclaw
+        run: |
+          node --input-type=module -e '
+            import("./dist/index.js").then((mod) => {
+              const plugin = mod.default;
+              if (!plugin || typeof plugin.register !== "function") {
+                console.error("plugin.default.register missing or not a function");
+                process.exit(1);
+              }
+              console.log("smoke OK — plugin loadable, register surface present");
+            }).catch((e) => { console.error("smoke failed:", e); process.exit(1); });
+          '

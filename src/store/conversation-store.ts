@@ -382,6 +382,25 @@ export class ConversationStore {
     return this.getConversationBySessionId(normalizedSessionId);
   }
 
+  /** List active conversations that may own live session storage. */
+  async listActiveConversations(limit?: number): Promise<ConversationRecord[]> {
+    const normalizedLimit =
+      typeof limit === "number" && Number.isFinite(limit) && limit > 0
+        ? Math.floor(limit)
+        : 1000;
+    const rows = this.db
+      .prepare(
+        `SELECT conversation_id, session_id, session_key, active, archived_at, title, bootstrapped_at, created_at, updated_at
+         FROM conversations
+         WHERE active = 1
+         ORDER BY updated_at DESC, conversation_id DESC
+         LIMIT ?`,
+      )
+      .all(normalizedLimit) as unknown as ConversationRow[];
+
+    return rows.map(toConversationRecord);
+  }
+
   async getOrCreateConversation(
     sessionId: string,
     titleOrOpts?: string | { title?: string; sessionKey?: string },

@@ -54,6 +54,12 @@ function createTestConfig(databasePath: string): LcmConfig {
     pruneHeartbeatOk: false,
     transcriptGcEnabled: false,
     proactiveThresholdCompactionMode: "deferred",
+    autoRotateSessionFiles: {
+      enabled: true,
+      sizeBytes: 2 * 1024 * 1024,
+      startup: "rotate",
+      runtime: "rotate",
+    },
     summaryMaxOverageFactor: 3,
     customInstructions: "",
     circuitBreakerThreshold: 5,
@@ -215,6 +221,27 @@ function makeMessage(params: { role?: string; content: unknown }): AgentMessage 
     content: params.content,
     timestamp: Date.now(),
   } as AgentMessage;
+}
+
+function readSessionMessages(sessionFile: string): AgentMessage[] {
+  return SessionManager.open(sessionFile)
+    .getBranch()
+    .filter((entry) => entry.type === "message")
+    .map((entry) => entry.message as AgentMessage);
+}
+
+function createBulkySession(sessionFile: string, messageCount: number): AgentMessage[] {
+  const sm = SessionManager.open(sessionFile);
+  const messages: AgentMessage[] = [];
+  for (let index = 0; index < messageCount; index += 1) {
+    const message = makeMessage({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: [{ type: "text", text: `auto rotate payload ${index} ${"x".repeat(160)}` }],
+    });
+    sm.appendMessage(message);
+    messages.push(message);
+  }
+  return messages;
 }
 
 async function flushImmediate(): Promise<void> {
@@ -3355,6 +3382,502 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(result.reason).toContain("could not rotate the current session transcript");
   });
 
+  it("auto-rotates oversized LCM-managed session files after runtime turns", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-runtime");
+    const messages = createBulkySession(sessionFile, 14);
+    const beforeSize = statSync(sessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+    const sessionId = "auto-rotate-runtime-session";
+    const sessionKey = "agent:main:test:auto-rotate-runtime";
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+
+    const afterSize = statSync(sessionFile).size;
+    expect(beforeSize).toBeGreaterThan(1_500);
+    expect(afterSize).toBeLessThan(beforeSize);
+    const autoRotateLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    const rotateLog = autoRotateLogs.find((message) =>
+      message.includes("phase=runtime action=rotate"),
+    );
+    expect(rotateLog).toContain(`sessionId=${sessionId}`);
+    expect(rotateLog).toContain(`sessionKey=${sessionKey}`);
+    expect(rotateLog).toContain(`sessionFile=${sessionFile}`);
+    expect(rotateLog).toContain("sizeBytes=");
+    expect(rotateLog).toContain("thresholdBytes=1500");
+    expect(rotateLog).toContain("durationMs=");
+    expect(rotateLog).toContain("backupPath=");
+    expect(rotateLog).toContain("bytesRemoved=");
+    expect(rotateLog).toContain("preservedTailMessageCount=1");
+    expect(rotateLog).toContain("checkpointSize=");
+  });
+
+  it("leaves below-threshold session files alone while logging the decision", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-below-threshold");
+    const messages = createBulkySession(sessionFile, 4);
+    const beforeSize = statSync(sessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: beforeSize + 1_000,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+    const sessionId = "auto-rotate-below-session";
+    const sessionKey = "agent:main:test:auto-rotate-below";
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+
+    expect(statSync(sessionFile).size).toBe(beforeSize);
+    const autoRotateLogs = log.info.mock.calls.map(([message]) => String(message));
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("phase=runtime action=skip"),
+        expect.stringContaining("reason=below-threshold"),
+      ]),
+    );
+  });
+
+  it("skips ignored, stateless, and untracked runtime sessions", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-skip-guards");
+    const messages = createBulkySession(sessionFile, 10);
+    const original = readFileSync(sessionFile, "utf8");
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        ignoreSessionPatterns: ["agent:*:cron:**"],
+        statelessSessionPatterns: ["agent:*:subagent:**"],
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 500,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+
+    await engine.afterTurn({
+      sessionId: "auto-rotate-ignored-session",
+      sessionKey: "agent:main:cron:nightly",
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+    await engine.afterTurn({
+      sessionId: "auto-rotate-stateless-session",
+      sessionKey: "agent:main:subagent:worker",
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+    await engine.afterTurn({
+      sessionId: "auto-rotate-untracked-session",
+      sessionKey: "agent:main:test:auto-rotate-untracked",
+      sessionFile,
+      messages: [messages[0]!],
+      prePromptMessageCount: 0,
+      isHeartbeat: true,
+    });
+
+    expect(readFileSync(sessionFile, "utf8")).toBe(original);
+    const autoRotateLogs = log.info.mock.calls.map(([message]) => String(message));
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("reason=session-excluded"),
+        expect.stringContaining("reason=stateless-session"),
+        expect.stringContaining("reason=no-active-conversation"),
+      ]),
+    );
+  });
+
+  it("startup scan rotates oversized active conversations with checkpointed files", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-startup");
+    const messages = createBulkySession(sessionFile, 14);
+    const beforeSize = statSync(sessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const sessionId = "auto-rotate-startup-session";
+    const sessionKey = "agent:main:test:auto-rotate-startup";
+    const listStartupSessionFileCandidates = vi.fn(async () => [
+      { sessionId, sessionKey, sessionFile },
+    ]);
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "rotate",
+          runtime: "off",
+        },
+      },
+      { log, listStartupSessionFileCandidates },
+    );
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.autoRotateManagedSessionFilesAtStartup();
+
+    expect(beforeSize).toBeGreaterThan(1_500);
+    expect(statSync(sessionFile).size).toBeLessThan(beforeSize);
+    const autoRotateLogs = log.info.mock.calls.map(([message]) => String(message));
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("phase=startup action=rotate"),
+        expect.stringContaining("backupPath="),
+      ]),
+    );
+    expect(readSessionMessages(sessionFile)).toHaveLength(1);
+    expect(readSessionMessages(sessionFile)[0]?.role).toBe(messages[messages.length - 1]?.role);
+  });
+
+  it("startup scan ignores stale active LCM conversations outside indexed candidates", async () => {
+    const indexedSessionFile = createSessionFilePath("auto-rotate-indexed-startup");
+    const staleSessionFile = createSessionFilePath("auto-rotate-stale-startup");
+    createBulkySession(indexedSessionFile, 14);
+    createBulkySession(staleSessionFile, 14);
+    const indexedBeforeSize = statSync(indexedSessionFile).size;
+    const staleBeforeSize = statSync(staleSessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const indexedSessionId = "auto-rotate-indexed-session";
+    const indexedSessionKey = "agent:main:test:auto-rotate-indexed";
+    const staleSessionId = "auto-rotate-stale-session";
+    const staleSessionKey = "agent:old:test:auto-rotate-stale";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "rotate",
+          runtime: "off",
+        },
+      },
+      {
+        log,
+        listStartupSessionFileCandidates: vi.fn(async () => [
+          {
+            sessionId: indexedSessionId,
+            sessionKey: indexedSessionKey,
+            sessionFile: indexedSessionFile,
+          },
+        ]),
+      },
+    );
+
+    await engine.bootstrap({
+      sessionId: indexedSessionId,
+      sessionKey: indexedSessionKey,
+      sessionFile: indexedSessionFile,
+    });
+    await engine.bootstrap({
+      sessionId: staleSessionId,
+      sessionKey: staleSessionKey,
+      sessionFile: staleSessionFile,
+    });
+    await engine.autoRotateManagedSessionFilesAtStartup();
+
+    expect(statSync(indexedSessionFile).size).toBeLessThan(indexedBeforeSize);
+    expect(statSync(staleSessionFile).size).toBe(staleBeforeSize);
+    const autoRotateLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    expect(autoRotateLogs.filter((message) => message.includes("action=rotate"))).toHaveLength(1);
+    const summaryLog = autoRotateLogs.find((message) => message.includes("action=summary"));
+    expect(summaryLog).toContain("scanned=1");
+    expect(summaryLog).toContain("eligible=1");
+    expect(summaryLog).toContain("rotated=1");
+    expect(summaryLog).toContain("skipped=0");
+  });
+
+  it("startup scan logs one compact summary for quiet skips", async () => {
+    const rotateSessionFile = createSessionFilePath("auto-rotate-summary-rotate");
+    const belowSessionFile = createSessionFilePath("auto-rotate-summary-below");
+    const missingSessionFile = createSessionFilePath("auto-rotate-summary-missing");
+    createBulkySession(rotateSessionFile, 14);
+    createBulkySession(belowSessionFile, 4);
+    const belowThresholdBytes = statSync(belowSessionFile).size + 500;
+    rmSync(missingSessionFile, { force: true });
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const rotateSessionId = "auto-rotate-summary-rotate-session";
+    const rotateSessionKey = "agent:main:test:auto-rotate-summary-rotate";
+    const belowSessionId = "auto-rotate-summary-below-session";
+    const belowSessionKey = "agent:main:test:auto-rotate-summary-below";
+    const missingSessionId = "auto-rotate-summary-missing-session";
+    const missingSessionKey = "agent:main:test:auto-rotate-summary-missing";
+    const noBootstrapSessionId = "auto-rotate-summary-no-bootstrap-session";
+    const noBootstrapSessionKey = "agent:main:test:auto-rotate-summary-no-bootstrap";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: belowThresholdBytes,
+          startup: "rotate",
+          runtime: "off",
+        },
+      },
+      {
+        log,
+        listStartupSessionFileCandidates: vi.fn(async () => [
+          { sessionId: rotateSessionId, sessionKey: rotateSessionKey, sessionFile: rotateSessionFile },
+          { sessionId: belowSessionId, sessionKey: belowSessionKey, sessionFile: belowSessionFile },
+          { sessionId: missingSessionId, sessionKey: missingSessionKey, sessionFile: missingSessionFile },
+          {
+            sessionId: noBootstrapSessionId,
+            sessionKey: noBootstrapSessionKey,
+            sessionFile: createSessionFilePath("auto-rotate-summary-no-bootstrap"),
+          },
+        ]),
+      },
+    );
+
+    await engine.bootstrap({
+      sessionId: rotateSessionId,
+      sessionKey: rotateSessionKey,
+      sessionFile: rotateSessionFile,
+    });
+    await engine.bootstrap({
+      sessionId: belowSessionId,
+      sessionKey: belowSessionKey,
+      sessionFile: belowSessionFile,
+    });
+    const missingConversation = await engine.getConversationStore().createConversation({
+      sessionId: missingSessionId,
+      sessionKey: missingSessionKey,
+    });
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: missingConversation.conversationId,
+      sessionFilePath: missingSessionFile,
+      lastSeenSize: 2_000,
+      lastSeenMtimeMs: Date.now(),
+      lastProcessedOffset: 0,
+    });
+    await engine.getConversationStore().createConversation({
+      sessionId: noBootstrapSessionId,
+      sessionKey: noBootstrapSessionKey,
+    });
+    await engine.autoRotateManagedSessionFilesAtStartup();
+
+    const autoRotateInfoLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    const autoRotateWarnLogs = log.warn.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    expect(autoRotateInfoLogs.filter((message) => message.includes("action=summary"))).toHaveLength(1);
+    expect(autoRotateInfoLogs.filter((message) => message.includes("action=skip"))).toHaveLength(0);
+    expect(autoRotateWarnLogs).toHaveLength(0);
+    const summaryLog = autoRotateInfoLogs.find((message) => message.includes("action=summary"));
+    expect(summaryLog).toContain("scanned=4");
+    expect(summaryLog).toContain("eligible=1");
+    expect(summaryLog).toContain("rotated=1");
+    expect(summaryLog).toContain("warned=0");
+    expect(summaryLog).toContain("skipped=3");
+  });
+
+  it("startup batch creates one pre-rotation backup for multiple rotations", async () => {
+    const firstSessionFile = createSessionFilePath("auto-rotate-batch-first");
+    const secondSessionFile = createSessionFilePath("auto-rotate-batch-second");
+    createBulkySession(firstSessionFile, 14);
+    createBulkySession(secondSessionFile, 14);
+    const firstBeforeSize = statSync(firstSessionFile).size;
+    const secondBeforeSize = statSync(secondSessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const firstSessionId = "auto-rotate-batch-first-session";
+    const firstSessionKey = "agent:main:test:auto-rotate-batch-first";
+    const secondSessionId = "auto-rotate-batch-second-session";
+    const secondSessionKey = "agent:main:test:auto-rotate-batch-second";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "rotate",
+          runtime: "off",
+        },
+      },
+      {
+        log,
+        listStartupSessionFileCandidates: vi.fn(async () => [
+          { sessionId: firstSessionId, sessionKey: firstSessionKey, sessionFile: firstSessionFile },
+          { sessionId: secondSessionId, sessionKey: secondSessionKey, sessionFile: secondSessionFile },
+        ]),
+      },
+    );
+
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey: firstSessionKey,
+      sessionFile: firstSessionFile,
+    });
+    await engine.bootstrap({
+      sessionId: secondSessionId,
+      sessionKey: secondSessionKey,
+      sessionFile: secondSessionFile,
+    });
+    const firstConversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId: firstSessionId, sessionKey: firstSessionKey });
+    const secondConversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId: secondSessionId, sessionKey: secondSessionKey });
+
+    await engine.autoRotateManagedSessionFilesAtStartup();
+
+    expect(statSync(firstSessionFile).size).toBeLessThan(firstBeforeSize);
+    expect(statSync(secondSessionFile).size).toBeLessThan(secondBeforeSize);
+    const autoRotateLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    const rotateLogs = autoRotateLogs.filter((message) =>
+      message.includes("phase=startup action=rotate"),
+    );
+    expect(rotateLogs).toHaveLength(2);
+    const backupPaths = new Set(
+      rotateLogs.map((message) => message.match(/backupPath=([^ ]+)/)?.[1]).filter(Boolean),
+    );
+    expect(backupPaths.size).toBe(1);
+    const backupPath = Array.from(backupPaths)[0]!;
+    const backupDb = createLcmDatabaseConnection(backupPath);
+    try {
+      const firstBackupState = backupDb
+        .prepare(`SELECT last_seen_size AS lastSeenSize FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .get(firstConversation!.conversationId) as { lastSeenSize: number } | undefined;
+      const secondBackupState = backupDb
+        .prepare(`SELECT last_seen_size AS lastSeenSize FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .get(secondConversation!.conversationId) as { lastSeenSize: number } | undefined;
+      expect(firstBackupState?.lastSeenSize).toBe(firstBeforeSize);
+      expect(secondBackupState?.lastSeenSize).toBe(secondBeforeSize);
+    } finally {
+      closeLcmConnection(backupDb);
+    }
+    const summaryLog = autoRotateLogs.find((message) => message.includes("action=summary"));
+    expect(summaryLog).toContain("scanned=2");
+    expect(summaryLog).toContain("eligible=2");
+    expect(summaryLog).toContain("rotated=2");
+    expect(summaryLog).toContain("backupCreated=1");
+  });
+
+  it("does not repeatedly rotate once the transcript has been compacted below threshold", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-no-loop");
+    const messages = createBulkySession(sessionFile, 14);
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+    const sessionId = "auto-rotate-no-loop-session";
+    const sessionKey = "agent:main:test:auto-rotate-no-loop";
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+    const compactedMessages = readSessionMessages(sessionFile);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: compactedMessages,
+      prePromptMessageCount: compactedMessages.length,
+    });
+
+    const autoRotateLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    expect(
+      autoRotateLogs.filter((message) => message.includes("action=rotate")),
+    ).toHaveLength(1);
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([expect.stringContaining("reason=below-threshold")]),
+    );
+  });
+
   it("reconciles missing tail messages when JSONL advanced past LCM", async () => {
     const sessionFile = createSessionFilePath("reconcile-tail");
     const sm = SessionManager.open(sessionFile);
@@ -4636,8 +5159,13 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 10_000,
     });
 
-    // Should fall back to live context, not return the assistant-only DB context
-    expect(result.messages).toBe(liveMessages);
+    // Should fall back to live context, not return the assistant-only DB context.
+    // The fallback must be a *new* array so the gateway hook's reference-equality
+    // check (`assembled.messages !== sourceMessages`) treats it as assembled —
+    // returning the same reference falls through to raw sourceMessages and
+    // re-introduces the prefill-rejection bug fixed by safeFallback.
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
     expect(result.estimatedTokens).toBe(0);
   });
 
@@ -5247,6 +5775,62 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[1]?.role).toBe("toolResult");
     expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("fc_1");
     expect(result.messages[2]?.role).toBe("user");
+  });
+
+  it("filters assistant messages with blank-text content during assembly", async () => {
+    // Regression: v0.9.3's #506 added an isThinkingOnlyContent filter for the
+    // Bedrock empty-content rejection, but did not handle the
+    // [{type:"text", text:""}] blank-text shape — Bedrock still rejects with
+    // "The text field in the ContentBlock object at messages.N.content.0 is
+    // blank". The cleanedEntries filter must strip all-blank messages and blank
+    // blocks inside otherwise valid assistant messages.
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "Question?" }),
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "   \n\t  " }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "" },
+          { type: "text", text: "Real answer." },
+        ],
+      } as AgentMessage,
+    });
+
+    const assembled = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(assembled.messages).toHaveLength(2);
+    expect(assembled.messages[0]?.role).toBe("user");
+    const assistant = assembled.messages[1] as {
+      role: string;
+      content?: Array<{ type?: string; text?: string }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content).toHaveLength(1);
+    expect(assistant.content?.[0]?.text).toBe("Real answer.");
   });
 
   it("filters thinking-only assistant messages during assembly", async () => {
@@ -10094,6 +10678,54 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((m) => m.content)).toEqual(["hello", "world"]);
+  });
+
+  it("fails closed for oversized no-overlap afterTurn batches", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "dedup-oversized-no-overlap-fail-closed";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-fail-closed"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "tool", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Simulates a short afterTurn runtime snapshot that has no overlap with
+    // the longer stored LCM conversation. Before this guard, LCM imported the
+    // whole batch as fresh rows and polluted context; the transcript reconcile
+    // path is responsible for genuine missing JSONL tail imports before this
+    // dedup check runs.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-fail-closed-2"),
+      messages: [
+        makeMessage({ role: "user", content: "unanchored user" }),
+        makeMessage({ role: "assistant", content: "unanchored assistant" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "old C"]);
+    expect(warnLog).toHaveBeenCalledWith(
+      `[lcm] dedup: oversized, storedCount=3 batchLen=2, no overlap found — fail-closed skipping full batch`,
+    );
   });
 
   it("preserves a legitimate repeated first new message", async () => {
