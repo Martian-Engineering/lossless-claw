@@ -526,11 +526,7 @@ function statFile(path) {
   }
 }
 
-function purgeSourceEvidence(db, sourceId) {
-  const eventIds = db
-    .prepare("SELECT event_id FROM codex_events WHERE source_file_id = ?")
-    .all(sourceId)
-    .map((row) => row.event_id);
+function purgeEventEvidence(db, eventIds) {
   if (eventIds.length === 0) return;
   const placeholders = eventIds.map(() => "?").join(", ");
   db.prepare(`DELETE FROM codex_tool_calls WHERE input_event_id IN (${placeholders}) OR output_event_id IN (${placeholders})`)
@@ -539,7 +535,15 @@ function purgeSourceEvidence(db, sourceId) {
   db.prepare(`DELETE FROM codex_observations WHERE first_event_id IN (${placeholders}) OR last_event_id IN (${placeholders})`)
     .run(...eventIds, ...eventIds);
   db.prepare(`DELETE FROM codex_summary_events WHERE event_id IN (${placeholders})`).run(...eventIds);
-  db.prepare("DELETE FROM codex_events WHERE source_file_id = ?").run(sourceId);
+  db.prepare(`DELETE FROM codex_events WHERE event_id IN (${placeholders})`).run(...eventIds);
+}
+
+function purgeSourceEvidence(db, sourceId) {
+  const eventIds = db
+    .prepare("SELECT event_id FROM codex_events WHERE source_file_id = ?")
+    .all(sourceId)
+    .map((row) => row.event_id);
+  purgeEventEvidence(db, eventIds);
 }
 
 function safePayload(raw) {
@@ -904,6 +908,17 @@ function insertEvent(db, threadId, turnId, sourceId, sourcePath, row) {
   const value = row.value;
   const payload = value.payload && typeof value.payload === "object" ? value.payload : {};
   const payloadHash = sha(row.raw);
+  const staleEventIds = db
+    .prepare(
+      `SELECT event_id
+       FROM codex_events
+       WHERE source_file_id = ?
+         AND source_line = ?
+         AND payload_sha256 != ?`,
+    )
+    .all(sourceId, row.lineNo, payloadHash)
+    .map((eventRow) => eventRow.event_id);
+  purgeEventEvidence(db, staleEventIds);
   const eventId = id("cevt", `${sourceId}:${row.lineNo}:${payloadHash}`);
   const result = db.prepare(
     `INSERT OR IGNORE INTO codex_events (
