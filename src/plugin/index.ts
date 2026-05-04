@@ -20,7 +20,7 @@ import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
-import type { LcmDependencies } from "../types.js";
+import type { LcmDependencies, StartupSessionFileCandidate } from "../types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
@@ -44,6 +44,73 @@ function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: st
 function normalizeAgentId(agentId: string | undefined): string {
   const normalized = (agentId ?? "").trim();
   return normalized.length > 0 ? normalized : "main";
+}
+
+type RuntimeSessionStoreEntry = {
+  sessionId?: unknown;
+  sessionFile?: unknown;
+};
+
+type RuntimeAgentSessionApi = {
+  resolveStorePath: (store?: string, opts?: { agentId?: string }) => string;
+  loadSessionStore: (storePath: string) => Record<string, RuntimeSessionStoreEntry | undefined>;
+  resolveSessionFilePath: (
+    sessionId: string,
+    entry?: RuntimeSessionStoreEntry,
+    opts?: { agentId?: string; storePath?: string },
+  ) => string;
+};
+type RuntimeAgentSessionApiCandidate = Partial<RuntimeAgentSessionApi>;
+
+/** Return the runtime session registry API when the host exposes it. */
+function getRuntimeAgentSessionApi(api: OpenClawPluginApi): RuntimeAgentSessionApi | undefined {
+  const runtime = api.runtime as unknown as {
+    agent?: { session?: RuntimeAgentSessionApiCandidate };
+    channel?: { session?: RuntimeAgentSessionApiCandidate };
+  };
+  const sessionApi = runtime.agent?.session ?? runtime.channel?.session;
+  if (!sessionApi) {
+    return undefined;
+  }
+  if (
+    typeof sessionApi.resolveStorePath !== "function" ||
+    typeof sessionApi.loadSessionStore !== "function" ||
+    typeof sessionApi.resolveSessionFilePath !== "function"
+  ) {
+    return undefined;
+  }
+  return sessionApi as RuntimeAgentSessionApi;
+}
+
+/** List configured OpenClaw agent ids whose session stores can be active at startup. */
+function listConfiguredAgentIds(config: unknown): string[] {
+  const agents = isRecord(config) ? config.agents : undefined;
+  const list = isRecord(agents) && Array.isArray(agents.list) ? agents.list : [];
+  const seen = new Set<string>();
+  const ids: string[] = [];
+
+  for (const entry of list) {
+    if (!isRecord(entry) || entry.enabled === false || typeof entry.id !== "string") {
+      continue;
+    }
+    const agentId = normalizeAgentId(entry.id);
+    if (seen.has(agentId)) {
+      continue;
+    }
+    seen.add(agentId);
+    ids.push(agentId);
+  }
+
+  return ids.length > 0 ? ids : ["main"];
+}
+
+/** Read a string value from an unknown object field. */
+function getStringField(
+  record: Record<string, unknown> | undefined,
+  key: string,
+): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 type PluginEnvSnapshot = {
@@ -2130,13 +2197,17 @@ function createLcmDependencies(
       }
 
       try {
+        const sessionApi = getRuntimeAgentSessionApi(api);
+        if (!sessionApi) {
+          return undefined;
+        }
         const cfg = api.runtime.config.loadConfig();
         const parsed = parseAgentSessionKey(key);
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = api.runtime.agent.session.resolveStorePath(cfg.session?.store, {
+        const storePath = sessionApi.resolveStorePath(cfg.session?.store, {
           agentId,
         });
-        const store = api.runtime.agent.session.loadSessionStore(storePath) as Record<
+        const store = sessionApi.loadSessionStore(storePath) as Record<
           string,
           { sessionId?: string } | undefined
         >;
@@ -2153,21 +2224,25 @@ function createLcmDependencies(
       }
 
       try {
+        const sessionApi = getRuntimeAgentSessionApi(api);
+        if (!sessionApi) {
+          return undefined;
+        }
         const cfg = api.runtime.config.loadConfig();
         const normalizedSessionKey = sessionKey?.trim();
         const parsed = normalizedSessionKey ? parseAgentSessionKey(normalizedSessionKey) : null;
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = api.runtime.agent.session.resolveStorePath(cfg.session?.store, {
+        const storePath = sessionApi.resolveStorePath(cfg.session?.store, {
           agentId,
         });
-        const store = api.runtime.agent.session.loadSessionStore(storePath) as Record<
+        const store = sessionApi.loadSessionStore(storePath) as Record<
           string,
           { sessionId?: string; sessionFile?: string } | undefined
         >;
         const entry =
           (normalizedSessionKey ? store[normalizedSessionKey] : undefined)
           ?? Object.values(store).find((candidate) => candidate?.sessionId === normalizedSessionId);
-        const transcriptPath = api.runtime.agent.session.resolveSessionFilePath(
+        const transcriptPath = sessionApi.resolveSessionFilePath(
           normalizedSessionId,
           entry,
           {
@@ -2179,6 +2254,78 @@ function createLcmDependencies(
       } catch {
         return undefined;
       }
+    },
+    listStartupSessionFileCandidates: async () => {
+      const sessionApi = getRuntimeAgentSessionApi(api);
+      if (!sessionApi) {
+        return [];
+      }
+
+      let cfg: unknown = registrationConfig.openClawConfig;
+      try {
+        cfg = api.runtime.config.loadConfig();
+      } catch {
+        // Fall back to the registration config snapshot when live config is unavailable.
+      }
+
+      const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
+      const storeConfig = getStringField(sessionConfig, "store");
+      const candidates: StartupSessionFileCandidate[] = [];
+      const seen = new Set<string>();
+
+      for (const agentId of listConfiguredAgentIds(cfg)) {
+        let storePath: string;
+        let store: Record<string, RuntimeSessionStoreEntry | undefined>;
+        try {
+          storePath = sessionApi.resolveStorePath(storeConfig, { agentId });
+          store = sessionApi.loadSessionStore(storePath);
+        } catch {
+          continue;
+        }
+
+        for (const [rawSessionKey, rawEntry] of Object.entries(store)) {
+          const sessionKey = rawSessionKey.trim();
+          if (!sessionKey || !isRecord(rawEntry)) {
+            continue;
+          }
+          const parsed = parseAgentSessionKey(sessionKey);
+          if (parsed?.agentId && normalizeAgentId(parsed.agentId) !== agentId) {
+            continue;
+          }
+          const sessionId = getStringField(rawEntry, "sessionId");
+          if (!sessionId) {
+            continue;
+          }
+
+          let sessionFile: string;
+          try {
+            sessionFile = sessionApi.resolveSessionFilePath(sessionId, rawEntry, {
+              agentId,
+              storePath,
+            }).trim();
+          } catch {
+            continue;
+          }
+          if (!sessionFile) {
+            continue;
+          }
+
+          const dedupeKey = `${sessionId}\0${sessionKey}\0${sessionFile}`;
+          if (seen.has(dedupeKey)) {
+            continue;
+          }
+          seen.add(dedupeKey);
+          candidates.push({
+            sessionId,
+            sessionKey,
+            sessionFile,
+            agentId,
+            storePath,
+          });
+        }
+      }
+
+      return candidates;
     },
     agentLaneSubagent: "subagent",
     log,

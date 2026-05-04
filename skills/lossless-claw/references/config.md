@@ -249,15 +249,17 @@ Defaults:
 Why it matters:
 
 - prevents very large OpenClaw session JSONL files from choking fallback/gateway startup while LCM owns the durable context
-- uses the same backup-backed safe path as `/lossless rotate` / `/lcm rotate`
-- only runs for active, writable LCM conversations; ignored sessions, stateless sessions, and sessions without active LCM state are skipped
+- runtime rotation uses the same backup-backed safe path as `/lossless rotate` / `/lcm rotate`
+- startup scans OpenClaw's current indexed session stores for configured agents, intersects those candidates with active LCM bootstrap state, and creates one pre-rotation DB backup for the startup batch
+- only runs for active, writable LCM conversations; ignored sessions, stateless sessions, sessions outside the indexed startup candidate set, and sessions without active LCM state are skipped
 - the preserved transcript tail follows the normal rotate behavior controlled by `freshTailCount`
 
 Operational logging:
 
 - every decision is logged with the prefix `[lcm] auto-rotate:`
+- startup emits one compact `action=summary` line with `scanned`, `eligible`, `rotated`, `warned`, `skipped`, `durationMs`, and `bytesRemoved`
 - rotate logs include `phase`, `action`, `sessionId`, `sessionKey`, `sessionFile`, `sizeBytes`, `thresholdBytes`, `durationMs`, `backupPath`, `bytesRemoved`, `preservedTailMessageCount`, and `checkpointSize`
-- skip/warn logs include the same available context plus `reason` or `error`
+- real warning logs include the same available context plus `reason` or `error`; quiet startup skips such as missing files, missing bootstrap mappings, and below-threshold files are counted in the summary instead of logged per candidate
 
 ## Compaction timing and shape
 

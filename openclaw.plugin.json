@@ -223,7 +223,7 @@
     },
     "autoRotateSessionFiles.startup": {
       "label": "Startup Auto-Rotate",
-      "help": "Startup behavior for oversized known LCM session files: rotate, warn, or off"
+      "help": "Startup behavior for oversized indexed OpenClaw session files with active LCM state: rotate, warn, or off"
     },
     "autoRotateSessionFiles.runtime": {
       "label": "Runtime Auto-Rotate",
