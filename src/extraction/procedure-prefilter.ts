@@ -82,16 +82,19 @@ export function prefilterContent(content: string): PrefilterResult {
 }
 
 /**
- * Numbered step heuristic: at least 3 numbered list items in sequence.
- * Detects:
- *   - Markdown numbered lists ("1. foo\n2. bar\n3. baz")
- *   - "Step 1: ...", "Step 2: ..." patterns
- *   - "1)", "(1)" variations
+ * Numbered step heuristic: at least 3 STRICTLY-SEQUENTIAL numbered
+ * list items (1, 2, 3 — not 1, 1, 1 nor 1, 5, 8).
+ *
+ * Group E adversarial Gap 5 fix: previously we accepted "non-decreasing"
+ * which trips on numbered citations ("[1] Smith ... [2] Jones ...") and
+ * action-item lists ("1. Bob ... 2. Alice ... 3. Carol" which are
+ * meeting notes, not procedures).
+ *
+ * Now requires `n+1` after `n` AND that the numbers start near 1
+ * (start ≤ 2 for tolerance of "0. setup" prefixes).
  */
 function hasNumberedSteps(content: string): boolean {
   const lines = content.split(/\r?\n/);
-  let count = 0;
-  let lastIdx = 0;
   // Patterns to recognize a "numbered list line"
   const patterns: RegExp[] = [
     /^\s*(\d+)\.\s+\S/, // "1. foo"
@@ -99,22 +102,53 @@ function hasNumberedSteps(content: string): boolean {
     /^\s*\((\d+)\)\s+\S/, // "(1) foo"
     /^\s*Step\s+(\d+)[:.\s]/i, // "Step 1: foo"
   ];
+  // Walk lines; collect runs of strictly-sequential numbered lines.
+  let runStart: number | null = null;
+  let lastN = 0;
+  let bestRun = 0;
   for (const line of lines) {
     let matched: RegExpMatchArray | null = null;
     for (const re of patterns) {
       matched = line.match(re);
       if (matched) break;
     }
-    if (!matched) continue;
+    if (!matched) {
+      runStart = null;
+      lastN = 0;
+      continue;
+    }
     const n = parseInt(matched[1], 10);
-    if (Number.isFinite(n) && n > 0 && n >= lastIdx) {
-      // Allow same-or-greater (don't require strictly increasing — handles
-      // "1. ... 1. ..." malformed but common in pasted output).
-      count++;
-      lastIdx = n;
+    if (!Number.isFinite(n) || n <= 0) {
+      runStart = null;
+      lastN = 0;
+      continue;
+    }
+    if (runStart === null) {
+      // Start of a new run — only count if starting at 0/1/2
+      if (n <= 2) {
+        runStart = n;
+        lastN = n;
+        bestRun = Math.max(bestRun, 1);
+      } else {
+        runStart = null;
+      }
+      continue;
+    }
+    if (n === lastN + 1) {
+      lastN = n;
+      bestRun = Math.max(bestRun, lastN - runStart + 1);
+    } else {
+      // Sequence broke; restart only if this line itself starts at 0/1/2
+      if (n <= 2) {
+        runStart = n;
+        lastN = n;
+      } else {
+        runStart = null;
+        lastN = 0;
+      }
     }
   }
-  return count >= 3;
+  return bestRun >= 3;
 }
 
 /**

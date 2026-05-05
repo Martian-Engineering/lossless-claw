@@ -80,6 +80,12 @@ export interface ClusterOptions {
    * Force a specific cluster count instead of cutting by height.
    * If provided, `cutHeight` is ignored.
    *
+   * BEST-EFFORT: ml-hclust may return FEWER groups than requested if
+   * the dendrogram has fewer internal levels (e.g., all identical
+   * vectors → 1 cluster regardless of K). Uncovered leaves get their
+   * own singleton cluster as fallback (Group E adversarial Gap 1 fix).
+   * Caller MUST NOT assume `result.numClusters === opts.numClusters`.
+   *
    * Must be ≥ 1 and ≤ vectors.length.
    */
   numClusters?: number;
@@ -226,19 +232,22 @@ export function clusterHierarchical(opts: ClusterOptions): ClusterResult {
     }
   }
 
-  // Sanity check — every input vector must be covered exactly once.
-  // This protects against future bugs in ml-hclust where a leaf could
-  // be skipped.
+  // Group E adversarial Gap 1 fix: previously this loop threw on
+  // missing assignments. ml-hclust's `tree.group(K)` does NOT
+  // guarantee K leaves get covered when the dendrogram has fewer
+  // than K internal levels (degenerate trees: identical/near-identical
+  // vectors). The previous "internal error" throw was a false-positive
+  // crash. Instead, fall back to "every-leaf-its-own-cluster" semantics
+  // for any uncovered indices. Caller's `numClusters` is documented as
+  // best-effort, not strict.
+  let nextFallbackId = groups.length;
   for (let i = 0; i < N; i++) {
     if (assignments[i] === undefined) {
-      throw new Error(
-        `[hierarchical-cluster] internal error: vector index ${i} was not assigned to any cluster ` +
-          `(N=${N}, groups=${groups.length}); ml-hclust API contract may have changed`,
-      );
+      assignments[i] = { vectorIndex: i, clusterId: nextFallbackId++ };
     }
   }
 
-  return { assignments, numClusters: groups.length };
+  return { assignments, numClusters: nextFallbackId };
 }
 
 /**

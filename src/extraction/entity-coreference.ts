@@ -214,11 +214,12 @@ export async function runCoreferenceTick(
           ).run(ent.entityType);
         }
 
-        // Insert mention with deterministic ID for idempotency
-        // (entityId + leafId + surface uniqueness — collision tolerated since
-        // surface form variations may legitimately mention the entity multiple
-        // times in same leaf; we use INSERT OR IGNORE).
-        const mentionId = `men_${entityId}_${item.leaf_id}_${truncateForId(ent.surface, 8)}_${randomSuffix()}`;
+        // Group E adversarial Gap 3 fix: TRULY deterministic mention_id
+        // (no random suffix — was defeating the INSERT OR IGNORE
+        // idempotency guarantee, causing duplicate mentions on re-runs).
+        // Same surface in same leaf for same entity = SAME mention_id =
+        // INSERT OR IGNORE no-ops (correct semantics).
+        const mentionId = `men_${entityId}_${item.leaf_id}_${truncateForId(ent.surface, 16)}`;
         const result_run = db
           .prepare(
             `INSERT OR IGNORE INTO lcm_entity_mentions

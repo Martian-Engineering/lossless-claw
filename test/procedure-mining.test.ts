@@ -159,8 +159,8 @@ describe("procedure-mining — judge declines / errors", () => {
 describe("procedure-mining — small clusters skipped", () => {
   it("clusters below minOccurrences get skipReason='below-min-occurrences'", async () => {
     const db = setupDb();
-    // 5 leaves — below default minOccurrences (8)
-    const leaves = Array.from({ length: 5 }, (_, i) =>
+    // 3 leaves — below default minOccurrences (4 since Gap 4 fix)
+    const leaves = Array.from({ length: 3 }, (_, i) =>
       makeLeaf(`leaf_${i}`, PROCEDURE_CONTENT, [0.1, 0.1, 0.1]),
     );
     let judgeCalled = 0;

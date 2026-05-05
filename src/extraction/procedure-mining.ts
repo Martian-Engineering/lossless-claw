@@ -107,7 +107,12 @@ export interface MineProceduresReport {
   }>;
 }
 
-const DEFAULT_MIN_OCCURRENCES = 8;
+// Group E adversarial Gap 4: schema comment in src/db/migration.ts:1721
+// (B7/B8 amendment) says "empirically-tuned promotion threshold (4
+// occurrences per B8, was 8 in v4.1)". Aligning the runtime default to
+// 4 so small-corpus operators (Eva's regime today) actually see
+// procedures auto-promote. Per-call override still works.
+const DEFAULT_MIN_OCCURRENCES = 4;
 const DEFAULT_MIN_CONFIDENCE = 0.9;
 
 /**
@@ -206,15 +211,32 @@ export async function mineProceduresPass(
     detail.confirmed = judgement.confirmed;
     detail.confidence = judgement.confidence;
 
+    // Group E adversarial Gap 2 fix: validate confidence is a finite
+    // number in [0,1] BEFORE the threshold check OR the SQL bind.
+    // Real LLM JSON parsers occasionally drop fields under load —
+    // undefined would silently slip into 'draft' branch; the SQL bind
+    // would then throw TypeError mid-loop killing the whole pass.
+    // Treat missing/NaN/out-of-range as judge-rejected (safer than
+    // coercing to 0 — operator should know the LLM produced bad output).
+    const confidence = judgement.confidence;
+    const validConfidence =
+      typeof confidence === "number" && Number.isFinite(confidence) && confidence >= 0 && confidence <= 1;
+
     if (!judgement.confirmed) {
       report.judgeRejected++;
       detail.skipReason = `judge-declined: ${judgement.reason ?? "no reason"}`;
       report.clusters.push(detail);
       continue;
     }
+    if (!validConfidence) {
+      report.judgeRejected++;
+      detail.skipReason = `judge-bad-confidence: got ${String(confidence)}`;
+      report.clusters.push(detail);
+      continue;
+    }
 
     const status: "active" | "draft" =
-      judgement.confidence >= minConf ? "active" : "draft";
+      confidence >= minConf ? "active" : "draft";
     if (status === "active") report.activeProceduresWritten++;
     else report.draftProceduresWritten++;
 
