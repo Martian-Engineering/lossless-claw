@@ -31,7 +31,8 @@
     "LICENSE"
   ],
   "dependencies": {
-    "@sinclair/typebox": "0.34.48"
+    "@sinclair/typebox": "0.34.48",
+    "ml-hclust": "^4.0.0"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",
