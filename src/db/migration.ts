@@ -1159,6 +1159,31 @@ export function runLcmMigrations(
         }
       });
     }
+
+    // ── v4.1 schema additions ────────────────────────────────────────────────
+    // Each block resolves a specific amendment from architecture-v4.1.1.md.
+    // Tables are created idempotently so the migration is safe to re-run.
+    //
+    // v4.1.1 A9 — `lcm_worker_lock`: cross-process job lock for the worker
+    // sidecar (condensation, extraction, embedding backfill, theme
+    // consolidation, eval, profile rebuild). `last_heartbeat_at` is
+    // required by §0.5 fallback rule (gateway can take over only when
+    // BOTH `expires_at < now` AND `last_heartbeat_at < now - 300s`).
+    // See `src/concurrency/model.ts` for the invariants and constants.
+    runMigrationStep("ensureLcmWorkerLockTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_worker_lock (
+          job_kind TEXT PRIMARY KEY,
+          worker_id TEXT NOT NULL,
+          acquired_at TEXT NOT NULL DEFAULT (datetime('now')),
+          expires_at TEXT NOT NULL,
+          last_heartbeat_at TEXT NOT NULL DEFAULT (datetime('now')),
+          job_session_key TEXT,
+          job_metadata TEXT
+        )
+      `);
+    });
+
     db.exec(`COMMIT`);
     transactionActive = false;
   } catch (error) {
