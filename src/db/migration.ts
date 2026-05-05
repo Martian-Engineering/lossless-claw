@@ -1826,6 +1826,89 @@ export function runLcmMigrations(
     // ensureSummaryV41Columns above), so we run them after that step.
     // CREATE INDEX IF NOT EXISTS is idempotent.
     //
+    // ── v4.1 data cleanup migration (A.09) ─────────────────────────────────
+    // General cleanup that runs on any DB. Specifically per-user re-keying
+    // (e.g. Eva's 5 legacy convs → agent:main:main) is OPERATOR-DRIVEN via
+    // Group F's `/lcm reconcile-session-keys` — NOT hardcoded into upstream
+    // migration code.
+    //
+    // Steps (each idempotent + audited):
+    //   1. Backfill conversations.session_key NULL → 'legacy:conv_<id>'
+    //      Records each re-key in lcm_session_key_audit.
+    //   2. Backfill summaries.session_key='' → conversations.session_key
+    //      (JOIN). This targets the rows that A.02 added with the default
+    //      empty-string value.
+    runMigrationStep("backfillConversationSessionKeys", log, () => {
+      // Audit each re-key BEFORE applying it (so the audit row exists even
+      // if the UPDATE fails for any row). Uses ULID-shape audit_id derived
+      // from conversation_id for idempotency (re-running won't duplicate
+      // audit rows for already-keyed convs).
+      db.exec(`
+        INSERT OR IGNORE INTO lcm_session_key_audit
+          (audit_id, conversation_id, original_session_key, new_session_key, reason, applied_by)
+        SELECT
+          'audit-backfill-conv-' || conversation_id,
+          conversation_id,
+          NULL,
+          'legacy:conv_' || conversation_id,
+          'v4.1 A.09: NULL session_key backfilled with legacy: prefix to enable cross-conv lookups',
+          'migration'
+        FROM conversations
+        WHERE session_key IS NULL
+      `);
+      db.exec(`
+        UPDATE conversations
+        SET session_key = 'legacy:conv_' || conversation_id
+        WHERE session_key IS NULL
+      `);
+    });
+
+    runMigrationStep("backfillSummarySessionKeys", log, () => {
+      // For every summary whose session_key is still '' (the A.02 default),
+      // populate it from the parent conversation. After step 1 above ran,
+      // conversations.session_key is non-NULL for every conv, so this
+      // covers all summaries.
+      db.exec(`
+        UPDATE summaries
+        SET session_key = (
+          SELECT c.session_key FROM conversations c
+          WHERE c.conversation_id = summaries.conversation_id
+        )
+        WHERE session_key = ''
+      `);
+    });
+
+    // Forward-compat: if Eva's fork-side lcm_rollups table exists on this DB
+    // (not in upstream src/), backfill its session_key column similarly
+    // (the table is otherwise out-of-scope for v4.1 — synthesis_cache replaces it).
+    // We only touch it if it exists AND has the session_key column. No-op
+    // on a fresh upstream install.
+    runMigrationStep("backfillForkRollupsSessionKeys", log, () => {
+      const hasRollupsTable = db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' AND name = 'lcm_rollups'`,
+        )
+        .get() as { name?: string } | undefined;
+      if (!hasRollupsTable) return;
+
+      const rollupCols = db
+        .prepare(`PRAGMA table_info(lcm_rollups)`)
+        .all() as Array<{ name: string }>;
+      const hasSessionKeyCol = rollupCols.some((c) => c.name === "session_key");
+      if (!hasSessionKeyCol) return;
+
+      // Backfill: rollups with empty session_key get it from their parent conv.
+      db.exec(`
+        UPDATE lcm_rollups
+        SET session_key = COALESCE(
+          (SELECT c.session_key FROM conversations c
+           WHERE c.conversation_id = lcm_rollups.conversation_id),
+          ''
+        )
+        WHERE session_key = '' OR session_key IS NULL
+      `);
+    });
+
     // session_key index supports cross-conv assemble (PR #338 session-family
     // scope) + every retrieval surface that filters by scope.
     runMigrationStep("ensureSummariesV41Indexes", log, () => {
