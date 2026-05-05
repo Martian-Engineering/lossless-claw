@@ -806,40 +806,36 @@ describe("runLcmMigrations summary depth backfill", () => {
   it("creates message_parts when the bulk schema create did not", () => {
     const db = createTestDb("missing-message-parts.db");
     let skippedBulkMessagePartsCreate = false;
+    let messagePartsIndexesSkipped = 0;
 
     const instrumentedDb = {
       prepare(sql: string) {
         return db.prepare(sql);
       },
       exec(sql: string) {
-        const isInitialSchemaCreate =
+        // After the split-bulk migration change (#569), each schema statement
+        // is exec'd individually. Simulate Node sqlite's silent-abort failure
+        // mode by dropping the message_parts CREATE TABLE statement (and its
+        // dependent indexes) the FIRST time they appear — i.e. inside the
+        // initial schema loop. The belt-and-suspenders `ensureMessagePartsTable`
+        // step (introduced in #482) runs afterwards and recreates the table
+        // + indexes; let those through.
+        if (
           !skippedBulkMessagePartsCreate &&
-          sql.includes("CREATE TABLE IF NOT EXISTS message_parts") &&
-          sql.includes("CREATE TABLE IF NOT EXISTS lcm_migration_state");
-        if (!isInitialSchemaCreate) {
-          return db.exec(sql);
+          sql.trimStart().startsWith("CREATE TABLE IF NOT EXISTS message_parts")
+        ) {
+          skippedBulkMessagePartsCreate = true;
+          return undefined;
         }
-
-        // Simulate the Node sqlite bulk-exec failure mode by letting the rest of
-        // the schema block run while omitting only the original message_parts DDL.
-        skippedBulkMessagePartsCreate = true;
-        const schemaWithoutMessageParts = sql
-          .replace(
-            /\n\s*CREATE TABLE IF NOT EXISTS message_parts \([\s\S]*?\n\s*\);\n\s*\n\s*CREATE TABLE IF NOT EXISTS summary_messages/,
-            "\n\n    CREATE TABLE IF NOT EXISTS summary_messages",
-          )
-          .replace(
-            /\n\s*CREATE INDEX IF NOT EXISTS message_parts_message_idx ON message_parts \(message_id\);/,
-            "",
-          )
-          .replace(
-            /\n\s*CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts \(part_type\);/,
-            "",
-          );
-        expect(schemaWithoutMessageParts).not.toContain(
-          "CREATE TABLE IF NOT EXISTS message_parts",
-        );
-        return db.exec(schemaWithoutMessageParts);
+        if (
+          skippedBulkMessagePartsCreate &&
+          messagePartsIndexesSkipped < 2 &&
+          /^\s*CREATE INDEX IF NOT EXISTS message_parts_(message|type)_idx/.test(sql)
+        ) {
+          messagePartsIndexesSkipped += 1;
+          return undefined;
+        }
+        return db.exec(sql);
       },
     } as unknown as Parameters<typeof runLcmMigrations>[0];
 
@@ -887,6 +883,65 @@ describe("runLcmMigrations summary depth backfill", () => {
       .prepare(`SELECT text_content FROM message_parts WHERE part_id = ?`)
       .get("part-1") as { text_content?: string } | undefined;
     expect(partRow?.text_content).toBe("hello");
+  });
+
+  it("split-bulk migration: throws when an arbitrary CREATE TABLE statement aborts mid-block (#569)", () => {
+    // PR #482 added belt-and-suspenders for message_parts only. Issue #569
+    // requested the same hardening for every table — we addressed the root
+    // cause by splitting the bulk db.exec() into per-statement calls so a SQL
+    // error throws on its own instead of silently aborting the rest of the
+    // block. This test verifies that a simulated SQL failure on an arbitrary
+    // table CREATE (here: summary_messages) is now visible (throws) rather
+    // than swallowed.
+    const db = createTestDb("summary-messages-fail.db");
+
+    const failure = new Error("simulated SQL failure for summary_messages");
+    const instrumentedDb = {
+      prepare(sql: string) {
+        return db.prepare(sql);
+      },
+      exec(sql: string) {
+        if (sql.trimStart().startsWith("CREATE TABLE IF NOT EXISTS summary_messages")) {
+          throw failure;
+        }
+        return db.exec(sql);
+      },
+    } as unknown as Parameters<typeof runLcmMigrations>[0];
+
+    expect(() => runLcmMigrations(instrumentedDb, { fts5Available: false })).toThrowError(
+      failure,
+    );
+  });
+
+  it("split-bulk migration: each table from the bulk schema is created independently (#569)", () => {
+    // Verify every table that previously lived in the single bulk db.exec()
+    // block ends up created. Regression guard against accidentally dropping a
+    // statement out of the LCM_INITIAL_SCHEMA_STATEMENTS array.
+    const db = createTestDb("split-bulk-tables.db");
+    runLcmMigrations(db, { fts5Available: false });
+
+    const expectedTables = [
+      "conversations",
+      "messages",
+      "summaries",
+      "message_parts",
+      "summary_messages",
+      "summary_parents",
+      "context_items",
+      "large_files",
+      "conversation_bootstrap_state",
+      "conversation_compaction_telemetry",
+      "conversation_compaction_maintenance",
+      "lcm_migration_state",
+    ];
+    const rows = db
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${expectedTables
+          .map(() => "?")
+          .join(",")}) ORDER BY name`,
+      )
+      .all(...expectedTables) as Array<{ name: string }>;
+    expect(rows.map((r) => r.name).sort()).toEqual([...expectedTables].sort());
   });
 
   it("backfills legacy tool_call_id values from metadata.raw.call_id", () => {
