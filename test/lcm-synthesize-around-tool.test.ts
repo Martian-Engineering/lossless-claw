@@ -118,7 +118,7 @@ function setupDb(opts: { withVec0?: boolean } = {}): DatabaseSync {
   if (opts.withVec0) {
     tryLoadSqliteVec(db, { path: VEC0_PATH });
   }
-  runLcmMigrations(db, { fts5Available: false });
+  runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
   db.prepare(`INSERT INTO conversations (session_id, session_key) VALUES ('s1', 'sk1')`).run();
   db.prepare(`INSERT INTO conversations (session_id, session_key) VALUES ('s2', 'sk2')`).run();
   if (opts.withVec0) {

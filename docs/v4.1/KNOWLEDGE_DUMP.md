@@ -119,7 +119,9 @@ v4 RAG-leak adversarial agent finding: themes in the assemble pyramid violate th
 
 **If you ever feel tempted to put themes in the pyramid**: re-read v4-rag-leak-agent-findings.md. The architectural reasoning is solid.
 
-## What's wired vs what's deferred (cycle-2)
+## What's wired vs what's deferred (cycle-2 SHIPPED ✅, cycle-3 deferred ❌)
+
+> **Updated 2026-05-06**: cycle-2 wire commits all landed (`f0469b1` + `09ee7ad` + `7b4d4ad` + `ded2a60`). Items previously marked cycle-2 ❌ that have shipped are now cycle-2 ✅. Truly remaining work is now labeled cycle-3.
 
 | Component | Wired? | Notes |
 |---|---|---|
@@ -139,17 +141,21 @@ v4 RAG-leak adversarial agent finding: themes in the assemble pyramid violate th
 | `lcm_semantic_recall` agent tool | ✅ | C.01b (returns empty until backfill runs) |
 | `lcm_grep --mode hybrid` | ✅ | C.02b (degrades to FTS-only without embeddings) |
 | `lcm_describe` extension (sessionKey + timeRange) | ✅ | C.05 |
-| Entity coref worker auto-tick | ❌ | Cycle-2 — needs LLM injection through plugin lifecycle |
-| Procedure mining auto-tick | ❌ | Cycle-2 — same LLM injection concern |
-| Themes consolidation auto-tick | ❌ | Cycle-2 |
-| `lcm_synthesize_around` agent tool | ❌ | Cycle-2 — depends on Group D operator validation |
-| Worker_threads heartbeat isolation (v4.1.1 A9) | ❌ | Cycle-2 — current setInterval works for this cadence |
-| Quality eval (LLM judge) wiring in /lcm eval | ❌ | Cycle-2 — recall-only this PR |
-| `/lcm eval --register-set` CLI flag | ❌ | Cycle-2 — operator seeds via SQL today |
-| Best-of-N parallel limit | ❌ | Cycle-2 — currently fully parallel; could throttle |
-| Voyage rate-state actually consulted | ❌ | Cycle-2 — table exists but client doesn't read it |
+| `lcm_synthesize_around` agent tool | ✅ | Group C cycle-2 wire (commit 09ee7ad); 754-line impl in `src/tools/lcm-synthesize-around-tool.ts`; 13 tests; registered in manifest line 19; wired in `plugin/index.ts` line 2408 |
+| `lcm_recent_themes` agent tool | ✅ | Cycle-2 (commit ded2a60) |
+| `lcm_search_themes` agent tool | ✅ | Cycle-2 (commit 7b4d4ad) |
+| `lcm_theme_explain` agent tool | ✅ | Cycle-2 |
+| Entity coref worker auto-tick | ✅ | Cycle-2 (commit f0469b1 + 09ee7ad wire); LLM injected via worker-llm.ts adapter |
+| Procedure mining auto-tick | ❌ | Cycle-3 — worker exists; needs cron schedule + LLM credentials plumbed |
+| Themes consolidation auto-tick | ❌ | Cycle-3 — worker exists; needs idle-pass scheduler |
+| Worker_threads heartbeat isolation (v4.1.1 A9) | ❌ | Cycle-3 — current setInterval works for this cadence |
+| Quality eval (LLM judge) wiring in /lcm eval | ❌ | Cycle-3 — recall-only this PR |
+| `/lcm eval --register-set` CLI flag | ❌ | Cycle-3 — operator seeds via SQL today |
+| Best-of-N parallel limit | ❌ | Cycle-3 — currently fully parallel; could throttle |
+| Voyage rate-state actually consulted | ❌ | Cycle-3 — table exists but client doesn't read it |
+| Hard-delete for `runPurge --immediate` (true byte-deletion) | ❌ | Cycle-3 — currently soft-purge + condensed-rebuild enqueue |
 
-**The cycle-2 work is small (~1.5K LOC total) and well-bounded.** Each item is independent and can ship as its own PR.
+**Cycle-2 is shipped.** What remains (cycle-3) is small (~1.0K LOC total), well-bounded, and each item can ship as its own PR.
 
 ## Failure modes the architecture handles
 

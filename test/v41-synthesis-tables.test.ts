@@ -19,7 +19,7 @@ type FkInfo = {
 
 function setupDbWithRequiredFixtures(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
-  runLcmMigrations(db, { fts5Available: false });
+  runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
 
   // Seed a conversation + summary so FK references work
   db.prepare(`INSERT INTO conversations (session_id) VALUES ('test-session')`).run();
@@ -42,7 +42,7 @@ function setupDbWithRequiredFixtures(): DatabaseSync {
 describe("lcm_prompt_registry (v4.1 §3)", () => {
   it("creates table with memory_type + pass_kind CHECK constraints", () => {
     const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
     const cols = db.prepare("PRAGMA table_info(lcm_prompt_registry)").all() as ColumnInfo[];
     const byName = new Map(cols.map((c) => [c.name, c]));
     expect(byName.get("prompt_id")?.pk).toBe(1);
@@ -56,7 +56,7 @@ describe("lcm_prompt_registry (v4.1 §3)", () => {
 
   it("rejects invalid memory_type values", () => {
     const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
     expect(() =>
       db
         .prepare(
@@ -69,7 +69,7 @@ describe("lcm_prompt_registry (v4.1 §3)", () => {
 
   it("rejects invalid pass_kind values", () => {
     const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
     expect(() =>
       db
         .prepare(
@@ -82,7 +82,7 @@ describe("lcm_prompt_registry (v4.1 §3)", () => {
 
   it("UNIQUE constraint prevents duplicate (memory_type, tier_label, pass_kind, version)", () => {
     const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
     db.prepare(
       `INSERT INTO lcm_prompt_registry (prompt_id, memory_type, tier_label, pass_kind, version, template) VALUES (?, ?, ?, ?, ?, ?)`,
     ).run("pa", "episodic-condensed", "monthly", "single", 1, "v1");

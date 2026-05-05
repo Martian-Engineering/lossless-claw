@@ -8,6 +8,48 @@ After merge: the agent can answer "what did we work on three weeks ago?" or "wha
 
 ---
 
+## What ships in this PR (and what doesn't)
+
+**Agent tools (8 tools, all shipped + manifest-registered + plugin-wired + tested):**
+- ✅ `lcm_synthesize_around` — on-demand synthesis (the lcm_recent replacement) — `src/tools/lcm-synthesize-around-tool.ts` (754 LOC, 13 tests)
+- ✅ `lcm_semantic_recall` — pure semantic search via Voyage embeddings
+- ✅ `lcm_grep` (`mode='hybrid'`) — FTS + semantic + Voyage rerank merge
+- ✅ `lcm_describe` (`sessionKey` + `timeRange` extension) — corpus shape inspection
+- ✅ `lcm_recent_themes` — surfaces idle-consolidated themes
+- ✅ `lcm_search_themes` — text search over theme corpus
+- ✅ `lcm_theme_explain` — drills into a theme + its source leaves
+- ✅ `lcm_expand` (existing) — kept compatible with new schema
+
+**Operator commands (5, all shipped):**
+- ✅ `/lcm health` — subsystem snapshot (embeddings coverage, worker status, eval scores, drift, cache size, prewarm queue, **over-cap pending**)
+- ✅ `/lcm worker [status | tick embedding-backfill]` — worker introspection + manual triggers
+- ✅ `/lcm reconcile-session-keys [--apply | --list-candidates]` — interactive thread merging for legacy data
+- ✅ `/lcm eval [--baseline | --corpus_sample N]` — recall-only eval harness against query sets
+- ✅ `runPurge(leafIds, reason)` operator service — soft-suppress + cascade through 10 read paths
+
+**Worker auto-ticks (1 of 4 shipped this PR; 3 deferred):**
+- ✅ Embedding backfill autostart (gated on `VOYAGE_API_KEY`)
+- ✅ Entity coreference auto-tick (gated on `LCM_EXTRACTION_LLM_ENABLED`, default ON)
+- ❌ Procedure mining auto-tick — cycle-3 (worker exists; needs cron + LLM credentials plumbed)
+- ❌ Themes consolidation auto-tick — cycle-3 (worker exists; needs idle-pass scheduler)
+
+**Schema (21 new tables, all shipped):**
+- ✅ Migration runs at boot, idempotent, live-DB-verified twice
+- ✅ Backfill of existing data: 5 legacy convs re-keyed, 517 NULL session_keys backfilled, 8 stale telegram rollups marked
+
+**Cycle-3 deferred (each <300 LOC, scoped, ships as own PR):**
+- ❌ Procedure mining auto-tick wiring
+- ❌ Themes consolidation auto-tick wiring
+- ❌ `worker_threads` heartbeat isolation
+- ❌ `/lcm eval --register-set` CLI (operator can seed via SQL today)
+- ❌ Quality eval (LLM judge) wiring in `/lcm eval` (recall-only this PR)
+- ❌ Hard-delete for `runPurge --immediate` (currently soft-purge + condensed-rebuild enqueue)
+- ❌ Voyage rate-state actually consulted (table exists; client doesn't read it yet)
+
+The *user-facing replacement for lcm_recent* — a time-window synthesis tool agents can call — is `lcm_synthesize_around` and it ships in this PR.
+
+---
+
 ## Why we threw out lcm_recent (the motivation)
 
 We shipped `lcm_recent` in v3 (the rollup tool). The plan was: every period (day/week/month) gets summarized into one rollup; the rollup is what the agent reads back. Cheap, simple, deterministic.

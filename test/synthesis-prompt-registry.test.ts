@@ -11,7 +11,7 @@ import {
 
 function newDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
-  runLcmMigrations(db, { fts5Available: false });
+  runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
   return db;
 }
 

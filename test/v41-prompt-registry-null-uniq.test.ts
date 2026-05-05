@@ -38,7 +38,7 @@ describe("lcm_prompt_registry NULL-safe UNIQUE index (v4.1 B.fix Gap 2)", () => 
 
   it("creates the lcm_prompt_registry_uniq_lookup index", () => {
     const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
 
     const indexes = db
       .prepare(
@@ -52,7 +52,7 @@ describe("lcm_prompt_registry NULL-safe UNIQUE index (v4.1 B.fix Gap 2)", () => 
 
   it("rejects a second row with the same memory_type + NULL tier_label + pass_kind + version", () => {
     const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
 
     insertRegistryRow(db, {
       prompt_id: "p_1",
@@ -76,7 +76,7 @@ describe("lcm_prompt_registry NULL-safe UNIQUE index (v4.1 B.fix Gap 2)", () => 
 
   it("allows two NULL-tier_label rows that differ only in version", () => {
     const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
 
     insertRegistryRow(db, {
       prompt_id: "p_1",
@@ -102,7 +102,7 @@ describe("lcm_prompt_registry NULL-safe UNIQUE index (v4.1 B.fix Gap 2)", () => 
 
   it("treats NULL and 'monthly' as distinct (different tier_label values)", () => {
     const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
 
     insertRegistryRow(db, {
       prompt_id: "p_null",
@@ -128,7 +128,7 @@ describe("lcm_prompt_registry NULL-safe UNIQUE index (v4.1 B.fix Gap 2)", () => 
 
   it("the original UNIQUE constraint still catches non-NULL collisions", () => {
     const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
 
     insertRegistryRow(db, {
       prompt_id: "p_1",
@@ -152,8 +152,8 @@ describe("lcm_prompt_registry NULL-safe UNIQUE index (v4.1 B.fix Gap 2)", () => 
 
   it("is idempotent — running migrations twice does not fail", () => {
     const db = new DatabaseSync(":memory:");
-    runLcmMigrations(db, { fts5Available: false });
-    expect(() => runLcmMigrations(db, { fts5Available: false })).not.toThrow();
+    runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
+    expect(() => runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false })).not.toThrow();
     db.close();
   });
 });

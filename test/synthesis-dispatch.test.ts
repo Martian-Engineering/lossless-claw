@@ -12,7 +12,7 @@ import {
 
 function setupDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
-  runLcmMigrations(db, { fts5Available: false });
+  runLcmMigrations(db, { fts5Available: false, seedDefaultPrompts: false });
   // Ensure conversation + summary so target_summary_id FK is valid in audit
   db.prepare(`INSERT INTO conversations (session_id, session_key) VALUES ('s1', 'sk1')`).run();
   db.prepare(
