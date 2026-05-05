@@ -81,12 +81,10 @@ const LcmSemanticRecallSchema = Type.Object({
       },
     ),
   ),
-  excludeSuppressed: Type.Optional(
-    Type.Boolean({
-      description:
-        "If true (default), suppressed rows are excluded. Operator/admin tools may opt out by setting false; agent tools should leave the default.",
-    }),
-  ),
+  // v4.1 §10 + Group C adversarial Finding #2: excludeSuppressed is no
+  // longer exposed as an agent param. Agents must NOT see suppressed
+  // content via this surface — operator opt-out lives in /lcm purge
+  // and operator-only tools (Group F), not in agent tool params.
 });
 
 function readSummaryKinds(value: unknown): Array<"leaf" | "condensed"> | undefined {
@@ -172,8 +170,6 @@ export function createLcmSemanticRecallTool(input: {
       }
 
       const summaryKinds = readSummaryKinds(p.summaryKinds);
-      const excludeSuppressed =
-        typeof p.excludeSuppressed === "boolean" ? p.excludeSuppressed : true;
 
       const conversationIds = conversationScope.allConversations
         ? undefined
@@ -193,7 +189,10 @@ export function createLcmSemanticRecallTool(input: {
           since,
           before,
           summaryKinds,
-          excludeSuppressed,
+          // v4.1 §10 + Group C Finding #2: hardcoded true. Agent surface
+          // never sees suppressed; operator opt-out is via separate
+          // operator tools (Group F).
+          excludeSuppressed: true,
         });
 
         const lines: string[] = [];

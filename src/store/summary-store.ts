@@ -1364,6 +1364,12 @@ export class SummaryStore {
     const latinArgs = latinTokens.map((token) => `%${this.escapeLikeTerm(token)}%`);
 
     const where: string[] = [...cjkClauses, ...latinClauses];
+    // v4.1 §10 invariant + Group C adversarial Finding #1: searchLikeCjk
+    // is the 5TH search code path; was missed in C.03's "4 paths" comment.
+    // CJK queries fall through to this path when trigram returns empty
+    // OR when CJK segments are <3 chars; without this filter, suppressed
+    // rows leak through CJK searches.
+    where.push("suppressed_at IS NULL");
     const args: Array<string | number> = [...cjkArgs, ...latinArgs];
     appendConversationScopeConstraint({
       where,

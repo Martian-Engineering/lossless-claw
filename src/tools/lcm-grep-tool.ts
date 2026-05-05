@@ -294,9 +294,16 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
     const placeholders = summaryIds.map(() => "?").join(",");
     const rows = db
       .prepare(
+        // v4.1 §10 + Group C Finding #5 (defense in depth): hydrate
+        // step also filters suppressed_at IS NULL. Source FTS already
+        // filters this (C.03), but a row could be suppressed BETWEEN
+        // FTS query and hydrate. This guarantees the hybrid surface
+        // never returns content for a suppressed row even under that
+        // race.
         `SELECT summary_id, conversation_id, session_key, kind, content, token_count, created_at
            FROM summaries
-           WHERE summary_id IN (${placeholders})`,
+           WHERE summary_id IN (${placeholders})
+             AND suppressed_at IS NULL`,
       )
       .all(...summaryIds) as Array<{
       summary_id: string;

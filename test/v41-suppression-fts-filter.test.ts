@@ -85,6 +85,26 @@ describe("v4.1 C.03 — searchSummaries (LIKE fallback path) excludes suppressed
     db.close();
   });
 
+  it("CJK path (searchLikeCjk): suppressed rows hidden — Group C Finding #1", async () => {
+    const { db, store } = setupStore();
+    insertLeaf(db, "leaf_visible", "你好 hello rebase test");
+    insertLeaf(db, "leaf_suppressed", "你好 hello rebase suppressed");
+    db.prepare(`UPDATE summaries SET suppressed_at = ? WHERE summary_id = ?`).run(
+      "2026-05-05",
+      "leaf_suppressed",
+    );
+
+    // CJK queries route through searchCjkTrigram or searchLikeCjk based
+    // on whether trigram returns hits. Either path must filter suppressed.
+    const results = await store.searchSummaries({
+      query: "你好",
+      mode: "full_text",
+    });
+    expect(results.map((r) => r.summaryId)).toEqual(["leaf_visible"]);
+    expect(results.map((r) => r.summaryId)).not.toContain("leaf_suppressed");
+    db.close();
+  });
+
   it("multiple suppressed rows all hidden in same query", async () => {
     const { db, store } = setupStore();
     insertLeaf(db, "leaf_a", "alpha doc");
