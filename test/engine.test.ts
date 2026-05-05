@@ -4125,6 +4125,108 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(reconcileSpy).not.toHaveBeenCalled();
   });
 
+  it("ignores runtime-context custom messages before bootstrap budget and checkpointing", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-runtime-context-custom-message");
+    const hiddenRuntimeContext = {
+      role: "custom",
+      customType: "openclaw.runtime-context",
+      content: `hidden runtime context must not enter bootstrap accounting ${"x ".repeat(1000)}`,
+      display: false,
+    };
+    writeFileSync(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "visible user" }],
+          },
+        }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "visible assistant" }],
+          },
+        }),
+        JSON.stringify({ type: "message", message: hiddenRuntimeContext }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({ bootstrapMaxTokens: 100 });
+    const sessionId = "bootstrap-runtime-context-custom-message";
+
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result).toEqual({ bootstrapped: true, importedMessages: 2 });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "visible user",
+      "visible assistant",
+    ]);
+    expect(stored.map((message) => message.role)).toEqual(["user", "assistant"]);
+  });
+
+  it("ignores runtime-context custom messages in append-only bootstrap suffixes", async () => {
+    const sessionFile = createSessionFilePath("append-only-runtime-context-custom-message");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-append-only-runtime-context-custom-message";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        type: "message",
+        message: {
+          role: "custom",
+          customType: "openclaw.runtime-context",
+          content: "hidden runtime context must not be imported",
+          display: false,
+        },
+      })}\n`,
+      "utf8",
+    );
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).not.toHaveBeenCalled();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "tail user",
+    ]);
+  });
+
   it("refreshes the bootstrap checkpoint after afterTurn heartbeat pruning", async () => {
     const sessionFile = createSessionFilePath("append-only-after-turn-heartbeat-prune");
     const sm = SessionManager.open(sessionFile);

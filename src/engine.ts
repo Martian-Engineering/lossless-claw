@@ -1332,7 +1332,8 @@ function extractCanonicalBootstrapMessage(value: unknown): AgentMessage | null {
 }
 
 function extractBootstrapMessageCandidate(value: unknown): AgentMessage | null {
-  return extractCanonicalBootstrapMessage(value);
+  const message = extractCanonicalBootstrapMessage(value);
+  return message && hasPersistableMessageRole(message) ? message : null;
 }
 
 function parseBootstrapJsonl(raw: string, options?: {
