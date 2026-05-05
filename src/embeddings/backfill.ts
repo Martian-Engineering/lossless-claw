@@ -96,11 +96,23 @@ export interface BackfillOptions {
   /** Inject mock fetch for tests. */
   voyageFetch?: typeof fetch;
   /**
-   * Override Voyage client retry count. Default uses VoyageClient default
-   * (3 retries on 5xx). Set to 0 in tests that want to surface 5xx
-   * immediately without waiting for backoff.
+   * Override Voyage client retry count. Default 1 (so backfill caps at
+   * 2 total attempts per batch). The Voyage client's own default (3
+   * retries) means worst-case wall-time per batch can be ~4 minutes
+   * (4 attempts × 60s timeoutMs). With WORKER_LOCK_TTL_MS = 90s, that
+   * means a slow batch can let another worker GC the lock and
+   * double-process. Capping at 1 retry + reduced timeoutMs (below)
+   * keeps worst-case per-batch under 90s. (Group B adversarial Gap 1.)
+   * Tests can opt to 0 (surface 5xx immediately, no backoff).
    */
   voyageMaxRetries?: number;
+  /**
+   * Override Voyage per-attempt timeout. Default 30_000 ms (30s) here
+   * (vs Voyage client's 60s default). Combined with default
+   * voyageMaxRetries=1 → worst case per batch ≈ 2×30 + 0.5s backoff
+   * ≈ 60.5s, comfortably under WORKER_LOCK_TTL_MS=90s. (Group B Gap 1.)
+   */
+  voyageTimeoutMs?: number;
   /**
    * Max requests per second to Voyage. Default 0.5 (one request every
    * 2 seconds) — generous safety margin under Voyage tier-1 limits
@@ -319,7 +331,12 @@ export async function runBackfillTick(
             inputType: opts.inputType,
             apiKey: opts.voyageApiKey,
             fetch: opts.voyageFetch,
-            maxRetries: opts.voyageMaxRetries,
+            // Group B Gap 1 fix: cap per-batch wall-time below
+            // WORKER_LOCK_TTL_MS=90s. See voyageMaxRetries / voyageTimeoutMs
+            // option docs for rationale. Use ?? not || so an explicit 0
+            // (test scenarios) is honored.
+            maxRetries: opts.voyageMaxRetries ?? 1,
+            timeoutMs: opts.voyageTimeoutMs ?? 30_000,
           });
         } catch (e: unknown) {
           // Voyage error — record in skipped list, continue with next

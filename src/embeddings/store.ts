@@ -278,6 +278,18 @@ export function dropEmbeddingsTriggers(
  * INSERT OR IGNORE into lcm_embedding_profile. Idempotent. Caller passes
  * the dim we'll use for the vec0 table — this couples profile registration
  * to actual table creation so the two can't drift.
+ *
+ * v4.1 §13 / Group B Gap 2 fix: also enforces SLUG uniqueness across
+ * profiles. Two model names that sluggify to the same vec0 table name
+ * (e.g. "voyage-4-large" and "voyage_4_large" both → "voyage4large")
+ * would silently corrupt KNN by routing inserts to the same table —
+ * the second registration here throws to prevent that.
+ *
+ * Throws if:
+ *   - modelName fails MODEL_NAME_PATTERN regex
+ *   - dim is not a positive integer or > 4096 (Gap 8: align with ensureEmbeddingsTable)
+ *   - existing profile with same name has different dim
+ *   - existing profile has same SLUG but different name
  */
 export function registerEmbeddingProfile(
   db: DatabaseSync,
@@ -290,6 +302,30 @@ export function registerEmbeddingProfile(
   if (!Number.isInteger(dim) || dim <= 0) {
     throw new Error(`[embeddings.store] invalid dim ${dim}`);
   }
+  // Group B Gap 8 fix: align dim upper bound between
+  // registerEmbeddingProfile and ensureEmbeddingsTable.
+  if (dim > 4096) {
+    throw new Error(`[embeddings.store] invalid dim ${dim} (max 4096)`);
+  }
+
+  // Group B Gap 2 fix: check slug uniqueness BEFORE inserting. Compute
+  // slug, scan existing profiles, throw if a different model_name already
+  // has the same slug (would cause vec0 table-name collision).
+  const ourSlug = modelName.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const existingSlugCollision = db
+    .prepare(`SELECT model_name FROM lcm_embedding_profile WHERE model_name != ?`)
+    .all(modelName) as Array<{ model_name: string }>;
+  for (const other of existingSlugCollision) {
+    const otherSlug = other.model_name.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (otherSlug === ourSlug) {
+      throw new Error(
+        `[embeddings.store] slug collision: model_name "${modelName}" sluggifies to ` +
+          `"${ourSlug}" which is already used by registered model "${other.model_name}". ` +
+          `Two profiles cannot share a vec0 table name. Pick a model_name that sluggifies differently.`,
+      );
+    }
+  }
+
   // INSERT OR IGNORE: if a row exists with the same model_name, leave it
   // alone (whether the dim matches or not is checked next).
   db.prepare(
