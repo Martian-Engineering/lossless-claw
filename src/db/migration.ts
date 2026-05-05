@@ -1435,6 +1435,19 @@ export function runLcmMigrations(
       `);
     });
 
+    // v4.1 B.fix — Gap 2: catch NULL tier_label collisions that the
+    // table's UNIQUE constraint admits (SQLite treats multiple NULLs
+    // as distinct in UNIQUE). COALESCE-based index follows the same
+    // pattern used for lcm_synthesis_cache_lookup_uniq.
+    runMigrationStep("ensureLcmPromptRegistryNullSafeUniqueIdx", log, () => {
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS lcm_prompt_registry_uniq_lookup
+          ON lcm_prompt_registry (
+            memory_type, COALESCE(tier_label, ''), pass_kind, version
+          )
+      `);
+    });
+
     // v3.1 A8 + v4.1.1 B4 — lcm_synthesis_cache: rebuildable derived layer
     // for ad-hoc synthesize() output (custom ranges + filtered grep + yearly
     // tier per A2). Has `status='building'` single-flight (v3.1 A8) and

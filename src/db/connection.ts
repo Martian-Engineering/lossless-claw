@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { assertForeignKeysEnabled } from "../concurrency/model.js";
 
 type ConnectionKey = string;
 /**
@@ -51,6 +52,11 @@ function configureConnection(db: DatabaseSync): DatabaseSync {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
   db.exec("PRAGMA foreign_keys = ON");
+  // v4.1 B.fix — Gap 7: verify the PRAGMA actually took effect. Catches
+  // future regressions where a code path opens a connection that bypasses
+  // configureConnection and leaves FK enforcement off — making every
+  // ON DELETE CASCADE in the schema a silent no-op.
+  assertForeignKeysEnabled(db);
   // 64MB page cache (default 2MB is severely undersized for multi-GB databases
   // with concurrent agents). Memory is demand-allocated, released on close.
   db.exec("PRAGMA cache_size = -65536");
