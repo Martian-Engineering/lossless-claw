@@ -1394,6 +1394,167 @@ export function runLcmMigrations(
       `);
     });
 
+    // ── v4.1 synthesis layer (A.04) ─────────────────────────────────────────
+    // Prompt registry → synthesis cache (FK on prompt_id) → audit trail (FK
+    // on both summary_id and cache_id, CHECK that at least one is set).
+    // Tables created in dependency order so FKs work on first run.
+    //
+    // v4.1 §3 + v4.1.1 D items — lcm_prompt_registry: versioned prompts per
+    // memory_type × tier × pass_kind. Append-only (old versions deactivated,
+    // never deleted). bundle_version groups synchronized prompt sets so
+    // voice-consistency rebuild fires on bundle delta.
+    runMigrationStep("ensureLcmPromptRegistryTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_prompt_registry (
+          prompt_id TEXT NOT NULL PRIMARY KEY,
+          memory_type TEXT NOT NULL CHECK (memory_type IN (
+            'episodic-leaf',
+            'episodic-condensed',
+            'episodic-yearly',
+            'procedural-extract',
+            'prospective-extract',
+            'entity-extract',
+            'theme-consolidation'
+          )),
+          tier_label TEXT,
+          pass_kind TEXT NOT NULL CHECK (pass_kind IN ('single', 'verify_fidelity', 'best_of_n_judge')),
+          version INTEGER NOT NULL,
+          template TEXT NOT NULL,
+          model_recommendation TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          active INTEGER NOT NULL DEFAULT 1,
+          bundle_version INTEGER NOT NULL DEFAULT 1,
+          notes TEXT,
+          UNIQUE(memory_type, tier_label, pass_kind, version)
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_prompt_registry_active_idx
+          ON lcm_prompt_registry (memory_type, tier_label, pass_kind)
+          WHERE active = 1
+      `);
+    });
+
+    // v3.1 A8 + v4.1.1 B4 — lcm_synthesis_cache: rebuildable derived layer
+    // for ad-hoc synthesize() output (custom ranges + filtered grep + yearly
+    // tier per A2). Has `status='building'` single-flight (v3.1 A8) and
+    // prompt_id FK (v4.1.1 B2 fix — cache invalidation can be prompt-selective).
+    // UNIQUE lookup index (v4.1.1 B4) enables `INSERT OR IGNORE` cross-process
+    // single-flight pattern (loser of race reads back the in-flight row).
+    runMigrationStep("ensureLcmSynthesisCacheTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_synthesis_cache (
+          cache_id TEXT NOT NULL PRIMARY KEY,
+          session_key TEXT NOT NULL,
+          range_start TEXT NOT NULL,
+          range_end TEXT NOT NULL,
+          grep_filter TEXT,
+          leaf_fingerprint TEXT NOT NULL,
+          content TEXT,
+          entity_index TEXT NOT NULL DEFAULT '{}',
+          model_used TEXT NOT NULL,
+          prompt_id TEXT NOT NULL REFERENCES lcm_prompt_registry(prompt_id),
+          tier_label TEXT NOT NULL CHECK (tier_label IN ('year', 'custom', 'filtered')),
+          source_leaf_ids TEXT NOT NULL,
+          source_condensed_ids TEXT,
+          built_at TEXT NOT NULL DEFAULT (datetime('now')),
+          source_token_count INTEGER NOT NULL,
+          output_token_count INTEGER NOT NULL,
+          actual_range_covered TEXT NOT NULL,
+          leaf_count_synthesized INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'ready'
+            CHECK (status IN ('building', 'ready', 'failed')),
+          building_started_at TEXT,
+          failure_reason TEXT
+        )
+      `);
+      // UNIQUE lookup index (v4.1.1 B4): enables INSERT OR IGNORE for
+      // cross-process single-flight. Both gateway + worker can attempt to
+      // create the same cache row; exactly one wins.
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS lcm_synthesis_cache_lookup_uniq
+          ON lcm_synthesis_cache (session_key, range_start, range_end,
+                                  leaf_fingerprint, COALESCE(grep_filter, ''))
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_synthesis_cache_built_idx
+          ON lcm_synthesis_cache (session_key, built_at DESC)
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_synthesis_cache_status_building_idx
+          ON lcm_synthesis_cache (building_started_at)
+          WHERE status = 'building'
+      `);
+    });
+
+    // v3.1 A3 (extension) — lcm_cache_leaf_refs: inverse index for the
+    // proactive purge path. When a leaf is suppressed, query this table
+    // to find every cache_id that referenced it; delete those rows so
+    // stale content doesn't get served. CASCADE both directions so the
+    // refs go when either parent (cache_id or leaf_summary_id) is deleted.
+    runMigrationStep("ensureLcmCacheLeafRefsTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_cache_leaf_refs (
+          cache_id TEXT NOT NULL REFERENCES lcm_synthesis_cache(cache_id) ON DELETE CASCADE,
+          leaf_summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+          PRIMARY KEY (cache_id, leaf_summary_id)
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_cache_leaf_refs_by_leaf_idx
+          ON lcm_cache_leaf_refs (leaf_summary_id)
+      `);
+    });
+
+    // v4.1.1 B1 — lcm_synthesis_audit: per-pass log for synthesis (draft,
+    // verify_fidelity, best-of-N drafts, judge). pass_output is NULLable
+    // so it can be inserted BEFORE the LLM call returns (status='started');
+    // post-LLM UPDATE sets pass_output + status='completed'/'failed'.
+    // pass_session_id groups all passes of one logical synthesis attempt
+    // (helps debug best-of-N runs + GC orphaned partial sessions).
+    runMigrationStep("ensureLcmSynthesisAuditTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_synthesis_audit (
+          audit_id TEXT NOT NULL PRIMARY KEY,
+          pass_session_id TEXT NOT NULL,
+          target_summary_id TEXT REFERENCES summaries(summary_id) ON DELETE CASCADE,
+          target_cache_id TEXT REFERENCES lcm_synthesis_cache(cache_id) ON DELETE CASCADE,
+          prompt_id TEXT NOT NULL REFERENCES lcm_prompt_registry(prompt_id),
+          pass_kind TEXT NOT NULL,
+          pass_input_truncated TEXT NOT NULL,
+          pass_output TEXT,
+          status TEXT NOT NULL DEFAULT 'started'
+            CHECK (status IN ('started', 'completed', 'failed')),
+          model_used TEXT NOT NULL,
+          latency_ms INTEGER,
+          cost_usd_cents INTEGER,
+          last_error TEXT,
+          ran_at TEXT NOT NULL DEFAULT (datetime('now')),
+          CHECK (target_summary_id IS NOT NULL OR target_cache_id IS NOT NULL)
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_synthesis_audit_target_summary_idx
+          ON lcm_synthesis_audit (target_summary_id, ran_at DESC)
+          WHERE target_summary_id IS NOT NULL
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_synthesis_audit_target_cache_idx
+          ON lcm_synthesis_audit (target_cache_id, ran_at DESC)
+          WHERE target_cache_id IS NOT NULL
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_synthesis_audit_session_idx
+          ON lcm_synthesis_audit (pass_session_id)
+      `);
+      // GC index: orphaned 'started' rows stuck >1h (v4.1.1 B1 GC pattern)
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_synthesis_audit_started_gc_idx
+          ON lcm_synthesis_audit (ran_at)
+          WHERE status = 'started'
+      `);
+    });
+
     db.exec(`COMMIT`);
     transactionActive = false;
   } catch (error) {
