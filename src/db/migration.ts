@@ -1634,6 +1634,139 @@ export function runLcmMigrations(
       `);
     });
 
+    // ── v4.1 entity layer (A.06) ────────────────────────────────────────────
+    // Per v4.1 §7 + v4.1.1 B5/B6 — simplified entity schema (no separate
+    // lcm_aliases table; alternate surface forms denormalized into
+    // lcm_entities.alternate_surfaces JSON; entity embeddings live in
+    // vec0 with embedded_kind='entity'). Coreference uses entity-table
+    // lookup (B6), not the v4 ±N leaf positional window.
+    //
+    // entity_type is freeform TEXT (no CHECK constraint per v4.1.1
+    // §C — Eva's domain has session_keys, config_flags, error_codes,
+    // R-XXX agent IDs, etc. that don't fit a closed enum). The
+    // type_registry table tracks first-seen + occurrence count per type
+    // so the operator can review/normalize types post-hoc.
+    runMigrationStep("ensureLcmEntityTypeRegistryTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_entity_type_registry (
+          type_name TEXT NOT NULL PRIMARY KEY,
+          first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+          occurrence_count INTEGER NOT NULL DEFAULT 1
+        )
+      `);
+    });
+
+    // v4.1.1 B4 — UNIQUE index on (session_key, canonical_text COLLATE NOCASE)
+    // enables INSERT OR IGNORE for cross-process entity coref single-flight.
+    runMigrationStep("ensureLcmEntitiesTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_entities (
+          entity_id TEXT NOT NULL PRIMARY KEY,
+          session_key TEXT NOT NULL,
+          canonical_text TEXT NOT NULL,
+          entity_type TEXT NOT NULL,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          first_seen_in_summary_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
+          occurrence_count INTEGER NOT NULL DEFAULT 1,
+          alternate_surfaces TEXT,
+          metadata TEXT
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_entities_lookup_idx
+          ON lcm_entities (session_key, entity_type, last_seen_at DESC)
+      `);
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS lcm_entities_canonical_uniq
+          ON lcm_entities (session_key, canonical_text COLLATE NOCASE)
+      `);
+    });
+
+    runMigrationStep("ensureLcmEntityMentionsTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_entity_mentions (
+          mention_id TEXT NOT NULL PRIMARY KEY,
+          entity_id TEXT NOT NULL REFERENCES lcm_entities(entity_id) ON DELETE CASCADE,
+          summary_id TEXT NOT NULL REFERENCES summaries(summary_id) ON DELETE CASCADE,
+          surface_form TEXT NOT NULL,
+          span_start INTEGER,
+          span_end INTEGER,
+          mentioned_at TEXT NOT NULL
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_entity_mentions_by_entity_idx
+          ON lcm_entity_mentions (entity_id, mentioned_at DESC)
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_entity_mentions_by_summary_idx
+          ON lcm_entity_mentions (summary_id)
+      `);
+    });
+
+    // v4.1 §7.1 + v4.1.1 B7/B8 — procedures with empirically-tuned
+    // promotion threshold (4 occurrences per B8, was 8 in v4.1) and
+    // status lifecycle. extraction_source distinguishes auto-extracted
+    // procedures from manually-flagged ones (lcm_remember_procedure).
+    runMigrationStep("ensureLcmProceduresTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_procedures (
+          procedure_id TEXT NOT NULL PRIMARY KEY,
+          session_key TEXT NOT NULL,
+          name TEXT NOT NULL,
+          steps TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          source_leaf_ids TEXT NOT NULL,
+          extracted_at TEXT NOT NULL DEFAULT (datetime('now')),
+          status TEXT NOT NULL DEFAULT 'draft'
+            CHECK (status IN ('draft', 'active', 'stale', 'archived', 'deprecated')),
+          occurrence_count INTEGER NOT NULL DEFAULT 1,
+          confidence REAL,
+          extracted_by_pass_id TEXT,
+          extraction_source TEXT NOT NULL DEFAULT 'auto'
+            CHECK (extraction_source IN ('auto', 'manual'))
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_procedures_lookup_idx
+          ON lcm_procedures (session_key, name, status)
+      `);
+    });
+
+    // v3 + v4.1 §7.3 + v4.1.1 B11 — intentions; resolution_text added in
+    // v4.1.1 B11 so lcm_resolve_intention can capture WHY an intention
+    // was fulfilled/cancelled. NOTE: source_leaf_id was NOT NULL in v4.1
+    // spec — relaxed here to NULL-allowed since suppression sets
+    // suppressed_at on the leaf (NOT delete) AND ON DELETE SET NULL only
+    // makes sense if the column allows NULL. v4.1.1 §C item.
+    runMigrationStep("ensureLcmIntentionsTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_intentions (
+          intention_id TEXT NOT NULL PRIMARY KEY,
+          session_key TEXT NOT NULL,
+          text TEXT NOT NULL,
+          target_date TEXT,
+          source_leaf_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
+          status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'fulfilled', 'cancelled')),
+          resolution_text TEXT,
+          resolved_at TEXT,
+          extracted_at TEXT NOT NULL DEFAULT (datetime('now')),
+          surfaced_at TEXT
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_intentions_due_idx
+          ON lcm_intentions (session_key, target_date)
+          WHERE status = 'pending'
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_intentions_session_status_idx
+          ON lcm_intentions (session_key, status)
+      `);
+    });
+
     db.exec(`COMMIT`);
     transactionActive = false;
   } catch (error) {
