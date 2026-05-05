@@ -1767,6 +1767,60 @@ export function runLcmMigrations(
       `);
     });
 
+    // ── v4.1 embedding registry tables (A.07) ───────────────────────────────
+    // Per v4.1 §1 + v4.1.1 A5/A7 — these are the MANAGED tables (regular
+    // SQLite tables, not vec0 virtual). The vec0 table itself
+    // (`lcm_embeddings_<model_slug>` virtual table) defers to Group B
+    // because creating a vec0 table requires the sqlite-vec extension to
+    // be loaded — which is best-effort (graceful degrade per v4.1.1 A7
+    // splits the migration into Transaction 1 = required schema (this
+    // file) + Transaction 2 = vec0 + triggers (loaded at runtime in
+    // src/embeddings/store.ts during Group B)).
+    //
+    // lcm_embedding_profile: registry of embedding models (active/archive).
+    // Used by Group B's profile-versioning logic. seed row added during
+    // Group B startup when sqlite-vec successfully loads.
+    runMigrationStep("ensureLcmEmbeddingProfileTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_embedding_profile (
+          model_name TEXT NOT NULL PRIMARY KEY,
+          dim INTEGER NOT NULL,
+          registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+          active INTEGER NOT NULL DEFAULT 1,
+          archive_after TEXT
+        )
+      `);
+    });
+
+    // lcm_embedding_meta: sidecar for non-vector queries (model attribution,
+    // backfill progress, archival state). Composite PK supports parallel
+    // rows during model-bump cutover (one summary embedded under both
+    // old + new model). NOTE: no FK to summaries (polymorphic — embedded_id
+    // can also reference lcm_entities.entity_id or lcm_themes.theme_id).
+    // Polymorphic-orphan cleanup deferred to Group B's idle pass.
+    runMigrationStep("ensureLcmEmbeddingMetaTable", log, () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS lcm_embedding_meta (
+          embedded_id TEXT NOT NULL,
+          embedded_kind TEXT NOT NULL CHECK (embedded_kind IN ('summary', 'entity', 'theme')),
+          embedding_model TEXT NOT NULL REFERENCES lcm_embedding_profile(model_name),
+          embedded_at TEXT NOT NULL DEFAULT (datetime('now')),
+          source_token_count INTEGER NOT NULL,
+          archived INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (embedded_id, embedded_kind, embedding_model)
+        )
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_embedding_meta_active_idx
+          ON lcm_embedding_meta (embedding_model, embedded_at DESC)
+          WHERE archived = 0
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS lcm_embedding_meta_by_kind_idx
+          ON lcm_embedding_meta (embedded_kind, embedded_id)
+      `);
+    });
+
     db.exec(`COMMIT`);
     transactionActive = false;
   } catch (error) {
