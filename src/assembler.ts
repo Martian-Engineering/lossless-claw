@@ -123,6 +123,50 @@ function isBlankContent(content: unknown[]): boolean {
   return content.every(isBlankTextBlock);
 }
 
+/** Returns true when a message's `content` is an empty/blank shape that the
+ *  Bedrock Converse API (and other strict providers) will reject.
+ *
+ *  Specifically guards against:
+ *  - `content === undefined` or `content === null`
+ *  - `content === ""` or whitespace-only string
+ *  - `content === []` (empty array) for **any** role
+ *  - For `assistant`: arrays that are thinking-only or blank-text-only,
+ *    since the provider layer strips reasoning blocks and forwards a
+ *    `[{type:"text", text:""}]` shape, both of which Bedrock rejects.
+ *
+ *  Bedrock Converse rejects empty `user` and `toolResult` content arrays
+ *  with the literal wording:
+ *    `The content field in the Message object at messages.N is empty.
+ *     Add a ContentBlock object to the content field and try again.`
+ *  This wording is reproducible only when `content === []`; bare strings or
+ *  non-empty arrays produce different validation errors. The pre-existing
+ *  filter only protected the assistant role, leaving an asymmetric gap that
+ *  fires during incremental compaction when an empty user/toolResult shape
+ *  can be momentarily produced upstream.
+ *
+ * @internal Exported for testing only.
+ */
+export function isEmptyMessageContent(message: {
+  role?: unknown;
+  content?: unknown;
+}): boolean {
+  if (!message) return true;
+  const content = message.content;
+  if (content === undefined || content === null) return true;
+  if (Array.isArray(content)) {
+    if (content.length === 0) return true;
+    if (message.role === "assistant") {
+      if (isThinkingOnlyContent(content)) return true;
+      if (isBlankContent(content)) return true;
+    }
+    return false;
+  }
+  if (typeof content === "string") {
+    return content.trim() === "";
+  }
+  return false;
+}
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface AssembleContextInput {
@@ -1273,23 +1317,22 @@ export class ContextAssembler {
       return entry;
     });
 
-    // Filter out assistant messages with empty, blank, or thinking-only
-    // content — these can occur when tool-use-only turns are stored with
-    // content="" and zero message_parts, when filterNonFreshAssistantToolCalls
-    // strips all tool_use blocks, when a turn contains only thinking/reasoning
-    // blocks that will be stripped by the provider layer, or when the stored
-    // content is a `[{type:"text", text:""}]` blank-text shape. Anthropic and
-    // Bedrock reject any of these as empty.
+    // Filter messages whose content normalises to no content — these can occur
+    // when tool-use-only turns are stored with content="" and zero
+    // message_parts, when filterNonFreshAssistantToolCalls strips all tool_use
+    // blocks, when an assistant turn contains only thinking/reasoning blocks
+    // that will be stripped by the provider layer, when the stored content is
+    // a `[{type:"text", text:""}]` blank-text shape, or when an upstream layer
+    // momentarily produces an empty `user` or `toolResult` content array
+    // during incremental compaction. Anthropic and Bedrock reject any of these
+    // as empty; Bedrock's specific wording for `content === []` is
+    // `The content field in the Message object at messages.N is empty.
+    //  Add a ContentBlock object to the content field and try again.`
+    // Dropping a `toolResult` here is safe — sanitizeToolUseResultPairing runs
+    // immediately below and re-pairs missing results with a synthetic
+    // `[lossless-claw] missing tool result …` placeholder.
     const cleanedEntries = normalizedEntries.filter(
-      (entry) =>
-        !(
-          entry.message?.role === "assistant" &&
-          (Array.isArray(entry.message.content)
-            ? entry.message.content.length === 0 ||
-              isThinkingOnlyContent(entry.message.content) ||
-              isBlankContent(entry.message.content)
-            : !entry.message.content || entry.message.content.trim() === "")
-        ),
+      (entry) => !isEmptyMessageContent(entry.message),
     );
     const cleaned = cleanedEntries.map((entry) => entry.message);
     const preSanitizeEvictableMessages = cleanedEntries
