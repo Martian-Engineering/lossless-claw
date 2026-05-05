@@ -45,6 +45,7 @@ import {
   type EvalMode,
   type RunEvalArgs,
 } from "../operator/eval-runner.js";
+import { getWorkerStatusSnapshot } from "../operator/worker-orchestrator.js";
 import { runHybridSearch } from "../embeddings/hybrid-search.js";
 import { vec0Version } from "../embeddings/store.js";
 import { SummaryStore } from "../store/summary-store.js";
@@ -95,6 +96,7 @@ type ParsedLcmCommand =
   | { kind: "doctor"; apply: boolean }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "health" }
+  | { kind: "worker_status" }
   | { kind: "reconcile_session_keys_list" }
   | {
       kind: "reconcile_session_keys_apply";
@@ -483,6 +485,25 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
         allowMainSession: parsed.allowMainSession,
       };
     }
+    case "worker": {
+      // /lcm worker [status]
+      // Currently only `status` is wired (Final review #3 partial fix).
+      // Manual `tick <kind>` is deferred to a follow-up wiring commit
+      // — the underlying orchestrator service is in src/operator/
+      // worker-orchestrator.ts; production wiring needs an LLM-call
+      // injection path that's not yet plumbed through the plugin.
+      if (rest.length === 0 || rest[0]?.toLowerCase() === "status") {
+        return { kind: "worker_status" };
+      }
+      return {
+        kind: "help",
+        error:
+          `\`${VISIBLE_COMMAND} worker\` currently supports \`status\` only. ` +
+          `Manual \`tick <kind>\` deferred to follow-up; backfill / extraction / ` +
+          `procedure-mining / themes-consolidation services exist in src/operator/ ` +
+          `but are not yet wired into the plugin lifecycle (cycle-2 work).`,
+      };
+    }
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
@@ -514,7 +535,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, health, reconcile-session-keys, eval, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, health, worker, reconcile-session-keys, eval, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -1522,6 +1543,48 @@ function buildHealthText(params: { db: DatabaseSync }): string {
   return lines.join("\n");
 }
 
+function buildWorkerStatusText(params: { db: DatabaseSync }): string {
+  // Final review #3 partial fix: surface worker-orchestrator state.
+  // Manual `tick <kind>` deferred — the underlying services exist
+  // (src/operator/worker-orchestrator.ts) but their LLM-call wiring
+  // through the plugin lifecycle is cycle-2 work.
+  const snapshot = getWorkerStatusSnapshot(params.db);
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "### Worker Status",
+    "",
+  ];
+  for (const [kind, lockInfo] of Object.entries(snapshot.locks)) {
+    if (lockInfo) {
+      lines.push(
+        `- **${kind}**: HELD by \`${lockInfo.workerId}\` (acquired ${lockInfo.acquiredAt}, expires ${lockInfo.expiresAt}); jobMetadata=${lockInfo.jobMetadata ?? "(none)"}`,
+      );
+    } else {
+      lines.push(`- **${kind}**: idle (no lock held)`);
+    }
+  }
+  lines.push("");
+  lines.push("### Pending Work");
+  lines.push("");
+  lines.push(
+    `- Embedding backfill pending: ${snapshot.pending.embeddingBackfill === -1 ? "(model not specified)" : snapshot.pending.embeddingBackfill}`,
+  );
+  lines.push(`- Extraction queue: ${snapshot.pending.extractionQueue}`);
+  lines.push("");
+  lines.push("### Note");
+  lines.push("");
+  lines.push(
+    "Manual `/lcm worker tick <kind>` is not yet wired in this PR. The worker " +
+      "orchestrator service (`src/operator/worker-orchestrator.ts`) exists and " +
+      "is testable, but production wiring (including LLM-call injection for " +
+      "extraction / procedure-mining / themes) is deferred to a cycle-2 commit. " +
+      "Today, view-only status reporting; for manual ticks against a dev DB, " +
+      "import `tickEmbeddingBackfill` etc. from `src/operator/worker-orchestrator.ts`.",
+  );
+  return lines.join("\n");
+}
+
 function buildReconcileListText(params: { db: DatabaseSync }): string {
   const candidates = listLegacyCandidates(params.db);
   const lines: string[] = [
@@ -2084,6 +2147,8 @@ export function createLcmCommand(params: {
             : { text: await buildDoctorCleanersText({ db: await getDb() }) };
         case "health":
           return { text: buildHealthText({ db: await getDb() }) };
+        case "worker_status":
+          return { text: buildWorkerStatusText({ db: await getDb() }) };
         case "reconcile_session_keys_list":
           return { text: buildReconcileListText({ db: await getDb() }) };
         case "reconcile_session_keys_apply":

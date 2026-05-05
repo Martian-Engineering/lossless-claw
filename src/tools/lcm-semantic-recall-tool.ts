@@ -193,6 +193,13 @@ export function createLcmSemanticRecallTool(input: {
           // never sees suppressed; operator opt-out is via separate
           // operator tools (Group F).
           excludeSuppressed: true,
+          // Final review Finding #2: cap Voyage wall-time budget on agent
+          // hot path. Default Voyage client uses 3 retries × 60s = up to
+          // ~244s — would block the agent's turn for minutes if Voyage
+          // hangs/throttles. 1 retry × 15s ≈ 30s worst case (15s + 0.5s
+          // backoff + 15s).
+          voyageMaxRetries: 1,
+          voyageTimeoutMs: 15_000,
         });
 
         const lines: string[] = [];

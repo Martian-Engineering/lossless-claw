@@ -491,13 +491,22 @@ export class SummaryStore {
     return toSummaryRecord(row);
   }
 
-  async getSummary(summaryId: string): Promise<SummaryRecord | null> {
+  async getSummary(
+    summaryId: string,
+    opts: { includeSuppressed?: boolean } = {},
+  ): Promise<SummaryRecord | null> {
+    // v4.1 §10 + Final adversarial Finding #1 (BLOCKER): exclude
+    // suppressed by default. Internal cleanup code (integrity.ts,
+    // compaction.ts internal paths) opts in to includeSuppressed=true
+    // when it legitimately needs to inspect suppressed rows. Agent-facing
+    // surfaces (retrieval.ts, assembler.ts) must NOT pass the flag.
+    const suppressedClause = opts.includeSuppressed ? "" : "AND suppressed_at IS NULL";
     const row = this.db
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, created_at
                 , descendant_token_count, source_message_token_count, model
-       FROM summaries WHERE summary_id = ?`,
+       FROM summaries WHERE summary_id = ? ${suppressedClause}`,
       )
       .get(summaryId) as unknown as SummaryRow | undefined;
     return row ? toSummaryRecord(row) : null;
@@ -692,7 +701,14 @@ export class SummaryStore {
 
     return candidates;
   }
-  async getSummaryChildren(parentSummaryId: string): Promise<SummaryRecord[]> {
+  // v4.1 §10 + Final review #1 fix: structural lineage methods exclude
+  // suppressed by default. Caller (integrity / compaction) opts in via
+  // includeSuppressed=true.
+  async getSummaryChildren(
+    parentSummaryId: string,
+    opts: { includeSuppressed?: boolean } = {},
+  ): Promise<SummaryRecord[]> {
+    const suppressedClause = opts.includeSuppressed ? "" : "AND s.suppressed_at IS NULL";
     const rows = this.db
       .prepare(
         `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
@@ -700,7 +716,7 @@ export class SummaryStore {
                 , s.descendant_token_count, s.source_message_token_count, s.model
        FROM summaries s
        JOIN summary_parents sp ON sp.summary_id = s.summary_id
-       WHERE sp.parent_summary_id = ?
+       WHERE sp.parent_summary_id = ? ${suppressedClause}
        ORDER BY sp.ordinal`,
       )
       .all(parentSummaryId) as unknown as SummaryRow[];
@@ -710,7 +726,11 @@ export class SummaryStore {
   // NOTE: historical naming is confusing here.
   // getSummaryParents(summaryId) returns the source summaries compacted into
   // `summaryId`. Expansion should use this direction for replay.
-  async getSummaryParents(summaryId: string): Promise<SummaryRecord[]> {
+  async getSummaryParents(
+    summaryId: string,
+    opts: { includeSuppressed?: boolean } = {},
+  ): Promise<SummaryRecord[]> {
+    const suppressedClause = opts.includeSuppressed ? "" : "AND s.suppressed_at IS NULL";
     const rows = this.db
       .prepare(
         `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
@@ -718,7 +738,7 @@ export class SummaryStore {
                 , s.descendant_token_count, s.source_message_token_count, s.model
        FROM summaries s
        JOIN summary_parents sp ON sp.parent_summary_id = s.summary_id
-       WHERE sp.summary_id = ?
+       WHERE sp.summary_id = ? ${suppressedClause}
        ORDER BY sp.ordinal`,
       )
       .all(summaryId) as unknown as SummaryRow[];
@@ -766,6 +786,7 @@ export class SummaryStore {
            ) AS child_count
          FROM subtree
          JOIN summaries s ON s.summary_id = subtree.summary_id
+         WHERE s.suppressed_at IS NULL
          ORDER BY subtree.depth_from_root ASC, subtree.path ASC, s.created_at ASC`,
       )
       .all(summaryId) as unknown as SummarySubtreeRow[];

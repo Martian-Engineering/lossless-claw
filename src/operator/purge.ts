@@ -208,13 +208,24 @@ function runSoftPurge(
 
     // Flag condensed summaries containing suppressed leaves.
     // summary_parents schema: (summary_id = condensed, parent_summary_id = leaf)
-    // So we look up condensed via WHERE parent_summary_id IN (purged leaves).
     db.prepare(
       `UPDATE summaries SET contains_suppressed_leaves = 1
          WHERE kind = 'condensed' AND summary_id IN (
            SELECT DISTINCT summary_id FROM summary_parents
              WHERE parent_summary_id IN (${placeholders})
          )`,
+    ).run(...leafIds);
+
+    // v4.1 §10 + Final review #1 fix: clean up context_items references
+    // so the assembler hot path can't re-emit suppressed content. The
+    // assembler's resolveSummaryItem reads summaries by ID via
+    // context_items.summary_id; if the entry stays, even with a
+    // suppressed source, we'd need defense-in-depth at the read layer.
+    // Removing the context_items rows AT PURGE TIME is the cleanest cut
+    // — prevents any future read from resolving them.
+    db.prepare(
+      `DELETE FROM context_items
+         WHERE item_type = 'summary' AND summary_id IN (${placeholders})`,
     ).run(...leafIds);
 
     db.exec("COMMIT");
@@ -276,6 +287,14 @@ function runImmediatePurge(
       `UPDATE summaries SET suppressed_at = datetime('now'), suppress_reason = ?
          WHERE summary_id IN (${placeholders})`,
     ).run(reason, ...leafIds);
+
+    // Clean up context_items references (Final review #1 fix; same
+    // as soft mode — assembler must not be able to re-emit purged
+    // content via resolveSummaryItem).
+    db.prepare(
+      `DELETE FROM context_items
+         WHERE item_type = 'summary' AND summary_id IN (${placeholders})`,
+    ).run(...leafIds);
 
     // 2. Find + flag affected condensed summaries (also same as soft)
     const affectedCondensedRows = db

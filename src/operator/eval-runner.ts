@@ -87,7 +87,15 @@ export async function runEval(
   if (!querySet) {
     throw new EvalRunnerError(
       "missing_query_set",
-      `[eval] query set ${encodeQuerySetId(args.querySetIdentity)} is not registered — run /lcm reconcile-session-keys --register-set or seed via SQL first`,
+      // Final review Finding #4 fix: previous error pointed at a flag
+      // (/lcm reconcile-session-keys --register-set) that doesn't exist.
+      // Operators seed the eval corpus today via the registerQuerySet()
+      // service (not via /lcm). The CLI seed flag is deferred to cycle-2.
+      `[eval] query set ${encodeQuerySetId(args.querySetIdentity)} is not registered. ` +
+        `Seed via the registerQuerySet() service (Node REPL: ` +
+        `registerQuerySet(db, {name, version}, queries[])) ` +
+        `or via SQL INSERT into lcm_eval_query_set + lcm_eval_query. ` +
+        `The /lcm CLI seed flag is deferred to a cycle-2 follow-up.`,
     );
   }
   if (querySet.queries.length === 0) {

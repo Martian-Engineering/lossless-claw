@@ -84,6 +84,11 @@ export interface HybridSearchOptions {
   voyageApiKey?: string;
   voyageFetch?: typeof fetch;
   voyageMaxRetries?: number;
+  /**
+   * Voyage per-attempt timeout in ms. Agent-tool callers should cap
+   * this (e.g. 15s) to avoid blocking the agent's turn.
+   */
+  voyageTimeoutMs?: number;
 
   // Semantic-side overrides (rarely used; passed through to semantic-search)
   semantic?: Pick<
@@ -208,6 +213,7 @@ export async function runHybridSearch(
         voyageApiKey: opts.voyageApiKey,
         voyageFetch: opts.voyageFetch,
         voyageMaxRetries: opts.voyageMaxRetries,
+        voyageTimeoutMs: opts.voyageTimeoutMs,
         inputType: opts.semantic?.inputType,
         queryVector: opts.semantic?.queryVector,
         embeddedKinds: ["summary"],
@@ -295,6 +301,7 @@ export async function runHybridSearch(
         apiKey: opts.voyageApiKey,
         fetch: opts.voyageFetch,
         maxRetries: opts.voyageMaxRetries,
+        timeoutMs: opts.voyageTimeoutMs,
       });
       voyageTokensConsumed += rerankResp.totalTokens;
       // Apply rerank scores; return only items that survived rerank

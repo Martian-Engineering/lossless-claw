@@ -76,7 +76,8 @@ export class ReconcileError extends Error {
     public readonly kind:
       | "no_from_keys"
       | "missing_reason"
-      | "main_session_blocked",
+      | "main_session_blocked"
+      | "active_conflict",
     message: string,
   ) {
     super(message);
@@ -117,6 +118,42 @@ export function reconcileSessionKeys(
     throw new ReconcileError(
       "main_session_blocked",
       "[reconcile] refusing to write into agent:main:main without allowMainSession=true",
+    );
+  }
+
+  // Final review Finding #5 fix: pre-check for active-session UNIQUE
+  // collision. The `conversations_active_session_key_idx` partial UNIQUE
+  // index over (session_key) WHERE active=1 AND session_key IS NOT NULL
+  // would fire mid-UPDATE with a raw SQLite error. Operators see a
+  // clear typed error instead, with a workaround.
+  const fromPlaceholders = args.fromSessionKeys.map(() => "?").join(",");
+  const activeFromCount = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM conversations
+           WHERE session_key IN (${fromPlaceholders}) AND active = 1`,
+      )
+      .get(...args.fromSessionKeys) as { n: number }
+  ).n;
+  const activeToCount = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM conversations
+           WHERE session_key = ? AND active = 1`,
+      )
+      .get(args.toSessionKey) as { n: number }
+  ).n;
+  // After-merge active count = activeFromCount + activeToCount; UNIQUE
+  // partial index requires this be ≤ 1.
+  if (activeFromCount + activeToCount > 1) {
+    throw new ReconcileError(
+      "active_conflict",
+      `[reconcile] cannot merge ${activeFromCount} active conversation(s) from ` +
+        `${args.fromSessionKeys.join(",")} into ${args.toSessionKey} (already has ${activeToCount} active) — ` +
+        `the conversations.session_key UNIQUE-active partial index requires at most 1 active per session_key. ` +
+        `Workaround: archive all but one conv first via ` +
+        `UPDATE conversations SET active=0, archived_at=datetime('now') WHERE conversation_id=?, ` +
+        `then re-run reconcile.`,
     );
   }
 

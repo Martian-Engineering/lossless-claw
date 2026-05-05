@@ -395,6 +395,12 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
       since,
       before,
       ftsSearch,
+      // Final review Finding #2: cap Voyage wall-time on agent hot path.
+      // Embed call + rerank call each capped at 15s × 1 retry ≈ 30s
+      // worst case per call. Default Voyage client (3×60s) would block
+      // agent turn for minutes if Voyage throttles.
+      voyageMaxRetries: 1,
+      voyageTimeoutMs: 15_000,
     });
   } catch (error) {
     if (error instanceof VoyageError && error.kind === "auth") {

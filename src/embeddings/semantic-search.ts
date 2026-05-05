@@ -83,6 +83,12 @@ export interface SemanticSearchOptions {
   voyageApiKey?: string;
   voyageFetch?: typeof fetch;
   voyageMaxRetries?: number;
+  /**
+   * Voyage per-attempt timeout in ms. Default = Voyage client default
+   * (60s). Agent-tool callers should cap this (e.g. 15s) to avoid
+   * blocking the agent's turn on a slow Voyage response.
+   */
+  voyageTimeoutMs?: number;
   /** Override `inputType` (default 'query' — asymmetric retrieval). */
   inputType?: VoyageInputType;
 
@@ -205,6 +211,7 @@ export async function runSemanticSearch(
       apiKey: opts.voyageApiKey,
       fetch: opts.voyageFetch,
       maxRetries: opts.voyageMaxRetries,
+      timeoutMs: opts.voyageTimeoutMs,
     });
     if (embed.vectors.length !== 1) {
       throw new Error(

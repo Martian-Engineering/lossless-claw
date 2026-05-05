@@ -216,20 +216,27 @@ describe("reconcile-session-keys — idempotency + edge cases", () => {
     db.close();
   });
 
-  it("collides loudly when merging multiple ACTIVE convs to one key (UNIQUE constraint)", () => {
-    // The conversations_active_session_key_idx UNIQUE index protects
-    // against two active convs sharing a session_key. Reconcile must
-    // surface this as a thrown error rather than silently truncating.
+  it("collides clearly with typed ReconcileError(active_conflict) when merging multiple ACTIVE convs (Final review #5)", () => {
+    // The conversations_active_session_key_idx UNIQUE index would fire
+    // mid-UPDATE with a raw SQLite error. Final review #5 fix: pre-check
+    // up-front and throw typed ReconcileError("active_conflict") with
+    // a workaround in the message.
     const db = setupDb();
     insertConv(db, "s1", "legacy:conv_a"); // active=1
     insertConv(db, "s2", "legacy:conv_b"); // active=1
-    expect(() =>
+    let caught: ReconcileError | null = null;
+    try {
       reconcileSessionKeys(db, {
         fromSessionKeys: ["legacy:conv_a", "legacy:conv_b"],
         toSessionKey: "merged-active",
         reason: "would collide",
-      }),
-    ).toThrow(/UNIQUE/);
+      });
+    } catch (e) {
+      caught = e as ReconcileError;
+    }
+    expect(caught).toBeInstanceOf(ReconcileError);
+    expect(caught?.kind).toBe("active_conflict");
+    expect(caught?.message).toContain("UPDATE conversations SET active=0"); // workaround in msg
     db.close();
   });
 
