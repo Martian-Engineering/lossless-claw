@@ -21,6 +21,7 @@ import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmRecentThemesTool } from "../tools/lcm-recent-themes-tool.js";
 import { createLcmSemanticRecallTool } from "../tools/lcm-semantic-recall-tool.js";
+import { createLcmThemeExplainTool } from "../tools/lcm-theme-explain-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import {
   tryStartBackfillAutostart,
@@ -2392,6 +2393,9 @@ function wirePluginHandlers(
   );
   api.registerTool((ctx) =>
     createLcmRecentThemesTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmThemeExplainTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
   );
 
   api.registerCommand(
