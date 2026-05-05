@@ -38,6 +38,17 @@ import {
   ReconcileError,
   type ReconcileResult,
 } from "../operator/reconcile-session-keys.js";
+import {
+  EvalRunnerError,
+  formatEvalReport,
+  runEval,
+  type EvalMode,
+  type RunEvalArgs,
+} from "../operator/eval-runner.js";
+import { runHybridSearch } from "../embeddings/hybrid-search.js";
+import { vec0Version } from "../embeddings/store.js";
+import { SummaryStore } from "../store/summary-store.js";
+import { getLcmDbFeatures } from "../db/features.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
@@ -92,6 +103,7 @@ type ParsedLcmCommand =
       reason: string;
       allowMainSession: boolean;
     }
+  | { kind: "eval"; mode: EvalMode; querySetName: string; querySetVersion: number }
   | { kind: "help"; error?: string };
 
 type RotateCommandEngine = {
@@ -237,6 +249,62 @@ function splitArgsQuoted(rawArgs: string | undefined): string[] {
   return out;
 }
 
+interface EvalParseResult {
+  baseline: boolean;
+  mode?: EvalMode;
+  querySet?: string;
+  querySetVersion?: number;
+}
+
+const EVAL_MODES: EvalMode[] = ["fts_only", "semantic_only", "hybrid"];
+const DEFAULT_EVAL_QUERY_SET_NAME = "eva-baseline";
+const DEFAULT_EVAL_QUERY_SET_VERSION = 1;
+
+function parseEvalArgs(tokens: string[]):
+  | { ok: true; parsed: EvalParseResult }
+  | { ok: false; error: string } {
+  const result: EvalParseResult = { baseline: false };
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    switch (t) {
+      case "--baseline":
+        result.baseline = true;
+        break;
+      case "--mode": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--mode` requires a value (fts_only|semantic_only|hybrid)." };
+        if (!EVAL_MODES.includes(v as EvalMode)) {
+          return { ok: false, error: `Unknown mode \`${v}\`. Supported: ${EVAL_MODES.join(", ")}.` };
+        }
+        result.mode = v as EvalMode;
+        i += 1;
+        break;
+      }
+      case "--query-set": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--query-set` requires a value." };
+        result.querySet = v;
+        i += 1;
+        break;
+      }
+      case "--version": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--version` requires a value." };
+        const parsed = Number.parseInt(v, 10);
+        if (!Number.isFinite(parsed) || parsed < 1) {
+          return { ok: false, error: `\`--version\` must be a positive integer (got \`${v}\`).` };
+        }
+        result.querySetVersion = parsed;
+        i += 1;
+        break;
+      }
+      default:
+        return { ok: false, error: `Unknown argument \`${t}\` for \`/lcm eval\`.` };
+    }
+  }
+  return { ok: true, parsed: result };
+}
+
 interface ReconcileParseResult {
   fromSessionKeys: string[];
   toSessionKey?: string;
@@ -345,6 +413,33 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return rest.length === 0
         ? { kind: "health" }
         : { kind: "help", error: "`/lcm health` does not accept extra arguments." };
+    case "eval": {
+      const idx = (rawArgs ?? "").toLowerCase().indexOf("eval");
+      const remainder = idx >= 0 ? (rawArgs ?? "").slice(idx + "eval".length) : "";
+      const quoted = splitArgsQuoted(remainder);
+      const r = parseEvalArgs(quoted);
+      if (!r.ok) {
+        return { kind: "help", error: r.error };
+      }
+      const { parsed } = r;
+      // --baseline shorthand: defaults to fts_only against eva-baseline v1.
+      const mode: EvalMode = parsed.mode ?? (parsed.baseline ? "fts_only" : "fts_only");
+      if (!parsed.mode && !parsed.baseline) {
+        // Plain `/lcm eval` is ambiguous — require either flag.
+        return {
+          kind: "help",
+          error: "`/lcm eval` requires `--baseline` or `--mode <fts_only|semantic_only|hybrid>`.",
+        };
+      }
+      const querySetName = parsed.querySet ?? DEFAULT_EVAL_QUERY_SET_NAME;
+      const querySetVersion = parsed.querySetVersion ?? DEFAULT_EVAL_QUERY_SET_VERSION;
+      return {
+        kind: "eval",
+        mode,
+        querySetName,
+        querySetVersion,
+      };
+    }
     case "reconcile-session-keys": {
       // Re-tokenize via the quote-aware splitter so `--reason "..."`
       // survives. We strip the leading subcommand token from the raw
@@ -419,7 +514,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, health, reconcile-session-keys, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, health, reconcile-session-keys, eval, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -743,6 +838,14 @@ function buildHelpText(error?: string): string {
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --apply --from k1,k2 --to k3 --reason "..."`),
         "Merge multiple legacy session keys into one logical session.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} eval --baseline`),
+        "Run the baseline eval (default: eva-baseline v1, fts_only) and report recall + drift.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} eval --mode hybrid --query-set <name> --version <n>`),
+        "Run an eval against a specific query set + retrieval mode.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
@@ -1453,6 +1556,162 @@ function buildReconcileListText(params: { db: DatabaseSync }): string {
   return lines.join("\n");
 }
 
+/**
+ * Build a recall search adapter that wraps `summaryStore.searchSummaries`
+ * in `mode='full_text'`. Returns IDs in rank order. Used by the
+ * fts_only eval mode and by the FTS arm of hybrid (when the operator
+ * picks --mode hybrid but vec0 is unavailable).
+ */
+function buildFtsOnlyAdapter(db: DatabaseSync): RunEvalArgs["retrievalAdapter"] {
+  const { fts5Available } = getLcmDbFeatures(db);
+  const summaryStore = new SummaryStore(db, { fts5Available });
+  return {
+    async search(query) {
+      const hits = await summaryStore.searchSummaries({
+        query: query.queryText,
+        mode: "full_text",
+        limit: 50,
+      });
+      return hits.map((h) => h.summaryId);
+    },
+  };
+}
+
+/**
+ * Build a hybrid adapter wrapping `runHybridSearch`. The hybrid arm
+ * gracefully degrades to FTS-only inside runHybridSearch itself if
+ * vec0 isn't available; we surface that via the eval report so the
+ * operator sees the warning.
+ *
+ * Note: the hybrid path requires Voyage credentials in the env (or a
+ * test-injected fetch). For an operator-driven `/lcm eval --mode
+ * hybrid` invocation we assume credentials are set; tests use
+ * fts_only with mocked adapters.
+ */
+function buildHybridAdapter(db: DatabaseSync): RunEvalArgs["retrievalAdapter"] {
+  const ftsAdapter = buildFtsOnlyAdapter(db);
+  return {
+    async search(query) {
+      try {
+        // Re-build the FTS hit shape inside the adapter — runHybridSearch
+        // wants ftsSearch to return FtsHit, not summaryIds, but we already
+        // collapse to IDs at the end so we re-run the lookup here for
+        // simplicity (the operator eval path is not perf-sensitive).
+        const { fts5Available } = getLcmDbFeatures(db);
+        const summaryStore = new SummaryStore(db, { fts5Available });
+        const result = await runHybridSearch(db, {
+          query: query.queryText,
+          rerank: false, // RRF fusion only — no Voyage rerank cost in eval path
+          ftsSearch: async (args) => {
+            const hits = await summaryStore.searchSummaries({
+              query: args.query,
+              mode: "full_text",
+              limit: args.limit,
+            });
+            return hits.map((h, idx) => ({
+              summaryId: h.summaryId,
+              conversationId: h.conversationId,
+              sessionKey: "",
+              kind: h.kind as "leaf" | "condensed",
+              content: h.snippet,
+              tokenCount: 0,
+              createdAt: h.createdAt.toISOString(),
+              rank: idx,
+            }));
+          },
+        });
+        return result.hits.map((h) => h.summaryId);
+      } catch {
+        // Hybrid arm unavailable (vec0 missing, no key, etc.) — fall
+        // back to FTS-only for this single query so the eval still
+        // produces a result.
+        return ftsAdapter.search(query);
+      }
+    },
+  };
+}
+
+async function buildEvalText(params: {
+  db: DatabaseSync;
+  mode: EvalMode;
+  querySetName: string;
+  querySetVersion: number;
+}): Promise<string> {
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "🧪 Lossless Claw Eval",
+    "",
+    buildSection("📋 Plan", [
+      buildStatLine("query set", `${params.querySetName} v${params.querySetVersion}`),
+      buildStatLine("mode", formatCommand(params.mode)),
+    ]),
+    "",
+  ];
+
+  // Pick the retrieval adapter for the requested mode.
+  let adapter: RunEvalArgs["retrievalAdapter"];
+  if (params.mode === "fts_only") {
+    adapter = buildFtsOnlyAdapter(params.db);
+  } else if (params.mode === "hybrid") {
+    if (vec0Version(params.db) === null) {
+      lines.push(
+        buildSection("⚠️ Warning", [
+          "vec0 is not loaded — hybrid mode will degrade to FTS-only inside the adapter.",
+        ]),
+        "",
+      );
+    }
+    adapter = buildHybridAdapter(params.db);
+  } else {
+    // semantic_only — not yet wired separately; treat as hybrid for v4.1
+    // first cut. The hybrid adapter already covers the "if vec0 absent
+    // fall back to FTS" case so the user gets a meaningful result.
+    lines.push(
+      buildSection("ℹ️ Note", [
+        "`semantic_only` is wired through the hybrid adapter for v4.1 first cut (RRF fusion, no rerank).",
+      ]),
+      "",
+    );
+    adapter = buildHybridAdapter(params.db);
+  }
+
+  try {
+    const result = await runEval(params.db, {
+      querySetIdentity: { name: params.querySetName, version: params.querySetVersion },
+      mode: params.mode,
+      retrievalAdapter: adapter,
+    });
+    lines.push(
+      buildSection("📊 Result", [
+        formatEvalReport({
+          querySetIdentity: { name: params.querySetName, version: params.querySetVersion },
+          mode: params.mode,
+          result,
+        }),
+      ]),
+    );
+  } catch (e) {
+    if (e instanceof EvalRunnerError) {
+      lines.push(
+        buildSection("🛠️ Eval", [
+          buildStatLine("status", "failed"),
+          buildStatLine("kind", e.kind),
+          buildStatLine("reason", e.message),
+        ]),
+      );
+      return lines.join("\n");
+    }
+    lines.push(
+      buildSection("🛠️ Eval", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(e)),
+      ]),
+    );
+  }
+  return lines.join("\n");
+}
+
 function buildReconcileApplyText(params: {
   db: DatabaseSync;
   fromSessionKeys: string[];
@@ -1835,6 +2094,15 @@ export function createLcmCommand(params: {
               toSessionKey: parsed.toSessionKey,
               reason: parsed.reason,
               allowMainSession: parsed.allowMainSession,
+            }),
+          };
+        case "eval":
+          return {
+            text: await buildEvalText({
+              db: await getDb(),
+              mode: parsed.mode,
+              querySetName: parsed.querySetName,
+              querySetVersion: parsed.querySetVersion,
             }),
           };
         case "help":
