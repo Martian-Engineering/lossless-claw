@@ -118,7 +118,11 @@ function closeDatabase(db: DatabaseSync | undefined): void {
  */
 export function createLcmDatabaseConnection(dbPath: string): DatabaseSync {
   ensureDbDirectory(dbPath);
-  const db = new DatabaseSync(dbPath);
+  // v4.1 Final.review P1 #1 fix: open with allowExtension=true so
+  // sqlite-vec can be loaded. Without this, db.loadExtension() throws
+  // and the entire v4.1 semantic feature is silently inert in
+  // production (autostart pre-flight returns NO_OP).
+  const db = new DatabaseSync(dbPath, { allowExtension: true });
   try {
     configureConnection(db);
   } catch (err) {

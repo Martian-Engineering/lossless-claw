@@ -49,6 +49,17 @@ export interface EmbeddingsHealth {
   pendingBackfill: number;
   /** Count of un-archived embedding rows across all models. */
   embeddedCount: number;
+  /**
+   * v4.1 Final.review P2 #4: leaves with token_count > MAX_TOKENS_PER_EMBED_DOC
+   * (default 30K) that backfill cannot embed. These are typically legacy
+   * leaves from before the A.10 cap raise (2400 → 4000) that were
+   * over-summarized at higher caps. countPendingDocs filters them out
+   * (token_count BETWEEN min AND max), so without surfacing them here,
+   * /lcm health could report "pending=0" while semantic coverage has
+   * permanent blind spots. Operator can re-summarize them at a lower
+   * cap to bring them into range.
+   */
+  overCapPending: number;
 }
 
 export interface WorkerStatus {
@@ -158,11 +169,39 @@ function getEmbeddingsHealth(db: DatabaseSync): EmbeddingsHealth {
   if (activeProfile && vec0 !== null) {
     embeddingsTableExists(db, activeProfile.modelName);
   }
+  // v4.1 Final.review P2 #4: count over-cap leaves explicitly.
+  // countPendingDocs filters BETWEEN min AND max — so leaves with
+  // token_count > 30K are NOT counted as pending OR as backfilled.
+  // Surface them so /lcm health doesn't lie about coverage.
+  let overCapPending = 0;
+  if (activeProfile) {
+    try {
+      const row = db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM summaries s
+             WHERE s.kind = 'leaf'
+               AND s.suppressed_at IS NULL
+               AND s.token_count > 30000
+               AND NOT EXISTS (
+                 SELECT 1 FROM lcm_embedding_meta m
+                   WHERE m.embedded_id = s.summary_id
+                     AND m.embedded_kind = 'summary'
+                     AND m.embedding_model = ?
+                     AND m.archived = 0
+               )`,
+        )
+        .get(activeProfile.modelName) as { n?: number } | undefined;
+      overCapPending = row?.n ?? 0;
+    } catch {
+      overCapPending = 0;
+    }
+  }
   return {
     activeProfile,
     vec0Version: vec0,
     pendingBackfill,
     embeddedCount,
+    overCapPending,
   };
 }
 

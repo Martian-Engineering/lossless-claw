@@ -30,6 +30,7 @@ import {
   type AutostartHandle,
 } from "../operator/backfill-autostart.js";
 import { tryStartExtractionAutostart } from "../operator/extraction-autostart.js";
+import { initSemanticInfraIfPossible } from "../operator/semantic-infra-init.js";
 import type { LcmDependencies, StartupSessionFileCandidate } from "../types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -2643,6 +2644,12 @@ const lcmPlugin = {
       try {
         const db = await shared.waitForDatabase();
         if (shared.stopped) return; // gateway_stop fired during wait
+        // v4.1 Final.review P1 #1 fix: load sqlite-vec, register the
+        // active embedding profile, and ensure the per-model vec0 table
+        // exists. Without this, the backfill autostart's pre-flight
+        // checks fail and the entire v4.1 semantic feature is inert.
+        // Best-effort + graceful degrade — see semantic-infra-init.ts.
+        initSemanticInfraIfPossible(db, { log: deps.log });
         const handle = tryStartBackfillAutostart(db, { log: deps.log });
         shared.backfillAutostart = handle;
       } catch (e) {

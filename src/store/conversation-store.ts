@@ -879,6 +879,8 @@ export class ConversationStore {
   ): MessageSearchResult[] {
     const where: string[] = ["messages_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
+    // v4.1 Final.review P1 #2: filter suppressed messages.
+    where.push("m.suppressed_at IS NULL");
     appendConversationScopeConstraint({
       where,
       args,
@@ -928,6 +930,8 @@ export class ConversationStore {
 
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
+    // v4.1 Final.review P1 #2: filter suppressed messages (LIKE path).
+    where.push("suppressed_at IS NULL");
     appendConversationScopeConstraint({
       where,
       args,
@@ -996,7 +1000,7 @@ export class ConversationStore {
       return [];
     }
 
-    const where: string[] = [];
+    const where: string[] = ["suppressed_at IS NULL"]; // v4.1 Final.review P1 #2
     const args: Array<string | number> = [];
     appendConversationScopeConstraint({
       where,

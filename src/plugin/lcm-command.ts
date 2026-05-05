@@ -1491,6 +1491,16 @@ function formatHealthSnapshot(snapshot: V41HealthSnapshot): string[] {
     buildStatLine("pending backfill", `${formatNumber(snapshot.embeddings.pendingBackfill)} docs`),
   );
   embeddingsLines.push(buildStatLine("embedded count", formatNumber(snapshot.embeddings.embeddedCount)));
+  // v4.1 Final.review P2 #4: surface over-cap leaves so "pending=0"
+  // doesn't lie about coverage.
+  if (snapshot.embeddings.overCapPending > 0) {
+    embeddingsLines.push(
+      buildStatLine(
+        "over-cap leaves (>30K tokens, NOT embeddable)",
+        `${formatNumber(snapshot.embeddings.overCapPending)} — re-summarize at lower cap to bring into range`,
+      ),
+    );
+  }
   lines.push(buildSection("Embeddings", embeddingsLines));
 
   // ── Workers ──────────────────────────────────────────────────────

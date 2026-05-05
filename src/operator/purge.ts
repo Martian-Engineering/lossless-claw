@@ -12,13 +12,26 @@
  *      flagged via contains_suppressed_leaves=1 (set by caller code OR
  *      by idle-pass) so the next assemble() pyramid sees the staleness.
  *
- *   mode='immediate' — hard-DELETE matched rows AND enqueue affected
- *      condensed summaries to lcm_purge_rebuild_queue. Worker drains
- *      the queue, rebuilds those condensed summaries WITHOUT the
- *      purged content, marks the old condensed superseded_by the new
- *      row (forwarder pattern from v4.1.1 A4 — never mutate
- *      summary_parents). vec0 + meta cascade via the AFTER DELETE
- *      triggers (B.03).
+ *   mode='immediate' — TWO-STEP process. Doc was misleading before
+ *      Final.review P2 #3 fix; here's the actual behavior:
+ *      (1) NOW: marks `summaries.suppressed_at` + cleans `context_items`
+ *          + cascades to `messages.suppressed_at` (Final.review P1 #2)
+ *          + enqueues affected condensed summaries to
+ *          lcm_purge_rebuild_queue. Suppression cascade triggers
+ *          (B.03) fire so vec0 + meta + themes mirror the change.
+ *      (2) LATER: a worker drains the rebuild queue + rebuilds those
+ *          condensed summaries WITHOUT the purged content + only THEN
+ *          can the leaves be hard-deleted (parent_summary_id RESTRICT
+ *          FK refs prevent direct DELETE until rebuild finishes).
+ *
+ *      ⚠️ CYCLE-3 GAP: the rebuild worker DOES NOT EXIST yet. Currently
+ *      'immediate' mode is functionally equivalent to 'soft' mode +
+ *      populating lcm_purge_rebuild_queue. Rows REMAIN on disk in
+ *      `summaries` and `messages`. The suppression cascade DOES make
+ *      them invisible to ALL agent surfaces (verified end-to-end), but
+ *      they are NOT hard-deleted. If your compliance requirement is
+ *      disk-level removal, use a separate VACUUM / DB-level scrub
+ *      after the cascade has fired.
  *
  * Criteria — caller specifies one of:
  *   - summaryIds: explicit list
@@ -56,8 +69,12 @@ export interface PurgeCriteria {
 export interface PurgeOptions extends PurgeCriteria {
   /**
    * 'soft' (default): set suppressed_at, leave content intact.
-   * 'immediate': hard-DELETE the leaves AND enqueue affected condensed
-   *   summaries for rebuild. UNRECOVERABLE.
+   * 'immediate': enqueue affected condensed for rebuild + cascade
+   *   suppression to messages. Per Final.review P2 #3 fix: this does
+   *   NOT actually hard-delete rows yet (rebuild worker is cycle-3
+   *   work); it does ensure the content is invisible to every agent
+   *   surface via the suppression cascade. See module docstring for
+   *   the full two-step semantics + the cycle-3 gap.
    */
   mode?: "soft" | "immediate";
   /**
@@ -226,6 +243,25 @@ function runSoftPurge(
     db.prepare(
       `DELETE FROM context_items
          WHERE item_type = 'summary' AND summary_id IN (${placeholders})`,
+    ).run(...leafIds);
+
+    // v4.1 Final.review P1 #2: cascade suppression to the underlying
+    // raw messages. Without this, lcm_grep mode='regex'/'full_text'
+    // scope='messages' or scope='both' would still find purged
+    // content via the raw messages table (which has its own FTS index).
+    //
+    // We find affected messages via summary_messages junction. Set
+    // messages.suppressed_at = now (column exists per A.02 migration).
+    //
+    // Privacy contract: when operator says "purge this leaf for
+    // confidentiality", they mean BOTH the summary AND the underlying
+    // raw messages should be unfindable via any agent surface.
+    db.prepare(
+      `UPDATE messages SET suppressed_at = datetime('now')
+         WHERE message_id IN (
+           SELECT message_id FROM summary_messages
+             WHERE summary_id IN (${placeholders})
+         )`,
     ).run(...leafIds);
 
     db.exec("COMMIT");
