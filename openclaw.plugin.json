@@ -13,7 +13,8 @@
       "lcm_semantic_recall",
       "lcm_describe",
       "lcm_expand",
-      "lcm_expand_query"
+      "lcm_expand_query",
+      "lcm_recent_themes"
     ]
   },
   "uiHints": {
