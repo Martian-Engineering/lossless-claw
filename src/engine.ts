@@ -8406,6 +8406,17 @@ export class LcmContextEngine implements ContextEngine {
     return this.retrieval;
   }
 
+  /**
+   * Expose the active SQLite connection for v4.1 retrieval surfaces
+   * (lcm_semantic_recall, lcm_grep hybrid mode) that need to call
+   * `runSemanticSearch` / `runHybridSearch` directly. Tools should treat
+   * the returned handle as read-mostly; long-running writes should still
+   * route through the appropriate store helper.
+   */
+  getDb(): DatabaseSync {
+    return this.db;
+  }
+
   getConversationStore(): ConversationStore {
     return this.conversationStore;
   }

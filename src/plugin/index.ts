@@ -19,6 +19,7 @@ import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
+import { createLcmSemanticRecallTool } from "../tools/lcm-semantic-recall-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type { LcmDependencies, StartupSessionFileCandidate } from "../types.js";
 
@@ -2366,6 +2367,9 @@ function wirePluginHandlers(
 
   api.registerTool((ctx) =>
     createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmSemanticRecallTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
   );
   api.registerTool((ctx) =>
     createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
