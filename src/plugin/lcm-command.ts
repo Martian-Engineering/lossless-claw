@@ -27,6 +27,11 @@ import {
   type ConversationCompactionMaintenanceRecord,
 } from "../store/compaction-maintenance-store.js";
 import { CompactionTelemetryStore } from "../store/compaction-telemetry-store.js";
+import {
+  getV41HealthSnapshot,
+  type V41HealthSnapshot,
+  type WorkerStatus,
+} from "../operator/health.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
@@ -72,6 +77,7 @@ type ParsedLcmCommand =
   | { kind: "rotate" }
   | { kind: "doctor"; apply: boolean }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
+  | { kind: "health" }
   | { kind: "help"; error?: string };
 
 type RotateCommandEngine = {
@@ -220,6 +226,10 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return rest.length === 0
         ? { kind: "rotate" }
         : { kind: "help", error: "`/lcm rotate` does not accept extra arguments." };
+    case "health":
+      return rest.length === 0
+        ? { kind: "health" }
+        : { kind: "help", error: "`/lcm health` does not accept extra arguments." };
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
@@ -251,7 +261,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, health, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -563,6 +573,10 @@ function buildHelpText(error?: string): string {
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} rotate`),
         "Compact the current session transcript while preserving the same LCM conversation and live session identity.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} health`),
+        "Show LCM v4.1 subsystem health: embeddings, workers, synthesis, eval, suppression.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
@@ -1135,6 +1149,110 @@ async function buildRotateText(params: {
   return lines.join("\n");
 }
 
+function formatWorkerLine(worker: WorkerStatus): string {
+  if (!worker.active) {
+    return `${worker.jobKind}: (idle)`;
+  }
+  const expiredFlag = worker.expired ? " EXPIRED" : "";
+  const id = worker.workerId ?? "unknown";
+  const acquired = worker.acquiredAt ?? "unknown";
+  const expires = worker.expiresAt ?? "unknown";
+  return `${worker.jobKind}: worker_id=${id}${expiredFlag} acquired_at=${acquired} expires_at=${expires}`;
+}
+
+function formatHealthSnapshot(snapshot: V41HealthSnapshot): string[] {
+  const lines: string[] = [];
+
+  // ── Embeddings ───────────────────────────────────────────────────
+  const embeddingsLines: string[] = [];
+  if (snapshot.embeddings.activeProfile) {
+    const p = snapshot.embeddings.activeProfile;
+    embeddingsLines.push(buildStatLine("active model", `${p.modelName} (dim=${formatNumber(p.dim)})`));
+  } else {
+    embeddingsLines.push(buildStatLine("active model", "NOT REGISTERED"));
+  }
+  embeddingsLines.push(
+    buildStatLine(
+      "vec0 status",
+      snapshot.embeddings.vec0Version ?? "NOT LOADED",
+    ),
+  );
+  embeddingsLines.push(
+    buildStatLine("pending backfill", `${formatNumber(snapshot.embeddings.pendingBackfill)} docs`),
+  );
+  embeddingsLines.push(buildStatLine("embedded count", formatNumber(snapshot.embeddings.embeddedCount)));
+  lines.push(buildSection("Embeddings", embeddingsLines));
+
+  // ── Workers ──────────────────────────────────────────────────────
+  lines.push("");
+  lines.push(buildSection("Workers", snapshot.workers.map(formatWorkerLine)));
+
+  // ── Synthesis ────────────────────────────────────────────────────
+  lines.push("");
+  lines.push(
+    buildSection("Synthesis", [
+      buildStatLine(
+        "active prompts",
+        `${formatNumber(snapshot.synthesis.activePromptCount)} across ${formatNumber(snapshot.synthesis.distinctMemoryTypeCount)} memory_types`,
+      ),
+      buildStatLine(
+        "recent synthesis runs",
+        `${formatNumber(snapshot.synthesis.recentSynthesisRuns7d)} (last 7 days)`,
+      ),
+    ]),
+  );
+
+  // ── Eval ─────────────────────────────────────────────────────────
+  lines.push("");
+  const evalLines = [
+    buildStatLine("query sets registered", formatNumber(snapshot.eval.querySetCount)),
+  ];
+  if (snapshot.eval.mostRecentRun) {
+    const r = snapshot.eval.mostRecentRun;
+    evalLines.push(
+      buildStatLine(
+        "most-recent run",
+        `${r.querySetId} mode=${r.mode} recall=${r.recallScore.toFixed(3)} (run_id=${r.runId})`,
+      ),
+    );
+  } else {
+    evalLines.push(buildStatLine("most-recent run", "(none)"));
+  }
+  if (snapshot.eval.driftIndex === null) {
+    evalLines.push(buildStatLine("drift index", "(no baseline)"));
+  } else {
+    const sign = snapshot.eval.driftIndex >= 0 ? "+" : "";
+    evalLines.push(buildStatLine("drift index", `${sign}${snapshot.eval.driftIndex.toFixed(4)}`));
+  }
+  lines.push(buildSection("Eval", evalLines));
+
+  // ── Suppression ──────────────────────────────────────────────────
+  lines.push("");
+  lines.push(
+    buildSection("Suppression", [
+      buildStatLine("suppressed leaves", formatNumber(snapshot.suppression.suppressedLeaves)),
+      buildStatLine(
+        "pending purge rebuilds",
+        formatNumber(snapshot.suppression.pendingPurgeRebuilds),
+      ),
+    ]),
+  );
+
+  return lines;
+}
+
+function buildHealthText(params: { db: DatabaseSync }): string {
+  const snapshot = getV41HealthSnapshot(params.db);
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "### v4.1 Health",
+    "",
+    ...formatHealthSnapshot(snapshot),
+  ];
+  return lines.join("\n");
+}
+
 async function buildDoctorCleanersApplyText(params: {
   db: DatabaseSync;
   config: LcmConfig;
@@ -1440,6 +1558,8 @@ export function createLcmCommand(params: {
                 }),
               }
             : { text: await buildDoctorCleanersText({ db: await getDb() }) };
+        case "health":
+          return { text: buildHealthText({ db: await getDb() }) };
         case "help":
           return { text: buildHelpText(parsed.error) };
       }
