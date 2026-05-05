@@ -109,6 +109,90 @@ function ensureSummaryModelColumn(db: DatabaseSync): void {
   }
 }
 
+/**
+ * v4.1 schema additions to `summaries`:
+ *   - session_key                  (v3.1 A1: cross-conv identity for assemble + retrieval)
+ *   - suppressed_at                (v3.1 A3: lossless-forget flag; cascade triggers)
+ *   - entity_index                 (v3.1: JSON sidecar populated by §7.2 entity coreference)
+ *   - contains_suppressed_leaves   (v3.1 A3: marks condensed needing idle rebuild)
+ *   - suppress_reason              (v4.1.1 A2: read by lcm_describe; written by lcm_suppress)
+ *   - superseded_by                (v4.1.1 A2: forwarder pattern; idle rebuild keeps old row immutable
+ *                                   and points to new row via this FK)
+ *   - leaf_summarizer_cap_was      (v4.1: forensic marker for the 2,415-token cap fix; NULL =
+ *                                   leaf was never capped or has been regenerated)
+ *
+ * SQLite ADD COLUMN constraints satisfied:
+ *   - No PRIMARY KEY / UNIQUE in any new column.
+ *   - No CURRENT_TIMESTAMP defaults.
+ *   - NOT NULL columns have non-NULL defaults.
+ *   - REFERENCES columns have NULL default (per SQLite ADD COLUMN with FK rule).
+ */
+function ensureSummaryV41Columns(db: DatabaseSync): void {
+  const cols = db.prepare(`PRAGMA table_info(summaries)`).all() as SummaryColumnInfo[];
+  const has = (name: string): boolean => cols.some((c) => c.name === name);
+
+  if (!has("session_key")) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN session_key TEXT NOT NULL DEFAULT ''`);
+  }
+  if (!has("suppressed_at")) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN suppressed_at TEXT`);
+  }
+  if (!has("entity_index")) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN entity_index TEXT`);
+  }
+  if (!has("contains_suppressed_leaves")) {
+    db.exec(
+      `ALTER TABLE summaries ADD COLUMN contains_suppressed_leaves INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+  if (!has("suppress_reason")) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN suppress_reason TEXT`);
+  }
+  if (!has("superseded_by")) {
+    // FK with SET NULL on parent delete. SQLite ADD COLUMN with REFERENCES requires NULL default.
+    db.exec(
+      `ALTER TABLE summaries ADD COLUMN superseded_by TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL`,
+    );
+  }
+  if (!has("leaf_summarizer_cap_was")) {
+    db.exec(`ALTER TABLE summaries ADD COLUMN leaf_summarizer_cap_was INTEGER`);
+  }
+}
+
+/**
+ * v3.1 A3 (extended in v4.1.1 A3): suppression cascade reaches raw messages
+ * via `messages.suppressed_at`. lcm_quote / lcm_factcheck filter on this.
+ */
+function ensureMessageSuppressedAtColumn(db: DatabaseSync): void {
+  const cols = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasSuppressedAt = cols.some((c) => c.name === "suppressed_at");
+  if (!hasSuppressedAt) {
+    db.exec(`ALTER TABLE messages ADD COLUMN suppressed_at TEXT`);
+  }
+}
+
+/**
+ * v4.1.1 A8 — feature-flag storage for v4.1 sections (e.g. semantic
+ * retrieval can be disabled if vec0 extension fails to load).
+ *
+ * Code-as-ground-truth note: v4.1.1 A8 originally proposed extending
+ * `lcm_migration_flags` with a `value` column. That table doesn't exist
+ * in the upstream source — it's a fork-side legacy table that only
+ * exists on Eva's live DB. This implementation creates a clean new
+ * `lcm_feature_flags` table that doesn't conflict with the legacy table.
+ */
+function ensureLcmFeatureFlagsTable(db: DatabaseSync): void {
+  // Note: explicit NOT NULL on the TEXT PRIMARY KEY column — SQLite's
+  // legacy behavior allows NULL in TEXT PK columns without it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lcm_feature_flags (
+      flag TEXT NOT NULL PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+}
+
 function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
   const hasConsecutiveColdObservations = telemetryColumns.some(
@@ -1171,9 +1255,11 @@ export function runLcmMigrations(
     // BOTH `expires_at < now` AND `last_heartbeat_at < now - 300s`).
     // See `src/concurrency/model.ts` for the invariants and constants.
     runMigrationStep("ensureLcmWorkerLockTable", log, () => {
+      // Note: explicit NOT NULL on the TEXT PRIMARY KEY column — SQLite's
+      // legacy behavior allows NULL in TEXT PK columns without it.
       db.exec(`
         CREATE TABLE IF NOT EXISTS lcm_worker_lock (
-          job_kind TEXT PRIMARY KEY,
+          job_kind TEXT NOT NULL PRIMARY KEY,
           worker_id TEXT NOT NULL,
           acquired_at TEXT NOT NULL DEFAULT (datetime('now')),
           expires_at TEXT NOT NULL,
@@ -1183,6 +1269,23 @@ export function runLcmMigrations(
         )
       `);
     });
+
+    // v3.1 A1/A3 + v4.1.1 A2 — additive columns on summaries (session_key,
+    // suppressed_at, entity_index, contains_suppressed_leaves, suppress_reason,
+    // superseded_by, leaf_summarizer_cap_was). Idempotent via PRAGMA check.
+    runMigrationStep("ensureSummaryV41Columns", log, () => ensureSummaryV41Columns(db));
+
+    // v3.1 A3 — messages.suppressed_at for raw-message suppression cascade.
+    runMigrationStep("ensureMessageSuppressedAtColumn", log, () =>
+      ensureMessageSuppressedAtColumn(db),
+    );
+
+    // v4.1.1 A8 — feature flags for v4.1 sections (e.g. v4_section_1_enabled
+    // when vec0 extension is available). Creates clean new table; does NOT
+    // touch Eva's legacy lcm_migration_flags table.
+    runMigrationStep("ensureLcmFeatureFlagsTable", log, () =>
+      ensureLcmFeatureFlagsTable(db),
+    );
 
     db.exec(`COMMIT`);
     transactionActive = false;
