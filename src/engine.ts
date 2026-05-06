@@ -6546,6 +6546,23 @@ export class LcmContextEngine implements ContextEngine {
           }
         }
       } else if (thresholdDecision.shouldCompact || rawLeafTrigger?.shouldCompact) {
+        // Hard-floor: in deferred mode, `thresholdDecision` and `rawLeafTrigger`
+        // come from `compaction.evaluate` / `evaluateLeafTrigger` directly and do
+        // not consult `respectThresholdAsHardFloor`. Without this guard, debt
+        // would accumulate from below-floor leaf-trigger fires and later drain
+        // via paths that do not re-check the floor — leaking the hard-floor
+        // semantics. Skip debt recording entirely when below floor.
+        if (
+          this.config.respectThresholdAsHardFloor
+          && typeof observedCurrentTokenCount === "number"
+          && Number.isFinite(observedCurrentTokenCount)
+          && observedCurrentTokenCount
+            < Math.floor(this.config.contextThreshold * tokenBudget)
+        ) {
+          this.deps.log.info(
+            `[lcm] afterTurn: skipping deferred compaction debt below context-threshold floor conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${observedCurrentTokenCount} threshold=${Math.floor(this.config.contextThreshold * tokenBudget)}`,
+          );
+        } else {
         const deferredReason = thresholdDecision.shouldCompact
           ? "threshold"
           : leafDecision.shouldCompact
@@ -6579,6 +6596,7 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: observedCurrentTokenCount,
           reason: deferredReason,
         };
+        }
       }
     } catch (err) {
       this.deps.log.warn(
