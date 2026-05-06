@@ -236,13 +236,18 @@ export function createLcmDescribeTool(input: {
         // sections still go below content, but the early header guarantees
         // an agent sees the empty-vs-found signal even when content gets
         // truncated by an outer wrapper.
+        // Audit 2 finding #5: the early signal must NOT promise candidates
+        // when all of them might be suppressed; phrase it as "raw count
+        // before suppression filter — see details for survivors".
         const expandChildren = p.expandChildren === true;
         const expandMessages = p.expandMessages === true;
         if (expandChildren) {
           if (s.childIds.length === 0) {
             lines.push("expansion (children): 0 — terminal node, nothing to drill into");
           } else {
-            lines.push(`expansion (children): ${s.childIds.length} candidate(s); details below`);
+            lines.push(
+              `expansion (children): ${s.childIds.length} raw candidate(s) before suppression filter; survivors + details below`,
+            );
           }
         }
         if (expandMessages) {
@@ -365,6 +370,7 @@ export function createLcmDescribeTool(input: {
           | "all-suppressed"
           | "ok"
           | "capped"
+          | "offset-past-end"
           | undefined;
         if (expandMessages) {
           if (s.kind !== "leaf") {
@@ -378,9 +384,15 @@ export function createLcmDescribeTool(input: {
               typeof p.expandMessagesLimit === "number" && Number.isFinite(p.expandMessagesLimit)
                 ? Math.max(1, Math.min(50, Math.trunc(p.expandMessagesLimit)))
                 : 20;
+            // Audit 2 finding #4: clamp offset upper-bound so an adversarial
+            // / runaway agent can't trigger LIMIT/OFFSET full-table scans.
+            // 100k messages is well past any realistic leaf size (max
+            // observed: 216) and stops a runaway loop from costing seconds-
+            // per-call.
+            const OFFSET_HARD_CAP = 100_000;
             const requestedOffset =
               typeof p.expandMessagesOffset === "number" && Number.isFinite(p.expandMessagesOffset)
-                ? Math.max(0, Math.trunc(p.expandMessagesOffset))
+                ? Math.max(0, Math.min(OFFSET_HARD_CAP, Math.trunc(p.expandMessagesOffset)))
                 : 0;
             const db = lcm.getDb();
             // Total source-message count (before offset/limit) to drive the
@@ -430,9 +442,13 @@ export function createLcmDescribeTool(input: {
               );
             } else if (expandedMessages.length === 0) {
               // Either offset went past the end or all in-range messages
-              // were suppressed.
+              // were suppressed. Audit 2 finding #6 fix: distinct status
+              // for offset-past-end so callers don't read "ok" + 0 results
+              // and conclude the leaf is empty.
               expandMessagesStatus =
-                requestedOffset >= totalMessages ? "ok" : "all-suppressed";
+                requestedOffset >= totalMessages
+                  ? "offset-past-end"
+                  : "all-suppressed";
               lines.push("");
               if (requestedOffset >= totalMessages) {
                 lines.push(

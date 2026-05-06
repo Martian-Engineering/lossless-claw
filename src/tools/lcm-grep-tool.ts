@@ -91,11 +91,13 @@ const LcmGrepSchema = Type.Object({
   // saturating with tool-role messages (code grep output, audit blobs) on
   // common queries, crowding out the user/assistant turns the agent
   // actually wants to quote. `role` filters at the SQL layer.
+  // Audit 2 finding #2 fix: include 'system' in the enum since system
+  // messages exist in the messages table (toDbRole writes them).
   role: Type.Optional(
     Type.String({
       description:
-        'Restrict matches to messages of this role. Useful in verbatim mode where tool-role messages (code grep output, audit blobs) often crowd out user/assistant turns. Accepts "user", "assistant", "tool", or "all" (default). Honored only by mode="verbatim" — other modes already match summaries that have no role.',
-      enum: ["user", "assistant", "tool", "all"],
+        'Restrict matches to messages of this role. Useful in verbatim mode where tool-role messages (code grep output, audit blobs) often crowd out user/assistant turns. Accepts "user", "assistant", "tool", "system", or "all" (default). Honored only by mode="verbatim" — other modes already match summaries that have no role.',
+      enum: ["user", "assistant", "tool", "system", "all"],
     }),
   ),
 });
@@ -261,14 +263,15 @@ export function createLcmGrepTool(input: {
         });
       }
 
-      // P7 fix: sanitize the FTS5 pattern for full_text mode so dots /
-      // brackets / hyphens / leading-trailing operators don't crash the
-      // tool with "fts5: syntax error". regex mode bypasses this — regex
-      // patterns have their own escape rules.
-      const queryToPass =
-        mode === "full_text" ? sanitizeFts5Pattern(pattern) : pattern;
+      // P7 fix (revisited per audit 2 finding #1): the full_text mode goes
+      // through retrieval.grep → conversation-store / summary-store, which
+      // already apply sanitizeFts5Query (src/store/fts5-sanitize.ts). That
+      // sanitizer correctly tokenizes-and-quotes problematic chars. Adding
+      // OUR sanitizer here was redundant and risked double-quoting.
+      // verbatim mode has its own SQL path that bypasses the store's
+      // sanitizer, so sanitize is applied there (in runVerbatimLcmGrep).
       const result = await retrieval.grep({
-        query: queryToPass,
+        query: pattern,
         mode,
         scope,
         conversationId: conversationScope.conversationId,
@@ -747,8 +750,9 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
 
   // P6 fix: role filter — at SQL layer so it composes with FTS5 and doesn't
   // burn the 20-result cap on tool-message blobs when the agent wants user
-  // or assistant turns.
-  if (roleFilter && (roleFilter === "user" || roleFilter === "assistant" || roleFilter === "tool")) {
+  // or assistant turns. Audit 2 finding #2: include 'system'.
+  const VALID_ROLES = new Set(["user", "assistant", "tool", "system"]);
+  if (roleFilter && VALID_ROLES.has(roleFilter)) {
     filters.push("m.role = ?");
     binds.push(roleFilter);
   }
@@ -804,12 +808,23 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
       created_at: string;
     }>;
   } catch (e: unknown) {
-    // FTS5 not available — fall back to LIKE on m.content
+    // FTS5 not available — fall back to LIKE on m.content.
+    // Audit 3 finding #1 (HIGH): the `binds` array was poisoned by the
+    // sanitizeFts5Pattern wrapping above (e.g. `"v4.1"` instead of raw
+    // `v4.1`). The previous `findIndex(bb => bb === pattern)` returned -1,
+    // so no replacement happened and LIKE got the literal phrase-quoted
+    // form, matching nothing on old-SQLite (no-FTS5) installations.
+    // Fix: replace the FIRST bind (always the pattern slot, since FTS5
+    // bind was pushed first at line "binds.push(...)") with the raw LIKE
+    // pattern, regardless of what was there.
     const fallbackFilters = filters.map((f) =>
       f === "messages_fts MATCH ?" ? "m.content LIKE ?" : f,
     );
+    // Find the FTS5-MATCH-bind index by position in the filters array
+    // (it's always pushed first per the code above).
+    const ftsBindIndex = 0; // first filter pushed above is "messages_fts MATCH ?"
     const fallbackBinds = binds.map((b, i) =>
-      i === binds.findIndex((bb) => bb === pattern) ? `%${pattern}%` : b,
+      i === ftsBindIndex ? `%${pattern}%` : b,
     );
     rows = db
       .prepare(

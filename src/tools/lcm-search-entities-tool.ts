@@ -198,20 +198,27 @@ export function createLcmSearchEntitiesTool(input: {
       // "0 entities indexed yet" — the latter is a coverage gap, not a
       // negative answer. Probe the catalog scope so callers (and the agent)
       // know which scenario they're in.
+      // Audit 3 finding #3 fix: use EXISTS(SELECT 1 ... LIMIT 1) instead of
+      // COUNT(*) to avoid full-table scans on multi-million-entity DBs.
+      // EXISTS short-circuits at the first row it finds (or doesn't) and
+      // is O(log n) via the lcm_entities_lookup_idx index when filtered by
+      // session_key, O(1) on the global probe.
       let catalogStatus:
         | "active"
         | "empty-for-session"
         | "empty-globally" = "active";
       if (rows.length === 0) {
-        const sessionRow = db
-          .prepare(`SELECT COUNT(*) AS n FROM lcm_entities WHERE session_key = ?`)
-          .get(effectiveSessionKey) as { n: number };
-        if ((sessionRow?.n ?? 0) === 0) {
-          const globalRow = db
-            .prepare(`SELECT COUNT(*) AS n FROM lcm_entities`)
-            .get() as { n: number };
+        const sessionExists = db
+          .prepare(
+            `SELECT EXISTS(SELECT 1 FROM lcm_entities WHERE session_key = ? LIMIT 1) AS e`,
+          )
+          .get(effectiveSessionKey) as { e: number };
+        if ((sessionExists?.e ?? 0) === 0) {
+          const globalExists = db
+            .prepare(`SELECT EXISTS(SELECT 1 FROM lcm_entities LIMIT 1) AS e`)
+            .get() as { e: number };
           catalogStatus =
-            (globalRow?.n ?? 0) === 0 ? "empty-globally" : "empty-for-session";
+            (globalExists?.e ?? 0) === 0 ? "empty-globally" : "empty-for-session";
         }
       }
 

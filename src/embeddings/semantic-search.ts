@@ -121,8 +121,10 @@ export interface SemanticHit {
   /**
    * Convenience: cosine similarity in [-1, 1] derived from `distance`
    * (assumes unit-normalized vectors, which Voyage guarantees).
-   * Higher = more similar. Use this for confidence-band classification:
-   *   ≥0.8 high / ≥0.6 medium / ≥0.4 low / <0.4 noise.
+   * Higher = more similar. The agent-facing tool maps this into bands:
+   *   ≥0.65 high / ≥0.5 medium / ≥0.35 low / <0.35 noise.
+   * (Calibrated against Eva's live DB on 2026-05-06; see
+   *  `lcm-semantic-recall-tool.ts` for the band logic.)
    */
   cosineSimilarity: number;
   /** From summaries: content + metadata (after suppression-filter join). */
@@ -281,11 +283,14 @@ export async function runSemanticSearch(
   if (summaryIds.length === 0) {
     // All candidates were entity/theme — return them with no JOIN. Caller
     // tools (lcm_semantic_recall) may or may not handle these.
+    // Audit 1 finding #1 (HIGH): cosineSimilarity is a required field —
+    // omitting it crashes downstream `.toFixed(3)` calls. Compute it here.
     return {
       hits: candidates.map((c) => ({
         summaryId: c.embeddedId,
         embeddedKind: c.embeddedKind,
         distance: c.distance,
+        cosineSimilarity: Math.max(-1, Math.min(1, 1 - (c.distance * c.distance) / 2)),
         conversationId: -1, // unknown — not a summary
         sessionKey: "",
         kind: "leaf",
