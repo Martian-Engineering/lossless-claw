@@ -284,3 +284,51 @@ describe("operator-purge — previewPurgeAffected parity (Wave-2 BUG-2/BUG-3 reg
     db.close();
   });
 });
+
+// Wave-7 P0-2 + Wave-8 regression tests
+describe("operator-purge — Wave-7 P0 fixes (regression coverage)", () => {
+  it("Wave-7 P0-2: shared message NOT suppressed when only ONE of its referencing leaves is purged", () => {
+    const db = setupDb();
+    // Two leaves that share message_id 1; purge only leaf_a
+    insertLeaf(db, "leaf_a", 1);
+    insertLeaf(db, "leaf_b", 1);
+    db.prepare(`INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (1, 1, 'user', 'shared msg', 5)`).run();
+    db.prepare(`INSERT INTO summary_messages (summary_id, message_id, ordinal) VALUES ('leaf_a', 1, 0)`).run();
+    db.prepare(`INSERT INTO summary_messages (summary_id, message_id, ordinal) VALUES ('leaf_b', 1, 0)`).run();
+
+    runPurge(db, { summaryIds: ["leaf_a"], reason: "test" });
+
+    const msg = db
+      .prepare(`SELECT suppressed_at FROM messages WHERE message_id = 1`)
+      .get() as { suppressed_at: string | null };
+    // Wave-7 P0 fix: message stays UN-suppressed because leaf_b (not in
+    // purge set) still references it. Pre-fix this would silently
+    // suppress the message and orphan leaf_b's content.
+    expect(msg.suppressed_at).toBeNull();
+
+    // Sanity: leaf_a IS suppressed
+    const leafA = db
+      .prepare(`SELECT suppressed_at FROM summaries WHERE summary_id = 'leaf_a'`)
+      .get() as { suppressed_at: string | null };
+    expect(leafA.suppressed_at).not.toBeNull();
+    db.close();
+  });
+
+  it("Wave-7 P0-2: shared message IS suppressed when ALL referencing leaves are purged in the same call", () => {
+    const db = setupDb();
+    insertLeaf(db, "leaf_a", 1);
+    insertLeaf(db, "leaf_b", 1);
+    db.prepare(`INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (1, 1, 'user', 'shared msg', 5)`).run();
+    db.prepare(`INSERT INTO summary_messages (summary_id, message_id, ordinal) VALUES ('leaf_a', 1, 0)`).run();
+    db.prepare(`INSERT INTO summary_messages (summary_id, message_id, ordinal) VALUES ('leaf_b', 1, 0)`).run();
+
+    // Purge both leaves: message should now be suppressed
+    runPurge(db, { summaryIds: ["leaf_a", "leaf_b"], reason: "test" });
+
+    const msg = db
+      .prepare(`SELECT suppressed_at FROM messages WHERE message_id = 1`)
+      .get() as { suppressed_at: string | null };
+    expect(msg.suppressed_at).not.toBeNull();
+    db.close();
+  });
+});

@@ -819,10 +819,16 @@ export function createLcmSynthesizeAroundTool(input: {
       const ZOMBIE_TTL_MIN = 10;
       const FAILED_BACKOFF_HARD_CAP_MIN = 6 * 60; // 6h ceiling
 
-      // Wave-3 fix M2: wrap janitor + INSERT in a single transaction so
-      // a concurrent caller can't steal the tuple between our DELETE and
-      // INSERT-OR-IGNORE. SQLite's BEGIN IMMEDIATE acquires the write
-      // lock at transaction start, serializing all writers.
+      // Wave-3 fix M2 + Wave-8 Auditor #6 P1 honest-comment fix: the
+      // janitor (zombie reap + audit GC) runs INSIDE a BEGIN IMMEDIATE
+      // tx that COMMITs before the INSERT OR IGNORE below. The INSERT is
+      // therefore NOT in the same tx as the janitor — but single-flight
+      // is still correct because INSERT OR IGNORE on the UNIQUE lookup
+      // index handles any concurrent claim atomically (SQLite-level).
+      // The tx around the janitor exists to serialize zombie/failed-row
+      // cleanup against concurrent zombie-reap attempts; not to make
+      // janitor+INSERT atomic. (Wave-7 audit caught the misleading prior
+      // comment.)
       let txStarted = false;
       try {
         db.exec("BEGIN IMMEDIATE");

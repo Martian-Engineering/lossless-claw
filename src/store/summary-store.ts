@@ -629,6 +629,12 @@ export class SummaryStore {
     }
 
     const placeholders = normalizedMessageIds.map(() => "?").join(", ");
+    // Wave-8 Auditor #1 P1 fix: was missing `s.suppressed_at IS NULL`.
+    // Caller is `lcm-expand-query-tool` (agent-facing) — without this
+    // filter, suppressed leaves leaked through expand-query results
+    // even after a /lcm purge. Other agent-facing read paths in this
+    // store all default to exclude-suppressed; this method was the
+    // outlier.
     const rows = this.db
       .prepare(
         `SELECT sm.message_id, sm.summary_id
@@ -636,6 +642,7 @@ export class SummaryStore {
          JOIN summaries s ON s.summary_id = sm.summary_id
          WHERE s.conversation_id = ?
            AND s.kind = 'leaf'
+           AND s.suppressed_at IS NULL
            AND sm.message_id IN (${placeholders})
          ORDER BY sm.ordinal ASC, s.created_at ASC`,
       )
@@ -1508,6 +1515,12 @@ export class SummaryStore {
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    // Wave-8 Auditor #1 P1 fix: bound the SQL scan, don't materialize
+    // entire summaries table in JS before applying the row-scan cap.
+    // Bind a SQL LIMIT that's at least as large as the JS-side
+    // MAX_ROW_SCAN (10K), ensuring SQLite stops short instead of
+    // streaming N rows through the prepared statement.
+    const SQL_SCAN_BOUND = 10_000;
     const rows = this.db
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
@@ -1516,9 +1529,10 @@ export class SummaryStore {
                 ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} AS created_at
          FROM summaries
          ${whereClause}
-         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC`,
+         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC
+         LIMIT ?`,
       )
-      .all(...args) as unknown as SummaryRow[];
+      .all(...args, SQL_SCAN_BOUND) as unknown as SummaryRow[];
 
     const MAX_ROW_SCAN = 10_000;
     const results: SummarySearchResult[] = [];

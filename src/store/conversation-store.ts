@@ -1029,14 +1029,22 @@ export class ConversationStore {
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    // Wave-8 Auditor #7-12 P1 fix: bound the SQL scan. Previously the
+    // SELECT had no LIMIT and JS-side MAX_ROW_SCAN=10K was the only
+    // brake — meaning the whole `messages` table (potentially millions
+    // of rows × content blobs) materialized into Node memory before the
+    // JS scan fires. Mirror the summary-store fix from W8 R1: bind a
+    // SQL LIMIT at the JS scan ceiling.
+    const SQL_SCAN_BOUND = 10_000;
     const rows = this.db
       .prepare(
         `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
          FROM messages
          ${whereClause}
-         ORDER BY created_at DESC`,
+         ORDER BY created_at DESC
+         LIMIT ?`,
       )
-      .all(...args) as unknown as MessageRow[];
+      .all(...args, SQL_SCAN_BOUND) as unknown as MessageRow[];
 
     const MAX_ROW_SCAN = 10_000;
     const results: MessageSearchResult[] = [];

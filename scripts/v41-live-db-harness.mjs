@@ -18,7 +18,10 @@
  *        - Suppression filter: suppress one leaf, verify it's hidden
  *   6. Emits a verdict report (PASS / FAIL with diagnostics)
  *
- * Cost: ~$0.05 (20 docs × ~250 tokens each at $0.10/1M tokens).
+ * Cost: ~$0.001 (20 docs × ~250 tokens each = 5K tokens at $0.18/1M).
+ * (Wave-8 P1 fix: prior comment said $0.05 — 100× over-estimate. Voyage
+ * voyage-4-large pricing is $0.18/1M tokens, not $0.10/1M; 5K tokens
+ * × $0.18/1M = $0.0009.)
  * Total runtime: ~1-2 min.
  */
 
@@ -147,7 +150,7 @@ async function main() {
   log(`Pending docs before backfill: ${pendingBefore}`);
   expect(pendingBefore > 0, `corpus has unembedded docs: ${pendingBefore}`);
 
-  log("Running backfill tick (perTickLimit=20, cost ≈ $0.05)...");
+  log("Running backfill tick (perTickLimit=20, cost ≈ $0.001 — Wave-8 corrected from prior $0.05)...");
   const backfillT0 = Date.now();
   const backfill = await runBackfillTick(db, {
     modelName: "voyage-4-large",

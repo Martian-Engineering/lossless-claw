@@ -319,6 +319,7 @@ export function createLcmDescribeTool(input: {
           | "ok"
           | "capped"
           | "skipped-non-summary"
+          | "budget-exhausted" // Wave-8 P1 fix: distinct from "skipped-non-summary"
           | undefined;
         // Wave-4 Auditor #9 P1 fix: when delegated-grant budget is
         // exhausted (resolvedTokenCap === 0), refuse to expand AT ALL
@@ -329,7 +330,11 @@ export function createLcmDescribeTool(input: {
           resolvedTokenCap === 0 && typeof delegatedRemainingBudget === "number";
 
         if (expandChildren && budgetExhausted) {
-          expandChildrenStatus = "skipped-non-summary"; // reuse status, but message is clear
+          // Wave-8 P1 fix: distinct status string (was reusing
+          // "skipped-non-summary"). Agents programmatically branching
+          // on details.expansion.childrenStatus can now distinguish
+          // file-target skips from budget-exhausted skips.
+          expandChildrenStatus = "budget-exhausted";
           lines.push("");
           lines.push(
             `expanded children: SKIPPED — delegated grant has 0 tokens remaining; expansion blocked. Re-issue the grant via lcm_expand_query with a higher remainingTokens to unblock.`,
@@ -443,12 +448,13 @@ export function createLcmDescribeTool(input: {
           | "ok"
           | "capped"
           | "offset-past-end"
+          | "budget-exhausted" // Wave-8 P1 fix
           | undefined;
         if (expandMessages && budgetExhausted) {
-          // Wave-7 Auditor #9 P0 fix: W4 added budget=0 BLOCK only to
-          // expandChildren — expandMessages was unguarded and would
-          // continue to serve content past the delegated grant.
-          expandMessagesStatus = "skipped-non-summary"; // reuse status semantically (P1 follow-up: distinct status)
+          // Wave-7 Auditor #9 P0 fix + Wave-8 P1 distinct-status:
+          // distinguish budget-exhausted from "not-leaf" so programmatic
+          // consumers can branch correctly.
+          expandMessagesStatus = "budget-exhausted";
           lines.push("");
           lines.push(
             `expanded source messages: SKIPPED — delegated grant has 0 tokens remaining; expansion blocked. Re-issue the grant via lcm_expand_query with a higher remainingTokens to unblock.`,

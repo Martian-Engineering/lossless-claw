@@ -91,7 +91,7 @@ That's v4.1.
 
 ### Scenario 1: "What did we work on yesterday?"
 
-The agent calls `lcm_synthesize_around` with `window_kind: 'time'` for yesterday. Synthesis runs *now*, against the actual raw leaves, using the daily-tier prompt + haiku-4-5. Result: same speed as the v3 pre-rolled rollup, but the summary works from primary source instead of a stale pre-rolled blob. If you ask the same question tomorrow, it'll re-synthesize fresh with the same source — but if any leaf got suppressed in between, the new synthesis automatically excludes it.
+The agent calls `lcm_synthesize_around` with `window_kind: 'period'` and `period: 'yesterday'`. No anchor leaf required (period mode is the actual `lcm_recent` replacement; `time` mode requires an anchor `target: 'sum_xxx'`). Synthesis runs *now*, against the actual raw leaves, using the daily-tier prompt + haiku-4-5. Result: same speed as the v3 pre-rolled rollup, but the summary works from primary source instead of a stale pre-rolled blob. If you ask the same question tomorrow, it'll re-synthesize fresh with the same source — but if any leaf got suppressed in between, the new synthesis automatically excludes it.
 
 ### Scenario 2: "We hit something like this rebase conflict before, what was the fix?"
 

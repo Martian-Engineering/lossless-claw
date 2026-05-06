@@ -475,3 +475,96 @@ describe("synthesis-dispatch — template rendering", () => {
     db.close();
   });
 });
+
+// Wave-7 + Wave-8 P0 fix regression coverage
+describe("synthesis-dispatch — yearly best-of-N P0 regression coverage (Wave-7 + Wave-8)", () => {
+  it("Wave-8 P0: 1-survivor short-circuit returns COMPLETE SynthesizeResult (all required fields)", async () => {
+    const db = setupDb();
+    registerPrompt(db, {
+      memoryType: "episodic-yearly",
+      tierLabel: "yearly",
+      passKind: "single",
+      template: "Yearly: {{source_text}}",
+    });
+    registerPrompt(db, {
+      memoryType: "episodic-yearly",
+      tierLabel: "yearly",
+      passKind: "best_of_n_judge",
+      template: "Pick best:\n{{candidates}}",
+    });
+
+    let callCount = 0;
+    const llm: LlmCall = async () => {
+      callCount++;
+      if (callCount === 1) return { output: "survivor", latencyMs: 100, costCents: 50 };
+      throw new Error("simulated candidate failure");
+    };
+
+    const result = await dispatchSynthesis(db, llm, {
+      tier: "yearly",
+      memoryType: "episodic-yearly",
+      sourceText: "src",
+      passSessionId: "ps-1survivor",
+      targetSummaryId: "sum_target",
+      bestOfN: 3,
+    });
+
+    // Critical Wave-8 P0 fix: 1-survivor path was missing 4 required
+    // fields. Verify all are present + populated.
+    expect(result.output).toBe("survivor");
+    expect(result.primaryPromptId).toBeDefined();
+    expect(result.primaryPromptId).toBeTypeOf("string");
+    expect(result.auditIds).toBeDefined();
+    expect(Array.isArray(result.auditIds)).toBe(true);
+    expect(result.auditIds.length).toBeGreaterThan(0);
+    expect(result.totalLatencyMs).toBe(100);
+    expect(result.totalCostCents).toBe(50);
+    expect(result.bestOfN?.n).toBe(1);
+    expect(result.bestOfN?.selectedIndex).toBe(0);
+    db.close();
+  });
+
+  it("Wave-8 P0: judge survivor-count is passed (not ctx.bestOfN) so out-of-range pick is impossible", async () => {
+    const db = setupDb();
+    registerPrompt(db, {
+      memoryType: "episodic-yearly",
+      tierLabel: "yearly",
+      passKind: "single",
+      template: "Yearly: {{source_text}}",
+    });
+    registerPrompt(db, {
+      memoryType: "episodic-yearly",
+      tierLabel: "yearly",
+      passKind: "best_of_n_judge",
+      template: "Pick best:\n{{candidates}}",
+    });
+
+    let callCount = 0;
+    const llm: LlmCall = async (args) => {
+      if (args.passKind === "best_of_n_judge") {
+        // Judge picks index 1 — only valid if survivors >= 2
+        return { output: "Winner: 1", latencyMs: 30, costCents: 5 };
+      }
+      callCount++;
+      // Candidates 0 + 2 succeed, candidate 1 fails (bestOfN=3, 2 survivors)
+      if (callCount === 2) throw new Error("middle candidate fails");
+      return { output: `cand-${callCount}`, latencyMs: 100, costCents: 50 };
+    };
+
+    const result = await dispatchSynthesis(db, llm, {
+      tier: "yearly",
+      memoryType: "episodic-yearly",
+      sourceText: "src",
+      passSessionId: "ps-judge-survivors",
+      targetSummaryId: "sum_target",
+      bestOfN: 3,
+    });
+
+    // 2 survivors → judge.n must be 2; selectedIndex must be in [0,1]
+    expect(result.bestOfN?.n).toBe(2);
+    expect(result.bestOfN?.selectedIndex).toBeGreaterThanOrEqual(0);
+    expect(result.bestOfN?.selectedIndex).toBeLessThan(2);
+    expect(result.output).toMatch(/cand-/);
+    db.close();
+  });
+});

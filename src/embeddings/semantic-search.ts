@@ -299,7 +299,13 @@ export async function runSemanticSearch(
         createdAt: "",
         earliestAt: null,
         latestAt: null,
-        filteredAfterJoin: true,
+        // Wave-8 Auditor #2-5 B-P1 fix: `filteredAfterJoin: true` was
+        // being set on EVERY entity/theme hit despite no JOIN being
+        // attempted. The field's documented semantic is "row passed
+        // metadata-only check but failed JOIN" — meaningless for the
+        // entity branch where no JOIN exists. Now `false` (these rows
+        // didn't fail any JOIN; there was no JOIN to fail).
+        filteredAfterJoin: false,
       })),
       candidateCount: candidates.length,
       voyageTokensConsumed,

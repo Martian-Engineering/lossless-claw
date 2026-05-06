@@ -604,13 +604,23 @@ async function runBestOfNYearly(
   // survived (either bestOfN=1 caller OR N-1 candidates failed). Judge over
   // a single candidate is a foot-gun (judge expected 0..N-1 but only "0"
   // would be valid; many models emit 1-indexed and crash judge_failure).
+  // Wave-8 Auditor #2-5 P1 CRITICAL FIX: previously this returned a
+  // malformed SynthesizeResult missing required fields (primaryPromptId,
+  // auditIds, totalLatencyMs, totalCostCents) — TYPE CONTRACT VIOLATION
+  // that would crash callers reading those fields. Now populates all
+  // required SynthesizeResult fields from the single survivor.
   if (candidateResults.length === 1) {
+    const sole = candidateResults[0]!;
     return {
-      output: candidateResults[0]!.output,
+      output: sole.output,
+      primaryPromptId: primaryPrompt.promptId,
+      auditIds: ctx.auditIds,
+      totalLatencyMs: sole.latencyMs,
+      totalCostCents: sole.costCents ?? 0,
       bestOfN: {
         n: 1,
         selectedIndex: 0,
-        candidates: [candidateResults[0]!.output],
+        candidates: [sole.output],
       },
       hallucinationFlagged: undefined,
     };
@@ -659,7 +669,13 @@ async function runBestOfNYearly(
   ctx.addCost(judgeResult.costCents);
 
   // Parse judge output: expect a number 0..N-1 (the candidate index).
-  const selectedIndex = parseJudgeOutput(judgeResult.output, ctx.bestOfN);
+  // Wave-8 Auditor #2-5 D-P1 fix: judge sees only SURVIVORS (post-
+  // Promise.allSettled), not the originally-requested N. Pass
+  // candidateResults.length so parseJudgeOutput's range check matches
+  // the actual choice space. Previously passed ctx.bestOfN — a judge
+  // picking index 2 when only 2 survivors existed would have indexed
+  // out of bounds (candidateResults[2] === undefined → crash).
+  const selectedIndex = parseJudgeOutput(judgeResult.output, candidateResults.length);
   return {
     output: candidateResults[selectedIndex].output,
     primaryPromptId: primaryPrompt.promptId,
@@ -667,7 +683,8 @@ async function runBestOfNYearly(
     totalLatencyMs: candidateResults.reduce((acc, r) => acc + r.latencyMs, 0) + judgeResult.latencyMs,
     totalCostCents: candidateResults.reduce((acc, r) => acc + (r.costCents ?? 0), 0) + (judgeResult.costCents ?? 0),
     bestOfN: {
-      n: ctx.bestOfN,
+      // Reflect actual N executed (may be < ctx.bestOfN if some failed).
+      n: candidateResults.length,
       selectedIndex,
       candidates: candidateResults.map((c) => c.output),
     },

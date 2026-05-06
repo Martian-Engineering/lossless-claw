@@ -151,6 +151,12 @@ type BucketExecutionResult =
 
 type RunDelegatedExpandQueryParams = {
   deps: LcmDependencies;
+  // Wave-8 Auditor #7-12 P0 fix: previously the citation validation
+  // path called `params.lcm.getDb()` but `lcm` was NOT a field on this
+  // type — the call threw TypeError silently swallowed by the empty
+  // catch, making the entire Wave-4 + Wave-6 anti-fabrication validation
+  // a NO-OP in production. Added explicitly here so call sites pass it.
+  lcm: LcmContextEngine;
   callerSessionKey: string;
   requesterAgentId: string;
   bucket: ConversationBucket;
@@ -931,8 +937,21 @@ async function runDelegatedExpandQuery(
             ...filtered,
             ...parsed.value.citedIds.slice(CITATION_VALIDATION_CAP),
           ];
-        } catch {
-          // best-effort; on validation error fall back to the unvalidated set
+        } catch (validationErr) {
+          // Wave-8 P0 fix: previously this catch was empty {} which
+          // SILENTLY swallowed the TypeError from `params.lcm` being
+          // undefined — making the entire W4+W6 validation a no-op for
+          // months. Now log the error so operators see if validation
+          // breaks again. Fallback to unvalidated set is preserved as
+          // graceful degradation (better to ship un-validated answer
+          // than to fail the whole request on a validation glitch).
+          if (params.deps.log?.error) {
+            params.deps.log.error(
+              `[lcm_expand_query] citedIds validation failed (falling back to unvalidated): ${
+                validationErr instanceof Error ? validationErr.message : String(validationErr)
+              }`,
+            );
+          }
         }
       }
 
@@ -1225,6 +1244,10 @@ export function createLcmExpandQueryTool(input: {
           });
           const delegatedReply = await runDelegatedExpandQuery({
             deps: input.deps,
+            // Wave-8 P0 fix: thread `lcm` so citation validation can
+            // call `lcm.getDb()`. Without this, the W4+W6 anti-
+            // fabrication validation silently no-ops.
+            lcm: input.lcm,
             callerSessionKey,
             requesterAgentId,
             bucket,
@@ -1272,6 +1295,7 @@ export function createLcmExpandQueryTool(input: {
           try {
             const delegatedReply = await runDelegatedExpandQuery({
               deps: input.deps,
+              lcm: input.lcm,
               callerSessionKey,
               requesterAgentId,
               bucket,

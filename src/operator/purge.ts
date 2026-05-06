@@ -142,17 +142,41 @@ export function runPurge(db: DatabaseSync, opts: PurgeOptions): PurgeResult {
 
   const purgeSessionId = `purge_${Date.now()}_${randomSuffix()}`;
 
-  // 2. Resolve the actual leaf IDs to purge
-  const targetLeaves = resolveTargetLeafIds(db, opts);
-  if (targetLeaves.length === 0) {
-    return {
-      affectedLeafIds: [],
-      purgeSessionId,
-      mode: "soft",
-    };
-  }
+  // Wave-8 Auditor #13-18 E-P1 fix: resolve targetLeaves INSIDE the
+  // BEGIN IMMEDIATE transaction so a concurrent /lcm purge or
+  // suppression update can't change the leaf set between resolve and
+  // UPDATE. Previously resolve ran outside the tx → audit-trail loss
+  // when an already-suppressed leaf got re-stamped with a new reason.
+  // We pass the criteria into runSoftPurge and have it do resolve +
+  // updates atomically.
+  return runSoftPurgeAtomic(db, opts, opts.reason, purgeSessionId);
+}
 
-  return runSoftPurge(db, targetLeaves, opts.reason, purgeSessionId);
+function runSoftPurgeAtomic(
+  db: DatabaseSync,
+  opts: PurgeCriteria,
+  reason: string,
+  purgeSessionId: string,
+): PurgeResult {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const targetLeaves = resolveTargetLeafIds(db, opts);
+    if (targetLeaves.length === 0) {
+      db.exec("COMMIT");
+      return {
+        affectedLeafIds: [],
+        purgeSessionId,
+        mode: "soft",
+      };
+    }
+    // Inline the runSoftPurge body here so the resolve + cascade UPDATEs
+    // share a single transaction. (Don't call runSoftPurge directly —
+    // it opens its own BEGIN IMMEDIATE which would conflict.)
+    return runSoftPurgeBody(db, targetLeaves, reason, purgeSessionId, /*alreadyInTx*/ true);
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw e;
+  }
 }
 
 // ---------- internals ----------
@@ -214,13 +238,19 @@ function resolveTargetLeafIds(db: DatabaseSync, opts: PurgeCriteria): string[] {
   return rows.map((r) => r.summary_id);
 }
 
-function runSoftPurge(
+function runSoftPurgeBody(
   db: DatabaseSync,
   leafIds: string[],
   reason: string,
   purgeSessionId: string,
+  alreadyInTx = false,
 ): PurgeResult {
-  db.exec("BEGIN IMMEDIATE");
+  // Wave-8 P1 fix: caller may already hold BEGIN IMMEDIATE from
+  // runSoftPurgeAtomic — don't open a second one (SQLite would error
+  // "cannot start a transaction within a transaction").
+  if (!alreadyInTx) {
+    db.exec("BEGIN IMMEDIATE");
+  }
   try {
     const placeholders = leafIds.map(() => "?").join(",");
     db.prepare(
@@ -320,7 +350,11 @@ function runSoftPurge(
 
     db.exec("COMMIT");
   } catch (e) {
-    db.exec("ROLLBACK");
+    // Wave-8 P1: only ROLLBACK if WE opened the tx; otherwise let outer
+    // try/catch handle it (the runSoftPurgeAtomic caller).
+    if (!alreadyInTx) {
+      try { db.exec("ROLLBACK"); } catch {}
+    }
     throw e;
   }
 
@@ -329,6 +363,17 @@ function runSoftPurge(
     purgeSessionId,
     mode: "soft",
   };
+}
+
+// Backward-compat shim: runSoftPurge (used by tests/internal callers)
+// still works as before — opens its own tx.
+function runSoftPurge(
+  db: DatabaseSync,
+  leafIds: string[],
+  reason: string,
+  purgeSessionId: string,
+): PurgeResult {
+  return runSoftPurgeBody(db, leafIds, reason, purgeSessionId, /*alreadyInTx*/ false);
 }
 
 // runImmediatePurge REMOVED in first-principles pass (2026-05-06).

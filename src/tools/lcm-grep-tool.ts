@@ -856,6 +856,10 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
   // P7 fix: sanitize the pattern so dots/brackets/hyphens don't trigger
   // "fts5: syntax error". Always-on for verbatim — by definition you want
   // literal text.
+  // Wave-8 P1 fix: track ftsBindIndex AT THE PUSH SITE so future refactors
+  // that move the FTS bind don't break the LIKE-fallback substitution.
+  // Previously hard-coded to 0 with a comment that's brittle to refactor.
+  const ftsBindIndex = binds.length;
   filters.push("messages_fts MATCH ?");
   binds.push(sanitizeFts5Pattern(pattern));
 
@@ -925,15 +929,12 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
     // `v4.1`). The previous `findIndex(bb => bb === pattern)` returned -1,
     // so no replacement happened and LIKE got the literal phrase-quoted
     // form, matching nothing on old-SQLite (no-FTS5) installations.
-    // Fix: replace the FIRST bind (always the pattern slot, since FTS5
-    // bind was pushed first at line "binds.push(...)") with the raw LIKE
-    // pattern, regardless of what was there.
+    // Fix: replace the FTS5 bind with the raw LIKE pattern. The bind
+    // index was tracked explicitly at the push site (ftsBindIndex) so
+    // this no longer assumes FTS is the first push.
     const fallbackFilters = filters.map((f) =>
       f === "messages_fts MATCH ?" ? "m.content LIKE ?" : f,
     );
-    // Find the FTS5-MATCH-bind index by position in the filters array
-    // (it's always pushed first per the code above).
-    const ftsBindIndex = 0; // first filter pushed above is "messages_fts MATCH ?"
     const fallbackBinds = binds.map((b, i) =>
       i === ftsBindIndex ? `%${pattern}%` : b,
     );
