@@ -1,9 +1,9 @@
-import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
+  AgentMessage,
   ContextEngine,
   ContextEngineInfo,
   AssembleResult,
@@ -13,7 +13,7 @@ import type {
   IngestResult,
   SubagentEndReason,
   SubagentSpawnPreparation,
-} from "openclaw/plugin-sdk";
+} from "./openclaw-bridge.js";
 import { ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
@@ -26,6 +26,7 @@ import {
   revokeDelegatedExpansionGrantForSession,
 } from "./expansion-auth.js";
 import {
+  extractFileIdsFromContent,
   extensionFromNameOrMime,
   formatFileReference,
   generateExplorationSummary,
@@ -33,15 +34,24 @@ import {
 } from "./large-files.js";
 import { RetrievalEngine } from "./retrieval.js";
 import {
+  extractActiveBranchMessages,
+  readSessionEntries,
+  selectActiveBranchEntries,
+} from "./session-transcript.js";
+import {
   ConversationStore,
   type CreateMessagePartInput,
   type MessagePartType,
 } from "./store/conversation-store.js";
-import { SummaryStore } from "./store/summary-store.js";
+import { SummaryStore, type LargeFileRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams } from "./summarize.js";
+import {
+  buildToolResultPreviewText,
+  sanitizeToolResultDetails,
+} from "./tool-result-offload.js";
+import { matchPendingToolResultRewrites } from "./tool-result-rewrite.js";
 import type { LcmDependencies } from "./types.js";
 
-type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -190,6 +200,42 @@ function extractMessageContent(content: unknown): string {
 
   const serialized = JSON.stringify(content);
   return typeof serialized === "string" ? serialized : "";
+}
+
+function extractToolResultOffloadText(message: AgentMessage): string {
+  if (!("content" in message)) {
+    return "";
+  }
+
+  if (typeof message.content === "string") {
+    return message.content;
+  }
+
+  if (Array.isArray(message.content)) {
+    const textOnly = extractMessageContent(message.content);
+    if (textOnly.length > 0) {
+      return textOnly;
+    }
+    const serialized = JSON.stringify(message.content);
+    return typeof serialized === "string" ? serialized : "";
+  }
+
+  const serialized = JSON.stringify(message.content);
+  return typeof serialized === "string" ? serialized : "";
+}
+
+function emptyMaintenanceResult(reason: string): {
+  changed: false;
+  bytesFreed: 0;
+  rewrittenEntries: 0;
+  reason: string;
+} {
+  return {
+    changed: false,
+    bytesFreed: 0,
+    rewrittenEntries: 0,
+    reason,
+  };
 }
 
 function toRuntimeRoleForTokenEstimate(role: string): "user" | "assistant" | "toolResult" {
@@ -426,6 +472,13 @@ type StoredMessage = {
   tokenCount: number;
 };
 
+type CanonicalizedMessage = {
+  storedMessage: StoredMessage;
+  messageForParts: AgentMessage;
+  offloadId?: number;
+  cleanupFilePaths: string[];
+};
+
 /**
  * Normalize AgentMessage variants into the storage shape used by LCM.
  */
@@ -518,62 +571,185 @@ function isBootstrapMessage(value: unknown): value is AgentMessage {
 
 /** Load recoverable messages from a JSON/JSONL session file. */
 function readLeafPathMessages(sessionFile: string): AgentMessage[] {
-  let raw = "";
-  try {
-    raw = readFileSync(sessionFile, "utf8");
-  } catch {
-    return [];
-  }
-
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return [];
-  }
-
-  if (trimmed.startsWith("[")) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      return parsed.filter(isBootstrapMessage);
-    } catch {
-      return [];
-    }
-  }
-
-  const messages: AgentMessage[] = [];
-  const lines = raw.split(/\r?\n/);
-  for (const line of lines) {
-    const item = line.trim();
-    if (!item) {
-      continue;
-    }
-    try {
-      const parsed = JSON.parse(item);
-      const candidate =
-        parsed && typeof parsed === "object" && "message" in parsed
-          ? (parsed as { message?: unknown }).message
-          : parsed;
-      if (isBootstrapMessage(candidate)) {
-        messages.push(candidate);
-      }
-    } catch {
-      // Skip malformed lines.
-    }
-  }
-  return messages;
+  return extractActiveBranchMessages(
+    selectActiveBranchEntries(readSessionEntries(sessionFile)),
+  ).filter(isBootstrapMessage);
 }
 
 function messageIdentity(role: string, content: string): string {
   return `${role}\u0000${content}`;
 }
 
+function toolResultOffloadIdentity(toolCallId: string, messageTimestamp: number): string {
+  return `toolResultOffload\u0000${toolCallId}\u0000${messageTimestamp}`;
+}
+
+function interceptedUserFileToken(params: {
+  fileName?: string | null;
+  mimeType?: string | null;
+  text: string;
+}): string {
+  const fileName = params.fileName?.trim() || "unknown";
+  const mimeType = params.mimeType?.trim() || "unknown";
+  const byteSize = Buffer.byteLength(params.text, "utf8");
+  const contentHash = createHash("sha256").update(params.text).digest("hex");
+  return `lcmfile:${fileName}:${mimeType}:${byteSize}:${contentHash}`;
+}
+
+function interceptedUserMessageIdentityFromRawContent(params: {
+  content: string;
+  threshold: number;
+}): string | null {
+  const blocks = parseFileBlocks(params.content);
+  if (blocks.length === 0) {
+    return null;
+  }
+
+  const rewrittenSegments: string[] = [];
+  let cursor = 0;
+  let interceptedAny = false;
+  for (const block of blocks) {
+    rewrittenSegments.push(params.content.slice(cursor, block.start));
+    const blockTokens = estimateTokens(block.text);
+    if (blockTokens >= params.threshold) {
+      interceptedAny = true;
+      rewrittenSegments.push(
+        `[[LCM_INTERCEPTED_FILE:${interceptedUserFileToken({
+          fileName: block.fileName,
+          mimeType: block.mimeType,
+          text: block.text,
+        })}]]`,
+      );
+    } else {
+      rewrittenSegments.push(block.fullMatch);
+    }
+    cursor = block.end;
+  }
+
+  if (!interceptedAny) {
+    return null;
+  }
+
+  rewrittenSegments.push(params.content.slice(cursor));
+  return `interceptedUser\u0000${rewrittenSegments.join("")}`;
+}
+
+function extractToolResultOffloadIdentity(
+  message: AgentMessage,
+): { toolCallId: string; messageTimestamp: number } | null {
+  const topLevel = message as unknown as Record<string, unknown>;
+  const topLevelRole = typeof topLevel.role === "string" ? topLevel.role : "";
+  if (topLevelRole !== "toolResult") {
+    return null;
+  }
+
+  const toolCallId =
+    safeString(topLevel.toolCallId) ??
+    safeString(topLevel.tool_call_id);
+  const messageTimestamp =
+    typeof topLevel.timestamp === "number" && Number.isFinite(topLevel.timestamp)
+      ? Math.floor(topLevel.timestamp)
+      : undefined;
+
+  if (!toolCallId || messageTimestamp === undefined) {
+    return null;
+  }
+
+  return {
+    toolCallId,
+    messageTimestamp,
+  };
+}
+
+function isTranscriptMessageAlreadyRewritten(params: {
+  activeBranchEntry: unknown;
+  replacementMessage: AgentMessage;
+}): boolean {
+  const entry = params.activeBranchEntry as { type?: unknown; message?: unknown } | null;
+  if (!entry || entry.type !== "message") {
+    return false;
+  }
+
+  const normalize = (message: unknown):
+    | {
+        toolCallId: string;
+        toolName: string;
+        isError: boolean;
+        messageTimestamp?: number;
+        contentText: string;
+        offloadFileId?: string;
+      }
+    | null => {
+      if (!message || typeof message !== "object") {
+        return null;
+      }
+      const record = message as Record<string, unknown>;
+      if (record.role !== "toolResult") {
+        return null;
+      }
+      const toolCallId =
+        safeString(record.toolCallId) ??
+        safeString(record.tool_call_id);
+      if (!toolCallId) {
+        return null;
+      }
+      const contentText = extractToolResultOffloadText(message as AgentMessage);
+      const details = record.details as { lcmOffload?: { fileId?: unknown } } | undefined;
+      const contentFileId = contentText.match(/\bfile_[a-f0-9]{16}\b/i)?.[0]?.toLowerCase();
+      const detailsFileId =
+        typeof details?.lcmOffload?.fileId === "string"
+          ? details.lcmOffload.fileId.match(/\bfile_[a-f0-9]{16}\b/i)?.[0]?.toLowerCase()
+          : undefined;
+      return {
+        toolCallId,
+        toolName:
+          safeString(record.toolName) ??
+          safeString(record.tool_name) ??
+          "",
+        isError:
+          safeBoolean(record.isError) ??
+          safeBoolean(record.is_error) ??
+          false,
+        messageTimestamp:
+          typeof record.timestamp === "number" && Number.isFinite(record.timestamp)
+            ? Math.floor(record.timestamp)
+            : undefined,
+        contentText,
+        offloadFileId: detailsFileId ?? contentFileId,
+      };
+    };
+
+  const activeMessage = normalize(entry.message);
+  const replacementMessage = normalize(params.replacementMessage);
+  if (activeMessage && replacementMessage) {
+    return activeMessage.toolCallId === replacementMessage.toolCallId
+      && activeMessage.toolName === replacementMessage.toolName
+      && activeMessage.isError === replacementMessage.isError
+      && activeMessage.messageTimestamp === replacementMessage.messageTimestamp
+      && activeMessage.contentText === replacementMessage.contentText
+      && activeMessage.offloadFileId === replacementMessage.offloadFileId;
+  }
+
+  return JSON.stringify(entry.message) === JSON.stringify(params.replacementMessage);
+}
+
+type ReconcileMessageDescriptor = {
+  message: AgentMessage;
+  stored: StoredMessage;
+  identity: string;
+  dbCount: number;
+};
+
+type InterceptedUserIdentityCaches = {
+  largeFiles: Map<string, LargeFileRecord | null>;
+  largeFileContents: Map<string, string | null>;
+};
+
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
 export class LcmContextEngine implements ContextEngine {
   readonly info: ContextEngineInfo = {
-    id: "lcm",
+    id: "lossless-claw",
     name: "Lossless Context Management Engine",
     version: "0.1.0",
     ownsCompaction: true,
@@ -821,7 +997,7 @@ export class LcmContextEngine implements ContextEngine {
   private async interceptLargeFiles(params: {
     conversationId: number;
     content: string;
-  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
+  }): Promise<{ rewrittenContent: string; fileIds: string[]; storageUris: string[] } | null> {
     const blocks = parseFileBlocks(params.content);
     if (blocks.length === 0) {
       return null;
@@ -830,6 +1006,7 @@ export class LcmContextEngine implements ContextEngine {
     const threshold = Math.max(1, this.config.largeFileTokenThreshold);
     const summarizeText = await this.resolveLargeFileTextSummarizer();
     const fileIds: string[] = [];
+    const storageUris: string[] = [];
     const rewrittenSegments: string[] = [];
     let cursor = 0;
     let interceptedAny = false;
@@ -879,6 +1056,7 @@ export class LcmContextEngine implements ContextEngine {
       );
       cursor = block.end;
       fileIds.push(fileId);
+      storageUris.push(storageUri);
     }
 
     if (!interceptedAny) {
@@ -889,7 +1067,345 @@ export class LcmContextEngine implements ContextEngine {
     return {
       rewrittenContent: rewrittenSegments.join(""),
       fileIds,
+      storageUris,
     };
+  }
+
+  /**
+   * Persist one canonicalized message and attach the corresponding message_parts/context item rows.
+   */
+  private async persistCanonicalMessage(params: {
+    conversationId: number;
+    sessionId: string;
+    storedMessage: StoredMessage;
+    messageForParts: AgentMessage;
+  }): Promise<number> {
+    const maxSeq = await this.conversationStore.getMaxSeq(params.conversationId);
+    const seq = maxSeq + 1;
+
+    const msgRecord = await this.conversationStore.createMessage({
+      conversationId: params.conversationId,
+      seq,
+      role: params.storedMessage.role,
+      content: params.storedMessage.content,
+      tokenCount: params.storedMessage.tokenCount,
+    });
+    await this.conversationStore.createMessageParts(
+      msgRecord.messageId,
+      buildMessageParts({
+        sessionId: params.sessionId,
+        message: params.messageForParts,
+        fallbackContent: params.storedMessage.content,
+      }),
+    );
+    await this.summaryStore.appendContextMessage(params.conversationId, msgRecord.messageId);
+    return msgRecord.messageId;
+  }
+
+  private async cleanupStoredFiles(filePaths: string[]): Promise<void> {
+    const uniquePaths = [...new Set(filePaths.filter((filePath) => filePath.length > 0))];
+    await Promise.all(
+      uniquePaths.map(async (filePath) => {
+        try {
+          await rm(filePath, { force: true });
+        } catch {
+          // Best-effort cleanup only.
+        }
+      }),
+    );
+  }
+
+  private async getLargeFileCached(
+    fileId: string,
+    cache: Map<string, LargeFileRecord | null>,
+  ): Promise<LargeFileRecord | null> {
+    let record = cache.get(fileId);
+    if (record === undefined) {
+      record = await this.summaryStore.getLargeFile(fileId);
+      cache.set(fileId, record);
+    }
+    return record;
+  }
+
+  private async getLargeFileContentCached(
+    record: LargeFileRecord,
+    cache: Map<string, string | null>,
+  ): Promise<string | null> {
+    let content = cache.get(record.fileId);
+    if (content === undefined) {
+      try {
+        content = await readFile(record.storageUri, "utf8");
+      } catch {
+        content = null;
+      }
+      cache.set(record.fileId, content);
+    }
+    return content;
+  }
+
+  private async buildStoredInterceptedUserMessageIdentity(params: {
+    content: string;
+    caches: InterceptedUserIdentityCaches;
+  }): Promise<string | null> {
+    const fileIds = extractFileIdsFromContent(params.content);
+    if (fileIds.length === 0) {
+      return null;
+    }
+
+    let rewritten = params.content;
+    let replacedAny = false;
+    for (const fileId of fileIds) {
+      const record = await this.getLargeFileCached(fileId, params.caches.largeFiles);
+      if (!record) {
+        continue;
+      }
+      const fileText = await this.getLargeFileContentCached(record, params.caches.largeFileContents);
+      if (fileText === null) {
+        continue;
+      }
+      const referenceText = formatFileReference({
+        fileId: record.fileId,
+        fileName: record.fileName ?? undefined,
+        mimeType: record.mimeType ?? undefined,
+        byteSize: record.byteSize ?? Buffer.byteLength(fileText, "utf8"),
+        summary: record.explorationSummary ?? "",
+      });
+      if (!rewritten.includes(referenceText)) {
+        continue;
+      }
+      rewritten = rewritten.split(referenceText).join(
+        `[[LCM_INTERCEPTED_FILE:${interceptedUserFileToken({
+          fileName: record.fileName,
+          mimeType: record.mimeType,
+          text: fileText,
+        })}]]`,
+      );
+      replacedAny = true;
+    }
+
+    if (!replacedAny) {
+      return null;
+    }
+    return `interceptedUser\u0000${rewritten}`;
+  }
+
+  private async buildStoredInterceptedUserIdentityCounts(params: {
+    conversationId: number;
+    messages: Array<{ role: string; content: string }>;
+    caches: InterceptedUserIdentityCaches;
+  }): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    for (const message of params.messages) {
+      if (message.role !== "user") {
+        continue;
+      }
+      const identity = await this.buildStoredInterceptedUserMessageIdentity({
+        content: message.content,
+        caches: params.caches,
+      });
+      if (!identity) {
+        continue;
+      }
+      counts.set(identity, (counts.get(identity) ?? 0) + 1);
+    }
+    return counts;
+  }
+
+  private async persistCanonicalizedMessage(params: {
+    conversationId: number;
+    sessionId: string;
+    canonicalized: CanonicalizedMessage;
+  }): Promise<number> {
+    try {
+      const messageId = await this.persistCanonicalMessage({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        storedMessage: params.canonicalized.storedMessage,
+        messageForParts: params.canonicalized.messageForParts,
+      });
+      if (typeof params.canonicalized.offloadId === "number") {
+        await this.summaryStore.attachToolResultOffloadMessageId(
+          params.canonicalized.offloadId,
+          messageId,
+        );
+      }
+      return messageId;
+    } catch (error) {
+      await this.cleanupStoredFiles(params.canonicalized.cleanupFilePaths);
+      throw error;
+    }
+  }
+
+  /**
+   * Import a historical message batch through the same canonical path used by
+   * live ingest so bootstrap rows also receive message_parts/context items.
+   */
+  private async importCanonicalMessages(params: {
+    conversationId: number;
+    sessionId: string;
+    messages: AgentMessage[];
+  }): Promise<number> {
+    const cleanupFilePaths: string[] = [];
+    let importedMessages = 0;
+    try {
+      for (const message of params.messages) {
+        const canonicalized = await this.canonicalizeMessageForStorage({
+          conversationId: params.conversationId,
+          sessionId: params.sessionId,
+          message,
+        });
+        await this.persistCanonicalizedMessage({
+          conversationId: params.conversationId,
+          sessionId: params.sessionId,
+          canonicalized,
+        });
+        cleanupFilePaths.push(...canonicalized.cleanupFilePaths);
+        importedMessages += 1;
+      }
+    } catch (error) {
+      await this.cleanupStoredFiles(cleanupFilePaths);
+      throw error;
+    }
+    return importedMessages;
+  }
+
+  /**
+   * Normalize one message into the canonical storage form used by LCM.
+   */
+  private async canonicalizeMessageForStorage(params: {
+    conversationId: number;
+    sessionId: string;
+    message: AgentMessage;
+  }): Promise<CanonicalizedMessage> {
+    const stored = toStoredMessage(params.message);
+    let messageForParts = params.message;
+    const cleanupFilePaths: string[] = [];
+
+    try {
+      if (stored.role === "user") {
+        const intercepted = await this.interceptLargeFiles({
+          conversationId: params.conversationId,
+          content: stored.content,
+        });
+        if (intercepted && "content" in params.message) {
+          cleanupFilePaths.push(...intercepted.storageUris);
+          stored.content = intercepted.rewrittenContent;
+          stored.tokenCount = estimateTokens(stored.content);
+          messageForParts = {
+            ...params.message,
+            content: stored.content,
+          } as AgentMessage;
+        }
+      }
+
+      const topLevel = params.message as unknown as Record<string, unknown>;
+      const topLevelRole = typeof topLevel.role === "string" ? topLevel.role : "";
+      if (topLevelRole === "toolResult" && this.config.toolResultPersistEnabled) {
+        const originalText = extractToolResultOffloadText(params.message);
+        const threshold = Math.max(1, this.config.toolResultPersistThresholdChars);
+        const toolCallId =
+          safeString(topLevel.toolCallId) ??
+          safeString(topLevel.tool_call_id);
+        const toolName =
+          safeString(topLevel.toolName) ??
+          safeString(topLevel.tool_name) ??
+          "unknown";
+        const isError =
+          safeBoolean(topLevel.isError) ??
+          safeBoolean(topLevel.is_error) ??
+          false;
+        const messageTimestamp =
+          typeof topLevel.timestamp === "number" && Number.isFinite(topLevel.timestamp)
+            ? Math.floor(topLevel.timestamp)
+            : Date.now();
+
+        if (toolCallId && originalText.length >= threshold) {
+          const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+          const originalByteSize = Buffer.byteLength(originalText, "utf8");
+          const previewText = buildToolResultPreviewText({
+            fileId,
+            toolName,
+            originalByteSize,
+            isError,
+            originalText,
+            previewChars: this.config.toolResultPreviewChars,
+          });
+          const storageUri = await this.storeLargeFileContent({
+            conversationId: params.conversationId,
+            fileId,
+            extension: "txt",
+            content: originalText,
+          });
+          cleanupFilePaths.push(storageUri);
+
+          await this.summaryStore.insertLargeFile({
+            fileId,
+            conversationId: params.conversationId,
+            fileName: `tool-result-${toolName}.txt`,
+            mimeType: "text/plain",
+            byteSize: originalByteSize,
+            storageUri,
+            explorationSummary: `Offloaded ${toolName} tool result.`,
+          });
+
+          const sanitizedDetails = sanitizeToolResultDetails({
+            toolName,
+            details: topLevel.details,
+            meta: {
+              fileId,
+              originalChars: originalText.length,
+              originalBytes: originalByteSize,
+              previewChars: this.config.toolResultPreviewChars,
+              strategy: "deterministic_head_tail",
+            },
+          });
+
+          const replacementMessage = {
+            ...params.message,
+            role: "toolResult",
+            toolCallId,
+            toolName,
+            isError,
+            timestamp: messageTimestamp,
+            content: previewText,
+            details: sanitizedDetails,
+          } as AgentMessage;
+
+          stored.content = previewText;
+          stored.tokenCount = estimateTokens(stored.content);
+          messageForParts = replacementMessage;
+
+          const offload = await this.summaryStore.insertToolResultOffload({
+            conversationId: params.conversationId,
+            sessionId: params.sessionId,
+            fileId,
+            toolCallId,
+            toolName,
+            messageTimestamp,
+            originalCharCount: originalText.length,
+            originalByteSize,
+            previewText,
+            replacementMessageJson: JSON.stringify(replacementMessage),
+          });
+
+          return {
+            storedMessage: stored,
+            messageForParts,
+            offloadId: offload.offloadId,
+            cleanupFilePaths,
+          };
+        }
+      }
+
+      return {
+        storedMessage: stored,
+        messageForParts,
+        cleanupFilePaths,
+      };
+    } catch (error) {
+      await this.cleanupStoredFiles(cleanupFilePaths);
+      throw error;
+    }
   }
 
   // ── ContextEngine interface ─────────────────────────────────────────────
@@ -911,29 +1427,115 @@ export class LcmContextEngine implements ContextEngine {
       return { importedMessages: 0, hasOverlap: false };
     }
 
-    const latestDbMessage = await this.conversationStore.getLastMessage(conversationId);
+    const dbMessages = await this.conversationStore.getMessages(conversationId);
+    const latestDbMessage = dbMessages.at(-1) ?? null;
     if (!latestDbMessage) {
       return { importedMessages: 0, hasOverlap: false };
     }
 
-    const storedHistoricalMessages = historicalMessages.map((message) => toStoredMessage(message));
+    const dbIdentityCounts = new Map<string, number>();
+    const offloadIdentityCache = new Map<string, boolean>();
+    const interceptedUserCaches: InterceptedUserIdentityCaches = {
+      largeFiles: new Map<string, LargeFileRecord | null>(),
+      largeFileContents: new Map<string, string | null>(),
+    };
+    const interceptedUserIdentityCounts = await this.buildStoredInterceptedUserIdentityCounts({
+      conversationId,
+      messages: dbMessages,
+      caches: interceptedUserCaches,
+    });
+    const historicalDescriptors: ReconcileMessageDescriptor[] = [];
+
+    for (const message of historicalMessages) {
+      const stored = toStoredMessage(message);
+      const offloadIdentity = extractToolResultOffloadIdentity(message);
+      if (offloadIdentity) {
+        const identity = toolResultOffloadIdentity(
+          offloadIdentity.toolCallId,
+          offloadIdentity.messageTimestamp,
+        );
+        let exists = offloadIdentityCache.get(identity);
+        if (exists === undefined) {
+          const offload = await this.summaryStore.getToolResultOffloadByIdentity({
+            conversationId,
+            toolCallId: offloadIdentity.toolCallId,
+            messageTimestamp: offloadIdentity.messageTimestamp,
+          });
+          exists = !!offload;
+          offloadIdentityCache.set(identity, exists);
+        }
+        if (exists) {
+          historicalDescriptors.push({
+            message,
+            stored,
+            identity,
+            dbCount: 1,
+          });
+          continue;
+        }
+      }
+
+      const historicalInterceptedUserIdentity =
+        stored.role === "user"
+          ? interceptedUserMessageIdentityFromRawContent({
+              content: stored.content,
+              threshold: Math.max(1, this.config.largeFileTokenThreshold),
+            })
+          : null;
+      if (historicalInterceptedUserIdentity) {
+        historicalDescriptors.push({
+          message,
+          stored,
+          identity: historicalInterceptedUserIdentity,
+          dbCount: interceptedUserIdentityCounts.get(historicalInterceptedUserIdentity) ?? 0,
+        });
+        continue;
+      }
+
+      const identity = messageIdentity(stored.role, stored.content);
+      let dbCount = dbIdentityCounts.get(identity);
+      if (dbCount === undefined) {
+        dbCount = await this.conversationStore.countMessagesByIdentity(
+          conversationId,
+          stored.role,
+          stored.content,
+        );
+        dbIdentityCounts.set(identity, dbCount);
+      }
+      historicalDescriptors.push({
+        message,
+        stored,
+        identity,
+        dbCount,
+      });
+    }
+
+    const latestDbOffload = await this.summaryStore.getToolResultOffloadByMessageId(
+      latestDbMessage.messageId,
+    );
+    const latestDbInterceptedUserIdentity =
+      latestDbMessage.role === "user"
+        ? await this.buildStoredInterceptedUserMessageIdentity({
+            content: latestDbMessage.content,
+            caches: interceptedUserCaches,
+          })
+        : null;
+    const latestDbIdentity = latestDbOffload
+      ? toolResultOffloadIdentity(latestDbOffload.toolCallId, latestDbOffload.messageTimestamp)
+      : latestDbInterceptedUserIdentity
+        ? latestDbInterceptedUserIdentity
+      : messageIdentity(latestDbMessage.role, latestDbMessage.content);
 
     // Fast path: one tail comparison for the common in-sync case.
-    const latestHistorical = storedHistoricalMessages[storedHistoricalMessages.length - 1];
-    const latestIdentity = messageIdentity(latestDbMessage.role, latestDbMessage.content);
-    if (latestIdentity === messageIdentity(latestHistorical.role, latestHistorical.content)) {
-      const dbOccurrences = await this.conversationStore.countMessagesByIdentity(
-        conversationId,
-        latestDbMessage.role,
-        latestDbMessage.content,
-      );
+    const latestHistorical = historicalDescriptors[historicalDescriptors.length - 1];
+    if (latestHistorical && latestDbIdentity === latestHistorical.identity) {
       let historicalOccurrences = 0;
-      for (const stored of storedHistoricalMessages) {
-        if (messageIdentity(stored.role, stored.content) === latestIdentity) {
+      for (const descriptor of historicalDescriptors) {
+        if (descriptor.identity === latestDbIdentity) {
           historicalOccurrences += 1;
         }
       }
-      if (dbOccurrences === historicalOccurrences) {
+      if (latestHistorical.dbCount === historicalOccurrences) {
         return { importedMessages: 0, hasOverlap: true };
       }
     }
@@ -942,42 +1544,28 @@ export class LcmContextEngine implements ContextEngine {
     // message that already exists in LCM, then append everything after it.
     let anchorIndex = -1;
     const historicalIdentityTotals = new Map<string, number>();
-    for (const stored of storedHistoricalMessages) {
-      const identity = messageIdentity(stored.role, stored.content);
-      historicalIdentityTotals.set(identity, (historicalIdentityTotals.get(identity) ?? 0) + 1);
+    for (const descriptor of historicalDescriptors) {
+      historicalIdentityTotals.set(
+        descriptor.identity,
+        (historicalIdentityTotals.get(descriptor.identity) ?? 0) + 1,
+      );
     }
 
     const historicalIdentityCountsAfterIndex = new Map<string, number>();
-    const dbIdentityCounts = new Map<string, number>();
-    for (let index = storedHistoricalMessages.length - 1; index >= 0; index--) {
-      const stored = storedHistoricalMessages[index];
-      const identity = messageIdentity(stored.role, stored.content);
+    for (let index = historicalDescriptors.length - 1; index >= 0; index--) {
+      const descriptor = historicalDescriptors[index];
+      const identity = descriptor.identity;
       const seenAfter = historicalIdentityCountsAfterIndex.get(identity) ?? 0;
       const total = historicalIdentityTotals.get(identity) ?? 0;
       const occurrencesThroughIndex = total - seenAfter;
-      const exists = await this.conversationStore.hasMessage(
-        conversationId,
-        stored.role,
-        stored.content,
-      );
       historicalIdentityCountsAfterIndex.set(identity, seenAfter + 1);
-      if (!exists) {
+      if (descriptor.dbCount === 0) {
         continue;
-      }
-
-      let dbCountForIdentity = dbIdentityCounts.get(identity);
-      if (dbCountForIdentity === undefined) {
-        dbCountForIdentity = await this.conversationStore.countMessagesByIdentity(
-          conversationId,
-          stored.role,
-          stored.content,
-        );
-        dbIdentityCounts.set(identity, dbCountForIdentity);
       }
 
       // Match the same occurrence index as the DB tail so repeated empty
       // tool messages do not anchor against a later, still-missing entry.
-      if (dbCountForIdentity !== occurrencesThroughIndex) {
+      if (descriptor.dbCount !== occurrencesThroughIndex) {
         continue;
       }
 
@@ -992,13 +1580,20 @@ export class LcmContextEngine implements ContextEngine {
       return { importedMessages: 0, hasOverlap: true };
     }
 
-    const missingTail = historicalMessages.slice(anchorIndex + 1);
+    const missingTail = historicalDescriptors.slice(anchorIndex + 1).map((descriptor) => descriptor.message);
+    const cleanupFilePaths: string[] = [];
     let importedMessages = 0;
-    for (const message of missingTail) {
-      const result = await this.ingestSingle({ sessionId, message });
-      if (result.ingested) {
-        importedMessages += 1;
+    try {
+      for (const message of missingTail) {
+        const result = await this.ingestSingle({ sessionId, message });
+        if (result.ingested) {
+          cleanupFilePaths.push(...result.cleanupFilePaths);
+          importedMessages += 1;
+        }
       }
+    } catch (error) {
+      await this.cleanupStoredFiles(cleanupFilePaths);
+      throw error;
     }
 
     return { importedMessages, hasOverlap: true };
@@ -1026,23 +1621,11 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
-          const bulkInput = historicalMessages.map((message, index) => {
-            const stored = toStoredMessage(message);
-            return {
-              conversationId,
-              seq: nextSeq + index,
-              role: stored.role,
-              content: stored.content,
-              tokenCount: stored.tokenCount,
-            };
-          });
-
-          const inserted = await this.conversationStore.createMessagesBulk(bulkInput);
-          await this.summaryStore.appendContextMessages(
+          const importedMessages = await this.importCanonicalMessages({
             conversationId,
-            inserted.map((record) => record.messageId),
-          );
+            sessionId: params.sessionId,
+            messages: historicalMessages,
+          });
           await this.conversationStore.markConversationBootstrapped(conversationId);
 
           // Prune HEARTBEAT_OK turns from the freshly imported data
@@ -1057,7 +1640,7 @@ export class LcmContextEngine implements ContextEngine {
 
           return {
             bootstrapped: true,
-            importedMessages: inserted.length,
+            importedMessages,
           };
         }
 
@@ -1129,60 +1712,29 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     message: AgentMessage;
     isHeartbeat?: boolean;
-  }): Promise<IngestResult> {
+  }): Promise<IngestResult & { cleanupFilePaths: string[] }> {
     const { sessionId, message, isHeartbeat } = params;
     if (isHeartbeat) {
-      return { ingested: false };
+      return { ingested: false, cleanupFilePaths: [] };
     }
-    const stored = toStoredMessage(message);
 
     // Get or create conversation for this session
     const conversation = await this.conversationStore.getOrCreateConversation(sessionId);
     const conversationId = conversation.conversationId;
 
-    let messageForParts = message;
-    if (stored.role === "user") {
-      const intercepted = await this.interceptLargeFiles({
-        conversationId,
-        content: stored.content,
-      });
-      if (intercepted) {
-        stored.content = intercepted.rewrittenContent;
-        stored.tokenCount = estimateTokens(stored.content);
-        if ("content" in message) {
-          messageForParts = {
-            ...message,
-            content: stored.content,
-          } as AgentMessage;
-        }
-      }
-    }
-
-    // Determine next sequence number
-    const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
-    const seq = maxSeq + 1;
-
-    // Persist the message
-    const msgRecord = await this.conversationStore.createMessage({
+    const canonicalized = await this.canonicalizeMessageForStorage({
       conversationId,
-      seq,
-      role: stored.role,
-      content: stored.content,
-      tokenCount: stored.tokenCount,
+      sessionId,
+      message,
     });
-    await this.conversationStore.createMessageParts(
-      msgRecord.messageId,
-      buildMessageParts({
-        sessionId,
-        message: messageForParts,
-        fallbackContent: stored.content,
-      }),
-    );
 
-    // Append to context items so assembler can see it
-    await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
+    await this.persistCanonicalizedMessage({
+      conversationId,
+      sessionId,
+      canonicalized,
+    });
 
-    return { ingested: true };
+    return { ingested: true, cleanupFilePaths: canonicalized.cleanupFilePaths };
   }
 
   async ingest(params: {
@@ -1191,7 +1743,12 @@ export class LcmContextEngine implements ContextEngine {
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
     this.ensureMigrated();
-    return this.withSessionQueue(params.sessionId, () => this.ingestSingle(params));
+    return this.withSessionQueue(params.sessionId, () =>
+      this.conversationStore.withTransaction(async () => {
+        const result = await this.ingestSingle(params);
+        return { ingested: result.ingested };
+      }),
+    );
   }
 
   async ingestBatch(params: {
@@ -1206,16 +1763,135 @@ export class LcmContextEngine implements ContextEngine {
     return this.withSessionQueue(params.sessionId, async () => {
       let ingestedCount = 0;
       for (const message of params.messages) {
-        const result = await this.ingestSingle({
-          sessionId: params.sessionId,
-          message,
-          isHeartbeat: params.isHeartbeat,
-        });
+        const result = await this.conversationStore.withTransaction(async () =>
+          this.ingestSingle({
+            sessionId: params.sessionId,
+            message,
+            isHeartbeat: params.isHeartbeat,
+          }),
+        );
         if (result.ingested) {
           ingestedCount += 1;
         }
       }
       return { ingestedCount };
+    });
+  }
+
+  async maintain(params: {
+    sessionId: string;
+    sessionFile: string;
+    runtimeContext?: { rewriteTranscriptEntries?: (request: {
+      replacements: Array<{ entryId: string; message: AgentMessage }>;
+    }) => Promise<{ changed: boolean; bytesFreed: number; rewrittenEntries: number; reason?: string }> };
+  }): Promise<{ changed: boolean; bytesFreed: number; rewrittenEntries: number; reason?: string }> {
+    this.ensureMigrated();
+
+    return this.withSessionQueue(params.sessionId, async () => {
+      const rewriteTranscriptEntries = params.runtimeContext?.rewriteTranscriptEntries;
+      if (typeof rewriteTranscriptEntries !== "function") {
+        return emptyMaintenanceResult("rewrite helper unavailable");
+      }
+
+      const pending = await this.summaryStore.getPendingToolResultOffloads(params.sessionId);
+      if (pending.length === 0) {
+        return emptyMaintenanceResult("no pending tool-result offloads");
+      }
+
+      const activeBranchEntries = selectActiveBranchEntries(readSessionEntries(params.sessionFile));
+      if (activeBranchEntries.length === 0) {
+        return emptyMaintenanceResult("no active branch entries in session");
+      }
+
+      const matches = matchPendingToolResultRewrites({
+        activeBranchEntries,
+        pending: pending.map((record) => ({
+          offloadId: record.offloadId,
+          toolCallId: record.toolCallId,
+          toolName: record.toolName,
+          messageTimestamp: record.messageTimestamp,
+        })),
+      });
+      if (matches.length === 0) {
+        return emptyMaintenanceResult("no matching active-branch tool results");
+      }
+
+      const pendingByOffloadId = new Map(pending.map((record) => [record.offloadId, record]));
+      const activeBranchEntriesById = new Map(activeBranchEntries.map((entry) => [entry.id, entry]));
+      const replacements: Array<{ offloadId: number; entryId: string; message: AgentMessage }> = [];
+
+      for (const match of matches) {
+        const record = pendingByOffloadId.get(match.offloadId);
+        if (!record) {
+          continue;
+        }
+
+        try {
+          replacements.push({
+            offloadId: record.offloadId,
+            entryId: match.entryId,
+            message: JSON.parse(record.replacementMessageJson) as AgentMessage,
+          });
+        } catch {
+          await this.summaryStore.markToolResultOffloadFailed(
+            record.offloadId,
+            "invalid replacement_message_json",
+          );
+        }
+      }
+
+      if (replacements.length === 0) {
+        return emptyMaintenanceResult("no valid replacement payloads");
+      }
+
+      const replacementsNeedingRewrite: Array<{ offloadId: number; entryId: string; message: AgentMessage }> = [];
+      let healedRewrites = 0;
+      for (const replacement of replacements) {
+        const activeBranchEntry = activeBranchEntriesById.get(replacement.entryId);
+        if (isTranscriptMessageAlreadyRewritten({
+          activeBranchEntry,
+          replacementMessage: replacement.message,
+        })) {
+          await this.summaryStore.markToolResultOffloadRewritten(
+            replacement.offloadId,
+            replacement.entryId,
+          );
+          healedRewrites += 1;
+          continue;
+        }
+        replacementsNeedingRewrite.push(replacement);
+      }
+
+      if (replacementsNeedingRewrite.length === 0) {
+        return {
+          changed: healedRewrites > 0,
+          bytesFreed: 0,
+          rewrittenEntries: healedRewrites,
+          reason: "pending offloads already reflected in transcript",
+        };
+      }
+
+      const result = await rewriteTranscriptEntries({
+        replacements: replacementsNeedingRewrite.map((replacement) => ({
+          entryId: replacement.entryId,
+          message: replacement.message,
+        })),
+      });
+
+      if (result.changed && result.rewrittenEntries === replacementsNeedingRewrite.length) {
+        for (const replacement of replacementsNeedingRewrite) {
+          await this.summaryStore.markToolResultOffloadRewritten(
+            replacement.offloadId,
+            replacement.entryId,
+          );
+        }
+      }
+
+      return {
+        ...result,
+        changed: result.changed || healedRewrites > 0,
+        rewrittenEntries: result.rewrittenEntries + healedRewrites,
+      };
     });
   }
 
@@ -1251,8 +1927,10 @@ export class LcmContextEngine implements ContextEngine {
         messages: ingestBatch,
         isHeartbeat: params.isHeartbeat === true,
       });
-    } catch {
-      // Continue with proactive compaction even if ingest fails.
+    } catch (error) {
+      // Surface ingest failures so the caller can mark post-turn finalization
+      // as incomplete; compaction must not continue against partial state.
+      throw error;
     }
 
     const tokenBudget =

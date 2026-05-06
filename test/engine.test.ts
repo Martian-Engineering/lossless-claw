@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
@@ -28,6 +28,9 @@ function createTestConfig(databasePath: string): LcmConfig {
     condensedTargetTokens: 900,
     maxExpandTokens: 4000,
     largeFileTokenThreshold: 25_000,
+    toolResultPersistEnabled: true,
+    toolResultPersistThresholdChars: 8_000,
+    toolResultPreviewChars: 1_800,
     largeFileSummaryProvider: "",
     largeFileSummaryModel: "",
     autocompactDisabled: false,
@@ -105,6 +108,23 @@ function createSessionFilePath(name: string): string {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-session-"));
   tempDirs.push(tempDir);
   return join(tempDir, `${name}.jsonl`);
+}
+
+function listFilesRecursive(root: string): string[] {
+  if (!existsSync(root)) {
+    return [];
+  }
+  const entries = readdirSync(root, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listFilesRecursive(path));
+    } else {
+      files.push(path);
+    }
+  }
+  return files;
 }
 
 function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine {
@@ -360,6 +380,203 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(largeFiles).toHaveLength(0);
     });
   });
+
+  it("offloads oversized tool results into large_files and pending offloads", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = randomUUID();
+      const toolResultText = `head ${"x".repeat(400)} tail`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call_tool_offload", name: "exec", input: { cmd: "pwd" } }],
+        } as AgentMessage,
+      });
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_tool_offload",
+          toolName: "exec",
+          isError: false,
+          timestamp: 1_717_171_717,
+          content: toolResultText,
+          details: {
+            status: "completed",
+            exitCode: 0,
+            aggregated: toolResultText,
+          },
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(2);
+      expect(storedMessages[1].content).toContain("[LCM Tool Result Offloaded: file_");
+
+      const fileIdMatch = storedMessages[1].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("tool-result-exec.txt");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(toolResultText);
+
+      const pending = await engine.getSummaryStore().getPendingToolResultOffloads(sessionId);
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.fileId).toBe(fileId);
+      expect(pending[0]?.messageId).toBe(storedMessages[1].messageId);
+      expect(pending[0]?.toolCallId).toBe("call_tool_offload");
+
+      const replacement = JSON.parse(pending[0]!.replacementMessageJson) as {
+        details?: Record<string, unknown>;
+      };
+      expect(replacement.details).toMatchObject({
+        status: "completed",
+        exitCode: 0,
+        lcmOffload: {
+          fileId,
+        },
+      });
+      expect(replacement.details?.aggregated).toBeUndefined();
+
+      const assembled = await engine.assemble({
+        sessionId,
+        messages: [],
+        tokenBudget: 10_000,
+      });
+      expect(assembled.messages).toHaveLength(2);
+      expect(assembled.messages[0]?.role).toBe("assistant");
+      expect(assembled.messages[1]?.role).toBe("toolResult");
+      expect((assembled.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_tool_offload");
+      expect(JSON.stringify((assembled.messages[1] as { content?: unknown }).content)).toContain(fileId);
+    });
+  });
+
+  it("rolls back live tool-result offload state when attach fails", async () => {
+    await withTempHome(async (homeDir) => {
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = randomUUID();
+      const toolResultText = `head ${"x".repeat(400)} tail`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call_tool_offload_rollback", name: "exec", input: { cmd: "pwd" } }],
+        } as AgentMessage,
+      });
+
+      const attachSpy = vi
+        .spyOn(engine.getSummaryStore(), "attachToolResultOffloadMessageId")
+        .mockRejectedValueOnce(new Error("attach boom"));
+
+      await expect(
+        engine.ingest({
+          sessionId,
+          message: {
+            role: "toolResult",
+            toolCallId: "call_tool_offload_rollback",
+            toolName: "exec",
+            isError: false,
+            timestamp: 1_717_171_730,
+            content: toolResultText,
+            details: {
+              status: "completed",
+              exitCode: 0,
+              aggregated: toolResultText,
+            },
+          } as AgentMessage,
+        }),
+      ).rejects.toThrow("attach boom");
+
+      attachSpy.mockRestore();
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(1);
+
+      const pending = await engine.getSummaryStore().getPendingToolResultOffloads(sessionId);
+      expect(pending).toHaveLength(0);
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(0);
+
+      const storageDir = join(
+        homeDir,
+        ".openclaw",
+        "lcm-files",
+        String(conversation!.conversationId),
+      );
+      expect(existsSync(storageDir) ? readdirSync(storageDir) : []).toHaveLength(0);
+    });
+  });
+
+  it("rolls back live large-file interception state when message_parts creation fails", async () => {
+    await withTempHome(async (homeDir) => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const fileText = `${"system design line\n".repeat(80)}closing note`;
+
+      const createMessagePartsSpy = vi
+        .spyOn(engine.getConversationStore(), "createMessageParts")
+        .mockRejectedValueOnce(new Error("parts boom"));
+
+      await expect(
+        engine.ingest({
+          sessionId,
+          message: makeMessage({
+            role: "user",
+            content: `<file name="system-design.md" mime="text/markdown">${fileText}</file>`,
+          }),
+        }),
+      ).rejects.toThrow("parts boom");
+
+      createMessagePartsSpy.mockRestore();
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      if (conversation) {
+        const storedMessages = await engine
+          .getConversationStore()
+          .getMessages(conversation.conversationId);
+        expect(storedMessages).toHaveLength(0);
+
+        const largeFiles = await engine
+          .getSummaryStore()
+          .getLargeFilesByConversation(conversation.conversationId);
+        expect(largeFiles).toHaveLength(0);
+      }
+
+      const lcmFilesRoot = join(homeDir, ".openclaw", "lcm-files");
+      expect(listFilesRecursive(lcmFilesRoot)).toEqual([]);
+    });
+  });
 });
 
 describe("LcmContextEngine connection lifecycle", () => {
@@ -420,25 +637,23 @@ describe("LcmContextEngine.bootstrap", () => {
     const result = await engine.bootstrap({ sessionId, sessionFile });
 
     expect(result.bootstrapped).toBe(true);
-    expect(result.importedMessages).toBe(4);
+    expect(result.importedMessages).toBe(2);
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
     expect(conversation!.bootstrappedAt).not.toBeNull();
 
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(stored).toHaveLength(4);
+    expect(stored).toHaveLength(2);
     expect(stored.map((m) => m.content)).toEqual([
       "root user",
-      "abandoned assistant",
-      "abandoned user",
       "active assistant",
     ]);
 
     const contextItems = await engine
       .getSummaryStore()
       .getContextItems(conversation!.conversationId);
-    expect(contextItems).toHaveLength(4);
+    expect(contextItems).toHaveLength(2);
     expect(contextItems.every((item) => item.itemType === "message")).toBe(true);
   });
 
@@ -604,7 +819,7 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(stored.map((message) => message.content)).toEqual(["db only user", "db only assistant"]);
   });
 
-  it("uses the bulk import path for initial bootstrap", async () => {
+  it("uses the canonical import path for initial bootstrap and writes message_parts", async () => {
     const sessionFile = createSessionFilePath("bulk");
     const sm = SessionManager.open(sessionFile);
     sm.appendMessage({
@@ -613,7 +828,15 @@ describe("LcmContextEngine.bootstrap", () => {
     } as AgentMessage);
     sm.appendMessage({
       role: "assistant",
-      content: [{ type: "text", text: "bulk two" }],
+      content: [{ type: "toolCall", id: "call_bootstrap", name: "read", input: { path: "bulk.txt" } }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "call_bootstrap",
+      toolName: "read",
+      isError: false,
+      timestamp: Date.now(),
+      content: [{ type: "tool_result", tool_use_id: "call_bootstrap", output: { ok: true } }],
     } as AgentMessage);
 
     const engine = createEngine();
@@ -626,8 +849,1067 @@ describe("LcmContextEngine.bootstrap", () => {
     });
 
     expect(result.bootstrapped).toBe(true);
-    expect(bulkSpy).toHaveBeenCalledTimes(1);
-    expect(singleSpy).not.toHaveBeenCalled();
+    expect(result.importedMessages).toBe(3);
+    expect(bulkSpy).not.toHaveBeenCalled();
+    expect(singleSpy).toHaveBeenCalledTimes(3);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId("bootstrap-bulk");
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(storedMessages).toHaveLength(3);
+
+    const assistantParts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[1].messageId);
+    expect(assistantParts).toHaveLength(1);
+    expect(assistantParts[0].partType).toBe("tool");
+    expect(assistantParts[0].toolCallId).toBe("call_bootstrap");
+
+    const toolResultParts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[2].messageId);
+    expect(toolResultParts).toHaveLength(1);
+    expect(toolResultParts[0].partType).toBe("tool");
+    expect(toolResultParts[0].toolCallId).toBe("call_bootstrap");
+  });
+
+  it("rehydrates bootstrapped tool results as toolResult messages", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-tool-roundtrip");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call_bootstrap_rt", name: "read", input: { path: "rt.txt" } }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "call_bootstrap_rt",
+      toolName: "read",
+      isError: false,
+      timestamp: Date.now(),
+      content: [{ type: "tool_result", tool_use_id: "call_bootstrap_rt", output: { ok: true } }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-tool-roundtrip";
+
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(2);
+
+    const assembled = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(assembled.messages).toHaveLength(2);
+    expect(assembled.messages[0]?.role).toBe("assistant");
+    expect(assembled.messages[1]?.role).toBe("toolResult");
+    expect((assembled.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_bootstrap_rt");
+  });
+
+  it("offloads oversized bootstrapped tool results into large_files and pending offloads", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("bootstrap-tool-offload");
+      const sm = SessionManager.open(sessionFile);
+      const toolResultText = `bootstrap ${"z".repeat(400)} tail`;
+
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_bootstrap_offload", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_bootstrap_offload",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_718,
+        content: toolResultText,
+        details: {
+          status: "completed",
+          exitCode: 0,
+          aggregated: toolResultText,
+        },
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "bootstrap-tool-offload";
+
+      const result = await engine.bootstrap({ sessionId, sessionFile });
+      expect(result.bootstrapped).toBe(true);
+      expect(result.importedMessages).toBe(2);
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(2);
+      expect(storedMessages[1].content).toContain("[LCM Tool Result Offloaded: file_");
+
+      const fileIdMatch = storedMessages[1].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+
+      const pending = await engine.getSummaryStore().getPendingToolResultOffloads(sessionId);
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.fileId).toBe(fileId);
+      expect(pending[0]?.messageId).toBe(storedMessages[1].messageId);
+      expect(pending[0]?.toolCallId).toBe("call_bootstrap_offload");
+    });
+  });
+
+  it("rolls back bootstrapped tool-result offload state when attach fails", async () => {
+    await withTempHome(async (homeDir) => {
+      const sessionFile = createSessionFilePath("bootstrap-tool-offload-rollback");
+      const sm = SessionManager.open(sessionFile);
+      const toolResultText = `bootstrap ${"k".repeat(400)} tail`;
+
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_bootstrap_offload_rollback", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_bootstrap_offload_rollback",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_731,
+        content: toolResultText,
+        details: {
+          status: "completed",
+          exitCode: 0,
+          aggregated: toolResultText,
+        },
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const attachSpy = vi
+        .spyOn(engine.getSummaryStore(), "attachToolResultOffloadMessageId")
+        .mockRejectedValueOnce(new Error("attach boom"));
+
+      await expect(
+        engine.bootstrap({
+          sessionId: "bootstrap-tool-offload-rollback",
+          sessionFile,
+        }),
+      ).rejects.toThrow("attach boom");
+
+      attachSpy.mockRestore();
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId("bootstrap-tool-offload-rollback");
+      if (conversation) {
+        const storedMessages = await engine
+          .getConversationStore()
+          .getMessages(conversation.conversationId);
+        expect(storedMessages).toHaveLength(0);
+
+        const largeFiles = await engine
+          .getSummaryStore()
+          .getLargeFilesByConversation(conversation.conversationId);
+        expect(largeFiles).toHaveLength(0);
+      }
+
+      const pending = await engine
+        .getSummaryStore()
+        .getPendingToolResultOffloads("bootstrap-tool-offload-rollback");
+      expect(pending).toHaveLength(0);
+
+      const lcmFilesRoot = join(homeDir, ".openclaw", "lcm-files");
+      const residualFiles = existsSync(lcmFilesRoot)
+        ? readdirSync(lcmFilesRoot, { recursive: true }).filter((entry) => String(entry).endsWith(".txt"))
+        : [];
+      expect(residualFiles).toHaveLength(0);
+    });
+  });
+
+  it("rolls back bootstrapped large-file interception state when message_parts creation fails", async () => {
+    await withTempHome(async (homeDir) => {
+      const sessionFile = createSessionFilePath("bootstrap-user-file-rollback");
+      const sm = SessionManager.open(sessionFile);
+      const fileText = `${"architecture line\n".repeat(80)}tail`;
+      sm.appendMessage({
+        role: "user",
+        content: `<file name="architecture.md" mime="text/markdown">${fileText}</file>`,
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "assistant anchor after raw file" }],
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const createMessagePartsSpy = vi
+        .spyOn(engine.getConversationStore(), "createMessageParts")
+        .mockRejectedValueOnce(new Error("parts boom"));
+
+      await expect(
+        engine.bootstrap({
+          sessionId: "bootstrap-user-file-rollback",
+          sessionFile,
+        }),
+      ).rejects.toThrow("parts boom");
+
+      createMessagePartsSpy.mockRestore();
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId("bootstrap-user-file-rollback");
+      if (conversation) {
+        const storedMessages = await engine
+          .getConversationStore()
+          .getMessages(conversation.conversationId);
+        expect(storedMessages).toHaveLength(0);
+
+        const largeFiles = await engine
+          .getSummaryStore()
+          .getLargeFilesByConversation(conversation.conversationId);
+        expect(largeFiles).toHaveLength(0);
+      }
+
+      const lcmFilesRoot = join(homeDir, ".openclaw", "lcm-files");
+      expect(listFilesRecursive(lcmFilesRoot)).toEqual([]);
+    });
+  });
+
+  it("does not re-offload an already bootstrapped oversized tool result before transcript rewrite", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("bootstrap-tool-offload-idempotent");
+      const sm = SessionManager.open(sessionFile);
+      const toolResultText = `bootstrap ${"q".repeat(400)} tail`;
+
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_bootstrap_offload_idempotent", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_bootstrap_offload_idempotent",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_719,
+        content: toolResultText,
+        details: {
+          status: "completed",
+          exitCode: 0,
+          aggregated: toolResultText,
+        },
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "bootstrap-tool-offload-idempotent";
+
+      const first = await engine.bootstrap({ sessionId, sessionFile });
+      expect(first.bootstrapped).toBe(true);
+      expect(first.importedMessages).toBe(2);
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const second = await engine.bootstrap({ sessionId, sessionFile });
+      expect(second.bootstrapped).toBe(false);
+      expect(second.importedMessages).toBe(0);
+      expect(second.reason).toBe("already bootstrapped");
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(2);
+
+      const pending = await engine.getSummaryStore().getPendingToolResultOffloads(sessionId);
+      expect(pending).toHaveLength(1);
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(1);
+    });
+  });
+
+  it("reconciles only new tail messages after an offloaded bootstrapped tool result", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("reconcile-after-tool-offload");
+      const sm = SessionManager.open(sessionFile);
+      const toolResultText = `bootstrap ${"r".repeat(400)} tail`;
+
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_reconcile_after_offload", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_reconcile_after_offload",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_720,
+        content: toolResultText,
+        details: {
+          status: "completed",
+          exitCode: 0,
+          aggregated: toolResultText,
+        },
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "reconcile-after-tool-offload";
+
+      const first = await engine.bootstrap({ sessionId, sessionFile });
+      expect(first.bootstrapped).toBe(true);
+      expect(first.importedMessages).toBe(2);
+
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "tail after offload" }],
+      } as AgentMessage);
+
+      const second = await engine.bootstrap({ sessionId, sessionFile });
+      expect(second.bootstrapped).toBe(true);
+      expect(second.importedMessages).toBe(1);
+      expect(second.reason).toBe("reconciled missing session messages");
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(3);
+      expect(storedMessages[2]?.content).toBe("tail after offload");
+
+      const pending = await engine.getSummaryStore().getPendingToolResultOffloads(sessionId);
+      expect(pending).toHaveLength(1);
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(1);
+    });
+  });
+
+  it("does not re-intercept an already bootstrapped oversized user <file> message before transcript rewrite", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("bootstrap-user-file-idempotent");
+      const sm = SessionManager.open(sessionFile);
+      const fileText = `${"system design line\n".repeat(80)}closing note`;
+      sm.appendMessage({
+        role: "user",
+        content: `<file name="system-design.md" mime="text/markdown">${fileText}</file>`,
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "assistant anchor after intercepted file" }],
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        largeFileTokenThreshold: 20,
+      });
+      const sessionId = "bootstrap-user-file-idempotent";
+
+      const first = await engine.bootstrap({ sessionId, sessionFile });
+      expect(first.bootstrapped).toBe(true);
+      expect(first.importedMessages).toBe(2);
+
+      const second = await engine.bootstrap({ sessionId, sessionFile });
+      expect(second.bootstrapped).toBe(false);
+      expect(second.importedMessages).toBe(0);
+      expect(second.reason).toBe("already bootstrapped");
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(2);
+      expect(storedMessages[0]?.content).toContain("[LCM File: file_");
+      expect(storedMessages[0]?.content).not.toContain("<file name=");
+      expect(storedMessages[1]?.content).toBe("assistant anchor after intercepted file");
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(1);
+    });
+  });
+
+  it("reconciles only new tail messages after an intercepted bootstrapped oversized user <file> message", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("reconcile-after-user-file-intercept");
+      const sm = SessionManager.open(sessionFile);
+      const fileText = `${"architecture note\n".repeat(80)}tail`;
+      sm.appendMessage({
+        role: "user",
+        content: `<file name="architecture.md" mime="text/markdown">${fileText}</file>`,
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "assistant anchor after raw file" }],
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        largeFileTokenThreshold: 20,
+      });
+      const sessionId = "reconcile-after-user-file-intercept";
+
+      const first = await engine.bootstrap({ sessionId, sessionFile });
+      expect(first.bootstrapped).toBe(true);
+      expect(first.importedMessages).toBe(2);
+
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "tail after intercepted file" }],
+      } as AgentMessage);
+
+      const second = await engine.bootstrap({ sessionId, sessionFile });
+      expect(second.bootstrapped).toBe(true);
+      expect(second.importedMessages).toBe(1);
+      expect(second.reason).toBe("reconciled missing session messages");
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(3);
+      expect(storedMessages[0]?.content).toContain("[LCM File: file_");
+      expect(storedMessages[1]?.content).toBe("assistant anchor after raw file");
+      expect(storedMessages[2]?.content).toBe("tail after intercepted file");
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(1);
+    });
+  });
+});
+
+describe("LcmContextEngine.maintain", () => {
+  it("rewrites multiple matched pending offloads in one batch", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("maintain-batch");
+      const sm = SessionManager.open(sessionFile);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_batch_1", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      const toolResultEntryId1 = sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_batch_1",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_721,
+        content: `batch-one ${"a".repeat(400)} tail`,
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_batch_2", name: "exec", input: { cmd: "ls" } }],
+      } as AgentMessage);
+      const toolResultEntryId2 = sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_batch_2",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_722,
+        content: `batch-two ${"b".repeat(400)} tail`,
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "maintain-batch";
+
+      await engine.bootstrap({ sessionId, sessionFile });
+      expect((await engine.getSummaryStore().getPendingToolResultOffloads(sessionId))).toHaveLength(2);
+
+      const rewriteTranscriptEntries = vi.fn(async (request: {
+        replacements: Array<{ entryId: string; message: AgentMessage }>;
+      }) => ({
+        changed: true,
+        bytesFreed: 1024,
+        rewrittenEntries: request.replacements.length,
+      }));
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile,
+        runtimeContext: { rewriteTranscriptEntries },
+      });
+
+      expect(result).toEqual({
+        changed: true,
+        bytesFreed: 1024,
+        rewrittenEntries: 2,
+      });
+      expect(rewriteTranscriptEntries).toHaveBeenCalledTimes(1);
+
+      const request = rewriteTranscriptEntries.mock.calls[0]?.[0] as {
+        replacements: Array<{ entryId: string; message: AgentMessage }>;
+      };
+      expect(request.replacements.map((replacement) => replacement.entryId)).toEqual([
+        toolResultEntryId1,
+        toolResultEntryId2,
+      ]);
+
+      expect(await engine.getSummaryStore().getPendingToolResultOffloads(sessionId)).toEqual([]);
+    });
+  });
+
+  it("rewrites one pending offload on the active branch and marks it rewritten", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("maintain-tool-offload");
+      const sm = SessionManager.open(sessionFile);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_maintain", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      const toolResultEntryId = sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_maintain",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_719,
+        content: `maintain ${"m".repeat(400)} tail`,
+        details: {
+          status: "completed",
+          exitCode: 0,
+          aggregated: `maintain ${"m".repeat(400)} tail`,
+        },
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "maintain-tool-offload";
+
+      await engine.bootstrap({ sessionId, sessionFile });
+      expect((await engine.getSummaryStore().getPendingToolResultOffloads(sessionId))).toHaveLength(1);
+
+      const rewriteTranscriptEntries = vi.fn(async (request: {
+        replacements: Array<{ entryId: string; message: AgentMessage }>;
+      }) => ({
+        changed: true,
+        bytesFreed: 512,
+        rewrittenEntries: request.replacements.length,
+      }));
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile,
+        runtimeContext: { rewriteTranscriptEntries },
+      });
+
+      expect(result).toEqual({
+        changed: true,
+        bytesFreed: 512,
+        rewrittenEntries: 1,
+      });
+      expect(rewriteTranscriptEntries).toHaveBeenCalledTimes(1);
+
+      const request = rewriteTranscriptEntries.mock.calls[0]?.[0] as {
+        replacements: Array<{ entryId: string; message: AgentMessage }>;
+      };
+      expect(request.replacements).toHaveLength(1);
+      expect(request.replacements[0]?.entryId).toBe(toolResultEntryId);
+      expect(JSON.stringify(request.replacements[0]?.message.content)).toContain("file_");
+
+      expect(await engine.getSummaryStore().getPendingToolResultOffloads(sessionId)).toEqual([]);
+      const rewritten = await engine.getSummaryStore().getToolResultOffload(1);
+      expect(rewritten?.rewriteState).toBe("rewritten");
+      expect(rewritten?.transcriptEntryId).toBe(toolResultEntryId);
+    });
+  });
+
+  it("self-heals pending offloads when transcript already contains the replacement", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("maintain-self-heal");
+      const sm = SessionManager.open(sessionFile);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_self_heal", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      const toolResultEntryId = sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_self_heal",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_732,
+        content: `self-heal ${"h".repeat(400)} tail`,
+        details: {
+          status: "completed",
+          exitCode: 0,
+          aggregated: `self-heal ${"h".repeat(400)} tail`,
+        },
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "maintain-self-heal";
+
+      await engine.bootstrap({ sessionId, sessionFile });
+      const [pendingBefore] = await engine.getSummaryStore().getPendingToolResultOffloads(sessionId);
+      expect(pendingBefore).toBeTruthy();
+
+      const rewriteTranscriptEntries = vi.fn(async (request: {
+        replacements: Array<{ entryId: string; message: AgentMessage }>;
+      }) => {
+        const target = request.replacements[0];
+        expect(target?.entryId).toBe(toolResultEntryId);
+        const targetMessage = target?.message as {
+          toolCallId?: string;
+          toolName?: string;
+          isError?: boolean;
+          timestamp?: number;
+          content?: unknown;
+        };
+        const targetText =
+          typeof targetMessage?.content === "string"
+            ? targetMessage.content
+            : JSON.stringify(targetMessage?.content ?? "");
+        const targetFileId = targetText.match(/\bfile_[a-f0-9]{16}\b/i)?.[0];
+
+        const sessionManager = SessionManager.open(sessionFile) as unknown as {
+          getBranch: () => Array<{ id: string; parentId?: string }>;
+          resetLeaf: () => void;
+          branch: (parentId: string) => void;
+          appendMessage: (message: AgentMessage) => string;
+        };
+        const targetEntry = sessionManager.getBranch().find((entry) => entry.id === target?.entryId);
+        expect(targetEntry).toBeTruthy();
+        if (targetEntry?.parentId) {
+          sessionManager.branch(targetEntry.parentId);
+        } else {
+          sessionManager.resetLeaf();
+        }
+        sessionManager.appendMessage({
+          timestamp: targetMessage.timestamp,
+          role: "toolResult",
+          toolName: targetMessage.toolName,
+          toolCallId: targetMessage.toolCallId,
+          isError: targetMessage.isError,
+          details: targetFileId
+            ? {
+                lcmOffload: { fileId: targetFileId },
+                normalized: true,
+              }
+            : undefined,
+          content: [{ type: "text", text: targetText }],
+        } as AgentMessage);
+
+        return {
+          changed: true,
+          bytesFreed: 512,
+          rewrittenEntries: request.replacements.length,
+        };
+      });
+
+      const markRewrittenSpy = vi
+        .spyOn(engine.getSummaryStore(), "markToolResultOffloadRewritten")
+        .mockRejectedValueOnce(new Error("mark boom"));
+
+      await expect(
+        engine.maintain({
+          sessionId,
+          sessionFile,
+          runtimeContext: { rewriteTranscriptEntries },
+        }),
+      ).rejects.toThrow("mark boom");
+
+      markRewrittenSpy.mockRestore();
+
+      const secondRewriteTranscriptEntries = vi.fn(async () => ({
+        changed: true,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+      }));
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile,
+        runtimeContext: { rewriteTranscriptEntries: secondRewriteTranscriptEntries },
+      });
+
+      expect(result).toEqual({
+        changed: true,
+        bytesFreed: 0,
+        rewrittenEntries: 1,
+        reason: "pending offloads already reflected in transcript",
+      });
+      expect(secondRewriteTranscriptEntries).not.toHaveBeenCalled();
+      expect(await engine.getSummaryStore().getPendingToolResultOffloads(sessionId)).toEqual([]);
+
+      const rewritten = await engine.getSummaryStore().getToolResultOffload(1);
+      expect(rewritten?.rewriteState).toBe("rewritten");
+      expect(rewritten?.transcriptEntryId).toBeTruthy();
+      expect(rewritten?.transcriptEntryId).not.toBe(toolResultEntryId);
+    });
+  });
+
+  it("keeps matched pending offloads when runtime reports no transcript change", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("maintain-no-change");
+      const sm = SessionManager.open(sessionFile);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_no_change", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_no_change",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_723,
+        content: `no-change ${"c".repeat(400)} tail`,
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "maintain-no-change";
+
+      await engine.bootstrap({ sessionId, sessionFile });
+      expect((await engine.getSummaryStore().getPendingToolResultOffloads(sessionId))).toHaveLength(1);
+
+      const rewriteTranscriptEntries = vi.fn(async () => ({
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "runtime skipped rewrite",
+      }));
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile,
+        runtimeContext: { rewriteTranscriptEntries },
+      });
+
+      expect(result).toEqual({
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "runtime skipped rewrite",
+      });
+      expect((await engine.getSummaryStore().getPendingToolResultOffloads(sessionId))).toHaveLength(1);
+    });
+  });
+
+  it("rewrites only matched pending offloads and leaves unmatched ones pending", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("maintain-partial-match");
+      const sm = SessionManager.open(sessionFile);
+      const toolResultText = `partial ${"p".repeat(400)} tail`;
+
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_partial_match", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      const toolResultEntryId = sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_partial_match",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_724,
+        content: toolResultText,
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "maintain-partial-match";
+
+      await engine.bootstrap({ sessionId, sessionFile });
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      await engine.getSummaryStore().insertLargeFile({
+        fileId: "file_feedfacecafebeef",
+        conversationId: conversation!.conversationId,
+        fileName: "tool-result-unmatched.txt",
+        mimeType: "text/plain",
+        byteSize: 2048,
+        storageUri: "/tmp/tool-result-unmatched.txt",
+        explorationSummary: "Unmatched offload",
+      });
+      await engine.getSummaryStore().insertToolResultOffload({
+        conversationId: conversation!.conversationId,
+        sessionId,
+        fileId: "file_feedfacecafebeef",
+        toolCallId: "call_unmatched",
+        toolName: "exec",
+        messageTimestamp: 1_717_171_725,
+        originalCharCount: 4096,
+        originalByteSize: 4096,
+        previewText: "unmatched preview",
+        replacementMessageJson: JSON.stringify({
+          role: "toolResult",
+          toolCallId: "call_unmatched",
+          toolName: "exec",
+          isError: false,
+          timestamp: 1_717_171_725,
+          content: "unmatched preview",
+        }),
+      });
+
+      expect((await engine.getSummaryStore().getPendingToolResultOffloads(sessionId))).toHaveLength(2);
+
+      const rewriteTranscriptEntries = vi.fn(async (request: {
+        replacements: Array<{ entryId: string; message: AgentMessage }>;
+      }) => ({
+        changed: true,
+        bytesFreed: 256,
+        rewrittenEntries: request.replacements.length,
+      }));
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile,
+        runtimeContext: { rewriteTranscriptEntries },
+      });
+
+      expect(result).toEqual({
+        changed: true,
+        bytesFreed: 256,
+        rewrittenEntries: 1,
+      });
+      expect(rewriteTranscriptEntries).toHaveBeenCalledTimes(1);
+
+      const request = rewriteTranscriptEntries.mock.calls[0]?.[0] as {
+        replacements: Array<{ entryId: string; message: AgentMessage }>;
+      };
+      expect(request.replacements).toHaveLength(1);
+      expect(request.replacements[0]?.entryId).toBe(toolResultEntryId);
+
+      const pending = await engine.getSummaryStore().getPendingToolResultOffloads(sessionId);
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.toolCallId).toBe("call_unmatched");
+    });
+  });
+
+  it("rewrites valid matches even when another matched offload has invalid replacement payload", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("maintain-invalid-payload");
+      const sm = SessionManager.open(sessionFile);
+
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_valid_payload", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      const validEntryId = sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_valid_payload",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_726,
+        content: `valid ${"v".repeat(400)} tail`,
+      } as AgentMessage);
+
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_invalid_payload", name: "exec", input: { cmd: "ls" } }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_invalid_payload",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_727,
+        content: "small tool result that stays inline",
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "maintain-invalid-payload";
+
+      await engine.bootstrap({ sessionId, sessionFile });
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      await engine.getSummaryStore().insertLargeFile({
+        fileId: "file_badpayloadcafebeef",
+        conversationId: conversation!.conversationId,
+        fileName: "tool-result-invalid.txt",
+        mimeType: "text/plain",
+        byteSize: 1024,
+        storageUri: "/tmp/tool-result-invalid.txt",
+        explorationSummary: "Invalid payload offload",
+      });
+      await engine.getSummaryStore().insertToolResultOffload({
+        conversationId: conversation!.conversationId,
+        sessionId,
+        fileId: "file_badpayloadcafebeef",
+        toolCallId: "call_invalid_payload",
+        toolName: "exec",
+        messageTimestamp: 1_717_171_727,
+        originalCharCount: 2048,
+        originalByteSize: 2048,
+        previewText: "invalid payload preview",
+        replacementMessageJson: "{not-valid-json",
+      });
+
+      expect((await engine.getSummaryStore().getPendingToolResultOffloads(sessionId))).toHaveLength(2);
+
+      const rewriteTranscriptEntries = vi.fn(async (request: {
+        replacements: Array<{ entryId: string; message: AgentMessage }>;
+      }) => ({
+        changed: true,
+        bytesFreed: 333,
+        rewrittenEntries: request.replacements.length,
+      }));
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile,
+        runtimeContext: { rewriteTranscriptEntries },
+      });
+
+      expect(result).toEqual({
+        changed: true,
+        bytesFreed: 333,
+        rewrittenEntries: 1,
+      });
+      expect(rewriteTranscriptEntries).toHaveBeenCalledTimes(1);
+
+      const request = rewriteTranscriptEntries.mock.calls[0]?.[0] as {
+        replacements: Array<{ entryId: string; message: AgentMessage }>;
+      };
+      expect(request.replacements).toHaveLength(1);
+      expect(request.replacements[0]?.entryId).toBe(validEntryId);
+
+      expect(await engine.getSummaryStore().getPendingToolResultOffloads(sessionId)).toEqual([]);
+      const failed = await engine.getSummaryStore().getToolResultOffload(2);
+      expect(failed?.rewriteState).toBe("failed");
+      expect(failed?.lastError).toBe("invalid replacement_message_json");
+    });
+  });
+
+  it("keeps all matched offloads pending when runtime reports a partial rewrite count", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("maintain-partial-runtime");
+      const sm = SessionManager.open(sessionFile);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_partial_runtime_1", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_partial_runtime_1",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_728,
+        content: `runtime-one ${"r".repeat(400)} tail`,
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_partial_runtime_2", name: "exec", input: { cmd: "ls" } }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_partial_runtime_2",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_729,
+        content: `runtime-two ${"s".repeat(400)} tail`,
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "maintain-partial-runtime";
+
+      await engine.bootstrap({ sessionId, sessionFile });
+      expect((await engine.getSummaryStore().getPendingToolResultOffloads(sessionId))).toHaveLength(2);
+
+      const rewriteTranscriptEntries = vi.fn(async () => ({
+        changed: true,
+        bytesFreed: 512,
+        rewrittenEntries: 1,
+        reason: "runtime only rewrote part of the batch",
+      }));
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile,
+        runtimeContext: { rewriteTranscriptEntries },
+      });
+
+      expect(result).toEqual({
+        changed: true,
+        bytesFreed: 512,
+        rewrittenEntries: 1,
+        reason: "runtime only rewrote part of the batch",
+      });
+      expect(rewriteTranscriptEntries).toHaveBeenCalledTimes(1);
+      expect((await engine.getSummaryStore().getPendingToolResultOffloads(sessionId))).toHaveLength(2);
+    });
+  });
+
+  it("keeps pending offloads when rewrite helper is unavailable", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("maintain-no-helper");
+      const sm = SessionManager.open(sessionFile);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_no_helper", name: "exec", input: { cmd: "pwd" } }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_no_helper",
+        toolName: "exec",
+        isError: false,
+        timestamp: 1_717_171_720,
+        content: `no-helper ${"n".repeat(400)} tail`,
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({
+        toolResultPersistThresholdChars: 120,
+        toolResultPreviewChars: 90,
+      });
+      const sessionId = "maintain-no-helper";
+
+      await engine.bootstrap({ sessionId, sessionFile });
+      expect((await engine.getSummaryStore().getPendingToolResultOffloads(sessionId))).toHaveLength(1);
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile,
+      });
+
+      expect(result).toEqual({
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "rewrite helper unavailable",
+      });
+      expect((await engine.getSummaryStore().getPendingToolResultOffloads(sessionId))).toHaveLength(1);
+    });
   });
 });
 
@@ -1534,6 +2816,33 @@ describe("LcmContextEngine fidelity and token budget", () => {
         compactionTarget: "threshold",
       }),
     );
+  });
+
+  it("afterTurn rethrows ingest failures before running compaction", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-ingest-failure";
+
+    const ingestBatchSpy = vi
+      .spyOn(engine, "ingestBatch")
+      .mockRejectedValueOnce(new Error("ingest boom"));
+    const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
+    const compactSpy = vi.spyOn(engine, "compact");
+
+    await expect(
+      engine.afterTurn({
+        sessionId,
+        sessionFile: createSessionFilePath("after-turn-ingest-failure"),
+        messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+        prePromptMessageCount: 0,
+        tokenBudget: 4096,
+      }),
+    ).rejects.toThrow("ingest boom");
+
+    expect(ingestBatchSpy).toHaveBeenCalledTimes(1);
+    expect(evaluateLeafTriggerSpy).not.toHaveBeenCalled();
+    expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
+    expect(compactSpy).not.toHaveBeenCalled();
   });
 });
 
