@@ -192,13 +192,26 @@ describe("lcm_synthesis_cache (v3.1 A8 + v4.1.1 B4)", () => {
         .run("c1", "sk", "s", "e", "fp", "m", "prompt_v1", "year", "[]", 0, 0, "x", 0, "bogus-status"),
     ).toThrow();
 
+    // Final.review.3 fix (Loop 4 Bug 4.4): the cache CHECK constraint was
+    // widened to include all dispatch tiers ('daily', 'weekly', 'monthly',
+    // 'yearly', 'year', 'custom', 'filtered'). 'monthly' is now ACCEPTED.
+    // Verify with 'bogus-tier' instead, which is still rejected.
     expect(() =>
       db
         .prepare(
           `INSERT INTO lcm_synthesis_cache (cache_id, session_key, range_start, range_end, leaf_fingerprint, model_used, prompt_id, tier_label, source_leaf_ids, source_token_count, output_token_count, actual_range_covered, leaf_count_synthesized) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run("c2", "sk", "s", "e", "fp", "m", "prompt_v1", "monthly", "[]", 0, 0, "x", 0),
-    ).toThrow(); // 'monthly' not in CHECK list (only 'year', 'custom', 'filtered')
+        .run("c2", "sk", "s", "e", "fp", "m", "prompt_v1", "bogus-tier", "[]", 0, 0, "x", 0),
+    ).toThrow();
+
+    // 'monthly' should now succeed (post-widen fix); verify it was a real change.
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO lcm_synthesis_cache (cache_id, session_key, range_start, range_end, leaf_fingerprint, model_used, prompt_id, tier_label, source_leaf_ids, source_token_count, output_token_count, actual_range_covered, leaf_count_synthesized) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("c3", "sk", "s2", "e2", "fp2", "m", "prompt_v1", "monthly", "[]", 0, 0, "x", 0),
+    ).not.toThrow();
 
     db.close();
   });

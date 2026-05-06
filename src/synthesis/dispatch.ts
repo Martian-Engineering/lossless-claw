@@ -300,9 +300,16 @@ export async function dispatchSynthesis(
       auditIds.push(verifyResult.auditId);
       totalLatencyMs += verifyResult.latencyMs;
       totalCostCents += verifyResult.costCents ?? 0;
-      // The verify prompt's contract is to return `OK` if no
-      // hallucinations, or `HALLUCINATION: <details>` otherwise.
-      hallucinationFlagged = !/^\s*OK\s*$/i.test(verifyResult.output);
+      // The verify prompt's contract is to return `OK` (or `OK: all N
+      // claims grounded` per the seeded §12 default) if no hallucinations,
+      // or `UNSUPPORTED: <claim>` / `HALLUCINATION: <details>` otherwise.
+      // Final.review.3 fix (Loop 4 Bug 4.1): regex was `^OK$` (requires
+      // bare OK only), which rejected the seeded `OK: all N claims grounded`
+      // contract — every clean monthly synthesis was wrongly flagged as
+      // hallucinating. Relaxed to `^OK\b` so "OK" on its own OR followed by
+      // a colon/whitespace passes; "OK!" or "OKAY" would still match (close
+      // enough for a fidelity-checker — the precision loss is acceptable).
+      hallucinationFlagged = !/^\s*OK\b/i.test(verifyResult.output);
     }
     // If no verify prompt registered, skip silently — caller can decide
     // to enforce its presence via /lcm health.
@@ -591,22 +598,44 @@ async function runBestOfNYearly(
 }
 
 function parseJudgeOutput(output: string, n: number): number {
-  // Judge prompt contract: respond with just a digit 0..N-1.
-  const m = output.match(/\d+/);
-  if (!m) {
+  // Judge prompt contract per §12 seed: outputs `Winner: <0-indexed integer>`
+  // potentially preceded by reasoning. Final.review.3 fix (Loop 4 Bug 4.3):
+  // the previous regex `/\d+/` matched the FIRST digit anywhere — including
+  // "0" from the prompt's "0-indexed" instruction echoed by the model, or
+  // a year "2026" appearing in the model's reasoning, or "12 monthlies"
+  // count. That made yearly synthesis silently wrong (wrong winner) or hard
+  // failure (out-of-range like 2026 or 12 vs N=3).
+  //
+  // Strategy: prefer the explicit `Winner: N` anchored form. Fall back to
+  // "last digit in output" which is more robust (the model's final
+  // commitment) than "first digit". Both bounded against N before accept.
+  const winnerMatch = output.match(/(?:^|\b)Winner\s*[:\s]\s*(\d+)/im);
+  if (winnerMatch) {
+    const idx = Number.parseInt(winnerMatch[1]!, 10);
+    if (idx >= 0 && idx < n) return idx;
+    // Winner: matched but out of range — fall through to last-digit fallback
+  }
+  // Fallback: last digit anywhere in output (matches model's final answer
+  // even without "Winner:" prefix).
+  const allDigits = output.match(/\d+/g);
+  if (!allDigits || allDigits.length === 0) {
     throw new SynthesisDispatchError(
       "judge_failure",
       `[synthesis.dispatch] judge output didn't contain a digit: ${output.slice(0, 200)}`,
     );
   }
-  const idx = Number.parseInt(m[0], 10);
-  if (idx < 0 || idx >= n) {
-    throw new SynthesisDispatchError(
-      "judge_failure",
-      `[synthesis.dispatch] judge picked out-of-range index ${idx} (N=${n})`,
-    );
+  // Try last → second-to-last → ... → first, accept first one in range.
+  for (let i = allDigits.length - 1; i >= 0; i--) {
+    const idx = Number.parseInt(allDigits[i]!, 10);
+    if (idx >= 0 && idx < n) return idx;
   }
-  return idx;
+  // No digit in output is in range — surface the FIRST out-of-range one
+  // (matches old behavior for backward compat on error message).
+  const firstIdx = Number.parseInt(allDigits[0]!, 10);
+  throw new SynthesisDispatchError(
+    "judge_failure",
+    `[synthesis.dispatch] judge picked out-of-range index ${firstIdx} (N=${n}); full output: ${output.slice(0, 200)}`,
+  );
 }
 
 function pickModel(req: SynthesizeRequest, primaryPrompt: PromptRecord): string {
@@ -629,9 +658,19 @@ function renderVerifyPrompt(
   template: string,
   args: { sourceText: string; candidateSummary: string },
 ): string {
+  // Final.review.3 fix (Loop 4 Bug 4.2): the seeded §12 verify_fidelity
+  // prompt uses `{{draft}}` and `{{source_leaves}}` placeholders (matching
+  // architecture-v4.1.md §12 / Appendix A literally). The renderer
+  // previously only handled `{{candidate_summary}}` and `{{source_text}}`,
+  // so the seeded template was sent verbatim to the LLM with placeholders
+  // un-substituted — making the entire monthly verify pass meaningless.
+  // We now substitute BOTH the spec-named placeholders AND the dispatch-
+  // canonical ones, so either prompt template works.
   return template
     .replace(/\{\{\s*source_text\s*\}\}/g, args.sourceText)
-    .replace(/\{\{\s*candidate_summary\s*\}\}/g, args.candidateSummary);
+    .replace(/\{\{\s*source_leaves\s*\}\}/g, args.sourceText) // alias to source_text
+    .replace(/\{\{\s*candidate_summary\s*\}\}/g, args.candidateSummary)
+    .replace(/\{\{\s*draft\s*\}\}/g, args.candidateSummary); // alias to candidate_summary
 }
 
 function renderJudgePrompt(

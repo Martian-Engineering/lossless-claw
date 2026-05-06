@@ -223,6 +223,19 @@ export async function runHybridSearch(
       if (e instanceof SemanticSearchUnavailableError) {
         return { hits: [] as SemanticHit[], tokens: 0, modelName: null, degraded: true };
       }
+      // v4.1 Final.review.3 fix (Slice 1 Gap A / Loop 8 B-1 HIGH):
+      // Mirror the rerank arm's behavior — auth errors propagate out (so the
+      // tool surface returns a useful "set VOYAGE_API_KEY" message), but
+      // transient VoyageError kinds (server_error, rate_limit, network,
+      // unexpected, bad_request) degrade to FTS-only. Without this, a single
+      // Voyage 5xx hiccup kills the whole hybrid query when FTS could have
+      // returned useful results. Matches the contract documented in PR
+      // description: "If VOYAGE_API_KEY is missing... falls back to FTS-only".
+      // (Auth still throws so the operator gets a clear setup-action error,
+      // not silent degradation that hides a misconfigured deploy.)
+      if (e instanceof VoyageError && e.kind !== "auth") {
+        return { hits: [] as SemanticHit[], tokens: 0, modelName: null, degraded: true };
+      }
       throw e;
     }
   })();

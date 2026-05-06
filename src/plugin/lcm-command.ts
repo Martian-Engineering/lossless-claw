@@ -1605,12 +1605,12 @@ function buildWorkerStatusText(params: { db: DatabaseSync }): string {
   lines.push("### Note");
   lines.push("");
   lines.push(
-    "Manual `/lcm worker tick <kind>` is not yet wired in this PR. The worker " +
-      "orchestrator service (`src/operator/worker-orchestrator.ts`) exists and " +
-      "is testable, but production wiring (including LLM-call injection for " +
-      "extraction / procedure-mining / themes) is deferred to a cycle-2 commit. " +
-      "Today, view-only status reporting; for manual ticks against a dev DB, " +
-      "import `tickEmbeddingBackfill` etc. from `src/operator/worker-orchestrator.ts`.",
+    "Manual `/lcm worker tick embedding-backfill` IS wired in this PR (Wire.2). " +
+      "Other tick kinds (extraction / procedure-mining / themes-consolidation) " +
+      "are exported from `src/operator/worker-orchestrator.ts` but not yet " +
+      "exposed via the `/lcm worker tick` parser — they're cycle-3. Backfill " +
+      "is the only one that doesn't need LLM-call injection (uses Voyage HTTP " +
+      "directly), which is why it's first to ship.",
   );
   return lines.join("\n");
 }
@@ -1682,8 +1682,9 @@ async function buildWorkerTickBackfillText(params: { db: DatabaseSync }): Promis
       modelName: active.modelName,
       voyageModel: active.modelName as Parameters<typeof tickEmbeddingBackfill>[1]["voyageModel"],
       inputType: "document",
-      // operator-tick uses longer Voyage budget than agent-hot-path
-      voyageMaxRetries: 2,
+      // v4.1 Final.review.3 fix: drop to 1 retry to keep worst-case
+      // tick time under WORKER_LOCK_TTL_MS (90s). Was 2 → ~91s worst case.
+      voyageMaxRetries: 1,
       voyageTimeoutMs: 30_000,
       maxRequestsPerSecond: 0.5,
       perTickLimit: 200,

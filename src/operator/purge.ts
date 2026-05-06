@@ -245,6 +245,23 @@ function runSoftPurge(
          WHERE item_type = 'summary' AND summary_id IN (${placeholders})`,
     ).run(...leafIds);
 
+    // v4.1 Final.review.3 fix (Loop 2 Leak 2.1 BLOCKER companion):
+    // Also DELETE context_items WHERE item_type='message' for any messages
+    // about to be cascade-suppressed below. Without this, the assembler
+    // hot path (assembler.resolveMessageItem → conversationStore.getMessageById)
+    // still loaded the suppressed message content into the prompt because
+    // the context_items pointer survived. The getMessageById fix (now
+    // filters suppressed_at IS NULL by default) handles the message-level
+    // read filter, but cleaning context_items here is the cleanest cut —
+    // prevents the assembler from even attempting the resolve.
+    db.prepare(
+      `DELETE FROM context_items
+         WHERE item_type = 'message' AND message_id IN (
+           SELECT message_id FROM summary_messages
+             WHERE summary_id IN (${placeholders})
+         )`,
+    ).run(...leafIds);
+
     // v4.1 Final.review P1 #2: cascade suppression to the underlying
     // raw messages. Without this, lcm_grep mode='regex'/'full_text'
     // scope='messages' or scope='both' would still find purged
@@ -261,6 +278,22 @@ function runSoftPurge(
          WHERE message_id IN (
            SELECT message_id FROM summary_messages
              WHERE summary_id IN (${placeholders})
+         )`,
+    ).run(...leafIds);
+
+    // v4.1 Final.review.3 fix (Loop 2 Leak 2.5):
+    // Invalidate any rebuildable synthesis caches that referenced the
+    // suppressed leaves. lcm_cache_leaf_refs has ON DELETE CASCADE on
+    // both lcm_synthesis_cache.cache_id and summaries.summary_id, but
+    // the cascade only fires on hard DELETE, not on soft suppression.
+    // We MUST DELETE the cache rows explicitly so any future cache read
+    // (or future re-synthesis) doesn't surface PII baked in before
+    // suppression. Cache is REBUILDABLE by design — losing rows is safe.
+    db.prepare(
+      `DELETE FROM lcm_synthesis_cache
+         WHERE cache_id IN (
+           SELECT DISTINCT cache_id FROM lcm_cache_leaf_refs
+             WHERE leaf_summary_id IN (${placeholders})
          )`,
     ).run(...leafIds);
 

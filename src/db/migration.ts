@@ -1481,6 +1481,37 @@ export function runLcmMigrations(
       });
     }
 
+    // v4.1 Final.review.3 (Loop 4 Bug 4.4) — widen lcm_synthesis_cache.tier_label
+    // CHECK to include all tier values dispatch may produce. Original CHECK
+    // only allowed ('year', 'custom', 'filtered'); dispatch tier vocabulary
+    // is ('daily', 'weekly', 'monthly', 'yearly', 'custom', 'filtered').
+    // Latent BLOCKER: yearly synthesis would crash on cache write because
+    // `tier_label='yearly'` was rejected by the old CHECK.
+    //
+    // SQLite can't ALTER a CHECK constraint, so we DROP+recreate. SAFE because
+    // lcm_synthesis_cache is REBUILDABLE by design (it's a cache, not bedrock).
+    // Idempotent: only fires if existing CHECK is the old narrow form.
+    runMigrationStep("widenLcmSynthesisCacheTierCheck_v413", log, () => {
+      const existing = db
+        .prepare(
+          `SELECT sql FROM sqlite_master
+             WHERE type='table' AND name='lcm_synthesis_cache'`,
+        )
+        .get() as { sql: string } | undefined;
+      if (!existing) return; // table doesn't exist yet; the next step creates it with new CHECK
+      // Detect the OLD CHECK signature. The new CHECK contains 'monthly'
+      // (one of the new values); old does not. Skip-if-already-widened.
+      if (existing.sql.includes("'monthly'") || existing.sql.includes('"monthly"')) {
+        return;
+      }
+      // Old CHECK detected → rebuildable, just DROP. Cache rows are derivable
+      // from primary sources (raw leaves + prompts).
+      db.exec(`DROP TABLE IF EXISTS lcm_synthesis_cache`);
+      log?.info?.(
+        "[migration] dropped lcm_synthesis_cache (old narrow CHECK; rebuildable; recreated next step with widened CHECK)",
+      );
+    });
+
     // v3.1 A8 + v4.1.1 B4 — lcm_synthesis_cache: rebuildable derived layer
     // for ad-hoc synthesize() output (custom ranges + filtered grep + yearly
     // tier per A2). Has `status='building'` single-flight (v3.1 A8) and
@@ -1500,7 +1531,7 @@ export function runLcmMigrations(
           entity_index TEXT NOT NULL DEFAULT '{}',
           model_used TEXT NOT NULL,
           prompt_id TEXT NOT NULL REFERENCES lcm_prompt_registry(prompt_id),
-          tier_label TEXT NOT NULL CHECK (tier_label IN ('year', 'custom', 'filtered')),
+          tier_label TEXT NOT NULL CHECK (tier_label IN ('year', 'yearly', 'monthly', 'weekly', 'daily', 'custom', 'filtered')),
           source_leaf_ids TEXT NOT NULL,
           source_condensed_ids TEXT,
           built_at TEXT NOT NULL DEFAULT (datetime('now')),

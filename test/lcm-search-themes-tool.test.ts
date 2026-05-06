@@ -151,7 +151,10 @@ describe("createLcmSearchThemesTool — text mode", () => {
     const result = await tool.execute("call-2", { query: "rebase" });
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain('No themes match query "rebase" in mode=text');
-    expect(text).toContain("/lcm worker tick consolidate-themes");
+    // Final.review.3 fix (Slice 5 §3): hint no longer points at non-existent
+    // `/lcm worker tick consolidate-themes` subcommand. New hint explains the
+    // cycle-3 status of themes consolidation auto-tick.
+    expect(text).toContain("auto-tick is cycle-3");
 
     const details = result.details as { themeCount: number };
     expect(details.themeCount).toBe(0);

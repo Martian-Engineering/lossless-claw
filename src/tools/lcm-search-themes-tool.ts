@@ -174,8 +174,14 @@ export function createLcmSearchThemesTool(input: {
 
       if (rows.length === 0) {
         lines.push("");
+        // v4.1 Final.review.3 fix (Slice 5 §3 MED): the previous hint pointed
+        // at `/lcm worker tick consolidate-themes`, which (a) doesn't accept
+        // `consolidate-themes` as a kind name (parser expects `themes-
+        // consolidation`), and (b) the kind isn't wired into the parser at
+        // all (cycle-3 deferred). Replace with an honest message about the
+        // current state.
         lines.push(
-          `No themes match query "${query}" in mode=${mode}. Try /lcm worker tick consolidate-themes after sufficient corpus.`,
+          `No themes match query "${query}" in mode=${mode}. Themes consolidation auto-tick is cycle-3 — themes are populated only when an operator manually triggers consolidation. If you expected results, check that themes have been built for this session.`,
         );
       } else {
         for (const r of rows) {

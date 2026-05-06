@@ -106,6 +106,13 @@ export function tryStartExtractionAutostart(
   const runOneTick = async (): Promise<void> => {
     if (stopped || inFlight) return;
     inFlight = true;
+    // v4.1 Final.review.3 fix (Loop 9 B2 HIGH): outer try/catch wraps the
+    // ENTIRE tick body, not just the runCoreferenceTick call. Without this,
+    // any throw before line 122 (e.g. countPendingExtractions failing
+    // because gateway_stop closed the DB mid-tick) becomes an unhandled
+    // promise rejection from `void runOneTick()` in the setInterval/Timeout
+    // callback. Backfill-autostart already had this pattern; extraction
+    // was modeled on backfill but lost the outer catch in cycle-2.
     try {
       const pending = countPendingExtractions(db);
       if (pending === 0) {
@@ -150,6 +157,20 @@ export function tryStartExtractionAutostart(
       // aren't marked completed so they'll retry next tick. Only count
       // tick-level throws as "consecutive failures".
       consecutiveFailures = 0;
+    } catch (e: unknown) {
+      // Outer catch — anything before/after the runCoreferenceTick
+      // (countPendingExtractions, log calls themselves, etc) doesn't escape.
+      consecutiveFailures++;
+      log.error(
+        `[lcm] extraction autostart: outer tick body threw (consecutive=${consecutiveFailures}): ${e instanceof Error ? e.message : String(e)}`,
+      );
+      if (consecutiveFailures >= 3) {
+        log.error(
+          `[lcm] extraction autostart: 3 consecutive outer-tick failures — stopping. ` +
+            `Likely gateway_stop closed the DB mid-tick; restart gateway after diagnosing.`,
+        );
+        handle.stop();
+      }
     } finally {
       inFlight = false;
     }

@@ -19,7 +19,9 @@ import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
+import { createLcmGetEntityTool } from "../tools/lcm-get-entity-tool.js";
 import { createLcmRecentThemesTool } from "../tools/lcm-recent-themes-tool.js";
+import { createLcmSearchEntitiesTool } from "../tools/lcm-search-entities-tool.js";
 import { createLcmSearchThemesTool } from "../tools/lcm-search-themes-tool.js";
 import { createLcmSemanticRecallTool } from "../tools/lcm-semantic-recall-tool.js";
 import { createLcmThemeExplainTool } from "../tools/lcm-theme-explain-tool.js";
@@ -2406,6 +2408,16 @@ function wirePluginHandlers(
   );
   api.registerTool((ctx) =>
     createLcmSynthesizeAroundTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  // Final.review.3 — entity tool surface (Scenario 4 fix). Read tools over
+  // lcm_entities + lcm_entity_mentions, populated by the async coreference
+  // worker. Without these the entity worker writes records that no agent can
+  // query, which the doc audit (Slice 1 BLOCKER) flagged as vapor.
+  api.registerTool((ctx) =>
+    createLcmGetEntityTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  );
+  api.registerTool((ctx) =>
+    createLcmSearchEntitiesTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
   );
 
   api.registerCommand(

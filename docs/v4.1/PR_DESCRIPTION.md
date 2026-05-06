@@ -24,7 +24,7 @@ After merge: the agent can answer "what did we work on three weeks ago?" or "wha
 - ✅ `/lcm health` — subsystem snapshot (embeddings coverage, worker status, eval scores, drift, cache size, prewarm queue, **over-cap pending**)
 - ✅ `/lcm worker [status | tick embedding-backfill]` — worker introspection + manual triggers
 - ✅ `/lcm reconcile-session-keys [--apply | --list-candidates]` — interactive thread merging for legacy data
-- ✅ `/lcm eval [--baseline | --corpus_sample N]` — recall-only eval harness against query sets
+- ✅ `/lcm eval [--baseline | --mode <fts_only|semantic_only|hybrid> [--query-set NAME] [--version N]]` — recall-only eval harness against query sets
 - ✅ `runPurge(leafIds, reason)` operator service — soft-suppress + cascade through 10 read paths
 
 **Worker auto-ticks (1 of 4 shipped this PR; 3 deferred):**

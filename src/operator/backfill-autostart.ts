@@ -171,7 +171,12 @@ export function tryStartBackfillAutostart(
         modelName: active.modelName,
         voyageModel: active.modelName as VoyageEmbeddingModel,
         inputType: "document",
-        voyageMaxRetries: 2,
+        // v4.1 Final.review.3 fix (Loop 1 Bug 1.1 / Loop 7 B1 HIGH):
+        // 2 retries × 30s + backoff = ~91s worst-case > WORKER_LOCK_TTL_MS (90s).
+        // Lock can expire mid-call; another worker can acquire + write to vec0
+        // simultaneously. Drop to 1 retry → worst-case 60.5s, well under TTL.
+        // Matches the safe default in backfill.ts BackfillOptions.
+        voyageMaxRetries: 1,
         voyageTimeoutMs: 30_000,
         maxRequestsPerSecond: 0.5,
         perTickLimit: 200,
@@ -190,7 +195,29 @@ export function tryStartBackfillAutostart(
           `tokens=${result.voyageTokensConsumed} duration=${(durationMs / 1000).toFixed(1)}s ` +
           `(pending was ${pending}, now ${countPendingDocs(db, { modelName: active.modelName })})`,
       );
-      consecutiveFailures = 0;
+      // v4.1 Final.review.3 fix (Loop 7 B5 HIGH):
+      // Treat all-failed-batches ticks (embeddedCount=0 with non-empty skipped
+      // when there were docs to process) as a failure, otherwise consecutiveFailures
+      // never increments through 5xx exhaustion / network errors / 400s — they
+      // become `result.skipped` entries instead of throws. Without this,
+      // a Voyage outage burns quota indefinitely without auto-stopping.
+      const allSkipped =
+        result.embeddedCount === 0 && result.skipped.length > 0 && pending > 0;
+      if (allSkipped) {
+        consecutiveFailures++;
+        log.warn(
+          `[lcm] backfill autostart: tick ${totalTicks} returned 0 embedded with ${result.skipped.length} skipped (consecutive=${consecutiveFailures}); ` +
+            `sample reasons: ${result.skipped.slice(0, 3).map((s) => s.reason).join(", ")}`,
+        );
+        if (consecutiveFailures >= 3) {
+          log.error(
+            `[lcm] backfill autostart: 3 consecutive all-failed ticks; stopping autostart. Investigate Voyage availability + restart gateway to retry.`,
+          );
+          handle.stop();
+        }
+      } else {
+        consecutiveFailures = 0;
+      }
     } catch (e: unknown) {
       consecutiveFailures++;
       log.error(

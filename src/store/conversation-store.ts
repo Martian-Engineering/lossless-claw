@@ -653,11 +653,22 @@ export class ConversationStore {
     return row?.count ?? 0;
   }
 
-  async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
+  async getMessageById(
+    messageId: MessageId,
+    opts: { includeSuppressed?: boolean } = {},
+  ): Promise<MessageRecord | null> {
+    // v4.1 Final.review.3 fix (Loop 2 Leak 2.1+2.2 BLOCKER):
+    // assembler.resolveMessageItem + retrieval.expandRecursive + compaction.leafPass
+    // all called this without filtering suppressed_at. After an operator suppress,
+    // the assembler hot path was re-emitting suppressed message content to the
+    // agent prompt. The §10 invariant requires every agent-facing read path to
+    // filter suppressed_at IS NULL by default; internal callers (integrity,
+    // compaction, doctor) opt-in via includeSuppressed=true.
+    const suppressedClause = opts.includeSuppressed ? "" : " AND suppressed_at IS NULL";
     const row = this.db
       .prepare(
         `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
-       FROM messages WHERE message_id = ?`,
+       FROM messages WHERE message_id = ?${suppressedClause}`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
     return row ? toMessageRecord(row) : null;
