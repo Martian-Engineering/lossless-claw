@@ -94,7 +94,10 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
         "config": {
           "freshTailCount": 32,
           "contextThreshold": 0.75,
-          "incrementalMaxDepth": -1
+          "incrementalMaxDepth": -1,
+          "toolResultPersistEnabled": true,
+          "toolResultPersistThresholdChars": 8000,
+          "toolResultPreviewChars": 1800
         }
       }
     }
@@ -119,6 +122,9 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_CONDENSED_TARGET_TOKENS` | `2000` | Target token count for condensed summaries |
 | `LCM_MAX_EXPAND_TOKENS` | `4000` | Token cap for sub-agent expansion queries |
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File blocks above this size are intercepted and stored separately |
+| `LCM_TOOL_RESULT_PERSIST_ENABLED` | `true` | Persist oversized tool results outside the main transcript and replace them with deterministic previews |
+| `LCM_TOOL_RESULT_PERSIST_THRESHOLD_CHARS` | `8000` | Character threshold above which tool results are offloaded into LCM storage |
+| `LCM_TOOL_RESULT_PREVIEW_CHARS` | `1800` | Character budget for the preview text left behind in the transcript |
 | `LCM_LARGE_FILE_SUMMARY_PROVIDER` | `""` | Provider override for large-file summarization |
 | `LCM_LARGE_FILE_SUMMARY_MODEL` | `""` | Model override for large-file summarization |
 | `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514`) |
@@ -137,6 +143,16 @@ LCM_CONTEXT_THRESHOLD=0.75
 - **freshTailCount=32** protects the last 32 messages from compaction, giving the model enough recent context for continuity.
 - **incrementalMaxDepth=-1** enables unlimited automatic condensation after each compaction pass — the DAG cascades as deep as needed. Set to `0` (default) for leaf-only, or a positive integer for a specific depth cap.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
+
+### Oversized tool-result persistence
+
+LCM can now offload oversized `toolResult` payloads into its SQLite-backed storage instead of leaving the entire payload inline in the active transcript.
+
+- `toolResultPersistEnabled=true` turns this on.
+- `toolResultPersistThresholdChars=8000` controls when an individual tool result is considered too large to keep inline.
+- `toolResultPreviewChars=1800` controls how much deterministic preview text remains in the transcript after offload.
+
+This is most useful for coding agents and shell-heavy sessions where large command output would otherwise dominate the fresh tail and crowd out user-visible context.
 
 ### OpenClaw session reset settings
 
@@ -191,11 +207,17 @@ For most long-lived LCM setups, a good starting point is:
 ## Development
 
 ```bash
+# Refresh compiled output and copied manifest in dist/
+npm run build
+
 # Run tests
 npx vitest
 
 # Type check
 npx tsc --noEmit
+
+# Validate the publish path end to end
+npm run release:verify
 
 # Run a specific test file
 npx vitest test/engine.test.ts

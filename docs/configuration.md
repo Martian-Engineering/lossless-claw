@@ -27,6 +27,9 @@ Set recommended environment variables:
 ```bash
 export LCM_FRESH_TAIL_COUNT=32
 export LCM_INCREMENTAL_MAX_DEPTH=-1
+export LCM_TOOL_RESULT_PERSIST_ENABLED=true
+export LCM_TOOL_RESULT_PERSIST_THRESHOLD_CHARS=8000
+export LCM_TOOL_RESULT_PREVIEW_CHARS=1800
 ```
 
 Restart OpenClaw.
@@ -91,6 +94,23 @@ The actual summary size depends on the LLM's output; these values are guidelines
 - Smaller chunks create summaries more frequently from less material.
 - This also affects the condensed minimum input threshold (10% of this value).
 
+### Tool-result persistence
+
+`LCM_TOOL_RESULT_PERSIST_ENABLED` (default `true`) controls whether oversized `toolResult` payloads are rewritten out of the active transcript and stored separately in LCM's database.
+
+- Turn this off if you explicitly want the raw tool output to remain inline in the transcript.
+- Leave it on for coding and shell-heavy workflows where a single command can otherwise consume most of the fresh tail.
+
+`LCM_TOOL_RESULT_PERSIST_THRESHOLD_CHARS` (default `8000`) sets the character count where a tool result is considered oversized.
+
+- Lower values offload more aggressively, reducing transcript bloat sooner.
+- Higher values keep more tool output inline, which may be useful when your tools usually return compact structured results.
+
+`LCM_TOOL_RESULT_PREVIEW_CHARS` (default `1800`) controls how much deterministic preview text remains in the transcript after offload.
+
+- Lower values preserve more context budget.
+- Higher values leave more immediate inline detail for the model and for humans reading the transcript.
+
 ## Model selection
 
 LCM uses the same model as the parent OpenClaw session for summarization by default. You can override this:
@@ -150,6 +170,30 @@ sqlite3 ~/.openclaw/lcm.db ".backup ~/.openclaw/lcm.db.backup"
 
 In multi-agent OpenClaw setups, each agent uses the same LCM database but has its own conversations (keyed by session ID). The plugin config applies globally; per-agent overrides use environment variables set in the agent's config.
 
+## Plugin config equivalents
+
+If you prefer OpenClaw plugin config over environment variables, the same settings are available under `plugins.entries["lossless-claw"].config`:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "enabled": true,
+        "config": {
+          "contextThreshold": 0.75,
+          "freshTailCount": 32,
+          "incrementalMaxDepth": -1,
+          "toolResultPersistEnabled": true,
+          "toolResultPersistThresholdChars": 8000,
+          "toolResultPreviewChars": 1800
+        }
+      }
+    }
+  }
+}
+```
+
 ## Disabling LCM
 
 To fall back to OpenClaw's built-in compaction:
@@ -165,3 +209,13 @@ To fall back to OpenClaw's built-in compaction:
 ```
 
 Or set `LCM_ENABLED=false` to disable the plugin while keeping it registered.
+
+## Development checks
+
+When changing runtime behavior or packaging, these are the quickest high-signal checks:
+
+```bash
+npm run build
+npm test
+npm run release:verify
+```
