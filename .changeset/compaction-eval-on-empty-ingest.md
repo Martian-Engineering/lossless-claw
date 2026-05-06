@@ -1,0 +1,5 @@
+---
+"@martian-engineering/lossless-claw": patch
+---
+
+Fix `afterTurn` skipping compaction evaluation when `ingestBatch` is empty. When `deduplicateAfterTurnBatch` removed every new message (e.g. because `afterTurnTranscriptReconcile` or per-message `engine.ingest` calls had already imported them), `afterTurn` would early-return before reaching the compaction policy block. Long-running conversations could accumulate well beyond `contextThreshold` without ever triggering an incremental leaf pass, deferred-compaction debt record, or budget-trigger run — leaving the host's emergency overflow truncation as the only safety net. The early-return is now replaced with a fall-through: when `ingestBatch` is empty the actual `ingestBatch` call is skipped, but token-budget resolution, conversation lookup, and the existing compaction evaluation flow still run. This is observable in the `[lcm] afterTurn: nothing to ingest …` log line, which now ends with `(continuing to compaction evaluation; transcript reconcile may have already ingested)`.
