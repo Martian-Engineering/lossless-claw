@@ -16,6 +16,7 @@
     "dag"
   ],
   "files": [
+    "dist/",
     "index.ts",
     "src/**/*.ts",
     "openclaw.plugin.json",
@@ -24,8 +25,10 @@
     "LICENSE"
   ],
   "scripts": {
+    "build": "node -e \"const { copyFileSync, mkdirSync, rmSync } = require('node:fs'); rmSync('dist', { recursive: true, force: true });\" && tsc -p tsconfig.json && node -e \"const { copyFileSync, mkdirSync } = require('node:fs'); mkdirSync('dist', { recursive: true }); copyFileSync('openclaw.plugin.json', 'dist/openclaw.plugin.json');\"",
     "changeset": "changeset",
-    "release:verify": "npm test && npm pack --dry-run",
+    "prepack": "npm run build",
+    "release:verify": "npm run build && npm test && npm pack --dry-run",
     "test": "vitest run --dir test",
     "version-packages": "changeset version"
   },
