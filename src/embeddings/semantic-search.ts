@@ -231,6 +231,10 @@ export async function runSemanticSearch(
       fetch: opts.voyageFetch,
       maxRetries: opts.voyageMaxRetries,
       timeoutMs: opts.voyageTimeoutMs,
+      // Wave-11 reviewer P1 fix: query embedding must request the
+      // same dim as the indexed corpus. Pulled from the active
+      // profile so query vectors match vec0's column shape.
+      outputDimension: active.dim,
     });
     if (embed.vectors.length !== 1) {
       throw new Error(

@@ -286,8 +286,28 @@ export function createLcmDescribeTool(input: {
             lines.push("expansion (messages): n/a — target is not a leaf");
           }
         }
-        lines.push("content");
-        lines.push(s.content);
+        // Wave-11 reviewer P1 fix: previously emitted `s.content` then
+        // charged the grant AFTER. For sub-agents at zero remaining budget,
+        // that meant the content was already disclosed before accounting
+        // could prevent it. Now: if this is a delegated session AND the
+        // base summary's tokens exceed the remaining grant budget, redact
+        // the content and surface a budget-exhausted error EARLY (before
+        // emit). Charge the budget after a successful emit, as before, so
+        // the grant accounting still reflects what the agent actually saw.
+        const baseSummaryTokens = s.tokenCount ?? 0;
+        const isDelegatedAndOverBudget =
+          delegatedGrantId !== "" &&
+          typeof delegatedRemainingBudget === "number" &&
+          delegatedRemainingBudget < baseSummaryTokens;
+        if (isDelegatedAndOverBudget) {
+          lines.push("content");
+          lines.push(
+            `[REDACTED — base summary content is ${baseSummaryTokens} tokens but the delegated grant has only ${delegatedRemainingBudget} tokens remaining. Re-issue the grant with a larger remainingTokens via lcm_expand_query, or call from a non-delegated session.]`,
+          );
+        } else {
+          lines.push("content");
+          lines.push(s.content);
+        }
 
         // Phase 2.9 — one-hop expansion flags. Lets main agents see source
         // children + messages WITHOUT delegating through lcm_expand_query
@@ -583,15 +603,11 @@ export function createLcmDescribeTool(input: {
         // without auth manager seeing it. Now we sum the token costs of
         // any expanded payload and consume them from the grant.
         if (delegatedGrantId !== "") {
-          // Wave-10 reviewer P1 fix (incomplete-Wave-9 follow-up): the base
-          // summary's full content is emitted via lines.push(s.content) on
-          // line 290, but Wave-9 only counted expandedChildren/Messages.
-          // A sub-agent calling lcm_describe on a 30K-token condensed
-          // summary with NO expansion flags drains 30K tokens of context-
-          // window-worthy content for free against the grant — exactly
-          // the bypass the fix was trying to close. Charge the base
-          // s.tokenCount too.
-          const baseTokens = s.tokenCount ?? 0;
+          // Wave-10 + Wave-11 reviewer P1 fix: charge consumed tokens
+          // against the grant. If the base summary was REDACTED (Wave-11
+          // early-gate above), don't charge for it — the agent didn't
+          // actually receive it. Otherwise charge base + expansions.
+          const baseTokens = isDelegatedAndOverBudget ? 0 : (s.tokenCount ?? 0);
           const expandedChildrenTokens = expandedChildren.reduce(
             (total, c) => total + (c.tokenCount ?? 0),
             0,

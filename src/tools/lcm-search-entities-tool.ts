@@ -16,10 +16,13 @@
  *   - `exact`: canonical_text = query COLLATE NOCASE — degenerate case;
  *     prefer `lcm_get_entity` for exact lookup
  *
- * Suppression note: this tool returns entity records, NOT mentions. Entities
- * with all-suppressed mentions can still appear here (the entity row itself
- * isn't suppressed). To check if an entity has agent-visible mentions, call
- * lcm_get_entity which filters mentions by parent summary's suppressed_at.
+ * Suppression: entities with ZERO unsuppressed mentions are filtered out
+ * (Wave-10 reviewer P2 fix). The query joins through `lcm_entity_mentions`
+ * + `summaries` and requires at least one mention with
+ * `suppressed_at IS NULL`. This means an entity returned here has at
+ * least one agent-visible mention. (Operators wanting the audit-mode
+ * view of suppressed-only entities must use raw SQL — there is no
+ * agent-facing path that exposes them.)
  */
 
 import { Type } from "@sinclair/typebox";

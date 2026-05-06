@@ -42,6 +42,10 @@ importers:
       vitest:
         specifier: ^3.0.0
         version: 3.2.4(@types/node@25.6.0)(jiti@2.7.0)(yaml@2.8.4)
+    optionalDependencies:
+      sqlite-vec:
+        specifier: ^0.1.7-alpha.2
+        version: 0.1.9
 
 packages:
 

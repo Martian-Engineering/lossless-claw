@@ -107,6 +107,13 @@ export interface BackfillOptions {
    */
   voyageMaxRetries?: number;
   /**
+   * Wave-11 reviewer P1 fix: target output dimension. If the registered
+   * profile is 256/512/2048 dim (non-default), this MUST be passed so
+   * Voyage returns the right-shape vectors. Default: omit (Voyage uses
+   * 1024). Resolved from `lcm_embedding_profile.dim` by callers.
+   */
+  voyageOutputDimension?: number;
+  /**
    * Override Voyage per-attempt timeout. Default 30_000 ms (30s) here
    * (vs Voyage client's 60s default). Combined with default
    * voyageMaxRetries=1 → worst case per batch ≈ 2×30 + 0.5s backoff
@@ -337,6 +344,9 @@ export async function runBackfillTick(
             // (test scenarios) is honored.
             maxRetries: opts.voyageMaxRetries ?? 1,
             timeoutMs: opts.voyageTimeoutMs ?? 30_000,
+            // Wave-11 reviewer P1: forward output dimension so 256/512/
+            // 2048-dim profiles get the right-shape vectors back.
+            outputDimension: opts.voyageOutputDimension,
           });
         } catch (e: unknown) {
           // Voyage error — record in skipped list, continue with next

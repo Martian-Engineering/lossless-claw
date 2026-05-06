@@ -151,3 +151,56 @@ describe("parsePeriodShortcut — local-timezone day boundaries (Wave-10 reviewe
     expect(r.before.toISOString()).toBe("2026-05-06T00:00:00.000Z");
   });
 });
+
+// ────────────────────────────────────────────────────────────────────
+// Wave-11 reviewer P1: half-hour offsets + DST robustness
+// ────────────────────────────────────────────────────────────────────
+
+describe("parsePeriodShortcut — fractional-offset + DST robustness (Wave-11 reviewer P1)", () => {
+  it("Asia/Kolkata 'yesterday' (UTC+5:30) returns local-yesterday boundaries", () => {
+    // 2026-05-07 02:00 IST = 2026-05-06 20:30 UTC.
+    // Kolkata local "yesterday" = 2026-05-06 (00:00-23:59 IST).
+    // Kolkata 2026-05-06 00:00 IST = 2026-05-05 18:30 UTC.
+    // Kolkata 2026-05-07 00:00 IST = 2026-05-06 18:30 UTC.
+    const r = parsePeriodShortcut("yesterday", {
+      nowMs: Date.UTC(2026, 4, 6, 20, 30, 0),
+      timezone: "Asia/Kolkata",
+    });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.since.toISOString()).toBe("2026-05-05T18:30:00.000Z");
+    expect(r.before.toISOString()).toBe("2026-05-06T18:30:00.000Z");
+  });
+
+  it("Asia/Kathmandu 'today' (UTC+5:45) handles 15-minute offsets", () => {
+    // 2026-05-07 06:00 NPT = 2026-05-07 00:15 UTC.
+    // Kathmandu local "today" = 2026-05-07 (00:00-23:59 NPT).
+    // Kathmandu 2026-05-07 00:00 NPT = 2026-05-06 18:15 UTC.
+    const r = parsePeriodShortcut("today", {
+      nowMs: Date.UTC(2026, 4, 7, 0, 15, 0),
+      timezone: "Asia/Kathmandu",
+    });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.since.toISOString()).toBe("2026-05-06T18:15:00.000Z");
+    // "today" duration in Kathmandu (no DST) is exactly 24h.
+    expect(r.before.toISOString()).toBe("2026-05-07T18:15:00.000Z");
+  });
+
+  it("America/Los_Angeles spring-forward day: 'today' duration is 23h", () => {
+    // US DST 2026 starts March 8 02:00 PST → 03:00 PDT (spring forward).
+    // Local "today" on 2026-03-08 in LA is 23 hours: 00:00 PST to 00:00
+    // PDT next day = 23h elapsed UTC instead of 24h.
+    // 2026-03-08 12:00 LA local = 2026-03-08 19:00 UTC (post-spring).
+    const r = parsePeriodShortcut("today", {
+      nowMs: Date.UTC(2026, 2, 8, 19, 0, 0),
+      timezone: "America/Los_Angeles",
+    });
+    if ("error" in r) throw new Error(r.error);
+    // LA 2026-03-08 00:00 PST = 2026-03-08 08:00 UTC (start of spring-forward day).
+    expect(r.since.toISOString()).toBe("2026-03-08T08:00:00.000Z");
+    // LA 2026-03-09 00:00 PDT = 2026-03-09 07:00 UTC (next day start).
+    expect(r.before.toISOString()).toBe("2026-03-09T07:00:00.000Z");
+    // Verify duration is 23h.
+    const durMs = r.before.getTime() - r.since.getTime();
+    expect(durMs).toBe(23 * 60 * 60 * 1000);
+  });
+});

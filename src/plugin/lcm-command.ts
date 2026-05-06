@@ -2625,7 +2625,28 @@ export function createLcmCommand(params: {
               getLcm: params.getLcm,
             }),
           };
-        case "doctor":
+        case "doctor": {
+          // Wave-11 reviewer P1 fix: `/lcm doctor apply` calls the summarizer
+          // (cost surface) AND mutates summaries (state surface). Read-only
+          // `/lcm doctor` (without --apply) stays open. Mirror the
+          // purge / reconcile / worker-tick / eval gate pattern.
+          if (parsed.apply && !ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "🩺 Doctor apply — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm doctor apply requires owner privileges (ctx.senderIsOwner=true). It runs the summarizer (cost) and updates summaries (mutation) — non-owner callers cannot invoke it. /lcm doctor (without --apply) is read-only and remains open.",
+                  ),
+                ]),
+              ].join("\n"),
+            };
+          }
           return parsed.apply
             ? {
                 text: await buildDoctorApplyText({
@@ -2637,7 +2658,28 @@ export function createLcmCommand(params: {
                 }),
               }
             : { text: await buildDoctorText({ ctx, db: await getDb() }) };
-        case "doctor_cleaners":
+        }
+        case "doctor_cleaners": {
+          // Wave-11 reviewer P1 fix: `/lcm doctor clean apply` deletes
+          // cleaner matches after backup — destructive. Gate the apply
+          // variant; read-only listing stays open.
+          if (parsed.apply && !ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "🧽 Doctor clean apply — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm doctor clean apply requires owner privileges (ctx.senderIsOwner=true). It deletes cleaner matches from the DB after backup — non-owner callers cannot invoke it. /lcm doctor clean (without --apply) is read-only and remains open.",
+                  ),
+                ]),
+              ].join("\n"),
+            };
+          }
           return parsed.apply
             ? {
                 text: await buildDoctorCleanersApplyText({
@@ -2648,6 +2690,7 @@ export function createLcmCommand(params: {
                 }),
               }
             : { text: await buildDoctorCleanersText({ db: await getDb() }) };
+        }
         case "health":
           return { text: buildHealthText({ db: await getDb() }) };
         case "worker_status":

@@ -147,23 +147,32 @@ interface SummariesScopeFilter {
 }
 
 /**
- * Wave-10 reviewer P1 fix: compute the UTC instant corresponding to the
- * START of the local day containing `at` in the given IANA timezone.
+ * Compute the UTC instant corresponding to the START of the local day
+ * containing `at` in the given IANA timezone.
  *
- * Why: previously `parsePeriodShortcut` anchored "today"/"yesterday"/etc.
- * at UTC midnight, so a Bangkok operator (UTC+7) at 02:00 local time
- * asking for "yesterday" got UTC-yesterday (which is ~17 hours different
- * from local-yesterday). Operator scenarios like "what did we work on
- * yesterday?" must mean LOCAL yesterday.
+ * Why: operator-facing periods like "yesterday" / "this-week" must use
+ * LOCAL day boundaries, not UTC. A Bangkok operator (UTC+7) at 02:00
+ * local time asking "yesterday" wants local-yesterday (~17h different
+ * from UTC-yesterday).
  *
- * Implementation: use Intl.DateTimeFormat to render the date in the
- * target timezone, parse the y/m/d back, and compute the UTC instant
- * for that local-midnight by sampling the timezone's UTC offset at noon
- * of that local day (avoids DST-fold ambiguity at midnight on spring-
- * forward / fall-back boundaries).
+ * Implementation (Wave-11 reviewer P1 fix — robust against half-hour
+ * offsets like Asia/Kolkata UTC+05:30 and DST transition days):
+ *
+ *   1. Format `at` in target tz to get the local Y-M-D as a string.
+ *   2. Find the UTC offset (in MINUTES, not hours) for that local day
+ *      by sampling at local noon — use both `hour` AND `minute` parts,
+ *      AND verify the rendered Y/M/D matches the target day (catches
+ *      DST-transition days where local noon + 12h still in target day).
+ *   3. Compute local midnight UTC instant = UTC noon - 12h - offsetMinutes.
+ *
+ * Previous Wave-10 implementation only sampled the hour at noon, which:
+ *   - Dropped minute offsets (Kolkata showed +5 instead of +5:30)
+ *   - Assumed every local day is exactly 24h (false on DST-transition
+ *     days where local-day spans 23h or 25h UTC)
  */
 function getLocalDayStartUtc(at: Date, timezone: string): Date {
-  let parts: Record<string, string> = {};
+  // Step 1: get y/m/d in target tz.
+  let y: number, m: number, d: number;
   try {
     const fmt = new Intl.DateTimeFormat("en-US", {
       timeZone: timezone,
@@ -171,44 +180,85 @@ function getLocalDayStartUtc(at: Date, timezone: string): Date {
       month: "2-digit",
       day: "2-digit",
     });
+    const parts: Record<string, string> = {};
     for (const p of fmt.formatToParts(at)) {
       if (p.type !== "literal") parts[p.type] = p.value;
     }
+    y = parseInt(parts.year ?? "1970", 10);
+    m = parseInt(parts.month ?? "01", 10);
+    d = parseInt(parts.day ?? "01", 10);
   } catch {
-    // Invalid timezone — fall back to UTC.
-    parts = {
-      year: String(at.getUTCFullYear()),
-      month: String(at.getUTCMonth() + 1).padStart(2, "0"),
-      day: String(at.getUTCDate()).padStart(2, "0"),
-    };
+    y = at.getUTCFullYear();
+    m = at.getUTCMonth() + 1;
+    d = at.getUTCDate();
   }
-  const y = parseInt(parts.year ?? "1970", 10);
-  const m = parseInt(parts.month ?? "01", 10);
-  const d = parseInt(parts.day ?? "01", 10);
-  // Sample the timezone offset at local noon (12:00) of the resolved
-  // local date. We compute by rendering the offset name and using the
-  // hourCycle h23 representation. Simpler approach: construct a UTC
-  // Date for "Y-M-D 12:00:00 UTC", measure its rendered hour in the
-  // target tz; offset = renderedHour - 12. Then localMidnight UTC =
-  // UTC noon - 12h - offset hours.
-  const probeUtc = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
-  let renderedHour = 12;
-  try {
-    const fmt = new Intl.DateTimeFormat("en-US", {
-      timeZone: timezone,
-      hour: "2-digit",
-      hourCycle: "h23",
-    });
-    const hourStr = fmt
-      .formatToParts(probeUtc)
-      .find((p) => p.type === "hour")?.value;
-    if (hourStr) renderedHour = parseInt(hourStr, 10);
-  } catch {
-    // already fell back above
+
+  // Step 2: find UTC instant such that formatting it in target tz gives
+  // exactly y/m/d 00:00. Iterate to converge — handles DST transitions
+  // and half/quarter-hour offsets without special-casing.
+  //
+  // Algorithm: start with naive `Date.UTC(y, m-1, d, 0, 0, 0)`, format
+  // it in target tz, compute the delta between rendered local time and
+  // target midnight, subtract that delta from probe. Repeat 3 iters
+  // (typically converges in 1-2; the third is a safety check).
+  let probe = new Date(Date.UTC(y, m - 1, d, 0, 0, 0));
+  const targetMidnightLocalMs = Date.UTC(y, m - 1, d, 0, 0);
+  for (let iter = 0; iter < 3; iter++) {
+    let renderedY = y, renderedM = m, renderedD = d, renderedH = 0, renderedMin = 0;
+    try {
+      const fmt = new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      });
+      const parts: Record<string, string> = {};
+      for (const p of fmt.formatToParts(probe)) {
+        if (p.type !== "literal") parts[p.type] = p.value;
+      }
+      renderedY = parseInt(parts.year ?? String(y), 10);
+      renderedM = parseInt(parts.month ?? String(m), 10);
+      renderedD = parseInt(parts.day ?? String(d), 10);
+      renderedH = parseInt(parts.hour ?? "0", 10);
+      // h23 returns 24 for end-of-day in some implementations; normalize.
+      if (renderedH === 24) renderedH = 0;
+      renderedMin = parseInt(parts.minute ?? "0", 10);
+    } catch {
+      // Invalid timezone → return UTC midnight as fallback.
+      return new Date(Date.UTC(y, m - 1, d, 0, 0, 0));
+    }
+    const renderedAsLocalMs = Date.UTC(
+      renderedY,
+      renderedM - 1,
+      renderedD,
+      renderedH,
+      renderedMin,
+    );
+    const delta = renderedAsLocalMs - targetMidnightLocalMs;
+    if (delta === 0) return probe;
+    probe = new Date(probe.getTime() - delta);
   }
-  const tzOffsetHours = renderedHour - 12; // e.g. Bangkok = +7, LA = -7/-8
-  const localMidnightMs = probeUtc.getTime() - 12 * 3600_000 - tzOffsetHours * 3600_000;
-  return new Date(localMidnightMs);
+  return probe;
+}
+
+/**
+ * Compute the duration (in ms) of the LOCAL day starting at `localStartUtc`
+ * in the given timezone. On DST spring-forward days this is 23h; on fall-
+ * back days it's 25h. Used by period parsing to compute "yesterday" =
+ * `[localStart-yesterdayDuration, localStart)` correctly across DST.
+ */
+function getLocalDayDurationMs(localStartUtc: Date, timezone: string): number {
+  const nextStart = getLocalDayStartUtc(
+    new Date(localStartUtc.getTime() + 36 * 3600_000), // +36h = next-day's noon-ish
+    timezone,
+  );
+  const ms = nextStart.getTime() - localStartUtc.getTime();
+  // Sanity bounds: ms should be in [22h, 26h]. If not, fall back to 24h.
+  if (ms < 22 * 3600_000 || ms > 26 * 3600_000) return 24 * 3600_000;
+  return ms;
 }
 
 /**
@@ -237,16 +287,28 @@ export function parsePeriodShortcut(
   const localMidnight = getLocalDayStartUtc(now, timezone);
   const dayMs = 24 * 60 * 60 * 1000;
 
+  // Wave-11 reviewer P1 fix: use the actual local-day durations (23h on
+  // spring-forward days, 25h on fall-back days) rather than a fixed 24h.
+  // Yesterday's duration is computed by sampling the next-day boundary
+  // from a known anchor.
   if (period === "today") {
+    const todayDuration = getLocalDayDurationMs(localMidnight, timezone);
     return {
       since: localMidnight,
-      before: new Date(localMidnight.getTime() + dayMs),
+      before: new Date(localMidnight.getTime() + todayDuration),
       label: "today",
     };
   }
   if (period === "yesterday") {
+    // Yesterday's local-day-start = today's local-day-start minus
+    // yesterday's duration (which we compute by going back a buffer
+    // and forward; getLocalDayStartUtc handles offsets correctly).
+    const yesterdayStart = getLocalDayStartUtc(
+      new Date(localMidnight.getTime() - 12 * 3600_000),
+      timezone,
+    );
     return {
-      since: new Date(localMidnight.getTime() - dayMs),
+      since: yesterdayStart,
       before: localMidnight,
       label: "yesterday",
     };
@@ -542,12 +604,13 @@ export function createLcmSynthesizeAroundTool(input: {
       "surface), 'time' (leaves within ±windowHours of a target summary's timestamp — " +
       "target REQUIRED), or 'semantic' (top windowK most-similar leaves to target " +
       "content/query — target REQUIRED). Period boundaries are computed in the operator's " +
-      "local timezone (configured on the LCM engine). Returns a markdown summary built via " +
-      "the synthesis dispatch (D.02), backed by lcm_synthesis_cache so subsequent identical " +
-      "calls hit the cache. Use 'period' for time-anchored questions (what did we do " +
-      "yesterday?), 'time' for narrow ±N-hour windows around a known leaf, or 'semantic' " +
-      "for memory passes around a topic — distinct from lcm_semantic_recall (which returns " +
-      "ranked snippets, not a synthesized rollup).",
+      "local timezone (configured on the LCM engine; handles half-hour offsets like Asia/Kolkata " +
+      "and DST transitions). Returns a markdown summary backed by lcm_synthesis_cache so " +
+      "subsequent identical calls hit the cache. The synthesis dispatch records the per-tier " +
+      "model name in the audit table; the actual LLM call goes through the operator's " +
+      "configured summarizer chain (summaryModel/summaryProvider) for inheritance of auth " +
+      "retries + fallback handling. Distinct from lcm_semantic_recall (which returns ranked " +
+      "snippets, not a synthesized rollup).",
     parameters: LcmSynthesizeAroundSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());

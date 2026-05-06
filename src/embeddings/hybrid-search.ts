@@ -325,28 +325,38 @@ export async function runHybridSearch(
   // even individually (a single 600K-token summary), fall through to RRF.
   let rerankPacked = candidates;
   let rerankPackTruncated = false;
+  let rerankPackSkippedOversized = 0;
   if (rerankRequested) {
     const RERANK_BUDGET = Math.floor(MAX_TOKENS_PER_RERANK_CALL * 0.85);
-    // Add an estimate for the query (small).
     const queryTokenEstimate = Math.ceil(query.length / 4);
     let cumulative = queryTokenEstimate;
     const packed: typeof candidates = [];
+    // Wave-11 reviewer P1 fix: previously broke out of the loop when
+    // the first candidate was oversized, disabling rerank for the
+    // entire result set even though smaller later candidates would fit.
+    // Now SKIP individual oversized candidates and continue packing —
+    // a single huge FTS hit no longer takes down the whole rerank.
     for (const c of candidates) {
       const candTokens = c.tokenCount ?? Math.ceil((c.content?.length ?? 0) / 4);
-      if (packed.length === 0 && candTokens > RERANK_BUDGET) {
-        // Single-candidate exceeds budget — fall back to RRF.
-        rerankPacked = [];
+      // Skip individually oversized candidates (rare but possible —
+      // a 700K-token condensed summary that exceeds the 510K rerank
+      // budget by itself). They still appear in `candidates` for the
+      // RRF backstop scoring.
+      if (candTokens > RERANK_BUDGET) {
+        rerankPackSkippedOversized++;
         rerankPackTruncated = true;
-        break;
+        continue;
       }
       if (cumulative + candTokens > RERANK_BUDGET) {
+        // Cumulative budget exceeded — stop packing. Rerank still runs
+        // on what we have so far.
         rerankPackTruncated = true;
         break;
       }
       packed.push(c);
       cumulative += candTokens;
     }
-    if (packed.length > 0) rerankPacked = packed;
+    rerankPacked = packed;
   }
   if (rerankRequested && rerankPacked.length > 0) {
     try {

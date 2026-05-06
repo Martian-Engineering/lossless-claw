@@ -219,10 +219,15 @@ function getEmbeddingsHealth(db: DatabaseSync): EmbeddingsHealth {
 
 function readActiveProfile(db: DatabaseSync): ActiveEmbeddingProfile | null {
   try {
+    // Wave-11 reviewer P2 fix: previously selected on `active = 1` alone,
+    // ignoring `archive_after IS NOT NULL`. Semantic retrieval correctly
+    // skips archived profiles (semantic-search.ts), so health was reporting
+    // a profile semantic search would not actually use during model cutover.
+    // Match the semantic-side filter exactly.
     const row = db
       .prepare(
         `SELECT model_name, dim, registered_at FROM lcm_embedding_profile
-           WHERE active = 1
+           WHERE active = 1 AND archive_after IS NULL
            ORDER BY registered_at DESC LIMIT 1`,
       )
       .get() as { model_name?: string; dim?: number; registered_at?: string } | undefined;

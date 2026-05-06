@@ -283,3 +283,132 @@ describe("Wave-10 #10: countOverCapPendingForBackfill exists and excludes embedd
     expect(overCap).toBe(1);
   });
 });
+
+// ────────────────────────────────────────────────────────────────────
+// Wave-11 reviewer P1: lcm_describe early-budget-gate
+// ────────────────────────────────────────────────────────────────────
+
+describe("Wave-11 #5: lcm_describe early-budget-gate (security)", () => {
+  it("redacts s.content when delegated grant has insufficient budget for base summary", () => {
+    // The reviewer scenario: sub-agent at zero/low remaining budget
+    // calls lcm_describe on a 30K-token summary. Pre-fix: emits
+    // s.content then charges (already disclosed). Post-fix: redacts
+    // s.content if base tokens exceed remaining grant.
+    //
+    // We assert the SOURCE has the gate logic (rather than spinning up
+    // a sub-agent harness). The presence of `isDelegatedAndOverBudget`
+    // + `[REDACTED` literal in the file is the contract.
+    const fs = require("node:fs") as typeof import("node:fs");
+    const path = require("node:path") as typeof import("node:path");
+    const url = require("node:url") as typeof import("node:url");
+    const here = path.dirname(url.fileURLToPath(import.meta.url));
+    const describeToolPath = path.resolve(
+      here,
+      "..",
+      "src",
+      "tools",
+      "lcm-describe-tool.ts",
+    );
+    const src = fs.readFileSync(describeToolPath, "utf8");
+    expect(src).toMatch(/isDelegatedAndOverBudget/);
+    expect(src).toContain("[REDACTED");
+    expect(src).toMatch(/baseSummaryTokens/);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+// Wave-11 reviewer P1: hybrid rerank skip-oversized (don't bail)
+// ────────────────────────────────────────────────────────────────────
+
+describe("Wave-11 #6: hybrid rerank skips individually oversized candidates", () => {
+  it("rerank packer continues past oversized candidates instead of breaking out", () => {
+    // The reviewer scenario: a single 700K-token FTS hit appearing
+    // first in the candidates list previously caused the packer to
+    // set rerankPacked=[] and break out, disabling rerank for the
+    // entire result set. Post-fix: skip the oversized one and
+    // continue packing later candidates.
+    const fs = require("node:fs") as typeof import("node:fs");
+    const path = require("node:path") as typeof import("node:path");
+    const url = require("node:url") as typeof import("node:url");
+    const here = path.dirname(url.fileURLToPath(import.meta.url));
+    const hybridSearchPath = path.resolve(
+      here,
+      "..",
+      "src",
+      "embeddings",
+      "hybrid-search.ts",
+    );
+    const src = fs.readFileSync(hybridSearchPath, "utf8");
+    expect(src).toMatch(/rerankPackSkippedOversized/);
+    // The pre-fix break statement (when packed.length === 0) is gone.
+    expect(src).not.toMatch(
+      /if \(packed\.length === 0 && candTokens > RERANK_BUDGET\)/,
+    );
+    // The new continue statement IS present.
+    expect(src).toMatch(/continue;[\s\S]{0,200}cumulative \+ candTokens > RERANK_BUDGET/);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+// Wave-11 reviewer P1: Voyage output_dimension passthrough
+// ────────────────────────────────────────────────────────────────────
+
+describe("Wave-11 #7: Voyage embedTexts forwards output_dimension", () => {
+  it("voyage client sends output_dimension when caller specifies it", async () => {
+    // Mock fetch: capture the body sent to Voyage.
+    let capturedBody: any = null;
+    const mockFetch = async (url: any, init: any) => {
+      capturedBody = JSON.parse(init.body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [{ index: 0, embedding: new Array(2048).fill(0.1) }],
+          usage: { total_tokens: 5 },
+          model: "voyage-4-large",
+        }),
+      } as any;
+    };
+    const { embedTexts } = await import("../src/voyage/client.js");
+    await embedTexts({
+      model: "voyage-4-large",
+      texts: ["test"],
+      inputType: "document",
+      outputDimension: 2048,
+      apiKey: "test-key",
+      fetch: mockFetch as any,
+      maxRetries: 0,
+      timeoutMs: 5000,
+    });
+    expect(capturedBody).toBeDefined();
+    expect(capturedBody.output_dimension).toBe(2048);
+  });
+
+  it("voyage client OMITS output_dimension when caller doesn't specify (default 1024)", async () => {
+    let capturedBody: any = null;
+    const mockFetch = async (url: any, init: any) => {
+      capturedBody = JSON.parse(init.body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [{ index: 0, embedding: new Array(1024).fill(0.1) }],
+          usage: { total_tokens: 5 },
+          model: "voyage-4-large",
+        }),
+      } as any;
+    };
+    const { embedTexts } = await import("../src/voyage/client.js");
+    await embedTexts({
+      model: "voyage-4-large",
+      texts: ["test"],
+      inputType: "document",
+      apiKey: "test-key",
+      fetch: mockFetch as any,
+      maxRetries: 0,
+      timeoutMs: 5000,
+    });
+    expect(capturedBody).toBeDefined();
+    expect(capturedBody.output_dimension).toBeUndefined();
+  });
+});

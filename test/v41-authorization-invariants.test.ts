@@ -34,7 +34,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { existsSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   closeLcmConnection,
   createLcmDatabaseConnection,
@@ -75,6 +76,13 @@ const DESTRUCTIVE_OPERATOR_CASES: Array<[string, string]> = [
   // as READ_ONLY in Wave-9 but reviewer correctly challenged that.
   ["eval", "eval --baseline"],
 ];
+
+// Wave-11 reviewer P1: doctor + doctor_cleaners are READ_ONLY at the
+// case level (the parser dispatches to the same case for both `--apply`
+// and the read-only variant). The gate fires on the parsed `apply`
+// flag inside the case body, not via the case classification. So the
+// case stays in READ_ONLY_OPERATOR_CASES below, but we add a separate
+// invariant test below for the apply-flag gate.
 
 /**
  * Read-only operator cases — explicitly NOT gated by senderIsOwner.
@@ -119,12 +127,21 @@ const READ_ONLY_OPERATOR_CASES: ReadonlySet<string> = new Set([
  * top of the file). We extract all `case "<name>":` patterns matching
  * that indent.
  */
+// Wave-11 reviewer P1 fix: previously hardcoded `/tmp/lossless-claw-upstream`
+// which broke CI (the path doesn't exist on GitHub runners) and made local
+// runs accidentally succeed by reading whatever stale checkout happened to
+// be at that path. Now we resolve relative to this test file's location:
+// __dirname/../src/plugin/lcm-command.ts. Works in CI, local checkouts at
+// any path, and any worktree.
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const LCM_COMMAND_PATH = resolve(__dirname, "..", "src", "plugin", "lcm-command.ts");
+
 function extractCommandCases(): string[] {
-  const path = "/tmp/lossless-claw-upstream/src/plugin/lcm-command.ts";
-  if (!existsSync(path)) {
-    throw new Error(`lcm-command.ts not found at ${path}`);
+  if (!existsSync(LCM_COMMAND_PATH)) {
+    throw new Error(`lcm-command.ts not found at ${LCM_COMMAND_PATH}`);
   }
-  const source = readFileSync(path, "utf8");
+  const source = readFileSync(LCM_COMMAND_PATH, "utf8");
   // Regex captures `        case "X":` (exactly 8 spaces then `case "..."`).
   const re = /^ {8}case "([a-z_]+)":/gm;
   const cases = new Set<string>();
@@ -235,6 +252,47 @@ describe("authorization invariants", () => {
     // matching on a string that's always present.
     const command = createCommandFixture();
     const ctx = createCommandContext("worker status", false);
+    const result = await command.handler(ctx);
+    const text = (result as { text: string }).text;
+    expect(text).not.toMatch(/operator-only/i);
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // Wave-11 reviewer P1: doctor + doctor_cleaners with --apply flag
+  // ────────────────────────────────────────────────────────────────────
+
+  it("INVARIANT: /lcm doctor apply rejects non-owner (Wave-11 reviewer P1)", async () => {
+    const command = createCommandFixture();
+    const ctx = createCommandContext("doctor apply", false);
+    const result = await command.handler(ctx);
+    expect(result).toBeDefined();
+    const text = (result as { text: string }).text;
+    expect(text).toMatch(/operator-only/i);
+    expect(text).toMatch(/owner privileges/i);
+  });
+
+  it("INVARIANT: /lcm doctor clean apply rejects non-owner (Wave-11 reviewer P1)", async () => {
+    const command = createCommandFixture();
+    const ctx = createCommandContext("doctor clean apply", false);
+    const result = await command.handler(ctx);
+    expect(result).toBeDefined();
+    const text = (result as { text: string }).text;
+    expect(text).toMatch(/operator-only/i);
+    expect(text).toMatch(/owner privileges/i);
+  });
+
+  it("INVARIANT: /lcm doctor (read-only, no --apply) is NOT gated", async () => {
+    const command = createCommandFixture();
+    const ctx = createCommandContext("doctor", false);
+    const result = await command.handler(ctx);
+    const text = (result as { text: string }).text;
+    // Read-only doctor scan should NOT show operator-only rejection.
+    expect(text).not.toMatch(/operator-only/i);
+  });
+
+  it("INVARIANT: /lcm doctor clean (read-only, no --apply) is NOT gated", async () => {
+    const command = createCommandFixture();
+    const ctx = createCommandContext("doctor clean", false);
     const result = await command.handler(ctx);
     const text = (result as { text: string }).text;
     expect(text).not.toMatch(/operator-only/i);

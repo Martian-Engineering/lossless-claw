@@ -132,6 +132,15 @@ export interface VoyageEmbedOptions {
   timeoutMs?: number;
   /** Max retries on 5xx / network errors. Default 3 (4 attempts total). */
   maxRetries?: number;
+  /**
+   * Wave-11 reviewer P1 fix: output dimension override. voyage-4-large
+   * supports 256/512/1024/2048 dimensions; the registered embedding
+   * profile (lcm_embedding_profile.dim) determines what the vec0 column
+   * expects. If callers register a non-default dim and don't pass this
+   * field, Voyage returns its default (1024) and vec0 INSERT fails with
+   * dim mismatch. Default 1024 (Voyage default).
+   */
+  outputDimension?: number;
 }
 
 export interface VoyageEmbedResult {
@@ -235,6 +244,13 @@ export async function embedTexts(opts: VoyageEmbedOptions): Promise<VoyageEmbedR
   };
   if (opts.inputType !== null) {
     body.input_type = opts.inputType;
+  }
+  // Wave-11 reviewer P1 fix: forward output_dimension to Voyage so
+  // non-default-dim profiles (256/512/2048) actually get those dims
+  // back. Without this, Voyage returns its default (1024) and vec0
+  // INSERT fails with dim mismatch on the per-model table.
+  if (typeof opts.outputDimension === "number" && opts.outputDimension > 0) {
+    body.output_dimension = opts.outputDimension;
   }
 
   const response = await postWithRetry(

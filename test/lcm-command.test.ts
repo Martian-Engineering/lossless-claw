@@ -41,9 +41,15 @@ function createCommandContext(
   args?: string,
   overrides: Record<string, unknown> = {},
 ) {
+  // Wave-11 reviewer P1 fix: default `senderIsOwner: true` so existing
+  // tests exercising operator-mutating commands (doctor apply, etc.)
+  // continue to pass after the Wave-11 doctor-apply gate. Negative-case
+  // tests (e.g., Wave-9 P0 regression) explicitly pass `senderIsOwner:
+  // false` via `overrides` and continue to work.
   return {
     channel: "telegram",
     isAuthorizedSender: true,
+    senderIsOwner: true,
     commandBody: args ? `/lossless ${args}` : "/lossless",
     args,
     config: {
