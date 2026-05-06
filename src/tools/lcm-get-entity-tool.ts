@@ -114,12 +114,18 @@ export function createLcmGetEntityTool(input: {
     name: "lcm_get_entity",
     label: "LCM Get Entity",
     description:
-      "Look up a specific entity by canonical name and return its mentions " +
-      "across the session corpus. Backed by the async entity coreference worker " +
-      "(lcm_entities + lcm_entity_mentions). Use for 'tell me about X' or 'what " +
-      "work has been done on X' style queries. For fuzzy substring search " +
-      "across many entities, use lcm_search_entities instead. For raw leaf " +
-      "content similarity, use lcm_semantic_recall.",
+      "Look up a NAMED entity (person, project, customer, library, identifier — " +
+      "things automatically extracted by the entity coreference worker) by " +
+      "canonical name and return its mentions across the session corpus. " +
+      "PRIMARY tool for Type D pattern-anchored entity queries when the user " +
+      "NAMES a specific entity: 'tell me about <X>', 'history of customer <Y>', " +
+      "'work I've done with <library Z>'. " +
+      "If the user is asking a paraphrastic topic question without naming an " +
+      "entity ('have we discussed X-shaped problems', 'what work has been done " +
+      "on rate limiting'), prefer lcm_grep --mode hybrid instead — it handles " +
+      "paraphrase across the corpus without needing a canonical entity to exist. " +
+      "For browsing many entities by substring, use lcm_search_entities. For " +
+      "raw leaf content similarity (no entity needed), use lcm_semantic_recall.",
     parameters: LcmGetEntitySchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());

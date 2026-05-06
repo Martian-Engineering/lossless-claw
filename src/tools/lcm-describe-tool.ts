@@ -99,10 +99,16 @@ export function createLcmDescribeTool(input: {
     name: "lcm_describe",
     label: "LCM Describe",
     description:
-      "Look up metadata and content for an LCM item by ID. " +
-      "Use this to inspect summaries (sum_xxx) or stored files (file_xxx) " +
-      "from compacted conversation history. Returns summary content, lineage, " +
-      "token counts, and file exploration results.",
+      "Look up an LCM item by ID, with optional one-hop drilldown. " +
+      "PRIMARY tool for Type E queries (drilldown / source-tracing): " +
+      "'where did this synthesized claim come from?', 'show me the source leaves " +
+      "for this summary'. Set expandChildren=true to inline child summaries " +
+      "(capped 20, max 50) and/or expandMessages=true to inline raw source " +
+      "messages. Inspects summaries (sum_xxx) or stored files (file_xxx). " +
+      "For multi-hop drilldown that needs to read more than one level, " +
+      "use lcm_expand_query (delegated sub-agent expansion). " +
+      "Returns summary content, lineage, token counts, file exploration, " +
+      "and (with expand flags) one-hop child/message detail.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());

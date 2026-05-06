@@ -167,12 +167,13 @@ export function createLcmGrepTool(input: {
     name: "lcm_grep",
     label: "LCM Grep",
     description:
-      "Search compacted conversation history using regex, full-text, or hybrid search. " +
-      "Searches across messages and/or summaries stored by LCM. " +
-      "Use this to find specific content that may have been compacted away from " +
-      "active context. In full_text mode, queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. " +
-      "In hybrid mode, FTS + semantic vector search are blended via Voyage rerank — best for keyword + paraphrase coverage in one call. Hybrid hits are summaries only (no raw messages); for purely-semantic exploration prefer lcm_semantic_recall. Returns matching snippets with their summary/message IDs " +
-      "for follow-up with lcm_expand or lcm_describe.",
+      "Search compacted conversation history with FIVE modes (`mode` parameter): " +
+      "(1) `regex` — literal or regex pattern over summary content; " +
+      "(2) `full_text` — FTS5 keyword search; queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics; " +
+      "(3) `hybrid` — FTS5 + Voyage semantic + rerank (PRIMARY for Type B topic-anchored queries: 'have we ever discussed X', 'what work has been done on Y' — handles paraphrases like 'merge mess' → 'rebase blew up'). Hybrid hits are summaries only; for purely-semantic exploration prefer lcm_semantic_recall; " +
+      "(4) `semantic` — vector-only, no rerank (cheaper than hybrid); " +
+      "(5) `verbatim` — returns FULL untruncated source messages (PRIMARY for Type C verbatim/citation queries: 'what exactly did X say about Y', 'quote me the original wording'). " +
+      "Returns matching snippets with summary/message IDs for follow-up with lcm_describe (one-hop) or lcm_expand_query (multi-hop drilldown).",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
