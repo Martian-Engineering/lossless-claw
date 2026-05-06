@@ -1,0 +1,14 @@
+{
+  "packageManager": "npm",
+  "testRunner": "vitest",
+  "vitest": {
+    "configFile": "vitest.config.ts"
+  },
+  "reporters": ["progress-append-only", "clear-text"],
+  "coverageAnalysis": "off",
+  "mutate": ["src/operator/purge.ts"],
+  "concurrency": 2,
+  "timeoutMS": 60000,
+  "disableTypeChecks": "{src,test}/**/*.{js,ts,mjs,cjs,jsx,tsx}",
+  "ignorePatterns": ["node_modules", "dist", ".stryker-tmp", "test/fixtures/v41-test-corpus.db"]
+}
