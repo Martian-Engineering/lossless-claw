@@ -276,11 +276,15 @@ const SUITES = {
         "Time-anchored: lcm_synthesize_around with a recent leaf as target + time window",
       tool: "lcm_synthesize_around",
       args: () => {
-        // Anchor on a real recent leaf so the time window has content
+        // Wave-10 fix: filter to production-shaped IDs (sum_*) so harness-
+        // inserted test leaves with non-conforming prefixes don't trip
+        // synthesize_around's target validation. Anchor on a real recent
+        // sum_-prefixed leaf so the time window has content.
         const row = db
           .prepare(
             `SELECT summary_id FROM summaries
              WHERE kind='leaf' AND suppressed_at IS NULL
+               AND summary_id LIKE 'sum_%'
              ORDER BY created_at DESC LIMIT 1`,
           )
           .get();
@@ -358,10 +362,14 @@ const SUITES = {
         // Wave-1 Auditor #9 finding #4: SELECT … LIMIT 1 without ORDER BY
         // is non-deterministic. Sort by summary_id (stable) so re-runs
         // pick the same leaf and report deltas vs prior runs cleanly.
+        // Wave-10 fix: filter to sum_-prefixed IDs (production shape) so
+        // harness-inserted test data with other prefixes doesn't trip the
+        // describe tool's id-prefix validation.
         const row = db
           .prepare(
             `SELECT summary_id FROM summaries
                WHERE kind='leaf' AND suppressed_at IS NULL
+                 AND summary_id LIKE 'sum_%'
                ORDER BY summary_id ASC LIMIT 1`,
           )
           .get();
@@ -394,17 +402,66 @@ const SUITES = {
       questionType: "A",
       description: "P1 regression check: time-windowed semantic returns hits in window",
       tool: "lcm_semantic_recall",
-      args: {
-        query: "openai websocket lineage 78055",
-        limit: 5,
-        allConversations: true,
-        since: "2026-05-05T00:00:00Z",
-        before: "2026-05-07T00:00:00Z",
+      // Wave-10 fix v2: previously hardcoded 2026-05-05 to 2026-05-07
+      // (time-bombed). Wave-10 v1 used a fixed query against latest-48h
+      // (failed when snapshot had insufficient embedded content). Now
+      // pick an actually-embedded leaf in the latest window and use its
+      // own content as the query — guarantees the test can pass when
+      // semantic recall is working, fails only when it's actually broken.
+      args: () => {
+        const seed = db
+          .prepare(
+            `SELECT s.summary_id, s.content, s.latest_at
+               FROM summaries s
+               JOIN lcm_embedding_meta m
+                 ON m.embedded_id = s.summary_id AND m.embedded_kind='summary' AND m.archived = 0
+               WHERE s.kind='leaf' AND s.suppressed_at IS NULL
+               ORDER BY s.latest_at DESC
+               LIMIT 1`,
+          )
+          .get();
+        if (!seed) {
+          // No embedded leaves at all — sentinel query that we'll accept
+          // 0-hits on (predicate checks the same condition).
+          return {
+            query: "__qa_noop_no_embedded_content__",
+            limit: 5,
+            allConversations: true,
+          };
+        }
+        const seedMs = new Date(seed.latest_at).getTime();
+        const since = new Date(seedMs - 1 * 60 * 60 * 1000).toISOString();
+        const before = new Date(seedMs + 1 * 60 * 60 * 1000).toISOString();
+        // Use first 8 words of the seed leaf's content as the query.
+        // Semantic recall on Voyage SHOULD find the seed itself or
+        // very-close neighbors.
+        const queryWords = String(seed.content)
+          .replace(/\s+/g, " ")
+          .trim()
+          .split(" ")
+          .slice(0, 8)
+          .join(" ");
+        return {
+          query: queryWords,
+          limit: 5,
+          allConversations: true,
+          since,
+          before,
+        };
       },
       expect: (r) => {
+        // Re-check whether the snapshot has any embedded content at all.
+        // If it doesn't, accept 0-hits as not-a-regression (the test is
+        // gated on infrastructure availability, not on tool correctness).
+        const embeddedCount = db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM lcm_embedding_meta WHERE embedded_kind='summary' AND archived = 0`,
+          )
+          .get()?.n ?? 0;
+        if (embeddedCount === 0) return null; // Snapshot empty; can't test.
         const hits = r.details?.hits ?? [];
         if (hits.length === 0) {
-          return "P1 regression: 0 hits for May5–6 window despite known content there";
+          return `P1 regression: 0 hits when querying with a seed leaf's own content (snapshot has ${embeddedCount} embedded leaves) — semantic recall pipeline is broken`;
         }
         return null;
       },

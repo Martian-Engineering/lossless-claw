@@ -262,7 +262,14 @@ async function main() {
   log("Validating leaf-write hook → extraction queue...");
   const store = new SummaryStore(db, { fts5Available: true });
   const conv = db.prepare(`SELECT conversation_id FROM conversations LIMIT 1`).get();
-  const newLeafId = `harness_leaf_${ts}`;
+  // Wave-10 follow-up: use production-shaped `sum_` prefix so the harness
+  // leaf is treated identically to real summaries by all downstream tools.
+  // Previous naming `harness_leaf_<ts>` made the leaf reach the most-
+  // recent slot in the live-DB copy, which downstream QA runs picked up
+  // as a target — but lcm_describe / lcm_synthesize_around require a
+  // `sum_xxx` prefix, so the QA runner reported false-positive failures.
+  // Aligning to production shape eliminates that whole class of test bug.
+  const newLeafId = `sum_harness_${ts.replace(/[:.]/g, "_")}`;
   await store.insertSummary({
     summaryId: newLeafId,
     conversationId: conv.conversation_id,

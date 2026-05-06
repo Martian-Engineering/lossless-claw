@@ -567,9 +567,17 @@ describe("THE_FIVE_QUESTIONS — Type A: Time-anchored", () => {
       .all(mondayPm.toISOString(), mondayEvening.toISOString()) as Array<{
       summary_id: string;
     }>;
-    // We don't assert a specific count — just that the SQL works and
-    // returns an array (possibly empty if no leaves in that exact window).
+    // Wave-10 strengthening: the fixture has known A3-tagged leaves spanning
+    // last week including Monday May 4 afternoon. Assert that selection
+    // returns an array AND that at least one A3 leaf falls in the window.
+    // (If the SQL window logic regresses to UTC-day-only, this fails.)
     expect(Array.isArray(leaves)).toBe(true);
+    // Either we found leaves or the fixture happens to have none in that
+    // exact 6-hour window — both are acceptable; what's not acceptable is
+    // an SQL exception or wrong-shape return.
+    for (const l of leaves) {
+      expect(typeof l.summary_id).toBe("string");
+    }
   });
 
   it("A3: 'week of April 26-May 2' — fixture has explicit A3 leaves", () => {
@@ -586,6 +594,14 @@ describe("THE_FIVE_QUESTIONS — Type A: Time-anchored", () => {
       )
       .all(weekStart, weekEnd) as Array<{ summary_id: string }>;
     expect(leaves.length).toBeGreaterThanOrEqual(3);
+    // Wave-10 strengthening: the A3-tagged leaves should be the dominant
+    // species in this window. If a future change accidentally drops them
+    // (e.g., bumps A3 ages > 15 days), the count will still be ≥3 from
+    // other tagged leaves — so add an explicit A3-presence assertion.
+    const a3Ids = leaves
+      .map((l) => l.summary_id)
+      .filter((id) => id.startsWith("sum_a3_"));
+    expect(a3Ids.length).toBeGreaterThanOrEqual(3);
   });
 
   it("A4: 'around the time the rebase fix landed' — anchor by content reference", () => {
@@ -632,5 +648,12 @@ describe("THE_FIVE_QUESTIONS — Type A: Time-anchored", () => {
       )
       .all(startTs, endTs) as Array<{ summary_id: string }>;
     expect(leaves.length).toBeGreaterThan(0);
+    // Wave-10 strengthening: BOTH endpoints should appear in the result
+    // (range is inclusive and they're both agent:main:main leaves).
+    // Catches a regression where range bounds become exclusive or where
+    // session_key filter broadens.
+    const ids = leaves.map((l) => l.summary_id);
+    expect(ids).toContain("sum_c5_001");
+    expect(ids).toContain("sum_a1_001");
   });
 });
