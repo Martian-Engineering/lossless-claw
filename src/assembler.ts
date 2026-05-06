@@ -1,4 +1,4 @@
-import type { ContextEngine } from "openclaw/plugin-sdk";
+import type { AgentMessage } from "./openclaw-bridge.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
   ConversationStore,
@@ -6,8 +6,6 @@ import type {
   MessageRole,
 } from "./store/conversation-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
-
-type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -52,7 +50,6 @@ function buildSystemPromptAddition(summarySignals: SummaryPromptSignal[]): strin
   if (summarySignals.length === 0) {
     return undefined;
   }
-
   const maxDepth = summarySignals.reduce((deepest, signal) => Math.max(deepest, signal.depth), 0);
   const condensedCount = summarySignals.filter((signal) => signal.kind === "condensed").length;
   const heavilyCompacted = maxDepth >= 2 || condensedCount >= 2;
@@ -595,6 +592,7 @@ export class ContextAssembler {
       }
     }
 
+    // For short / medium conversations, prefer stable raw turns over synthetic
     const systemPromptAddition = buildSystemPromptAddition(summarySignals);
 
     // Step 3: Split into evictable prefix and protected fresh tail

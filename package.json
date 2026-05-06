@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with incremental compaction",
   "type": "module",
-  "main": "index.ts",
+  "main": "dist/index.js",
   "license": "MIT",
   "author": "Josh Lehman <josh@martian.engineering>",
   "keywords": [

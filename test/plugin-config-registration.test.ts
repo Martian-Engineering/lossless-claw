@@ -15,10 +15,12 @@ function buildApi(
   api: OpenClawPluginApi;
   getFactory: () => RegisteredEngineFactory;
   infoLog: ReturnType<typeof vi.fn>;
+  debugLog: ReturnType<typeof vi.fn>;
   warnLog: ReturnType<typeof vi.fn>;
 } {
   let factory: RegisteredEngineFactory;
   const infoLog = vi.fn();
+  const debugLog = vi.fn();
   const warnLog = vi.fn();
   const agentDir = options?.agentDir ?? "/tmp/fake-agent";
 
@@ -56,7 +58,7 @@ function buildApi(
       info: infoLog,
       warn: warnLog,
       error: vi.fn(),
-      debug: vi.fn(),
+      debug: debugLog,
     },
     registerContextEngine: vi.fn((_id: string, nextFactory: () => unknown) => {
       factory = nextFactory;
@@ -79,6 +81,7 @@ function buildApi(
     api,
     getFactory: () => factory,
     infoLog,
+    debugLog,
     warnLog,
   };
 }
@@ -115,13 +118,16 @@ describe("lcm plugin registration", () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
 
-    const { api, getFactory, infoLog } = buildApi({
+    const { api, getFactory, debugLog } = buildApi({
       enabled: true,
       contextThreshold: 0.33,
       incrementalMaxDepth: -1,
       freshTailCount: 7,
       dbPath,
       largeFileThresholdTokens: 12345,
+      toolResultPersistEnabled: false,
+      toolResultPersistThresholdChars: 15000,
+      toolResultPreviewChars: 640,
     });
 
     lcmPlugin.register(api);
@@ -137,8 +143,11 @@ describe("lcm plugin registration", () => {
       freshTailCount: 7,
       databasePath: dbPath,
       largeFileTokenThreshold: 12345,
+      toolResultPersistEnabled: false,
+      toolResultPersistThresholdChars: 15000,
+      toolResultPreviewChars: 640,
     });
-    expect(infoLog).toHaveBeenCalledWith(
+    expect(debugLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33)`,
     );
   });
