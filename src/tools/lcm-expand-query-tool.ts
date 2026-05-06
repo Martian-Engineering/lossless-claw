@@ -101,6 +101,10 @@ type DelegatedExpandQueryReply = {
   /** Wave-4 Auditor #10 P1-02: count of citedIds the LLM emitted that
    *  weren't found in the summaries table — i.e., fabricated. */
   citedIdsRejectedAsFabricated?: number;
+  /** Wave-6 P2 fix: count of citedIds that exceeded the 1000-cap and
+   *  were therefore not validated against the summaries table.
+   *  Distinguishes "fabricated" from "too many to verify cheaply". */
+  citedIdsExceededValidationCap?: number;
 };
 
 type ParsedExpandQueryReply =
@@ -893,6 +897,7 @@ async function runDelegatedExpandQuery(
       // so the caller can detect fabrication.
       let citedIdsValidated: string[] = parsed.value.citedIds;
       let citedIdsRejectedAsFabricated = 0;
+      let citedIdsExceededValidationCap = 0;
       if (parsed.value.citedIds.length > 0) {
         // Wave-5 P2 fix: cap IN-list size before query so an LLM that
         // emitted thousands of fabricated IDs doesn't blow SQLite's
@@ -909,9 +914,23 @@ async function runDelegatedExpandQuery(
             )
             .all(...idsToCheck) as Array<{ summary_id: string }>;
           const real = new Set(rows.map((r) => r.summary_id));
-          const filtered = parsed.value.citedIds.filter((id) => real.has(id));
-          citedIdsRejectedAsFabricated = parsed.value.citedIds.length - filtered.length;
-          citedIdsValidated = filtered;
+          // Wave-6 P2 fix: distinguish "rejected as fabricated" from
+          // "exceeded validation cap" so caller diagnostics aren't
+          // misleadingly labeled. Filter ONLY the validated slice; IDs
+          // beyond the cap are reported separately.
+          const filtered = idsToCheck.filter((id) => real.has(id));
+          citedIdsRejectedAsFabricated = idsToCheck.length - filtered.length;
+          citedIdsExceededValidationCap = Math.max(
+            0,
+            parsed.value.citedIds.length - CITATION_VALIDATION_CAP,
+          );
+          // Preserve the over-cap IDs in the result (un-validated but
+          // returned for the caller's UI; only the first 1000 are
+          // confirmed real).
+          citedIdsValidated = [
+            ...filtered,
+            ...parsed.value.citedIds.slice(CITATION_VALIDATION_CAP),
+          ];
         } catch {
           // best-effort; on validation error fall back to the unvalidated set
         }
@@ -956,6 +975,7 @@ async function runDelegatedExpandQuery(
         citedIds: citedIdsValidated,
         truncated: parsed.value.truncated || answerWasTruncated,
         citedIdsRejectedAsFabricated,
+        citedIdsExceededValidationCap,
       };
     } finally {
       try {

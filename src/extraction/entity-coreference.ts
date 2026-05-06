@@ -225,7 +225,11 @@ export async function runCoreferenceTick(
         ).run(errMsg.slice(0, 500), item.queue_id);
       } catch (updateErr) {
         const updateErrMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
-        itemDetail.error = `${errMsg} | dead-letter-update-failed: ${updateErrMsg}`;
+        // Wave-6 P2 fix: slice both halves to 500 chars before merging
+        // so a multi-MB error blob can't blow up `result.perItem` (which
+        // is returned to operators via /lcm health surfaces).
+        itemDetail.error =
+          `${errMsg.slice(0, 500)} | dead-letter-update-failed: ${updateErrMsg.slice(0, 500)}`;
         // Don't break the loop — other items may still be processable.
         // But the operator will see the merged error in the per-item
         // diagnostics.
