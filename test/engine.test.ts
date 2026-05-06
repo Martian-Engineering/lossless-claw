@@ -7366,6 +7366,140 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenance?.requestedAt).toBeInstanceOf(Date);
   });
 
+  it("afterTurn evaluates compaction when ingestBatch is empty (dedup swallowed everything but conversation may still be over threshold)", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-empty-ingest-still-evaluates-compaction";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (conversationId: number, tokenBudget: number, observed?: number) => Promise<unknown>;
+      };
+      deduplicateAfterTurnBatch: (
+        sessionId: string,
+        sessionKey: string | undefined,
+        messages: AgentMessage[],
+        opts: unknown,
+      ) => Promise<AgentMessage[]>;
+    };
+
+    // Pre-create the conversation via a real ingest so afterTurn's later
+    // conversation lookup succeeds (mirrors a long-running session that has
+    // already had messages stored from prior turns).
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed message" }),
+    });
+
+    // Force every new message to dedup as already-stored — simulates the
+    // afterTurnTranscriptReconcile / per-message ingest race in modern
+    // OpenClaw hosts.
+    vi.spyOn(privateEngine, "deduplicateAfterTurnBatch").mockResolvedValue([]);
+
+    // Conversation IS already over threshold from prior turns.
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 50_000,
+      threshold: 20_000,
+    } as unknown as Record<string, unknown>);
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 200_000,
+      threshold: 180_000,
+    });
+
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
+    const compactSpy = vi.spyOn(engine, "compact");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-empty-ingest-still-evaluates-compaction"),
+      messages: [
+        makeMessage({ role: "user", content: "already-stored user message" }),
+        makeMessage({ role: "assistant", content: "already-stored assistant reply" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 258_000,
+      runtimeContext: { currentTokenCount: 200_000 },
+    });
+
+    // Conversation should exist (created by afterTurn even with empty ingest).
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    // The defining behavior: deferred-mode default records compaction debt
+    // even though ingestBatch was empty. Pre-fix, afterTurn would early-return
+    // and no maintenance row would exist.
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance).not.toBeNull();
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.reason).toBe("threshold");
+
+    // Inline-execution paths should not have fired in deferred mode.
+    expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
+    expect(compactSpy).not.toHaveBeenCalled();
+  });
+
+  it("afterTurn skips compaction work when ingestBatch is empty AND conversation is below threshold", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-empty-ingest-below-threshold-noop";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (conversationId: number, tokenBudget: number, observed?: number) => Promise<unknown>;
+      };
+      deduplicateAfterTurnBatch: (
+        sessionId: string,
+        sessionKey: string | undefined,
+        messages: AgentMessage[],
+        opts: unknown,
+      ) => Promise<AgentMessage[]>;
+    };
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed message" }),
+    });
+
+    vi.spyOn(privateEngine, "deduplicateAfterTurnBatch").mockResolvedValue([]);
+
+    // Below threshold — leaf trigger off and budget evaluator says no.
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 5_000,
+      threshold: 20_000,
+    } as unknown as Record<string, unknown>);
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 30_000,
+      threshold: 180_000,
+    });
+
+    const compactLeafAsyncSpy = vi.spyOn(engine, "compactLeafAsync");
+    const compactSpy = vi.spyOn(engine, "compact");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-empty-ingest-below-threshold-noop"),
+      messages: [makeMessage({ role: "assistant", content: "already-stored" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 258_000,
+      runtimeContext: { currentTokenCount: 30_000 },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance?.pending ?? false).toBe(false);
+    expect(compactLeafAsyncSpy).not.toHaveBeenCalled();
+    expect(compactSpy).not.toHaveBeenCalled();
+  });
+
   it("afterTurn records deferred leaf debt even when cache heuristics defer execution", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-hot-cache-deferred-leaf-debt";

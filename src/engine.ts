@@ -6292,38 +6292,43 @@ export class LcmContextEngine implements ContextEngine {
 
     ingestBatch.push(...summaryDedupedNewMessages);
     if (ingestBatch.length === 0) {
+      // Nothing to ingest in *this* afterTurn call — but the conversation may
+      // still be over threshold from prior turns, especially when the host
+      // path (e.g. afterTurnTranscriptReconcile, or external `engine.ingest`
+      // calls during the turn) already imported the new messages before
+      // afterTurn's dedup ran. Log and fall through to compaction evaluation
+      // rather than early-returning, otherwise compaction would never fire
+      // once dedup begins consistently swallowing new turn deltas.
       this.deps.log.info(
-        `[lcm] afterTurn: nothing to ingest ${sessionLabel} newMessages=${newMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        `[lcm] afterTurn: nothing to ingest ${sessionLabel} newMessages=${newMessages.length} (continuing to compaction evaluation; transcript reconcile may have already ingested) duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
-      await runRuntimeAutoRotate();
-      return;
-    }
-
-    try {
-      await this.ingestBatch({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        messages: ingestBatch,
-        isHeartbeat: params.isHeartbeat === true,
-      });
-    } catch (err) {
-      // Never compact a stale or partially ingested frontier.
-      this.deps.log.error(
-        `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(err)}`,
-      );
-      this.logAutoRotateSessionFileDecision({
-        phase: "runtime",
-        action: "skip",
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-        thresholdBytes: this.config.autoRotateSessionFiles.sizeBytes,
-        durationMs: 0,
-        reason: "ingest-failed",
-        error: describeLogError(err),
-        level: "warn",
-      });
-      return;
+    } else {
+      try {
+        await this.ingestBatch({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          messages: ingestBatch,
+          isHeartbeat: params.isHeartbeat === true,
+        });
+      } catch (err) {
+        // Never compact a stale or partially ingested frontier.
+        this.deps.log.error(
+          `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(err)}`,
+        );
+        this.logAutoRotateSessionFileDecision({
+          phase: "runtime",
+          action: "skip",
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          sessionFile: params.sessionFile,
+          thresholdBytes: this.config.autoRotateSessionFiles.sizeBytes,
+          durationMs: 0,
+          reason: "ingest-failed",
+          error: describeLogError(err),
+          level: "warn",
+        });
+        return;
+      }
     }
 
     if (batchLooksLikeHeartbeatAckTurn(ingestBatch)) {
