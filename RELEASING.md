@@ -37,6 +37,14 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
 
 ## Release flow
 
+Before triggering a release, run the local preflight once on the release commit:
+
+```bash
+npm run release:verify
+```
+
+This rebuilds `dist/`, runs the test suite, and dry-runs `npm pack` so packaging drift is caught before the GitHub publish workflow is used.
+
 1. Merge releasable PRs to `main`
 2. Let the `Version Packages` workflow open or update the release PR
 3. Review the generated version bump and `CHANGELOG.md`
