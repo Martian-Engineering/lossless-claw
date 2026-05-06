@@ -24,6 +24,10 @@
       "label": "Context Threshold",
       "help": "Fraction of context window that triggers compaction (0.0–1.0)"
     },
+    "respectThresholdAsHardFloor": {
+      "label": "Respect Threshold as Hard Floor",
+      "help": "When enabled, never run incremental compaction below contextThreshold of the budget — including cold-cache catch-up. Prevents bleed during idle gaps. Default off (no behavior change)."
+    },
     "incrementalMaxDepth": {
       "label": "Incremental Max Depth",
       "help": "How deep incremental compaction goes (0 = leaf only, -1 = unlimited)"
@@ -248,6 +252,9 @@
         "type": "number",
         "minimum": 0,
         "maximum": 1
+      },
+      "respectThresholdAsHardFloor": {
+        "type": "boolean"
       },
       "incrementalMaxDepth": {
         "type": "integer",
