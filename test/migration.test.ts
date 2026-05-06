@@ -224,4 +224,47 @@ describe("runLcmMigrations summary depth backfill", () => {
 
     expect(ftsTables).toEqual([]);
   });
+
+  it("creates tool_result_offloads table and indexes", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "tool-result-offloads.db");
+    const db = getLcmConnection(dbPath);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const columns = db.prepare(`PRAGMA table_info(tool_result_offloads)`).all() as Array<{
+      name?: string;
+    }>;
+    const columnNames = columns.map((column) => column.name);
+    expect(columnNames).toEqual(expect.arrayContaining([
+      "offload_id",
+      "conversation_id",
+      "session_id",
+      "message_id",
+      "transcript_entry_id",
+      "file_id",
+      "tool_call_id",
+      "tool_name",
+      "message_timestamp",
+      "original_char_count",
+      "original_byte_size",
+      "preview_text",
+      "replacement_message_json",
+      "rewrite_state",
+      "rewrite_attempts",
+      "last_error",
+      "rewritten_at",
+      "created_at",
+    ]));
+
+    const indexes = db.prepare(`PRAGMA index_list(tool_result_offloads)`).all() as Array<{
+      name?: string;
+      unique?: number;
+    }>;
+    const indexByName = new Map(indexes.map((index) => [index.name, index]));
+
+    expect(indexByName.get("tool_result_offloads_session_state_idx")).toBeDefined();
+    expect(indexByName.get("tool_result_offloads_identity_idx")?.unique).toBe(1);
+  });
 });

@@ -91,6 +91,44 @@ export type LargeFileRecord = {
   createdAt: Date;
 };
 
+export type ToolResultOffloadRewriteState = "pending" | "rewritten" | "failed";
+
+export type CreateToolResultOffloadInput = {
+  conversationId: number;
+  sessionId: string;
+  messageId?: number;
+  transcriptEntryId?: string;
+  fileId: string;
+  toolCallId: string;
+  toolName: string;
+  messageTimestamp: number;
+  originalCharCount: number;
+  originalByteSize: number;
+  previewText: string;
+  replacementMessageJson: string;
+};
+
+export type ToolResultOffloadRecord = {
+  offloadId: number;
+  conversationId: number;
+  sessionId: string;
+  messageId: number | null;
+  transcriptEntryId: string | null;
+  fileId: string;
+  toolCallId: string;
+  toolName: string;
+  messageTimestamp: number;
+  originalCharCount: number;
+  originalByteSize: number;
+  previewText: string;
+  replacementMessageJson: string;
+  rewriteState: ToolResultOffloadRewriteState;
+  rewriteAttempts: number;
+  lastError: string | null;
+  rewrittenAt: Date | null;
+  createdAt: Date;
+};
+
 // ── DB row shapes (snake_case) ────────────────────────────────────────────────
 
 interface SummaryRow {
@@ -158,6 +196,27 @@ interface LargeFileRow {
   byte_size: number | null;
   storage_uri: string;
   exploration_summary: string | null;
+  created_at: string;
+}
+
+interface ToolResultOffloadRow {
+  offload_id: number;
+  conversation_id: number;
+  session_id: string;
+  message_id: number | null;
+  transcript_entry_id: string | null;
+  file_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  message_timestamp: number;
+  original_char_count: number;
+  original_byte_size: number;
+  preview_text: string;
+  replacement_message_json: string;
+  rewrite_state: ToolResultOffloadRewriteState;
+  rewrite_attempts: number;
+  last_error: string | null;
+  rewritten_at: string | null;
   created_at: string;
 }
 
@@ -233,6 +292,29 @@ function toLargeFileRecord(row: LargeFileRow): LargeFileRecord {
     byteSize: row.byte_size,
     storageUri: row.storage_uri,
     explorationSummary: row.exploration_summary,
+    createdAt: new Date(row.created_at),
+  };
+}
+
+function toToolResultOffloadRecord(row: ToolResultOffloadRow): ToolResultOffloadRecord {
+  return {
+    offloadId: row.offload_id,
+    conversationId: row.conversation_id,
+    sessionId: row.session_id,
+    messageId: row.message_id,
+    transcriptEntryId: row.transcript_entry_id,
+    fileId: row.file_id,
+    toolCallId: row.tool_call_id,
+    toolName: row.tool_name,
+    messageTimestamp: row.message_timestamp,
+    originalCharCount: row.original_char_count,
+    originalByteSize: row.original_byte_size,
+    previewText: row.preview_text,
+    replacementMessageJson: row.replacement_message_json,
+    rewriteState: row.rewrite_state,
+    rewriteAttempts: row.rewrite_attempts,
+    lastError: row.last_error,
+    rewrittenAt: row.rewritten_at ? new Date(row.rewritten_at) : null,
     createdAt: new Date(row.created_at),
   };
 }
@@ -914,5 +996,161 @@ export class SummaryStore {
       )
       .all(conversationId) as unknown as LargeFileRow[];
     return rows.map(toLargeFileRecord);
+  }
+
+  // ── Tool-result offloads ─────────────────────────────────────────────────
+
+  async insertToolResultOffload(input: CreateToolResultOffloadInput): Promise<ToolResultOffloadRecord> {
+    const result = this.db
+      .prepare(
+        `INSERT INTO tool_result_offloads (
+           conversation_id,
+           session_id,
+           message_id,
+           transcript_entry_id,
+           file_id,
+           tool_call_id,
+           tool_name,
+           message_timestamp,
+           original_char_count,
+           original_byte_size,
+           preview_text,
+           replacement_message_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.conversationId,
+        input.sessionId,
+        input.messageId ?? null,
+        input.transcriptEntryId ?? null,
+        input.fileId,
+        input.toolCallId,
+        input.toolName,
+        input.messageTimestamp,
+        input.originalCharCount,
+        input.originalByteSize,
+        input.previewText,
+        input.replacementMessageJson,
+      ) as unknown as { lastInsertRowid: number | bigint };
+
+    const offloadId = Number(result.lastInsertRowid);
+    const row = this.db
+      .prepare(
+        `SELECT offload_id, conversation_id, session_id, message_id, transcript_entry_id,
+                file_id, tool_call_id, tool_name, message_timestamp, original_char_count,
+                original_byte_size, preview_text, replacement_message_json, rewrite_state,
+                rewrite_attempts, last_error, rewritten_at, created_at
+         FROM tool_result_offloads
+         WHERE offload_id = ?`,
+      )
+      .get(offloadId) as unknown as ToolResultOffloadRow;
+    return toToolResultOffloadRecord(row);
+  }
+
+  async getPendingToolResultOffloads(sessionId: string): Promise<ToolResultOffloadRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT offload_id, conversation_id, session_id, message_id, transcript_entry_id,
+                file_id, tool_call_id, tool_name, message_timestamp, original_char_count,
+                original_byte_size, preview_text, replacement_message_json, rewrite_state,
+                rewrite_attempts, last_error, rewritten_at, created_at
+         FROM tool_result_offloads
+         WHERE session_id = ?
+           AND rewrite_state = 'pending'
+         ORDER BY created_at ASC, offload_id ASC`,
+      )
+      .all(sessionId) as unknown as ToolResultOffloadRow[];
+    return rows.map(toToolResultOffloadRecord);
+  }
+
+  async getToolResultOffload(offloadId: number): Promise<ToolResultOffloadRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT offload_id, conversation_id, session_id, message_id, transcript_entry_id,
+                file_id, tool_call_id, tool_name, message_timestamp, original_char_count,
+                original_byte_size, preview_text, replacement_message_json, rewrite_state,
+                rewrite_attempts, last_error, rewritten_at, created_at
+         FROM tool_result_offloads
+         WHERE offload_id = ?`,
+      )
+      .get(offloadId) as unknown as ToolResultOffloadRow | undefined;
+    return row ? toToolResultOffloadRecord(row) : null;
+  }
+
+  async getToolResultOffloadByMessageId(messageId: number): Promise<ToolResultOffloadRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT offload_id, conversation_id, session_id, message_id, transcript_entry_id,
+                file_id, tool_call_id, tool_name, message_timestamp, original_char_count,
+                original_byte_size, preview_text, replacement_message_json, rewrite_state,
+                rewrite_attempts, last_error, rewritten_at, created_at
+         FROM tool_result_offloads
+         WHERE message_id = ?
+         LIMIT 1`,
+      )
+      .get(messageId) as unknown as ToolResultOffloadRow | undefined;
+    return row ? toToolResultOffloadRecord(row) : null;
+  }
+
+  async getToolResultOffloadByIdentity(params: {
+    conversationId: number;
+    toolCallId: string;
+    messageTimestamp: number;
+  }): Promise<ToolResultOffloadRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT offload_id, conversation_id, session_id, message_id, transcript_entry_id,
+                file_id, tool_call_id, tool_name, message_timestamp, original_char_count,
+                original_byte_size, preview_text, replacement_message_json, rewrite_state,
+                rewrite_attempts, last_error, rewritten_at, created_at
+         FROM tool_result_offloads
+         WHERE conversation_id = ?
+           AND tool_call_id = ?
+           AND message_timestamp = ?
+         LIMIT 1`,
+      )
+      .get(
+        params.conversationId,
+        params.toolCallId,
+        params.messageTimestamp,
+      ) as unknown as ToolResultOffloadRow | undefined;
+    return row ? toToolResultOffloadRecord(row) : null;
+  }
+
+  async attachToolResultOffloadMessageId(offloadId: number, messageId: number): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE tool_result_offloads
+         SET message_id = ?
+         WHERE offload_id = ?`,
+      )
+      .run(messageId, offloadId);
+  }
+
+  async markToolResultOffloadRewritten(offloadId: number, transcriptEntryId: string): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE tool_result_offloads
+         SET rewrite_state = 'rewritten',
+             transcript_entry_id = ?,
+             rewrite_attempts = rewrite_attempts + 1,
+             last_error = NULL,
+             rewritten_at = datetime('now')
+         WHERE offload_id = ?`,
+      )
+      .run(transcriptEntryId, offloadId);
+  }
+
+  async markToolResultOffloadFailed(offloadId: number, error: string): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE tool_result_offloads
+         SET rewrite_state = 'failed',
+             rewrite_attempts = rewrite_attempts + 1,
+             last_error = ?,
+             rewritten_at = NULL
+         WHERE offload_id = ?`,
+      )
+      .run(error, offloadId);
   }
 }

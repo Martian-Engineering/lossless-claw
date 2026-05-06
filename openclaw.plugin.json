@@ -1,5 +1,8 @@
 {
   "id": "lossless-claw",
+  "activation": {
+    "onStartup": true
+  },
   "uiHints": {
     "contextThreshold": {
       "label": "Context Threshold",
@@ -16,6 +19,18 @@
     "dbPath": {
       "label": "Database Path",
       "help": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
+    },
+    "toolResultPersistEnabled": {
+      "label": "Persist Tool Results",
+      "help": "Store oversized tool results out of the main transcript and replace them with deterministic previews"
+    },
+    "toolResultPersistThresholdChars": {
+      "label": "Tool Result Persist Threshold",
+      "help": "Character count above which tool results are offloaded into LCM storage"
+    },
+    "toolResultPreviewChars": {
+      "label": "Tool Result Preview Chars",
+      "help": "Maximum character budget for deterministic tool-result previews"
     },
     "summaryModel": {
       "label": "Summary Model",
@@ -64,6 +79,17 @@
       "largeFileThresholdTokens": {
         "type": "integer",
         "minimum": 1000
+      },
+      "toolResultPersistEnabled": {
+        "type": "boolean"
+      },
+      "toolResultPersistThresholdChars": {
+        "type": "integer",
+        "minimum": 1000
+      },
+      "toolResultPreviewChars": {
+        "type": "integer",
+        "minimum": 128
       },
       "summaryModel": {
         "type": "string"

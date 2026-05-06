@@ -15,6 +15,9 @@ export type LcmConfig = {
   condensedTargetTokens: number;
   maxExpandTokens: number;
   largeFileTokenThreshold: number;
+  toolResultPersistEnabled: boolean;
+  toolResultPersistThresholdChars: number;
+  toolResultPreviewChars: number;
   /** Provider override for large-file text summarization. */
   largeFileSummaryProvider: string;
   /** Model override for large-file text summarization. */
@@ -110,6 +113,22 @@ export function resolveLcmConfig(
         ?? toNumber(pc.largeFileThresholdTokens)
         ?? toNumber(pc.largeFileTokenThreshold)
         ?? 25000,
+    toolResultPersistEnabled:
+      env.LCM_TOOL_RESULT_PERSIST_ENABLED !== undefined
+        ? env.LCM_TOOL_RESULT_PERSIST_ENABLED === "true"
+        : toBool(pc.toolResultPersistEnabled) ?? true,
+    toolResultPersistThresholdChars:
+      (env.LCM_TOOL_RESULT_PERSIST_THRESHOLD_CHARS !== undefined
+        ? parseInt(env.LCM_TOOL_RESULT_PERSIST_THRESHOLD_CHARS, 10)
+        : undefined)
+        ?? toNumber(pc.toolResultPersistThresholdChars)
+        ?? 8000,
+    toolResultPreviewChars:
+      (env.LCM_TOOL_RESULT_PREVIEW_CHARS !== undefined
+        ? parseInt(env.LCM_TOOL_RESULT_PREVIEW_CHARS, 10)
+        : undefined)
+        ?? toNumber(pc.toolResultPreviewChars)
+        ?? 1800,
     largeFileSummaryProvider:
       env.LCM_LARGE_FILE_SUMMARY_PROVIDER?.trim() ?? toStr(pc.largeFileSummaryProvider) ?? "",
     largeFileSummaryModel:

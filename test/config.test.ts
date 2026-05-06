@@ -12,6 +12,9 @@ describe("resolveLcmConfig", () => {
     expect(config.leafMinFanout).toBe(8);
     expect(config.condensedMinFanout).toBe(4);
     expect(config.condensedMinFanoutHard).toBe(2);
+    expect(config.toolResultPersistEnabled).toBe(true);
+    expect(config.toolResultPersistThresholdChars).toBe(8000);
+    expect(config.toolResultPreviewChars).toBe(1800);
     expect(config.autocompactDisabled).toBe(false);
     expect(config.pruneHeartbeatOk).toBe(false);
   });
@@ -23,6 +26,9 @@ describe("resolveLcmConfig", () => {
       incrementalMaxDepth: -1,
       leafMinFanout: 4,
       condensedMinFanout: 2,
+      toolResultPersistEnabled: false,
+      toolResultPersistThresholdChars: 12000,
+      toolResultPreviewChars: 900,
       autocompactDisabled: true,
       pruneHeartbeatOk: true,
       enabled: false,
@@ -33,6 +39,9 @@ describe("resolveLcmConfig", () => {
     expect(config.incrementalMaxDepth).toBe(-1);
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
+    expect(config.toolResultPersistEnabled).toBe(false);
+    expect(config.toolResultPersistThresholdChars).toBe(12000);
+    expect(config.toolResultPreviewChars).toBe(900);
     expect(config.autocompactDisabled).toBe(true);
     expect(config.pruneHeartbeatOk).toBe(true);
   });
@@ -44,6 +53,9 @@ describe("resolveLcmConfig", () => {
       LCM_INCREMENTAL_MAX_DEPTH: "3",
       LCM_ENABLED: "false",
       LCM_AUTOCOMPACT_DISABLED: "true",
+      LCM_TOOL_RESULT_PERSIST_ENABLED: "false",
+      LCM_TOOL_RESULT_PERSIST_THRESHOLD_CHARS: "16000",
+      LCM_TOOL_RESULT_PREVIEW_CHARS: "512",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
@@ -51,6 +63,9 @@ describe("resolveLcmConfig", () => {
       incrementalMaxDepth: -1,
       enabled: true,
       autocompactDisabled: false,
+      toolResultPersistEnabled: true,
+      toolResultPersistThresholdChars: 12000,
+      toolResultPreviewChars: 900,
     };
     const config = resolveLcmConfig(env, pluginConfig);
     expect(config.enabled).toBe(false); // env wins
@@ -58,6 +73,9 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
     expect(config.autocompactDisabled).toBe(true); // env wins
+    expect(config.toolResultPersistEnabled).toBe(false); // env wins
+    expect(config.toolResultPersistThresholdChars).toBe(16000); // env wins
+    expect(config.toolResultPreviewChars).toBe(512); // env wins
   });
 
   it("plugin config fills gaps when env vars are absent", () => {
@@ -123,6 +141,17 @@ describe("resolveLcmConfig", () => {
       largeFileThresholdTokens: 12345,
     });
     expect(config.largeFileTokenThreshold).toBe(12345);
+  });
+
+  it("accepts tool-result persistence settings from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      toolResultPersistEnabled: false,
+      toolResultPersistThresholdChars: 12_345,
+      toolResultPreviewChars: 777,
+    });
+    expect(config.toolResultPersistEnabled).toBe(false);
+    expect(config.toolResultPersistThresholdChars).toBe(12_345);
+    expect(config.toolResultPreviewChars).toBe(777);
   });
 
   it("ships a manifest that accepts unlimited incremental depth", () => {

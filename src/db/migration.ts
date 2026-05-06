@@ -473,6 +473,28 @@ export function runLcmMigrations(
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS tool_result_offloads (
+      offload_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      message_id INTEGER REFERENCES messages(message_id) ON DELETE SET NULL,
+      transcript_entry_id TEXT,
+      file_id TEXT NOT NULL REFERENCES large_files(file_id) ON DELETE RESTRICT,
+      tool_call_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      message_timestamp INTEGER NOT NULL,
+      original_char_count INTEGER NOT NULL,
+      original_byte_size INTEGER NOT NULL,
+      preview_text TEXT NOT NULL,
+      replacement_message_json TEXT NOT NULL,
+      rewrite_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (rewrite_state IN ('pending', 'rewritten', 'failed')),
+      rewrite_attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      rewritten_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
@@ -480,6 +502,10 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type);
     CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal);
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
+    CREATE INDEX IF NOT EXISTS tool_result_offloads_session_state_idx
+      ON tool_result_offloads (session_id, rewrite_state, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS tool_result_offloads_identity_idx
+      ON tool_result_offloads (conversation_id, tool_call_id, message_timestamp);
   `);
 
   // Forward-compatible conversations migration for existing DBs.
