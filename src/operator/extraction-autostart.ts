@@ -14,8 +14,9 @@
  *     extraction works)
  *
  * Cadence: every 60s by default. Each tick processes up to 50 queue
- * items (perTickLimit=50). Cost per item: 1 small LLM call to
- * claude-haiku-4-5 (~$0.0001 each, ~$0.005 per tick).
+ * items (perTickLimit=50). Cost per item: 1 small LLM call (the model
+ * is whatever `LCM_SUMMARY_MODEL` env / per-prompt model_recommendation
+ * resolves to; default `gpt-5.4-mini` ~$0.0001 each, ~$0.005 per tick).
  *
  * Auto-stop conditions (same as backfill):
  *   - 3 consecutive idle ticks (queue empty) → pause until next interval

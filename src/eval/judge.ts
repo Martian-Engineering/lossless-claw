@@ -57,7 +57,7 @@ export interface JudgeCall {
 }
 
 /** A judge entry in the ensemble. `judgeId` is opaque (typically the
- *  model family name, e.g. 'claude-opus-4-7' or 'gpt-5-mini'). */
+ *  model family name, e.g. 'gpt-5.4-mini' or 'claude-opus-4-7'). */
 export interface JudgeEntry {
   judgeId: string;
   call: JudgeCall;
