@@ -75,6 +75,11 @@ const DESTRUCTIVE_OPERATOR_CASES: Array<[string, string]> = [
   // tables AND may cost Voyage tokens in hybrid mode. Was previously classified
   // as READ_ONLY in Wave-9 but reviewer correctly challenged that.
   ["eval", "eval --baseline"],
+  // Wave-12 reviewer P1 fix: doctor_cleaners read-only path leaked
+  // session_keys + first-message previews to non-owner. Now gates the
+  // whole case (was gating only --apply). Sample uses bare `doctor clean`
+  // (no --apply) to assert gate fires on the read-only path too.
+  ["doctor_cleaners", "doctor clean"],
 ];
 
 // Wave-11 reviewer P1: doctor + doctor_cleaners are READ_ONLY at the
@@ -99,9 +104,14 @@ const READ_ONLY_OPERATOR_CASES: ReadonlySet<string> = new Set([
   "health",
   "worker_status",
   "doctor",
-  "doctor_cleaners",
+  // NOTE: doctor_cleaners moved to DESTRUCTIVE_OPERATOR_CASES in Wave-12
+  // because both read-only and apply paths leak session metadata.
   "reconcile_session_keys_list",
-  "eval",
+  // NOTE: `eval` was previously in this set AND in DESTRUCTIVE_OPERATOR_CASES.
+  // Wave-10 reviewer correctly classified it as destructive (mutates eval
+  // tables + costs Voyage tokens). The set-union check at "every case is
+  // classified" silently accepted the duplicate. Removed from read-only here;
+  // a new invariant below catches future double-classification.
   // backup creates a .bak file (no DB mutation, low-risk; left ungated
   // intentionally — operator can take a snapshot anytime).
   "backup",
@@ -221,6 +231,17 @@ describe("authorization invariants", () => {
     expect(declaredCases.length).toBeGreaterThan(0);
   });
 
+  it("INVARIANT: no case is classified as both destructive and read-only", () => {
+    // Set-union in the previous test silently accepts a case that appears
+    // in both sets — e.g., Wave-10 reviewer caught `eval` in both lists.
+    // This invariant fails loudly so the duplicate is impossible to miss.
+    const destructiveNames = new Set(DESTRUCTIVE_OPERATOR_CASES.map(([n]) => n));
+    const dupes = [...READ_ONLY_OPERATOR_CASES].filter((n) => destructiveNames.has(n));
+    expect(dupes, `cases classified BOTH destructive and read-only: ${dupes.join(", ")}`).toEqual(
+      [],
+    );
+  });
+
   it("INVARIANT: every destructive case rejects non-owner sender", async () => {
     // This is the test that would have caught Wave-9 P0 the moment
     // Wave-7 introduced the asymmetry. For each destructive case,
@@ -290,9 +311,22 @@ describe("authorization invariants", () => {
     expect(text).not.toMatch(/operator-only/i);
   });
 
-  it("INVARIANT: /lcm doctor clean (read-only, no --apply) is NOT gated", async () => {
+  it("INVARIANT: /lcm doctor clean (read-only, no --apply) IS gated for non-owner (Wave-12 reviewer P1)", async () => {
+    // Was previously read-only-open. Reviewer found it leaks session_keys
+    // + first-message previews across the global conversation set; now
+    // both read and apply paths require senderIsOwner.
     const command = createCommandFixture();
     const ctx = createCommandContext("doctor clean", false);
+    const result = await command.handler(ctx);
+    const text = (result as { text: string }).text;
+    expect(text).toMatch(/operator-only/i);
+    expect(text).toMatch(/owner privileges/i);
+  });
+
+  it("INVARIANT: /lcm doctor clean (read-only) returns clean output for owner", async () => {
+    // Sanity check: owner is NOT gated — the read path runs normally.
+    const command = createCommandFixture();
+    const ctx = createCommandContext("doctor clean", true);
     const result = await command.handler(ctx);
     const text = (result as { text: string }).text;
     expect(text).not.toMatch(/operator-only/i);
