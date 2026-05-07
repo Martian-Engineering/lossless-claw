@@ -132,12 +132,14 @@ export function createLcmExpandTool(input: {
     name: "lcm_expand",
     label: "LCM Expand",
     description:
-      "Expand compacted conversation summaries from LCM (Lossless Context Management). " +
-      "Traverses the summary DAG to retrieve children and source messages. " +
-      "Use this to drill into previously-compacted context when you need detail " +
-      "that was summarised away. Provide either summaryIds (direct expansion) or " +
-      "query (grep-first, then expand top matches). Returns a compact text payload " +
-      "plus cited IDs in tool output for follow-up.",
+      "SUB-AGENT ONLY. Main-agent sessions get a runtime error if they invoke " +
+      "this tool — instead, main agents should use lcm_describe with " +
+      "expandChildren/expandMessages flags (one-hop drilldown), or " +
+      "lcm_expand_query (delegated multi-hop drilldown that spawns a sub-agent). " +
+      "When called from a sub-agent: expands the LCM summary DAG to retrieve " +
+      "children and source messages. Provide summaryIds (direct expansion) or " +
+      "query (grep-first, then expand top matches). Returns a compact text " +
+      "payload plus cited IDs for follow-up.",
     parameters: LcmExpandSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());

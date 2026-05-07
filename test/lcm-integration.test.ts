@@ -90,6 +90,7 @@ function createMockConversationStore() {
           content: input.content,
           tokenCount: input.tokenCount,
           createdAt: new Date(),
+          largeContent: null,
         };
         messages.push(msg);
         return msg;

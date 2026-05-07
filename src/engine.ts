@@ -2230,8 +2230,15 @@ export class LcmContextEngine implements ContextEngine {
     return identifiers.some((identifier) =>
       identifier.includes("anthropic")
       || identifier.includes("claude")
-      || identifier.includes("openai-codex")
+      // Wave-13 follow-up: OpenAI Platform's prompt caching has been live
+      // since Oct 2024 (https://platform.openai.com/docs/guides/prompt-caching).
+      // Plain `openai` provider + gpt-* model strings ARE cache-mutation-
+      // sensitive — without these matches the gate silently disabled cache-
+      // aware deferral for plain-openai operators, causing 4× input cost
+      // on every threshold compaction.
+      || identifier.includes("openai")  // covers openai, openai-codex, openai-resp
       || identifier.includes("openai_codex")
+      || identifier.includes("gpt-")    // model-name match for cases where provider is unset
       || identifier.includes("github-copilot")
       || identifier.includes("github_copilot")
       || identifier.includes("codex-cli")
@@ -6047,31 +6054,46 @@ export class LcmContextEngine implements ContextEngine {
       stored = rawPayloadIntercepted.stored;
     }
 
-    // Determine next sequence number
-    const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
-    const seq = maxSeq + 1;
+    // Wave-4 Auditor #18 P0 fix: wrap the three-write ingest path in a
+    // single SQLite transaction. Previously these ran as separate ops:
+    //   1. getMaxSeq + createMessage
+    //   2. createMessageParts
+    //   3. appendContextMessage
+    // Failure modes if any one threw mid-sequence:
+    //   - createMessageParts throws after createMessage → orphan message
+    //     row with no parts → assembler emits malformed turn.
+    //   - appendContextMessage throws after the first two → message
+    //     persisted but invisible to assembler → permanent context gap.
+    //   - Concurrent ingest race: two callers both read seq=N, both INSERT
+    //     seq=N+1 → UNIQUE conflict, second caller's exception bubbles up
+    //     after partial writes were already committed.
+    // BEGIN IMMEDIATE locks SQLite for write so seq computation + message
+    // INSERT happen atomically; any throw rolls back the whole sequence.
+    return await this.conversationStore.withTransaction(async () => {
+      const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
+      const seq = maxSeq + 1;
 
-    // Persist the message
-    const msgRecord = await this.conversationStore.createMessage({
-      conversationId,
-      seq,
-      role: stored.role,
-      content: stored.content,
-      tokenCount: stored.tokenCount,
+      const msgRecord = await this.conversationStore.createMessage({
+        conversationId,
+        seq,
+        role: stored.role,
+        content: stored.content,
+        tokenCount: stored.tokenCount,
+      });
+      await this.conversationStore.createMessageParts(
+        msgRecord.messageId,
+        buildMessageParts({
+          sessionId,
+          message: messageForParts,
+          fallbackContent: stored.content,
+        }),
+      );
+
+      // Append to context items so assembler can see it
+      await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
+
+      return { ingested: true };
     });
-    await this.conversationStore.createMessageParts(
-      msgRecord.messageId,
-      buildMessageParts({
-        sessionId,
-        message: messageForParts,
-        fallbackContent: stored.content,
-      }),
-    );
-
-    // Append to context items so assembler can see it
-    await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
-
-    return { ingested: true };
   }
 
   async ingest(params: {
@@ -6595,14 +6617,64 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (deferredCompactionDrain) {
-      this.scheduleDeferredCompactionDebtDrain({
-        conversationId: conversation.conversationId,
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        tokenBudget: deferredCompactionDrain.tokenBudget,
+      // Wave-14: at CRITICAL pressure (>= criticalBudgetPressureRatio,
+      // default 0.70), the deferred drain must run SYNCHRONOUSLY before
+      // the next assemble() so the LLM call sees the compacted view.
+      // Without this, the cache-hot deferred-drain race lets context
+      // overflow into openclaw's emergency truncation path
+      // (run.ts:1743) — LOSSY tool-result truncation that breaks the
+      // lossless guarantee. Sync at critical pressure preserves the
+      // promise; deferred-async behavior remains the default below
+      // critical to protect prompt cache.
+      const isCritical = this.isUnderCriticalBudgetPressure({
         currentTokenCount: deferredCompactionDrain.currentTokenCount,
-        reason: deferredCompactionDrain.reason,
+        tokenBudget: deferredCompactionDrain.tokenBudget,
       });
+      if (isCritical) {
+        // SYNC drain — block until done. Caller sees afterTurn complete only
+        // after compaction lands, so subsequent assemble() reads the
+        // compacted state from DB.
+        try {
+          await this.drainDeferredCompactionDebtIfIdle({
+            conversationId: conversation.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            tokenBudget: deferredCompactionDrain.tokenBudget,
+            currentTokenCount: deferredCompactionDrain.currentTokenCount,
+            reason: deferredCompactionDrain.reason,
+            queueKey: this.resolveSessionQueueKey(
+              params.sessionId,
+              params.sessionKey,
+            ),
+          });
+          this.deps.log.info(
+            `[lcm] afterTurn: critical-pressure synchronous drain ran conversation=${conversation.conversationId} ${sessionLabel} ratio=${(deferredCompactionDrain.currentTokenCount / deferredCompactionDrain.tokenBudget).toFixed(2)}`,
+          );
+        } catch (err) {
+          this.deps.log.warn(
+            `[lcm] afterTurn: critical-pressure sync drain failed conversation=${conversation.conversationId}: ${describeLogError(err)} — falling back to async drain`,
+          );
+          this.scheduleDeferredCompactionDebtDrain({
+            conversationId: conversation.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            tokenBudget: deferredCompactionDrain.tokenBudget,
+            currentTokenCount: deferredCompactionDrain.currentTokenCount,
+            reason: deferredCompactionDrain.reason,
+          });
+        }
+      } else {
+        // Below critical pressure → async drain (preserves cache-aware
+        // throttling behavior unchanged from before Wave-14).
+        this.scheduleDeferredCompactionDebtDrain({
+          conversationId: conversation.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget: deferredCompactionDrain.tokenBudget,
+          currentTokenCount: deferredCompactionDrain.currentTokenCount,
+          reason: deferredCompactionDrain.reason,
+        });
+      }
     }
 
     this.deps.log.info(
@@ -6716,6 +6788,11 @@ export class LcmContextEngine implements ContextEngine {
         promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
         orphanStrippingOrdinal: stableOrphanStrippingOrdinal,
+        // v4.2 §B — gated by config.stubLargeToolPayloads (default false).
+        // Off-by-default so v4.1 behavior is preserved until the migration
+        // tool has populated `messages.large_content` for the running DB.
+        stubLargeToolPayloads:
+          (this.config as { stubLargeToolPayloads?: boolean }).stubLargeToolPayloads === true,
       });
       if (cacheAwareState === "hot") {
         this.setStableOrphanStrippingOrdinal(
@@ -7054,6 +7131,98 @@ export class LcmContextEngine implements ContextEngine {
         });
       },
     );
+  }
+
+  /**
+   * Public read-only gate state for the agent-triggered `lcm_compact` tool.
+   *
+   * Returns whether compaction is currently allowed AND a structured
+   * refusal reason if not. The tool consults this BEFORE calling
+   * `compact()` so the agent gets a fast, structured reason without
+   * incurring an LLM call when the gate refuses.
+   *
+   * Gates checked (in order — first refusal wins):
+   *   1. ownsCompaction — engine migration succeeded at boot
+   *   2. below-floor    — currentTokens / tokenBudget &lt; reserveFraction
+   *
+   * **DELIBERATELY NOT GATED**: prompt cache hot/cold state. The agent
+   * calling `lcm_compact` is making a CONSCIOUS trade ("pay the 4× cache
+   * cost vs. fail with context_length_exceeded"). The cache-hot gate
+   * exists in `shouldDelayPromptMutatingDeferredCompaction` for the
+   * AUTOMATIC threshold-drain path (where the system has no agent
+   * awareness) — applying it here would create a paradox: the cache is
+   * hot precisely because the agent is actively using tools, which is
+   * the exact moment it needs to compact.
+   *
+   * NOT checked here (engine-side concerns deferred to compact() itself):
+   *   - Auth circuit breaker — surfaces inside compact()'s reason
+   *   - Session inclusion / stateless — surfaces inside compact()'s reason
+   */
+  async getAgentCompactionGateState(params: {
+    sessionId: string;
+    sessionKey?: string;
+    currentTokenCount?: number;
+    tokenBudget?: number;
+    /** Lower bound on (currentTokens / tokenBudget) before compaction is allowed. Default 0.5. */
+    reserveFraction?: number;
+  }): Promise<{
+    ownsCompaction: boolean;
+    belowFloor: boolean;
+    shouldRefuse: boolean;
+    refusalReason?: "engine-unhealthy" | "below-floor";
+    refusalNote?: string;
+    /** Echo back for diagnostics. */
+    contextRatio?: number;
+  }> {
+    const ownsCompaction = this.info.ownsCompaction === true;
+    if (!ownsCompaction) {
+      return {
+        ownsCompaction: false,
+        belowFloor: false,
+        shouldRefuse: true,
+        refusalReason: "engine-unhealthy",
+        refusalNote:
+          "LCM engine migration did not complete at boot — compaction unavailable until the gateway restarts cleanly.",
+      };
+    }
+
+    const reserveFraction = (() => {
+      const r = params.reserveFraction;
+      if (typeof r !== "number" || !Number.isFinite(r)) return 0.5;
+      return Math.max(0.5, Math.min(1.0, r));  // clamp [0.5, 1.0]
+    })();
+
+    // Floor check: only meaningful if both numbers are present.
+    const haveBudget =
+      typeof params.tokenBudget === "number"
+      && Number.isFinite(params.tokenBudget)
+      && params.tokenBudget > 0;
+    const haveCurrent =
+      typeof params.currentTokenCount === "number"
+      && Number.isFinite(params.currentTokenCount)
+      && params.currentTokenCount >= 0;
+    const contextRatio = haveBudget && haveCurrent
+      ? (params.currentTokenCount! / params.tokenBudget!)
+      : undefined;
+    const belowFloor =
+      contextRatio !== undefined && contextRatio < reserveFraction;
+    if (belowFloor) {
+      return {
+        ownsCompaction: true,
+        belowFloor: true,
+        shouldRefuse: true,
+        refusalReason: "below-floor",
+        refusalNote: `Context is at ${(contextRatio! * 100).toFixed(1)}% of budget — below the ${(reserveFraction * 100).toFixed(0)}% floor. No need to compact yet; chained tool calls have headroom.`,
+        contextRatio,
+      };
+    }
+
+    return {
+      ownsCompaction: true,
+      belowFloor: false,
+      shouldRefuse: false,
+      contextRatio,
+    };
   }
 
   async compact(params: {
@@ -8442,6 +8611,17 @@ export class LcmContextEngine implements ContextEngine {
 
   getRetrieval(): RetrievalEngine {
     return this.retrieval;
+  }
+
+  /**
+   * Expose the active SQLite connection for v4.1 retrieval surfaces
+   * (lcm_semantic_recall, lcm_grep hybrid mode) that need to call
+   * `runSemanticSearch` / `runHybridSearch` directly. Tools should treat
+   * the returned handle as read-mostly; long-running writes should still
+   * route through the appropriate store helper.
+   */
+  getDb(): DatabaseSync {
+    return this.db;
   }
 
   getConversationStore(): ConversationStore {

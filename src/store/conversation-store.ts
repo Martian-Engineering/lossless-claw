@@ -43,6 +43,14 @@ export type MessageRecord = {
   content: string;
   tokenCount: number;
   createdAt: Date;
+  /**
+   * v4.2 §B — non-null when the row has been stratified into a stubbable
+   * payload (large_content) plus a thread-metadata tier (content).
+   * Readers that always want the full payload should
+   * `coalesce(largeContent, content)`. Stub-emitting code in the
+   * assembler reads `largeContent != null` as the "stubbable" flag.
+   */
+  largeContent: string | null;
 };
 
 export type CreateMessagePartInput = {
@@ -133,6 +141,9 @@ interface MessageRow {
   content: string;
   token_count: number;
   created_at: string;
+  // v4.2 §B — sidecar payload column. Optional in row shape because not
+  // every SELECT projects it; mappers tolerate undefined → null.
+  large_content?: string | null;
 }
 
 interface MessageSearchRow {
@@ -191,6 +202,7 @@ function toMessageRecord(row: MessageRow): MessageRecord {
     content: row.content,
     tokenCount: row.token_count,
     createdAt: parseUtcTimestamp(row.created_at),
+    largeContent: row.large_content ?? null,
   };
 }
 
@@ -532,7 +544,7 @@ export class ConversationStore {
 
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow;
@@ -549,7 +561,7 @@ export class ConversationStore {
        VALUES (?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
-      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages WHERE message_id = ?`,
     );
 
@@ -583,7 +595,7 @@ export class ConversationStore {
     if (limit != null) {
       const rows = this.db
         .prepare(
-          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
          FROM messages
          WHERE conversation_id = ? AND seq > ?
          ORDER BY seq
@@ -595,7 +607,7 @@ export class ConversationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages
        WHERE conversation_id = ? AND seq > ?
        ORDER BY seq`,
@@ -607,7 +619,7 @@ export class ConversationStore {
   async getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -653,11 +665,22 @@ export class ConversationStore {
     return row?.count ?? 0;
   }
 
-  async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
+  async getMessageById(
+    messageId: MessageId,
+    opts: { includeSuppressed?: boolean } = {},
+  ): Promise<MessageRecord | null> {
+    // v4.1 Final.review.3 fix (Loop 2 Leak 2.1+2.2 BLOCKER):
+    // assembler.resolveMessageItem + retrieval.expandRecursive + compaction.leafPass
+    // all called this without filtering suppressed_at. After an operator suppress,
+    // the assembler hot path was re-emitting suppressed message content to the
+    // agent prompt. The §10 invariant requires every agent-facing read path to
+    // filter suppressed_at IS NULL by default; internal callers (integrity,
+    // compaction, doctor) opt-in via includeSuppressed=true.
+    const suppressedClause = opts.includeSuppressed ? "" : " AND suppressed_at IS NULL";
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
-       FROM messages WHERE message_id = ?`,
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+       FROM messages WHERE message_id = ?${suppressedClause}`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
     return row ? toMessageRecord(row) : null;
@@ -879,6 +902,8 @@ export class ConversationStore {
   ): MessageSearchResult[] {
     const where: string[] = ["messages_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
+    // v4.1 Final.review P1 #2: filter suppressed messages.
+    where.push("m.suppressed_at IS NULL");
     appendConversationScopeConstraint({
       where,
       args,
@@ -928,6 +953,8 @@ export class ConversationStore {
 
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
+    // v4.1 Final.review P1 #2: filter suppressed messages (LIKE path).
+    where.push("suppressed_at IS NULL");
     appendConversationScopeConstraint({
       where,
       args,
@@ -948,7 +975,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC
@@ -996,7 +1023,7 @@ export class ConversationStore {
       return [];
     }
 
-    const where: string[] = [];
+    const where: string[] = ["suppressed_at IS NULL"]; // v4.1 Final.review P1 #2
     const args: Array<string | number> = [];
     appendConversationScopeConstraint({
       where,
@@ -1014,14 +1041,22 @@ export class ConversationStore {
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    // Wave-8 Auditor #7-12 P1 fix: bound the SQL scan. Previously the
+    // SELECT had no LIMIT and JS-side MAX_ROW_SCAN=10K was the only
+    // brake — meaning the whole `messages` table (potentially millions
+    // of rows × content blobs) materialized into Node memory before the
+    // JS scan fires. Mirror the summary-store fix from W8 R1: bind a
+    // SQL LIMIT at the JS scan ceiling.
+    const SQL_SCAN_BOUND = 10_000;
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
          FROM messages
          ${whereClause}
-         ORDER BY created_at DESC`,
+         ORDER BY created_at DESC
+         LIMIT ?`,
       )
-      .all(...args) as unknown as MessageRow[];
+      .all(...args, SQL_SCAN_BOUND) as unknown as MessageRow[];
 
     const MAX_ROW_SCAN = 10_000;
     const results: MessageSearchResult[] = [];

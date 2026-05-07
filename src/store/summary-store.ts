@@ -408,6 +408,13 @@ export class SummaryStore {
           ? 0
           : 1;
 
+    // v4.1 Gap 8 (Group A adversarial review): atomically populate
+    // session_key from conversations.session_key via sub-SELECT. Closes
+    // the gap where new summaries inserted between gateway boots had
+    // session_key='' until the next boot's JOIN-backfill step ran.
+    // The COALESCE protects against a (theoretically impossible) case
+    // where conversations.session_key is NULL — in that case the row
+    // would be backfilled by the migration on next boot.
     this.db
       .prepare(
         `INSERT INTO summaries (
@@ -423,9 +430,11 @@ export class SummaryStore {
           descendant_count,
           descendant_token_count,
           source_message_token_count,
-          model
+          model,
+          session_key
         )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+               COALESCE((SELECT session_key FROM conversations WHERE conversation_id = ?), ''))`,
       )
       .run(
         input.summaryId,
@@ -441,6 +450,7 @@ export class SummaryStore {
         descendantTokenCount,
         sourceMessageTokenCount,
         input.model ?? "unknown",
+        input.conversationId,
       );
 
     const row = this.db
@@ -451,6 +461,31 @@ export class SummaryStore {
        FROM summaries WHERE summary_id = ?`,
       )
       .get(input.summaryId) as unknown as SummaryRow;
+
+    // v4.1 §0/§6.1 — Leaf-write hook: enqueue async entity coreference
+    // extraction. NEVER inline (would couple gateway hot path to LLM
+    // latency, per the v3.1 invariant). Just inserts a queue row so the
+    // worker (Group F orchestrator) can pick it up later. Best-effort —
+    // if lcm_extraction_queue doesn't exist (pre-migration) or the
+    // insert fails, leaf-write still succeeds.
+    //
+    // MUST run BEFORE the FTS-availability early-return so FTS-disabled
+    // installs (or in-memory test DBs) still get the queue write.
+    if (input.kind === "leaf") {
+      try {
+        const queueId = `q_${input.summaryId}_${Date.now().toString(36)}`;
+        this.db
+          .prepare(
+            `INSERT INTO lcm_extraction_queue (queue_id, leaf_id, kind, queued_at)
+             VALUES (?, ?, 'entity', datetime('now'))`,
+          )
+          .run(queueId, input.summaryId);
+      } catch {
+        // lcm_extraction_queue not present (pre-migration) OR queue_id
+        // collision (incredibly rare given the timestamp suffix). Either
+        // way: leaf-write must succeed regardless.
+      }
+    }
 
     // Index in FTS5 as best-effort; compaction flow must continue even if
     // FTS indexing fails for any reason.
@@ -481,13 +516,22 @@ export class SummaryStore {
     return toSummaryRecord(row);
   }
 
-  async getSummary(summaryId: string): Promise<SummaryRecord | null> {
+  async getSummary(
+    summaryId: string,
+    opts: { includeSuppressed?: boolean } = {},
+  ): Promise<SummaryRecord | null> {
+    // v4.1 §10 + Final adversarial Finding #1 (BLOCKER): exclude
+    // suppressed by default. Internal cleanup code (integrity.ts,
+    // compaction.ts internal paths) opts in to includeSuppressed=true
+    // when it legitimately needs to inspect suppressed rows. Agent-facing
+    // surfaces (retrieval.ts, assembler.ts) must NOT pass the flag.
+    const suppressedClause = opts.includeSuppressed ? "" : "AND suppressed_at IS NULL";
     const row = this.db
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
                 earliest_at, latest_at, descendant_count, created_at
                 , descendant_token_count, source_message_token_count, model
-       FROM summaries WHERE summary_id = ?`,
+       FROM summaries WHERE summary_id = ? ${suppressedClause}`,
       )
       .get(summaryId) as unknown as SummaryRow | undefined;
     return row ? toSummaryRecord(row) : null;
@@ -585,6 +629,12 @@ export class SummaryStore {
     }
 
     const placeholders = normalizedMessageIds.map(() => "?").join(", ");
+    // Wave-8 Auditor #1 P1 fix: was missing `s.suppressed_at IS NULL`.
+    // Caller is `lcm-expand-query-tool` (agent-facing) — without this
+    // filter, suppressed leaves leaked through expand-query results
+    // even after a /lcm purge. Other agent-facing read paths in this
+    // store all default to exclude-suppressed; this method was the
+    // outlier.
     const rows = this.db
       .prepare(
         `SELECT sm.message_id, sm.summary_id
@@ -592,6 +642,7 @@ export class SummaryStore {
          JOIN summaries s ON s.summary_id = sm.summary_id
          WHERE s.conversation_id = ?
            AND s.kind = 'leaf'
+           AND s.suppressed_at IS NULL
            AND sm.message_id IN (${placeholders})
          ORDER BY sm.ordinal ASC, s.created_at ASC`,
       )
@@ -682,7 +733,14 @@ export class SummaryStore {
 
     return candidates;
   }
-  async getSummaryChildren(parentSummaryId: string): Promise<SummaryRecord[]> {
+  // v4.1 §10 + Final review #1 fix: structural lineage methods exclude
+  // suppressed by default. Caller (integrity / compaction) opts in via
+  // includeSuppressed=true.
+  async getSummaryChildren(
+    parentSummaryId: string,
+    opts: { includeSuppressed?: boolean } = {},
+  ): Promise<SummaryRecord[]> {
+    const suppressedClause = opts.includeSuppressed ? "" : "AND s.suppressed_at IS NULL";
     const rows = this.db
       .prepare(
         `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
@@ -690,7 +748,7 @@ export class SummaryStore {
                 , s.descendant_token_count, s.source_message_token_count, s.model
        FROM summaries s
        JOIN summary_parents sp ON sp.summary_id = s.summary_id
-       WHERE sp.parent_summary_id = ?
+       WHERE sp.parent_summary_id = ? ${suppressedClause}
        ORDER BY sp.ordinal`,
       )
       .all(parentSummaryId) as unknown as SummaryRow[];
@@ -700,7 +758,11 @@ export class SummaryStore {
   // NOTE: historical naming is confusing here.
   // getSummaryParents(summaryId) returns the source summaries compacted into
   // `summaryId`. Expansion should use this direction for replay.
-  async getSummaryParents(summaryId: string): Promise<SummaryRecord[]> {
+  async getSummaryParents(
+    summaryId: string,
+    opts: { includeSuppressed?: boolean } = {},
+  ): Promise<SummaryRecord[]> {
+    const suppressedClause = opts.includeSuppressed ? "" : "AND s.suppressed_at IS NULL";
     const rows = this.db
       .prepare(
         `SELECT s.summary_id, s.conversation_id, s.kind, s.depth, s.content, s.token_count,
@@ -708,7 +770,7 @@ export class SummaryStore {
                 , s.descendant_token_count, s.source_message_token_count, s.model
        FROM summaries s
        JOIN summary_parents sp ON sp.parent_summary_id = s.summary_id
-       WHERE sp.summary_id = ?
+       WHERE sp.summary_id = ? ${suppressedClause}
        ORDER BY sp.ordinal`,
       )
       .all(summaryId) as unknown as SummaryRow[];
@@ -716,6 +778,13 @@ export class SummaryStore {
   }
 
   async getSummarySubtree(summaryId: string): Promise<SummarySubtreeNodeRecord[]> {
+    // Wave-4 Auditor #7 P1 fix: cap recursion to prevent runaway memory
+    // on pathological subtrees (deep condensation chains, doctor-recovered
+    // DBs with cycles, stress-test artifacts). 10K nodes is ~10× the
+    // largest realistic synthesis tree in Eva's actual DB; beyond that
+    // we truncate and the caller (lcm_describe) sees the truncation in
+    // the manifest length vs claimed descendant_count.
+    const SUBTREE_HARD_CAP = 10_000;
     const rows = this.db
       .prepare(
         `WITH RECURSIVE subtree(summary_id, parent_summary_id, depth_from_root, path) AS (
@@ -756,9 +825,11 @@ export class SummaryStore {
            ) AS child_count
          FROM subtree
          JOIN summaries s ON s.summary_id = subtree.summary_id
-         ORDER BY subtree.depth_from_root ASC, subtree.path ASC, s.created_at ASC`,
+         WHERE s.suppressed_at IS NULL
+         ORDER BY subtree.depth_from_root ASC, subtree.path ASC, s.created_at ASC
+         LIMIT ?`,
       )
-      .all(summaryId) as unknown as SummarySubtreeRow[];
+      .all(summaryId, SUBTREE_HARD_CAP) as unknown as SummarySubtreeRow[];
 
     const seen = new Set<string>();
     const output: SummarySubtreeNodeRecord[] = [];
@@ -1108,6 +1179,11 @@ export class SummaryStore {
   ): SummarySearchResult[] {
     const where: string[] = ["summaries_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
+    // v4.1 §10 invariant: every retrieval surface defaults to
+    // exclude-suppressed. lcm_grep / lcm_semantic_recall flow through
+    // here; operator/admin tools that need to see suppressed should
+    // bypass searchSummaries entirely.
+    where.push("s.suppressed_at IS NULL");
     appendConversationScopeConstraint({
       where,
       args,
@@ -1157,6 +1233,9 @@ export class SummaryStore {
 
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
+    // v4.1 §10 invariant: exclude suppressed by default (LIKE fallback
+    // for FTS — same surface from agent's POV).
+    where.push("suppressed_at IS NULL");
     appendConversationScopeConstraint({
       where,
       args,
@@ -1262,6 +1341,8 @@ export class SummaryStore {
 
     const where: string[] = ["summaries_fts_cjk MATCH ?"];
     const args: Array<string | number> = [cjkGroups.join(" AND ")];
+    // v4.1 §10 invariant: exclude suppressed (CJK FTS path).
+    where.push("s.suppressed_at IS NULL");
     for (const token of latinTokens) {
       where.push("LOWER(s.content) LIKE ? ESCAPE '\\'");
       args.push(`%${this.escapeLikeTerm(token)}%`);
@@ -1344,6 +1425,12 @@ export class SummaryStore {
     const latinArgs = latinTokens.map((token) => `%${this.escapeLikeTerm(token)}%`);
 
     const where: string[] = [...cjkClauses, ...latinClauses];
+    // v4.1 §10 invariant + Group C adversarial Finding #1: searchLikeCjk
+    // is the 5TH search code path; was missed in C.03's "4 paths" comment.
+    // CJK queries fall through to this path when trigram returns empty
+    // OR when CJK segments are <3 chars; without this filter, suppressed
+    // rows leak through CJK searches.
+    where.push("suppressed_at IS NULL");
     const args: Array<string | number> = [...cjkArgs, ...latinArgs];
     appendConversationScopeConstraint({
       where,
@@ -1381,7 +1468,12 @@ export class SummaryStore {
       conversationId: row.conversation_id,
       kind: row.kind,
       snippet: createFallbackSnippet(row.content, snippetTerms),
-      createdAt: new Date(row.created_at),
+      // Wave-7 Auditor #1 P1 fix: SQLite stores 'YYYY-MM-DD HH:MM:SS'
+      // (no Z), and `new Date(naive)` parses as LOCAL time. All other
+      // search paths use parseUtcTimestamp; this CJK fallback path was
+      // the outlier. Without this, CJK matches showed timestamps offset
+      // by the host's local timezone (8h for Asia/Shanghai, etc).
+      createdAt: parseUtcTimestamp(row.created_at),
       rank: 0,
     }));
   }
@@ -1405,7 +1497,7 @@ export class SummaryStore {
       return [];
     }
 
-    const where: string[] = [];
+    const where: string[] = ["suppressed_at IS NULL"]; // v4.1 §10
     const args: Array<string | number> = [];
     appendConversationScopeConstraint({
       where,
@@ -1423,6 +1515,12 @@ export class SummaryStore {
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    // Wave-8 Auditor #1 P1 fix: bound the SQL scan, don't materialize
+    // entire summaries table in JS before applying the row-scan cap.
+    // Bind a SQL LIMIT that's at least as large as the JS-side
+    // MAX_ROW_SCAN (10K), ensuring SQLite stops short instead of
+    // streaming N rows through the prepared statement.
+    const SQL_SCAN_BOUND = 10_000;
     const rows = this.db
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
@@ -1431,9 +1529,10 @@ export class SummaryStore {
                 ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} AS created_at
          FROM summaries
          ${whereClause}
-         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC`,
+         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC
+         LIMIT ?`,
       )
-      .all(...args) as unknown as SummaryRow[];
+      .all(...args, SQL_SCAN_BOUND) as unknown as SummaryRow[];
 
     const MAX_ROW_SCAN = 10_000;
     const results: SummarySearchResult[] = [];

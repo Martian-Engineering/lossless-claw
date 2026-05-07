@@ -25,6 +25,19 @@ export type SharedLcmInit = {
   waitForEngine: () => Promise<LcmContextEngine>;
   /** Async accessor for the initialized DB handle (waits for deferred init). */
   waitForDatabase: () => Promise<DatabaseSync>;
+  /**
+   * v4.1 Wire-2: backfill autostart handle. Set if autostart was started
+   * for this DB; null otherwise. Stopped by the gateway_stop handler.
+   * Also stored here so per-agent-context register() reuse doesn't
+   * accidentally start a second autostart loop on the same DB.
+   */
+  backfillAutostart?: { stop: () => void } | null;
+  /**
+   * v4.1 cycle-2: extraction autostart handle. Same lifecycle as
+   * backfillAutostart. Drains lcm_extraction_queue with an LLM-backed
+   * entity extractor.
+   */
+  extractionAutostart?: { stop: () => void } | null;
 };
 
 const SHARED_KEY = Symbol.for(

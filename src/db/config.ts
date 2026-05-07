@@ -94,7 +94,21 @@ export type LcmConfig = {
   freshTailCount: number;
   /** Optional token cap for the protected fresh tail; newest message is always preserved. */
   freshTailMaxTokens?: number;
-  /** When true, budget-constrained assembly may keep older items by prompt relevance instead of pure chronology. */
+  /**
+   * When true, budget-constrained assembly may keep older items by prompt
+   * relevance instead of pure chronology.
+   *
+   * WARNING — Wave-7 Auditor #18 P1: this flag introduces a RAG-style
+   * adaptive decision into the assemble() pyramid, which violates the
+   * v4.1 architecture invariant "pyramid is structural, NOT RAG-style
+   * adaptive (locked design)". Default `false` (chronological eviction
+   * preserves cache stability across turns). Enable only with full
+   * understanding that turn-to-turn assembly may differ for the same
+   * conversation, breaking deterministic replay + breaking the pyramid's
+   * structural-correctness contract. The flag is documented as opt-in
+   * and is preserved for backward compatibility with v3 callers; the
+   * v4.1 default is OFF and we recommend keeping it off.
+   */
   promptAwareEviction: boolean;
   newSessionRetainDepth: number;
   leafMinFanout: number;
@@ -130,6 +144,22 @@ export type LcmConfig = {
   pruneHeartbeatOk: boolean;
   /** When true, maintain() may rewrite transcript entries for transcript GC. */
   transcriptGcEnabled: boolean;
+  /**
+   * Operator opt-in for the agent-triggered `lcm_compact` tool.
+   *
+   * When false (default), agents calling `lcm_compact` get a structured
+   * "operator-disabled" response. The tool is always REGISTERED so the
+   * agent learns it exists and can recommend the operator enable it,
+   * rather than silently failing with "tool not found".
+   *
+   * When true, agents may proactively compact context mid-turn within
+   * the tool's safety gates (50% reserve floor, cache-hot deferral,
+   * 2-calls-per-5-min cap). See src/tools/lcm-compact-tool.ts.
+   *
+   * Set via env `LCM_AGENT_COMPACTION_TOOL_ENABLED=true` or plugin
+   * config field of the same name.
+   */
+  agentCompactionToolEnabled: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
   /** Automatically rotate LCM-managed session JSONL files that exceed a size ceiling. */
@@ -461,7 +491,9 @@ export function resolveLcmConfigWithDiagnostics(
       bootstrapMaxTokens: resolvedBootstrapMaxTokens,
       leafTargetTokens:
         parseFiniteInt(env.LCM_LEAF_TARGET_TOKENS)
-          ?? toNumber(pc.leafTargetTokens) ?? 2400,
+          // v4.1 (A.10): default raised from 2400 → 4000 to stop LLM-truncating
+          // dense leaves at the cap. See src/summarize.ts comment.
+          ?? toNumber(pc.leafTargetTokens) ?? 4000,
       condensedTargetTokens:
         parseFiniteInt(env.LCM_CONDENSED_TARGET_TOKENS)
           ?? toNumber(pc.condensedTargetTokens) ?? 2000,
@@ -498,6 +530,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
           ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"
           : toBool(pc.transcriptGcEnabled) ?? false,
+      agentCompactionToolEnabled:
+        env.LCM_AGENT_COMPACTION_TOOL_ENABLED !== undefined
+          ? env.LCM_AGENT_COMPACTION_TOOL_ENABLED === "true"
+          : toBool(pc.agentCompactionToolEnabled) ?? false,
       proactiveThresholdCompactionMode,
       autoRotateSessionFiles: {
         enabled:
