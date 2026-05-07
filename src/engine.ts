@@ -7040,6 +7040,140 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  /**
+   * Public read-only gate state for the agent-triggered `lcm_compact` tool.
+   *
+   * Returns whether compaction is currently allowed AND a structured
+   * refusal reason if not. The tool consults this BEFORE calling
+   * `compact()` so the agent gets a fast, structured reason without
+   * incurring an LLM call when the gate refuses.
+   *
+   * Gates checked (in order — first refusal wins):
+   *   1. ownsCompaction — engine migration succeeded at boot
+   *   2. below-floor    — currentTokens / tokenBudget &lt; reserveFraction
+   *   3. cache-hot      — prompt cache is hot for a mutation-sensitive
+   *                       provider (Anthropic / OpenAI / Codex / Copilot)
+   *
+   * NOT checked here (engine-side concerns deferred to compact() itself):
+   *   - Auth circuit breaker — surfaces inside compact()'s reason
+   *   - Session inclusion / stateless — surfaces inside compact()'s reason
+   */
+  async getAgentCompactionGateState(params: {
+    sessionId: string;
+    sessionKey?: string;
+    currentTokenCount?: number;
+    tokenBudget?: number;
+    /** Lower bound on (currentTokens / tokenBudget) before compaction is allowed. Default 0.5. */
+    reserveFraction?: number;
+  }): Promise<{
+    ownsCompaction: boolean;
+    belowFloor: boolean;
+    cacheHot: boolean;
+    shouldRefuse: boolean;
+    refusalReason?: "engine-unhealthy" | "below-floor" | "cache-hot";
+    refusalNote?: string;
+    /** Echo back for diagnostics. */
+    contextRatio?: number;
+  }> {
+    const ownsCompaction = this.info.ownsCompaction === true;
+    if (!ownsCompaction) {
+      return {
+        ownsCompaction: false,
+        belowFloor: false,
+        cacheHot: false,
+        shouldRefuse: true,
+        refusalReason: "engine-unhealthy",
+        refusalNote:
+          "LCM engine migration did not complete at boot — compaction unavailable until the gateway restarts cleanly.",
+      };
+    }
+
+    const reserveFraction = (() => {
+      const r = params.reserveFraction;
+      if (typeof r !== "number" || !Number.isFinite(r)) return 0.5;
+      return Math.max(0.5, Math.min(1.0, r));  // clamp [0.5, 1.0]
+    })();
+
+    // Floor check: only meaningful if both numbers are present.
+    const haveBudget =
+      typeof params.tokenBudget === "number"
+      && Number.isFinite(params.tokenBudget)
+      && params.tokenBudget > 0;
+    const haveCurrent =
+      typeof params.currentTokenCount === "number"
+      && Number.isFinite(params.currentTokenCount)
+      && params.currentTokenCount >= 0;
+    const contextRatio = haveBudget && haveCurrent
+      ? (params.currentTokenCount! / params.tokenBudget!)
+      : undefined;
+    const belowFloor =
+      contextRatio !== undefined && contextRatio < reserveFraction;
+    if (belowFloor) {
+      return {
+        ownsCompaction: true,
+        belowFloor: true,
+        cacheHot: false,
+        shouldRefuse: true,
+        refusalReason: "below-floor",
+        refusalNote: `Context is at ${(contextRatio! * 100).toFixed(1)}% of budget — below the ${(reserveFraction * 100).toFixed(0)}% floor. No need to compact yet; chained tool calls have headroom.`,
+        contextRatio,
+      };
+    }
+
+    // Cache-hot check: requires telemetry. If conversation isn't found
+    // (no prior turns), skip the check.
+    let cacheHot = false;
+    let cacheNote: string | undefined;
+    try {
+      const conversation = await this.conversationStore.getConversationForSession({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+      });
+      if (conversation) {
+        const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+          conversation.conversationId,
+        );
+        if (
+          this.shouldDelayPromptMutatingDeferredCompaction(
+            telemetry,
+            new Date(),
+            params.currentTokenCount,
+            params.tokenBudget,
+          )
+        ) {
+          cacheHot = true;
+          const ttlMs = this.resolvePromptCacheTtlMs(telemetry?.retention ?? null);
+          const cacheTtlSeconds = Math.round(ttlMs / 1000);
+          cacheNote =
+            `Prompt cache is hot for a mutation-sensitive provider (${telemetry?.provider ?? "unknown"}). Compacting now would invalidate the cache prefix (4× input cost). Retry after the cache cools (~${cacheTtlSeconds}s TTL) or set agentCompactionToolEnabled with force=true if you accept the cost.`;
+        }
+      }
+    } catch (e) {
+      // Telemetry lookup failure is non-fatal — fall through and let
+      // engine.compact() decide.
+      cacheHot = false;
+    }
+    if (cacheHot) {
+      return {
+        ownsCompaction: true,
+        belowFloor: false,
+        cacheHot: true,
+        shouldRefuse: true,
+        refusalReason: "cache-hot",
+        refusalNote: cacheNote,
+        contextRatio,
+      };
+    }
+
+    return {
+      ownsCompaction: true,
+      belowFloor: false,
+      cacheHot: false,
+      shouldRefuse: false,
+      contextRatio,
+    };
+  }
+
   async compact(params: {
     sessionId: string;
     sessionKey?: string;
