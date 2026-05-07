@@ -43,6 +43,14 @@ export type MessageRecord = {
   content: string;
   tokenCount: number;
   createdAt: Date;
+  /**
+   * v4.2 §B — non-null when the row has been stratified into a stubbable
+   * payload (large_content) plus a thread-metadata tier (content).
+   * Readers that always want the full payload should
+   * `coalesce(largeContent, content)`. Stub-emitting code in the
+   * assembler reads `largeContent != null` as the "stubbable" flag.
+   */
+  largeContent: string | null;
 };
 
 export type CreateMessagePartInput = {
@@ -133,6 +141,9 @@ interface MessageRow {
   content: string;
   token_count: number;
   created_at: string;
+  // v4.2 §B — sidecar payload column. Optional in row shape because not
+  // every SELECT projects it; mappers tolerate undefined → null.
+  large_content?: string | null;
 }
 
 interface MessageSearchRow {
@@ -191,6 +202,7 @@ function toMessageRecord(row: MessageRow): MessageRecord {
     content: row.content,
     tokenCount: row.token_count,
     createdAt: parseUtcTimestamp(row.created_at),
+    largeContent: row.large_content ?? null,
   };
 }
 
@@ -532,7 +544,7 @@ export class ConversationStore {
 
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow;
@@ -549,7 +561,7 @@ export class ConversationStore {
        VALUES (?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
-      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages WHERE message_id = ?`,
     );
 
@@ -583,7 +595,7 @@ export class ConversationStore {
     if (limit != null) {
       const rows = this.db
         .prepare(
-          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
          FROM messages
          WHERE conversation_id = ? AND seq > ?
          ORDER BY seq
@@ -595,7 +607,7 @@ export class ConversationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages
        WHERE conversation_id = ? AND seq > ?
        ORDER BY seq`,
@@ -607,7 +619,7 @@ export class ConversationStore {
   async getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -667,7 +679,7 @@ export class ConversationStore {
     const suppressedClause = opts.includeSuppressed ? "" : " AND suppressed_at IS NULL";
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages WHERE message_id = ?${suppressedClause}`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
@@ -963,7 +975,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC
@@ -1038,7 +1050,7 @@ export class ConversationStore {
     const SQL_SCAN_BOUND = 10_000;
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC

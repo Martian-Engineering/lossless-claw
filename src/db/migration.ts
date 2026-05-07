@@ -174,6 +174,29 @@ function ensureMessageSuppressedAtColumn(db: DatabaseSync): void {
 }
 
 /**
+ * v4.2 §B — stub-tier stratification: the `large_content` sidecar column.
+ *
+ * Stratifies the messages row into a thread-metadata tier (always emitted)
+ * and a payload tier (elided to a stub when outside the fresh tail). The
+ * column is NULL by default; populated by `scripts/lcm-blob-migrate.mjs`
+ * for tool messages whose content exceeds the bytewise threshold. When
+ * non-NULL it is the full payload text; `messages.content` remains
+ * lossless and unchanged so all existing readers keep working without
+ * schema awareness.
+ *
+ * The assembler reads `large_content IS NOT NULL` to decide whether a
+ * given evictable tool result is stubbable. lcm_describe / lcm_grep
+ * coalesce(large_content, content) so they always serve the full payload.
+ */
+function ensureMessageLargeContentColumn(db: DatabaseSync): void {
+  const cols = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasLargeContent = cols.some((c) => c.name === "large_content");
+  if (!hasLargeContent) {
+    db.exec(`ALTER TABLE messages ADD COLUMN large_content TEXT`);
+  }
+}
+
+/**
  * v4.1.1 A8 — feature-flag storage for v4.1 sections (e.g. semantic
  * retrieval can be disabled if vec0 extension fails to load).
  *
@@ -1295,6 +1318,12 @@ export function runLcmMigrations(
     // v3.1 A3 — messages.suppressed_at for raw-message suppression cascade.
     runMigrationStep("ensureMessageSuppressedAtColumn", log, () =>
       ensureMessageSuppressedAtColumn(db),
+    );
+
+    // v4.2 §B — messages.large_content sidecar column for stub-tier
+    // stratification. Idempotent additive ALTER; safe across versions.
+    runMigrationStep("ensureMessageLargeContentColumn", log, () =>
+      ensureMessageLargeContentColumn(db),
     );
 
     // v4.1.1 A8 — feature flags for v4.1 sections (e.g. v4_section_1_enabled

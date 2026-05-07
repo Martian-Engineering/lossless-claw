@@ -6750,6 +6750,11 @@ export class LcmContextEngine implements ContextEngine {
         promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
         orphanStrippingOrdinal: stableOrphanStrippingOrdinal,
+        // v4.2 §B — gated by config.stubLargeToolPayloads (default false).
+        // Off-by-default so v4.1 behavior is preserved until the migration
+        // tool has populated `messages.large_content` for the running DB.
+        stubLargeToolPayloads:
+          (this.config as { stubLargeToolPayloads?: boolean }).stubLargeToolPayloads === true,
       });
       if (cacheAwareState === "hot") {
         this.setStableOrphanStrippingOrdinal(

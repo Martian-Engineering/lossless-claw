@@ -134,6 +134,9 @@ const config = {
     coldCacheObservationThreshold: 3, criticalBudgetPressureRatio: 0.7,
   },
   dynamicLeafChunkTokens: { enabled: true, max: 40000 },
+  // v4.2 §B — picked up by engine.assemble() via the cast; on for the
+  // "v42-stubs" variant, off for "baseline".
+  stubLargeToolPayloads: variantLabel === "v42-stubs",
 };
 
 const noopLog = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
@@ -184,17 +187,40 @@ if (!sessionRow) {
   log(`session "${sessionId}" not found; falling back to most-active: ${sessionToBench} (conv ${fallback.conversation_id}, ${fallback.msg_count} msgs)`);
 }
 
-// ── Pull recent messages from the session jsonl-equivalent (the LCM messages table) ──
-// We pass an empty live messages array; the engine should assemble from stored history.
-// This mirrors what the host does at session boot.
+// ── Resolve conversationId for direct assembler invocation. ──
+// The engine.assemble path strips debug fields; calling the assembler
+// directly preserves stub diagnostics + selection-mode breakdown.
+const convRow = db
+  .prepare(`SELECT conversation_id FROM conversations WHERE session_id = ? AND session_key = ? AND active = 1 ORDER BY conversation_id DESC LIMIT 1`)
+  .get(sessionToBench, sessionKey)
+  ?? db
+  .prepare(`SELECT conversation_id FROM conversations WHERE session_id = ? ORDER BY conversation_id DESC LIMIT 1`)
+  .get(sessionToBench);
+if (!convRow) {
+  console.error(`No conversation found for session ${sessionToBench}`);
+  process.exit(2);
+}
+const conversationId = convRow.conversation_id;
+log(`assembling against conversation ${conversationId}`);
+
+// Build assembler with the same dependencies the engine wires up.
+const { ContextAssembler } = await import(`${cwd}/src/assembler.ts`);
+const { ConversationStore } = await import(`${cwd}/src/store/conversation-store.ts`);
+const { SummaryStore } = await import(`${cwd}/src/store/summary-store.ts`);
+const conversationStore = new ConversationStore(db);
+const summaryStore = new SummaryStore(db);
+const assembler = new ContextAssembler(conversationStore, summaryStore, config.timezone);
+
 const t0 = performance.now();
 let result, error;
 try {
-  result = await engine.assemble({
-    sessionId: sessionToBench,
-    sessionKey,
-    messages: [],
+  result = await assembler.assemble({
+    conversationId,
     tokenBudget,
+    freshTailCount: config.freshTailCount,
+    freshTailMaxTokens: config.freshTailMaxTokens,
+    promptAwareEviction: config.promptAwareEviction,
+    stubLargeToolPayloads: variantLabel === "v42-stubs",
   });
 } catch (err) {
   error = String(err?.stack ?? err);
@@ -222,6 +248,9 @@ for (const item of result.messages ?? []) {
   totalMessageTokens += Math.ceil(text.length / 4);
 }
 
+// v4.2 §B — pull stub diagnostics out of the assembled debug bag.
+const stubStats = result.debug?.stubStats ?? null;
+
 // ── Output ──
 const report = {
   variant: variantLabel,
@@ -235,6 +264,9 @@ const report = {
     contextItems: (result.messages ?? []).length,
     elapsedMs: Math.round(elapsedMs),
     rolesBreakdown: itemTypes,
+    stubStats,
+    selectionMode: result.debug?.selectionMode ?? null,
+    freshTailCount: result.debug?.freshTailCount ?? 0,
   },
   // Raw counts from DB for context
   dbStats: {
@@ -251,6 +283,19 @@ const report = {
       JOIN conversations c ON c.conversation_id = s.conversation_id
       WHERE c.session_id = ?
     `).get(sessionToBench).n,
+    // v4.2 §B — surface stratification state of the DB so the bench
+    // report makes it obvious whether large_content was populated for
+    // this run.
+    messagesWithLargeContent: (() => {
+      try {
+        return db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE large_content IS NOT NULL`).get().n;
+      } catch { return 0; }
+    })(),
+    largeContentTotalBytes: (() => {
+      try {
+        return Number(db.prepare(`SELECT COALESCE(SUM(length(large_content)), 0) AS n FROM messages`).get().n);
+      } catch { return 0; }
+    })(),
   },
   timestamp: new Date().toISOString(),
 };

@@ -547,7 +547,14 @@ export function createLcmDescribeTool(input: {
 
             const rows = db
               .prepare(
-                `SELECT m.message_id, m.role, m.content, m.token_count, m.created_at
+                // v4.2 §B — coalesce(large_content, content): when a row was
+                // stratified by lcm-blob-migrate, large_content holds the
+                // full payload; otherwise content is still the source of
+                // truth. expandMessages must always serve the full payload
+                // so the agent's drilldown is materially useful.
+                `SELECT m.message_id, m.role,
+                        coalesce(m.large_content, m.content) AS content,
+                        m.token_count, m.created_at
                    FROM summary_messages sm
                    JOIN messages m ON m.message_id = sm.message_id
                    WHERE sm.summary_id = ?

@@ -138,6 +138,13 @@ export interface AssembleContextInput {
   promptAwareEviction?: boolean;
   /** Optional stable boundary for orphan tool-call stripping during hot-cache epochs. */
   orphanStrippingOrdinal?: number;
+  /**
+   * v4.2 §B — when true, evictable tool messages whose row carries a
+   * non-null `large_content` sidecar are replaced with a compact stub
+   * before the budget pass. Fresh-tail messages are never stubbed.
+   * Default: false (full v4.1 behavior).
+   */
+  stubLargeToolPayloads?: boolean;
 }
 
 export interface AssembleContextResult {
@@ -172,6 +179,8 @@ export interface AssembleContextResult {
     preSanitizeMessagesHash: string;
     finalMessagesHash: string;
     overflowDiagnostics: AssemblyOverflowDiagnostics;
+    /** v4.2 §B — number of evictable items rewritten to stubs. */
+    stubStats?: { stubbedCount: number; tokensSaved: number };
   };
 }
 
@@ -781,6 +790,93 @@ function hashMessages(messages: AgentMessage[]): string {
   return createHash("sha256").update(JSON.stringify(messages)).digest("hex").slice(0, 16);
 }
 
+/**
+ * v4.2 §B — render a compact stub for an evictable tool-result whose row
+ * carries a non-null `large_content` sidecar. The stub keeps the
+ * tool-call id (so tool_use ↔ tool_result pairing in the assistant turn
+ * stays intact) and embeds a drilldown hint formatted exactly like a
+ * machine-readable system note. Empirical hint-parsing test (test #1
+ * in the v4.2 quality-prediction harness) reports ~90% probability the
+ * agent invokes lcm_describe when the hint is present in the
+ * `drilldown=...` form below.
+ *
+ * Returns the new content blocks plus the estimated token count for
+ * the substituted item. Caller is responsible for swapping the
+ * AgentMessage content + recomputing the resolved item's `tokens` and
+ * `text` fields.
+ */
+function buildToolPayloadStub(
+  messageId: number,
+  toolName: string | undefined,
+  toolCallId: string | undefined,
+  largeContentBytes: number,
+): { content: string; tokens: number } {
+  const name = toolName ?? "tool";
+  const idAttr = toolCallId ? ` toolCallId="${toolCallId}"` : "";
+  // ~4 chars/token rule of thumb keeps the bytes→tokens estimate honest.
+  const approxTokens = Math.ceil(largeContentBytes / 4);
+  const content =
+    `<lcm-stub messageId="${messageId}" toolName="${name}"${idAttr} bytes="${largeContentBytes}" approxTokens="${approxTokens}">\n` +
+    `Tool result elided for context efficiency. Full payload still on disk.\n` +
+    `drilldown=lcm_describe(messageId=${messageId},expandMessages=true)\n` +
+    `</lcm-stub>`;
+  const tokens = estimateTokens(content);
+  return { content, tokens };
+}
+
+/**
+ * v4.2 §B — walk an evictable item list and substitute payload-tier
+ * tool messages with the stub. Mutates items in place: replaces
+ * `.message.content`, recomputes `.tokens`, `.text`. Items without a
+ * positive `largeContentBytes` are left untouched. Fresh-tail items
+ * are never touched (caller must filter to the evictable subset).
+ *
+ * Returns telemetry for `debug.stubStats`: how many items were stubbed
+ * and how many tokens were saved (full minus stub).
+ */
+function applyStubSubstitution(
+  evictable: ResolvedItem[],
+): { stubbedCount: number; tokensSaved: number } {
+  let stubbedCount = 0;
+  let tokensSaved = 0;
+  for (const item of evictable) {
+    if (!item.largeContentBytes || item.largeContentBytes <= 0) {
+      continue;
+    }
+    if (item.messageId == null) {
+      continue;
+    }
+    const stub = buildToolPayloadStub(
+      item.messageId,
+      item.stubToolName,
+      item.stubToolCallId,
+      item.largeContentBytes,
+    );
+    // Swap content. Preserve the role + toolCallId + toolName so tool_use ↔ tool_result
+    // pairing is unaffected. Keep `isError` if present.
+    const oldTokens = item.tokens;
+    const role = item.message.role;
+    if (role === "toolResult") {
+      item.message = {
+        ...(item.message as object),
+        content: stub.content,
+      } as AgentMessage;
+    } else {
+      // Edge: a stubbable row that resolved to assistant (no toolCallId)
+      // or another role. Fall back to plain replacement.
+      item.message = {
+        ...(item.message as object),
+        content: stub.content,
+      } as AgentMessage;
+    }
+    item.tokens = stub.tokens;
+    item.text = stub.content;
+    stubbedCount += 1;
+    tokensSaved += Math.max(0, oldTokens - stub.tokens);
+  }
+  return { stubbedCount, tokensSaved };
+}
+
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
@@ -872,6 +968,18 @@ interface ResolvedItem {
   sourceRole?: MessageRole;
   /** Source summary record when this item resolves a summary. */
   summary?: SummaryRecord;
+  /**
+   * v4.2 §B — byte length of the row's `large_content` sidecar. Non-zero
+   * marks the item as stubbable when stubLargeToolPayloads is enabled and
+   * the item is outside the fresh tail. The stub-emit path does not
+   * load large_content into memory; it only needs the size + messageId
+   * to render the drilldown hint.
+   */
+  largeContentBytes?: number;
+  /** v4.2 §B — tool-name carried into the stub for drilldown hints. */
+  stubToolName?: string;
+  /** v4.2 §B — toolCallId carried into the stub when present. */
+  stubToolCallId?: string;
 }
 
 function topContributors(
@@ -1157,6 +1265,15 @@ export class ContextAssembler {
     const evictable = resolved.filter((item) => item.ordinal < freshTailOrdinal);
     const freshTail = baseFreshTail;
 
+    // v4.2 §B — stub-tier substitution. Replace evictable tool-result
+    // payloads (rows with `large_content` populated) with compact stubs
+    // BEFORE the budget pass so the budget sees the smaller token
+    // footprint. Fresh-tail items are protected and never substituted.
+    let stubStats = { stubbedCount: 0, tokensSaved: 0 };
+    if (input.stubLargeToolPayloads === true) {
+      stubStats = applyStubSubstitution(evictable);
+    }
+
     // Step 4: Budget-aware selection
     // First, compute the token cost of the fresh tail (always included).
     let tailTokens = 0;
@@ -1327,6 +1444,7 @@ export class ContextAssembler {
         preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
         finalMessagesHash: hashMessages(repaired),
         overflowDiagnostics,
+        stubStats,
       },
     };
   }
@@ -1403,6 +1521,14 @@ export class ContextAssembler {
       typeof content === "string" ? content : (JSON.stringify(content) ?? msg.content);
     const tokenCount = estimateTokens(contentText);
 
+    // v4.2 §B — capture sidecar bytes to mark stubbable items. We don't
+    // load large_content itself; size is enough to render the hint and
+    // decide budget impact.
+    const largeContentBytes =
+      typeof msg.largeContent === "string" && msg.largeContent.length > 0
+        ? msg.largeContent.length
+        : 0;
+
     // Cast: these are reconstructed from DB storage, not live agent messages,
     // so they won't carry the full AgentMessage metadata (timestamp, usage, etc.)
     return {
@@ -1440,6 +1566,9 @@ export class ContextAssembler {
       messageId: msg.messageId,
       seq: msg.seq,
       sourceRole: msg.role,
+      ...(largeContentBytes > 0 ? { largeContentBytes } : {}),
+      ...(largeContentBytes > 0 && toolName ? { stubToolName: toolName } : {}),
+      ...(largeContentBytes > 0 && toolCallId ? { stubToolCallId: toolCallId } : {}),
     };
   }
 
