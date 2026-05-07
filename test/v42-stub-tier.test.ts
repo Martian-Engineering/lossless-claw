@@ -205,10 +205,13 @@ describe("v4.2 §B (Option C) stub-tier stratification", () => {
       })
       .filter((t) => t.includes("[LCM Tool Output:"));
     expect(stubTexts.length).toBeGreaterThan(0);
-    // Each stub references a file_xxx id and includes the v4.1 hint.
+    // Each stub references a file_xxx id and includes the v4.2 hint
+    // pointing at lcm_describe with expandFile=true (the path that
+    // actually returns content from disk).
     for (const t of stubTexts) {
       expect(t).toMatch(/\[LCM Tool Output: file_/);
-      expect(t).toContain("Use lcm_describe with the file id");
+      expect(t).toContain("Call lcm_describe");
+      expect(t).toContain("expandFile=true");
     }
   });
 
@@ -276,22 +279,57 @@ describe("v4.2 §B (Option C) stub-tier stratification", () => {
     expect(out.debug?.stubStats?.tokensSaved ?? 0).toBe(0);
   });
 
-  it("preserves multi-block tool_result content shape (image + text)", async () => {
-    // This test covers the P1 fix from adversarial review: when a
-    // tool_result has structured (array) content, the stub must also
-    // be array-shaped (1-element text block) so downstream provider
-    // serialization doesn't change shape mid-stream.
+  it("preserves multi-block tool_result content shape (text + image)", async () => {
+    // P1 fix verification (Wave 1 Agent 4 found this test was fake):
+    // when the source tool_result was a multi-block array (e.g. text +
+    // image), the stub must also be array-shaped so downstream provider
+    // serialization doesn't change shape mid-stream. Previous test
+    // version only seeded single-text-block content and asserted the
+    // stub was array-shaped — but a regression that collapsed
+    // multi-block to string would still pass.
+    //
+    // This rewrite directly seeds a multi-block tool_result by inserting
+    // TWO message_parts (text + image) for the same tool message, so
+    // the assembler reconstructs an array content. Then verifies the
+    // post-stub content is still a 1-element text-block array.
     const { db, storageDir } = setupDb();
-    // Multi-block synthesis: we approximate by directly seeding a
-    // tool_result with a content array stored in the parts metadata.
-    // For the test, we just verify the substitution preserves array
-    // shape — the assembler builds toolResult content from parts; here
-    // we construct via the seedConversation helper and check the stub's
-    // resulting `content` shape.
+
+    // Set up conversation + assistant tool_use (using helper with one entry).
     seedConversation(db, storageDir, [
       { toolCallId: "mb-1", toolName: "Read", payload: bigPayload("MB", 16), externalize: true },
-      { toolCallId: "mb-2", toolName: "Read", payload: "small", externalize: false },
     ]);
+
+    // The toolResult message (id=3 by seq) has a single 'tool' part
+    // installed by seedConversation. Add a SECOND part to make it
+    // multi-block: text part + image-like text part with structured
+    // raw metadata that maps to an array shape after contentFromParts.
+    const secondPartMetadata = JSON.stringify({
+      originalRole: "toolResult",
+      raw: { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KG..." } },
+    });
+    db.prepare(
+      `INSERT INTO message_parts (part_id, message_id, session_id, part_type, ordinal, text_content, metadata)
+       VALUES (?, ?, ?, 'text', 1, ?, ?)`,
+    ).run(
+      `p-mb-img`,
+      3, // toolResult message id from helper (1=user prompt, 2=assistant, 3=toolResult)
+      "test-session",
+      "[image elided]",
+      secondPartMetadata,
+    );
+
+    // Pad with follow-up small messages so the multi-block tool_result
+    // is evictable, not in the fresh tail. Append directly (don't call
+    // seedConversation, which would try to create a duplicate conv).
+    for (let pad = 0; pad < 3; pad++) {
+      const seq = 5 + pad;
+      db.prepare(
+        `INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (?, ?, 'user', 'follow up', 1)`,
+      ).run(1, seq);
+      db.prepare(
+        `INSERT INTO context_items (conversation_id, ordinal, item_type, message_id) VALUES (?, ?, 'message', last_insert_rowid())`,
+      ).run(1, seq + 1);
+    }
 
     const conversationStore = new ConversationStore(db);
     const summaryStore = new SummaryStore(db);
@@ -304,18 +342,18 @@ describe("v4.2 §B (Option C) stub-tier stratification", () => {
       stubLargeToolPayloads: true,
     });
 
-    // For the substituted toolResult, content should still be a
-    // structured form acceptable to provider serialization (string OR
-    // array; but if the original was array-shaped, the stub is too).
-    const stubbedToolResults = out.messages.filter(
-      (m) => (m as { role?: string }).role === "toolResult" &&
-        (typeof (m as { content?: unknown }).content === "string"
-          ? ((m as { content?: string }).content ?? "").includes("[LCM Tool Output:")
-          : Array.isArray((m as { content?: unknown[] }).content)
-            ? JSON.stringify((m as { content?: unknown }).content).includes("[LCM Tool Output:")
-            : false),
+    // Find the stubbed toolResult and verify content is array-shaped.
+    const stubbedToolResult = out.messages.find(
+      (m) => (m as { role?: string }).role === "toolResult"
+        && Array.isArray((m as { content?: unknown }).content)
+        && JSON.stringify((m as { content?: unknown }).content).includes("[LCM Tool Output:"),
     );
-    expect(stubbedToolResults.length).toBeGreaterThan(0);
+    expect(stubbedToolResult).toBeDefined();
+    const content = (stubbedToolResult as { content: unknown[] }).content;
+    expect(Array.isArray(content)).toBe(true);
+    expect(content.length).toBe(1);
+    expect((content[0] as { type: string }).type).toBe("text");
+    expect((content[0] as { text: string }).text).toContain("[LCM Tool Output:");
   });
 });
 
@@ -366,13 +404,31 @@ describe("v4.2 §B (Option C) drilldown round-trip", () => {
       .find((t) => t.includes(expectedFileId!));
     expect(stubText).toBeDefined();
     expect(stubText).toContain("[LCM Tool Output:");
-    expect(stubText).toContain("Use lcm_describe with the file id");
+    expect(stubText).toContain("Call lcm_describe");
+    expect(stubText).toContain("expandFile=true");
 
-    // Drilldown: the v4.1 path lcm_describe(id="file_xxx") reads
-    // `large_files` and the on-disk storage_uri. Round-trip the bytes.
+    // Drilldown: actually go through the retrieval.describe API path with
+    // expandFile=true. This is the same path lcm_describe tool uses, so
+    // a regression in either retrieval.ts or describeFile would surface
+    // here. The previous test variant bypassed this by calling
+    // readFileSync directly on storage_uri; that hid the P0-B gap that
+    // describeFile didn't read content at all.
+    const { RetrievalEngine } = await import("../src/retrieval.js");
+    const retrieval = new RetrievalEngine(conversationStore, summaryStore);
+    const described = await retrieval.describe(expectedFileId!, {
+      expandFile: true,
+      largeFilesDir: storageDir,
+    });
+    expect(described).not.toBeNull();
+    expect(described!.type).toBe("file");
+    expect(described!.file).toBeDefined();
+    expect(described!.file!.byteSize).toBe(originalPayload.length);
+    expect(described!.file!.content).toBe(originalPayload);
+    expect(described!.file!.contentTruncated).toBe(false);
+
+    // Belt-and-suspenders: storage on disk also matches.
     const fileRow = await summaryStore.getLargeFile(expectedFileId!);
     expect(fileRow).not.toBeNull();
-    expect(fileRow!.byteSize).toBe(originalPayload.length);
     const onDisk = readFileSync(fileRow!.storageUri, "utf8");
     expect(onDisk).toBe(originalPayload);
   });

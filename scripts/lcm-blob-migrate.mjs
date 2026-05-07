@@ -23,11 +23,21 @@
  *     [--limit N] [--verbose]
  */
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+
+// Wave-2 P3: tell the operator early if Node is too old for node:sqlite.
+const [nodeMajor] = process.versions.node.split(".").map(Number);
+if (!Number.isFinite(nodeMajor) || nodeMajor < 22) {
+  console.error(
+    `node:sqlite requires Node ≥ 22.5.0; got ${process.versions.node}. ` +
+    `Update Node before running this migration.`,
+  );
+  process.exit(1);
+}
 
 const args = process.argv.slice(2);
 const getArg = (n) => {
@@ -38,13 +48,19 @@ const hasFlag = (n) => args.includes(`--${n}`);
 
 const dbPath = getArg("db");
 const dryRun = hasFlag("dry-run");
+const revert = hasFlag("revert");
 const thresholdBytes = Number(getArg("threshold-bytes") ?? 8000);
 const storageDir = getArg("storage-dir") ?? join(homedir(), ".openclaw", "lcm-files");
 const limit = getArg("limit") ? Number(getArg("limit")) : undefined;
 const verbose = hasFlag("verbose");
 
 if (!dbPath) {
-  console.error("Usage: lcm-blob-migrate.mjs --db <path> [--dry-run] [--threshold-bytes N] [--storage-dir PATH] [--limit N] [--verbose]");
+  console.error(
+    "Usage: lcm-blob-migrate.mjs --db <path> [--dry-run | --revert] [--threshold-bytes N] [--storage-dir PATH] [--limit N] [--verbose]\n" +
+    "  --revert: undo a previous migration. UPDATE messages SET large_content = NULL\n" +
+    "            for migration-marked rows, DELETE matching large_files rows, and\n" +
+    "            unlink the on-disk files. Reversible — re-run migration to restore.",
+  );
   process.exit(1);
 }
 if (!existsSync(dbPath)) { console.error(`DB not found: ${dbPath}`); process.exit(1); }
@@ -77,14 +93,18 @@ if (filesCols.length === 0) {
 // a disambiguator it can match to a user's natural-language reference
 // ("the ripgrep against openclaw-ui-source", "the read of foo.json",
 // etc.) without seeing the assistant tool_use block.
+// Wave-2 P1: use length(CAST(content AS BLOB)) for true byte counts.
+// SQLite's length() on TEXT returns characters, not bytes — UTF-8 multi-byte
+// content (CJK, emoji, etc.) was undercounted. The threshold and the
+// `byte_size` we persist into large_files now both reflect on-disk bytes.
 const candidatesSql = `
-  SELECT m.message_id, m.conversation_id, length(m.content) AS bytes, m.content,
+  SELECT m.message_id, m.conversation_id, length(CAST(m.content AS BLOB)) AS bytes, m.content,
          (SELECT mp.tool_name FROM message_parts mp
             WHERE mp.message_id = m.message_id AND mp.tool_name IS NOT NULL LIMIT 1) AS tool_name,
          (SELECT mp.tool_call_id FROM message_parts mp
             WHERE mp.message_id = m.message_id AND mp.tool_call_id IS NOT NULL LIMIT 1) AS tool_call_id
   FROM messages m
-  WHERE m.role = 'tool' AND m.large_content IS NULL AND length(m.content) > ?
+  WHERE m.role = 'tool' AND m.large_content IS NULL AND length(CAST(m.content AS BLOB)) > ?
   ORDER BY bytes DESC ${limit ? "LIMIT ?" : ""}
 `;
 // JOIN: given a tool_call_id, find the assistant tool_use that produced
@@ -95,9 +115,41 @@ const inputLookupStmt = db.prepare(
 );
 
 /**
+ * Wave-2 P0-C fix: redact common credential patterns before persisting
+ * the disambiguator into `large_files.exploration_summary`. These will
+ * appear in EVERY assemble — the original ephemeral nature of tool
+ * outputs (where commands could be evicted under budget pressure) is
+ * lost when promoted into a stub summary. Redact aggressively.
+ */
+function redactCredentials(s) {
+  if (typeof s !== "string") return s;
+  return s
+    // SSH/identity-file flag pointing at a secret path
+    .replace(/(-i\s+)\S*secret\S*/gi, "$1<REDACTED:identity-file>")
+    .replace(/(-i\s+)\S*\.openclaw\/secrets\S*/gi, "$1<REDACTED:identity-file>")
+    .replace(/(-i\s+)\S*\.ssh\/[^\s]*id_(?:rsa|ed25519|ecdsa)[^\s]*/gi, "$1<REDACTED:ssh-key>")
+    // Bearer / Authorization tokens
+    .replace(/\b(Authorization:\s*Bearer\s+)\S+/gi, "$1<REDACTED:bearer>")
+    .replace(/\b(-H\s+["']?Authorization:\s*Bearer\s+)\S+/gi, "$1<REDACTED:bearer>")
+    // AWS access key id (format: AKIA + 16 alnums)
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, "<REDACTED:aws-key-id>")
+    // GitHub-style PATs
+    .replace(/\bgh[ps]_[A-Za-z0-9]{30,}\b/g, "<REDACTED:github-pat>")
+    // Anthropic / OpenAI style keys
+    .replace(/\b(sk-(?:ant-)?(?:proj-|live-|oat\d+-)?)[A-Za-z0-9_-]{20,}/g, "$1<REDACTED>")
+    // Postgres / DB URLs with embedded passwords (scheme://user:pw@host)
+    .replace(/(\b[a-z][a-z0-9+\-.]*:\/\/[^:\/\s@]+:)[^@\s]+(@)/gi, "$1<REDACTED:db-pass>$2")
+    // API key env-var assignment style ((name)_API_KEY=value)
+    .replace(/\b(([A-Z][A-Z0-9_]*?_)?(?:API_KEY|TOKEN|SECRET))=\S+/g, "$1=<REDACTED>");
+}
+
+/**
  * Render a one-line disambiguator from a JSON tool_input. The agent only
  * needs enough to match a user reference like "the bash command from
  * earlier" or "your read of foo.json"; full input is in lcm_describe.
+ *
+ * Wave-2 P0-C: command field is truncated to 80 chars (was 240) AND run
+ * through `redactCredentials` so persisted summary doesn't leak secrets.
  */
 function renderToolInputDisambiguator(rawInput, toolName) {
   if (typeof rawInput !== "string" || rawInput.length === 0) return null;
@@ -107,7 +159,9 @@ function renderToolInputDisambiguator(rawInput, toolName) {
   const oneLine = (s, n = 200) =>
     String(s).split(/\r?\n/)[0].slice(0, n) + (String(s).length > n ? " …" : "");
   if (typeof inp.path === "string") return `Tool: ${toolName} | Path: ${inp.path}`;
-  if (typeof inp.command === "string") return `Tool: ${toolName} | Command: ${oneLine(inp.command, 240)}`;
+  if (typeof inp.command === "string") {
+    return `Tool: ${toolName} | Command: ${redactCredentials(oneLine(inp.command, 80))}`;
+  }
   if (typeof inp.pattern === "string") {
     const scope = inp.path ? ` | Path: ${inp.path}` : "";
     return `Tool: ${toolName} | Pattern: ${oneLine(inp.pattern, 160)}${scope}`;
@@ -134,7 +188,65 @@ const summary = {
 };
 
 if (dryRun) { console.log(JSON.stringify(summary, null, 2)); db.close(); process.exit(0); }
-if (!existsSync(storageDir)) { mkdirSync(storageDir, { recursive: true }); log(`created storage dir ${storageDir}`); }
+
+if (revert) {
+  // Wave-2 P1: complete reversibility — undo a previous migration.
+  // Identifies migration-marked rows (large_content starts with `file_`),
+  // looks up storage_uri from large_files, deletes the on-disk file,
+  // deletes the large_files row, and clears the messages.large_content.
+  const revertSummary = {
+    db: dbPath, dryRun: false, mode: "revert",
+    rowsCleared: 0, filesDeleted: 0, largeFilesRowsDeleted: 0, errors: [],
+  };
+  const revertCandidates = db
+    .prepare(
+      `SELECT m.message_id, m.large_content AS file_id, lf.storage_uri
+       FROM messages m
+       JOIN large_files lf ON lf.file_id = m.large_content
+       WHERE m.large_content LIKE 'file_%'`,
+    )
+    .all();
+  try {
+    db.exec("BEGIN");
+    const clearMsgStmt = db.prepare(`UPDATE messages SET large_content = NULL WHERE message_id = ?`);
+    const deleteFileStmt = db.prepare(`DELETE FROM large_files WHERE file_id = ?`);
+    for (const row of revertCandidates) {
+      // Delete the disk file first; if SQL ROLLBACKs after this, the
+      // file is gone but DB still references it — that's the same
+      // "orphan" failure mode as forward-migration, but in reverse.
+      // Acceptable because revert is operator-driven and recoverable.
+      try {
+        if (row.storage_uri && existsSync(row.storage_uri)) {
+          unlinkSync(row.storage_uri);
+          revertSummary.filesDeleted++;
+        }
+      } catch (err) {
+        revertSummary.errors.push(`unlink ${row.storage_uri}: ${err}`);
+      }
+      deleteFileStmt.run(row.file_id);
+      revertSummary.largeFilesRowsDeleted++;
+      clearMsgStmt.run(row.message_id);
+      revertSummary.rowsCleared++;
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    try { db.exec("ROLLBACK"); } catch { /* noop */ }
+    revertSummary.errors.push(String(err?.stack ?? err));
+    console.error(JSON.stringify(revertSummary, null, 2));
+    db.close();
+    process.exit(2);
+  }
+  try { db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch { /* best-effort */ }
+  console.log(JSON.stringify(revertSummary, null, 2));
+  db.close();
+  process.exit(0);
+}
+
+if (!existsSync(storageDir)) {
+  // Wave-2 P1: 0700 so other users on the box can't list filenames.
+  mkdirSync(storageDir, { recursive: true, mode: 0o700 });
+  log(`created storage dir ${storageDir} (mode 0700)`);
+}
 
 const CHUNK = 200;
 const insertFileStmt = db.prepare(
@@ -152,7 +264,9 @@ try {
       const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
       const fileName = `tool-output-${row.message_id}.txt`;
       const storageUri = join(storageDir, `${fileId}.txt`);
-      writeFileSync(storageUri, row.content);
+      // Wave-2 P1: 0600 so tool outputs (which can contain credentials)
+      // aren't world-readable on multi-user boxes.
+      writeFileSync(storageUri, row.content, { mode: 0o600 });
       // Option F: lift tool_input into exploration_summary so the
       // assembler's [LCM Tool Output: …] reference carries an
       // agent-recognizable disambiguator.
@@ -174,6 +288,11 @@ try {
   summary.applied = done;
 } catch (err) {
   try { db.exec("ROLLBACK"); } catch { /* noop */ }
+  // Wave-2 P1 fix: even on a partial-failure, report the chunks that DID
+  // commit. Pre-fix, `summary.applied` stayed 0 and operators re-ran the
+  // script, doubling the orphan-file count. Now the report tells the
+  // truth: N rows committed before the failure.
+  summary.applied = done;
   summary.errors.push(String(err?.stack ?? err));
   console.error(JSON.stringify(summary, null, 2));
   db.close();

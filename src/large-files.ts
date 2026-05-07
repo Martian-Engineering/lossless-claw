@@ -527,7 +527,7 @@ export function formatToolOutputReference(input: {
     "Exploration Summary:",
     input.summary.trim() || "(no summary available)",
     "",
-    "Use lcm_describe with the file id to inspect the full output.",
+    "Call lcm_describe(id=\"<file_id above>\", expandFile=true) to fetch the full output content from disk.",
   ].join("\n");
 }
 
@@ -548,7 +548,7 @@ export function formatRawPayloadReference(input: {
     "Exploration Summary:",
     input.summary.trim() || "(no summary available)",
     "",
-    "Use lcm_describe with the file id to inspect the full payload.",
+    "Call lcm_describe(id=\"<file_id above>\", expandFile=true) to fetch the full payload content from disk.",
   ].join("\n");
 }
 

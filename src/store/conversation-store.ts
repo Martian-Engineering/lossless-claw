@@ -263,7 +263,9 @@ function normalizeMessageContentForFullTextIndex(content: string): string | null
       inSummary = true;
       continue;
     }
-    if (line.startsWith("Use lcm_describe")) {
+    // Filter both legacy "Use lcm_describe …" and v4.2 "Call lcm_describe(…)"
+    // hint lines so they don't pollute the FTS index for unrelated queries.
+    if (line.startsWith("Use lcm_describe") || line.startsWith("Call lcm_describe")) {
       continue;
     }
     if (inSummary) {

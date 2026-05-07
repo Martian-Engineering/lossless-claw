@@ -97,6 +97,15 @@ export type LcmConfig = {
   freshTailMaxTokens?: number;
   /** When true, budget-constrained assembly may keep older items by prompt relevance instead of pure chronology. */
   promptAwareEviction: boolean;
+  /**
+   * v4.2 §B — when true, evictable tool-result rows whose `large_content`
+   * sidecar is set (a `file_xxx` id from lcm-blob-migrate) are replaced
+   * with the v4.1 `[LCM Tool Output: file_xxx | tool=… | N bytes]`
+   * reference at assemble time. Fresh tail is never stubbed. Drilldown
+   * via `lcm_describe(id="file_xxx")` returns the original content.
+   * Default false; flag-flip is reversible at runtime.
+   */
+  stubLargeToolPayloads: boolean;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -443,6 +452,13 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_PROMPT_AWARE_EVICTION_ENABLED !== undefined
           ? env.LCM_PROMPT_AWARE_EVICTION_ENABLED === "true"
           : toBool(pc.promptAwareEviction) ?? false,
+      // v4.2 §B — config + env-var propagation for the stub-tier flag.
+      // Default false. Mirror the env-takes-precedence-over-config
+      // pattern used by every other boolean LCM flag.
+      stubLargeToolPayloads:
+        env.LCM_STUB_LARGE_TOOL_PAYLOADS !== undefined
+          ? env.LCM_STUB_LARGE_TOOL_PAYLOADS === "true"
+          : toBool(pc.stubLargeToolPayloads) ?? false,
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,

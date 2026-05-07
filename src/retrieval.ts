@@ -1,3 +1,5 @@
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import type {
   ConversationStore,
   MessageRecord,
@@ -59,6 +61,15 @@ export interface DescribeResult {
     storageUri: string;
     explorationSummary: string | null;
     createdAt: Date;
+    /**
+     * v4.2 §B — actual file content read from `storageUri` when the
+     * caller requests `expandFile=true` AND the file is on disk AND
+     * the byte count is under the budget cap. Null when the file is
+     * absent (orphan), too large to inline, or not requested. The
+     * tool layer surfaces a `truncated`/`hint` field separately.
+     */
+    content?: string | null;
+    contentTruncated?: boolean;
   };
 }
 
@@ -134,12 +145,15 @@ export class RetrievalEngine {
    * - IDs starting with "file_" are looked up as large files.
    * - Returns null if the item is not found.
    */
-  async describe(id: string): Promise<DescribeResult | null> {
+  async describe(
+    id: string,
+    options?: { expandFile?: boolean; expandFileMaxBytes?: number; largeFilesDir?: string },
+  ): Promise<DescribeResult | null> {
     if (id.startsWith("sum_")) {
       return this.describeSummary(id);
     }
     if (id.startsWith("file_")) {
-      return this.describeFile(id);
+      return this.describeFile(id, options);
     }
     return null;
   }
@@ -196,10 +210,67 @@ export class RetrievalEngine {
     };
   }
 
-  private async describeFile(id: string): Promise<DescribeResult | null> {
+  private async describeFile(
+    id: string,
+    options?: { expandFile?: boolean; expandFileMaxBytes?: number; largeFilesDir?: string },
+  ): Promise<DescribeResult | null> {
     const file = await this.summaryStore.getLargeFile(id);
     if (!file) {
       return null;
+    }
+
+    // v4.2 §B — when caller requests expandFile, read the actual file
+    // bytes from disk. Bounds:
+    //   1. Path validation: storageUri MUST resolve under the runtime's
+    //      configured `largeFilesDir` to prevent traversal via a poisoned
+    //      `large_files.storage_uri` row.
+    //   2. Existence check: orphaned files (DB row points at a missing
+    //      file) return null content with `contentTruncated: false` —
+    //      caller can decide how to render the gap.
+    //   3. Size cap: default 32 KB (~8K tokens) so a single drilldown
+    //      can't blow out the agent's context. Override via
+    //      `expandFileMaxBytes`. Files over the cap return the head
+    //      portion + `contentTruncated: true`.
+    let content: string | null = null;
+    let contentTruncated = false;
+    if (options?.expandFile === true && file.storageUri) {
+      try {
+        const maxBytes = Math.max(1024, Math.min(
+          options.expandFileMaxBytes ?? 32_768,
+          512_000, // hard cap: 500 KB regardless of caller request
+        ));
+        // Path validation: ensure the resolved absolute path lives under
+        // the configured large-files dir. Anything outside is rejected
+        // (could indicate a moved storage dir or a tampered DB row).
+        const safeRoot = options.largeFilesDir
+          ? resolvePath(options.largeFilesDir)
+          : null;
+        const target = resolvePath(file.storageUri);
+        const safeRootOk = safeRoot ? target.startsWith(safeRoot + "/") || target === safeRoot : true;
+        if (safeRootOk && existsSync(target)) {
+          const stat = statSync(target);
+          if (stat.size <= maxBytes) {
+            content = readFileSync(target, "utf8");
+          } else {
+            // Read just the head; mark truncated so the agent knows
+            // there's more to fetch via lcm_grep.
+            const buf = Buffer.alloc(maxBytes);
+            const fs = await import("node:fs");
+            const fd = fs.openSync(target, "r");
+            try {
+              fs.readSync(fd, buf, 0, maxBytes, 0);
+            } finally {
+              fs.closeSync(fd);
+            }
+            content = buf.toString("utf8");
+            contentTruncated = true;
+          }
+        }
+      } catch {
+        // Disk read failed — fall back to metadata-only describe. Caller
+        // can still see byteSize and explorationSummary.
+        content = null;
+      }
     }
 
     return {
@@ -213,6 +284,7 @@ export class RetrievalEngine {
         storageUri: file.storageUri,
         explorationSummary: file.explorationSummary,
         createdAt: file.createdAt,
+        ...(content !== null ? { content, contentTruncated } : {}),
       },
     };
   }

@@ -1746,6 +1746,18 @@ export class LcmContextEngine implements ContextEngine {
     return this.config.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   }
 
+  /**
+   * v4.2 §B — read-only window into the resolved config so tools that
+   * need a config-bound value (e.g. `lcm_describe` validating paths
+   * under `largeFilesDir`) can ask without mutating engine state.
+   */
+  get configView(): Pick<LcmConfig, "largeFilesDir" | "stubLargeToolPayloads"> {
+    return {
+      largeFilesDir: this.config.largeFilesDir,
+      stubLargeToolPayloads: this.config.stubLargeToolPayloads,
+    };
+  }
+
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
@@ -6743,8 +6755,7 @@ export class LcmContextEngine implements ContextEngine {
         // v4.2 §B — gated by config.stubLargeToolPayloads (default false).
         // Off-by-default so v4.1 behavior is preserved until the migration
         // tool has populated `messages.large_content` for the running DB.
-        stubLargeToolPayloads:
-          (this.config as { stubLargeToolPayloads?: boolean }).stubLargeToolPayloads === true,
+        stubLargeToolPayloads: this.config.stubLargeToolPayloads,
       });
       if (cacheAwareState === "hot") {
         this.setStableOrphanStrippingOrdinal(
