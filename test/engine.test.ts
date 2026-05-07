@@ -8088,8 +8088,14 @@ describe("LcmContextEngine fidelity and token budget", () => {
       prePromptMessageCount: 0,
       tokenBudget: 4_096,
       runtimeContext: {
-        provider: "openai",
-        model: "gpt-5.1",
+        // Wave-13 follow-up: was `provider: "openai"` to demonstrate
+        // background-drain on a non-cache-mutation-sensitive provider.
+        // Plain openai now IS mutation-sensitive (OpenAI prompt caching
+        // launched Oct 2024). Switched to Groq (no prompt caching) to
+        // preserve the test's intent: drain proceeds when cache policy
+        // genuinely allows.
+        provider: "groq",
+        model: "llama-3.1-70b-versatile",
       },
     });
 

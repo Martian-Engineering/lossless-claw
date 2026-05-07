@@ -2230,8 +2230,15 @@ export class LcmContextEngine implements ContextEngine {
     return identifiers.some((identifier) =>
       identifier.includes("anthropic")
       || identifier.includes("claude")
-      || identifier.includes("openai-codex")
+      // Wave-13 follow-up: OpenAI Platform's prompt caching has been live
+      // since Oct 2024 (https://platform.openai.com/docs/guides/prompt-caching).
+      // Plain `openai` provider + gpt-* model strings ARE cache-mutation-
+      // sensitive — without these matches the gate silently disabled cache-
+      // aware deferral for plain-openai operators, causing 4× input cost
+      // on every threshold compaction.
+      || identifier.includes("openai")  // covers openai, openai-codex, openai-resp
       || identifier.includes("openai_codex")
+      || identifier.includes("gpt-")    // model-name match for cases where provider is unset
       || identifier.includes("github-copilot")
       || identifier.includes("github_copilot")
       || identifier.includes("codex-cli")
