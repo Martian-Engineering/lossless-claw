@@ -168,7 +168,23 @@ const tools = [
     type: "function",
     function: {
       name: "lcm_describe",
-      description: "Look up an LCM item by ID, with optional one-hop drilldown. Inspects summaries (sum_xxx) or stored files (file_xxx). Use to inspect the full output of an elided tool result that was replaced with a [LCM Tool Output: file_xxx …] reference in the conversation.",
+      // Mirror src/tools/lcm-describe-tool.ts production description verbatim
+      // so the harness signal matches what runtime agents actually see.
+      description:
+        "Look up an LCM item by ID, with optional one-hop drilldown. " +
+        "PRIMARY tool for Type E queries (drilldown / source-tracing): " +
+        "'where did this synthesized claim come from?', 'show me the source leaves " +
+        "for this summary'. Set expandChildren=true to inline child summaries " +
+        "(capped 20, max 50) and/or expandMessages=true to inline raw source " +
+        "messages. Inspects summaries (sum_xxx) or stored files (file_xxx). " +
+        "ALSO USE THIS when you see a `[LCM Tool Output: file_xxx | tool=… | N bytes]` " +
+        "reference in the conversation — that means an older tool result was elided " +
+        "for context efficiency. Call lcm_describe(id=file_xxx) to fetch the original " +
+        "output before answering questions that depend on its specifics. " +
+        "For multi-hop drilldown that needs to read more than one level, " +
+        "use lcm_expand_query (delegated sub-agent expansion). " +
+        "Returns summary content, lineage, token counts, file exploration, " +
+        "and (with expand flags) one-hop child/message detail.",
       parameters: {
         type: "object",
         properties: {

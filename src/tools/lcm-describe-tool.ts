@@ -116,6 +116,10 @@ export function createLcmDescribeTool(input: {
       "for this summary'. Set expandChildren=true to inline child summaries " +
       "(capped 20, max 50) and/or expandMessages=true to inline raw source " +
       "messages. Inspects summaries (sum_xxx) or stored files (file_xxx). " +
+      "ALSO USE THIS when you see a `[LCM Tool Output: file_xxx | tool=… | N bytes]` " +
+      "reference in the conversation — that means an older tool result was elided " +
+      "for context efficiency. Call lcm_describe(id=file_xxx) to fetch the original " +
+      "output before answering questions that depend on its specifics. " +
       "For multi-hop drilldown that needs to read more than one level, " +
       "use lcm_expand_query (delegated sub-agent expansion). " +
       "Returns summary content, lineage, token counts, file exploration, " +
