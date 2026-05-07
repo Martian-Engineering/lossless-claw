@@ -662,8 +662,17 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
             break;
           }
           default:
-            if (t?.startsWith("--")) {
+            // Wave-12 reviewer P2 fix: previously only `--`-prefixed unknowns
+            // were rejected; bare positional args (e.g. user typoing
+            // `purge sk1` instead of `purge --session-key sk1`) were
+            // silently swallowed and the command ran with no scope.
+            if (t === undefined || t === "") break;
+            if (t.startsWith("--")) {
               parseError = `Unknown flag for \`${VISIBLE_COMMAND} purge\`: ${t}`;
+            } else {
+              parseError =
+                `Unexpected positional arg for \`${VISIBLE_COMMAND} purge\`: \`${t}\`. ` +
+                `Did you mean \`--session-key ${t}\`? Use \`${VISIBLE_COMMAND} help\` for usage.`;
             }
         }
         if (parseError) break;
@@ -1641,7 +1650,7 @@ function formatHealthSnapshot(snapshot: V41HealthSnapshot): string[] {
   if (snapshot.embeddings.overCapPending > 0) {
     embeddingsLines.push(
       buildStatLine(
-        "over-cap leaves (>30K tokens, NOT embeddable)",
+        `over-cap leaves (>${formatNumber(MAX_TOKENS_PER_EMBED_DOC)} tokens, NOT embeddable)`,
         `${formatNumber(snapshot.embeddings.overCapPending)} — re-summarize at lower cap to bring into range`,
       ),
     );
@@ -1822,6 +1831,11 @@ async function buildWorkerTickBackfillText(params: { db: DatabaseSync }): Promis
       modelName: active.modelName,
       voyageModel: active.modelName as Parameters<typeof tickEmbeddingBackfill>[1]["voyageModel"],
       inputType: "document",
+      // Wave-12 reviewer P1 fix: pass profile.dim so non-default
+      // (256/512/2048) profiles get the right-shape vectors. Without
+      // this, Voyage returns 1024-dim vectors and recordEmbedding
+      // rejects them as length-mismatched.
+      voyageOutputDimension: active.dim,
       // v4.1 Final.review.3 fix: drop to 1 retry to keep worst-case
       // tick time under WORKER_LOCK_TTL_MS (90s). Was 2 → ~91s worst case.
       voyageMaxRetries: 1,
@@ -2660,21 +2674,26 @@ export function createLcmCommand(params: {
             : { text: await buildDoctorText({ ctx, db: await getDb() }) };
         }
         case "doctor_cleaners": {
-          // Wave-11 reviewer P1 fix: `/lcm doctor clean apply` deletes
-          // cleaner matches after backup — destructive. Gate the apply
-          // variant; read-only listing stays open.
-          if (parsed.apply && !ctx.senderIsOwner) {
+          // Wave-12 reviewer P1 fix: gate the WHOLE doctor_cleaners case
+          // on senderIsOwner, not just `--apply`. The read-only path
+          // emits per-filter top-3 conversations including session_keys
+          // (truncated) and `JSON.stringify`'d first-message previews
+          // across the global conversation set — leaks of conversational
+          // content + session-identity to non-owners that mirrors the
+          // gate already on `purge` / `reconcile-session-keys --apply`.
+          // Wave-11 had only gated --apply.
+          if (!ctx.senderIsOwner) {
             return {
               text: [
                 ...buildHeaderLines(),
                 "",
-                "🧽 Doctor clean apply — operator-only",
+                "🧽 Doctor clean — operator-only",
                 "",
                 buildSection("🚫 Rejected", [
                   buildStatLine("status", "operator-only"),
                   buildStatLine(
                     "reason",
-                    "/lcm doctor clean apply requires owner privileges (ctx.senderIsOwner=true). It deletes cleaner matches from the DB after backup — non-owner callers cannot invoke it. /lcm doctor clean (without --apply) is read-only and remains open.",
+                    "/lcm doctor clean requires owner privileges (ctx.senderIsOwner=true). The read-only listing surfaces session_keys + first-message previews across the global conversation set; the apply variant is destructive. Both are owner-only.",
                   ),
                 ]),
               ].join("\n"),
