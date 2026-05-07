@@ -30,6 +30,7 @@ import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { formatTimestamp } from "../compaction.js";
 import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
+import { VISIBLE_MENTIONS_CTE, entityAggCte } from "./lcm-entity-shared.js";
 
 const DEFAULT_MENTION_LIMIT = 20;
 const MIN_MENTION_LIMIT = 1;
@@ -200,29 +201,12 @@ export function createLcmGetEntityTool(input: {
         entityFilters.push("e.entity_type = ?");
         entityBinds.push(entityTypeFilter);
       }
+      // Wave-12 consolidation B: CTE extracted into shared helper to
+      // close the parallel-edit drift hazard between get-entity +
+      // search-entities (both maintained byte-identical SQL post-F4).
       const entity = db
         .prepare(
-          `WITH visible_mentions AS (
-             SELECT m.entity_id, m.summary_id, m.surface_form, m.mentioned_at
-               FROM lcm_entity_mentions m
-               JOIN summaries s ON s.summary_id = m.summary_id
-              WHERE s.suppressed_at IS NULL
-           ),
-           entity_agg AS (
-             SELECT
-               vm.entity_id,
-               COUNT(*) AS occ_count,
-               MIN(vm.mentioned_at) AS first_at,
-               MAX(vm.mentioned_at) AS last_at,
-               (SELECT vm2.summary_id
-                  FROM visible_mentions vm2
-                  WHERE vm2.entity_id = vm.entity_id
-                  ORDER BY vm2.mentioned_at ASC, vm2.summary_id ASC
-                  LIMIT 1) AS first_in,
-               json_group_array(DISTINCT vm.surface_form) AS visible_surfaces
-              FROM visible_mentions vm
-             GROUP BY vm.entity_id
-           )
+          `${VISIBLE_MENTIONS_CTE}${entityAggCte({ includeFirstIn: true })}
            SELECT e.entity_id, e.session_key, e.canonical_text, e.entity_type,
                   ea.first_at AS first_seen_at,
                   ea.last_at  AS last_seen_at,

@@ -32,6 +32,7 @@ import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { formatTimestamp } from "../compaction.js";
 import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
+import { VISIBLE_MENTIONS_CTE, entityAggCte } from "./lcm-entity-shared.js";
 
 const DEFAULT_LIMIT = 20;
 const MIN_LIMIT = 1;
@@ -224,25 +225,15 @@ export function createLcmSearchEntitiesTool(input: {
       // remain visible. The CTE join also acts as the visible-mentions
       // gate (no unsuppressed mention → entity hidden, mirroring the
       // EXISTS guard already in get-entity).
+      // Wave-12 consolidation B: CTE extracted into shared helper to
+      // close the parallel-edit drift hazard with get-entity (both
+      // maintained byte-identical SQL post-F4). search-entities omits
+      // `first_in` (it's the get-entity-only first_seen_in_summary_id
+      // column).
       // Rank: most-occurrences first, then most-recent. Cap at `limit`.
       const rows = db
         .prepare(
-          `WITH visible_mentions AS (
-             SELECT m.entity_id, m.summary_id, m.surface_form, m.mentioned_at
-               FROM lcm_entity_mentions m
-               JOIN summaries s ON s.summary_id = m.summary_id
-              WHERE s.suppressed_at IS NULL
-           ),
-           entity_agg AS (
-             SELECT
-               vm.entity_id,
-               COUNT(*) AS occ_count,
-               MIN(vm.mentioned_at) AS first_at,
-               MAX(vm.mentioned_at) AS last_at,
-               json_group_array(DISTINCT vm.surface_form) AS visible_surfaces
-              FROM visible_mentions vm
-             GROUP BY vm.entity_id
-           )
+          `${VISIBLE_MENTIONS_CTE}${entityAggCte({ includeFirstIn: false })}
            SELECT e.entity_id, e.canonical_text, e.entity_type,
                   ea.first_at AS first_seen_at,
                   ea.last_at  AS last_seen_at,
