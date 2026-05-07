@@ -173,8 +173,8 @@ describe("lcm_compact — per-window cap", () => {
       lcm: makeTestEngine(db),
       sessionId: "agent:main:main",
       sessionKey: "agent:main:main",
-      // Below floor → tool refuses without running compact, but still
-      // increments the counter.
+      // 70% ratio passes the floor (default reserveFraction=0.5 = 50%).
+      // Gate accepts → counter increments.
       getRuntimeContext: () => ({
         currentTokenCount: 70_000,
         tokenBudget: 100_000,
@@ -196,6 +196,52 @@ describe("lcm_compact — per-window cap", () => {
     expect(p3.reason).toBe("capped-this-turn");
     expect(p3.note).toContain("2/2");
     expect(p3.retryAfterIso).toBeDefined();
+  });
+
+  it("INVARIANT: gate-refused calls do NOT burn cap (Wave-12 reviewer P2 fix)", async () => {
+    // Pre-fix bug: counter was incremented BEFORE the engine gate, so an
+    // agent probing at 30% context (below-floor refusal) burned its 2-call
+    // budget and was locked out at 80% when it actually needed compaction.
+    // Post-fix: refusals are free; only gate-accepted calls count.
+    const tool = createLcmCompactTool({
+      deps: depsWithCompactionEnabled(true),
+      lcm: makeTestEngine(db),
+      sessionId: "agent:main:main",
+      sessionKey: "agent:main:main",
+      // 30% < 50% floor → engine gate refuses with below-floor.
+      getRuntimeContext: () => ({
+        currentTokenCount: 30_000,
+        tokenBudget: 100_000,
+        sessionFile: "/tmp/test-session.jsonl",
+      }),
+    });
+    // Probe 5 times at low context — all should return below-floor and
+    // NEVER hit the 2-call cap.
+    for (let i = 0; i < 5; i++) {
+      const r = await tool.execute(`probe-${i}`, {});
+      const p = JSON.parse((r.content[0] as { text: string }).text);
+      expect(p.reason).toBe("below-floor");
+      expect(p.reason).not.toBe("capped-this-turn");
+    }
+    // Now switch to high-context tool with the SAME session-key. The cap
+    // must still be fresh — gate-refused probes did not consume it.
+    const highCtxTool = createLcmCompactTool({
+      deps: depsWithCompactionEnabled(true),
+      lcm: makeTestEngine(db),
+      sessionId: "agent:main:main",
+      sessionKey: "agent:main:main",
+      getRuntimeContext: () => ({
+        currentTokenCount: 80_000,
+        tokenBudget: 100_000,
+        sessionFile: "/tmp/test-session.jsonl",
+      }),
+    });
+    const r1 = await highCtxTool.execute("real-1", {});
+    const p1 = JSON.parse((r1.content[0] as { text: string }).text);
+    expect(p1.reason).not.toBe("capped-this-turn");
+    const r2 = await highCtxTool.execute("real-2", {});
+    const p2 = JSON.parse((r2.content[0] as { text: string }).text);
+    expect(p2.reason).not.toBe("capped-this-turn");
   });
 
   it("counter is per-session-key — different sessions are isolated", async () => {

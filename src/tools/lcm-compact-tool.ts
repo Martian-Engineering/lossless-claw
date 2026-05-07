@@ -287,19 +287,13 @@ export function createLcmCompactTool(input: {
       const currentTokenCount = runtimeCtx.currentTokenCount;
       const tokenBudget = runtimeCtx.tokenBudget;
 
-      // Per-window cap (in-memory; documented limitation).
-      const cap = checkAndIncrementCounter(sessionKey, DEFAULT_CAP_PER_WINDOW);
-      if (!cap.allowed) {
-        return jsonResult({
-          ok: false,
-          compacted: false,
-          reason: "capped-this-turn",
-          note: `Per-window compaction cap reached (${cap.count}/${DEFAULT_CAP_PER_WINDOW} in the last ${Math.round(COMPACTION_WINDOW_MS / 60000)} min). Counter resets at ${new Date(cap.resetAtMs).toISOString()}. Continue with your existing context — chained calls will queue post-turn compaction automatically.`,
-          retryAfterIso: new Date(cap.resetAtMs).toISOString(),
-        });
-      }
-
-      // Engine-side gates (cheap; no LLM call).
+      // Wave-12 reviewer P2 fix: gate FIRST, increment counter AFTER.
+      // Previously the per-window cap was burned on every call regardless
+      // of whether the engine accepted it — so an agent probing at 30%
+      // context (below-floor refusal) burned its 2-call budget without
+      // ever running compaction, then was locked out at 80% when it
+      // actually needed to compact. Refusals are free; only successful
+      // (or attempted) compactions count against the cap.
       const gate = await lcm.getAgentCompactionGateState({
         sessionId: input.sessionId ?? sessionKey,
         sessionKey,
@@ -314,6 +308,19 @@ export function createLcmCompactTool(input: {
           reason: gate.refusalReason,
           note: gate.refusalNote,
           contextRatio: gate.contextRatio,
+        });
+      }
+
+      // Per-window cap (in-memory; documented limitation). Increment now
+      // that gate has accepted — this counts as a real compaction attempt.
+      const cap = checkAndIncrementCounter(sessionKey, DEFAULT_CAP_PER_WINDOW);
+      if (!cap.allowed) {
+        return jsonResult({
+          ok: false,
+          compacted: false,
+          reason: "capped-this-turn",
+          note: `Per-window compaction cap reached (${cap.count}/${DEFAULT_CAP_PER_WINDOW} in the last ${Math.round(COMPACTION_WINDOW_MS / 60000)} min). Counter resets at ${new Date(cap.resetAtMs).toISOString()}. Continue with your existing context — chained calls will queue post-turn compaction automatically.`,
+          retryAfterIso: new Date(cap.resetAtMs).toISOString(),
         });
       }
 
