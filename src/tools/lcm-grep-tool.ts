@@ -1006,22 +1006,14 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
     // Wave-9 Agent #4 P1 fix: when CJK detected at the JS layer above,
     // skip the messages_fts JOIN entirely - the filter is already a
     // direct `m.content LIKE ?` substring match.
-    // v4.2 §B — return coalesce(large_content, content) so callers always
-    // see the full payload. The MATCH filter still operates on the
-    // `messages_fts` virtual table (indexed off content), and LIKE fallback
-    // still scans m.content; only the projection coalesces. This keeps
-    // search behavior identical when v4.2 stratification has been applied.
+    // v4.2 §B (Option C): drilldown via file_xxx; content canonical here.
     const sql = useLikeForCjk
-      ? `SELECT m.message_id, m.conversation_id, m.role,
-                coalesce(m.large_content, m.content) AS content,
-                m.token_count, m.created_at
+      ? `SELECT m.message_id, m.conversation_id, m.role, m.content, m.token_count, m.created_at
            FROM messages m
            WHERE ${filters.join(" AND ")}
            ORDER BY datetime(m.created_at) DESC
            LIMIT ?`
-      : `SELECT m.message_id, m.conversation_id, m.role,
-                coalesce(m.large_content, m.content) AS content,
-                m.token_count, m.created_at
+      : `SELECT m.message_id, m.conversation_id, m.role, m.content, m.token_count, m.created_at
            FROM messages m
            JOIN messages_fts ON messages_fts.rowid = m.rowid
            WHERE ${filters.join(" AND ")}
@@ -1055,10 +1047,7 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
     );
     rows = db
       .prepare(
-        // v4.2 §B — coalesce mirrors the FTS path above.
-        `SELECT m.message_id, m.conversation_id, m.role,
-                coalesce(m.large_content, m.content) AS content,
-                m.token_count, m.created_at
+        `SELECT m.message_id, m.conversation_id, m.role, m.content, m.token_count, m.created_at
            FROM messages m
            WHERE ${fallbackFilters.join(" AND ")}
            ORDER BY datetime(m.created_at) DESC

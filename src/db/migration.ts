@@ -932,6 +932,9 @@ export function runLcmMigrations(
   const log = options?.log;
   const seedPrompts = options?.seedDefaultPrompts !== false; // default true
   let transactionActive = false;
+  // v4.2 adversarial review P1: prevent instant SQLITE_BUSY when the
+  // gateway has a writer in flight on the live DB.
+  try { db.exec(`PRAGMA busy_timeout = 30000`); } catch { /* best-effort */ }
   db.exec(`BEGIN EXCLUSIVE`);
   transactionActive = true;
 
