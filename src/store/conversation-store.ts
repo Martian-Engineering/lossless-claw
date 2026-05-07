@@ -43,6 +43,14 @@ export type MessageRecord = {
   content: string;
   tokenCount: number;
   createdAt: Date;
+  /**
+   * v4.2 §B — non-null when the row has been stratified into a
+   * stubbable payload via lcm-blob-migrate.mjs. Stores the externalized
+   * `file_xxx` id (in `large_files`); the assembler reads this to
+   * decide whether an evictable tool result can be replaced with a
+   * compact `[LCM Tool Output: file_xxx | …]` reference.
+   */
+  largeContent: string | null;
 };
 
 export type CreateMessagePartInput = {
@@ -133,6 +141,9 @@ interface MessageRow {
   content: string;
   token_count: number;
   created_at: string;
+  // v4.2 §B — sidecar fileId column. Optional in row shape because not
+  // every SELECT projects it; mappers tolerate undefined → null.
+  large_content?: string | null;
 }
 
 interface MessageSearchRow {
@@ -184,6 +195,7 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
 
 function toMessageRecord(row: MessageRow): MessageRecord {
   return {
+    largeContent: row.large_content ?? null,
     messageId: row.message_id,
     conversationId: row.conversation_id,
     seq: row.seq,
@@ -532,7 +544,7 @@ export class ConversationStore {
 
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow;
@@ -549,7 +561,7 @@ export class ConversationStore {
        VALUES (?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
-      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages WHERE message_id = ?`,
     );
 
@@ -583,7 +595,7 @@ export class ConversationStore {
     if (limit != null) {
       const rows = this.db
         .prepare(
-          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
          FROM messages
          WHERE conversation_id = ? AND seq > ?
          ORDER BY seq
@@ -595,7 +607,7 @@ export class ConversationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages
        WHERE conversation_id = ? AND seq > ?
        ORDER BY seq`,
@@ -607,7 +619,7 @@ export class ConversationStore {
   async getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -656,7 +668,7 @@ export class ConversationStore {
   async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
@@ -948,7 +960,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC
@@ -1016,7 +1028,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC`,

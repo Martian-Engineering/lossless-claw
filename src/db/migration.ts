@@ -243,6 +243,30 @@ function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
   }
 }
 
+/**
+ * v4.2 §B — stub-tier stratification: the `large_content` sidecar column.
+ *
+ * Stratifies the messages row into a thread-metadata tier (always emitted)
+ * and a payload tier (elided to a stub when outside the fresh tail). The
+ * column is NULL by default; populated by `scripts/lcm-blob-migrate.mjs`
+ * for tool messages whose content exceeds the bytewise threshold. When
+ * non-NULL it stores the externalized `file_xxx` id (reusing the v4.1
+ * `large_files` storage model) — NOT a content copy. `messages.content`
+ * remains lossless and unchanged so all existing readers keep working
+ * without schema awareness.
+ *
+ * The assembler reads `large_content IS NOT NULL` to decide whether a
+ * given evictable tool result is stubbable. Drilldown via the existing
+ * `lcm_describe(id="file_xxx")` path.
+ */
+function ensureMessageLargeContentColumn(db: DatabaseSync): void {
+  const cols = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasLargeContent = cols.some((c) => c.name === "large_content");
+  if (!hasLargeContent) {
+    db.exec(`ALTER TABLE messages ADD COLUMN large_content TEXT`);
+  }
+}
+
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
@@ -808,6 +832,9 @@ export function runLcmMigrations(
 ): void {
   const log = options?.log;
   let transactionActive = false;
+  // v4.2 adversarial review P1: prevent instant SQLITE_BUSY when the
+  // gateway has a writer in flight on the live DB.
+  try { db.exec(`PRAGMA busy_timeout = 30000`); } catch { /* best-effort */ }
   db.exec(`BEGIN EXCLUSIVE`);
   transactionActive = true;
 
@@ -1048,6 +1075,11 @@ export function runLcmMigrations(
     runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
     runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
       ensureMessageIdentityHashColumn(db),
+    );
+    // v4.2 §B — messages.large_content sidecar column for stub-tier
+    // stratification. Idempotent additive ALTER; safe across versions.
+    runMigrationStep("ensureMessageLargeContentColumn", log, () =>
+      ensureMessageLargeContentColumn(db),
     );
     // Belt-and-suspenders: ensure message_parts exists even if the bulk
     // CREATE TABLE block above was interrupted before reaching it.

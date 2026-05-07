@@ -8,6 +8,7 @@ import type {
 } from "./store/conversation-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import { formatToolOutputReference } from "./large-files.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssemblySegment = "evictable" | "freshTail";
@@ -138,6 +139,13 @@ export interface AssembleContextInput {
   promptAwareEviction?: boolean;
   /** Optional stable boundary for orphan tool-call stripping during hot-cache epochs. */
   orphanStrippingOrdinal?: number;
+  /**
+   * v4.2 §B — when true, evictable tool messages whose row carries a
+   * non-null `large_content` sidecar are replaced with a compact stub
+   * before the budget pass. Fresh-tail messages are never stubbed.
+   * Default: false (full v4.1 behavior).
+   */
+  stubLargeToolPayloads?: boolean;
 }
 
 export interface AssembleContextResult {
@@ -172,6 +180,8 @@ export interface AssembleContextResult {
     preSanitizeMessagesHash: string;
     finalMessagesHash: string;
     overflowDiagnostics: AssemblyOverflowDiagnostics;
+    /** v4.2 §B — number of evictable items rewritten to stubs. */
+    stubStats?: { stubbedCount: number; tokensSaved: number };
   };
 }
 
@@ -781,6 +791,80 @@ function hashMessages(messages: AgentMessage[]): string {
   return createHash("sha256").update(JSON.stringify(messages)).digest("hex").slice(0, 16);
 }
 
+/**
+ * v4.2 §B (Option C) — render the stub for an evictable tool-result whose
+ * row was externalized to `large_files` (its `messages.large_content`
+ * stores the file_xxx id). Reuses the v4.1 `formatToolOutputReference`
+ * format so the agent sees the same `[LCM Tool Output: …]` shape it has
+ * encountered in production for months — known drilldown path,
+ * `lcm_describe(id="file_xxx")`, with conversation scoping and
+ * suppression filtering already wired up.
+ */
+function buildToolPayloadStub(
+  fileId: string,
+  toolName: string | undefined,
+  byteSize: number,
+  summary?: string,
+): { content: string; tokens: number } {
+  const content = formatToolOutputReference({
+    fileId,
+    toolName,
+    byteSize,
+    summary: summary ?? "",
+  });
+  const tokens = estimateTokens(content);
+  return { content, tokens };
+}
+
+/**
+ * v4.2 §B (Option C) — walk an evictable item list and replace payload-tier
+ * tool-result messages with the v4.1 `[LCM Tool Output: file_xxx …]` reference.
+ *
+ * Skip rules (post-adversarial-review):
+ *  - Item must have a `fileId` (i.e. `messages.large_content` set + lookup hit).
+ *  - Item's `messageId` must be present (defense-in-depth).
+ *  - Item's `message.role` must be `"toolResult"`. Legacy rows that
+ *    `resolveMessageItem` downgrades to `"assistant"` (DB role 'tool' but no
+ *    toolCallId) are NOT stubbed: there's no upstream `tool_use` to pair with,
+ *    so emitting a tool-output reference would create a phantom drilldown.
+ *  - Multi-block tool_result content (`Array<{type, ...}>`) is replaced as a
+ *    1-element text-block array so we preserve the array shape Anthropic
+ *    expects, instead of collapsing to a string. (P1 fix.)
+ */
+function applyStubSubstitution(
+  evictable: ResolvedItem[],
+): { stubbedCount: number; tokensSaved: number } {
+  let stubbedCount = 0;
+  let tokensSaved = 0;
+  for (const item of evictable) {
+    if (!item.fileId) continue;
+    if (item.messageId == null) continue;
+    if (item.message.role !== "toolResult") continue;
+
+    const stub = buildToolPayloadStub(
+      item.fileId,
+      item.stubToolName,
+      item.fileByteSize ?? 0,
+      item.fileSummary,
+    );
+
+    const oldTokens = item.tokens;
+    const wasArray = Array.isArray(item.message.content);
+    const newContent = wasArray
+      ? ([{ type: "text", text: stub.content }] as unknown as typeof item.message.content)
+      : (stub.content as unknown as typeof item.message.content);
+    item.message = {
+      ...(item.message as object),
+      content: newContent,
+    } as AgentMessage;
+    item.tokens = stub.tokens;
+    item.text = stub.content;
+    stubbedCount += 1;
+    tokensSaved += Math.max(0, oldTokens - stub.tokens);
+  }
+  return { stubbedCount, tokensSaved };
+}
+
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
@@ -872,6 +956,21 @@ interface ResolvedItem {
   sourceRole?: MessageRole;
   /** Source summary record when this item resolves a summary. */
   summary?: SummaryRecord;
+  /**
+   * v4.2 §B (Option C) — externalized `file_xxx` id for this row's
+   * tool-result payload, set by the migration tool. Non-null marks the
+   * item as stubbable when stubLargeToolPayloads is enabled and the
+   * item is outside the fresh tail. Drilldown via lcm_describe(id=fileId).
+   */
+  fileId?: string;
+  /** v4.2 §B — byte size of the externalized payload (from `large_files.byte_size`). */
+  fileByteSize?: number;
+  /** v4.2 §B — `tool_name` resolved from message_parts; flows into the stub label. */
+  stubToolName?: string;
+  /** v4.2 §B — toolCallId carried for tool_use ↔ tool_result pairing checks. */
+  stubToolCallId?: string;
+  /** v4.2 §B — optional exploration summary (lazy-generated; null in v4.2.0). */
+  fileSummary?: string;
 }
 
 function topContributors(
@@ -1157,6 +1256,15 @@ export class ContextAssembler {
     const evictable = resolved.filter((item) => item.ordinal < freshTailOrdinal);
     const freshTail = baseFreshTail;
 
+    // v4.2 §B — stub-tier substitution. Replace evictable tool-result
+    // payloads (rows with `large_content` populated) with compact stubs
+    // BEFORE the budget pass so the budget sees the smaller token
+    // footprint. Fresh-tail items are protected and never substituted.
+    let stubStats = { stubbedCount: 0, tokensSaved: 0 };
+    if (input.stubLargeToolPayloads === true) {
+      stubStats = applyStubSubstitution(evictable);
+    }
+
     // Step 4: Budget-aware selection
     // First, compute the token cost of the fresh tail (always included).
     let tailTokens = 0;
@@ -1327,6 +1435,7 @@ export class ContextAssembler {
         preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
         finalMessagesHash: hashMessages(repaired),
         overflowDiagnostics,
+        stubStats,
       },
     };
   }
@@ -1403,6 +1512,26 @@ export class ContextAssembler {
       typeof content === "string" ? content : (JSON.stringify(content) ?? msg.content);
     const tokenCount = estimateTokens(contentText);
 
+    // v4.2 §B (Option C) — `messages.large_content` now stores the
+    // externalized `file_xxx` id, not a content copy. When present, look
+    // up `large_files` for byteSize / summary so applyStubSubstitution
+    // can build the v4.1 [LCM Tool Output: …] reference.
+    const fileIdFromSidecar =
+      typeof msg.largeContent === "string" && msg.largeContent.startsWith("file_")
+        ? msg.largeContent
+        : null;
+    let fileMeta: { byteSize: number; summary?: string } | null = null;
+    if (fileIdFromSidecar) {
+      const fileRow = await this.summaryStore.getLargeFile(fileIdFromSidecar);
+      if (fileRow) {
+        fileMeta = {
+          byteSize: fileRow.byteSize ?? 0,
+          summary: fileRow.explorationSummary ?? undefined,
+        };
+      }
+    }
+    const stubEligible = fileIdFromSidecar != null && fileMeta != null && role === "toolResult";
+
     // Cast: these are reconstructed from DB storage, not live agent messages,
     // so they won't carry the full AgentMessage metadata (timestamp, usage, etc.)
     return {
@@ -1440,6 +1569,11 @@ export class ContextAssembler {
       messageId: msg.messageId,
       seq: msg.seq,
       sourceRole: msg.role,
+      ...(stubEligible && fileIdFromSidecar ? { fileId: fileIdFromSidecar } : {}),
+      ...(stubEligible && fileMeta ? { fileByteSize: fileMeta.byteSize } : {}),
+      ...(stubEligible && fileMeta?.summary ? { fileSummary: fileMeta.summary } : {}),
+      ...(stubEligible && toolName ? { stubToolName: toolName } : {}),
+      ...(stubEligible && toolCallId ? { stubToolCallId: toolCallId } : {}),
     };
   }
 

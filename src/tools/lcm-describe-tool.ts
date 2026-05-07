@@ -95,7 +95,11 @@ export function createLcmDescribeTool(input: {
       "Look up metadata and content for an LCM item by ID. " +
       "Use this to inspect summaries (sum_xxx) or stored files (file_xxx) " +
       "from compacted conversation history. Returns summary content, lineage, " +
-      "token counts, and file exploration results.",
+      "token counts, and file exploration results. " +
+      "ALSO USE THIS when you see a `[LCM Tool Output: file_xxx | tool=… | N bytes]` " +
+      "reference in the conversation — that means an older tool result was elided " +
+      "for context efficiency. Call lcm_describe(id=file_xxx) to fetch the original " +
+      "output before answering questions that depend on its specifics.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
