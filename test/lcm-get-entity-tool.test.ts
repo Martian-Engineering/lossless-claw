@@ -179,14 +179,21 @@ describe("createLcmGetEntityTool — happy path", () => {
     const db = setupDb();
     insertSummary(db, "sum_1");
     insertSummary(db, "sum_2");
+    insertSummary(db, "sum_3");
     // Wave-10 reviewer P2 fix follow-up: this test inserts its own
     // mentions explicitly, so opt out of the default-mention auto-insert.
+    // Wave-12 reviewer P1 fix: aggregates are recomputed from
+    // unsuppressed mentions so insertEntity's stored
+    // occurrence_count/alternate_surfaces are no longer authoritative;
+    // the test pulls them from the actual mention rows. Add a "VoyageAI"
+    // surface mention so the alternate-surfaces list contains a non-
+    // canonical surface form.
     insertEntity(db, {
       entityId: "ent_voyage",
       canonicalText: "Voyage",
       entityType: "tool",
-      occurrenceCount: 2,
-      alternateSurfaces: ["voyage", "VoyageAI"],
+      occurrenceCount: 99, // ignored — recomputed from visible mentions
+      alternateSurfaces: ["stale-pre-recompute"], // ignored
       noDefaultMention: true,
     });
     insertMention(db, {
@@ -201,6 +208,12 @@ describe("createLcmGetEntityTool — happy path", () => {
       summaryId: "sum_2",
       surfaceForm: "voyage",
     });
+    insertMention(db, {
+      mentionId: "m3",
+      entityId: "ent_voyage",
+      summaryId: "sum_3",
+      surfaceForm: "VoyageAI",
+    });
 
     const tool = createLcmGetEntityTool({
       deps: makeDeps(),
@@ -213,19 +226,26 @@ describe("createLcmGetEntityTool — happy path", () => {
       entityId: string;
       name: string;
       entityType: string;
+      totalOccurrences: number;
+      alternateSurfaces: string[];
       mentions: Array<{ mentionId: string; summaryId: string }>;
     };
     expect(details.found).toBe(true);
     expect(details.entityId).toBe("ent_voyage");
     expect(details.name).toBe("Voyage");
     expect(details.entityType).toBe("tool");
-    expect(details.mentions).toHaveLength(2);
-    expect(details.mentions.map((m) => m.mentionId).sort()).toEqual(["m1", "m2"]);
+    expect(details.mentions).toHaveLength(3);
+    expect(details.mentions.map((m) => m.mentionId).sort()).toEqual(["m1", "m2", "m3"]);
+    // Aggregates recomputed from mentions, not from stored entity row.
+    expect(details.totalOccurrences).toBe(3);
+    // Alternate surfaces strips canonical "Voyage" (case-insensitive),
+    // leaving distinct non-canonical forms.
+    expect(details.alternateSurfaces.sort()).toEqual(["VoyageAI"]);
 
     const text = (r.content[0] as { text: string }).text;
     expect(text).toContain("## Entity: Voyage");
-    expect(text).toContain("**Total occurrences**: 2");
-    expect(text).toContain("**Alternate surfaces**: voyage, VoyageAI");
+    expect(text).toContain("**Total occurrences**: 3");
+    expect(text).toContain("**Alternate surfaces**: VoyageAI");
 
     db.close();
   });
@@ -301,9 +321,74 @@ describe("createLcmGetEntityTool — suppression", () => {
     };
     expect(details.mentions).toHaveLength(1);
     expect(details.mentions[0]!.mentionId).toBe("m_visible");
-    // Total occurrences is the entity-row column, NOT the agent-visible count.
-    // Both surfaced so the agent knows hidden mentions exist.
-    expect(details.totalOccurrences).toBe(2);
+    // Wave-12 reviewer P1 fix: total occurrences is now recomputed from
+    // unsuppressed mentions only. Previously this read the stored
+    // entity-row column (which includes suppressed counts) — which leaks
+    // an oracle handle revealing that hidden mentions exist. Now suppression
+    // means invisible-to-agent, period: agent-visible = 1 (one
+    // unsuppressed mention), totalOccurrences = 1 (recomputed).
+    expect(details.totalOccurrences).toBe(1);
+    db.close();
+  });
+
+  it("INVARIANT: aggregates (first_seen, last_seen, alternate_surfaces, first_seen_in) are recomputed from unsuppressed mentions (Wave-12 reviewer P1)", async () => {
+    // Pre-fix: entity row aggregates included suppressed-mention data,
+    // leaking surface forms first introduced in suppressed leaves and
+    // exposing summary IDs of suppressed leaves via first_seen_in_summary_id.
+    // Post-fix: every aggregate is computed live from the JOIN with
+    // unsuppressed summaries.
+    const db = setupDb();
+    // Suppressed leaf 7 days ago, surface form only used here.
+    insertSummary(db, "sum_suppressed_old", "sk1", 1, new Date().toISOString());
+    db.prepare(`UPDATE summaries SET created_at = datetime('now', '-7 days') WHERE summary_id = 'sum_suppressed_old'`).run();
+    // Visible leaf 1 day ago.
+    insertSummary(db, "sum_visible_recent");
+    db.prepare(`UPDATE summaries SET created_at = datetime('now', '-1 day') WHERE summary_id = 'sum_visible_recent'`).run();
+    insertEntity(db, {
+      entityId: "ent_x",
+      canonicalText: "ProjectAlpha",
+      occurrenceCount: 99, // stale stored count; ignored after fix
+      noDefaultMention: true,
+    });
+    // Hidden mention with a unique surface form — must NOT appear post-fix.
+    insertMention(db, {
+      mentionId: "m_hidden_old",
+      entityId: "ent_x",
+      summaryId: "sum_suppressed_old",
+      surfaceForm: "alpha-secret-codename",
+    });
+    db.prepare(`UPDATE lcm_entity_mentions SET mentioned_at = datetime('now', '-7 days') WHERE mention_id = 'm_hidden_old'`).run();
+    // Visible mention with canonical surface form.
+    insertMention(db, {
+      mentionId: "m_visible_recent",
+      entityId: "ent_x",
+      summaryId: "sum_visible_recent",
+      surfaceForm: "ProjectAlpha",
+    });
+    db.prepare(`UPDATE lcm_entity_mentions SET mentioned_at = datetime('now', '-1 day') WHERE mention_id = 'm_visible_recent'`).run();
+
+    const tool = createLcmGetEntityTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine(db) as never,
+      sessionKey: "sk1",
+    });
+    const r = await tool.execute("c", { name: "ProjectAlpha" });
+    const details = r.details as {
+      totalOccurrences: number;
+      alternateSurfaces: string[];
+      firstSeenInSummaryId: string | null;
+      firstSeenAt: string;
+      lastSeenAt: string;
+    };
+    // Aggregates should reflect ONLY the visible mention.
+    expect(details.totalOccurrences).toBe(1);
+    expect(details.firstSeenInSummaryId).toBe("sum_visible_recent");
+    // 'alpha-secret-codename' was only in the suppressed leaf — must not appear.
+    expect(details.alternateSurfaces).not.toContain("alpha-secret-codename");
+    // first_seen_at = last_seen_at = visible mention's mentioned_at (1d ago).
+    // Both should match each other; 7d-ago suppressed mention must not pull
+    // first_seen_at backward.
+    expect(details.firstSeenAt).toBe(details.lastSeenAt);
     db.close();
   });
 });

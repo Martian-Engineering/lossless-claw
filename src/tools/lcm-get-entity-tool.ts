@@ -179,23 +179,21 @@ export function createLcmGetEntityTool(input: {
 
       // 5. Look up the entity (COLLATE NOCASE).
       // Wave-10 reviewer P2 fix: previously this returned the entity row
-      // even when ALL its mentions had been suppressed via /lcm purge —
-      // canonical_text + alternate_surfaces + metadata leaked. Add an
-      // EXISTS guard requiring at least one unsuppressed mention so
-      // suppression contract holds: "suppression means invisible to
-      // agents, period." Operators wanting the audit-mode view (see
-      // suppressed entities directly) must do so via raw SQL, not the
-      // agent-facing tool.
+      // even when ALL its mentions had been suppressed via /lcm purge.
+      // Wave-12 reviewer P1 fix: even with the EXISTS guard, the
+      // aggregate columns (occurrence_count, first/last_seen_*,
+      // alternate_surfaces, first_seen_in_summary_id) were read directly
+      // from `lcm_entities` — they include suppressed-mention data.
+      // Recompute aggregates from the unsuppressed mention join. Now
+      // suppression contract is fully clean: "suppression means
+      // invisible to agents, period" (no oracle handles via aggregate
+      // columns either). The CTE join also implicitly enforces the
+      // EXISTS guard — if no unsuppressed mention, no row in entity_agg
+      // → no row returned. Operators wanting audit-mode view must use
+      // raw SQL.
       const entityFilters: string[] = [
         "e.session_key = ?",
         "e.canonical_text = ? COLLATE NOCASE",
-        // EXISTS guard: at least one mention whose summary is not suppressed.
-        `EXISTS (
-           SELECT 1 FROM lcm_entity_mentions m
-             JOIN summaries s ON s.summary_id = m.summary_id
-             WHERE m.entity_id = e.entity_id
-               AND s.suppressed_at IS NULL
-         )`,
       ];
       const entityBinds: (string | number)[] = [effectiveSessionKey, name];
       if (entityTypeFilter) {
@@ -204,12 +202,38 @@ export function createLcmGetEntityTool(input: {
       }
       const entity = db
         .prepare(
-          `SELECT e.entity_id, e.session_key, e.canonical_text, e.entity_type,
-                  e.first_seen_at, e.last_seen_at, e.first_seen_in_summary_id,
-                  e.occurrence_count, e.alternate_surfaces, e.metadata
+          `WITH visible_mentions AS (
+             SELECT m.entity_id, m.summary_id, m.surface_form, m.mentioned_at
+               FROM lcm_entity_mentions m
+               JOIN summaries s ON s.summary_id = m.summary_id
+              WHERE s.suppressed_at IS NULL
+           ),
+           entity_agg AS (
+             SELECT
+               vm.entity_id,
+               COUNT(*) AS occ_count,
+               MIN(vm.mentioned_at) AS first_at,
+               MAX(vm.mentioned_at) AS last_at,
+               (SELECT vm2.summary_id
+                  FROM visible_mentions vm2
+                  WHERE vm2.entity_id = vm.entity_id
+                  ORDER BY vm2.mentioned_at ASC, vm2.summary_id ASC
+                  LIMIT 1) AS first_in,
+               json_group_array(DISTINCT vm.surface_form) AS visible_surfaces
+              FROM visible_mentions vm
+             GROUP BY vm.entity_id
+           )
+           SELECT e.entity_id, e.session_key, e.canonical_text, e.entity_type,
+                  ea.first_at AS first_seen_at,
+                  ea.last_at  AS last_seen_at,
+                  ea.first_in AS first_seen_in_summary_id,
+                  ea.occ_count AS occurrence_count,
+                  ea.visible_surfaces AS alternate_surfaces,
+                  e.metadata
              FROM lcm_entities e
-             WHERE ${entityFilters.join(" AND ")}
-             LIMIT 1`,
+             JOIN entity_agg ea ON ea.entity_id = e.entity_id
+            WHERE ${entityFilters.join(" AND ")}
+            LIMIT 1`,
         )
         .get(...entityBinds) as EntityRow | undefined;
 
@@ -253,7 +277,15 @@ export function createLcmGetEntityTool(input: {
         // through unknown.
         .all(entity.entity_id, mentionLimit) as unknown as MentionRow[];
 
-      const altSurfaces = safeJsonParse<string[]>(entity.alternate_surfaces) ?? [];
+      // Wave-12 reviewer P1 fix: alternate_surfaces is now the
+      // recomputed distinct set from unsuppressed mentions only.
+      // Strip the canonical form so the list shows only *alternate*
+      // surfaces (matches the column's intent + parity with stored
+      // representation).
+      const allSurfaces = safeJsonParse<string[]>(entity.alternate_surfaces) ?? [];
+      const altSurfaces = allSurfaces.filter(
+        (s) => s.localeCompare(entity.canonical_text, undefined, { sensitivity: "base" }) !== 0,
+      );
       const metadata = safeJsonParse<Record<string, unknown>>(entity.metadata) ?? {};
 
       // 7. Markdown rendering for tool output
@@ -276,7 +308,15 @@ export function createLcmGetEntityTool(input: {
       if (mentions.length === 0) {
         lines.push("_No agent-visible mentions (all may be in suppressed leaves)._");
       } else {
-        lines.push(`### Mentions (${mentions.length} of ${entity.occurrence_count})`);
+        // Wave-12 reviewer P1: occurrence_count is now visible-only, so
+        // length === occurrence_count when not truncated by mentionLimit.
+        // Show "(N of M)" only when truncation actually happened.
+        const truncated = mentions.length < entity.occurrence_count;
+        lines.push(
+          truncated
+            ? `### Mentions (${mentions.length} of ${entity.occurrence_count})`
+            : `### Mentions (${mentions.length})`,
+        );
         lines.push("");
         for (const m of mentions) {
           lines.push(

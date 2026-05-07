@@ -212,25 +212,61 @@ describe("createLcmSearchEntitiesTool — match modes", () => {
 
 describe("createLcmSearchEntitiesTool — ranking and limits", () => {
   it("ranks by occurrence_count DESC, then last_seen_at DESC", async () => {
+    // Wave-12 reviewer P1 fix: occurrence_count + last_seen_at are now
+    // recomputed from unsuppressed mentions, so the test must seed real
+    // mentions instead of relying on the stored entity-row column.
     const db = setupDb();
-    insertEntity(db, {
-      entityId: "e_low",
-      canonicalText: "TopicA",
-      occurrenceCount: 1,
-      lastSeenAt: new Date().toISOString(),
-    });
-    insertEntity(db, {
-      entityId: "e_high",
-      canonicalText: "TopicB",
-      occurrenceCount: 50,
-      lastSeenAt: new Date(Date.now() - 86400_000).toISOString(),
-    });
-    insertEntity(db, {
-      entityId: "e_med",
-      canonicalText: "TopicC",
-      occurrenceCount: 50,
-      lastSeenAt: new Date().toISOString(),
-    });
+    const seedEntityWithMentions = (
+      entityId: string,
+      canonicalText: string,
+      mentionCount: number,
+      lastMentionAt: string,
+    ): void => {
+      insertEntity(db, {
+        entityId,
+        canonicalText,
+        occurrenceCount: mentionCount,
+        lastSeenAt: lastMentionAt,
+        noDefaultMention: true,
+      });
+      // Ensure conversation exists.
+      const convRow = db
+        .prepare(`SELECT conversation_id FROM conversations WHERE session_key = ? LIMIT 1`)
+        .get("sk1") as { conversation_id: number } | undefined;
+      let convId = convRow?.conversation_id;
+      if (convId == null) {
+        const result = db
+          .prepare(`INSERT INTO conversations (session_id, session_key) VALUES (?, ?)`)
+          .run("s_sk1", "sk1");
+        convId = Number(result.lastInsertRowid);
+      }
+      // First N-1 mentions back-dated; final mention at lastMentionAt to
+      // pin MAX(mentioned_at) deterministically.
+      for (let i = 0; i < mentionCount; i++) {
+        const sumId = `sum_${entityId}_${i}`;
+        const mentionedAt = i === mentionCount - 1
+          ? lastMentionAt
+          : new Date(Date.parse(lastMentionAt) - (mentionCount - i) * 1000).toISOString();
+        db.prepare(
+          `INSERT OR IGNORE INTO summaries
+             (summary_id, conversation_id, kind, content, token_count, session_key, suppressed_at)
+           VALUES (?, ?, 'leaf', 'fixture', 1, 'sk1', NULL)`,
+        ).run(sumId, convId);
+        db.prepare(
+          `INSERT INTO lcm_entity_mentions
+             (mention_id, entity_id, summary_id, surface_form, span_start, span_end, mentioned_at)
+           VALUES (?, ?, ?, ?, 0, 5, ?)`,
+        ).run(`m_${entityId}_${i}`, entityId, sumId, canonicalText, mentionedAt);
+      }
+    };
+    seedEntityWithMentions("e_low", "TopicA", 1, new Date().toISOString());
+    seedEntityWithMentions(
+      "e_high",
+      "TopicB",
+      50,
+      new Date(Date.now() - 86400_000).toISOString(),
+    );
+    seedEntityWithMentions("e_med", "TopicC", 50, new Date().toISOString());
 
     const tool = createLcmSearchEntitiesTool({
       deps: makeDeps(),

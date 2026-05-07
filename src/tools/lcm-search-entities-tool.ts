@@ -216,15 +216,43 @@ export function createLcmSearchEntitiesTool(input: {
         binds.push(entityTypeFilter);
       }
 
+      // Wave-12 reviewer P1 fix: rank + display aggregates from
+      // unsuppressed mentions only (mirrors lcm_get_entity). Without the
+      // CTE, occurrence_count + last_seen_at + alternate_surfaces leak
+      // suppressed-mention data, ranking biases toward heavily-suppressed
+      // entities, and surface forms first introduced in suppressed leaves
+      // remain visible. The CTE join also acts as the visible-mentions
+      // gate (no unsuppressed mention → entity hidden, mirroring the
+      // EXISTS guard already in get-entity).
       // Rank: most-occurrences first, then most-recent. Cap at `limit`.
       const rows = db
         .prepare(
-          `SELECT e.entity_id, e.canonical_text, e.entity_type,
-                  e.first_seen_at, e.last_seen_at, e.occurrence_count, e.alternate_surfaces
+          `WITH visible_mentions AS (
+             SELECT m.entity_id, m.summary_id, m.surface_form, m.mentioned_at
+               FROM lcm_entity_mentions m
+               JOIN summaries s ON s.summary_id = m.summary_id
+              WHERE s.suppressed_at IS NULL
+           ),
+           entity_agg AS (
+             SELECT
+               vm.entity_id,
+               COUNT(*) AS occ_count,
+               MIN(vm.mentioned_at) AS first_at,
+               MAX(vm.mentioned_at) AS last_at,
+               json_group_array(DISTINCT vm.surface_form) AS visible_surfaces
+              FROM visible_mentions vm
+             GROUP BY vm.entity_id
+           )
+           SELECT e.entity_id, e.canonical_text, e.entity_type,
+                  ea.first_at AS first_seen_at,
+                  ea.last_at  AS last_seen_at,
+                  ea.occ_count AS occurrence_count,
+                  ea.visible_surfaces AS alternate_surfaces
              FROM lcm_entities e
-             WHERE ${filters.join(" AND ")}
-             ORDER BY e.occurrence_count DESC, e.last_seen_at DESC
-             LIMIT ?`,
+             JOIN entity_agg ea ON ea.entity_id = e.entity_id
+            WHERE ${filters.join(" AND ")}
+            ORDER BY ea.occ_count DESC, ea.last_at DESC
+            LIMIT ?`,
         )
         // Wave-9 TS-tightening: route through unknown (Record<string,
         // SQLOutputValue>[] doesn't overlap EntityRow strictly).
@@ -306,15 +334,24 @@ export function createLcmSearchEntitiesTool(input: {
           totalMatches: rows.length,
           limitReached: rows.length === limit,
           catalogStatus,
-          entities: rows.map((r) => ({
-            entityId: r.entity_id,
-            canonicalText: r.canonical_text,
-            entityType: r.entity_type,
-            firstSeenAt: r.first_seen_at,
-            lastSeenAt: r.last_seen_at,
-            occurrenceCount: r.occurrence_count,
-            alternateSurfaces: safeJsonParse<string[]>(r.alternate_surfaces) ?? [],
-          })),
+          entities: rows.map((r) => {
+            const allSurfaces = safeJsonParse<string[]>(r.alternate_surfaces) ?? [];
+            // Strip canonical (the recomputed list captures all distinct
+            // forms incl. canonical itself). See parity comment in
+            // lcm_get_entity for rationale.
+            const altSurfaces = allSurfaces.filter(
+              (s) => s.localeCompare(r.canonical_text, undefined, { sensitivity: "base" }) !== 0,
+            );
+            return {
+              entityId: r.entity_id,
+              canonicalText: r.canonical_text,
+              entityType: r.entity_type,
+              firstSeenAt: r.first_seen_at,
+              lastSeenAt: r.last_seen_at,
+              occurrenceCount: r.occurrence_count,
+              alternateSurfaces: altSurfaces,
+            };
+          }),
         },
       };
         },
