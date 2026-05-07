@@ -40,6 +40,10 @@
       "label": "Prompt-Aware Eviction",
       "help": "When enabled, budget-constrained assembly keeps older context by prompt relevance instead of pure chronology. This can improve recall under tight budgets, but it can also reduce provider prompt-cache hit rates because the preserved prefix changes as prompts change."
     },
+    "stubLargeToolPayloads": {
+      "label": "Stub Large Tool Payloads (v4.2)",
+      "help": "When enabled, evictable tool-result rows whose payload was externalized via lcm-blob-migrate are replaced with a [LCM Tool Output: file_xxx | …] reference at assemble time. Fresh tail is never stubbed. The agent recovers the original output via lcm_describe(id=file_xxx, expandFile=true). Default off; requires running scripts/lcm-blob-migrate.mjs first to populate messages.large_content."
+    },
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",
       "help": "Maximum source tokens per leaf compaction chunk before summarization"
@@ -266,6 +270,9 @@
         "minimum": 0
       },
       "promptAwareEviction": {
+        "type": "boolean"
+      },
+      "stubLargeToolPayloads": {
         "type": "boolean"
       },
       "leafChunkTokens": {

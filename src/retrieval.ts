@@ -1,5 +1,12 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
+import {
+  closeSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
+import { resolve as resolvePath, sep as pathSep } from "node:path";
 import type {
   ConversationStore,
   MessageRecord,
@@ -233,42 +240,58 @@ export class RetrievalEngine {
     //      portion + `contentTruncated: true`.
     let content: string | null = null;
     let contentTruncated = false;
-    if (options?.expandFile === true && file.storageUri) {
+    // Wave-3 P3 fix: refuse expansion when largeFilesDir is unset in
+    // production. Test mocks pass it explicitly; production goes through
+    // configView.largeFilesDir which is always populated post-resolver.
+    if (options?.expandFile === true && file.storageUri && options.largeFilesDir) {
       try {
         const maxBytes = Math.max(1024, Math.min(
           options.expandFileMaxBytes ?? 32_768,
           512_000, // hard cap: 500 KB regardless of caller request
         ));
-        // Path validation: ensure the resolved absolute path lives under
-        // the configured large-files dir. Anything outside is rejected
-        // (could indicate a moved storage dir or a tampered DB row).
-        const safeRoot = options.largeFilesDir
-          ? resolvePath(options.largeFilesDir)
-          : null;
-        const target = resolvePath(file.storageUri);
-        const safeRootOk = safeRoot ? target.startsWith(safeRoot + "/") || target === safeRoot : true;
-        if (safeRootOk && existsSync(target)) {
-          const stat = statSync(target);
-          if (stat.size <= maxBytes) {
-            content = readFileSync(target, "utf8");
-          } else {
-            // Read just the head; mark truncated so the agent knows
-            // there's more to fetch via lcm_grep.
-            const buf = Buffer.alloc(maxBytes);
-            const fs = await import("node:fs");
-            const fd = fs.openSync(target, "r");
-            try {
-              fs.readSync(fd, buf, 0, maxBytes, 0);
-            } finally {
-              fs.closeSync(fd);
+        // Path validation v2 (Wave-3 P1):
+        //   1. realpathSync resolves symlinks. lexical resolvePath did
+        //      NOT — a symlink at <storageDir>/file_x.txt -> /etc/passwd
+        //      would have passed the prefix check.
+        //   2. Compare with `path.sep` separator (not hardcoded "/")
+        //      so the check works on Windows too (P1 portability).
+        //   3. Single openSync + fstatSync closes the TOCTOU window
+        //      (P2). All subsequent ops use the file descriptor, not
+        //      the path.
+        const safeRoot = realpathSync(resolvePath(options.largeFilesDir));
+        const realTarget = realpathSync(resolvePath(file.storageUri));
+        const safeRootOk =
+          realTarget === safeRoot || realTarget.startsWith(safeRoot + pathSep);
+        if (safeRootOk) {
+          const fd = openSync(realTarget, "r");
+          try {
+            const stat = fstatSync(fd);
+            if (stat.size <= maxBytes) {
+              content = readFileSync(fd, "utf8");
+            } else {
+              // Read just the head. Wave-3 P1 fix: scan back from the
+              // cap to the last UTF-8 codepoint boundary so we don't
+              // emit U+FFFD mojibake from a split multi-byte sequence.
+              const buf = Buffer.alloc(maxBytes);
+              readSync(fd, buf, 0, maxBytes, 0);
+              let safeEnd = maxBytes;
+              while (safeEnd > 0) {
+                const b = buf[safeEnd - 1];
+                if ((b & 0x80) === 0) break;             // ASCII
+                if ((b & 0xc0) === 0xc0) { safeEnd -= 1; break; } // start byte
+                safeEnd -= 1;                             // continuation
+                if (maxBytes - safeEnd > 4) break;        // bounded
+              }
+              content = buf.subarray(0, safeEnd).toString("utf8");
+              contentTruncated = true;
             }
-            content = buf.toString("utf8");
-            contentTruncated = true;
+          } finally {
+            try { closeSync(fd); } catch { /* fd already closed */ }
           }
         }
       } catch {
-        // Disk read failed — fall back to metadata-only describe. Caller
-        // can still see byteSize and explorationSummary.
+        // Disk read failed (file missing on disk after orphaning, perm
+        // denied, realpath rejected). Fall back to metadata-only.
         content = null;
       }
     }

@@ -24,7 +24,7 @@
  */
 
 import { existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve as resolvePath, sep as pathSep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
@@ -115,64 +115,64 @@ const inputLookupStmt = db.prepare(
 );
 
 /**
- * Wave-2 P0-C fix: redact common credential patterns before persisting
- * the disambiguator into `large_files.exploration_summary`. These will
- * appear in EVERY assemble — the original ephemeral nature of tool
- * outputs (where commands could be evicted under budget pressure) is
- * lost when promoted into a stub summary. Redact aggressively.
- */
-function redactCredentials(s) {
-  if (typeof s !== "string") return s;
-  return s
-    // SSH/identity-file flag pointing at a secret path
-    .replace(/(-i\s+)\S*secret\S*/gi, "$1<REDACTED:identity-file>")
-    .replace(/(-i\s+)\S*\.openclaw\/secrets\S*/gi, "$1<REDACTED:identity-file>")
-    .replace(/(-i\s+)\S*\.ssh\/[^\s]*id_(?:rsa|ed25519|ecdsa)[^\s]*/gi, "$1<REDACTED:ssh-key>")
-    // Bearer / Authorization tokens
-    .replace(/\b(Authorization:\s*Bearer\s+)\S+/gi, "$1<REDACTED:bearer>")
-    .replace(/\b(-H\s+["']?Authorization:\s*Bearer\s+)\S+/gi, "$1<REDACTED:bearer>")
-    // AWS access key id (format: AKIA + 16 alnums)
-    .replace(/\bAKIA[0-9A-Z]{16}\b/g, "<REDACTED:aws-key-id>")
-    // GitHub-style PATs
-    .replace(/\bgh[ps]_[A-Za-z0-9]{30,}\b/g, "<REDACTED:github-pat>")
-    // Anthropic / OpenAI style keys
-    .replace(/\b(sk-(?:ant-)?(?:proj-|live-|oat\d+-)?)[A-Za-z0-9_-]{20,}/g, "$1<REDACTED>")
-    // Postgres / DB URLs with embedded passwords (scheme://user:pw@host)
-    .replace(/(\b[a-z][a-z0-9+\-.]*:\/\/[^:\/\s@]+:)[^@\s]+(@)/gi, "$1<REDACTED:db-pass>$2")
-    // API key env-var assignment style ((name)_API_KEY=value)
-    .replace(/\b(([A-Z][A-Z0-9_]*?_)?(?:API_KEY|TOKEN|SECRET))=\S+/g, "$1=<REDACTED>");
-}
-
-/**
- * Render a one-line disambiguator from a JSON tool_input. The agent only
- * needs enough to match a user reference like "the bash command from
- * earlier" or "your read of foo.json"; full input is in lcm_describe.
+ * Render a one-line disambiguator from a JSON tool_input.
  *
- * Wave-2 P0-C: command field is truncated to 80 chars (was 240) AND run
- * through `redactCredentials` so persisted summary doesn't leak secrets.
+ * Wave-3 P0 fix: previous strategy of redacting commands via regex
+ * patterns leaked ~half the patterns it claimed to catch (lowercase
+ * variants, --identity-file=, Basic/Token auth schemes, JSON-quoted
+ * forms, mid-string env-var assignments). Replaced with a fail-closed
+ * design: only the LOW-RISK input shapes propagate to the persisted
+ * `exploration_summary` (which appears in every assemble). Commands,
+ * URLs, and unknown JSON shapes are deliberately elided here — the
+ * agent can still call `lcm_describe(id=file_xxx, expandFile=true)`
+ * to retrieve the full input + output.
+ *
+ * Low-risk shapes (preserved, since they help the agent disambiguate):
+ *   - tool=Read with input.path        → "Tool: Read | Path: /foo/bar"
+ *   - tool=Grep with input.pattern     → "Tool: Grep | Pattern: ..."
+ *   - tool=process with input.sessionId → "Tool: process | Session: ..."
+ *
+ * Higher-risk shapes (elided to avoid leaking creds in stubs):
+ *   - command (bash/exec)              → "Tool: exec | (command elided)"
+ *   - url                              → "Tool: <name> | (URL elided)"
+ *   - any other shape                  → "Tool: <name>" only
+ *
+ * Path keys ARE preserved because file paths rarely contain creds; an
+ * operator with a path like "/home/user/.ssh/id_rsa" is asking for it
+ * to be visible since they're operating on it. But arguments to bash
+ * /ssh/curl/etc. routinely include API tokens, identity files, signed
+ * URLs — so we strip those entirely rather than guess at redaction.
  */
 function renderToolInputDisambiguator(rawInput, toolName) {
   if (typeof rawInput !== "string" || rawInput.length === 0) return null;
   let inp;
   try { inp = JSON.parse(rawInput); } catch { return null; }
   if (!inp || typeof inp !== "object") return null;
-  const oneLine = (s, n = 200) =>
-    String(s).split(/\r?\n/)[0].slice(0, n) + (String(s).length > n ? " …" : "");
-  if (typeof inp.path === "string") return `Tool: ${toolName} | Path: ${inp.path}`;
-  if (typeof inp.command === "string") {
-    return `Tool: ${toolName} | Command: ${redactCredentials(oneLine(inp.command, 80))}`;
+  if (typeof inp.path === "string") {
+    // Truncate to 240 chars to bound display length without losing
+    // the disambiguating tail of long paths.
+    const path = inp.path.length > 240 ? `${inp.path.slice(0, 237)}…` : inp.path;
+    return `Tool: ${toolName} | Path: ${path}`;
   }
   if (typeof inp.pattern === "string") {
-    const scope = inp.path ? ` | Path: ${inp.path}` : "";
-    return `Tool: ${toolName} | Pattern: ${oneLine(inp.pattern, 160)}${scope}`;
+    const pattern = inp.pattern.length > 160 ? `${inp.pattern.slice(0, 157)}…` : inp.pattern;
+    const scope = typeof inp.path === "string" ? ` | Path: ${inp.path}` : "";
+    return `Tool: ${toolName} | Pattern: ${pattern}${scope}`;
   }
   if (typeof inp.sessionId === "string") {
-    return `Tool: ${toolName} | Action: ${inp.action ?? "(unknown)"} | Session: ${inp.sessionId}`;
+    const action = typeof inp.action === "string" ? inp.action : "(unknown)";
+    return `Tool: ${toolName} | Action: ${action} | Session: ${inp.sessionId}`;
   }
-  if (typeof inp.url === "string") return `Tool: ${toolName} | URL: ${inp.url}`;
-  // Fallback: dump the keys + first value as a hint.
-  const keys = Object.keys(inp).slice(0, 4).join(",");
-  return `Tool: ${toolName} | Input keys: ${keys}`;
+  // Wave-3 P0: command/url and unknown shapes are deliberately elided.
+  // Don't even include the keys list — key names like
+  // ANTHROPIC_API_KEY in a JSON property leak operational topology.
+  if (typeof inp.command === "string") {
+    return `Tool: ${toolName} | (command elided for security; use lcm_describe with expandFile=true for full content)`;
+  }
+  if (typeof inp.url === "string") {
+    return `Tool: ${toolName} | (URL elided for security; use lcm_describe with expandFile=true for full content)`;
+  }
+  return `Tool: ${toolName}`;
 }
 const candidatesStmt = db.prepare(candidatesSql);
 const candidates = limit ? candidatesStmt.all(thresholdBytes, limit) : candidatesStmt.all(thresholdBytes);
@@ -190,14 +190,23 @@ const summary = {
 if (dryRun) { console.log(JSON.stringify(summary, null, 2)); db.close(); process.exit(0); }
 
 if (revert) {
-  // Wave-2 P1: complete reversibility — undo a previous migration.
-  // Identifies migration-marked rows (large_content starts with `file_`),
-  // looks up storage_uri from large_files, deletes the on-disk file,
-  // deletes the large_files row, and clears the messages.large_content.
+  // Wave-2 P1 + Wave-3 P1: complete reversibility — undo a previous
+  // migration. Defenses against the "wrong DB" footgun:
+  //   1. SELECT JOINs with `LIKE 'file_%'` — INNER JOIN ensures we only
+  //      touch rows that actually have a matching `large_files` entry.
+  //   2. Validate every `storage_uri` is under `--storage-dir` BEFORE
+  //      unlinking. Snapshots / backups whose rows point at a different
+  //      storage dir are silently skipped (with a count in `errors`).
+  //   3. Commit DB changes BEFORE unlink, so a kill mid-run leaves
+  //      consistent DB state (the orphan files self-recover on next
+  //      revert because LIKE 'file_%' won't match cleared rows).
+  //   4. Honor --dry-run by reporting intended actions without writing.
   const revertSummary = {
-    db: dbPath, dryRun: false, mode: "revert",
-    rowsCleared: 0, filesDeleted: 0, largeFilesRowsDeleted: 0, errors: [],
+    db: dbPath, dryRun, mode: "revert", storageDir,
+    candidateCount: 0, rowsCleared: 0, filesDeleted: 0, largeFilesRowsDeleted: 0,
+    skippedOutOfStorageDir: 0, errors: [],
   };
+  const safeRoot = resolvePath(storageDir);
   const revertCandidates = db
     .prepare(
       `SELECT m.message_id, m.large_content AS file_id, lf.storage_uri
@@ -206,22 +215,45 @@ if (revert) {
        WHERE m.large_content LIKE 'file_%'`,
     )
     .all();
+  revertSummary.candidateCount = revertCandidates.length;
+
+  if (dryRun) {
+    // Show what WOULD happen, no writes.
+    for (const row of revertCandidates) {
+      const target = row.storage_uri ? resolvePath(row.storage_uri) : "";
+      const inSafeRoot = target === safeRoot || target.startsWith(safeRoot + pathSep);
+      if (!inSafeRoot) revertSummary.skippedOutOfStorageDir++;
+    }
+    console.log(JSON.stringify(revertSummary, null, 2));
+    db.close();
+    process.exit(0);
+  }
+
   try {
+    // Stage filenames to unlink AFTER COMMIT — wave-3 P2 fix:
+    // pre-COMMIT unlink left silent-degradation if process killed
+    // between unlink and commit. Now DB is sole source of truth at
+    // crash; on next revert, large_files row is gone so file isn't
+    // referenced (orphan, but harmless).
+    const filesToUnlink = [];
     db.exec("BEGIN");
     const clearMsgStmt = db.prepare(`UPDATE messages SET large_content = NULL WHERE message_id = ?`);
     const deleteFileStmt = db.prepare(`DELETE FROM large_files WHERE file_id = ?`);
     for (const row of revertCandidates) {
-      // Delete the disk file first; if SQL ROLLBACKs after this, the
-      // file is gone but DB still references it — that's the same
-      // "orphan" failure mode as forward-migration, but in reverse.
-      // Acceptable because revert is operator-driven and recoverable.
-      try {
-        if (row.storage_uri && existsSync(row.storage_uri)) {
-          unlinkSync(row.storage_uri);
-          revertSummary.filesDeleted++;
+      if (row.storage_uri) {
+        const target = resolvePath(row.storage_uri);
+        const inSafeRoot = target === safeRoot || target.startsWith(safeRoot + pathSep);
+        if (inSafeRoot) {
+          filesToUnlink.push(target);
+        } else {
+          revertSummary.skippedOutOfStorageDir++;
+          revertSummary.errors.push(
+            `skipped ${row.storage_uri}: outside --storage-dir ${storageDir}`,
+          );
+          // Don't delete the DB row either — preserve the operator's
+          // intent. They can re-run with the correct --storage-dir.
+          continue;
         }
-      } catch (err) {
-        revertSummary.errors.push(`unlink ${row.storage_uri}: ${err}`);
       }
       deleteFileStmt.run(row.file_id);
       revertSummary.largeFilesRowsDeleted++;
@@ -229,6 +261,17 @@ if (revert) {
       revertSummary.rowsCleared++;
     }
     db.exec("COMMIT");
+    // Now unlink the files whose DB rows we successfully cleared.
+    for (const target of filesToUnlink) {
+      try {
+        if (existsSync(target)) {
+          unlinkSync(target);
+          revertSummary.filesDeleted++;
+        }
+      } catch (err) {
+        revertSummary.errors.push(`unlink ${target}: ${err}`);
+      }
+    }
   } catch (err) {
     try { db.exec("ROLLBACK"); } catch { /* noop */ }
     revertSummary.errors.push(String(err?.stack ?? err));
@@ -241,6 +284,7 @@ if (revert) {
   db.close();
   process.exit(0);
 }
+
 
 if (!existsSync(storageDir)) {
   // Wave-2 P1: 0700 so other users on the box can't list filenames.
