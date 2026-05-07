@@ -144,6 +144,22 @@ export type LcmConfig = {
   pruneHeartbeatOk: boolean;
   /** When true, maintain() may rewrite transcript entries for transcript GC. */
   transcriptGcEnabled: boolean;
+  /**
+   * Operator opt-in for the agent-triggered `lcm_compact` tool.
+   *
+   * When false (default), agents calling `lcm_compact` get a structured
+   * "operator-disabled" response. The tool is always REGISTERED so the
+   * agent learns it exists and can recommend the operator enable it,
+   * rather than silently failing with "tool not found".
+   *
+   * When true, agents may proactively compact context mid-turn within
+   * the tool's safety gates (50% reserve floor, cache-hot deferral,
+   * 2-calls-per-5-min cap). See src/tools/lcm-compact-tool.ts.
+   *
+   * Set via env `LCM_AGENT_COMPACTION_TOOL_ENABLED=true` or plugin
+   * config field of the same name.
+   */
+  agentCompactionToolEnabled: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
   /** Automatically rotate LCM-managed session JSONL files that exceed a size ceiling. */
@@ -514,6 +530,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
           ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"
           : toBool(pc.transcriptGcEnabled) ?? false,
+      agentCompactionToolEnabled:
+        env.LCM_AGENT_COMPACTION_TOOL_ENABLED !== undefined
+          ? env.LCM_AGENT_COMPACTION_TOOL_ENABLED === "true"
+          : toBool(pc.agentCompactionToolEnabled) ?? false,
       proactiveThresholdCompactionMode,
       autoRotateSessionFiles: {
         enabled:

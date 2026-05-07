@@ -21,6 +21,7 @@ import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmGetEntityTool } from "../tools/lcm-get-entity-tool.js";
 import { createLcmSearchEntitiesTool } from "../tools/lcm-search-entities-tool.js";
+import { createLcmCompactTool } from "../tools/lcm-compact-tool.js";
 import { createLcmSemanticRecallTool } from "../tools/lcm-semantic-recall-tool.js";
 import { createLcmSynthesizeAroundTool } from "../tools/lcm-synthesize-around-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
@@ -2427,6 +2428,21 @@ function wirePluginHandlers(
     (ctx) =>
       createLcmSearchEntitiesTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
     { name: "lcm_search_entities" },
+  );
+  // Wave-14: agent-triggered LCM compaction. Always REGISTERED (so agents
+  // learn it exists and can recommend operator-enable on disabled-state),
+  // but execution is gated on `agentCompactionToolEnabled` config flag
+  // (default false). See src/tools/lcm-compact-tool.ts for the tool's
+  // safety gates (50% reserve floor, cache-hot deferral, 2-calls-per-5-min cap).
+  api.registerTool(
+    (ctx) =>
+      createLcmCompactTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionId: ctx.sessionId,
+        sessionKey: ctx.sessionKey,
+      }),
+    { name: "lcm_compact" },
   );
 
   api.registerCommand(

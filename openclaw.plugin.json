@@ -16,7 +16,8 @@
       "lcm_expand_query",
       "lcm_get_entity",
       "lcm_search_entities",
-      "lcm_synthesize_around"
+      "lcm_synthesize_around",
+      "lcm_compact"
     ]
   },
   "uiHints": {
@@ -235,6 +236,10 @@
     "fallbackProviders": {
       "label": "Fallback Providers",
       "help": "Explicit fallback provider/model pairs for compaction summarization (e.g., [{\"provider\": \"openai-codex\", \"model\": \"gpt-5.4-mini\"}, {\"provider\": \"anthropic\", \"model\": \"claude-haiku-4-5\"}])"
+    },
+    "agentCompactionToolEnabled": {
+      "label": "Agent Compaction Tool",
+      "help": "Operator opt-in for the agent-triggered lcm_compact tool. When false (default), agents see a structured 'operator-disabled' response. When true, agents may proactively compact context mid-turn (gated by 50% reserve floor, cache-hot deferral, 2-calls-per-5-min cap)."
     }
   },
   "configSchema": {
@@ -429,6 +434,9 @@
         "type": "boolean"
       },
       "transcriptGcEnabled": {
+        "type": "boolean"
+      },
+      "agentCompactionToolEnabled": {
         "type": "boolean"
       },
       "proactiveThresholdCompactionMode": {

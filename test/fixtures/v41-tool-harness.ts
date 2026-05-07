@@ -102,18 +102,87 @@ export function makeTestDeps(
  */
 export function makeTestEngine(
   db: DatabaseSync,
-  opts?: { timezone?: string },
+  opts?: {
+    timezone?: string;
+    /** Test-only override for the gate-state method (lcm_compact tool). */
+    agentCompactionGateState?: (params: {
+      sessionId: string;
+      sessionKey?: string;
+      currentTokenCount?: number;
+      tokenBudget?: number;
+      reserveFraction?: number;
+    }) => Promise<{
+      ownsCompaction: boolean;
+      belowFloor: boolean;
+      cacheHot: boolean;
+      shouldRefuse: boolean;
+      refusalReason?: "engine-unhealthy" | "below-floor" | "cache-hot";
+      refusalNote?: string;
+      contextRatio?: number;
+    }>;
+    /** Test-only override for compact() (lcm_compact tool). */
+    compactImpl?: (params: unknown) => Promise<{ ok: boolean; compacted?: boolean; reason?: string }>;
+  },
 ): LcmContextEngine {
   const fts5Available = true;
   const conversationStore = new ConversationStore(db, { fts5Available });
   const summaryStore = new SummaryStore(db, { fts5Available });
   const retrieval = new RetrievalEngine(conversationStore, summaryStore);
+  // Default gate-state impl: fast in-process that mimics the real engine's
+  // floor + cacheHot logic without needing the full telemetry plumbing.
+  const defaultGateState = async (params: {
+    sessionId: string;
+    sessionKey?: string;
+    currentTokenCount?: number;
+    tokenBudget?: number;
+    reserveFraction?: number;
+  }) => {
+    const reserveFraction = (() => {
+      const r = params.reserveFraction;
+      if (typeof r !== "number" || !Number.isFinite(r)) return 0.5;
+      return Math.max(0.5, Math.min(1.0, r));
+    })();
+    const haveBudget =
+      typeof params.tokenBudget === "number"
+      && Number.isFinite(params.tokenBudget)
+      && params.tokenBudget > 0;
+    const haveCurrent =
+      typeof params.currentTokenCount === "number"
+      && Number.isFinite(params.currentTokenCount)
+      && params.currentTokenCount >= 0;
+    const contextRatio = haveBudget && haveCurrent
+      ? params.currentTokenCount! / params.tokenBudget!
+      : undefined;
+    const belowFloor = contextRatio !== undefined && contextRatio < reserveFraction;
+    if (belowFloor) {
+      return {
+        ownsCompaction: true,
+        belowFloor: true,
+        cacheHot: false,
+        shouldRefuse: true,
+        refusalReason: "below-floor" as const,
+        refusalNote: `Context is at ${(contextRatio! * 100).toFixed(1)}% of budget — below the ${(reserveFraction * 100).toFixed(0)}% floor. No need to compact yet; chained tool calls have headroom.`,
+        contextRatio,
+      };
+    }
+    return {
+      ownsCompaction: true,
+      belowFloor: false,
+      cacheHot: false,
+      shouldRefuse: false,
+      contextRatio,
+    };
+  };
   return {
-    info: { id: "lcm", name: "LCM", version: "0.0.0-test" },
+    info: { id: "lcm", name: "LCM", version: "0.0.0-test", ownsCompaction: true },
     timezone: opts?.timezone ?? "UTC",
     getDb: () => db,
     getRetrieval: () => retrieval,
     getConversationStore: () => conversationStore,
     getSummaryStore: () => summaryStore,
+    getAgentCompactionGateState: opts?.agentCompactionGateState ?? defaultGateState,
+    compact:
+      opts?.compactImpl
+      ?? (async () => ({ ok: true, compacted: false, reason: "no conversation found" })),
   } as unknown as LcmContextEngine;
 }
