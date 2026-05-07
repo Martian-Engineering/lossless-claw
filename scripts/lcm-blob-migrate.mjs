@@ -71,14 +71,55 @@ if (filesCols.length === 0) {
   process.exit(1);
 }
 
+// Pull the tool_call_id off this row's parts so we can JOIN back to the
+// preceding assistant tool_use and lift its `tool_input` into the
+// large_files row's `exploration_summary`. Option F: gives the agent
+// a disambiguator it can match to a user's natural-language reference
+// ("the ripgrep against openclaw-ui-source", "the read of foo.json",
+// etc.) without seeing the assistant tool_use block.
 const candidatesSql = `
   SELECT m.message_id, m.conversation_id, length(m.content) AS bytes, m.content,
          (SELECT mp.tool_name FROM message_parts mp
-            WHERE mp.message_id = m.message_id AND mp.tool_name IS NOT NULL LIMIT 1) AS tool_name
+            WHERE mp.message_id = m.message_id AND mp.tool_name IS NOT NULL LIMIT 1) AS tool_name,
+         (SELECT mp.tool_call_id FROM message_parts mp
+            WHERE mp.message_id = m.message_id AND mp.tool_call_id IS NOT NULL LIMIT 1) AS tool_call_id
   FROM messages m
   WHERE m.role = 'tool' AND m.large_content IS NULL AND length(m.content) > ?
   ORDER BY bytes DESC ${limit ? "LIMIT ?" : ""}
 `;
+// JOIN: given a tool_call_id, find the assistant tool_use that produced
+// it and return the tool_input. Same tool_call_id appears on both sides
+// of the pairing; we want the row with tool_input set.
+const inputLookupStmt = db.prepare(
+  `SELECT tool_input FROM message_parts WHERE tool_call_id = ? AND tool_input IS NOT NULL LIMIT 1`,
+);
+
+/**
+ * Render a one-line disambiguator from a JSON tool_input. The agent only
+ * needs enough to match a user reference like "the bash command from
+ * earlier" or "your read of foo.json"; full input is in lcm_describe.
+ */
+function renderToolInputDisambiguator(rawInput, toolName) {
+  if (typeof rawInput !== "string" || rawInput.length === 0) return null;
+  let inp;
+  try { inp = JSON.parse(rawInput); } catch { return null; }
+  if (!inp || typeof inp !== "object") return null;
+  const oneLine = (s, n = 200) =>
+    String(s).split(/\r?\n/)[0].slice(0, n) + (String(s).length > n ? " …" : "");
+  if (typeof inp.path === "string") return `Tool: ${toolName} | Path: ${inp.path}`;
+  if (typeof inp.command === "string") return `Tool: ${toolName} | Command: ${oneLine(inp.command, 240)}`;
+  if (typeof inp.pattern === "string") {
+    const scope = inp.path ? ` | Path: ${inp.path}` : "";
+    return `Tool: ${toolName} | Pattern: ${oneLine(inp.pattern, 160)}${scope}`;
+  }
+  if (typeof inp.sessionId === "string") {
+    return `Tool: ${toolName} | Action: ${inp.action ?? "(unknown)"} | Session: ${inp.sessionId}`;
+  }
+  if (typeof inp.url === "string") return `Tool: ${toolName} | URL: ${inp.url}`;
+  // Fallback: dump the keys + first value as a hint.
+  const keys = Object.keys(inp).slice(0, 4).join(",");
+  return `Tool: ${toolName} | Input keys: ${keys}`;
+}
 const candidatesStmt = db.prepare(candidatesSql);
 const candidates = limit ? candidatesStmt.all(thresholdBytes, limit) : candidatesStmt.all(thresholdBytes);
 log(`candidates: ${candidates.length}`);
@@ -98,7 +139,7 @@ if (!existsSync(storageDir)) { mkdirSync(storageDir, { recursive: true }); log(`
 const CHUNK = 200;
 const insertFileStmt = db.prepare(
   `INSERT INTO large_files (file_id, conversation_id, file_name, mime_type, byte_size, storage_uri, exploration_summary)
-   VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+   VALUES (?, ?, ?, ?, ?, ?, ?)`,
 );
 const updateMsgStmt = db.prepare(`UPDATE messages SET large_content = ? WHERE message_id = ?`);
 
@@ -112,7 +153,17 @@ try {
       const fileName = `tool-output-${row.message_id}.txt`;
       const storageUri = join(storageDir, `${fileId}.txt`);
       writeFileSync(storageUri, row.content);
-      insertFileStmt.run(fileId, row.conversation_id, fileName, "text/plain", row.bytes, storageUri);
+      // Option F: lift tool_input into exploration_summary so the
+      // assembler's [LCM Tool Output: …] reference carries an
+      // agent-recognizable disambiguator.
+      let inputSummary = null;
+      if (row.tool_call_id) {
+        const inpRow = inputLookupStmt.get(row.tool_call_id);
+        if (inpRow?.tool_input) {
+          inputSummary = renderToolInputDisambiguator(inpRow.tool_input, row.tool_name ?? "tool");
+        }
+      }
+      insertFileStmt.run(fileId, row.conversation_id, fileName, "text/plain", row.bytes, storageUri, inputSummary);
       updateMsgStmt.run(fileId, row.message_id);
       summary.filesWritten += 1;
     }
