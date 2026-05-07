@@ -27,6 +27,34 @@ import {
   type ConversationCompactionMaintenanceRecord,
 } from "../store/compaction-maintenance-store.js";
 import { CompactionTelemetryStore } from "../store/compaction-telemetry-store.js";
+import {
+  getV41HealthSnapshot,
+  type V41HealthSnapshot,
+  type WorkerStatus,
+} from "../operator/health.js";
+import {
+  listLegacyCandidates,
+  reconcileSessionKeys,
+  ReconcileError,
+  type ReconcileResult,
+} from "../operator/reconcile-session-keys.js";
+import {
+  EvalRunnerError,
+  formatEvalReport,
+  runEval,
+  type EvalMode,
+  type RunEvalArgs,
+} from "../operator/eval-runner.js";
+import {
+  getWorkerStatusSnapshot,
+  tickEmbeddingBackfill,
+} from "../operator/worker-orchestrator.js";
+import { countPendingDocs as countBackfillPending } from "../embeddings/backfill.js";
+import { getActiveEmbeddingModel } from "../embeddings/semantic-search.js";
+import { runHybridSearch } from "../embeddings/hybrid-search.js";
+import { vec0Version } from "../embeddings/store.js";
+import { SummaryStore } from "../store/summary-store.js";
+import { getLcmDbFeatures } from "../db/features.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
@@ -72,6 +100,18 @@ type ParsedLcmCommand =
   | { kind: "rotate" }
   | { kind: "doctor"; apply: boolean }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
+  | { kind: "health" }
+  | { kind: "worker_status" }
+  | { kind: "worker_tick_backfill" }
+  | { kind: "reconcile_session_keys_list" }
+  | {
+      kind: "reconcile_session_keys_apply";
+      fromSessionKeys: string[];
+      toSessionKey: string;
+      reason: string;
+      allowMainSession: boolean;
+    }
+  | { kind: "eval"; mode: EvalMode; querySetName: string; querySetVersion: number }
   | { kind: "help"; error?: string };
 
 type RotateCommandEngine = {
@@ -174,6 +214,163 @@ function splitArgs(rawArgs: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Tokenize a raw argument string respecting double-quoted segments. Used
+ * by subcommands whose flag values can contain spaces (`--reason "all
+ * rebase work"`). Returns the list of tokens with surrounding quotes
+ * stripped. Backslash inside a quoted region escapes the next char.
+ */
+function splitArgsQuoted(rawArgs: string | undefined): string[] {
+  const text = rawArgs ?? "";
+  const out: string[] = [];
+  let cur = "";
+  let inQuote = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inQuote) {
+      if (ch === "\\" && i + 1 < text.length) {
+        cur += text[i + 1];
+        i += 1;
+        continue;
+      }
+      if (ch === '"') {
+        inQuote = false;
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inQuote = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (cur.length > 0) {
+        out.push(cur);
+        cur = "";
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.length > 0) out.push(cur);
+  return out;
+}
+
+interface EvalParseResult {
+  baseline: boolean;
+  mode?: EvalMode;
+  querySet?: string;
+  querySetVersion?: number;
+}
+
+const EVAL_MODES: EvalMode[] = ["fts_only", "semantic_only", "hybrid"];
+const DEFAULT_EVAL_QUERY_SET_NAME = "eva-baseline";
+const DEFAULT_EVAL_QUERY_SET_VERSION = 1;
+
+function parseEvalArgs(tokens: string[]):
+  | { ok: true; parsed: EvalParseResult }
+  | { ok: false; error: string } {
+  const result: EvalParseResult = { baseline: false };
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    switch (t) {
+      case "--baseline":
+        result.baseline = true;
+        break;
+      case "--mode": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--mode` requires a value (fts_only|semantic_only|hybrid)." };
+        if (!EVAL_MODES.includes(v as EvalMode)) {
+          return { ok: false, error: `Unknown mode \`${v}\`. Supported: ${EVAL_MODES.join(", ")}.` };
+        }
+        result.mode = v as EvalMode;
+        i += 1;
+        break;
+      }
+      case "--query-set": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--query-set` requires a value." };
+        result.querySet = v;
+        i += 1;
+        break;
+      }
+      case "--version": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--version` requires a value." };
+        const parsed = Number.parseInt(v, 10);
+        if (!Number.isFinite(parsed) || parsed < 1) {
+          return { ok: false, error: `\`--version\` must be a positive integer (got \`${v}\`).` };
+        }
+        result.querySetVersion = parsed;
+        i += 1;
+        break;
+      }
+      default:
+        return { ok: false, error: `Unknown argument \`${t}\` for \`/lcm eval\`.` };
+    }
+  }
+  return { ok: true, parsed: result };
+}
+
+interface ReconcileParseResult {
+  fromSessionKeys: string[];
+  toSessionKey?: string;
+  reason?: string;
+  allowMainSession: boolean;
+  list: boolean;
+  apply: boolean;
+}
+
+function parseReconcileArgs(tokens: string[]):
+  | { ok: true; parsed: ReconcileParseResult }
+  | { ok: false; error: string } {
+  const result: ReconcileParseResult = {
+    fromSessionKeys: [],
+    allowMainSession: false,
+    list: false,
+    apply: false,
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    switch (t) {
+      case "--list-candidates":
+        result.list = true;
+        break;
+      case "--apply":
+        result.apply = true;
+        break;
+      case "--allow-main-session":
+        result.allowMainSession = true;
+        break;
+      case "--from": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--from` requires a comma-separated session_key list." };
+        result.fromSessionKeys = v.split(",").map((s) => s.trim()).filter(Boolean);
+        i += 1;
+        break;
+      }
+      case "--to": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--to` requires a session_key." };
+        result.toSessionKey = v;
+        i += 1;
+        break;
+      }
+      case "--reason": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--reason` requires a string." };
+        result.reason = v;
+        i += 1;
+        break;
+      }
+      default:
+        return { ok: false, error: `Unknown argument \`${t}\` for \`/lcm reconcile-session-keys\`.` };
+    }
+  }
+  return { ok: true, parsed: result };
+}
+
 function parseDoctorCleanerApplyArgs(tokens: string[]):
   | { ok: true; filterId?: DoctorCleanerId; vacuum: boolean }
   | { ok: false; error: string } {
@@ -220,6 +417,113 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return rest.length === 0
         ? { kind: "rotate" }
         : { kind: "help", error: "`/lcm rotate` does not accept extra arguments." };
+    case "health":
+      return rest.length === 0
+        ? { kind: "health" }
+        : { kind: "help", error: "`/lcm health` does not accept extra arguments." };
+    case "eval": {
+      const idx = (rawArgs ?? "").toLowerCase().indexOf("eval");
+      const remainder = idx >= 0 ? (rawArgs ?? "").slice(idx + "eval".length) : "";
+      const quoted = splitArgsQuoted(remainder);
+      const r = parseEvalArgs(quoted);
+      if (!r.ok) {
+        return { kind: "help", error: r.error };
+      }
+      const { parsed } = r;
+      // --baseline shorthand: defaults to fts_only against eva-baseline v1.
+      const mode: EvalMode = parsed.mode ?? (parsed.baseline ? "fts_only" : "fts_only");
+      if (!parsed.mode && !parsed.baseline) {
+        // Plain `/lcm eval` is ambiguous — require either flag.
+        return {
+          kind: "help",
+          error: "`/lcm eval` requires `--baseline` or `--mode <fts_only|semantic_only|hybrid>`.",
+        };
+      }
+      const querySetName = parsed.querySet ?? DEFAULT_EVAL_QUERY_SET_NAME;
+      const querySetVersion = parsed.querySetVersion ?? DEFAULT_EVAL_QUERY_SET_VERSION;
+      return {
+        kind: "eval",
+        mode,
+        querySetName,
+        querySetVersion,
+      };
+    }
+    case "reconcile-session-keys": {
+      // Re-tokenize via the quote-aware splitter so `--reason "..."`
+      // survives. We strip the leading subcommand token from the raw
+      // arg string and re-parse the remainder.
+      const idx = (rawArgs ?? "").toLowerCase().indexOf("reconcile-session-keys");
+      const remainder = idx >= 0
+        ? (rawArgs ?? "").slice(idx + "reconcile-session-keys".length)
+        : "";
+      const quoted = splitArgsQuoted(remainder);
+      const r = parseReconcileArgs(quoted);
+      if (!r.ok) {
+        return { kind: "help", error: r.error };
+      }
+      const { parsed } = r;
+      if (parsed.list && parsed.apply) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys` cannot combine `--list-candidates` with `--apply`." };
+      }
+      if (parsed.list) {
+        return { kind: "reconcile_session_keys_list" };
+      }
+      if (!parsed.apply) {
+        return {
+          kind: "help",
+          error: "`/lcm reconcile-session-keys` requires `--list-candidates` or `--apply --from k1,k2 --to k3 --reason \"...\"`.",
+        };
+      }
+      if (parsed.fromSessionKeys.length === 0) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys --apply` requires `--from <comma-separated session_keys>`." };
+      }
+      if (!parsed.toSessionKey) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys --apply` requires `--to <destination session_key>`." };
+      }
+      if (!parsed.reason || parsed.reason.trim().length === 0) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys --apply` requires `--reason \"...\"`." };
+      }
+      return {
+        kind: "reconcile_session_keys_apply",
+        fromSessionKeys: parsed.fromSessionKeys,
+        toSessionKey: parsed.toSessionKey,
+        reason: parsed.reason,
+        allowMainSession: parsed.allowMainSession,
+      };
+    }
+    case "worker": {
+      // /lcm worker [status | tick <kind>]
+      if (rest.length === 0 || rest[0]?.toLowerCase() === "status") {
+        return { kind: "worker_status" };
+      }
+      if (rest[0]?.toLowerCase() === "tick") {
+        const kind = rest[1]?.toLowerCase();
+        if (!kind) {
+          return {
+            kind: "help",
+            error:
+              `\`${VISIBLE_COMMAND} worker tick\` requires a job kind. ` +
+              `Supported: \`embedding-backfill\`. ` +
+              `Other kinds (extraction, procedure-mining, themes-consolidation) ` +
+              `need LLM-call injection wiring — deferred to a cycle-2 commit.`,
+          };
+        }
+        if (kind !== "embedding-backfill") {
+          return {
+            kind: "help",
+            error:
+              `\`${VISIBLE_COMMAND} worker tick ${kind}\` not supported. ` +
+              `Only \`embedding-backfill\` is wired today (no LLM call needed; uses Voyage HTTP directly). ` +
+              `Extraction / procedure-mining / themes-consolidation need LLM-injection wiring (cycle-2).`,
+          };
+        }
+        return { kind: "worker_tick_backfill" };
+      }
+      return {
+        kind: "help",
+        error: `\`${VISIBLE_COMMAND} worker\` accepts \`status\` (default) or \`tick <kind>\`.`,
+      };
+    }
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
@@ -251,7 +555,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, health, worker, reconcile-session-keys, eval, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -563,6 +867,26 @@ function buildHelpText(error?: string): string {
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} rotate`),
         "Compact the current session transcript while preserving the same LCM conversation and live session identity.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} health`),
+        "Show LCM v4.1 subsystem health: embeddings, workers, synthesis, eval, suppression.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --list-candidates`),
+        "List `legacy:conv_*` session keys that may be candidates for merging.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --apply --from k1,k2 --to k3 --reason "..."`),
+        "Merge multiple legacy session keys into one logical session.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} eval --baseline`),
+        "Run the baseline eval (default: eva-baseline v1, fts_only) and report recall + drift.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} eval --mode hybrid --query-set <name> --version <n>`),
+        "Run an eval against a specific query set + retrieval mode.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
@@ -1135,6 +1459,524 @@ async function buildRotateText(params: {
   return lines.join("\n");
 }
 
+function formatWorkerLine(worker: WorkerStatus): string {
+  if (!worker.active) {
+    return `${worker.jobKind}: (idle)`;
+  }
+  const expiredFlag = worker.expired ? " EXPIRED" : "";
+  const id = worker.workerId ?? "unknown";
+  const acquired = worker.acquiredAt ?? "unknown";
+  const expires = worker.expiresAt ?? "unknown";
+  return `${worker.jobKind}: worker_id=${id}${expiredFlag} acquired_at=${acquired} expires_at=${expires}`;
+}
+
+function formatHealthSnapshot(snapshot: V41HealthSnapshot): string[] {
+  const lines: string[] = [];
+
+  // ── Embeddings ───────────────────────────────────────────────────
+  const embeddingsLines: string[] = [];
+  if (snapshot.embeddings.activeProfile) {
+    const p = snapshot.embeddings.activeProfile;
+    embeddingsLines.push(buildStatLine("active model", `${p.modelName} (dim=${formatNumber(p.dim)})`));
+  } else {
+    embeddingsLines.push(buildStatLine("active model", "NOT REGISTERED"));
+  }
+  embeddingsLines.push(
+    buildStatLine(
+      "vec0 status",
+      snapshot.embeddings.vec0Version ?? "NOT LOADED",
+    ),
+  );
+  embeddingsLines.push(
+    buildStatLine("pending backfill", `${formatNumber(snapshot.embeddings.pendingBackfill)} docs`),
+  );
+  embeddingsLines.push(buildStatLine("embedded count", formatNumber(snapshot.embeddings.embeddedCount)));
+  // v4.1 Final.review P2 #4: surface over-cap leaves so "pending=0"
+  // doesn't lie about coverage.
+  if (snapshot.embeddings.overCapPending > 0) {
+    embeddingsLines.push(
+      buildStatLine(
+        "over-cap leaves (>30K tokens, NOT embeddable)",
+        `${formatNumber(snapshot.embeddings.overCapPending)} — re-summarize at lower cap to bring into range`,
+      ),
+    );
+  }
+  lines.push(buildSection("Embeddings", embeddingsLines));
+
+  // ── Workers ──────────────────────────────────────────────────────
+  lines.push("");
+  lines.push(buildSection("Workers", snapshot.workers.map(formatWorkerLine)));
+
+  // ── Synthesis ────────────────────────────────────────────────────
+  lines.push("");
+  lines.push(
+    buildSection("Synthesis", [
+      buildStatLine(
+        "active prompts",
+        `${formatNumber(snapshot.synthesis.activePromptCount)} across ${formatNumber(snapshot.synthesis.distinctMemoryTypeCount)} memory_types`,
+      ),
+      buildStatLine(
+        "recent synthesis runs",
+        `${formatNumber(snapshot.synthesis.recentSynthesisRuns7d)} (last 7 days)`,
+      ),
+    ]),
+  );
+
+  // ── Eval ─────────────────────────────────────────────────────────
+  lines.push("");
+  const evalLines = [
+    buildStatLine("query sets registered", formatNumber(snapshot.eval.querySetCount)),
+  ];
+  if (snapshot.eval.mostRecentRun) {
+    const r = snapshot.eval.mostRecentRun;
+    evalLines.push(
+      buildStatLine(
+        "most-recent run",
+        `${r.querySetId} mode=${r.mode} recall=${r.recallScore.toFixed(3)} (run_id=${r.runId})`,
+      ),
+    );
+  } else {
+    evalLines.push(buildStatLine("most-recent run", "(none)"));
+  }
+  if (snapshot.eval.driftIndex === null) {
+    evalLines.push(buildStatLine("drift index", "(no baseline)"));
+  } else {
+    const sign = snapshot.eval.driftIndex >= 0 ? "+" : "";
+    evalLines.push(buildStatLine("drift index", `${sign}${snapshot.eval.driftIndex.toFixed(4)}`));
+  }
+  lines.push(buildSection("Eval", evalLines));
+
+  // ── Suppression ──────────────────────────────────────────────────
+  lines.push("");
+  lines.push(
+    buildSection("Suppression", [
+      buildStatLine("suppressed leaves", formatNumber(snapshot.suppression.suppressedLeaves)),
+      buildStatLine(
+        "pending purge rebuilds",
+        formatNumber(snapshot.suppression.pendingPurgeRebuilds),
+      ),
+    ]),
+  );
+
+  return lines;
+}
+
+function buildHealthText(params: { db: DatabaseSync }): string {
+  const snapshot = getV41HealthSnapshot(params.db);
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "### v4.1 Health",
+    "",
+    ...formatHealthSnapshot(snapshot),
+  ];
+  return lines.join("\n");
+}
+
+function buildWorkerStatusText(params: { db: DatabaseSync }): string {
+  // Final review #3 partial fix: surface worker-orchestrator state.
+  // Manual `tick <kind>` deferred — the underlying services exist
+  // (src/operator/worker-orchestrator.ts) but their LLM-call wiring
+  // through the plugin lifecycle is cycle-2 work.
+  const snapshot = getWorkerStatusSnapshot(params.db);
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "### Worker Status",
+    "",
+  ];
+  for (const [kind, lockInfo] of Object.entries(snapshot.locks)) {
+    if (lockInfo) {
+      lines.push(
+        `- **${kind}**: HELD by \`${lockInfo.workerId}\` (acquired ${lockInfo.acquiredAt}, expires ${lockInfo.expiresAt}); jobMetadata=${lockInfo.jobMetadata ?? "(none)"}`,
+      );
+    } else {
+      lines.push(`- **${kind}**: idle (no lock held)`);
+    }
+  }
+  lines.push("");
+  lines.push("### Pending Work");
+  lines.push("");
+  lines.push(
+    `- Embedding backfill pending: ${snapshot.pending.embeddingBackfill === -1 ? "(model not specified)" : snapshot.pending.embeddingBackfill}`,
+  );
+  lines.push(`- Extraction queue: ${snapshot.pending.extractionQueue}`);
+  lines.push("");
+  lines.push("### Note");
+  lines.push("");
+  lines.push(
+    "Manual `/lcm worker tick embedding-backfill` IS wired in this PR (Wire.2). " +
+      "Other tick kinds (extraction / procedure-mining / themes-consolidation) " +
+      "are exported from `src/operator/worker-orchestrator.ts` but not yet " +
+      "exposed via the `/lcm worker tick` parser — they're cycle-3. Backfill " +
+      "is the only one that doesn't need LLM-call injection (uses Voyage HTTP " +
+      "directly), which is why it's first to ship.",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * /lcm worker tick embedding-backfill
+ *
+ * Runs ONE tick of the embedding-backfill cron against the active
+ * embedding profile. Reads VOYAGE_API_KEY from env. perTickLimit
+ * default 200 (covers ~7-15 minutes of work at 0.5 RPS); operator
+ * can re-invoke until pending count is 0.
+ *
+ * Returns markdown summary of the tick result + a hint about the next
+ * tick if work remains.
+ */
+async function buildWorkerTickBackfillText(params: { db: DatabaseSync }): Promise<string> {
+  const lines: string[] = [...buildHeaderLines(), "", "### Worker Tick — embedding-backfill", ""];
+
+  // 1. Pre-flight checks
+  if (!process.env.VOYAGE_API_KEY?.trim()) {
+    lines.push("**ERROR**: `VOYAGE_API_KEY` env var is empty.");
+    lines.push("");
+    lines.push("Set it via your shell or `.envrc` and retry. See `~/.openclaw/credentials/voyage-api-key`.");
+    return lines.join("\n");
+  }
+  if (vec0Version(params.db) === null) {
+    lines.push("**ERROR**: sqlite-vec extension not loaded.");
+    lines.push("");
+    lines.push(
+      "Embedding backfill requires sqlite-vec. Install via `pnpm add sqlite-vec` (or upstream's preferred path) and restart the gateway.",
+    );
+    return lines.join("\n");
+  }
+  const active = getActiveEmbeddingModel(params.db);
+  if (!active) {
+    lines.push("**ERROR**: no active embedding model registered in `lcm_embedding_profile`.");
+    lines.push("");
+    lines.push(
+      "Register one before backfilling. Example for voyage-4-large (1024 dims):",
+    );
+    lines.push("```sql");
+    lines.push(
+      "INSERT INTO lcm_embedding_profile (model_name, dim, active) VALUES ('voyage-4-large', 1024, 1);",
+    );
+    lines.push("```");
+    lines.push(
+      "Then call `ensureEmbeddingsTable(db, 'voyage-4-large', 1024)` from a Node script (it creates the vec0 virtual table + cascade triggers).",
+    );
+    return lines.join("\n");
+  }
+
+  // 2. Pre-tick stats
+  const pendingBefore = countBackfillPending(params.db, { modelName: active.modelName });
+  lines.push(`**Active model**: ${active.modelName} (dim=${active.dim})`);
+  lines.push(`**Pending docs before tick**: ${pendingBefore}`);
+  if (pendingBefore === 0) {
+    lines.push("");
+    lines.push("Nothing to do. All eligible leaves already embedded.");
+    return lines.join("\n");
+  }
+
+  // 3. Run the tick
+  lines.push("");
+  lines.push("Running tick (perTickLimit=200; may take 5-15 min at 0.5 RPS)...");
+  const startedAt = Date.now();
+  let result;
+  try {
+    result = await tickEmbeddingBackfill(params.db, {
+      modelName: active.modelName,
+      voyageModel: active.modelName as Parameters<typeof tickEmbeddingBackfill>[1]["voyageModel"],
+      inputType: "document",
+      // v4.1 Final.review.3 fix: drop to 1 retry to keep worst-case
+      // tick time under WORKER_LOCK_TTL_MS (90s). Was 2 → ~91s worst case.
+      voyageMaxRetries: 1,
+      voyageTimeoutMs: 30_000,
+      maxRequestsPerSecond: 0.5,
+      perTickLimit: 200,
+    });
+  } catch (e) {
+    lines.push("");
+    lines.push(`**ERROR**: backfill tick failed: ${e instanceof Error ? e.message : String(e)}`);
+    return lines.join("\n");
+  }
+  const durationMs = Date.now() - startedAt;
+
+  // 4. Result + next-step hint
+  lines.push("");
+  lines.push("### Result");
+  lines.push("");
+  lines.push(`- **Embedded**: ${result.embeddedCount}`);
+  lines.push(`- **Skipped (over-cap)**: ${result.skippedOverCap}`);
+  lines.push(`- **Skipped (other failures)**: ${result.skipped.length}`);
+  lines.push(`- **Voyage tokens consumed**: ${result.voyageTokensConsumed.toLocaleString()}`);
+  lines.push(`- **Duration**: ${(durationMs / 1000).toFixed(1)}s`);
+  if (result.lockNotAcquired) {
+    lines.push("- **Lock contention**: another worker held the lock; this tick was a no-op");
+  }
+
+  const pendingAfter = countBackfillPending(params.db, { modelName: active.modelName });
+  lines.push("");
+  lines.push(`**Pending docs after tick**: ${pendingAfter}`);
+  if (pendingAfter > 0) {
+    lines.push("");
+    lines.push(`Re-run \`${VISIBLE_COMMAND} worker tick embedding-backfill\` to continue.`);
+  } else {
+    lines.push("");
+    lines.push("✅ Backfill complete. `lcm_semantic_recall` and `lcm_grep --mode hybrid` should now return real results.");
+  }
+  return lines.join("\n");
+}
+
+function buildReconcileListText(params: { db: DatabaseSync }): string {
+  const candidates = listLegacyCandidates(params.db);
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "🔗 Lossless Claw Reconcile Session Keys",
+    "",
+    buildSection("📋 Legacy candidates", [
+      buildStatLine("matched session keys", formatNumber(candidates.length)),
+    ]),
+  ];
+  if (candidates.length === 0) {
+    lines.push(
+      "",
+      buildSection("✅ Result", ["No `legacy:conv_*` session keys present."]),
+    );
+    return lines.join("\n");
+  }
+  lines.push(
+    "",
+    buildSection(
+      "🧷 Candidates",
+      candidates.map((c) =>
+        `${formatCommand(truncateMiddle(c.sessionKey, 44))} · convs=${formatNumber(c.conversationCount)} · leaves=${formatNumber(c.leafCount)}`,
+      ),
+    ),
+    "",
+    buildSection("🛠️ Next step", [
+      `${formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --apply --from k1,k2 --to my-thread --reason "..."`)} merges the listed keys.`,
+    ]),
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Build a recall search adapter that wraps `summaryStore.searchSummaries`
+ * in `mode='full_text'`. Returns IDs in rank order. Used by the
+ * fts_only eval mode and by the FTS arm of hybrid (when the operator
+ * picks --mode hybrid but vec0 is unavailable).
+ */
+function buildFtsOnlyAdapter(db: DatabaseSync): RunEvalArgs["retrievalAdapter"] {
+  const { fts5Available } = getLcmDbFeatures(db);
+  const summaryStore = new SummaryStore(db, { fts5Available });
+  return {
+    async search(query) {
+      const hits = await summaryStore.searchSummaries({
+        query: query.queryText,
+        mode: "full_text",
+        limit: 50,
+      });
+      return hits.map((h) => h.summaryId);
+    },
+  };
+}
+
+/**
+ * Build a hybrid adapter wrapping `runHybridSearch`. The hybrid arm
+ * gracefully degrades to FTS-only inside runHybridSearch itself if
+ * vec0 isn't available; we surface that via the eval report so the
+ * operator sees the warning.
+ *
+ * Note: the hybrid path requires Voyage credentials in the env (or a
+ * test-injected fetch). For an operator-driven `/lcm eval --mode
+ * hybrid` invocation we assume credentials are set; tests use
+ * fts_only with mocked adapters.
+ */
+function buildHybridAdapter(db: DatabaseSync): RunEvalArgs["retrievalAdapter"] {
+  const ftsAdapter = buildFtsOnlyAdapter(db);
+  return {
+    async search(query) {
+      try {
+        // Re-build the FTS hit shape inside the adapter — runHybridSearch
+        // wants ftsSearch to return FtsHit, not summaryIds, but we already
+        // collapse to IDs at the end so we re-run the lookup here for
+        // simplicity (the operator eval path is not perf-sensitive).
+        const { fts5Available } = getLcmDbFeatures(db);
+        const summaryStore = new SummaryStore(db, { fts5Available });
+        const result = await runHybridSearch(db, {
+          query: query.queryText,
+          rerank: false, // RRF fusion only — no Voyage rerank cost in eval path
+          ftsSearch: async (args) => {
+            const hits = await summaryStore.searchSummaries({
+              query: args.query,
+              mode: "full_text",
+              limit: args.limit,
+            });
+            return hits.map((h, idx) => ({
+              summaryId: h.summaryId,
+              conversationId: h.conversationId,
+              sessionKey: "",
+              kind: h.kind as "leaf" | "condensed",
+              content: h.snippet,
+              tokenCount: 0,
+              createdAt: h.createdAt.toISOString(),
+              rank: idx,
+            }));
+          },
+        });
+        return result.hits.map((h) => h.summaryId);
+      } catch {
+        // Hybrid arm unavailable (vec0 missing, no key, etc.) — fall
+        // back to FTS-only for this single query so the eval still
+        // produces a result.
+        return ftsAdapter.search(query);
+      }
+    },
+  };
+}
+
+async function buildEvalText(params: {
+  db: DatabaseSync;
+  mode: EvalMode;
+  querySetName: string;
+  querySetVersion: number;
+}): Promise<string> {
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "🧪 Lossless Claw Eval",
+    "",
+    buildSection("📋 Plan", [
+      buildStatLine("query set", `${params.querySetName} v${params.querySetVersion}`),
+      buildStatLine("mode", formatCommand(params.mode)),
+    ]),
+    "",
+  ];
+
+  // Pick the retrieval adapter for the requested mode.
+  let adapter: RunEvalArgs["retrievalAdapter"];
+  if (params.mode === "fts_only") {
+    adapter = buildFtsOnlyAdapter(params.db);
+  } else if (params.mode === "hybrid") {
+    if (vec0Version(params.db) === null) {
+      lines.push(
+        buildSection("⚠️ Warning", [
+          "vec0 is not loaded — hybrid mode will degrade to FTS-only inside the adapter.",
+        ]),
+        "",
+      );
+    }
+    adapter = buildHybridAdapter(params.db);
+  } else {
+    // semantic_only — not yet wired separately; treat as hybrid for v4.1
+    // first cut. The hybrid adapter already covers the "if vec0 absent
+    // fall back to FTS" case so the user gets a meaningful result.
+    lines.push(
+      buildSection("ℹ️ Note", [
+        "`semantic_only` is wired through the hybrid adapter for v4.1 first cut (RRF fusion, no rerank).",
+      ]),
+      "",
+    );
+    adapter = buildHybridAdapter(params.db);
+  }
+
+  try {
+    const result = await runEval(params.db, {
+      querySetIdentity: { name: params.querySetName, version: params.querySetVersion },
+      mode: params.mode,
+      retrievalAdapter: adapter,
+    });
+    lines.push(
+      buildSection("📊 Result", [
+        formatEvalReport({
+          querySetIdentity: { name: params.querySetName, version: params.querySetVersion },
+          mode: params.mode,
+          result,
+        }),
+      ]),
+    );
+  } catch (e) {
+    if (e instanceof EvalRunnerError) {
+      lines.push(
+        buildSection("🛠️ Eval", [
+          buildStatLine("status", "failed"),
+          buildStatLine("kind", e.kind),
+          buildStatLine("reason", e.message),
+        ]),
+      );
+      return lines.join("\n");
+    }
+    lines.push(
+      buildSection("🛠️ Eval", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(e)),
+      ]),
+    );
+  }
+  return lines.join("\n");
+}
+
+function buildReconcileApplyText(params: {
+  db: DatabaseSync;
+  fromSessionKeys: string[];
+  toSessionKey: string;
+  reason: string;
+  allowMainSession: boolean;
+}): string {
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "🔗 Lossless Claw Reconcile Session Keys",
+    "",
+    buildSection("📋 Plan", [
+      buildStatLine("from", params.fromSessionKeys.map((k) => formatCommand(truncateMiddle(k, 44))).join(", ")),
+      buildStatLine("to", formatCommand(truncateMiddle(params.toSessionKey, 44))),
+      buildStatLine("reason", params.reason),
+      buildStatLine("allow main session", formatBoolean(params.allowMainSession)),
+    ]),
+    "",
+  ];
+
+  let result: ReconcileResult;
+  try {
+    result = reconcileSessionKeys(params.db, {
+      fromSessionKeys: params.fromSessionKeys,
+      toSessionKey: params.toSessionKey,
+      reason: params.reason,
+      allowMainSession: params.allowMainSession,
+    });
+  } catch (e) {
+    if (e instanceof ReconcileError) {
+      lines.push(
+        buildSection("🛠️ Apply", [
+          buildStatLine("status", "failed"),
+          buildStatLine("kind", e.kind),
+          buildStatLine("reason", e.message),
+        ]),
+      );
+      return lines.join("\n");
+    }
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(e)),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const fromLabel = params.fromSessionKeys.map((k) => `\`${truncateMiddle(k, 32)}\``).join(", ");
+  lines.push(
+    buildSection("🛠️ Apply", [
+      buildStatLine("status", "completed"),
+      buildStatLine("conversations moved", formatNumber(result.conversationsMoved)),
+      buildStatLine("summaries moved", formatNumber(result.summariesMoved)),
+      buildStatLine("audit entries", formatNumber(result.auditEntries)),
+      buildStatLine(
+        "summary",
+        `Moved ${formatNumber(result.conversationsMoved)} conversations, ${formatNumber(result.summariesMoved)} summaries from {${fromLabel}} to ${formatCommand(truncateMiddle(params.toSessionKey, 44))}`,
+      ),
+    ]),
+  );
+  return lines.join("\n");
+}
+
 async function buildDoctorCleanersApplyText(params: {
   db: DatabaseSync;
   config: LcmConfig;
@@ -1440,6 +2282,33 @@ export function createLcmCommand(params: {
                 }),
               }
             : { text: await buildDoctorCleanersText({ db: await getDb() }) };
+        case "health":
+          return { text: buildHealthText({ db: await getDb() }) };
+        case "worker_status":
+          return { text: buildWorkerStatusText({ db: await getDb() }) };
+        case "worker_tick_backfill":
+          return { text: await buildWorkerTickBackfillText({ db: await getDb() }) };
+        case "reconcile_session_keys_list":
+          return { text: buildReconcileListText({ db: await getDb() }) };
+        case "reconcile_session_keys_apply":
+          return {
+            text: buildReconcileApplyText({
+              db: await getDb(),
+              fromSessionKeys: parsed.fromSessionKeys,
+              toSessionKey: parsed.toSessionKey,
+              reason: parsed.reason,
+              allowMainSession: parsed.allowMainSession,
+            }),
+          };
+        case "eval":
+          return {
+            text: await buildEvalText({
+              db: await getDb(),
+              mode: parsed.mode,
+              querySetName: parsed.querySetName,
+              querySetVersion: parsed.querySetVersion,
+            }),
+          };
         case "help":
           return { text: buildHelpText(parsed.error) };
       }

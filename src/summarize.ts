@@ -47,7 +47,14 @@ function buildSummarizerBreakerKey(params: {
 
 type SummaryMode = "normal" | "aggressive";
 
-const DEFAULT_LEAF_TARGET_TOKENS = 2400;
+// v4.1 (A.10): raised from 2400 → 4000. The empirical-spike-agent found
+// 543 leaves on Eva's live DB pegged at exactly 2,415 tokens — the LLM
+// was hitting the old 2400 default and producing artificially-truncated
+// summaries. Voyage embedding (Group B) supports 32K input context, so
+// 4000-token leaves are well within budget. Average leaf on Eva's corpus
+// is 1,167 tokens (most leaves don't approach the cap); the change only
+// affects leaves where the source content is dense enough to need it.
+const DEFAULT_LEAF_TARGET_TOKENS = 4000;
 const DEFAULT_CONDENSED_TARGET_TOKENS = 2000;
 const LCM_SUMMARIZER_SYSTEM_PROMPT =
   "You are a context-compaction summarization engine. Follow user instructions exactly and return plain text summary content only.";

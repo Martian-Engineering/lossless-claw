@@ -5,6 +5,12 @@ import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
+import {
+  runHybridSearch,
+  type FtsHit,
+  type HybridHit,
+} from "../embeddings/hybrid-search.js";
+import { VoyageError } from "../voyage/client.js";
 
 const MAX_RESULT_CHARS = 40_000; // ~10k tokens
 
@@ -30,8 +36,8 @@ const LcmGrepSchema = Type.Object({
   mode: Type.Optional(
     Type.String({
       description:
-        'Search mode: "regex" for regular expression matching, "full_text" for text search. Default: "regex".',
-      enum: ["regex", "full_text"],
+        'Search mode: "regex" for regular expression matching, "full_text" for text search, or "hybrid" to blend FTS + semantic vector search via Voyage rerank. "hybrid" returns hits scoped to summaries only (semantic doesn\'t cover raw messages); use it when keyword matches alone are too narrow. Default: "regex".',
+      enum: ["regex", "full_text", "hybrid"],
     }),
   ),
   scope: Type.Optional(
@@ -98,10 +104,11 @@ export function createLcmGrepTool(input: {
     name: "lcm_grep",
     label: "LCM Grep",
     description:
-      "Search compacted conversation history using regex or full-text search. " +
+      "Search compacted conversation history using regex, full-text, or hybrid search. " +
       "Searches across messages and/or summaries stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
-      "active context. In full_text mode, queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. Returns matching snippets with their summary/message IDs " +
+      "active context. In full_text mode, queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. " +
+      "In hybrid mode, FTS + semantic vector search are blended via Voyage rerank — best for keyword + paraphrase coverage in one call. Hybrid hits are summaries only (no raw messages); for purely-semantic exploration prefer lcm_semantic_recall. Returns matching snippets with their summary/message IDs " +
       "for follow-up with lcm_expand or lcm_describe.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
@@ -114,7 +121,7 @@ export function createLcmGrepTool(input: {
 
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
-      const mode = (p.mode as "regex" | "full_text") ?? "regex";
+      const mode = (p.mode as "regex" | "full_text" | "hybrid") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
       const requestedSort = (p.sort as "recency" | "relevance" | "hybrid") ?? "recency";
@@ -147,6 +154,19 @@ export function createLcmGrepTool(input: {
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
         });
       }
+
+      if (mode === "hybrid") {
+        return runHybridLcmGrep({
+          lcm,
+          pattern,
+          conversationScope,
+          since,
+          before,
+          limit,
+          timezone,
+        });
+      }
+
       const result = await retrieval.grep({
         query: pattern,
         mode,
@@ -231,4 +251,259 @@ export function createLcmGrepTool(input: {
       };
     },
   };
+}
+
+interface HybridGrepInput {
+  lcm: LcmContextEngine;
+  pattern: string;
+  conversationScope: {
+    conversationId?: number;
+    conversationIds?: number[];
+    allConversations: boolean;
+  };
+  since?: Date;
+  before?: Date;
+  limit: number;
+  timezone: string;
+}
+
+/**
+ * Hybrid lcm_grep path. Routes pattern → runHybridSearch (FTS arm calls
+ * summaryStore.searchSummaries, which we hydrate via the same db
+ * connection to get content + sessionKey + tokenCount + createdAt).
+ *
+ * Output format mirrors the regex/full_text branch but with hybrid-
+ * specific extras: per-hit provenance flags ([from FTS+semantic],
+ * [from FTS only], [from semantic only]), the rerank/RRF score, and
+ * degraded-mode warnings when vec0 or rerank is unavailable.
+ */
+async function runHybridLcmGrep(input: HybridGrepInput) {
+  const { lcm, pattern, conversationScope, since, before, limit, timezone } = input;
+  const summaryStore = lcm.getSummaryStore();
+  const db = lcm.getDb();
+
+  const hydrateRowsById = (summaryIds: string[]) => {
+    if (summaryIds.length === 0) return new Map<string, {
+      sessionKey: string;
+      content: string;
+      tokenCount: number;
+      createdAt: string;
+      kind: "leaf" | "condensed";
+      conversationId: number;
+    }>();
+    const placeholders = summaryIds.map(() => "?").join(",");
+    const rows = db
+      .prepare(
+        // v4.1 §10 + Group C Finding #5 (defense in depth): hydrate
+        // step also filters suppressed_at IS NULL. Source FTS already
+        // filters this (C.03), but a row could be suppressed BETWEEN
+        // FTS query and hydrate. This guarantees the hybrid surface
+        // never returns content for a suppressed row even under that
+        // race.
+        `SELECT summary_id, conversation_id, session_key, kind, content, token_count, created_at
+           FROM summaries
+           WHERE summary_id IN (${placeholders})
+             AND suppressed_at IS NULL`,
+      )
+      .all(...summaryIds) as Array<{
+      summary_id: string;
+      conversation_id: number;
+      session_key: string;
+      kind: "leaf" | "condensed";
+      content: string;
+      token_count: number;
+      created_at: string;
+    }>;
+    return new Map(
+      rows.map(
+        (r) =>
+          [
+            r.summary_id,
+            {
+              sessionKey: r.session_key,
+              content: r.content,
+              tokenCount: r.token_count,
+              createdAt: r.created_at,
+              kind: r.kind,
+              conversationId: r.conversation_id,
+            },
+          ] as const,
+      ),
+    );
+  };
+
+  const ftsSearch = async (args: {
+    sessionKeys?: string[];
+    conversationIds?: number[];
+    since?: Date;
+    before?: Date;
+    summaryKinds?: Array<"leaf" | "condensed">;
+    excludeSuppressed?: boolean;
+    limit: number;
+  }): Promise<FtsHit[]> => {
+    const ftsResults = await summaryStore.searchSummaries({
+      query: pattern,
+      mode: "full_text",
+      conversationId: conversationScope.allConversations
+        ? undefined
+        : conversationScope.conversationId,
+      conversationIds: conversationScope.allConversations
+        ? undefined
+        : conversationScope.conversationIds,
+      since: args.since,
+      before: args.before,
+      limit: args.limit,
+      sort: "relevance",
+    });
+    if (ftsResults.length === 0) return [];
+    const hydrated = hydrateRowsById(ftsResults.map((r) => r.summaryId));
+    const out: FtsHit[] = [];
+    for (let i = 0; i < ftsResults.length; i++) {
+      const r = ftsResults[i];
+      const row = hydrated.get(r.summaryId);
+      if (!row) continue; // suppressed/deleted between FTS and hydrate — drop
+      out.push({
+        summaryId: r.summaryId,
+        conversationId: row.conversationId,
+        sessionKey: row.sessionKey,
+        kind: row.kind,
+        content: row.content,
+        tokenCount: row.tokenCount,
+        createdAt: row.createdAt,
+        rank: i,
+      });
+    }
+    return out;
+  };
+
+  const conversationIds = conversationScope.allConversations
+    ? undefined
+    : conversationScope.conversationIds && conversationScope.conversationIds.length > 0
+      ? conversationScope.conversationIds
+      : conversationScope.conversationId != null
+        ? [conversationScope.conversationId]
+        : undefined;
+
+  let hybridResult;
+  try {
+    hybridResult = await runHybridSearch(db, {
+      query: pattern,
+      kFts: Math.max(limit, 50),
+      kSemantic: Math.max(limit, 50),
+      topN: limit,
+      conversationIds,
+      since,
+      before,
+      ftsSearch,
+      // Final review Finding #2: cap Voyage wall-time on agent hot path.
+      // Embed call + rerank call each capped at 15s × 1 retry ≈ 30s
+      // worst case per call. Default Voyage client (3×60s) would block
+      // agent turn for minutes if Voyage throttles.
+      voyageMaxRetries: 1,
+      voyageTimeoutMs: 15_000,
+    });
+  } catch (error) {
+    if (error instanceof VoyageError && error.kind === "auth") {
+      return jsonResult({
+        error:
+          "Voyage API key is missing or invalid (set VOYAGE_API_KEY) — hybrid mode requires it. Use mode='full_text' for keyword-only search.",
+        detail: error.message,
+      });
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (/VOYAGE_API_KEY/i.test(message)) {
+      return jsonResult({
+        error:
+          "Voyage API key is missing (set VOYAGE_API_KEY) — hybrid mode requires it. Use mode='full_text' for keyword-only search.",
+        detail: message,
+      });
+    }
+    return jsonResult({
+      error: `Hybrid search failed: ${message}`,
+    });
+  }
+
+  const lines: string[] = [];
+  lines.push("## LCM Grep Results");
+  lines.push(`**Pattern:** \`${pattern}\``);
+  lines.push(`**Mode:** hybrid`);
+  if (conversationScope.allConversations) {
+    lines.push("**Conversation scope:** all conversations");
+  } else if (conversationScope.conversationId != null) {
+    const familyCount = conversationScope.conversationIds?.length ?? 0;
+    lines.push(
+      familyCount > 1
+        ? `**Conversation scope:** session family rooted at ${conversationScope.conversationId} (${familyCount} segments)`
+        : `**Conversation scope:** ${conversationScope.conversationId}`,
+    );
+  }
+  if (since || before) {
+    lines.push(
+      `**Time filter:** ${since ? `since ${formatDisplayTime(since, timezone)}` : "since -∞"} | ${
+        before ? `before ${formatDisplayTime(before, timezone)}` : "before +∞"
+      }`,
+    );
+  }
+  lines.push(`**Total matches:** ${hybridResult.hits.length}`);
+  if (hybridResult.degradedToFtsOnly) {
+    lines.push("*(semantic search unavailable; degraded to FTS-only)*");
+  }
+  if (hybridResult.degradedSkippedRerank) {
+    lines.push("*(rerank failed; using RRF fusion fallback)*");
+  }
+  lines.push("");
+
+  let currentChars = lines.join("\n").length;
+
+  if (hybridResult.hits.length > 0) {
+    lines.push("### Summaries");
+    lines.push("");
+    for (const hit of hybridResult.hits) {
+      const provenance = hitProvenanceTag(hit);
+      const snippet = truncateSnippet(hit.content);
+      const score = hit.score.toFixed(4);
+      const line = `- [${hit.summaryId}] ${provenance} (${hit.kind}, score=${score}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
+      if (currentChars + line.length > MAX_RESULT_CHARS) {
+        lines.push("*(truncated — more results available)*");
+        break;
+      }
+      lines.push(line);
+      currentChars += line.length;
+    }
+    lines.push("");
+  } else {
+    lines.push("No matches found.");
+  }
+
+  return {
+    content: [{ type: "text", text: lines.join("\n") }],
+    details: {
+      mode: "hybrid",
+      messageCount: 0,
+      summaryCount: hybridResult.hits.length,
+      totalMatches: hybridResult.hits.length,
+      candidateCount: hybridResult.candidateCount,
+      voyageTokensConsumed: hybridResult.voyageTokensConsumed,
+      degradedToFtsOnly: hybridResult.degradedToFtsOnly,
+      degradedSkippedRerank: hybridResult.degradedSkippedRerank,
+      modelName: hybridResult.modelName,
+      hits: hybridResult.hits.map((h) => ({
+        summaryId: h.summaryId,
+        conversationId: h.conversationId,
+        sessionKey: h.sessionKey,
+        kind: h.kind,
+        score: h.score,
+        fromFts: h.fromFts,
+        fromSemantic: h.fromSemantic,
+        semanticDistance: h.semanticDistance,
+        ftsRank: h.ftsRank,
+      })),
+    },
+  };
+}
+
+function hitProvenanceTag(hit: HybridHit): string {
+  if (hit.fromFts && hit.fromSemantic) return "[from FTS+semantic]";
+  if (hit.fromFts) return "[from FTS only]";
+  return "[from semantic only]";
 }

@@ -461,7 +461,9 @@ export function resolveLcmConfigWithDiagnostics(
       bootstrapMaxTokens: resolvedBootstrapMaxTokens,
       leafTargetTokens:
         parseFiniteInt(env.LCM_LEAF_TARGET_TOKENS)
-          ?? toNumber(pc.leafTargetTokens) ?? 2400,
+          // v4.1 (A.10): default raised from 2400 → 4000 to stop LLM-truncating
+          // dense leaves at the cap. See src/summarize.ts comment.
+          ?? toNumber(pc.leafTargetTokens) ?? 4000,
       condensedTargetTokens:
         parseFiniteInt(env.LCM_CONDENSED_TARGET_TOKENS)
           ?? toNumber(pc.condensedTargetTokens) ?? 2000,

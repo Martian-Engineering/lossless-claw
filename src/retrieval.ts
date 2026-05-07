@@ -20,6 +20,14 @@ export interface DescribeResult {
   /** Summary-specific fields */
   summary?: {
     conversationId: number;
+    /**
+     * v4.1 §13 / Group C.05: session_key sourced from the parent
+     * conversations row. summaries.session_key is atomically populated
+     * at write time per Gap 8 (B.05); we pull through the conversation
+     * record so callers don't need a separate lookup. Empty string when
+     * the parent conversation has no session_key set.
+     */
+    sessionKey: string;
     kind: "leaf" | "condensed";
     content: string;
     depth: number;
@@ -33,6 +41,17 @@ export interface DescribeResult {
     messageIds: number[];
     earliestAt: Date | null;
     latestAt: Date | null;
+    /**
+     * v4.1 §13 / Group C.05: normalized time bracket — earliest covered
+     * content, latest covered content, and the row's own creation time.
+     * Mirrors earliestAt/latestAt/createdAt above for callers (esp.
+     * agents) that prefer a single struct.
+     */
+    timeRange: {
+      earliestAt: Date | null;
+      latestAt: Date | null;
+      createdAt: Date;
+    };
     subtree: Array<{
       summaryId: string;
       parentSummaryId: string | null;
@@ -150,19 +169,27 @@ export class RetrievalEngine {
       return null;
     }
 
-    // Fetch lineage in parallel
-    const [parents, children, messageIds, subtree] = await Promise.all([
+    // Fetch lineage + parent conversation (for session_key) in parallel.
+    // session_key is atomically populated on summaries (Gap 8 / B.05) but
+    // SummaryRecord doesn't carry it through the public store API; pull
+    // from the parent conversation, which holds the same value by
+    // invariant.
+    const [parents, children, messageIds, subtree, conversation] = await Promise.all([
       this.summaryStore.getSummaryParents(id),
       this.summaryStore.getSummaryChildren(id),
       this.summaryStore.getSummaryMessages(id),
       this.summaryStore.getSummarySubtree(id),
+      this.conversationStore.getConversation(summary.conversationId),
     ]);
+
+    const sessionKey = conversation?.sessionKey ?? "";
 
     return {
       id,
       type: "summary",
       summary: {
         conversationId: summary.conversationId,
+        sessionKey,
         kind: summary.kind,
         content: summary.content,
         depth: summary.depth,
@@ -176,6 +203,11 @@ export class RetrievalEngine {
         messageIds,
         earliestAt: summary.earliestAt,
         latestAt: summary.latestAt,
+        timeRange: {
+          earliestAt: summary.earliestAt,
+          latestAt: summary.latestAt,
+          createdAt: summary.createdAt,
+        },
         subtree: subtree.map((node) => ({
           summaryId: node.summaryId,
           parentSummaryId: node.parentSummaryId,

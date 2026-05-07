@@ -10,9 +10,16 @@
   "contracts": {
     "tools": [
       "lcm_grep",
+      "lcm_semantic_recall",
       "lcm_describe",
       "lcm_expand",
-      "lcm_expand_query"
+      "lcm_expand_query",
+      "lcm_get_entity",
+      "lcm_recent_themes",
+      "lcm_search_entities",
+      "lcm_search_themes",
+      "lcm_synthesize_around",
+      "lcm_theme_explain"
     ]
   },
   "uiHints": {

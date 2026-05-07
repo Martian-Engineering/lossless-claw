@@ -174,9 +174,10 @@ export function createLcmDescribeTool(input: {
         const lines: string[] = [];
         lines.push(`LCM_SUMMARY ${id}`);
         lines.push(
-          `meta conv=${s.conversationId} kind=${s.kind} depth=${s.depth} tok=${s.tokenCount} ` +
+          `meta conv=${s.conversationId} sessionKey=${s.sessionKey || "-"} kind=${s.kind} depth=${s.depth} tok=${s.tokenCount} ` +
             `descTok=${s.descendantTokenCount} srcTok=${s.sourceMessageTokenCount} ` +
             `desc=${s.descendantCount} range=${formatDisplayTime(s.earliestAt, timezone)}..${formatDisplayTime(s.latestAt, timezone)} ` +
+            `created=${formatDisplayTime(s.createdAt, timezone)} ` +
             `budgetCap=${resolvedTokenCap}`,
         );
         if (s.parentIds.length > 0) {
