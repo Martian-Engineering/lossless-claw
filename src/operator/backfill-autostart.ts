@@ -171,6 +171,12 @@ export function tryStartBackfillAutostart(
         modelName: active.modelName,
         voyageModel: active.modelName as VoyageEmbeddingModel,
         inputType: "document",
+        // Wave-12 reviewer P1 fix: previously omitted, so a registered
+        // profile with non-default dim (256/512/2048) had its
+        // `recordEmbedding` writes rejected for vector.length mismatch.
+        // The dim was logged at autostart but never plumbed through to
+        // the Voyage call. Pass it explicitly.
+        voyageOutputDimension: active.dim,
         // v4.1 Final.review.3 fix (Loop 1 Bug 1.1 / Loop 7 B1 HIGH):
         // 2 retries × 30s + backoff = ~91s worst-case > WORKER_LOCK_TTL_MS (90s).
         // Lock can expire mid-call; another worker can acquire + write to vec0

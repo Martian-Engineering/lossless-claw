@@ -173,7 +173,7 @@ export interface BackfillOptions {
 
 export interface BackfillSkippedDoc {
   summaryId: string;
-  reason: "over_cap" | "voyage_400" | "voyage_other";
+  reason: "over_cap" | "voyage_400" | "voyage_other" | "lock_stolen_mid_embed";
   detail?: string;
 }
 
@@ -376,7 +376,35 @@ export async function runBackfillTick(
           continue;
         }
 
-        // 4. Write results (vec0 + meta). One implicit transaction per
+        // 4. Wave-12 reviewer P2 fix (defense in depth): Voyage 429 with
+        //    Retry-After up to 60s + 30s timeout = 90s wall-time worst
+        //    case, which equals WORKER_LOCK_TTL_MS. If we crossed the TTL
+        //    during embedTexts, another worker may have GC'd the lock and
+        //    started processing the SAME docs. Re-check ownership before
+        //    writing to vec0 — a second writer would corrupt the vec0
+        //    table or duplicate-write meta rows.
+        if (!opts.skipLock) {
+          const stillOursAfterEmbed = heartbeatLock(db, "embedding-backfill", workerId);
+          if (!stillOursAfterEmbed) {
+            // Lock stolen mid-call. Skip writes for this batch; the next
+            // tick (this worker, after re-acquiring) or the other worker
+            // (which now owns the lock) will reprocess.
+            for (const doc of batch) {
+              failedThisTick.add(doc.summaryId);
+              result = withSkippedDoc(result, {
+                summaryId: doc.summaryId,
+                reason: "lock_stolen_mid_embed",
+                detail: "Worker lock expired during Voyage call (likely Retry-After exceeded TTL); writes aborted.",
+              });
+            }
+            return {
+              ...result,
+              durationMs: Date.now() - startedAt,
+              lockNotAcquired: true,
+            };
+          }
+        }
+        // 5. Write results (vec0 + meta). One implicit transaction per
         //    batch via writeBatch's internal BEGIN/COMMIT.
         const writeReport = writeBatch(db, opts.modelName, embeddedKind, batch, resp.vectors);
         result = {
