@@ -10,6 +10,7 @@ import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
+import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
 
 // Tool-result hard cap — see lcm-grep-tool.ts for env contract
 // (LCM_TOOL_RESULT_TOKEN_BUDGET; default 10K tokens / 40K chars).
@@ -114,6 +115,11 @@ export function createLcmSemanticRecallTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  /** Wave-14 token-state runtime context. */
+  getRuntimeContext?: () => {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  };
 }): AnyAgentTool {
   return {
     name: "lcm_semantic_recall",
@@ -129,6 +135,12 @@ export function createLcmSemanticRecallTool(input: {
       "Tool result is hard-capped at LCM_TOOL_RESULT_TOKEN_BUDGET (default 10K tokens / 40K chars) — when context is near full, prefer smaller `limit` over big sweeps; chained tool calls accumulate context, and compaction only fires post-turn.",
     parameters: LcmSemanticRecallSchema,
     async execute(_toolCallId, params) {
+      return runWithTokenGate({
+        toolName: "lcm_semantic_recall",
+        toolParams: params as Record<string, unknown>,
+        sessionKey: input.sessionKey,
+        getRuntimeContext: input.getRuntimeContext,
+        inner: async () => {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -337,6 +349,8 @@ export function createLcmSemanticRecallTool(input: {
           error: `Semantic search failed: ${message}`,
         });
       }
+        },
+      });
     },
   };
 }

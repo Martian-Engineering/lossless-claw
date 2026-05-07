@@ -8,6 +8,7 @@ import {
 import type { LcmDependencies } from "../types.js";
 import { jsonResult, type AnyAgentTool } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
 import {
   normalizeSummaryIds,
   resolveRequesterConversationScopeId,
@@ -1069,6 +1070,11 @@ export function createLcmExpandQueryTool(input: {
   requesterSessionKey?: string;
   /** Session key for scope fallback when sessionId is unavailable. */
   sessionKey?: string;
+  /** Wave-14 token-state runtime context. */
+  getRuntimeContext?: () => {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  };
 }): AnyAgentTool {
   const delegatedWaitTimeoutMs =
     input.deps.config.delegationTimeoutMs || DEFAULT_DELEGATED_WAIT_TIMEOUT_MS;
@@ -1083,6 +1089,12 @@ export function createLcmExpandQueryTool(input: {
       "and return a compact prompt-focused answer. Tool output includes cited summary IDs for follow-up.",
     parameters: LcmExpandQuerySchema,
     async execute(_toolCallId, params) {
+      return runWithTokenGate({
+        toolName: "lcm_expand_query",
+        toolParams: params as Record<string, unknown>,
+        sessionKey: input.sessionKey,
+        getRuntimeContext: input.getRuntimeContext,
+        inner: async () => {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -1448,6 +1460,8 @@ export function createLcmExpandQueryTool(input: {
           requestId,
         });
       }
+        },
+      });
     },
   };
 }

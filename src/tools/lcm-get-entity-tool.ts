@@ -29,6 +29,7 @@ import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { formatTimestamp } from "../compaction.js";
+import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
 
 const DEFAULT_MENTION_LIMIT = 20;
 const MIN_MENTION_LIMIT = 1;
@@ -109,6 +110,11 @@ export function createLcmGetEntityTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  /** Wave-14 token-state runtime context. */
+  getRuntimeContext?: () => {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  };
 }): AnyAgentTool {
   return {
     name: "lcm_get_entity",
@@ -128,6 +134,12 @@ export function createLcmGetEntityTool(input: {
       "raw leaf content similarity (no entity needed), use lcm_semantic_recall.",
     parameters: LcmGetEntitySchema,
     async execute(_toolCallId, params) {
+      return runWithTokenGate({
+        toolName: "lcm_get_entity",
+        toolParams: params as Record<string, unknown>,
+        sessionKey: input.sessionKey,
+        getRuntimeContext: input.getRuntimeContext,
+        inner: async () => {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -298,6 +310,8 @@ export function createLcmGetEntityTool(input: {
           mentionsTruncated: mentions.length === mentionLimit,
         },
       };
+        },
+      });
     },
   };
 }

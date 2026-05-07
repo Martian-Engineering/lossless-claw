@@ -16,6 +16,8 @@ import {
 } from "../embeddings/semantic-search.js";
 import { VoyageError } from "../voyage/client.js";
 import { containsCjk } from "../store/full-text-fallback.js";
+import { evaluateNeedsCompactGate } from "../plugin/needs-compact-gate.js";
+import { tapResultForTokenAccounting } from "../plugin/token-state.js";
 
 // Tool-result hard cap — protects against back-to-back tool calls
 // blowing out the agent's context window. Operators tune via env;
@@ -172,6 +174,11 @@ export function createLcmGrepTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  /** Wave-14 token-state runtime context (see plugin/token-state.ts). */
+  getRuntimeContext?: () => {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  };
 }): AnyAgentTool {
   return {
     name: "lcm_grep",
@@ -187,6 +194,18 @@ export function createLcmGrepTool(input: {
       "Tool result is hard-capped at LCM_TOOL_RESULT_TOKEN_BUDGET (default 10K tokens / 40K chars) — when context is near full, prefer narrower queries (smaller `limit`, more specific `pattern`) over big sweeps; chained calls accumulate context, and compaction only fires post-turn.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
+      // Wave-14 needsCompact gate.
+      const runtimeCtx = input.getRuntimeContext?.();
+      if (runtimeCtx) {
+        const refusal = evaluateNeedsCompactGate({
+          toolName: "lcm_grep",
+          toolParams: params as Record<string, unknown>,
+          currentTokenCount: runtimeCtx.currentTokenCount,
+          tokenBudget: runtimeCtx.tokenBudget,
+        });
+        if (refusal) return tapResultForTokenAccounting(input.sessionKey, jsonResult(refusal));
+      }
+
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -200,9 +219,9 @@ export function createLcmGrepTool(input: {
       // pattern was reaching FTS5 sanitizer which returns `'""'`,
       // causing FTS5 to match all rows. Reject explicitly.
       if (pattern.length === 0) {
-        return jsonResult({
+        return tapResultForTokenAccounting(input.sessionKey, jsonResult({
           error: "`pattern` is required and must be a non-empty string.",
-        });
+        }));
       }
       const mode =
         (p.mode as "regex" | "full_text" | "hybrid" | "semantic" | "verbatim") ?? "regex";
@@ -225,14 +244,14 @@ export function createLcmGrepTool(input: {
         since = parseIsoTimestampParam(p, "since");
         before = parseIsoTimestampParam(p, "before");
       } catch (error) {
-        return jsonResult({
+        return tapResultForTokenAccounting(input.sessionKey, jsonResult({
           error: error instanceof Error ? error.message : "Invalid timestamp filter.",
-        });
+        }));
       }
       if (since && before && since.getTime() >= before.getTime()) {
-        return jsonResult({
+        return tapResultForTokenAccounting(input.sessionKey, jsonResult({
           error: "`since` must be earlier than `before`.",
-        });
+        }));
       }
       const conversationScope = await resolveLcmConversationScope({
         lcm,
@@ -242,10 +261,10 @@ export function createLcmGrepTool(input: {
         params: p,
       });
       if (!conversationScope.allConversations && conversationScope.conversationId == null) {
-        return jsonResult({
+        return tapResultForTokenAccounting(input.sessionKey, jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
-        });
+        }));
       }
 
       if (mode === "hybrid") {

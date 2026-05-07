@@ -31,6 +31,7 @@ import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { formatTimestamp } from "../compaction.js";
+import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
 
 const DEFAULT_LIMIT = 20;
 const MIN_LIMIT = 1;
@@ -119,6 +120,11 @@ export function createLcmSearchEntitiesTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  /** Wave-14 token-state runtime context. */
+  getRuntimeContext?: () => {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  };
 }): AnyAgentTool {
   return {
     name: "lcm_search_entities",
@@ -131,6 +137,12 @@ export function createLcmSearchEntitiesTool(input: {
       "coreference worker.",
     parameters: LcmSearchEntitiesSchema,
     async execute(_toolCallId, params) {
+      return runWithTokenGate({
+        toolName: "lcm_search_entities",
+        toolParams: params as Record<string, unknown>,
+        sessionKey: input.sessionKey,
+        getRuntimeContext: input.getRuntimeContext,
+        inner: async () => {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -305,6 +317,8 @@ export function createLcmSearchEntitiesTool(input: {
           })),
         },
       };
+        },
+      });
     },
   };
 }

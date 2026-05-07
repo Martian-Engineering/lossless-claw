@@ -9,6 +9,8 @@ import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
+import { evaluateNeedsCompactGate } from "../plugin/needs-compact-gate.js";
+import { tapResultForTokenAccounting } from "../plugin/token-state.js";
 
 function formatDisplayTime(
   value: Date | string | number | null | undefined,
@@ -94,6 +96,16 @@ export function createLcmDescribeTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  /**
+   * Live runtime-context provider (Wave-14 token-state cache). When
+   * present, the tool runs a pre-call needsCompact gate and refuses
+   * with structured response if projected result would push context
+   * past REFUSAL_THRESHOLD. Tolerates undefined (no llm_output yet).
+   */
+  getRuntimeContext?: () => {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  };
 }): AnyAgentTool {
   return {
     name: "lcm_describe",
@@ -111,6 +123,20 @@ export function createLcmDescribeTool(input: {
       "and (with expand flags) one-hop child/message detail.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
+      // Wave-14 needsCompact gate: refuse with structured payload if the
+      // projected result size would push context past REFUSAL_THRESHOLD.
+      // Bypass when no runtime telemetry is available yet.
+      const runtimeCtx = input.getRuntimeContext?.();
+      if (runtimeCtx) {
+        const refusal = evaluateNeedsCompactGate({
+          toolName: "lcm_describe",
+          toolParams: params as Record<string, unknown>,
+          currentTokenCount: runtimeCtx.currentTokenCount,
+          tokenBudget: runtimeCtx.tokenBudget,
+        });
+        if (refusal) return tapResultForTokenAccounting(input.sessionKey, jsonResult(refusal));
+      }
+
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -684,7 +710,7 @@ export function createLcmDescribeTool(input: {
         };
       }
 
-      return jsonResult(result);
+      return tapResultForTokenAccounting(input.sessionKey, jsonResult(result));
     },
   };
 }

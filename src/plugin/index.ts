@@ -2404,16 +2404,31 @@ function wirePluginHandlers(
   api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
 
   api.registerTool(
-    (ctx) => createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) => createLcmGrepTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+      getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+    }),
     { name: "lcm_grep" },
   );
   api.registerTool(
     (ctx) =>
-      createLcmSemanticRecallTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+      createLcmSemanticRecallTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+        getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+      }),
     { name: "lcm_semantic_recall" },
   );
   api.registerTool(
-    (ctx) => createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) => createLcmDescribeTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+      getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+    }),
     { name: "lcm_describe" },
   );
   api.registerTool(
@@ -2427,6 +2442,7 @@ function wirePluginHandlers(
         getLcm: shared.waitForEngine,
         sessionKey: ctx.sessionKey,
         requesterSessionKey: ctx.sessionKey,
+        getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
       }),
     { name: "lcm_expand_query" },
   );
@@ -2440,12 +2456,22 @@ function wirePluginHandlers(
   // worker. Without these the entity worker writes records that no agent can
   // query, which the doc audit (Slice 1 BLOCKER) flagged as vapor.
   api.registerTool(
-    (ctx) => createLcmGetEntityTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) => createLcmGetEntityTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+      getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+    }),
     { name: "lcm_get_entity" },
   );
   api.registerTool(
     (ctx) =>
-      createLcmSearchEntitiesTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+      createLcmSearchEntitiesTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+        getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+      }),
     { name: "lcm_search_entities" },
   );
   // Wave-14: agent-triggered LCM compaction. Always REGISTERED (so agents

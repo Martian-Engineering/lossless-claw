@@ -150,6 +150,24 @@ export function __resetTokenStateForTesting(): void {
 }
 
 /**
+ * Convenience helper used by tools to wrap their result emissions:
+ * extracts the rendered text and calls accumulateToolResultTokens.
+ * Tools call this on every return path (success + error) so the cache
+ * stays accurate across mixed outcomes.
+ *
+ * Returns the input result unchanged so callers can `return tapResult(sessionKey, jsonResult(...))`.
+ */
+export function tapResultForTokenAccounting<
+  T extends { content?: Array<{ type?: string; text?: string }> },
+>(sessionKey: string | undefined, result: T): T {
+  if (!sessionKey) return result;
+  const first = result.content?.[0];
+  const text = first && first.type === "text" && typeof first.text === "string" ? first.text : "";
+  if (text) accumulateToolResultTokens(sessionKey, text);
+  return result;
+}
+
+/**
  * Best-effort token-budget inference from a model identifier. Returns
  * undefined when the model isn't recognized — caller falls back to
  * config (`config.maxAssemblyTokenBudget`) or skips the budget check.
