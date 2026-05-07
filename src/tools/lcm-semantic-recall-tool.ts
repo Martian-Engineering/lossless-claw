@@ -11,7 +11,15 @@ import { jsonResult } from "./common.js";
 import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
 
-const MAX_RESULT_CHARS = 40_000; // ~10k tokens
+// Tool-result hard cap — see lcm-grep-tool.ts for env contract
+// (LCM_TOOL_RESULT_TOKEN_BUDGET; default 10K tokens / 40K chars).
+function resolveMaxResultChars(): number {
+  const raw = process.env.LCM_TOOL_RESULT_TOKEN_BUDGET?.trim();
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+  const tokens = Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
+  return Math.max(2_000, tokens) * 4;
+}
+const MAX_RESULT_CHARS = resolveMaxResultChars();
 const DEFAULT_LIMIT = 20;
 const MIN_LIMIT = 1;
 const MAX_LIMIT = 100;
@@ -117,7 +125,8 @@ export function createLcmSemanticRecallTool(input: {
       "the original wording was different). For keyword + semantic blending, prefer " +
       "lcm_grep with mode='hybrid'; reserve lcm_semantic_recall for purely semantic " +
       "exploration. Returns ranked summary hits with [summary_id], kind, distance, " +
-      "and a snippet for follow-up via lcm_expand or lcm_describe.",
+      "and a snippet for follow-up via lcm_describe (one-hop) or lcm_expand_query (multi-hop). " +
+      "Tool result is hard-capped at LCM_TOOL_RESULT_TOKEN_BUDGET (default 10K tokens / 40K chars) — when context is near full, prefer smaller `limit` over big sweeps; chained tool calls accumulate context, and compaction only fires post-turn.",
     parameters: LcmSemanticRecallSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
@@ -267,7 +276,7 @@ export function createLcmSemanticRecallTool(input: {
             const cosStr = hit.cosineSimilarity.toFixed(3);
             const line = `- [${hit.summaryId}] (${hit.kind}, cosine=${cosStr}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
             if (currentChars + line.length > MAX_RESULT_CHARS) {
-              lines.push("*(truncated — more results available)*");
+              lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow query, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
               break;
             }
             lines.push(line);

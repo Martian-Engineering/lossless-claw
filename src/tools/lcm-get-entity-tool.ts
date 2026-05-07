@@ -213,6 +213,14 @@ export function createLcmGetEntityTool(input: {
           sessionKey: effectiveSessionKey,
           entityType: entityTypeFilter,
           message: `No entity matching '${name}'${entityTypeFilter ? ` of type '${entityTypeFilter}'` : ""} in session_key='${effectiveSessionKey}'. The entity coreference worker may not have run yet, or the name doesn't appear in any leaf summary.`,
+          // Concrete fallbacks the agent can try right now (Eva onboarding
+          // feedback: empty entity result should suggest next steps, not
+          // dead-end). Try in order: prefix browse → paraphrastic search.
+          fallback_suggestions: [
+            `lcm_search_entities query='${name.toLowerCase().split(/[\s\-_]+/)[0] ?? name}' mode='prefix' — browse entities by canonical-name prefix (handles 'Smarter-Claw' vs 'smarter claw' canonicalization mismatches)`,
+            `lcm_grep mode='hybrid' pattern='${name}' — paraphrastic search across all summary content (works without an entity catalog entry, surfaces mentions even if coreference hasn't run)`,
+            `lcm_grep mode='verbatim' pattern='${name}' — exact-text search of source messages (for citation / quote-back use cases)`,
+          ],
         });
       }
 

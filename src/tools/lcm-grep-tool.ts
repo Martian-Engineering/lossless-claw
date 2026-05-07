@@ -17,7 +17,17 @@ import {
 import { VoyageError } from "../voyage/client.js";
 import { containsCjk } from "../store/full-text-fallback.js";
 
-const MAX_RESULT_CHARS = 40_000; // ~10k tokens
+// Tool-result hard cap — protects against back-to-back tool calls
+// blowing out the agent's context window. Operators tune via env;
+// default 10K tokens (~40K chars) preserves prior behavior. Lower
+// during testing or for cost-sensitive deployments.
+function resolveMaxResultChars(): number {
+  const raw = process.env.LCM_TOOL_RESULT_TOKEN_BUDGET?.trim();
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+  const tokens = Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
+  return Math.max(2_000, tokens) * 4;  // floor: 8K chars (~2K tokens) — anything less makes the tool useless
+}
+const MAX_RESULT_CHARS = resolveMaxResultChars();
 
 function formatDisplayTime(
   value: Date | string | number | null | undefined,
@@ -173,7 +183,8 @@ export function createLcmGrepTool(input: {
       "(3) `hybrid` — FTS5 + Voyage semantic + rerank (PRIMARY for Type B topic-anchored queries: 'have we ever discussed X', 'what work has been done on Y' — handles paraphrases like 'merge mess' → 'rebase blew up'). Hybrid hits are summaries only; for purely-semantic exploration prefer lcm_semantic_recall; " +
       "(4) `semantic` — vector-only, no rerank (cheaper than hybrid); " +
       "(5) `verbatim` — returns FULL untruncated source messages (PRIMARY for Type C verbatim/citation queries: 'what exactly did X say about Y', 'quote me the original wording'). " +
-      "Returns matching snippets with summary/message IDs for follow-up with lcm_describe (one-hop) or lcm_expand_query (multi-hop drilldown).",
+      "Returns matching snippets with summary/message IDs for follow-up with lcm_describe (one-hop) or lcm_expand_query (multi-hop drilldown). " +
+      "Tool result is hard-capped at LCM_TOOL_RESULT_TOKEN_BUDGET (default 10K tokens / 40K chars) — when context is near full, prefer narrower queries (smaller `limit`, more specific `pattern`) over big sweeps; chained calls accumulate context, and compaction only fires post-turn.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
@@ -330,7 +341,7 @@ export function createLcmGrepTool(input: {
           const snippet = truncateSnippet(msg.snippet);
           const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatDisplayTime(msg.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
-            lines.push("*(truncated — more results available)*");
+            lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow query, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
             break;
           }
           lines.push(line);
@@ -346,7 +357,7 @@ export function createLcmGrepTool(input: {
           const snippet = truncateSnippet(sum.snippet);
           const line = `- [${sum.summaryId}] (${sum.kind}, ${formatDisplayTime(sum.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
-            lines.push("*(truncated — more results available)*");
+            lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow query, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
             break;
           }
           lines.push(line);
@@ -617,7 +628,7 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
       const score = hit.score.toFixed(4);
       const line = `- [${hit.summaryId}] ${provenance} (${hit.kind}, score=${score}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
       if (currentChars + line.length > MAX_RESULT_CHARS) {
-        lines.push("*(truncated — more results available)*");
+        lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow query, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
         break;
       }
       lines.push(line);
@@ -813,7 +824,7 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
       const cosStr = hit.cosineSimilarity.toFixed(3);
       const line = `- [${hit.summaryId}] (${hit.kind}, cosine=${cosStr}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
       if (currentChars + line.length > MAX_RESULT_CHARS) {
-        lines.push("*(truncated — more results available)*");
+        lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow query, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
         break;
       }
       lines.push(line);
@@ -1022,7 +1033,7 @@ async function runVerbatimLcmGrep(input: HybridGrepInput) {
       const header = `### [msg#${row.message_id}] ${row.role} — ${formatDisplayTime(row.created_at, timezone)} (${row.token_count} tokens)`;
       const block = `${header}\n\n${row.content}\n`;
       if (currentChars + block.length > MAX_RESULT_CHARS) {
-        lines.push("*(truncated — increase limit or narrow time range to see more)*");
+        lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow time range, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
         break;
       }
       lines.push(block);
