@@ -124,19 +124,25 @@ const conversationStore = new ConversationStore(db);
 const summaryStore = new SummaryStore(db);
 const assembler = new ContextAssembler(conversationStore, summaryStore, "UTC");
 
+// --no-stubs lets us compare baseline (v4.1) vs v4.2 with the SAME prompt,
+// so we can read the agent's answer side-by-side and judge confabulation.
+const stubsOn = !args.includes("--no-stubs");
 const assembled = await assembler.assemble({
   conversationId,
   tokenBudget,
   freshTailCount: 64,
   freshTailMaxTokens: 24000,
   promptAwareEviction: false,
-  stubLargeToolPayloads: true,
+  stubLargeToolPayloads: stubsOn,
 });
 
 console.error(`[harness] assembled ${assembled.messages.length} items, stubs=${assembled.debug?.stubStats?.stubbedCount ?? 0}`);
 
 // ── Find stub-bearing toolResult messages we can interrogate ──
 // A stub is a toolResult whose content includes `[LCM Tool Output: file_xxx`.
+// Also capture the preceding assistant's tool_input (what the agent was
+// actually doing) so the harness can build realistic-soft prompts that
+// reference WHAT the tool was called for, the way real users do.
 const stubsInPrompt = [];
 for (let i = 0; i < assembled.messages.length; i++) {
   const m = assembled.messages[i];
@@ -145,16 +151,39 @@ for (let i = 0; i < assembled.messages.length; i++) {
     ? m.content
     : Array.isArray(m.content) ? (m.content[0]?.text ?? JSON.stringify(m.content)) : "";
   const match = c.match(/\[LCM Tool Output: (file_[a-f0-9]+) \| tool=(\S+) \| ([\d,]+) bytes\]/);
-  if (match) {
-    stubsInPrompt.push({
-      index: i,
-      fileId: match[1],
-      toolName: match[2],
-      bytesStr: match[3],
-      toolCallId: m.toolCallId,
-      stubText: c,
-    });
+  if (!match) continue;
+  // Pull tool_input for this stub directly from message_parts. The
+  // assembled message may have had its tool_use block stripped, so we
+  // can't rely on assembled.messages — go to the DB.
+  let disambiguator = null;
+  if (m.toolCallId) {
+    const tipRow = db
+      .prepare(
+        `SELECT mp.tool_input FROM message_parts mp WHERE mp.tool_call_id = ? AND mp.tool_input IS NOT NULL LIMIT 1`,
+      )
+      .get(String(m.toolCallId));
+    const rawInput = tipRow?.tool_input;
+    if (typeof rawInput === "string" && rawInput.length > 0) {
+      try {
+        const inp = JSON.parse(rawInput);
+        if (typeof inp.path === "string") disambiguator = `the read of ${inp.path}`;
+        else if (typeof inp.command === "string") {
+          const cmd = inp.command.split("\n")[0].slice(0, 60);
+          disambiguator = `the bash command \`${cmd}…\``;
+        } else if (typeof inp.pattern === "string") disambiguator = `the grep for \`${inp.pattern}\``;
+        else if (typeof inp.sessionId === "string") disambiguator = `the ${inp.action ?? "process"} for session ${inp.sessionId}`;
+      } catch { /* best-effort */ }
+    }
   }
+  stubsInPrompt.push({
+    index: i,
+    fileId: match[1],
+    toolName: match[2],
+    bytesStr: match[3],
+    toolCallId: m.toolCallId,
+    stubText: c,
+    disambiguator,
+  });
 }
 console.error(`[harness] found ${stubsInPrompt.length} stubs in assembled prompt`);
 if (stubsInPrompt.length === 0) {
@@ -378,16 +407,52 @@ for (let s = 0; s < sample.length; s++) {
   // Append the test question. We deliberately ask for specifics that
   // could ONLY be answered by inspecting the elided content. The model
   // either drills down via lcm_describe(file_xxx) or admits it can't.
-  // Three question modes:
+  // Five question modes:
   //   --explicit (default): names the fileId, forces the agent to act
   //   --medium: references the elided form but doesn't say "use tools"
-  //   --soft: pure user question, no hint that elision happened
-  const mode = args.includes("--soft") ? "soft" : args.includes("--medium") ? "medium" : "explicit";
-  const userQuestion = mode === "soft"
-    ? `Earlier in this session you ran a ${stub.toolName} call. What did it actually return? I need the specifics, not a summary.`
-    : mode === "medium"
-      ? `Looking at the conversation, one of your ${stub.toolName} tool results is shown as a [LCM Tool Output: ${stub.fileId} | …] reference instead of the actual output. What did the tool actually return?`
-      : `I'm reviewing what happened earlier in this session. In the tool call where you ran ${stub.toolName} (the result is currently elided as ${stub.fileId} — see the [LCM Tool Output: ${stub.fileId} …] reference above), what was actually in the output? I need to see the actual content. Use the available tools to get it if needed, then summarize what was returned.`;
+  //   --soft: generic question naming only the toolName (often ambiguous)
+  //   --realistic: real-user phrasing using a distinguishing detail
+  //                from the tool's input (e.g. "the read of foo.json")
+  //   --conversational: normal "what did we work on?" prompt — the actual
+  //                production case. Agent should answer from assistant
+  //                turns (which describe what was done); drilldown is only
+  //                needed if the user asks about specifics in elided
+  //                results. This is the test that matters most.
+  const mode = args.includes("--conversational")
+    ? "conversational"
+    : args.includes("--realistic") ? "realistic"
+    : args.includes("--soft") ? "soft"
+    : args.includes("--medium") ? "medium"
+    : "explicit";
+  let userQuestion;
+  if (mode === "conversational") {
+    // The real production case. Pick the question once and use it for
+    // every scenario — the conversational case isn't tied to a specific
+    // stub. We're observing whether the agent (a) answers fluidly from
+    // the assistant turns, (b) drills down when it needs specifics, and
+    // (c) does NOT confabulate elided content.
+    const conversationalQuestions = [
+      "Briefly recap what we worked on in this session — what was the main goal and what got done? Two or three paragraphs is fine.",
+      "What's the status of what we were doing? Any blockers or open items?",
+      "Quick summary please: where are we at? What's next?",
+    ];
+    userQuestion = conversationalQuestions[s % conversationalQuestions.length];
+  } else if (mode === "realistic") {
+    if (!stub.disambiguator) {
+      // Skip scenarios without a clean disambiguator — this mode is only
+      // meaningful when we can name the call by what it was for.
+      console.error(`[harness]   skipped (no disambiguator): ${stub.fileId}`);
+      results.push({ stub: stub.fileId, skipped: true });
+      continue;
+    }
+    userQuestion = `Earlier ${stub.disambiguator} — what did it return? I need the specifics.`;
+  } else if (mode === "soft") {
+    userQuestion = `Earlier in this session you ran a ${stub.toolName} call. What did it actually return? I need the specifics, not a summary.`;
+  } else if (mode === "medium") {
+    userQuestion = `Looking at the conversation, one of your ${stub.toolName} tool results is shown as a [LCM Tool Output: ${stub.fileId} | …] reference instead of the actual output. What did the tool actually return?`;
+  } else {
+    userQuestion = `I'm reviewing what happened earlier in this session. In the tool call where you ran ${stub.toolName} (the result is currently elided as ${stub.fileId} — see the [LCM Tool Output: ${stub.fileId} …] reference above), what was actually in the output? I need to see the actual content. Use the available tools to get it if needed, then summarize what was returned.`;
+  }
   baseMsgs.push({ role: "user", content: userQuestion });
 
   let drilldown = null;
@@ -427,6 +492,11 @@ for (let s = 0; s < sample.length; s++) {
     drilldownId: drilldown,
     llmError,
     contentSnippet: typeof response.content === "string" ? response.content.slice(0, 300) : null,
+    // Full response in conversational mode so we can inspect for confabulation.
+    fullResponse: mode === "conversational" && typeof response.content === "string"
+      ? response.content
+      : undefined,
+    userQuestion: mode === "conversational" ? userQuestion : undefined,
   });
 }
 
