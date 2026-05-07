@@ -591,18 +591,28 @@ function formatDisplayTime(value: string | Date | null | undefined, timezone: st
  * is left undefined (we don't have a cost calculator wired here).
  *
  * The summarizer wrapper ignores the dispatch-supplied model (the legacy
- * resolver picks its own provider/model fallback chain), so we record the
- * caller-supplied model name for audit, while letting the summarizer do
- * its own resolution.
+ * resolver picks its own provider/model fallback chain). Wave-12 reviewer
+ * F8 audit-honesty fix: we now pass `actualModel` from the summarizer's
+ * resolved-primary-candidate so the audit row records what *actually ran*,
+ * not what dispatch's `pickModel` recommended. Without this, the audit
+ * silently records the dispatched intent and operators debugging a
+ * synthesis failure see the wrong model name.
+ *
+ * Caveat: `resolveActualModel()` returns the PRIMARY resolved candidate;
+ * if mid-call fallback fires, the recorded model may not match the
+ * actually-used candidate. Strictly better than recording dispatched
+ * intent, but not perfect. Future improvement: have the summarizer
+ * surface the candidate that actually succeeded.
  */
 function buildLlmCallFromSummarizer(
   summarize: (text: string) => Promise<string>,
+  resolveActualModel: () => string | undefined,
 ): LlmCall {
   return async (args) => {
     const startedAt = Date.now();
     const output = await summarize(args.prompt);
     const latencyMs = Date.now() - startedAt;
-    return { output, latencyMs };
+    return { output, latencyMs, actualModel: resolveActualModel() };
   };
 }
 
@@ -625,11 +635,11 @@ export function createLcmSynthesizeAroundTool(input: {
       "content/query — target REQUIRED). Period boundaries are computed in the operator's " +
       "local timezone (configured on the LCM engine; handles half-hour offsets like Asia/Kolkata " +
       "and DST transitions). Returns a markdown summary backed by lcm_synthesis_cache so " +
-      "subsequent identical calls hit the cache. The synthesis dispatch records the per-tier " +
-      "model name in the audit table; the actual LLM call goes through the operator's " +
-      "configured summarizer chain (summaryModel/summaryProvider) for inheritance of auth " +
-      "retries + fallback handling. Distinct from lcm_semantic_recall (which returns ranked " +
-      "snippets, not a synthesized rollup).",
+      "subsequent identical calls hit the cache. The actual LLM call goes through the " +
+      "operator's configured summarizer chain (summaryModel/summaryProvider) for inheritance of auth " +
+      "retries + fallback handling; the audit table records the resolved model that actually ran " +
+      "(Wave-12 fix — was previously recording the dispatched recommendation). Distinct from " +
+      "lcm_semantic_recall (which returns ranked snippets, not a synthesized rollup).",
     parameters: LcmSynthesizeAroundSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
@@ -993,8 +1003,13 @@ export function createLcmSynthesizeAroundTool(input: {
             "No summarization model resolved — set summaryModel/summaryProvider on the lossless-claw plugin or LCM_SUMMARY_MODEL env.",
         });
       }
-      const llmCall = buildLlmCallFromSummarizer((text) =>
-        summarizerBuilt.fn(text, false, { isCondensed: true }),
+      // Wave-12 reviewer F8 audit-honesty: pass the resolved primary
+      // candidate's model name so the audit row records the actually-run
+      // model, not dispatch's pickModel recommendation. summarizerBuilt
+      // exposes `model` from its first resolved candidate (src/summarize.ts:1688-1695).
+      const llmCall = buildLlmCallFromSummarizer(
+        (text) => summarizerBuilt.fn(text, false, { isCondensed: true }),
+        () => summarizerBuilt.model,
       );
 
       // 10. Pre-compute the cache_id and persist the synthesis to
