@@ -653,11 +653,22 @@ export class ConversationStore {
     return row?.count ?? 0;
   }
 
-  async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
+  async getMessageById(
+    messageId: MessageId,
+    opts: { includeSuppressed?: boolean } = {},
+  ): Promise<MessageRecord | null> {
+    // v4.1 Final.review.3 fix (Loop 2 Leak 2.1+2.2 BLOCKER):
+    // assembler.resolveMessageItem + retrieval.expandRecursive + compaction.leafPass
+    // all called this without filtering suppressed_at. After an operator suppress,
+    // the assembler hot path was re-emitting suppressed message content to the
+    // agent prompt. The §10 invariant requires every agent-facing read path to
+    // filter suppressed_at IS NULL by default; internal callers (integrity,
+    // compaction, doctor) opt-in via includeSuppressed=true.
+    const suppressedClause = opts.includeSuppressed ? "" : " AND suppressed_at IS NULL";
     const row = this.db
       .prepare(
         `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
-       FROM messages WHERE message_id = ?`,
+       FROM messages WHERE message_id = ?${suppressedClause}`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
     return row ? toMessageRecord(row) : null;
@@ -879,6 +890,8 @@ export class ConversationStore {
   ): MessageSearchResult[] {
     const where: string[] = ["messages_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
+    // v4.1 Final.review P1 #2: filter suppressed messages.
+    where.push("m.suppressed_at IS NULL");
     appendConversationScopeConstraint({
       where,
       args,
@@ -928,6 +941,8 @@ export class ConversationStore {
 
     const where: string[] = [...plan.where];
     const args: Array<string | number> = [...plan.args];
+    // v4.1 Final.review P1 #2: filter suppressed messages (LIKE path).
+    where.push("suppressed_at IS NULL");
     appendConversationScopeConstraint({
       where,
       args,
@@ -996,7 +1011,7 @@ export class ConversationStore {
       return [];
     }
 
-    const where: string[] = [];
+    const where: string[] = ["suppressed_at IS NULL"]; // v4.1 Final.review P1 #2
     const args: Array<string | number> = [];
     appendConversationScopeConstraint({
       where,
@@ -1014,14 +1029,22 @@ export class ConversationStore {
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    // Wave-8 Auditor #7-12 P1 fix: bound the SQL scan. Previously the
+    // SELECT had no LIMIT and JS-side MAX_ROW_SCAN=10K was the only
+    // brake — meaning the whole `messages` table (potentially millions
+    // of rows × content blobs) materialized into Node memory before the
+    // JS scan fires. Mirror the summary-store fix from W8 R1: bind a
+    // SQL LIMIT at the JS scan ceiling.
+    const SQL_SCAN_BOUND = 10_000;
     const rows = this.db
       .prepare(
         `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
          FROM messages
          ${whereClause}
-         ORDER BY created_at DESC`,
+         ORDER BY created_at DESC
+         LIMIT ?`,
       )
-      .all(...args) as unknown as MessageRow[];
+      .all(...args, SQL_SCAN_BOUND) as unknown as MessageRow[];
 
     const MAX_ROW_SCAN = 10_000;
     const results: MessageSearchResult[] = [];

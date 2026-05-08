@@ -69,6 +69,13 @@ function extractRegisterToolFactoryCallSites(): string[] {
   return [...matches].map((m) => m[1]).sort();
 }
 
+function extractRegisterToolExplicitNames(): string[] {
+  const src = readFileSync(PLUGIN_INDEX, "utf8");
+  const pattern =
+    /api\.registerTool\s*\([\s\S]*?\{\s*name\s*:\s*["'](lcm_[a-z_]+)["']\s*\}\s*,?\s*\)/g;
+  return [...src.matchAll(pattern)].map((m) => m[1]).sort();
+}
+
 describe("openclaw.plugin.json manifest drift guard (#570)", () => {
   it("contracts.tools matches the canonical name fields in src/tools/*", () => {
     const declared = [...manifest.contracts.tools].sort();
@@ -93,6 +100,17 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
     const expected = factories.map(factoryToName).sort();
     const declared = [...manifest.contracts.tools].sort();
     expect(declared).toEqual(expected);
+  });
+
+  it("registers every tool factory with an explicit contracts.tools name", () => {
+    // OpenClaw's cached descriptor path resolves plugin tools by registration
+    // names before falling back to broad declaredNames. If these factories are
+    // unnamed, the palette can advertise all contract tools while execution
+    // resolves the wrong runtime factory and fails with
+    // `plugin tool runtime missing (lossless-claw): <tool>`.
+    const explicitNames = extractRegisterToolExplicitNames();
+    const declared = [...manifest.contracts.tools].sort();
+    expect(explicitNames).toEqual(declared);
   });
 
   it("declares startup activation until OpenClaw always loads selected context-engine plugins", () => {

@@ -251,7 +251,41 @@ describe("shouldDelayPromptMutatingDeferredCompaction (cache-aware deferral gate
     expect(gate(makeHotCodexTelemetry(), new Date(), 100_000, 0)).toBe(true);
   });
 
-  it("does not defer when provider is not mutation-sensitive (e.g. plain openai)", () => {
+  it("does not defer when provider is genuinely not mutation-sensitive (no prompt cache)", () => {
+    // Wave-13 follow-up: previously this test used `provider: "openai"` as
+    // the example of a non-mutation-sensitive provider. That was correct
+    // PRE-2024, but OpenAI Platform's prompt caching has been live since
+    // Oct 2024 — plain `openai` IS now cache-mutation-sensitive. Test
+    // updated to use Groq, which (as of 2026-05) does NOT publish a
+    // prompt-caching feature comparable to OpenAI/Anthropic/Codex —
+    // making it a genuine negative-case fixture for the family check.
+    //
+    // If/when Groq ships prompt caching, update this test to a different
+    // provider that genuinely lacks prompt caching (e.g., a local llama,
+    // ollama, or a custom HTTP endpoint).
+    const engine = createEngine();
+    const gate = (engine as unknown as {
+      shouldDelayPromptMutatingDeferredCompaction: (
+        telemetry: ConversationCompactionTelemetryRecord | null,
+        now?: Date,
+        currentTokenCount?: number,
+        tokenBudget?: number,
+      ) => boolean;
+    }).shouldDelayPromptMutatingDeferredCompaction.bind(engine);
+
+    expect(
+      gate(
+        makeHotCodexTelemetry({ provider: "groq", model: "llama-3.1-70b-versatile" }),
+        new Date(),
+        100_000,
+        200_000,
+      ),
+    ).toBe(false);
+  });
+
+  it("DOES defer for plain openai (cache-mutation-sensitive since OpenAI prompt caching launched Oct 2024)", () => {
+    // Wave-13 follow-up positive test: pins the new behavior so a future
+    // refactor that drops `openai` from the family list breaks loudly.
     const engine = createEngine();
     const gate = (engine as unknown as {
       shouldDelayPromptMutatingDeferredCompaction: (
@@ -269,6 +303,30 @@ describe("shouldDelayPromptMutatingDeferredCompaction (cache-aware deferral gate
         100_000,
         200_000,
       ),
-    ).toBe(false);
+    ).toBe(true);  // cache hot + plain openai → defer
+  });
+
+  it("DOES defer when only the model identifier matches (provider unset, model gpt-*)", () => {
+    // Defense-in-depth: if telemetry's provider field is missing/empty but
+    // model is "gpt-*", we still want cache protection. The family check
+    // matches across both identifiers via `.some`.
+    const engine = createEngine();
+    const gate = (engine as unknown as {
+      shouldDelayPromptMutatingDeferredCompaction: (
+        telemetry: ConversationCompactionTelemetryRecord | null,
+        now?: Date,
+        currentTokenCount?: number,
+        tokenBudget?: number,
+      ) => boolean;
+    }).shouldDelayPromptMutatingDeferredCompaction.bind(engine);
+
+    expect(
+      gate(
+        makeHotCodexTelemetry({ provider: "", model: "gpt-5.4-mini" }),
+        new Date(),
+        100_000,
+        200_000,
+      ),
+    ).toBe(true);
   });
 });

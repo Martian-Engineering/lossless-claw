@@ -302,11 +302,12 @@ const LcmExpansionSchema = Type.Object({
 });
 
 /**
- * Build a tool definition object for LCM expansion that can be registered as
- * an agent tool. Follows the pattern used in `src/agents/tools/`.
- *
- * Requires an already-initialised ExpansionOrchestrator and an LcmConfig
- * (for the default tokenCap).
+ * Build a tool definition object for LCM expansion. NOTE: this factory is
+ * NOT registered in production (the live `lcm_expand` tool comes from
+ * `src/tools/lcm-expand-tool.ts`, registered in `src/plugin/index.ts`).
+ * This function is exercised only by `test/expansion.test.ts` to verify
+ * the ExpansionOrchestrator's tokenCap clamping. Description text below
+ * is kept aligned with the production tool to avoid drift.
  */
 export function buildExpansionToolDefinition(options: {
   orchestrator: ExpansionOrchestrator;
@@ -318,10 +319,12 @@ export function buildExpansionToolDefinition(options: {
   return {
     name: "lcm_expand",
     description:
-      "Expand compacted conversation summaries from LCM (Lossless Context Management). " +
-      "Traverses the summary DAG to retrieve children and source messages. " +
-      "Use this to drill into previously-compacted context when you need detail " +
-      "that was summarised away. Returns a compact text payload with cited IDs for follow-up.",
+      "SUB-AGENT ONLY. Main-agent sessions get a runtime error if they invoke " +
+      "this tool — instead, main agents should use lcm_describe with " +
+      "expandChildren/expandMessages flags (one-hop drilldown), or " +
+      "lcm_expand_query (delegated multi-hop drilldown that spawns a sub-agent). " +
+      "When called from a sub-agent: expands the LCM summary DAG to retrieve " +
+      "children and source messages.",
     parameters: LcmExpansionSchema,
     execute: async (
       _toolCallId: string,

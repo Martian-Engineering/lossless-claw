@@ -154,6 +154,7 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `largeFileThresholdTokens` | `integer` | `25000` | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | Preferred key for the token threshold that routes text attachments into large-file summarization. |
 | `largeFileTokenThreshold` | `integer` | alias of `largeFileThresholdTokens` | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | Legacy alias accepted by the runtime. Prefer `largeFileThresholdTokens` in new config. |
 | `maxAssemblyTokenBudget` | `integer` | unset | `LCM_MAX_ASSEMBLY_TOKEN_BUDGET` | Optional hard cap for assembly and threshold evaluation, useful with smaller-context models. |
+| `toolResultTokenBudget` | `integer` | `10000` | `LCM_TOOL_RESULT_TOKEN_BUDGET` | Per-call token cap for any single LCM tool's emitted result (`lcm_grep`, `lcm_describe`, etc). Both per-tool truncation AND the `needsCompact` gate's projection ceiling read from this — keep them in lockstep. Floor 2000. |
 | `maxExpandTokens` | `integer` | `4000` | `LCM_MAX_EXPAND_TOKENS` | Default token cap for `lcm_expand_query` responses. |
 
 ### Model selection, execution, and prompts
