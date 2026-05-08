@@ -155,6 +155,8 @@ Guidance:
 
 - Pick a cheaper model only if it remains reliably structured and faithful.
 - `summaryProvider` only matters when `summaryModel` is a bare model name rather than a canonical provider/model ref.
+- Summary calls go through OpenClaw's `api.runtime.llm.complete`; Lossless does not resolve provider credentials directly.
+- Explicit summary model overrides require `plugins.entries.lossless-claw.llm.allowModelOverride` plus matching `allowedModels` entries, or `openclaw doctor --fix` to add them.
 
 ### `expansionModel` and `expansionProvider`
 

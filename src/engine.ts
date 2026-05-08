@@ -3394,7 +3394,10 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
-      legacyParams,
+      legacyParams: this.buildSummarizerLegacyParams({
+        legacyParams,
+        sessionKey: params.sessionKey,
+      }),
       customInstructions: params.customInstructions,
       breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
@@ -3596,6 +3599,22 @@ export class LcmContextEngine implements ContextEngine {
       parts.push(`sessionKey=${trimmedSessionKey}`);
     }
     return parts.join(" ");
+  }
+
+  /** Attach session identity to summarizer params without mutating host runtimeContext objects. */
+  private buildSummarizerLegacyParams(params: {
+    legacyParams?: Record<string, unknown>;
+    sessionKey?: string;
+  }): Record<string, unknown> | undefined {
+    const trimmedSessionKey = params.sessionKey?.trim();
+    if (!params.legacyParams && !trimmedSessionKey) {
+      return undefined;
+    }
+    const next = { ...(params.legacyParams ?? {}) };
+    if (trimmedSessionKey && typeof next.sessionKey !== "string") {
+      next.sessionKey = trimmedSessionKey;
+    }
+    return next;
   }
 
   /** Build a summarize callback with runtime provider fallback handling. */
@@ -6859,7 +6878,10 @@ export class LcmContextEngine implements ContextEngine {
         ).currentTokenCount,
     );
     const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
-      legacyParams,
+      legacyParams: this.buildSummarizerLegacyParams({
+        legacyParams,
+        sessionKey: params.sessionKey,
+      }),
       customInstructions: params.customInstructions,
       breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });

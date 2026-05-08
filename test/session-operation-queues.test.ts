@@ -89,8 +89,6 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
     })),
     callGateway: vi.fn(async () => ({})),
     resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
-    getApiKey: vi.fn(async () => process.env.ANTHROPIC_API_KEY),
-    requireApiKey: vi.fn(async () => process.env.ANTHROPIC_API_KEY ?? "test-api-key"),
     parseAgentSessionKey: () => null,
     isSubagentSessionKey: () => false,
     normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),

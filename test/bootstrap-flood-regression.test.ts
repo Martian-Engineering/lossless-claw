@@ -67,8 +67,6 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
     })),
     callGateway: vi.fn(async () => ({})),
     resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
-    getApiKey: vi.fn(async () => "test-api-key"),
-    requireApiKey: vi.fn(async () => "test-api-key"),
     parseAgentSessionKey: (key: string) => {
       const trimmed = key.trim();
       if (!trimmed.startsWith("agent:")) return null;

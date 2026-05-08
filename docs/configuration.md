@@ -172,6 +172,8 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `summaryTimeoutMs` | `integer` | `60000` | `LCM_SUMMARY_TIMEOUT_MS` | Maximum time to wait for one model-backed summarizer call. |
 | `customInstructions` | `string` | `""` | `LCM_CUSTOM_INSTRUCTIONS` | Extra natural-language instructions injected into every summarization prompt. |
 
+Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capability. If you configure an explicit Lossless summary model (`summaryModel`, `largeFileSummaryModel`, or `fallbackProviders`), OpenClaw must allow that runtime LLM override under `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`. `openclaw doctor --fix` can add the minimal policy entries for configured Lossless summary models.
+
 ### Fallbacks, circuit breaking, and safety rails
 
 | Key | Type | Default | Env override | Purpose |
@@ -237,12 +239,12 @@ Compaction summarization resolves candidates in this order:
 1. `LCM_SUMMARY_MODEL` and `LCM_SUMMARY_PROVIDER`
 2. `plugins.entries.lossless-claw.config.summaryModel` and `summaryProvider`
 3. OpenClaw's default compaction model
-4. Legacy per-call provider and model hints
+4. Runtime/session provider and model hints from OpenClaw
 5. `fallbackProviders`
 
 If `summaryModel` already contains a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that candidate.
 
-Runtime-managed OAuth providers are supported here too. In particular, `openai-codex` and `github-copilot` auth profiles can be used for summary and expansion calls without a separate API key.
+Lossless does not resolve provider credentials directly for compaction summaries. OpenClaw's runtime LLM layer owns provider/model preparation, auth profiles, OAuth refresh, base URLs, and dispatch. Lossless only selects the requested summary target and passes it to the host runtime, where model override policy is enforced.
 
 A practical starting point for cost-sensitive setups is:
 

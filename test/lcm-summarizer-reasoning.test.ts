@@ -20,8 +20,6 @@ function createDeps(overrides: Partial<Record<string, unknown>> = {}) {
       provider: providerHint?.trim() || "openrouter",
       model: modelRef?.trim() || "minimax/minimax-m2.7",
     }),
-    getApiKey: async () => "test-key",
-    requireApiKey: async () => "test-key",
     parseAgentSessionKey: () => null,
     isSubagentSessionKey: () => false,
     normalizeAgentId: (id?: string) => id ?? "main",

@@ -108,8 +108,6 @@ function createTestDeps(
     })),
     callGateway: vi.fn(async () => ({})),
     resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
-    getApiKey: vi.fn(async () => process.env.ANTHROPIC_API_KEY),
-    requireApiKey: vi.fn(async () => process.env.ANTHROPIC_API_KEY ?? "test-api-key"),
     parseAgentSessionKey,
     isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
     normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
@@ -11438,7 +11436,6 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     const completeSpy = vi.fn(async () => ({
       content: [{ type: "text", text: "codex large-file summary" }],
     }));
-    const getApiKeySpy = vi.fn(async () => "scoped-token");
     const engine = createEngineWithDeps(
       {
         largeFileSummaryProvider: "openai-codex",
@@ -11446,8 +11443,6 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
       },
       {
         complete: completeSpy,
-        getApiKey: getApiKeySpy,
-        isRuntimeManagedAuthProvider: () => true,
         resolveModel: vi.fn((modelRef?: string, providerHint?: string) => ({
           provider: providerHint ?? "openai-codex",
           model: modelRef ?? "gpt-5.4",
@@ -11463,7 +11458,6 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
 
     const summary = await summarizeText!("Large file prompt");
     expect(summary).toBe("codex large-file summary");
-    expect(getApiKeySpy).not.toHaveBeenCalled();
     expect(completeSpy).toHaveBeenCalledTimes(1);
     expect(completeSpy).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -11472,6 +11466,75 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
           configPath: "plugins.entries.lossless-claw.config.largeFileSummaryModel",
           modelRef: "openai-codex/gpt-5.4",
         },
+      }),
+    );
+  });
+
+  it("passes context-engine runtime llm and session identity to compaction summaries", async () => {
+    const completeSpy = vi.fn(async () => ({
+      content: [{ type: "text", text: "bound runtime summary" }],
+    }));
+    const runtimeLlmComplete = vi.fn(async () => ({
+      text: "bound runtime summary",
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+      agentId: "research",
+    }));
+    const engine = createEngineWithDeps(
+      {
+        leafMinFanout: 2,
+        leafChunkTokens: 1,
+        incrementalMaxDepth: 0,
+      },
+      {
+        complete: completeSpy,
+      },
+    );
+    const sessionId = "compact-bound-runtime-llm";
+    const sessionKey = "agent:research:session:abc";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactLeaf: (input: {
+          summarize: (text: string, aggressive?: boolean) => Promise<string>;
+        }) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "compactLeaf").mockImplementation(async (input) => {
+      await input.summarize("Question and answer text that should compact.");
+      return {
+        actionTaken: true,
+        tokensBefore: 900,
+        tokensAfter: 520,
+        condensed: false,
+      };
+    });
+
+    await engine.ingestBatch({
+      sessionId,
+      sessionKey,
+      messages: [
+        makeMessage({ role: "user", content: "Question that should compact." }),
+        makeMessage({ role: "assistant", content: "Answer that should compact." }),
+      ],
+    });
+
+    await engine.compactLeafAsync({
+      sessionId,
+      sessionKey,
+      sessionFile: createSessionFilePath("compact-bound-runtime-llm"),
+      tokenBudget: 4096,
+      force: true,
+      runtimeContext: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        llm: { complete: runtimeLlmComplete },
+      },
+    });
+
+    expect(completeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeLlmComplete,
+        agentId: "research",
       }),
     );
   });

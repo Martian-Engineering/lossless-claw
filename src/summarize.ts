@@ -1,5 +1,9 @@
 import { describeLogError } from "./lcm-log.js";
-import type { LcmDependencies, RuntimeLlmModelOverride } from "./types.js";
+import type {
+  LcmDependencies,
+  RuntimeLlmCompleteFn,
+  RuntimeLlmModelOverride,
+} from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 
 export type LcmSummarizeOptions = {
@@ -20,8 +24,7 @@ export type LcmSummarizerLegacyParams = {
   modelConfigField?: unknown;
   modelConfigPath?: unknown;
   config?: unknown;
-  agentDir?: unknown;
-  authProfileId?: unknown;
+  llm?: unknown;
   agentId?: unknown;
   sessionKey?: unknown;
 };
@@ -31,7 +34,6 @@ type SummaryResolutionCandidate = {
   modelRef: string;
   providerHint?: string;
   hasExplicitProvider: boolean;
-  useLegacyAuthProfile: boolean;
   runtimeModelOverrideField?: string;
   runtimeModelOverrideConfigPath?: string;
 };
@@ -57,14 +59,18 @@ function buildRuntimeModelOverride(
   };
 }
 
-function buildSummarizerBreakerKey(params: {
-  candidate: ResolvedSummaryCandidate;
-  legacyAuthProfileId?: string;
-}): string {
-  const authProfileId = params.candidate.useLegacyAuthProfile
-    ? (params.legacyAuthProfileId ?? "-")
-    : "-";
-  return `provider:${params.candidate.provider};model:${params.candidate.model};authProfile:${authProfileId}`;
+/** Read the host-bound runtime LLM completion capability from context engine runtime params. */
+function readRuntimeLlmComplete(params: unknown): RuntimeLlmCompleteFn | undefined {
+  if (!isRecord(params) || !isRecord(params.llm)) {
+    return undefined;
+  }
+  return typeof params.llm.complete === "function"
+    ? (params.llm.complete as RuntimeLlmCompleteFn)
+    : undefined;
+}
+
+function buildSummarizerBreakerKey(candidate: ResolvedSummaryCandidate): string {
+  return `provider:${candidate.provider};model:${candidate.model}`;
 }
 
 type SummaryMode = "normal" | "aggressive";
@@ -570,7 +576,7 @@ function buildProviderAuthWarning(params: {
     params.failure.message && !params.failure.missingModelRequestScope
       ? ` Detail: ${params.failure.message}`
       : "";
-  return `[lcm] compaction failed: ${detail}. Check that the configured summaryProvider has valid API credentials. Current: ${params.provider}/${params.model}${messageSuffix}`;
+  return `[lcm] compaction failed: ${detail}. Check OpenClaw runtime LLM auth and policy for the configured summary model. Current: ${params.provider}/${params.model}${messageSuffix}`;
 }
 
 function getProviderResponseFinishReason(value: Record<string, unknown>): string | undefined {
@@ -1179,7 +1185,6 @@ function resolveSummaryCandidates(params: {
         process.env.LCM_SUMMARY_PROVIDER?.trim() ||
         (providerHint || undefined),
       hasExplicitProvider: Boolean(process.env.LCM_SUMMARY_PROVIDER?.trim()),
-      useLegacyAuthProfile: false,
       runtimeModelOverrideField: "LCM_SUMMARY_MODEL",
       runtimeModelOverrideConfigPath: "LCM_SUMMARY_MODEL",
     },
@@ -1194,7 +1199,6 @@ function resolveSummaryCandidates(params: {
         typeof nestedPluginConfig?.summaryProvider === "string" &&
           nestedPluginConfig.summaryProvider.trim(),
       ),
-      useLegacyAuthProfile: false,
       runtimeModelOverrideField: "summaryModel",
       runtimeModelOverrideConfigPath: "plugins.entries.lossless-claw.config.summaryModel",
     },
@@ -1203,21 +1207,18 @@ function resolveSummaryCandidates(params: {
       modelRef: readModelRef(runtimeConfig?.agents?.defaults?.compaction?.model),
       providerHint: undefined,
       hasExplicitProvider: false,
-      useLegacyAuthProfile: false,
     },
     {
       levelName: "OpenClaw agents.defaults.model",
       modelRef: readModelRef(runtimeConfig?.agents?.defaults?.model),
       providerHint: undefined,
       hasExplicitProvider: false,
-      useLegacyAuthProfile: false,
     },
     {
       levelName: "legacy runtime/session model",
       modelRef: modelHint,
       providerHint: providerHint || undefined,
       hasExplicitProvider: Boolean(providerHint),
-      useLegacyAuthProfile: true,
       runtimeModelOverrideField: legacyModelConfigField,
       runtimeModelOverrideConfigPath: legacyModelConfigPath,
     },
@@ -1230,7 +1231,6 @@ function resolveSummaryCandidates(params: {
       modelRef: `${fb.provider}/${fb.model}`,
       providerHint: fb.provider,
       hasExplicitProvider: true,
-      useLegacyAuthProfile: false,
       runtimeModelOverrideField: "fallbackProviders",
       runtimeModelOverrideConfigPath: `plugins.entries.lossless-claw.config.fallbackProviders[${fallbackIndex}]`,
     });
@@ -1282,11 +1282,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     return undefined;
   }
 
-  const legacyAuthProfileId =
-    typeof params.legacyParams.authProfileId === "string" &&
-    params.legacyParams.authProfileId.trim()
-      ? params.legacyParams.authProfileId.trim()
-      : undefined;
   const explicitAgentId =
     typeof params.legacyParams.agentId === "string" && params.legacyParams.agentId.trim()
       ? params.legacyParams.agentId.trim()
@@ -1296,6 +1291,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       ? params.deps.parseAgentSessionKey(params.legacyParams.sessionKey)?.agentId
       : undefined;
   const agentId = explicitAgentId || sessionAgentId;
+  const runtimeLlmComplete = readRuntimeLlmComplete(params.legacyParams);
 
   const condensedTargetTokens =
     Number.isFinite(params.deps.config.condensedTargetTokens) &&
@@ -1366,8 +1362,8 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           provider,
           model,
           ...(runtimeModelOverride ? { runtimeModelOverride } : {}),
+          ...(runtimeLlmComplete ? { runtimeLlmComplete } : {}),
           ...(agentId ? { agentId } : {}),
-          runtimeConfig: params.legacyParams.config,
           system: LCM_SUMMARIZER_SYSTEM_PROMPT,
           messages: [
             {
@@ -1644,9 +1640,6 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   return {
     fn,
     model: resolvedCandidates[0]!.model,
-    breakerKey: buildSummarizerBreakerKey({
-      candidate: resolvedCandidates[0]!,
-      legacyAuthProfileId,
-    }),
+    breakerKey: buildSummarizerBreakerKey(resolvedCandidates[0]!),
   };
 }

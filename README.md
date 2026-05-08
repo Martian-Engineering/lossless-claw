@@ -128,6 +128,10 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
     "entries": {
       "lossless-claw": {
         "enabled": true,
+        "llm": {
+          "allowModelOverride": true,
+          "allowedModels": ["openai/gpt-5.4-mini"]
+        },
         "config": {
           "freshTailCount": 64,
           "leafChunkTokens": 80000,
@@ -154,7 +158,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 }
 ```
 
-`leafChunkTokens` controls how many source tokens can accumulate in a leaf compaction chunk before summarization is triggered. The default is `20000`, but quota-limited summary providers may benefit from a larger value to reduce compaction frequency. `summaryModel` and `summaryProvider` let you pin compaction summarization to a cheaper or faster model than your main OpenClaw session model. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). `delegationTimeoutMs` controls how long `lcm_expand_query` waits for that delegated sub-agent to finish before returning a timeout error; it defaults to `120000` (120s). `summaryTimeoutMs` controls the per-call timeout for model-backed LCM summarization; it defaults to `60000` (60s). When unset, the model settings still fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
+`leafChunkTokens` controls how many source tokens can accumulate in a leaf compaction chunk before summarization is triggered. The default is `20000`, but quota-limited summary providers may benefit from a larger value to reduce compaction frequency. `summaryModel` and `summaryProvider` let you request a cheaper or faster compaction model through OpenClaw's `api.runtime.llm.complete` capability; OpenClaw still owns provider dispatch and auth. Explicit summary model requests require `llm.allowModelOverride` and matching `llm.allowedModels` policy entries for `lossless-claw`. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). `delegationTimeoutMs` controls how long `lcm_expand_query` waits for that delegated sub-agent to finish before returning a timeout error; it defaults to `120000` (120s). `summaryTimeoutMs` controls the per-call timeout for model-backed LCM summarization; it defaults to `60000` (60s). When unset, the model settings still fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
 
 ### Environment variables
 
@@ -250,11 +254,11 @@ For compaction summarization, lossless-claw resolves the model in this order:
 1. `LCM_SUMMARY_MODEL` / `LCM_SUMMARY_PROVIDER`
 2. Plugin config `summaryModel` / `summaryProvider`
 3. OpenClaw's default compaction model/provider
-4. Legacy per-call model/provider hints
+4. Runtime/session model/provider hints from OpenClaw
 
 If `summaryModel` already includes a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that choice. Otherwise, the provider falls back to the matching override, then `OPENCLAW_PROVIDER`, then the provider inferred by the caller.
 
-Runtime-managed OAuth providers are supported here too. In particular, `openai-codex` and `github-copilot` auth profiles can be used for summary and expansion calls without a separate API key.
+Summary calls are dispatched through OpenClaw's runtime LLM layer, so auth profiles, OAuth refresh, API keys, base URLs, and provider-specific request preparation remain host-owned. Run `openclaw doctor --fix` after adding explicit summary model overrides if you want OpenClaw to add the matching `plugins.entries.lossless-claw.llm` policy.
 
 ### Recommended starting configuration
 

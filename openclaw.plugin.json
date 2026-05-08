@@ -114,7 +114,7 @@
     },
     "summaryModel": {
       "label": "Summary Model",
-      "help": "Model override for LCM summarization (e.g., 'gpt-5.4' to reuse the session provider, or 'openai-resp/gpt-5.4' for a full cross-provider ref)"
+      "help": "Runtime LLM model override for LCM summarization (e.g., 'gpt-5.4' with summaryProvider, or 'openai-resp/gpt-5.4'); explicit overrides require plugins.entries.lossless-claw.llm policy"
     },
     "summaryProvider": {
       "label": "Summary Provider",
@@ -122,7 +122,7 @@
     },
     "largeFileSummaryModel": {
       "label": "Large File Summary Model",
-      "help": "Model override for large-file summarization"
+      "help": "Runtime LLM model override for large-file summarization; explicit overrides require plugins.entries.lossless-claw.llm policy"
     },
     "largeFileSummaryProvider": {
       "label": "Large File Summary Provider",
@@ -238,7 +238,7 @@
     },
     "fallbackProviders": {
       "label": "Fallback Providers",
-      "help": "Explicit fallback provider/model pairs for compaction summarization (e.g., [{\"provider\": \"anthropic\", \"model\": \"claude-haiku-4-5\"}])"
+      "help": "Explicit runtime LLM fallback provider/model pairs for compaction summarization; entries require plugins.entries.lossless-claw.llm policy"
     }
   },
   "configSchema": {

@@ -781,7 +781,7 @@ describe("lcm plugin registration", () => {
     );
   });
 
-  it("does not expose direct provider credential lookup through dependencies", async () => {
+  it("does not expose direct provider credential lookup through dependencies", () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "env-anthropic-key");
 
     const { api, getFactory } = buildApi({
@@ -795,15 +795,10 @@ describe("lcm plugin registration", () => {
     expect(factory).toBeTypeOf("function");
 
     const engine = factory!() as {
-      deps?: {
-        getApiKey: (provider: string, model: string) => Promise<string | undefined>;
-        requireApiKey: (provider: string, model: string) => Promise<string>;
-      };
+      deps?: Record<string, unknown>;
     };
-    await expect(engine.deps?.getApiKey("anthropic", "claude-sonnet-4-6")).resolves.toBeUndefined();
-    await expect(engine.deps?.requireApiKey("anthropic", "claude-sonnet-4-6")).rejects.toThrow(
-      "direct provider credential lookup has been removed",
-    );
+    expect(engine.deps).not.toHaveProperty("getApiKey");
+    expect(engine.deps).not.toHaveProperty("requireApiKey");
   });
   it("waits for gateway_start when eager init hits a lock", async () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);

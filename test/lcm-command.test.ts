@@ -1030,8 +1030,6 @@ describe("lcm command", () => {
         const [provider, model] = String(modelRef ?? "anthropic/claude-haiku-4-5").split("/", 2);
         return { provider, model };
       }) as LcmDependencies["resolveModel"],
-      getApiKey: vi.fn(async () => "test-api-key") as LcmDependencies["getApiKey"],
-      requireApiKey: vi.fn(async () => "test-api-key") as LcmDependencies["requireApiKey"],
       parseAgentSessionKey: vi.fn(() => ({ agentId: "main", suffix: "test" })) as LcmDependencies["parseAgentSessionKey"],
       isSubagentSessionKey: vi.fn(() => false) as LcmDependencies["isSubagentSessionKey"],
       normalizeAgentId: vi.fn((id?: string) => id?.trim() || "main") as LcmDependencies["normalizeAgentId"],

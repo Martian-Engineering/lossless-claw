@@ -58,17 +58,13 @@ openclaw plugins enable lossless-claw
 }
 ```
 
-## 本 Fork 的修復
+## 整合重點
 
-### 1. `getApiKey()` Provider Config Fallback
+### 1. OpenClaw `runtime.llm.complete`
 
-**分支**: `fix/getApiKey-provider-config-fallback`
+LCM 摘要現在透過 OpenClaw host-owned `runtime.llm.complete` 執行。lossless-claw 只提出摘要模型 override 請求；provider dispatch、憑證解析、OAuth refresh、usage attribution 都由 OpenClaw runtime 負責。
 
-**問題**：LCM 的 `getApiKey()` 缺少 `models.providers.*.apiKey` fallback，導致非內建 provider（如 MiniMax）在 launchd 環境下 401。
-
-**修復**：在 `getApiKey()` 和 `requireApiKey()` 中加入第 6 層 fallback，讀取 `models.providers.*.apiKey`。
-
-> ⚠️ v0.5.1 已包含此修復（`findProviderConfigValue`），此分支主要用於舊版本。
+如果設定 `summaryModel`、`largeFileSummaryModel` 或 `fallbackProviders`，需要在 `plugins.entries.lossless-claw.llm` 中允許對應的 model override。
 
 ### 2. `stripAuthErrors()` 假陽性修復
 

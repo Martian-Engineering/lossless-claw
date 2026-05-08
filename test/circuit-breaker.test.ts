@@ -85,8 +85,6 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
       provider: providerHint ?? "test",
       model: modelRef ?? "test-model",
     }),
-    getApiKey: async () => "test-api-key",
-    requireApiKey: async () => "test-api-key",
     parseAgentSessionKey: () => null,
     isSubagentSessionKey: () => false,
     normalizeAgentId: (id?: string) => id ?? "",

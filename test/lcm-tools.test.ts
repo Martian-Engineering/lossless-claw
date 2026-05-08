@@ -64,8 +64,6 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
     complete: vi.fn(),
     callGateway: vi.fn(async () => ({})),
     resolveModel: () => ({ provider: "anthropic", model: "claude-opus-4-5" }),
-    getApiKey: async () => undefined,
-    requireApiKey: async () => "",
     parseAgentSessionKey,
     isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
     normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),

@@ -59,8 +59,6 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       provider: "anthropic",
       model: "claude-opus-4-5",
     })),
-    getApiKey: vi.fn(async () => "test-api-key"),
-    requireApiKey: vi.fn(async () => "test-api-key"),
     parseAgentSessionKey: vi.fn(() => null),
     isSubagentSessionKey: vi.fn(() => false),
     normalizeAgentId: vi.fn(() => "main"),
@@ -460,10 +458,8 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(requestOptions.reasoning).toBeUndefined();
   });
 
-  it("does not resolve direct API keys before completion calls", async () => {
-    const deps = makeDeps({
-      getApiKey: vi.fn(async () => "resolved-api-key"),
-    });
+  it("does not pass direct API keys to completion calls", async () => {
+    const deps = makeDeps();
 
     const summarize = await createSummarizeFn({
       deps,
@@ -476,13 +472,39 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     await summarize!("Summary input");
 
     const completeMock = vi.mocked(deps.complete);
-    expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
-    expect(completeMock.mock.calls[0]?.[0]?.apiKey).toBeUndefined();
+    const completeArgs = completeMock.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(completeArgs, "apiKey")).toBe(false);
   });
 
-  it("does not pass authProfileId through a direct credential path", async () => {
+  it("does not pass authProfileId through completion calls", async () => {
+    const deps = makeDeps();
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    await summarize!("Summary input");
+
+    const completeArgs = vi.mocked(deps.complete).mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(completeArgs, "authProfileId")).toBe(false);
+  });
+
+  it("passes host-bound runtime llm completion from context engine params", async () => {
+    const runtimeLlmComplete = vi.fn(async () => ({
+      text: "bound summary",
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+      agentId: "research",
+    }));
     const deps = makeDeps({
-      getApiKey: vi.fn(() => "resolved-api-key"),
+      parseAgentSessionKey: vi.fn(() => ({
+        agentId: "research",
+        suffix: "session:abc",
+      })),
     });
 
     const summarize = await createSummarizeFn({
@@ -490,23 +512,25 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       legacyParams: {
         provider: "anthropic",
         model: "claude-opus-4-5",
-        authProfileId: "profile-123",
+        sessionKey: "agent:research:session:abc",
+        llm: { complete: runtimeLlmComplete },
       },
     });
 
     await summarize!("Summary input");
 
-    expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
-    expect(vi.mocked(deps.complete).mock.calls[0]?.[0]?.authProfileId).toBeUndefined();
+    expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
+      runtimeLlmComplete,
+      agentId: "research",
+    });
   });
 
-  it("does not inherit runtime authProfileId when plugin summary provider/model are explicit", async () => {
+  it("uses explicit plugin summary provider/model without direct auth fields", async () => {
     const deps = makeDeps({
       resolveModel: vi.fn(() => ({
         provider: "kimi-coding",
         model: "k2p5",
       })),
-      getApiKey: vi.fn(async () => "resolved-api-key"),
     });
     const runtimeConfig = {
       plugins: {
@@ -526,7 +550,6 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       legacyParams: {
         provider: "openai-codex",
         model: "gpt-5.4",
-        authProfileId: "openai-codex:default",
         config: runtimeConfig,
       },
     });
@@ -534,13 +557,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     await summarize!("Summary input");
 
     expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith("k2p5", "kimi-coding");
-    expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
 
-    const completeArgs = vi.mocked(deps.complete).mock.calls[0]?.[0];
+    const completeArgs = vi.mocked(deps.complete).mock.calls[0]?.[0] as Record<string, unknown>;
     expect(completeArgs?.provider).toBe("kimi-coding");
     expect(completeArgs?.model).toBe("k2p5");
-    expect(completeArgs?.authProfileId).toBeUndefined();
-    expect(completeArgs?.runtimeConfig).toBe(runtimeConfig);
+    expect(Object.prototype.hasOwnProperty.call(completeArgs, "apiKey")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(completeArgs, "authProfileId")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(completeArgs, "runtimeConfig")).toBe(false);
   });
 
   it("falls back deterministically when model returns empty summary output after retry", async () => {
@@ -782,7 +805,9 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("provider auth error (401 / missing model.request scope)");
-      expect(diagnostics).toContain("Check that the configured summaryProvider has valid API credentials.");
+      expect(diagnostics).toContain(
+        "Check OpenClaw runtime LLM auth and policy for the configured summary model.",
+      );
       expect(diagnostics).toContain("Current: openai-codex/gpt-5.4");
       expect(diagnostics).not.toContain("summarizer auth retry");
       expect(diagnostics).not.toContain("retrying with conservative settings");
@@ -823,15 +848,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(diagnostics).toContain("ALL PROVIDERS EXHAUSTED");
   });
 
-    it("skips direct credential lookup for runtime-managed auth providers", async () => {
+    it("propagates runtime llm auth failures without direct credential retry", async () => {
       const deps = makeDeps({
         config: { summaryTimeoutMs: 60_000 },
         resolveModel: vi.fn(() => ({
           provider: "openai-codex",
           model: "gpt-5.4",
         })),
-        getApiKey: vi.fn(async () => "should-not-be-used"),
-        isRuntimeManagedAuthProvider: vi.fn(() => true),
         complete: vi.fn(async () => ({
           content: [],
           error: {
@@ -850,7 +873,6 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       await expect(result!.fn("R".repeat(8_000), false)).rejects.toBeInstanceOf(
         LcmProviderAuthError,
       );
-      expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
 
       const diagnostics = getDepsLogText(deps);
@@ -1209,7 +1231,6 @@ describe("createLcmSummarizeFromLegacyParams", () => {
             }
             throw new Error(`unexpected modelRef: ${String(modelRef)}`);
           }),
-          getApiKey: vi.fn(async () => "should-not-be-used"),
           complete: vi.fn(async ({ provider }: { provider?: string }) => {
             if (provider === "openai-codex") {
               return {
@@ -1255,7 +1276,6 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       const summary = await summarize!("A".repeat(8_000), false);
 
       expect(summary).toBe("Recovered summary from provider fallback.");
-      expect(vi.mocked(deps.getApiKey)).not.toHaveBeenCalled();
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
       expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).toMatchObject({
         provider: "openai-codex",

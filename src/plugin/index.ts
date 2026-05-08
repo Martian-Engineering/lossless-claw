@@ -22,6 +22,7 @@ import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type {
   LcmDependencies,
+  RuntimeLlmCompleteFn,
   RuntimeLlmModelOverride,
   StartupSessionFileCandidate,
 } from "../types.js";
@@ -135,27 +136,8 @@ type RuntimeLlmCompleteMessage = {
   content: string;
 };
 
-type RuntimeLlmCompleteParams = {
-  messages: RuntimeLlmCompleteMessage[];
-  model?: string;
-  maxTokens?: number;
-  temperature?: number;
-  systemPrompt?: string;
-  purpose?: string;
-  agentId?: string;
-};
-
-type RuntimeLlmCompleteResult = {
-  text: string;
-  provider: string;
-  model: string;
-  agentId: string;
-  usage?: Record<string, unknown>;
-  audit?: Record<string, unknown>;
-};
-
 type RuntimeLlm = {
-  complete: (params: RuntimeLlmCompleteParams) => Promise<RuntimeLlmCompleteResult>;
+  complete: RuntimeLlmCompleteFn;
 };
 
 type SessionEndLifecycleEvent = {
@@ -992,17 +974,14 @@ function createLcmDependencies(
     });
   }
 
-  const directCredentialLookupError =
-    "[lcm] direct provider credential lookup has been removed; OpenClaw runtime.llm.complete owns model auth.";
-
   return {
     config,
     configDiagnostics: diagnostics,
-    isRuntimeManagedAuthProvider: () => true,
     complete: async ({
       provider,
       model,
       runtimeModelOverride,
+      runtimeLlmComplete,
       agentId,
       messages,
       system,
@@ -1014,7 +993,7 @@ function createLcmDependencies(
       const providerId = provider?.trim();
       const modelId = model.trim();
       const modelRef = runtimeModelOverride?.modelRef.trim();
-      const runtimeLlm = getRuntimeLlm(api);
+      const runtimeLlm = runtimeLlmComplete ?? getRuntimeLlm(api)?.complete;
       const requestMetadata = {
         request_provider: providerId ?? "(runtime)",
         request_model: modelId || "(runtime)",
@@ -1038,7 +1017,7 @@ function createLcmDependencies(
       }
 
       try {
-        const result = await runtimeLlm.complete({
+        const result = await runtimeLlm({
           messages: toRuntimeLlmMessages(messages),
           ...(modelRef ? { model: modelRef } : {}),
           ...(typeof maxTokens === "number" && Number.isFinite(maxTokens) ? { maxTokens } : {}),
@@ -1075,13 +1054,6 @@ function createLcmDependencies(
           ...requestMetadata,
         };
       }
-    },
-    getApiKey: async () => {
-      log.warn(directCredentialLookupError);
-      return undefined;
-    },
-    requireApiKey: async () => {
-      throw new Error(directCredentialLookupError);
     },
     callGateway: async (params) => {
       const sub = api.runtime.subagent;

@@ -186,7 +186,6 @@ async function resolveDoctorApplySummarize(params: {
     deps: params.deps,
     legacyParams: {
       config: params.runtimeConfig,
-      agentDir: params.deps.resolveAgentDir(),
     },
     customInstructions: params.config.customInstructions || undefined,
   });

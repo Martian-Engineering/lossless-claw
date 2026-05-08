@@ -66,9 +66,9 @@ The **leaf pass** converts raw messages into leaf summaries:
 2. Cap the chunk at `leafChunkTokens` (default 20k tokens).
 3. Concatenate message content with timestamps.
 4. Resolve the most recent prior summary for continuity (passed as `previous_context` so the LLM avoids repeating known information).
-5. Send to the LLM with the leaf prompt.
-6. Normalize provider response blocks (Anthropic/OpenAI text, output_text, and nested content/summary shapes) into plain text.
-7. If normalization is empty, log provider/model/block-type diagnostics and fall back to deterministic truncation.
+5. Send to OpenClaw's host-owned `runtime.llm.complete` capability with the leaf prompt.
+6. Normalize runtime LLM response text into plain text while preserving provider/model diagnostics from the host result.
+7. If normalization is empty, log provider/model diagnostics and fall back to deterministic truncation.
 8. If the summary is larger than the input (LLM failure), retry with the aggressive prompt. If still too large, fall back to deterministic truncation.
 9. Persist the summary, link to source messages, and replace the message range in context_items.
 
@@ -213,12 +213,8 @@ This handles the case where OpenClaw wrote messages to the session file but cras
 
 All mutating operations (ingest, compact) are serialized per-session using a promise queue. This prevents races between concurrent afterTurn/compact calls for the same conversation without blocking operations on different conversations.
 
-## Authentication
+## Runtime LLM boundary
 
-LCM needs to call an LLM for summarization. It resolves credentials through a three-tier cascade:
+LCM needs model inference for summarization, but it does not resolve provider credentials, base URLs, or provider transport settings directly. Summarization calls go through OpenClaw's `runtime.llm.complete` capability, which owns model preparation, credential resolution, OAuth refresh, provider dispatch, and usage attribution.
 
-1. **Auth profiles** — OpenClaw's OAuth/token/API-key profile system (`auth-profiles.json`), checked in priority order
-2. **Environment variables** — Standard provider env vars (`ANTHROPIC_API_KEY`, etc.)
-3. **Custom provider key** — From models config (e.g., `models.json`)
-
-For OAuth providers (e.g., Anthropic via Claude Max), LCM handles token refresh and credential persistence automatically.
+Configured Lossless summary model overrides (`summaryModel`, `largeFileSummaryModel`, and `fallbackProviders`) are sent as runtime LLM model override requests. OpenClaw enforces those requests with `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`; denied overrides fail closed instead of silently falling back to a different model.

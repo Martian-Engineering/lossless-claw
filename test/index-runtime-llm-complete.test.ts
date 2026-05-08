@@ -95,6 +95,7 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
           configPath: string;
           modelRef: string;
         };
+        runtimeLlmComplete?: RuntimeLlmComplete;
         agentId?: string;
         system?: string;
         messages: Array<{ role: string; content: unknown }>;
@@ -102,7 +103,6 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
         temperature?: number;
         reasoningIfSupported?: string;
       }) => Promise<Record<string, unknown>>;
-      getApiKey: () => Promise<string | undefined>;
     };
     config: { databasePath: string };
   };
@@ -162,6 +162,42 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
         model: "gpt-5.4",
         agentId: "research-agent",
         request_api: "runtime.llm",
+      });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it("prefers a context-engine runtime llm capability when supplied", async () => {
+    const pluginRuntimeLlmComplete = vi.fn(async () => ({
+      text: "plugin summary",
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      agentId: "main",
+    }));
+    const boundRuntimeLlmComplete = vi.fn(async () => ({
+      text: "bound summary",
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      agentId: "research",
+    }));
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete: pluginRuntimeLlmComplete });
+    const engine = getRegisteredEngine(api, getFactory);
+
+    try {
+      const result = await engine.deps.complete({
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        runtimeLlmComplete: boundRuntimeLlmComplete,
+        messages: [{ role: "user", content: "Summarize this." }],
+        maxTokens: 256,
+      });
+
+      expect(boundRuntimeLlmComplete).toHaveBeenCalledTimes(1);
+      expect(pluginRuntimeLlmComplete).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        content: [{ type: "text", text: "bound summary" }],
+        agentId: "research",
       });
     } finally {
       closeLcmConnection(dbPath);
@@ -255,7 +291,7 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
           message: expect.stringContaining("runtime.llm.complete is unavailable"),
         },
       });
-      await expect(engine.deps.getApiKey()).resolves.toBeUndefined();
+      expect(engine.deps).not.toHaveProperty("getApiKey");
     } finally {
       closeLcmConnection(dbPath);
     }

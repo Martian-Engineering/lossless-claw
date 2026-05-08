@@ -41,17 +41,29 @@ export type RuntimeLlmModelOverride = {
   modelRef: string;
 };
 
+export type RuntimeLlmCompleteFn = (params: {
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+  model?: string;
+  maxTokens?: number;
+  temperature?: number;
+  systemPrompt?: string;
+  purpose?: string;
+  agentId?: string;
+}) => Promise<{
+  text: string;
+  provider: string;
+  model: string;
+  agentId: string;
+  usage?: Record<string, unknown>;
+  audit?: Record<string, unknown>;
+}>;
+
 export type CompleteFn = (params: {
   provider?: string;
   model: string;
   runtimeModelOverride?: RuntimeLlmModelOverride;
-  apiKey?: string;
-  providerApi?: string;
-  authProfileId?: string;
+  runtimeLlmComplete?: RuntimeLlmCompleteFn;
   agentId?: string;
-  agentDir?: string;
-  runtimeConfig?: unknown;
-  skipModelAuth?: boolean;
   messages: Array<{ role: string; content: unknown }>;
   system?: string;
   maxTokens: number;
@@ -77,29 +89,6 @@ export type ResolveModelFn = (modelRef?: string, providerHint?: string) => {
   provider: string;
   model: string;
 };
-
-/**
- * API key resolution function.
- */
-export type ApiKeyLookupOptions = {
-  profileId?: string;
-  preferredProfile?: string;
-  agentDir?: string;
-  runtimeConfig?: unknown;
-  skipModelAuth?: boolean;
-};
-
-export type GetApiKeyFn = (
-  provider: string,
-  model: string,
-  options?: ApiKeyLookupOptions,
-) => Promise<string | undefined>;
-
-export type RequireApiKeyFn = (
-  provider: string,
-  model: string,
-  options?: ApiKeyLookupOptions,
-) => Promise<string>;
 
 /**
  * Session key utilities.
@@ -133,20 +122,11 @@ export interface LcmDependencies {
   /** LLM completion function for summarization */
   complete: CompleteFn;
 
-  /** Whether a provider uses runtime-managed OAuth / auth profiles instead of direct API keys. */
-  isRuntimeManagedAuthProvider?: (provider: string, providerApi?: string) => boolean;
-
   /** Gateway RPC call function (for subagent spawning, session ops) */
   callGateway: CallGatewayFn;
 
   /** Resolve model alias to provider/model pair */
   resolveModel: ResolveModelFn;
-
-  /** Legacy direct API-key lookup; runtime LLM implementations should not call this. */
-  getApiKey: GetApiKeyFn;
-
-  /** Legacy direct API-key lookup; runtime LLM implementations should not call this. */
-  requireApiKey: RequireApiKeyFn;
 
   /** Parse agent session key into components */
   parseAgentSessionKey: ParseAgentSessionKeyFn;
