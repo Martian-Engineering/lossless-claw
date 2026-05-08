@@ -409,5 +409,18 @@ describe("LCM tools session scoping", () => {
     expect((cross.content[0] as { text: string }).text).toContain(
       formatTimestamp(new Date("2026-01-01T00:00:00.000Z"), timezone),
     );
+    expect(cross.details).toMatchObject({
+      id: "sum_foreign",
+      type: "summary",
+      summary: {
+        conversationId: 99,
+        tokenCount: 12,
+      },
+      manifest: {
+        tokenCap: 120,
+      },
+    });
+    expect(JSON.stringify(cross.details)).not.toContain("foreign summary");
+    expect(JSON.stringify(cross.details)).not.toContain("subtree");
   });
 });

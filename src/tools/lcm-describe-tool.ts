@@ -55,6 +55,32 @@ function normalizeRequestedTokenCap(value: unknown): number | undefined {
   return Math.max(1, Math.trunc(value));
 }
 
+function compactDescribeDetails(result: Awaited<ReturnType<LcmContextEngine["getRetrieval"]>["describe"]>) {
+  if (!result) {
+    return result;
+  }
+  if (result.type === "summary" && result.summary) {
+    const { content: _content, subtree: _subtree, ...summary } = result.summary;
+    return {
+      id: result.id,
+      type: result.type,
+      summary,
+    };
+  }
+  if (result.type === "file" && result.file) {
+    const { explorationSummary: _explorationSummary, ...file } = result.file;
+    return {
+      id: result.id,
+      type: result.type,
+      file: {
+        ...file,
+        hasExplorationSummary: Boolean(result.file.explorationSummary),
+      },
+    };
+  }
+  return { id: result.id, type: result.type };
+}
+
 export function createLcmDescribeTool(input: {
   deps: LcmDependencies;
   lcm?: LcmContextEngine;
@@ -203,7 +229,7 @@ export function createLcmDescribeTool(input: {
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: {
-            ...result,
+            ...compactDescribeDetails(result),
             manifest: {
               tokenCap: resolvedTokenCap,
               budgetSource:
@@ -242,7 +268,7 @@ export function createLcmDescribeTool(input: {
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: result,
+          details: compactDescribeDetails(result),
         };
       }
 
