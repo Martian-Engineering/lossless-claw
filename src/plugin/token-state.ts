@@ -43,6 +43,19 @@
  * fallback for older openclaw versions. The hook subscription becomes
  * legacy code; the per-tool self-update stays as a lag-protection layer
  * within iterations.
+ *
+ * # Public surface contract (Wave-12 retro N1)
+ *
+ * Tools MAY import named lifecycle hooks from this module — currently
+ * `getRuntimeContext`, `inferTokenBudget`, `noteSuccessfulCompact`. They
+ * MUST NOT reach into the underlying `tokensBySession` map directly. If
+ * a tool needs a new lifecycle event (e.g. a future `noteCompactionMidpoint`),
+ * add a named exported function here and document its semantics; do not
+ * push the cache-management concern into the tool.
+ *
+ * `lcm_compact` is the first tool to import a lifecycle hook directly
+ * (`noteSuccessfulCompact`). Future cache-aware tools should follow the
+ * same pattern.
  */
 
 export interface TokenSnapshot {
@@ -209,7 +222,8 @@ export function inferTokenBudget(
   model: string | undefined,
 ): number | undefined {
   const ref = `${provider ?? ""}/${model ?? ""}`.toLowerCase();
-  // 1M-context tier
+
+  // 1M-context tier (most-specific match first)
   if (ref.includes("opus-4-7") || ref.includes("opus-4-6") || ref.includes("opus-4-5")) {
     return 1_000_000;
   }
@@ -217,21 +231,43 @@ export function inferTokenBudget(
     // OpenAI Codex 1M context tier
     return 1_000_000;
   }
+  // Gemini 1.5/2.x — 1M default; matches actual context window for the family.
+  if (ref.includes("gemini-1.5") || ref.includes("gemini-2")) {
+    return 1_000_000;
+  }
+  // Anthropic 200K family (claude 3.x, sonnet/haiku-4.x)
   if (ref.includes("sonnet-4-5") || ref.includes("sonnet-4-6")) {
     return 200_000;
   }
   if (ref.includes("haiku")) {
     return 200_000;
   }
-  // Wave-12 audit (W1A1 P1): previously returned undefined for any model
-  // outside the recognized tiers (gpt-4 / gpt-4o / claude-3.x / o1 / Gemini /
-  // Mistral / Ollama / etc). evaluateNeedsCompactGate treats undefined as a
-  // bypass signal, so the gate was silently disabled for the majority of
-  // operators not on the recognized list. Conservative default of 200K
-  // covers most modern frontier-tier models (GPT-4 32K-128K, Claude 3.5
-  // 200K, o1 128K, Gemini 1.5 Pro 1M but capped here, etc). Operators on
-  // smaller-context models (8K-32K) over-protect, but per-call MAX_RESULT_CHARS
-  // already bounds the worst case at 10K tokens / call. Operators wanting a
-  // different default should set explicit tokenBudget via runtime config.
-  return 200_000;
+  if (ref.includes("claude-3-5") || ref.includes("claude-3-7") || ref.includes("claude-3.5") || ref.includes("claude-3.7") || ref.includes("claude-sonnet")) {
+    return 200_000;
+  }
+  // 128K-context tier — gpt-4o family, o1 family.
+  if (ref.includes("gpt-4o") || ref.includes("o1-")) {
+    return 128_000;
+  }
+  // 32K floor for small-context legacy GPT-4 + unknown providers.
+  // Wave-12 retro M1: was a uniform 200K — too generous for sub-200K
+  // models (gate stayed silent until projected context was 6× over real
+  // budget). Per-provider defaults match each family's actual context
+  // window more closely. Unknown / Ollama / Mistral / OpenRouter all
+  // fall through to the 32K floor (smallest common context across
+  // self-hosted + niche-cloud setups). Operators on larger models with
+  // an unrecognized name should explicitly set tokenBudget via runtime
+  // config, OR via env var `LCM_DEFAULT_TOKEN_BUDGET` (escape hatch).
+  if (ref.includes("gpt-4")) {
+    return 32_000;
+  }
+  // Env-driven escape hatch for unknown providers.
+  const envOverride = process.env.LCM_DEFAULT_TOKEN_BUDGET?.trim();
+  if (envOverride) {
+    const parsed = Number.parseInt(envOverride, 10);
+    if (Number.isFinite(parsed) && parsed >= 8_000 && parsed <= 2_000_000) {
+      return parsed;
+    }
+  }
+  return 32_000;
 }

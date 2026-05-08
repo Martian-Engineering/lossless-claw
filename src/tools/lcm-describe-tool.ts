@@ -697,6 +697,14 @@ export function createLcmDescribeTool(input: {
           content: [{ type: "text", text: trimmed.text }],
           details: {
             ...result,
+            // Wave-12 retro review N2: top-level `truncated` is the
+            // canonical agent-facing contract field (mirrored across
+            // all content-emitting tools). Tools that ALSO surface
+            // truncation in a domain-specific manifest (e.g. describe's
+            // expansion manifest) MAY duplicate the flag there, but the
+            // top-level placement is what generic "did this tool
+            // truncate?" callers should read.
+            truncated: trimmed.truncated,
             manifest: {
               tokenCap: resolvedTokenCap,
               budgetSource:
@@ -706,7 +714,7 @@ export function createLcmDescribeTool(input: {
                     ? "delegated_grant_remaining"
                     : "config_default",
               nodes: manifestNodes,
-              truncated: trimmed.truncated,
+              truncated: trimmed.truncated,  // duplicate for back-compat with manifest readers
             },
             expansion: {
               children: expandedChildren,

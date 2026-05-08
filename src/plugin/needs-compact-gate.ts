@@ -156,10 +156,13 @@ export function estimateResultTokens(
     case "lcm_synthesize_around":
       // Wave-12 audit W2A1: lcm_synthesize_around is now wrapped by
       // runWithTokenGate so this estimate IS consulted. Output is the
-      // synthesized markdown rollup (typically 2K-3K tokens; bounded by
-      // the summarizer's max-output-tokens). Source-input cap (50K) is
-      // separate and not the OUTPUT we're estimating here.
-      return 3_000;
+      // synthesized markdown rollup. Wave-12 retro review (L1) flagged
+      // a self-contradiction with this file's docstring ("4K-8K tokens
+      // of LLM-generated rollup"). Picked 6_000 (midpoint of the
+      // docstring range) — conservative under-estimate for typical
+      // synthesis, matches what the file's docstring documents. The
+      // 50K source-input cap is separate; we estimate OUTPUT here.
+      return 6_000;
 
     default:
       return 1_000;  // unknown tool — small default

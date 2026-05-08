@@ -56,6 +56,17 @@ describe("estimateResultTokens — empirical formulas (Wave-14 Agent C calibrati
     expect(t).toBeLessThan(200);
   });
 
+  it("lcm_synthesize_around estimate matches the docstring's 4K-8K range (Wave-12 retro L1 self-contradiction fix)", () => {
+    // Wave-12 retro review L1: the file's docstring at line 26-29
+    // documents synthesize output as "4K-8K tokens of LLM-generated
+    // rollup", but the estimator previously returned 3000 — under-
+    // estimating by ~50%. Fixed to 6000 (midpoint of the documented
+    // range). If the docstring drifts, update both sides together.
+    const t = estimateResultTokens("lcm_synthesize_around", {});
+    expect(t).toBeGreaterThanOrEqual(4_000);
+    expect(t).toBeLessThanOrEqual(8_000);
+  });
+
   it("unknown tool returns conservative default", () => {
     const t = estimateResultTokens("unknown_tool", {});
     expect(t).toBe(1000);

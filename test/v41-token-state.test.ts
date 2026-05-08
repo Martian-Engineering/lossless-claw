@@ -145,21 +145,65 @@ describe("token-state — inferTokenBudget", () => {
   it("infers 200K for sonnet-4-5", () => {
     expect(inferTokenBudget("anthropic", "claude-sonnet-4-5")).toBe(200_000);
   });
-  it("returns 200K conservative default for unknown providers (Wave-12 audit fix)", () => {
-    // Wave-12 audit (W1A1 P1): previously returned undefined for unknown
-    // models, which evaluateNeedsCompactGate treated as a bypass signal —
-    // gate was silently disabled for gpt-4 / gpt-4o / claude-3.x / o1 / Gemini /
-    // Mistral / Ollama. Now returns 200K conservative default so the gate
-    // protects every operator. Per-call MAX_RESULT_CHARS bounds worst case.
-    expect(inferTokenBudget("unknown-provider", "unknown-model")).toBe(200_000);
-    expect(inferTokenBudget("openai", "gpt-4")).toBe(200_000);
-    expect(inferTokenBudget("openai", "gpt-4o")).toBe(200_000);
+  // Wave-12 retro M1: per-provider defaults. The previous uniform 200K
+  // default was too generous for sub-200K models (gpt-4 8K-32K, ollama
+  // 8K-128K) — gate stayed silent until projected context was 6× over
+  // real budget. Now per-family defaults match actual context windows.
+  it("returns 200K for claude-3.x family", () => {
     expect(inferTokenBudget("anthropic", "claude-3-5-sonnet")).toBe(200_000);
-    expect(inferTokenBudget("openai", "o1-preview")).toBe(200_000);
+    expect(inferTokenBudget("anthropic", "claude-3-7-sonnet")).toBe(200_000);
   });
-  it("handles missing provider/model gracefully (200K default)", () => {
-    // Wave-12 audit (W1A1 P1): missing provider/model also gets the default.
-    // The hook handler checks `!event.usage` upstream; this is the safety net.
-    expect(inferTokenBudget(undefined, undefined)).toBe(200_000);
+  it("returns 128K for gpt-4o family + o1 family", () => {
+    expect(inferTokenBudget("openai", "gpt-4o")).toBe(128_000);
+    expect(inferTokenBudget("openai", "gpt-4o-mini")).toBe(128_000);
+    expect(inferTokenBudget("openai", "o1-preview")).toBe(128_000);
+    expect(inferTokenBudget("openai", "o1-mini")).toBe(128_000);
+  });
+  it("returns 1M for Gemini 1.5/2.x family", () => {
+    expect(inferTokenBudget("google", "gemini-1.5-pro")).toBe(1_000_000);
+    expect(inferTokenBudget("google", "gemini-2-flash")).toBe(1_000_000);
+  });
+  it("returns 32K for legacy gpt-4 (8K-32K context)", () => {
+    expect(inferTokenBudget("openai", "gpt-4")).toBe(32_000);
+    expect(inferTokenBudget("openai", "gpt-4-32k")).toBe(32_000);
+  });
+  it("returns 32K floor for unknown providers (Ollama / Mistral / OpenRouter / unknown)", () => {
+    // Smallest common context across self-hosted + niche-cloud. Operators
+    // on larger unrecognized models should set tokenBudget explicitly OR
+    // via env var LCM_DEFAULT_TOKEN_BUDGET (escape hatch tested below).
+    expect(inferTokenBudget("ollama", "llama3-70b")).toBe(32_000);
+    expect(inferTokenBudget("mistral", "mistral-large")).toBe(32_000);
+    expect(inferTokenBudget("openrouter", "weird-model")).toBe(32_000);
+    expect(inferTokenBudget("unknown-provider", "unknown-model")).toBe(32_000);
+  });
+  it("LCM_DEFAULT_TOKEN_BUDGET env override applies to unknown models", () => {
+    const original = process.env.LCM_DEFAULT_TOKEN_BUDGET;
+    process.env.LCM_DEFAULT_TOKEN_BUDGET = "100000";
+    try {
+      // Unknown provider gets the env override.
+      expect(inferTokenBudget("unknown-provider", "weird")).toBe(100_000);
+      // Known provider still gets per-family default (env doesn't override known).
+      expect(inferTokenBudget("anthropic", "claude-3-5-sonnet")).toBe(200_000);
+    } finally {
+      if (original === undefined) delete process.env.LCM_DEFAULT_TOKEN_BUDGET;
+      else process.env.LCM_DEFAULT_TOKEN_BUDGET = original;
+    }
+  });
+  it("LCM_DEFAULT_TOKEN_BUDGET env override clamps to [8K, 2M] sanity range", () => {
+    const original = process.env.LCM_DEFAULT_TOKEN_BUDGET;
+    process.env.LCM_DEFAULT_TOKEN_BUDGET = "100";  // way below floor
+    try {
+      // Out-of-range value falls through to 32K floor.
+      expect(inferTokenBudget("unknown-provider", "weird")).toBe(32_000);
+    } finally {
+      if (original === undefined) delete process.env.LCM_DEFAULT_TOKEN_BUDGET;
+      else process.env.LCM_DEFAULT_TOKEN_BUDGET = original;
+    }
+  });
+  it("handles missing provider/model gracefully (32K default)", () => {
+    // Wave-12 audit (W1A1 P1): missing provider/model also gets the
+    // default. The hook handler checks `!event.usage` upstream; this is
+    // the safety net. Wave-12 retro M1: was 200K, now 32K floor.
+    expect(inferTokenBudget(undefined, undefined)).toBe(32_000);
   });
 });

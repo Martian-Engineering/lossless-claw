@@ -375,6 +375,7 @@ export function createLcmGrepTool(input: {
       lines.push("");
 
       let currentChars = lines.join("\n").length;
+      let truncated = false;
 
       if (result.messages.length > 0) {
         lines.push("### Messages");
@@ -384,6 +385,7 @@ export function createLcmGrepTool(input: {
           const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatDisplayTime(msg.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow query, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
+            truncated = true;
             break;
           }
           lines.push(line);
@@ -392,7 +394,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
       }
 
-      if (result.summaries.length > 0) {
+      if (result.summaries.length > 0 && !truncated) {
         lines.push("### Summaries");
         lines.push("");
         for (const sum of result.summaries) {
@@ -400,6 +402,7 @@ export function createLcmGrepTool(input: {
           const line = `- [${sum.summaryId}] (${sum.kind}, ${formatDisplayTime(sum.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow query, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
+            truncated = true;
             break;
           }
           lines.push(line);
@@ -420,6 +423,10 @@ export function createLcmGrepTool(input: {
           messageCount: result.messages.length,
           summaryCount: result.summaries.length,
           totalMatches: result.totalMatches,
+          // Wave-12 retro N2: top-level `truncated` is the canonical
+          // agent-facing contract field across all content-emitting
+          // tools. Mirrors lcm_describe + verbatim-mode parity.
+          truncated,
           // Wave-7 Auditor #8 P1: surface sort override
           ...(sortIgnored
             ? { sortIgnored: true, requestedSort, effectiveSort }
@@ -671,6 +678,7 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
   lines.push("");
 
   let currentChars = lines.join("\n").length;
+  let truncated = false;
 
   if (hybridResult.hits.length > 0) {
     lines.push("### Summaries");
@@ -682,6 +690,7 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
       const line = `- [${hit.summaryId}] ${provenance} (${hit.kind}, score=${score}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
       if (currentChars + line.length > MAX_RESULT_CHARS) {
         lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow query, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
+        truncated = true;
         break;
       }
       lines.push(line);
@@ -700,6 +709,8 @@ async function runHybridLcmGrep(input: HybridGrepInput) {
       messageCount: 0,
       summaryCount: hybridResult.hits.length,
       totalMatches: hybridResult.hits.length,
+      // Wave-12 retro N2: top-level truncated for parity with other tools.
+      truncated,
       candidateCount: hybridResult.candidateCount,
       voyageTokensConsumed: hybridResult.voyageTokensConsumed,
       degradedToFtsOnly: hybridResult.degradedToFtsOnly,
@@ -864,6 +875,8 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
   }
   lines.push("");
 
+  let truncatedSemantic = false;
+
   if (semResult.hits.length === 0) {
     lines.push(
       "_No semantic matches. Try mode='hybrid' for rerank-boosted recall, or mode='regex'/'full_text' for keyword-only._",
@@ -884,6 +897,7 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
       const line = `- [${hit.summaryId}] (${hit.kind}, cosine=${cosStr}, ${formatDisplayTime(hit.createdAt, timezone)}): ${snippet}`;
       if (currentChars + line.length > MAX_RESULT_CHARS) {
         lines.push(`*(truncated at ~${Math.round(MAX_RESULT_CHARS / 4)} tokens to protect agent context — narrow query, lower limit, or wait for next-turn compaction; raise LCM_TOOL_RESULT_TOKEN_BUDGET env to increase the cap)*`);
+        truncatedSemantic = true;
         break;
       }
       lines.push(line);
@@ -897,6 +911,8 @@ async function runSemanticLcmGrep(input: HybridGrepInput) {
       mode: "semantic",
       pattern,
       totalMatches: semResult.hits.length,
+      // Wave-12 retro N2: top-level truncated for parity with other tools.
+      truncated: truncatedSemantic,
       voyageTokensConsumed: semResult.voyageTokensConsumed,
       modelName: semResult.modelName,
       // Wave-3 Auditor #4 fix #5: confidenceBand mirrors lcm_semantic_recall
