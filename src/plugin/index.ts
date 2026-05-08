@@ -2364,22 +2364,27 @@ function wirePluginHandlers(
 
   api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
 
-  api.registerTool((ctx) =>
-    createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  api.registerTool(
+    (ctx) => createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_grep" },
   );
-  api.registerTool((ctx) =>
-    createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  api.registerTool(
+    (ctx) => createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_describe" },
   );
-  api.registerTool((ctx) =>
-    createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+  api.registerTool(
+    (ctx) => createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_expand" },
   );
-  api.registerTool((ctx) =>
-    createLcmExpandQueryTool({
-      deps,
-      getLcm: shared.waitForEngine,
-      sessionKey: ctx.sessionKey,
-      requesterSessionKey: ctx.sessionKey,
-    }),
+  api.registerTool(
+    (ctx) =>
+      createLcmExpandQueryTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+        requesterSessionKey: ctx.sessionKey,
+      }),
+    { name: "lcm_expand_query" },
   );
 
   api.registerCommand(

@@ -54,21 +54,49 @@ function extractToolNames(): string[] {
   return [...names].sort();
 }
 
-function extractRegisterToolFactoryCallSites(): string[] {
-  const src = readFileSync(PLUGIN_INDEX, "utf8");
-  // Find each `api.registerTool(...)` call and capture the inner factory
-  // identifier (e.g. createLcmGrepTool). Tolerates both expression-body and
-  // block-body arrow forms, optional async, and any whitespace/newlines:
-  //
-  //   api.registerTool((ctx) => createLcmGrepTool(...))
-  //   api.registerTool((ctx) => { return createLcmGrepTool(...) })
-  //   api.registerTool(async (ctx) => createLcmGrepTool(...))
-  const pattern =
-    /api\.registerTool\s*\(\s*(?:async\s+)?\([^)]*\)\s*=>\s*\{?\s*(?:return\s+)?(create[A-Za-z]+Tool)\b/g;
-  const matches = src.matchAll(pattern);
-  return [...matches].map((m) => m[1]).sort();
-}
+type RegisterToolFactoryCallSite = {
+  factory: string;
+  runtimeName?: string;
+};
 
+function extractRegisterToolFactoryCallSites(): RegisterToolFactoryCallSite[] {
+  const src = readFileSync(PLUGIN_INDEX, "utf8");
+  const sites: RegisterToolFactoryCallSite[] = [];
+  const marker = "api.registerTool(";
+  let searchFrom = 0;
+
+  while (true) {
+    const start = src.indexOf(marker, searchFrom);
+    if (start === -1) {
+      break;
+    }
+    let depth = 0;
+    let end = start;
+    for (; end < src.length; end += 1) {
+      const char = src[end];
+      if (char === "(") {
+        depth += 1;
+      } else if (char === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          end += 1;
+          break;
+        }
+      }
+    }
+    const call = src.slice(start, end);
+    const factory = call.match(/\b(create[A-Za-z]+Tool)\b/)?.[1];
+    if (factory) {
+      sites.push({
+        factory,
+        runtimeName: call.match(/\{\s*name\s*:\s*["'](lcm_[a-z_]+)["']\s*\}/)?.[1],
+      });
+    }
+    searchFrom = end;
+  }
+
+  return sites.sort((a, b) => a.factory.localeCompare(b.factory));
+}
 describe("openclaw.plugin.json manifest drift guard (#570)", () => {
   it("contracts.tools matches the canonical name fields in src/tools/*", () => {
     const declared = [...manifest.contracts.tools].sort();
@@ -77,11 +105,11 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
   });
 
   it("contracts.tools enumerates one entry per registerTool call site", () => {
-    const factories = extractRegisterToolFactoryCallSites();
+    const callSites = extractRegisterToolFactoryCallSites();
     // Each createLcm*Tool factory must correspond to exactly one declared
     // contract. If a registerTool call is added without a manifest update,
-    // factories.length grows and this assertion fails.
-    expect(factories.length).toBe(manifest.contracts.tools.length);
+    // callSites.length grows and this assertion fails.
+    expect(callSites.length).toBe(manifest.contracts.tools.length);
     // Each factory name should map 1:1 to a declared tool (createLcmGrepTool
     // -> lcm_grep, createLcmExpandQueryTool -> lcm_expand_query, etc.).
     const factoryToName = (s: string): string =>
@@ -90,9 +118,16 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
         .replace(/Tool$/, "")
         .replace(/([a-z])([A-Z])/g, "$1_$2")
         .toLowerCase();
-    const expected = factories.map(factoryToName).sort();
+    const expected = callSites.map((site) => factoryToName(site.factory)).sort();
     const declared = [...manifest.contracts.tools].sort();
     expect(declared).toEqual(expected);
+  });
+
+  it("registers explicit runtime names for factory-owned tools", () => {
+    const callSites = extractRegisterToolFactoryCallSites();
+    const runtimeNames = callSites.map((site) => site.runtimeName).sort();
+    const declared = [...manifest.contracts.tools].sort();
+    expect(runtimeNames).toEqual(declared);
   });
 
   it("declares startup activation until OpenClaw always loads selected context-engine plugins", () => {
