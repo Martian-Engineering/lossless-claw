@@ -2610,6 +2610,63 @@ describe("LcmContextEngine.bootstrap", () => {
     );
   });
 
+  it("does not rewrite prior assistant transcript rows when bootstrap re-instantiates a conversation", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("bootstrap-reinstantiation-replay");
+    const sm = SessionManager.open(sessionFile);
+    const sessionId = "bootstrap-reinstantiation-replay";
+
+    for (let turn = 1; turn <= 5; turn += 1) {
+      sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: `question ${turn}` }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: `answer ${turn}` }],
+      } as AgentMessage);
+    }
+
+    const engineA = createEngineAtDatabasePath(dbPath);
+    const first = await engineA.bootstrap({ sessionId, sessionFile });
+    expect(first).toEqual({ bootstrapped: true, importedMessages: 10 });
+
+    const conversation = await engineA.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const before = await engineA.getConversationStore().getMessages(conversation!.conversationId);
+    await engineA.dispose();
+
+    for (const answer of ["answer 3", "answer 4", "answer 5"]) {
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: answer }],
+      } as AgentMessage);
+    }
+
+    const engineB = createEngineAtDatabasePath(dbPath);
+    const second = await engineB.bootstrap({ sessionId, sessionFile });
+    expect(second.bootstrapped).toBe(false);
+    expect(second.importedMessages).toBe(0);
+
+    const after = await engineB.getConversationStore().getMessages(conversation!.conversationId);
+    expect(after.map((message) => `${message.role}\0${message.content}`)).toEqual(
+      before.map((message) => `${message.role}\0${message.content}`),
+    );
+
+    const seen = new Set<string>();
+    const duplicateContentRows = after.filter((message) => {
+      const identity = `${message.role}\0${message.content}`;
+      if (seen.has(identity)) {
+        return true;
+      }
+      seen.add(identity);
+      return false;
+    });
+    expect(duplicateContentRows).toHaveLength(0);
+  });
+
   it("skips reopening the transcript when checkpoint stats match", async () => {
     const sessionFile = createSessionFilePath("unchanged-fast-path");
     const sm = SessionManager.open(sessionFile);

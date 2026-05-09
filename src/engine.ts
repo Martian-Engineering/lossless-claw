@@ -4766,7 +4766,12 @@ export class LcmContextEngine implements ContextEngine {
       return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
     }
 
-    const missingTail = historicalMessages.slice(anchorIndex + 1);
+    const missingTail = await this.filterBootstrapReplayMessages({
+      conversationId,
+      messages: historicalMessages.slice(anchorIndex + 1),
+      sessionContext,
+      source: "reconcileSessionTail",
+    });
 
     const existingDbCount = await this.conversationStore.getMessageCount(conversationId);
     if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
@@ -4791,6 +4796,82 @@ export class LcmContextEngine implements ContextEngine {
       `[lcm] reconcileSessionTail: slow path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages}`,
     );
     return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+  }
+
+  /**
+   * Existing-conversation bootstrap is a rehydrate path. It may repair small
+   * crash gaps, but it must not replay already persisted transcript rows as
+   * fresh LCM seqs after a runtime re-instantiation.
+   */
+  private async filterBootstrapReplayMessages(params: {
+    conversationId: number;
+    messages: AgentMessage[];
+    sessionContext: string;
+    source: string;
+  }): Promise<AgentMessage[]> {
+    if (params.messages.length === 0) {
+      return params.messages;
+    }
+
+    const storedMessages = params.messages.map((message) => toStoredMessage(message));
+    const existingCountsByIdentity = new Map<string, number>();
+    let replicatedNonEmptyRows = 0;
+
+    for (const stored of storedMessages) {
+      if (stored.content.length === 0) {
+        continue;
+      }
+      const identity = messageIdentity(stored.role, stored.content);
+      let existingCount = existingCountsByIdentity.get(identity);
+      if (existingCount === undefined) {
+        existingCount = await this.conversationStore.countMessagesByIdentity(
+          params.conversationId,
+          stored.role,
+          stored.content,
+        );
+        existingCountsByIdentity.set(identity, existingCount);
+      }
+      if (existingCount > 0) {
+        replicatedNonEmptyRows += 1;
+      }
+    }
+
+    if (replicatedNonEmptyRows < 3) {
+      return params.messages;
+    }
+
+    const seenIncomingByIdentity = new Map<string, number>();
+    const filtered: AgentMessage[] = [];
+    let droppedMessages = 0;
+
+    for (let index = 0; index < params.messages.length; index += 1) {
+      const stored = storedMessages[index]!;
+      const message = params.messages[index]!;
+      if (stored.content.length === 0) {
+        droppedMessages += 1;
+        continue;
+      }
+
+      const identity = messageIdentity(stored.role, stored.content);
+      const seenIncoming = seenIncomingByIdentity.get(identity) ?? 0;
+      const existingCount = existingCountsByIdentity.get(identity) ?? 0;
+      seenIncomingByIdentity.set(identity, seenIncoming + 1);
+
+      if (seenIncoming < existingCount) {
+        droppedMessages += 1;
+        continue;
+      }
+
+      filtered.push(message);
+    }
+
+    if (droppedMessages > 0) {
+      this.deps.log.warn(
+        `[lcm] bootstrap replay guard: ${params.source} dropped ${droppedMessages}/${params.messages.length} replayed transcript messages for ${params.sessionContext} replicatedNonEmptyRows=${replicatedNonEmptyRows}`,
+      );
+    }
+
+    return filtered;
   }
 
   private async reconcileTranscriptTailForAfterTurn(params: {
@@ -4827,8 +4908,18 @@ export class LcmContextEngine implements ContextEngine {
             offset: checkpoint.lastProcessedOffset,
           });
           if (appended.canUseAppendOnly) {
+            const replayFilteredMessages = await this.filterBootstrapReplayMessages({
+              conversationId: conversation.conversationId,
+              messages: appended.messages,
+              sessionContext: this.formatSessionLogContext({
+                conversationId: conversation.conversationId,
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+              }),
+              source: "afterTurn transcript reconcile append-only",
+            });
             let importedMessages = 0;
-            for (const message of appended.messages) {
+            for (const message of replayFilteredMessages) {
               const result = await this.ingestSingle({
                 sessionId: params.sessionId,
                 sessionKey: params.sessionKey,
@@ -5202,8 +5293,19 @@ export class LcmContextEngine implements ContextEngine {
                   await this.conversationStore.markConversationBootstrapped(conversationId);
                 }
 
+                const replayFilteredMessages = await this.filterBootstrapReplayMessages({
+                  conversationId,
+                  messages: appended.messages,
+                  sessionContext: this.formatSessionLogContext({
+                    conversationId,
+                    sessionId: params.sessionId,
+                    sessionKey: params.sessionKey,
+                  }),
+                  source: "bootstrap append-only",
+                });
+
                 let importedMessages = 0;
-                for (const message of appended.messages) {
+                for (const message of replayFilteredMessages) {
                   const ingestResult = await this.ingestSingle({
                     sessionId: params.sessionId,
                     sessionKey: params.sessionKey,
@@ -5219,7 +5321,7 @@ export class LcmContextEngine implements ContextEngine {
                   this.clearStableOrphanStrippingOrdinal(conversationId);
                 }
                 this.deps.log.debug(
-                  `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
+                  `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} replayFilteredMessages=${replayFilteredMessages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
                 );
 
                 if (importedMessages > 0) {
@@ -6119,19 +6221,21 @@ export class LcmContextEngine implements ContextEngine {
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
-        let ingestedCount = 0;
-        for (const message of params.messages) {
-          const result = await this.ingestSingle({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            message,
-            isHeartbeat: params.isHeartbeat,
-          });
-          if (result.ingested) {
-            ingestedCount += 1;
+        return this.conversationStore.withTransaction(async () => {
+          let ingestedCount = 0;
+          for (const message of params.messages) {
+            const result = await this.ingestSingle({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              message,
+              isHeartbeat: params.isHeartbeat,
+            });
+            if (result.ingested) {
+              ingestedCount += 1;
+            }
           }
-        }
-        return { ingestedCount };
+          return { ingestedCount };
+        });
       },
       {
         operationName: "ingestBatch",
