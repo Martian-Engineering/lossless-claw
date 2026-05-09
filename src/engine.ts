@@ -6791,8 +6791,14 @@ export class LcmContextEngine implements ContextEngine {
         return safeFallback();
       }
 
-      this.deps.log.debug(
-        `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${assembled.messages.length} tokenBudget=${tokenBudget} estimatedTokens=${assembled.estimatedTokens} duration=${formatDurationMs(Date.now() - startedAt)}`,
+      // v4.2 §B — surface stub telemetry on the standard "assemble: done" line
+      // so live watchers can grep stubbedCount/tokensSaved without needing the
+      // full assemble-debug bag.
+      const stubStatsLog = assembled.debug?.stubStats
+        ? ` stubbed=${assembled.debug.stubStats.stubbedCount} tokensSaved=${assembled.debug.stubStats.tokensSaved}`
+        : "";
+      this.deps.log.info(
+        `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${assembled.messages.length} tokenBudget=${tokenBudget} estimatedTokens=${assembled.estimatedTokens}${stubStatsLog} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
       const prefixChange = describeAssembledPrefixChange(
         this.getPreviousAssembledSnapshot(conversation.conversationId),
