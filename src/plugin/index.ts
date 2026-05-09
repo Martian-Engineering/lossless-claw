@@ -20,7 +20,14 @@ import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
-import type { LcmDependencies, StartupSessionFileCandidate } from "../types.js";
+import type {
+  LcmDependencies,
+  SqliteSessionTranscriptCursor,
+  SqliteSessionTranscriptDelta,
+  SqliteSessionTranscriptFrontier,
+  SqliteSessionTranscriptScope,
+  StartupSessionFileCandidate,
+} from "../types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
@@ -61,6 +68,31 @@ type RuntimeAgentSessionApi = {
   ) => string;
 };
 type RuntimeAgentSessionApiCandidate = Partial<RuntimeAgentSessionApi>;
+
+type SessionStoreRuntimeModule = {
+  getSqliteSessionTranscriptFrontier?: (scope: {
+    env?: NodeJS.ProcessEnv;
+    agentId: string;
+    sessionId: string;
+  }) => Promise<SqliteSessionTranscriptFrontier | null> | SqliteSessionTranscriptFrontier | null;
+  loadSqliteSessionTranscriptDelta?: (params: {
+    env?: NodeJS.ProcessEnv;
+    agentId: string;
+    sessionId: string;
+    cursor?: SqliteSessionTranscriptCursor;
+  }) => Promise<SqliteSessionTranscriptDelta> | SqliteSessionTranscriptDelta;
+};
+
+let sessionStoreRuntimeModulePromise: Promise<SessionStoreRuntimeModule | null> | null = null;
+
+async function loadSessionStoreRuntimeModule(): Promise<SessionStoreRuntimeModule | null> {
+  if (!sessionStoreRuntimeModulePromise) {
+    sessionStoreRuntimeModulePromise = import("openclaw/plugin-sdk/session-store-runtime")
+      .then((mod) => mod as SessionStoreRuntimeModule)
+      .catch(() => null);
+  }
+  return sessionStoreRuntimeModulePromise;
+}
 
 /** Return the runtime session registry API when the host exposes it. */
 function getRuntimeAgentSessionApi(api: OpenClawPluginApi): RuntimeAgentSessionApi | undefined {
@@ -2253,6 +2285,49 @@ function createLcmDependencies(
         return transcriptPath.trim() || undefined;
       } catch {
         return undefined;
+      }
+    },
+    getSqliteSessionTranscriptFrontier: async (scope: SqliteSessionTranscriptScope) => {
+      const runtime = await loadSessionStoreRuntimeModule();
+      if (!runtime?.getSqliteSessionTranscriptFrontier) {
+        return null;
+      }
+      try {
+        return (
+          (await runtime.getSqliteSessionTranscriptFrontier({
+            env: process.env,
+            agentId: scope.agentId,
+            sessionId: scope.sessionId,
+          })) ?? null
+        );
+      } catch {
+        return null;
+      }
+    },
+    loadSqliteSessionTranscriptDelta: async (
+      params: SqliteSessionTranscriptScope & { cursor?: SqliteSessionTranscriptCursor },
+    ) => {
+      const runtime = await loadSessionStoreRuntimeModule();
+      if (!runtime?.loadSqliteSessionTranscriptDelta) {
+        return {
+          mode: "missing",
+          frontier: null,
+          events: [],
+        } satisfies SqliteSessionTranscriptDelta;
+      }
+      try {
+        return await runtime.loadSqliteSessionTranscriptDelta({
+          env: process.env,
+          agentId: params.agentId,
+          sessionId: params.sessionId,
+          ...(params.cursor ? { cursor: params.cursor } : {}),
+        });
+      } catch {
+        return {
+          mode: "missing",
+          frontier: null,
+          events: [],
+        } satisfies SqliteSessionTranscriptDelta;
       }
     },
     listStartupSessionFileCandidates: async () => {

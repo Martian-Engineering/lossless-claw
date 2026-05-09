@@ -71,7 +71,15 @@ import {
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
-import type { LcmDependencies, StartupSessionFileCandidate } from "./types.js";
+import type {
+  LcmDependencies,
+  SqliteSessionTranscriptCursor,
+  SqliteSessionTranscriptDelta,
+  SqliteSessionTranscriptEvent,
+  SqliteSessionTranscriptFrontier,
+  SqliteSessionTranscriptScope,
+  StartupSessionFileCandidate,
+} from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
 import {
@@ -1675,6 +1683,19 @@ function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | n
   } catch {
     return null;
   }
+}
+
+function bootstrapMessagesFromSqliteTranscriptEvents(
+  events: SqliteSessionTranscriptEvent[],
+): AgentMessage[] {
+  const messages: AgentMessage[] = [];
+  for (const entry of events) {
+    const candidate = extractBootstrapMessageCandidate(entry.event);
+    if (candidate) {
+      messages.push(candidate);
+    }
+  }
+  return messages;
 }
 
 function messageIdentity(role: string, content: string): string {
@@ -4939,6 +4960,321 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  private resolveSqliteTranscriptScope(params: {
+    sessionId: string;
+    sessionKey?: string;
+  }): SqliteSessionTranscriptScope | null {
+    if (
+      !this.deps.getSqliteSessionTranscriptFrontier
+      || !this.deps.loadSqliteSessionTranscriptDelta
+    ) {
+      return null;
+    }
+    const sessionId = params.sessionId.trim();
+    if (!sessionId) {
+      return null;
+    }
+    const parsed = params.sessionKey?.trim()
+      ? this.deps.parseAgentSessionKey(params.sessionKey.trim())
+      : null;
+    return {
+      agentId: this.deps.normalizeAgentId(parsed?.agentId),
+      sessionId,
+    };
+  }
+
+  private async bootstrapFromHistoricalMessages(params: {
+    conversation: ConversationRecord;
+    existingCount: number;
+    historicalMessages: AgentMessage[];
+    sessionId: string;
+    sessionKey?: string;
+    sessionLabel: string;
+    startedAt: number;
+    checkpointEntryHash?: string | null;
+    persistBootstrapState: (lastProcessedEntryHash?: string | null) => Promise<void>;
+  }): Promise<BootstrapResult> {
+    const conversationId = params.conversation.conversationId;
+
+    if (params.existingCount === 0) {
+      const bootstrapMessages = trimBootstrapMessagesToBudget(
+        params.historicalMessages,
+        resolveBootstrapMaxTokens(this.config),
+      );
+
+      if (bootstrapMessages.length === 0) {
+        await this.conversationStore.markConversationBootstrapped(conversationId);
+        await params.persistBootstrapState();
+        return {
+          bootstrapped: false,
+          importedMessages: 0,
+          reason: "no leaf-path messages in session",
+        };
+      }
+
+      let importedMessages = 0;
+      for (const message of bootstrapMessages) {
+        const result = await this.ingestSingle({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          message,
+        });
+        if (result.ingested) {
+          importedMessages += 1;
+        }
+      }
+      await this.conversationStore.markConversationBootstrapped(conversationId);
+
+      let prunedMessages = 0;
+      if (this.config.pruneHeartbeatOk) {
+        const pruned = await this.pruneHeartbeatOkTurns(conversationId);
+        prunedMessages = pruned;
+        if (pruned > 0) {
+          this.clearStableOrphanStrippingOrdinal(conversationId);
+          this.deps.log.info(
+            `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
+          );
+        }
+      }
+
+      const lastImportedHash =
+        prunedMessages === 0 && bootstrapMessages.length > 0
+          ? createBootstrapEntryHash(toStoredMessage(bootstrapMessages[bootstrapMessages.length - 1]))
+          : undefined;
+      await params.persistBootstrapState(lastImportedHash);
+      if (importedMessages > 0) {
+        this.clearStableOrphanStrippingOrdinal(conversationId);
+      }
+      this.deps.log.info(
+        `[lcm] bootstrap: initial import conversation=${conversationId} ${params.sessionLabel} importedMessages=${importedMessages} sourceMessages=${params.historicalMessages.length} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+      );
+
+      return {
+        bootstrapped: true,
+        importedMessages,
+      };
+    }
+
+    const reconcile = await this.reconcileSessionTail({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      conversationId,
+      historicalMessages: params.historicalMessages,
+      checkpointEntryHash: params.checkpointEntryHash,
+    });
+    this.deps.log.info(
+      `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+    );
+
+    if (reconcile.blockedByImportCap) {
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "reconcile import capped",
+      };
+    }
+
+    if (!params.conversation.bootstrappedAt) {
+      await this.conversationStore.markConversationBootstrapped(conversationId);
+    }
+
+    if (reconcile.importedMessages > 0) {
+      this.clearStableOrphanStrippingOrdinal(conversationId);
+      await params.persistBootstrapState();
+      return {
+        bootstrapped: true,
+        importedMessages: reconcile.importedMessages,
+        reason: "reconciled missing session messages",
+      };
+    }
+
+    if (reconcile.hasOverlap) {
+      await params.persistBootstrapState();
+    }
+
+    if (params.conversation.bootstrappedAt) {
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "already bootstrapped",
+      };
+    }
+
+    return {
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: reconcile.hasOverlap
+        ? "conversation already up to date"
+        : "conversation already has messages",
+    };
+  }
+
+  private async bootstrapFromSqliteTranscript(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    sessionLabel: string;
+    startedAt: number;
+    sqliteScope: SqliteSessionTranscriptScope;
+  }): Promise<BootstrapResult> {
+    const getFrontier = this.deps.getSqliteSessionTranscriptFrontier;
+    const loadDelta = this.deps.loadSqliteSessionTranscriptDelta;
+    if (!getFrontier || !loadDelta) {
+      throw new Error("SQLite transcript bootstrap requested without SQLite transcript dependencies.");
+    }
+
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () =>
+        this.conversationStore.withTransaction(async () => {
+          const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
+            sessionKey: params.sessionKey,
+          });
+          const conversationId = conversation.conversationId;
+          const existingCount = await this.conversationStore.getMessageCount(conversationId);
+          const bootstrapState = await this.summaryStore.getConversationBootstrapState(conversationId);
+          const sourceIdentity = `${params.sqliteScope.agentId}:${params.sqliteScope.sessionId}`;
+          const frontier = await getFrontier(params.sqliteScope);
+
+          if (!frontier) {
+            if (!conversation.bootstrappedAt) {
+              await this.conversationStore.markConversationBootstrapped(conversationId);
+            }
+            return {
+              bootstrapped: false,
+              importedMessages: 0,
+              reason: "no sqlite transcript events",
+            };
+          }
+
+          const persistBootstrapState = async (
+            lastProcessedEntryHash?: string | null,
+            nextFrontier: SqliteSessionTranscriptFrontier = frontier,
+          ): Promise<void> => {
+            await this.refreshBootstrapState({
+              conversationId,
+              sessionFile: params.sessionFile,
+              lastProcessedEntryHash,
+              sqliteScope: params.sqliteScope,
+              sqliteFrontier: nextFrontier,
+            });
+          };
+
+          if (
+            bootstrapState?.transcriptSourceKind === "sqlite"
+            && bootstrapState.transcriptSourceIdentity === sourceIdentity
+            && bootstrapState.transcriptEventCount === frontier.eventCount
+            && bootstrapState.transcriptLastSeq === frontier.lastSeq
+            && bootstrapState.transcriptBaseCreatedAt === frontier.baseCreatedAt
+          ) {
+            if (!conversation.bootstrappedAt) {
+              await this.conversationStore.markConversationBootstrapped(conversationId);
+            }
+            this.deps.log.info(
+              `[lcm] bootstrap: sqlite checkpoint hit conversation=${conversationId} ${params.sessionLabel} existingCount=${existingCount} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+            );
+            return {
+              bootstrapped: false,
+              importedMessages: 0,
+              reason: conversation.bootstrappedAt
+                ? "already bootstrapped"
+                : "conversation already up to date",
+            };
+          }
+
+          const cursor: SqliteSessionTranscriptCursor | undefined =
+            bootstrapState?.transcriptSourceKind === "sqlite"
+            && bootstrapState.transcriptSourceIdentity === sourceIdentity
+            && bootstrapState.transcriptEventCount !== null
+            && bootstrapState.transcriptLastSeq !== null
+            && bootstrapState.transcriptBaseCreatedAt !== null
+              ? {
+                  eventCount: bootstrapState.transcriptEventCount,
+                  lastSeq: bootstrapState.transcriptLastSeq,
+                  baseCreatedAt: bootstrapState.transcriptBaseCreatedAt,
+                }
+              : undefined;
+          const delta: SqliteSessionTranscriptDelta = await loadDelta({
+            ...params.sqliteScope,
+            ...(cursor ? { cursor } : {}),
+          });
+
+          if (delta.mode === "missing" || !delta.frontier) {
+            if (!conversation.bootstrappedAt) {
+              await this.conversationStore.markConversationBootstrapped(conversationId);
+            }
+            return {
+              bootstrapped: false,
+              importedMessages: 0,
+              reason: "no sqlite transcript events",
+            };
+          }
+
+          if (delta.mode === "append" && cursor) {
+            if (!conversation.bootstrappedAt) {
+              await this.conversationStore.markConversationBootstrapped(conversationId);
+            }
+
+            let importedMessages = 0;
+            const appendMessages = bootstrapMessagesFromSqliteTranscriptEvents(delta.events);
+            for (const message of appendMessages) {
+              const ingestResult = await this.ingestSingle({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                message,
+              });
+              if (ingestResult.ingested) {
+                importedMessages += 1;
+              }
+            }
+
+            await persistBootstrapState(undefined, delta.frontier);
+            if (importedMessages > 0) {
+              this.clearStableOrphanStrippingOrdinal(conversationId);
+            }
+            this.deps.log.info(
+              `[lcm] bootstrap: sqlite append conversation=${conversationId} ${params.sessionLabel} existingCount=${existingCount} appendedMessages=${appendMessages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+            );
+
+            if (importedMessages > 0) {
+              return {
+                bootstrapped: true,
+                importedMessages,
+                reason: "reconciled missing session messages",
+              };
+            }
+
+            return {
+              bootstrapped: false,
+              importedMessages: 0,
+              reason: conversation.bootstrappedAt
+                ? "already bootstrapped"
+                : "conversation already up to date",
+            };
+          }
+
+          const historicalMessages = bootstrapMessagesFromSqliteTranscriptEvents(delta.events);
+          this.deps.log.info(
+            `[lcm] bootstrap: sqlite transcript read conversation=${conversationId} ${params.sessionLabel} existingCount=${existingCount} historicalMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+          );
+
+          return this.bootstrapFromHistoricalMessages({
+            conversation,
+            existingCount,
+            historicalMessages,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            sessionLabel: params.sessionLabel,
+            startedAt: params.startedAt,
+            checkpointEntryHash: bootstrapState?.lastProcessedEntryHash,
+            persistBootstrapState: async (lastProcessedEntryHash?: string | null) =>
+              persistBootstrapState(lastProcessedEntryHash, delta.frontier),
+          });
+        }),
+      { operationName: "bootstrap", context: params.sessionLabel },
+    );
+  }
+
   /**
    * Persist bootstrap checkpoint metadata anchored to the current DB frontier.
    *
@@ -4951,9 +5287,16 @@ export class LcmContextEngine implements ContextEngine {
     sessionFile: string;
     fileStats?: { size: number; mtimeMs: number };
     lastProcessedEntryHash?: string | null;
+    sqliteScope?: SqliteSessionTranscriptScope;
+    sqliteFrontier?: SqliteSessionTranscriptFrontier;
   }): Promise<void> {
     const latestDbMessage = await this.conversationStore.getLastMessage(params.conversationId);
-    const fileStats = params.fileStats ?? (await stat(params.sessionFile));
+    const fileStats = params.sqliteFrontier
+      ? {
+          size: 0,
+          mtimeMs: params.sqliteFrontier.updatedAt,
+        }
+      : params.fileStats ?? (await stat(params.sessionFile));
     await this.summaryStore.upsertConversationBootstrapState({
       conversationId: params.conversationId,
       sessionFilePath: params.sessionFile,
@@ -4970,6 +5313,16 @@ export class LcmContextEngine implements ContextEngine {
                 tokenCount: latestDbMessage.tokenCount,
               })
             : null,
+      transcriptSourceKind: params.sqliteFrontier ? "sqlite" : "jsonl",
+      transcriptSourceIdentity: params.sqliteScope
+        ? `${params.sqliteScope.agentId}:${params.sqliteScope.sessionId}`
+        : params.sessionFile,
+      transcriptUpdatedAt: params.sqliteFrontier
+        ? params.sqliteFrontier.updatedAt
+        : Math.trunc(fileStats.mtimeMs),
+      transcriptEventCount: params.sqliteFrontier?.eventCount ?? null,
+      transcriptLastSeq: params.sqliteFrontier?.lastSeq ?? null,
+      transcriptBaseCreatedAt: params.sqliteFrontier?.baseCreatedAt ?? null,
     });
   }
 
@@ -4998,6 +5351,51 @@ export class LcmContextEngine implements ContextEngine {
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
+    const sqliteScope = this.resolveSqliteTranscriptScope(params);
+    if (sqliteScope) {
+      const result = await this.bootstrapFromSqliteTranscript({
+        ...params,
+        sessionLabel,
+        startedAt,
+        sqliteScope,
+      });
+
+      if (this.config.pruneHeartbeatOk && result.bootstrapped === false) {
+        try {
+          const conversation = await this.conversationStore.getConversationForSession({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+          });
+          if (conversation) {
+            const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
+            if (pruned > 0) {
+              this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
+              const frontier = await this.deps.getSqliteSessionTranscriptFrontier?.(sqliteScope);
+              if (frontier) {
+                await this.refreshBootstrapState({
+                  conversationId: conversation.conversationId,
+                  sessionFile: params.sessionFile,
+                  sqliteScope,
+                  sqliteFrontier: frontier,
+                });
+              }
+              this.deps.log.info(
+                `[lcm] bootstrap: retroactively pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversation.conversationId}`,
+              );
+            }
+          }
+        } catch (err) {
+          this.deps.log.warn(
+            `[lcm] bootstrap: heartbeat pruning failed: ${describeLogError(err)}`,
+          );
+        }
+      }
+
+      this.deps.log.info(
+        `[lcm] bootstrap: done ${sessionLabel} bootstrapped=${result.bootstrapped} importedMessages=${result.importedMessages} reason=${result.reason ?? "none"} duration=${formatDurationMs(Date.now() - startedAt)}`,
+      );
+      return result;
+    }
     const sessionFileStats = await stat(params.sessionFile);
     const sessionFileSize = sessionFileStats.size;
     const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);

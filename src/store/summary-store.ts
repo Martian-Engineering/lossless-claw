@@ -112,6 +112,12 @@ export type UpsertConversationBootstrapStateInput = {
   lastSeenMtimeMs: number;
   lastProcessedOffset: number;
   lastProcessedEntryHash?: string | null;
+  transcriptSourceKind?: "jsonl" | "sqlite";
+  transcriptSourceIdentity?: string | null;
+  transcriptUpdatedAt?: number | null;
+  transcriptEventCount?: number | null;
+  transcriptLastSeq?: number | null;
+  transcriptBaseCreatedAt?: number | null;
 };
 
 export type ConversationBootstrapStateRecord = {
@@ -121,6 +127,12 @@ export type ConversationBootstrapStateRecord = {
   lastSeenMtimeMs: number;
   lastProcessedOffset: number;
   lastProcessedEntryHash: string | null;
+  transcriptSourceKind: "jsonl" | "sqlite";
+  transcriptSourceIdentity: string;
+  transcriptUpdatedAt: number | null;
+  transcriptEventCount: number | null;
+  transcriptLastSeq: number | null;
+  transcriptBaseCreatedAt: number | null;
   updatedAt: Date;
 };
 
@@ -224,6 +236,12 @@ interface ConversationBootstrapStateRow {
   last_seen_mtime_ms: number;
   last_processed_offset: number;
   last_processed_entry_hash: string | null;
+  transcript_source_kind: string | null;
+  transcript_source_identity: string | null;
+  transcript_updated_at: number | null;
+  transcript_event_count: number | null;
+  transcript_last_seq: number | null;
+  transcript_base_created_at: number | null;
   updated_at: string;
 }
 
@@ -318,6 +336,7 @@ function toLargeFileRecord(row: LargeFileRow): LargeFileRecord {
 function toConversationBootstrapStateRecord(
   row: ConversationBootstrapStateRow,
 ): ConversationBootstrapStateRecord {
+  const transcriptSourceKind = row.transcript_source_kind === "sqlite" ? "sqlite" : "jsonl";
   return {
     conversationId: row.conversation_id,
     sessionFilePath: row.session_file_path,
@@ -325,6 +344,27 @@ function toConversationBootstrapStateRecord(
     lastSeenMtimeMs: row.last_seen_mtime_ms,
     lastProcessedOffset: row.last_processed_offset,
     lastProcessedEntryHash: row.last_processed_entry_hash,
+    transcriptSourceKind,
+    transcriptSourceIdentity:
+      row.transcript_source_identity ??
+      (row.session_file_path && row.session_file_path.length > 0 ? row.session_file_path : ""),
+    transcriptUpdatedAt:
+      typeof row.transcript_updated_at === "number" && Number.isFinite(row.transcript_updated_at)
+        ? row.transcript_updated_at
+        : null,
+    transcriptEventCount:
+      typeof row.transcript_event_count === "number" && Number.isFinite(row.transcript_event_count)
+        ? row.transcript_event_count
+        : null,
+    transcriptLastSeq:
+      typeof row.transcript_last_seq === "number" && Number.isFinite(row.transcript_last_seq)
+        ? row.transcript_last_seq
+        : null,
+    transcriptBaseCreatedAt:
+      typeof row.transcript_base_created_at === "number" &&
+      Number.isFinite(row.transcript_base_created_at)
+        ? row.transcript_base_created_at
+        : null,
     updatedAt: parseUtcTimestamp(row.updated_at),
   };
 }
@@ -1516,7 +1556,9 @@ export class SummaryStore {
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, updated_at
+                last_processed_offset, last_processed_entry_hash, transcript_source_kind,
+                transcript_source_identity, transcript_updated_at, transcript_event_count,
+                transcript_last_seq, transcript_base_created_at, updated_at
          FROM conversation_bootstrap_state
          WHERE conversation_id = ?`,
       )
@@ -1535,15 +1577,27 @@ export class SummaryStore {
            last_seen_size,
            last_seen_mtime_ms,
            last_processed_offset,
-           last_processed_entry_hash
+           last_processed_entry_hash,
+           transcript_source_kind,
+           transcript_source_identity,
+           transcript_updated_at,
+           transcript_event_count,
+           transcript_last_seq,
+           transcript_base_created_at
          )
-         VALUES (?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (conversation_id) DO UPDATE SET
            session_file_path = excluded.session_file_path,
            last_seen_size = excluded.last_seen_size,
            last_seen_mtime_ms = excluded.last_seen_mtime_ms,
            last_processed_offset = excluded.last_processed_offset,
            last_processed_entry_hash = excluded.last_processed_entry_hash,
+           transcript_source_kind = excluded.transcript_source_kind,
+           transcript_source_identity = excluded.transcript_source_identity,
+           transcript_updated_at = excluded.transcript_updated_at,
+           transcript_event_count = excluded.transcript_event_count,
+           transcript_last_seq = excluded.transcript_last_seq,
+           transcript_base_created_at = excluded.transcript_base_created_at,
            updated_at = datetime('now')`,
       )
       .run(
@@ -1553,12 +1607,20 @@ export class SummaryStore {
         Math.max(0, Math.floor(input.lastSeenMtimeMs)),
         Math.max(0, Math.floor(input.lastProcessedOffset)),
         input.lastProcessedEntryHash ?? null,
+        input.transcriptSourceKind ?? "jsonl",
+        input.transcriptSourceIdentity ?? input.sessionFilePath,
+        input.transcriptUpdatedAt ?? input.lastSeenMtimeMs,
+        input.transcriptEventCount ?? null,
+        input.transcriptLastSeq ?? null,
+        input.transcriptBaseCreatedAt ?? null,
       );
 
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, updated_at
+                last_processed_offset, last_processed_entry_hash, transcript_source_kind,
+                transcript_source_identity, transcript_updated_at, transcript_event_count,
+                transcript_last_seq, transcript_base_created_at, updated_at
          FROM conversation_bootstrap_state
          WHERE conversation_id = ?`,
       )

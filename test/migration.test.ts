@@ -799,6 +799,12 @@ describe("runLcmMigrations summary depth backfill", () => {
       "last_seen_mtime_ms",
       "last_processed_offset",
       "last_processed_entry_hash",
+      "transcript_source_kind",
+      "transcript_source_identity",
+      "transcript_updated_at",
+      "transcript_event_count",
+      "transcript_last_seq",
+      "transcript_base_created_at",
       "updated_at",
     ]);
   });

@@ -111,6 +111,71 @@ function createSessionFilePath(name: string): string {
   return join(tempDir, `${name}.jsonl`);
 }
 
+type MockSqliteTranscriptFrontier = {
+  sessionId: string;
+  updatedAt: number;
+  eventCount: number;
+  lastSeq: number;
+  baseCreatedAt: number;
+};
+
+type MockSqliteTranscriptEvent = {
+  seq: number;
+  createdAt: number;
+  event: unknown;
+};
+
+function createSqliteTranscriptEventsFromMessages(params: {
+  sessionId: string;
+  messages: AgentMessage[];
+  startedAt?: number;
+}): MockSqliteTranscriptEvent[] {
+  const startedAt = params.startedAt ?? Date.parse("2026-05-10T00:00:00Z");
+  const events: MockSqliteTranscriptEvent[] = [
+    {
+      seq: 0,
+      createdAt: startedAt,
+      event: {
+        type: "session",
+        version: 3,
+        id: params.sessionId,
+        timestamp: new Date(startedAt).toISOString(),
+        cwd: "/tmp/lcm-sqlite-flood",
+      },
+    },
+  ];
+
+  params.messages.forEach((message, index) => {
+    const id = `msg-${index + 1}`;
+    events.push({
+      seq: index + 1,
+      createdAt: startedAt + (index + 1) * 1_000,
+      event: {
+        type: "message",
+        id,
+        parentId: index === 0 ? null : `msg-${index}`,
+        timestamp: new Date(startedAt + (index + 1) * 1_000).toISOString(),
+        message,
+      },
+    });
+  });
+
+  return events;
+}
+
+function createSqliteTranscriptFrontier(
+  sessionId: string,
+  events: MockSqliteTranscriptEvent[],
+): MockSqliteTranscriptFrontier {
+  return {
+    sessionId,
+    updatedAt: events.at(-1)?.createdAt ?? 0,
+    eventCount: events.length,
+    lastSeq: events.at(-1)?.seq ?? -1,
+    baseCreatedAt: events[0]?.createdAt ?? 0,
+  };
+}
+
 /**
  * Build a JSONL session with `pairCount` user/assistant message pairs.
  * Every 5th pair uses identical "ping"/"pong" content to stress
@@ -445,5 +510,88 @@ describe("bootstrap flood regression (PR #280) — round-trip integration", () =
       finalCount,
       "DB message count should be unchanged after capped flood attempt",
     ).toBe(dbCountAfterBoot);
+  });
+
+  it("reconciles a SQLite reset replay with repeated content without duplicate flood", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-flood-skills-"));
+    tempDirs.push(tempDir);
+    const config = createTestConfig(join(tempDir, "lcm.db"));
+    const db = createLcmDatabaseConnection(config.databasePath);
+    const deps = createTestDeps(config) as LcmDependencies & {
+      getSqliteSessionTranscriptFrontier: ReturnType<typeof vi.fn>;
+      loadSqliteSessionTranscriptDelta: ReturnType<typeof vi.fn>;
+    };
+    const engine = new LcmContextEngine(deps, db);
+    const sessionId = randomUUID();
+    const sessionKey = "agent:main:sqlite-flood";
+
+    const initialMessages: AgentMessage[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      initialMessages.push({
+        role: "user",
+        content: [{ type: "text", text: i % 2 === 0 ? "ping" : `Question ${i}` }],
+      } as AgentMessage);
+      initialMessages.push({
+        role: "assistant",
+        content: [{ type: "text", text: i % 2 === 0 ? "pong" : `Answer ${i}` }],
+      } as AgentMessage);
+    }
+    const initialEvents = createSqliteTranscriptEventsFromMessages({
+      sessionId,
+      messages: initialMessages,
+    });
+    const initialFrontier = createSqliteTranscriptFrontier(sessionId, initialEvents);
+    const resetMessages = [
+      ...initialMessages,
+      { role: "user", content: [{ type: "text", text: "ping" }] } as AgentMessage,
+      { role: "assistant", content: [{ type: "text", text: "pong" }] } as AgentMessage,
+    ];
+    const resetEvents = createSqliteTranscriptEventsFromMessages({
+      sessionId,
+      messages: resetMessages,
+      startedAt: Date.parse("2026-05-10T01:00:00Z"),
+    });
+    const resetFrontier = createSqliteTranscriptFrontier(sessionId, resetEvents);
+
+    deps.getSqliteSessionTranscriptFrontier = vi
+      .fn()
+      .mockResolvedValueOnce(initialFrontier)
+      .mockResolvedValueOnce(resetFrontier);
+    deps.loadSqliteSessionTranscriptDelta = vi
+      .fn()
+      .mockResolvedValueOnce({
+        mode: "reset",
+        frontier: initialFrontier,
+        events: initialEvents,
+      })
+      .mockResolvedValueOnce({
+        mode: "reset",
+        frontier: resetFrontier,
+        events: resetEvents,
+      });
+
+    const first = await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      sessionFile: "/tmp/sqlite-flood-first.jsonl",
+    });
+    const second = await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      sessionFile: "/tmp/sqlite-flood-second.jsonl",
+    });
+
+    expect(first.importedMessages).toBe(initialMessages.length);
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId, sessionKey });
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(resetMessages.length);
   });
 });

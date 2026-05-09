@@ -168,6 +168,54 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   }
 }
 
+function ensureBootstrapStateColumns(db: DatabaseSync): void {
+  const bootstrapColumns = db.prepare(`PRAGMA table_info(conversation_bootstrap_state)`).all() as SummaryColumnInfo[];
+  const hasTranscriptSourceKind = bootstrapColumns.some((col) => col.name === "transcript_source_kind");
+  const hasTranscriptSourceIdentity = bootstrapColumns.some(
+    (col) => col.name === "transcript_source_identity",
+  );
+  const hasTranscriptUpdatedAt = bootstrapColumns.some((col) => col.name === "transcript_updated_at");
+  const hasTranscriptEventCount = bootstrapColumns.some((col) => col.name === "transcript_event_count");
+  const hasTranscriptLastSeq = bootstrapColumns.some((col) => col.name === "transcript_last_seq");
+  const hasTranscriptBaseCreatedAt = bootstrapColumns.some(
+    (col) => col.name === "transcript_base_created_at",
+  );
+
+  if (!hasTranscriptSourceKind) {
+    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN transcript_source_kind TEXT`);
+  }
+  if (!hasTranscriptSourceIdentity) {
+    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN transcript_source_identity TEXT`);
+  }
+  if (!hasTranscriptUpdatedAt) {
+    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN transcript_updated_at INTEGER`);
+  }
+  if (!hasTranscriptEventCount) {
+    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN transcript_event_count INTEGER`);
+  }
+  if (!hasTranscriptLastSeq) {
+    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN transcript_last_seq INTEGER`);
+  }
+  if (!hasTranscriptBaseCreatedAt) {
+    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN transcript_base_created_at INTEGER`);
+  }
+
+  db.exec(`
+    UPDATE conversation_bootstrap_state
+    SET transcript_source_kind = COALESCE(NULLIF(transcript_source_kind, ''), 'jsonl'),
+        transcript_source_identity = COALESCE(NULLIF(transcript_source_identity, ''), session_file_path),
+        transcript_updated_at = COALESCE(transcript_updated_at, last_seen_mtime_ms),
+        transcript_event_count = COALESCE(transcript_event_count, 0),
+        transcript_last_seq = COALESCE(transcript_last_seq, -1),
+        transcript_base_created_at = COALESCE(transcript_base_created_at, 0)
+  `);
+  db.exec(`DROP INDEX IF EXISTS bootstrap_state_path_idx`);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS bootstrap_state_source_idx
+    ON conversation_bootstrap_state (transcript_source_kind, transcript_source_identity, updated_at)
+  `);
+}
+
 /**
  * Belt-and-suspenders guard: create `message_parts` if it does not yet exist.
  *
@@ -937,6 +985,13 @@ export function runLcmMigrations(
       last_seen_mtime_ms INTEGER NOT NULL,
       last_processed_offset INTEGER NOT NULL,
       last_processed_entry_hash TEXT,
+      transcript_source_kind TEXT NOT NULL DEFAULT 'jsonl'
+        CHECK (transcript_source_kind IN ('jsonl', 'sqlite')),
+      transcript_source_identity TEXT,
+      transcript_updated_at INTEGER,
+      transcript_event_count INTEGER,
+      transcript_last_seq INTEGER,
+      transcript_base_created_at INTEGER,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -993,8 +1048,8 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type);
     CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal);
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
-    CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
-      ON conversation_bootstrap_state (session_file_path, updated_at);
+    CREATE INDEX IF NOT EXISTS bootstrap_state_source_idx
+      ON conversation_bootstrap_state (transcript_source_kind, transcript_source_identity, updated_at);
     CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
       ON conversation_compaction_telemetry (cache_state, updated_at);
 
@@ -1046,6 +1101,7 @@ export function runLcmMigrations(
       ensureSummaryMetadataColumns(db),
     );
     runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
+    runMigrationStep("ensureBootstrapStateColumns", log, () => ensureBootstrapStateColumns(db));
     runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
       ensureMessageIdentityHashColumn(db),
     );

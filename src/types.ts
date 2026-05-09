@@ -100,6 +100,42 @@ export type ParseAgentSessionKeyFn = (sessionKey: string) => {
 
 export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 
+export type SqliteSessionTranscriptScope = {
+  agentId: string;
+  sessionId: string;
+};
+
+export type SqliteSessionTranscriptFrontier = {
+  sessionId: string;
+  updatedAt: number;
+  eventCount: number;
+  lastSeq: number;
+  baseCreatedAt: number;
+};
+
+export type SqliteSessionTranscriptCursor = Pick<
+  SqliteSessionTranscriptFrontier,
+  "eventCount" | "lastSeq" | "baseCreatedAt"
+>;
+
+export type SqliteSessionTranscriptEvent = {
+  seq: number;
+  createdAt: number;
+  event: unknown;
+};
+
+export type SqliteSessionTranscriptDelta =
+  | {
+      mode: "missing";
+      frontier: null;
+      events: [];
+    }
+  | {
+      mode: "append" | "reset";
+      frontier: SqliteSessionTranscriptFrontier;
+      events: SqliteSessionTranscriptEvent[];
+    };
+
 export type StartupSessionFileCandidate = {
   sessionId: string;
   sessionKey: string;
@@ -170,6 +206,16 @@ export interface LcmDependencies {
     sessionId: string;
     sessionKey?: string;
   }) => Promise<string | undefined>;
+
+  /** Optional SQLite-native transcript frontier seam from newer OpenClaw runtimes. */
+  getSqliteSessionTranscriptFrontier?: (
+    scope: SqliteSessionTranscriptScope,
+  ) => Promise<SqliteSessionTranscriptFrontier | null>;
+
+  /** Optional SQLite-native transcript delta seam from newer OpenClaw runtimes. */
+  loadSqliteSessionTranscriptDelta?: (
+    params: SqliteSessionTranscriptScope & { cursor?: SqliteSessionTranscriptCursor },
+  ) => Promise<SqliteSessionTranscriptDelta>;
 
   /** List OpenClaw-indexed session files that startup recovery may enumerate. */
   listStartupSessionFileCandidates?: () => Promise<StartupSessionFileCandidate[]>;

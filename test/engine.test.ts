@@ -173,6 +173,83 @@ function createSessionFilePath(name: string): string {
   return join(tempDir, `${name}.jsonl`);
 }
 
+type MockSqliteTranscriptFrontier = {
+  sessionId: string;
+  updatedAt: number;
+  eventCount: number;
+  lastSeq: number;
+  baseCreatedAt: number;
+};
+
+type MockSqliteTranscriptEvent = {
+  seq: number;
+  createdAt: number;
+  event: unknown;
+};
+
+type MockSqliteTranscriptDelta =
+  | {
+      mode: "missing";
+      frontier: null;
+      events: [];
+    }
+  | {
+      mode: "append" | "reset";
+      frontier: MockSqliteTranscriptFrontier;
+      events: MockSqliteTranscriptEvent[];
+    };
+
+function createSqliteTranscriptMessageEvents(params: {
+  sessionId: string;
+  messages: Array<{ role: string; content: unknown }>;
+  startedAt?: number;
+}): MockSqliteTranscriptEvent[] {
+  const startedAt = params.startedAt ?? Date.parse("2026-05-10T00:00:00Z");
+  const events: MockSqliteTranscriptEvent[] = [
+    {
+      seq: 0,
+      createdAt: startedAt,
+      event: {
+        type: "session",
+        version: 3,
+        id: params.sessionId,
+        timestamp: new Date(startedAt).toISOString(),
+        cwd: "/tmp/lcm-sqlite-bootstrap",
+      },
+    },
+  ];
+
+  params.messages.forEach((message, index) => {
+    const id = `msg-${index + 1}`;
+    events.push({
+      seq: index + 1,
+      createdAt: startedAt + (index + 1) * 1_000,
+      event: {
+        type: "message",
+        id,
+        parentId: index === 0 ? null : `msg-${index}`,
+        timestamp: new Date(startedAt + (index + 1) * 1_000).toISOString(),
+        message,
+      },
+    });
+  });
+
+  return events;
+}
+
+function createSqliteTranscriptFrontier(
+  sessionId: string,
+  events: MockSqliteTranscriptEvent[],
+): MockSqliteTranscriptFrontier {
+  return {
+    sessionId,
+    updatedAt: events.at(-1)?.createdAt ?? 0,
+    eventCount: events.length,
+    lastSeq: events.at(-1)?.seq ?? -1,
+    baseCreatedAt: events[0]?.createdAt ?? 0,
+  };
+}
+
 function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
   tempDirs.push(tempDir);
@@ -5002,6 +5079,165 @@ describe("LcmContextEngine.bootstrap", () => {
         typeof call[0] === "string" && call[0].includes("skipped full read (file unchanged)"),
     );
     expect(skippedLogs).toHaveLength(0);
+  });
+
+  it("bootstraps from a SQLite transcript delta without requiring a transcript file", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const config = createTestConfig(join(tempDir, "lcm.db"));
+    const db = createLcmDatabaseConnection(config.databasePath);
+    const sessionId = "sqlite-bootstrap";
+    const sessionKey = "agent:main:sqlite-bootstrap";
+    const events = createSqliteTranscriptMessageEvents({
+      sessionId,
+      messages: [
+        { role: "user", content: "hello from sqlite" },
+        { role: "assistant", content: "reply from sqlite" },
+      ],
+    });
+    const frontier = createSqliteTranscriptFrontier(sessionId, events);
+    const deps = createTestDeps(config) as LcmDependencies & {
+      getSqliteSessionTranscriptFrontier: ReturnType<typeof vi.fn>;
+      loadSqliteSessionTranscriptDelta: ReturnType<typeof vi.fn>;
+    };
+    deps.getSqliteSessionTranscriptFrontier = vi.fn(async () => frontier);
+    deps.loadSqliteSessionTranscriptDelta = vi.fn(
+      async (): Promise<MockSqliteTranscriptDelta> => ({
+        mode: "reset",
+        frontier,
+        events,
+      }),
+    );
+    const engine = new LcmContextEngine(deps, db);
+
+    const result = await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      sessionFile: "/tmp/does-not-exist.jsonl",
+    });
+
+    expect(result).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "hello from sqlite",
+      "reply from sqlite",
+    ]);
+
+    const bootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(bootstrapState).not.toBeNull();
+    expect(bootstrapState?.transcriptSourceKind).toBe("sqlite");
+    expect(bootstrapState?.transcriptSourceIdentity).toBe("main:sqlite-bootstrap");
+    expect(bootstrapState?.transcriptEventCount).toBe(frontier.eventCount);
+    expect(bootstrapState?.transcriptLastSeq).toBe(frontier.lastSeq);
+    expect(bootstrapState?.transcriptBaseCreatedAt).toBe(frontier.baseCreatedAt);
+  });
+
+  it("resumes from a stored SQLite cursor and ingests only appended transcript messages", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const config = createTestConfig(join(tempDir, "lcm.db"));
+    const db = createLcmDatabaseConnection(config.databasePath);
+    const sessionId = "sqlite-append";
+    const sessionKey = "agent:main:sqlite-append";
+    const initialEvents = createSqliteTranscriptMessageEvents({
+      sessionId,
+      messages: [
+        { role: "user", content: "turn one" },
+        { role: "assistant", content: "turn two" },
+      ],
+    });
+    const initialFrontier = createSqliteTranscriptFrontier(sessionId, initialEvents);
+    const appendedEvents: MockSqliteTranscriptEvent[] = [
+      {
+        seq: 3,
+        createdAt: initialFrontier.updatedAt + 1_000,
+        event: {
+          type: "message",
+          id: "msg-3",
+          parentId: "msg-2",
+          timestamp: new Date(initialFrontier.updatedAt + 1_000).toISOString(),
+          message: { role: "user", content: "turn three" },
+        },
+      },
+      {
+        seq: 4,
+        createdAt: initialFrontier.updatedAt + 2_000,
+        event: {
+          type: "message",
+          id: "msg-4",
+          parentId: "msg-3",
+          timestamp: new Date(initialFrontier.updatedAt + 2_000).toISOString(),
+          message: { role: "assistant", content: "turn four" },
+        },
+      },
+    ];
+    const appendedFrontier = createSqliteTranscriptFrontier(sessionId, [
+      ...initialEvents,
+      ...appendedEvents,
+    ]);
+    const deps = createTestDeps(config) as LcmDependencies & {
+      getSqliteSessionTranscriptFrontier: ReturnType<typeof vi.fn>;
+      loadSqliteSessionTranscriptDelta: ReturnType<typeof vi.fn>;
+    };
+    deps.getSqliteSessionTranscriptFrontier = vi
+      .fn()
+      .mockResolvedValueOnce(initialFrontier)
+      .mockResolvedValueOnce(appendedFrontier);
+    deps.loadSqliteSessionTranscriptDelta = vi
+      .fn()
+      .mockResolvedValueOnce({
+        mode: "reset",
+        frontier: initialFrontier,
+        events: initialEvents,
+      } satisfies MockSqliteTranscriptDelta)
+      .mockResolvedValueOnce({
+        mode: "append",
+        frontier: appendedFrontier,
+        events: appendedEvents,
+      } satisfies MockSqliteTranscriptDelta);
+    const engine = new LcmContextEngine(deps, db);
+
+    const first = await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      sessionFile: "/tmp/missing-first.jsonl",
+    });
+    const second = await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      sessionFile: "/tmp/missing-second.jsonl",
+    });
+
+    expect(first.importedMessages).toBe(2);
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "turn one",
+      "turn two",
+      "turn three",
+      "turn four",
+    ]);
   });
 });
 
