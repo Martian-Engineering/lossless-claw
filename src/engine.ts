@@ -1758,6 +1758,8 @@ export class LcmContextEngine implements ContextEngine {
   private readonly fts5Available: boolean;
   private readonly ignoreSessionPatterns: RegExp[];
   private readonly statelessSessionPatterns: RegExp[];
+  private readonly sessionAllowlistPatterns: string[];
+  private readonly compiledSessionAllowlist: RegExp[];
   private sessionOperationQueues = new Map<
     string,
     { promise: Promise<void>; refCount: number }
@@ -1810,6 +1812,10 @@ export class LcmContextEngine implements ContextEngine {
     this.config = deps.config;
     this.ignoreSessionPatterns = compileSessionPatterns(this.config.ignoreSessionPatterns);
     this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
+    this.sessionAllowlistPatterns = Array.isArray(this.config.sessionAllowlistPatterns)
+      ? this.config.sessionAllowlistPatterns
+      : [];
+    this.compiledSessionAllowlist = compileSessionPatterns(this.sessionAllowlistPatterns);
     this.db = database;
 
     // Run migrations eagerly at construction time so the schema exists
@@ -1891,6 +1897,13 @@ export class LcmContextEngine implements ContextEngine {
         message: `[lcm] Stateless session patterns${enforcement} from ${source}: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
       });
     }
+    if (this.sessionAllowlistPatterns.length > 0) {
+      logStartupBannerOnce({
+        key: "session-allowlist-patterns",
+        log: (message) => this.deps.log.info(message),
+        message: `[lcm] Session allowlist enabled: ${this.sessionAllowlistPatterns.length} pattern(s): ${this.sessionAllowlistPatterns.join(", ")}`,
+      });
+    }
     this.assembler = new ContextAssembler(
       this.conversationStore,
       this.summaryStore,
@@ -1956,6 +1969,34 @@ export class LcmContextEngine implements ContextEngine {
       return false;
     }
     return matchesSessionPattern(trimmedKey, this.statelessSessionPatterns);
+  }
+
+  /** Check whether a session is allowed to persist into LCM. */
+  private isSessionAllowlisted(params: { sessionId?: string; sessionKey?: string }): boolean {
+    if (this.compiledSessionAllowlist.length === 0) {
+      return true;
+    }
+
+    const candidate =
+      typeof params.sessionKey === "string" && params.sessionKey.trim()
+        ? params.sessionKey.trim()
+        : (params.sessionId?.trim() ?? "");
+    if (!candidate) {
+      return false;
+    }
+
+    return matchesSessionPattern(candidate, this.compiledSessionAllowlist);
+  }
+
+  private logSessionAllowlistExclusion(params: { sessionId?: string; sessionKey?: string }): void {
+    const candidate =
+      typeof params.sessionKey === "string" && params.sessionKey.trim()
+        ? params.sessionKey.trim()
+        : (params.sessionId?.trim() ?? "");
+    if (!candidate) {
+      return;
+    }
+    this.deps.log.debug(`[lcm] session excluded by allowlist: ${candidate}`);
   }
 
   // ── Circuit breaker helpers ──────────────────────────────────────────────
@@ -5024,6 +5065,14 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
+    if (!this.isSessionAllowlisted({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      this.logSessionAllowlistExclusion({ sessionId: params.sessionId, sessionKey: params.sessionKey });
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "session excluded by allowlist",
+      };
+    }
     this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = [
@@ -6086,6 +6135,10 @@ export class LcmContextEngine implements ContextEngine {
     if (this.isStatelessSession(params.sessionKey)) {
       return { ingested: false };
     }
+    if (!this.isSessionAllowlisted({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      this.logSessionAllowlistExclusion({ sessionId: params.sessionId, sessionKey: params.sessionKey });
+      return { ingested: false };
+    }
     this.ensureMigrated();
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
@@ -6110,6 +6163,10 @@ export class LcmContextEngine implements ContextEngine {
       return { ingestedCount: 0 };
     }
     if (this.isStatelessSession(params.sessionKey)) {
+      return { ingestedCount: 0 };
+    }
+    if (!this.isSessionAllowlisted({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      this.logSessionAllowlistExclusion({ sessionId: params.sessionId, sessionKey: params.sessionKey });
       return { ingestedCount: 0 };
     }
     this.ensureMigrated();
@@ -6256,6 +6313,10 @@ export class LcmContextEngine implements ContextEngine {
     }
     if (this.isStatelessSession(params.sessionKey)) {
       await runRuntimeAutoRotate();
+      return;
+    }
+    if (!this.isSessionAllowlisted({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      this.logSessionAllowlistExclusion({ sessionId: params.sessionId, sessionKey: params.sessionKey });
       return;
     }
     this.ensureMigrated();
@@ -6633,6 +6694,14 @@ export class LcmContextEngine implements ContextEngine {
       return safeFallback();
     }
     try {
+      const sessionAllowlisted = this.isSessionAllowlisted({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+      });
+      if (!sessionAllowlisted) {
+        this.logSessionAllowlistExclusion({ sessionId: params.sessionId, sessionKey: params.sessionKey });
+      }
+
       this.ensureMigrated();
       const startedAt = Date.now();
       const sessionLabel = [
@@ -7004,6 +7073,14 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
+    if (!this.isSessionAllowlisted({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      this.logSessionAllowlistExclusion({ sessionId: params.sessionId, sessionKey: params.sessionKey });
+      return {
+        ok: true,
+        compacted: false,
+        reason: "session excluded by allowlist",
+      };
+    }
     this.ensureMigrated();
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
@@ -7083,6 +7160,14 @@ export class LcmContextEngine implements ContextEngine {
         ok: true,
         compacted: false,
         reason: "stateless session",
+      };
+    }
+    if (!this.isSessionAllowlisted({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      this.logSessionAllowlistExclusion({ sessionId: params.sessionId, sessionKey: params.sessionKey });
+      return {
+        ok: true,
+        compacted: false,
+        reason: "session excluded by allowlist",
       };
     }
     this.ensureMigrated();
