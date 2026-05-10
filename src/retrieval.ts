@@ -295,6 +295,17 @@ export class RetrievalEngine {
         content = null;
       }
     }
+    if (options?.expandFile === true && content == null) {
+      // v4.2 migrated rows keep the original payload in `messages.content`
+      // while adding `messages.large_content = file_xxx`. If the backing
+      // file is missing or its path no longer validates, recover the
+      // payload from the message row so drilldown remains lossless.
+      const migratedMessage = await this.conversationStore.getMessageByLargeContent(id);
+      if (migratedMessage && typeof migratedMessage.content === "string") {
+        content = migratedMessage.content;
+        contentTruncated = false;
+      }
+    }
 
     return {
       id,

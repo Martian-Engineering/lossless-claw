@@ -72,6 +72,21 @@ Good default:
 - `false`
 - enable it only when topical older-context recall under tight budgets matters more than prompt-cache stability
 
+### `stubLargeToolPayloads`
+
+Controls whether older, evictable tool-result rows that were backfilled into the `large_files` store are assembled as compact `[LCM Tool Output: file_xxx ...]` stubs instead of full inline payloads.
+
+Why it matters:
+
+- it reuses the existing `large_files` drilldown path for old tool output without changing the fresh tail
+- it can recover substantially more historical context at the same token budget in tool-heavy sessions
+- it should stay off until the operator has run `scripts/lcm-blob-migrate.mjs` for the target database
+
+Good default:
+
+- `false`
+- enable it only after migration and live validation
+
 ### `leafChunkTokens`
 
 Caps how much raw material gets summarized into one leaf summary.
@@ -292,6 +307,21 @@ Why it matters:
 Env override:
 
 - `LCM_PROMPT_AWARE_EVICTION_ENABLED`
+
+### `stubLargeToolPayloads`
+
+Boolean toggle for assemble-time stub substitution of migrated tool-result payloads outside the protected fresh tail.
+
+Why it matters:
+
+- only affects rows whose `messages.large_content` sidecar points at a `file_xxx` record
+- the fresh tail is still emitted verbatim
+- drilldown uses `lcm_describe(id=file_xxx, expandFile=true)`
+- `scripts/lcm-blob-migrate.mjs` defaults to the same storage root as runtime LCM: `LCM_LARGE_FILES_DIR` or `${OPENCLAW_STATE_DIR}/lcm-files`
+
+Env override:
+
+- `LCM_STUB_LARGE_TOOL_PAYLOADS`
 
 ### `leafChunkTokens`
 

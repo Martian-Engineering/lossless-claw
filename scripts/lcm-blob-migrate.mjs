@@ -19,7 +19,7 @@
  * USAGE:
  *   node scripts/lcm-blob-migrate.mjs --db <path> [--dry-run]
  *     [--threshold-bytes N]  default 8000  (~2k tokens)
- *     [--storage-dir PATH]   default $HOME/.openclaw/lcm-files
+ *     [--storage-dir PATH]   default ${LCM_LARGE_FILES_DIR:-$OPENCLAW_STATE_DIR/lcm-files}
  *     [--limit N] [--verbose]
  */
 
@@ -46,11 +46,27 @@ const getArg = (n) => {
 };
 const hasFlag = (n) => args.includes(`--${n}`);
 
+function resolveOpenclawStateDir(env = process.env) {
+  const configured = env.OPENCLAW_STATE_DIR?.trim();
+  if (configured) {
+    return configured;
+  }
+  return join(homedir(), ".openclaw");
+}
+
+function resolveDefaultStorageDir(env = process.env) {
+  const explicit = env.LCM_LARGE_FILES_DIR?.trim();
+  if (explicit) {
+    return explicit;
+  }
+  return join(resolveOpenclawStateDir(env), "lcm-files");
+}
+
 const dbPath = getArg("db");
 const dryRun = hasFlag("dry-run");
 const revert = hasFlag("revert");
 const thresholdBytes = Number(getArg("threshold-bytes") ?? 8000);
-const storageDir = getArg("storage-dir") ?? join(homedir(), ".openclaw", "lcm-files");
+const storageDir = getArg("storage-dir") ?? resolveDefaultStorageDir();
 const limit = getArg("limit") ? Number(getArg("limit")) : undefined;
 const verbose = hasFlag("verbose");
 
@@ -187,7 +203,7 @@ const summary = {
   dryRun, applied: 0, filesWritten: 0, errors: [],
 };
 
-if (dryRun) { console.log(JSON.stringify(summary, null, 2)); db.close(); process.exit(0); }
+if (dryRun && !revert) { console.log(JSON.stringify(summary, null, 2)); db.close(); process.exit(0); }
 
 if (revert) {
   // Wave-2 P1 + Wave-3 P1: complete reversibility — undo a previous

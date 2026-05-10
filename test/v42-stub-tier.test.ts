@@ -1,12 +1,18 @@
+import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ContextAssembler } from "../src/assembler.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
+
+const BLOB_MIGRATE_SCRIPT = fileURLToPath(
+  new URL("../scripts/lcm-blob-migrate.mjs", import.meta.url),
+);
 
 /**
  * v4.2 §B (Option C) — stub-tier stratification end-to-end behavior tests.
@@ -153,6 +159,16 @@ function setupDb(): { db: DatabaseSync; storageDir: string } {
   runLcmMigrations(db, { fts5Available: false });
   const storageDir = mkdtempSync(join(tmpdir(), "v42-stub-storage-"));
   return { db, storageDir };
+}
+
+function setupScriptDb(): { db: DatabaseSync; dbPath: string; storageDir: string; stateDir: string } {
+  const stateDir = mkdtempSync(join(tmpdir(), "v42-script-state-"));
+  const storageDir = join(stateDir, "lcm-files");
+  mkdirSync(storageDir, { recursive: true });
+  const dbPath = join(stateDir, "lcm.db");
+  const db = new DatabaseSync(dbPath);
+  runLcmMigrations(db, { fts5Available: false });
+  return { db, dbPath, storageDir, stateDir };
 }
 
 describe("v4.2 §B (Option C) stub-tier stratification", () => {
@@ -431,5 +447,88 @@ describe("v4.2 §B (Option C) drilldown round-trip", () => {
     expect(fileRow).not.toBeNull();
     const onDisk = readFileSync(fileRow!.storageUri, "utf8");
     expect(onDisk).toBe(originalPayload);
+  });
+
+  it("recovers migrated payloads from the message row when the disk file is unavailable", async () => {
+    const { db, storageDir } = setupDb();
+    const originalPayload = bigPayload("FALLBACK", 12);
+    const { fileIds } = seedConversation(db, storageDir, [
+      { toolCallId: "fallback-1", toolName: "Read", payload: originalPayload, externalize: true },
+      { toolCallId: "filler-1", toolName: "Read", payload: "ok", externalize: false },
+      { toolCallId: "filler-2", toolName: "Read", payload: "ok", externalize: false },
+    ]);
+
+    const conversationStore = new ConversationStore(db);
+    const summaryStore = new SummaryStore(db);
+    const retrieval = new (await import("../src/retrieval.js")).RetrievalEngine(
+      conversationStore,
+      summaryStore,
+    );
+    const fileId = fileIds.get("fallback-1");
+    expect(fileId).toBeDefined();
+
+    const fileRow = await summaryStore.getLargeFile(fileId!);
+    expect(fileRow).not.toBeNull();
+    unlinkSync(fileRow!.storageUri);
+
+    const described = await retrieval.describe(fileId!, {
+      expandFile: true,
+      largeFilesDir: storageDir,
+    });
+    expect(described).not.toBeNull();
+    expect(described!.type).toBe("file");
+    expect(described!.file!.content).toBe(originalPayload);
+    expect(described!.file!.contentTruncated).toBe(false);
+  });
+});
+
+describe("v4.2 §B blob-migrate script", () => {
+  it("uses the runtime large-files root derived from OPENCLAW_STATE_DIR", () => {
+    const { db, dbPath, stateDir } = setupScriptDb();
+    db.close();
+
+    const raw = execFileSync(
+      process.execPath,
+      [BLOB_MIGRATE_SCRIPT, "--db", dbPath, "--dry-run"],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_STATE_DIR: stateDir,
+          LCM_LARGE_FILES_DIR: "",
+        },
+      },
+    );
+    const summary = JSON.parse(raw) as { storageDir: string };
+    expect(summary.storageDir).toBe(join(stateDir, "lcm-files"));
+  });
+
+  it("honors --revert --dry-run instead of exiting through the forward dry-run path", () => {
+    const { db, dbPath, storageDir } = setupScriptDb();
+    seedConversation(db, storageDir, [
+      { toolCallId: "revert-1", toolName: "Read", payload: bigPayload("REVERT", 4), externalize: true },
+    ]);
+    db.close();
+
+    const raw = execFileSync(
+      process.execPath,
+      [BLOB_MIGRATE_SCRIPT, "--db", dbPath, "--revert", "--dry-run", "--storage-dir", storageDir],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: process.env,
+      },
+    );
+    const summary = JSON.parse(raw) as {
+      mode?: string;
+      candidateCount?: number;
+      rowsCleared?: number;
+      filesDeleted?: number;
+    };
+    expect(summary.mode).toBe("revert");
+    expect(summary.candidateCount).toBe(1);
+    expect(summary.rowsCleared).toBe(0);
+    expect(summary.filesDeleted).toBe(0);
   });
 });

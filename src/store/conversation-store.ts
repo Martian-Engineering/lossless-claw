@@ -677,6 +677,20 @@ export class ConversationStore {
     return row ? toMessageRecord(row) : null;
   }
 
+  /** Return the most recent message whose `large_content` sidecar references the given file id. */
+  async getMessageByLargeContent(fileId: string): Promise<MessageRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+       FROM messages
+       WHERE large_content = ?
+       ORDER BY seq DESC
+       LIMIT 1`,
+      )
+      .get(fileId) as unknown as MessageRow | undefined;
+    return row ? toMessageRecord(row) : null;
+  }
+
   async createMessageParts(messageId: MessageId, parts: CreateMessagePartInput[]): Promise<void> {
     if (parts.length === 0) {
       return;
