@@ -206,6 +206,8 @@ LCM handles crash recovery through **bootstrap reconciliation**:
 2. Compare against the LCM database.
 3. Find the most recent message that exists in both (the "anchor").
 4. Import any messages after the anchor that are in JSONL but not in LCM.
+5. If an existing session key moves to a different transcript file and no anchor exists, treat the new file as a bounded transcript epoch and import its recoverable messages. The same flood cap used for tail reconciliation prevents large unrelated transcripts from being appended automatically.
+6. Advance the bootstrap checkpoint only after an overlap is found or a bounded epoch import succeeds. No-anchor reads that import nothing leave the old checkpoint in place so a later turn can retry.
 
 This handles the case where OpenClaw wrote messages to the session file but crashed before LCM could persist them.
 

@@ -172,6 +172,26 @@ function createSessionFilePath(name: string): string {
   return join(tempDir, `${name}.jsonl`);
 }
 
+function writeLeafTranscript(
+  sessionFile: string,
+  entries: Array<{ role: AgentMessage["role"]; content: string }>,
+): void {
+  writeFileSync(
+    sessionFile,
+    entries
+      .map((entry) =>
+        JSON.stringify({
+          message: {
+            role: entry.role,
+            content: [{ type: "text", text: entry.content }],
+          },
+        }),
+      )
+      .join("\n") + "\n",
+    "utf8",
+  );
+}
+
 function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
   tempDirs.push(tempDir);
@@ -7756,9 +7776,11 @@ describe("LcmContextEngine fidelity and token budget", () => {
     // Seed conversation by ingesting one turn through afterTurn first, with
     // a DIFFERENT sessionFile so the next call has a path-mismatched
     // checkpoint and is forced into the slow path.
+    const seedSessionFile = createSessionFilePath("after-turn-reconcile-slow-path-seed");
+    writeLeafTranscript(seedSessionFile, [{ role: "assistant", content: "seed turn" }]);
     await engine.afterTurn({
       sessionId,
-      sessionFile: createSessionFilePath("after-turn-reconcile-slow-path-seed"),
+      sessionFile: seedSessionFile,
       messages: [makeMessage({ role: "assistant", content: "seed turn" })],
       prePromptMessageCount: 0,
       tokenBudget: 4_096,
@@ -7772,16 +7794,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
     // First call with a different sessionFile triggers the slow path.
     // Pre-populate the target sessionFile with at least one historical
-    // message so readLeafPathMessages returns a non-empty list and the
-    // slow-path warn fires (the empty-file branch is a separate exit).
+    // overlapping message so readLeafPathMessages returns a successful
+    // same-frontier full read and the slow-path cap can be remembered.
     const targetSessionFile = createSessionFilePath("after-turn-reconcile-slow-path-target");
-    writeFileSync(
-      targetSessionFile,
-      `${JSON.stringify({
-        message: { role: "user", content: [{ type: "text", text: "historical user line" }] },
-      })}\n`,
-      "utf8",
-    );
+    writeLeafTranscript(targetSessionFile, [{ role: "assistant", content: "seed turn" }]);
     await engine.afterTurn({
       sessionId,
       sessionFile: targetSessionFile,
@@ -7813,6 +7829,390 @@ describe("LcmContextEngine fidelity and token budget", () => {
       .map((c) => String(c[0]))
       .filter((m) => m.includes("transcript reconcile slow path (full re-read)"));
     expect(secondSlowPathWarns.length).toBe(0);
+  });
+
+  it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {
+    const engine = createEngine();
+    const sessionId = "bootstrap-transcript-epoch-no-anchor";
+    const sessionKey = "agent:main:test:direct:transcript-epoch";
+
+    const oldSessionFile = createSessionFilePath("bootstrap-transcript-epoch-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old runtime question" },
+      { role: "assistant", content: "old runtime answer" },
+    ]);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "old runtime question" }),
+        makeMessage({ role: "assistant", content: "old runtime answer" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const newSessionFile = createSessionFilePath("bootstrap-transcript-epoch-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "current codex user report" },
+      { role: "assistant", content: "current codex assistant reply" },
+    ]);
+
+    const result = await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+    });
+
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(2);
+    expect(result.reason).toBe("reconciled missing session messages");
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old runtime question",
+      "old runtime answer",
+      "current codex user report",
+      "current codex assistant reply",
+    ]);
+
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.sessionFilePath).toBe(newSessionFile);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(newSessionFile).size);
+  });
+
+  it("afterTurn reconciles a path-mismatched no-anchor transcript before oversized delta dedup", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-transcript-epoch-no-anchor";
+    const sessionKey = "agent:main:test:direct:transcript-epoch";
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    } as unknown as Record<string, unknown>);
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 0,
+      threshold: 3_072,
+    });
+
+    const oldSessionFile = createSessionFilePath("after-turn-transcript-epoch-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old turn user 1" },
+      { role: "assistant", content: "old turn assistant 1" },
+      { role: "user", content: "old turn user 2" },
+      { role: "assistant", content: "old turn assistant 2" },
+    ]);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "old turn user 1" }),
+        makeMessage({ role: "assistant", content: "old turn assistant 1" }),
+        makeMessage({ role: "user", content: "old turn user 2" }),
+        makeMessage({ role: "assistant", content: "old turn assistant 2" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const newSessionFile = createSessionFilePath("after-turn-transcript-epoch-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "new codex user prompt" },
+      { role: "assistant", content: "new codex assistant delta" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "new codex assistant delta" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old turn user 1",
+      "old turn assistant 1",
+      "old turn user 2",
+      "old turn assistant 2",
+      "new codex user prompt",
+      "new codex assistant delta",
+    ]);
+
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.sessionFilePath).toBe(newSessionFile);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(newSessionFile).size);
+  });
+
+  it("afterTurn skips persistence when full reread finds no anchor and imports nothing", async () => {
+    const engine = createEngineWithDeps({}, {
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    });
+    const sessionId = "after-turn-no-anchor-no-import";
+    const sessionKey = "agent:main:test:direct:no-anchor-no-import";
+
+    const privateEngine = engine as unknown as {
+      config: LcmConfig;
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 0,
+      threshold: 3_072,
+    });
+
+    const sessionFile = createSessionFilePath("after-turn-no-anchor-no-import");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "old no-anchor user" },
+      { role: "assistant", content: "old no-anchor assistant" },
+    ]);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "old no-anchor user" }),
+        makeMessage({ role: "assistant", content: "old no-anchor assistant" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(oldCheckpoint?.sessionFilePath).toBe(sessionFile);
+
+    const rawDb = createLcmDatabaseConnection(privateEngine.config.databasePath);
+    try {
+      rawDb
+        .prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "rewritten missing prefix user" },
+      { role: "assistant", content: "rewritten missing prefix assistant" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "live no-anchor user" }),
+        makeMessage({ role: "assistant", content: "live no-anchor assistant" }),
+        makeMessage({ role: "user", content: "live no-anchor follow-up" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const checkpointAfterNoImport = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpointAfterNoImport).toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old no-anchor user",
+      "old no-anchor assistant",
+    ]);
+  });
+
+  it("afterTurn keeps the old checkpoint when a path-mismatched no-anchor import is capped", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      { proactiveThresholdCompactionMode: "inline" },
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-transcript-epoch-no-anchor-capped";
+    const sessionKey = "agent:main:test:direct:transcript-epoch";
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 0,
+      threshold: 3_072,
+    });
+
+    const oldSessionFile = createSessionFilePath("after-turn-transcript-epoch-capped-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old capped user" },
+      { role: "assistant", content: "old capped assistant" },
+    ]);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "old capped user" }),
+        makeMessage({ role: "assistant", content: "old capped assistant" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(oldCheckpoint?.sessionFilePath).toBe(oldSessionFile);
+
+    const newSessionFile = createSessionFilePath("after-turn-transcript-epoch-capped-new");
+    writeLeafTranscript(
+      newSessionFile,
+      Array.from({ length: 60 }, (_, index) => ({
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `oversized no-anchor epoch ${index}`,
+      })),
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "live after capped epoch user" }),
+        makeMessage({ role: "assistant", content: "live after capped epoch assistant" }),
+        makeMessage({ role: "user", content: "live after capped epoch follow-up" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("no anchor import cap exceeded")),
+    ).toBe(true);
+
+    const checkpointAfterCap = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpointAfterCap).toEqual(oldCheckpoint);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old capped user",
+      "old capped assistant",
+    ]);
+
+    appendFileSync(
+      newSessionFile,
+      `${JSON.stringify({
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "live after capped epoch assistant" }],
+        },
+      })}\n${JSON.stringify({
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "second live after capped epoch user" }],
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    warnLog.mockClear();
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+      messages: [
+        makeMessage({ role: "assistant", content: "live after capped epoch assistant" }),
+        makeMessage({ role: "user", content: "second live after capped epoch user" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("no anchor import cap exceeded")),
+    ).toBe(true);
+    const checkpointAfterRetry = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpointAfterRetry).toEqual(oldCheckpoint);
+
+    const storedAfterRetry = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(storedAfterRetry.map((message) => message.content)).toEqual([
+      "old capped user",
+      "old capped assistant",
+    ]);
   });
 
   it("afterTurn retries a capped reconcile when the transcript file changed with an append-only-ineligible suffix (F7)", async () => {

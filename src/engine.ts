@@ -1736,6 +1736,12 @@ function messageContentCoveredBySummary(params: {
 
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
+type TranscriptReconcileResult = {
+  blockedByImportCap: boolean;
+  importedMessages: number;
+  hasOverlap: boolean;
+};
+
 export class LcmContextEngine implements ContextEngine {
   readonly info: ContextEngineInfo;
 
@@ -4664,11 +4670,9 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number;
     historicalMessages: AgentMessage[];
     checkpointEntryHash?: string | null;
-  }): Promise<{
-    blockedByImportCap: boolean;
-    importedMessages: number;
-    hasOverlap: boolean;
-  }> {
+    allowNoAnchorImport?: boolean;
+    noAnchorImportReason?: string;
+  }): Promise<TranscriptReconcileResult> {
     const { sessionId, conversationId, historicalMessages } = params;
     const startedAt = Date.now();
     const sessionContext = this.formatSessionLogContext({
@@ -4690,6 +4694,7 @@ export class LcmContextEngine implements ContextEngine {
       );
       return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
     }
+    const existingDbCount = await this.conversationStore.getMessageCount(conversationId);
 
     const storedHistoricalMessages = historicalMessages.map((message) => toStoredMessage(message));
 
@@ -4777,6 +4782,30 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       if (anchorIndex < 0) {
+        if (params.allowNoAnchorImport) {
+          const importCap = Math.max(Math.floor(existingDbCount * 0.2), 50);
+          if (historicalMessages.length > importCap) {
+            this.deps.log.warn(
+              `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${historicalMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
+            );
+            this.deps.log.debug(
+              `[lcm] reconcileSessionTail: blocked no-anchor import for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} existingDbCount=${existingDbCount} cap=${importCap} overlap=false`,
+            );
+            return { blockedByImportCap: true, importedMessages: 0, hasOverlap: false };
+          }
+
+          let importedMessages = 0;
+          for (const message of historicalMessages) {
+            const result = await this.ingestSingle({ sessionId, sessionKey: params.sessionKey, message });
+            if (result.ingested) {
+              importedMessages += 1;
+            }
+          }
+          this.deps.log.warn(
+            `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=${importedMessages} overlap=false`,
+          );
+          return { blockedByImportCap: false, importedMessages, hasOverlap: false };
+        }
         this.deps.log.debug(
           `[lcm] reconcileSessionTail: no anchor for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=false`,
         );
@@ -4792,7 +4821,6 @@ export class LcmContextEngine implements ContextEngine {
 
     const missingTail = historicalMessages.slice(anchorIndex + 1);
 
-    const existingDbCount = await this.conversationStore.getMessageCount(conversationId);
     if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
       this.deps.log.warn(
         `[lcm] reconcileSessionTail: import cap exceeded for ${sessionContext} — would import ${missingTail.length} messages (existing: ${existingDbCount}). Aborting to prevent flood.`,
@@ -4821,7 +4849,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     sessionKey?: string;
     sessionFile: string;
-  }): Promise<{ importedMessages: number; blockedByImportCap: boolean }> {
+  }): Promise<TranscriptReconcileResult> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     return await this.withSessionQueue(
       queueKey,
@@ -4831,7 +4859,10 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
         });
         if (!conversation) {
-          return { importedMessages: 0, blockedByImportCap: false };
+          // No persisted conversation exists yet; afterTurn's own ingest batch
+          // will create the initial frontier, so refreshing after that ingest is
+          // safe and preserves the normal first-turn checkpoint behavior.
+          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
         }
 
         // OpenClaw can submit the foreground prompt outside the mutable
@@ -4874,7 +4905,7 @@ export class LcmContextEngine implements ContextEngine {
                 sessionFile: params.sessionFile,
               });
             }
-            return { importedMessages, blockedByImportCap: false };
+            return { importedMessages, blockedByImportCap: false, hasOverlap: true };
           }
         }
 
@@ -4909,7 +4940,7 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.debug(
             `[lcm] afterTurn: transcript reconcile slow path skipped (file state already read this process) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
           );
-          return { importedMessages: 0, blockedByImportCap: false };
+          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
         }
 
         const rememberSlowReadState = (): void => {
@@ -4939,7 +4970,17 @@ export class LcmContextEngine implements ContextEngine {
         // and we lose messages.
         const historicalMessages = await readLeafPathMessages(params.sessionFile);
         if (historicalMessages.length === 0) {
-          if (sessionFileState?.size === 0) {
+          if (!sessionFileState) {
+            this.deps.log.warn(
+              `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; allowing live afterTurn persistence without checkpoint refresh conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+            );
+            return {
+              importedMessages: 0,
+              blockedByImportCap: false,
+              hasOverlap: true,
+            };
+          }
+          if (sessionFileState.size === 0) {
             // File is genuinely empty — refresh the checkpoint so the next
             // afterTurn takes the incremental path.
             await this.refreshBootstrapState({
@@ -4952,16 +4993,22 @@ export class LcmContextEngine implements ContextEngine {
               `[lcm] afterTurn: transcript reconcile slow path read empty messages from non-empty file (${sessionFileState?.size ?? "?"} bytes) — skipping checkpoint refresh to avoid dropping messages on parser failure conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
             );
           }
-          return { importedMessages: 0, blockedByImportCap: false };
+          return {
+            importedMessages: 0,
+            blockedByImportCap: false,
+            hasOverlap: sessionFileState.size === 0,
+          };
         }
         const reconcile = await this.reconcileSessionTail({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
           conversationId: conversation.conversationId,
           historicalMessages,
+          allowNoAnchorImport: reason === "path-mismatch",
+          noAnchorImportReason: reason,
         });
         if (reconcile.blockedByImportCap) {
-          return { importedMessages: 0, blockedByImportCap: true };
+          return { importedMessages: 0, blockedByImportCap: true, hasOverlap: reconcile.hasOverlap };
         }
         if (reconcile.importedMessages > 0) {
           this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
@@ -4971,10 +5018,15 @@ export class LcmContextEngine implements ContextEngine {
             "reconciled missing session messages",
           );
         }
-        // Always refresh the checkpoint after a slow-path read, even when no
-        // messages were imported. This pins the offset to the new sessionFile
-        // so the next afterTurn takes the incremental path instead of paying
-        // for another full re-read on every turn.
+        if (!reconcile.hasOverlap && reconcile.importedMessages === 0) {
+          this.deps.log.warn(
+            `[lcm] afterTurn: transcript reconcile found no anchor and imported 0 messages; skipping checkpoint refresh conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length}`,
+          );
+          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: false };
+        }
+        // Refresh only after the slow-path read either found an overlap or
+        // imported the bounded no-anchor epoch. A no-overlap/no-import result
+        // leaves the checkpoint stale on purpose so future turns can retry.
         await this.refreshBootstrapState({
           conversationId: conversation.conversationId,
           sessionFile: params.sessionFile,
@@ -4983,7 +5035,11 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.warn(
           `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${reconcile.importedMessages} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
         );
-        return { importedMessages: reconcile.importedMessages, blockedByImportCap: false };
+        return {
+          importedMessages: reconcile.importedMessages,
+          blockedByImportCap: false,
+          hasOverlap: reconcile.hasOverlap,
+        };
       },
       {
         operationName: "afterTurnTranscriptReconcile",
@@ -5136,11 +5192,13 @@ export class LcmContextEngine implements ContextEngine {
           const conversationId = conversation.conversationId;
           let existingCount = await this.conversationStore.getMessageCount(conversationId);
           let bootstrapState = await this.summaryStore.getConversationBootstrapState(conversationId);
+          let transcriptEpochRotated = false;
 
           if (
             bootstrapState &&
             bootstrapState.sessionFilePath !== params.sessionFile
           ) {
+            transcriptEpochRotated = true;
             this.deps.log.warn(
               `[lcm] bootstrap: session file rotated conversation=${conversationId} ${sessionLabel} oldFile=${bootstrapState.sessionFilePath} newFile=${params.sessionFile}`,
             );
@@ -5362,6 +5420,8 @@ export class LcmContextEngine implements ContextEngine {
             conversationId,
             historicalMessages,
             checkpointEntryHash: bootstrapState?.lastProcessedEntryHash,
+            allowNoAnchorImport: transcriptEpochRotated,
+            noAnchorImportReason: transcriptEpochRotated ? "path-mismatch" : undefined,
           });
           this.deps.log.debug(
             `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -6295,7 +6355,11 @@ export class LcmContextEngine implements ContextEngine {
     const newMessages = filterPersistableMessages(
       params.messages.slice(params.prePromptMessageCount),
     );
-    let transcriptReconcileResult = { importedMessages: 0, blockedByImportCap: false };
+    let transcriptReconcileResult: TranscriptReconcileResult = {
+      importedMessages: 0,
+      blockedByImportCap: false,
+      hasOverlap: true,
+    };
     try {
       transcriptReconcileResult = await this.reconcileTranscriptTailForAfterTurn({
         sessionId: params.sessionId,
@@ -6307,14 +6371,26 @@ export class LcmContextEngine implements ContextEngine {
         `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
       );
     }
-    const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
-      params.sessionId,
-      params.sessionKey,
-      newMessages,
-      {
-        oversizedNoOverlap: transcriptReconcileResult.importedMessages > 0 ? "ingest" : "skip",
-      },
-    );
+    const transcriptReconcileUnsafeToAdvance =
+      transcriptReconcileResult.blockedByImportCap ||
+      (!transcriptReconcileResult.hasOverlap && transcriptReconcileResult.importedMessages === 0);
+    let dedupedNewMessages: AgentMessage[] = [];
+    if (transcriptReconcileUnsafeToAdvance) {
+      if (newMessages.length > 0 || params.autoCompactionSummary) {
+        this.deps.log.warn(
+          `[lcm] afterTurn: transcript reconcile did not cover the transcript frontier; skipping afterTurn persistence to avoid creating a future anchor past unreconciled transcript history ${sessionLabel}`,
+        );
+      }
+    } else {
+      dedupedNewMessages = await this.deduplicateAfterTurnBatch(
+        params.sessionId,
+        params.sessionKey,
+        newMessages,
+        {
+          oversizedNoOverlap: transcriptReconcileResult.importedMessages > 0 ? "ingest" : "skip",
+        },
+      );
+    }
     const summaryCoveredMessages: AgentMessage[] = [];
     const summaryDedupedNewMessages: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
@@ -6340,7 +6416,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const ingestBatch: AgentMessage[] = [];
-    if (params.autoCompactionSummary) {
+    if (!transcriptReconcileUnsafeToAdvance && params.autoCompactionSummary) {
       ingestBatch.push({
         role: "user",
         content: params.autoCompactionSummary,
@@ -6494,7 +6570,9 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
     };
-    let shouldRefreshBootstrapState = true;
+    let shouldRefreshBootstrapState =
+      !transcriptReconcileResult.blockedByImportCap &&
+      (transcriptReconcileResult.hasOverlap || transcriptReconcileResult.importedMessages > 0);
     let deferredCompactionDrain:
       | {
           reason: string;
@@ -6553,8 +6631,6 @@ export class LcmContextEngine implements ContextEngine {
             leafDecision,
             sessionLabel,
           });
-        } else {
-          shouldRefreshBootstrapState = true;
         }
 
         if (!leafCompactionScheduled) {
