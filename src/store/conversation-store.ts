@@ -35,6 +35,11 @@ export type CreateMessageInput = {
   identityHash?: string;
 };
 
+type PreparedMessageInsert = CreateMessageInput & {
+  createdAt: string;
+  identityHash: string;
+};
+
 export type MessageRecord = {
   messageId: MessageId;
   conversationId: ConversationId;
@@ -160,6 +165,10 @@ interface MessagePartRow {
 
 interface CountRow {
   count: number;
+}
+
+interface TimestampRow {
+  created_at: string;
 }
 
 interface MaxSeqRow {
@@ -512,18 +521,22 @@ export class ConversationStore {
   // ── Message operations ────────────────────────────────────────────────────
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
+    const prepared = this.prepareMessageInsert(input);
+    this.assertNoReplayTimestampFlood([prepared]);
+
     const result = this.db
       .prepare(
-        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        input.conversationId,
-        input.seq,
-        input.role,
-        input.content,
-        input.tokenCount,
-        input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
+        prepared.conversationId,
+        prepared.seq,
+        prepared.role,
+        prepared.content,
+        prepared.tokenCount,
+        prepared.identityHash,
+        prepared.createdAt,
       );
 
     const messageId = Number(result.lastInsertRowid);
@@ -544,9 +557,13 @@ export class ConversationStore {
     if (inputs.length === 0) {
       return [];
     }
+    const createdAt = this.currentSqliteTimestamp();
+    const preparedInputs = inputs.map((input) => this.prepareMessageInsert(input, createdAt));
+    this.assertNoReplayTimestampFlood(preparedInputs);
+
     const insertStmt = this.db.prepare(
-      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
       `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
@@ -554,14 +571,15 @@ export class ConversationStore {
     );
 
     const records: MessageRecord[] = [];
-    for (const input of inputs) {
+    for (const input of preparedInputs) {
       const result = insertStmt.run(
         input.conversationId,
         input.seq,
         input.role,
         input.content,
         input.tokenCount,
-        input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
+        input.identityHash,
+        input.createdAt,
       );
 
       const messageId = Number(result.lastInsertRowid);
@@ -649,6 +667,43 @@ export class ConversationStore {
        WHERE conversation_id = ? AND identity_hash = ? AND role = ? AND content = ?`,
       )
       .get(conversationId, identityHash, role, content) as unknown as CountRow | undefined;
+
+    return row?.count ?? 0;
+  }
+
+  async countMessagesByIdentityBeforeTimestamp(params: {
+    conversationId: ConversationId;
+    role: MessageRole;
+    content: string;
+    beforeCreatedAt: string;
+  }): Promise<number> {
+    return this.countMessagesByIdentityBeforeTimestampSync(params);
+  }
+
+  private countMessagesByIdentityBeforeTimestampSync(params: {
+    conversationId: ConversationId;
+    role: MessageRole;
+    content: string;
+    beforeCreatedAt: string;
+  }): number {
+    const identityHash = buildMessageIdentityHash(params.role, params.content);
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+       FROM messages
+       WHERE conversation_id = ?
+         AND identity_hash = ?
+         AND role = ?
+         AND content = ?
+         AND created_at < ?`,
+      )
+      .get(
+        params.conversationId,
+        identityHash,
+        params.role,
+        params.content,
+        params.beforeCreatedAt,
+      ) as unknown as CountRow | undefined;
 
     return row?.count ?? 0;
   }
@@ -854,6 +909,88 @@ export class ConversationStore {
         .run(messageId, normalizedContent);
     } catch {
       // Full-text indexing is optional. Message persistence must still succeed.
+    }
+  }
+
+  private currentSqliteTimestamp(): string {
+    const row = this.db
+      .prepare(`SELECT datetime('now') AS created_at`)
+      .get() as unknown as TimestampRow;
+    return row.created_at;
+  }
+
+  private prepareMessageInsert(
+    input: CreateMessageInput,
+    createdAt = this.currentSqliteTimestamp(),
+  ): PreparedMessageInsert {
+    return {
+      ...input,
+      createdAt,
+      identityHash: input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
+    };
+  }
+
+  private countExistingReplayRowsAtTimestamp(
+    conversationId: ConversationId,
+    createdAt: string,
+  ): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+       FROM messages AS m
+       WHERE m.conversation_id = ?
+         AND m.created_at = ?
+         AND length(m.content) > 0
+         AND EXISTS (
+           SELECT 1
+           FROM messages AS prior
+           WHERE prior.conversation_id = m.conversation_id
+             AND prior.identity_hash = m.identity_hash
+             AND prior.role = m.role
+             AND prior.content = m.content
+             AND prior.created_at < m.created_at
+         )`,
+      )
+      .get(conversationId, createdAt) as unknown as CountRow | undefined;
+    return row?.count ?? 0;
+  }
+
+  private assertNoReplayTimestampFlood(inputs: PreparedMessageInsert[]): void {
+    if (inputs.length === 0) {
+      return;
+    }
+
+    const replicatedByConversationAndTimestamp = new Map<string, number>();
+    for (const input of inputs) {
+      if (input.content.length === 0) {
+        continue;
+      }
+      const priorCount = this.countMessagesByIdentityBeforeTimestampSync({
+        conversationId: input.conversationId,
+        role: input.role,
+        content: input.content,
+        beforeCreatedAt: input.createdAt,
+      });
+      if (priorCount === 0) {
+        continue;
+      }
+      const key = `${input.conversationId}\u0000${input.createdAt}`;
+      replicatedByConversationAndTimestamp.set(
+        key,
+        (replicatedByConversationAndTimestamp.get(key) ?? 0) + 1,
+      );
+    }
+
+    for (const [key, candidateCount] of replicatedByConversationAndTimestamp) {
+      const [conversationIdText, createdAt] = key.split("\u0000");
+      const conversationId = Number(conversationIdText);
+      const existingCount = this.countExistingReplayRowsAtTimestamp(conversationId, createdAt);
+      const replicatedCount = existingCount + candidateCount;
+      if (replicatedCount >= 3) {
+        throw new Error(
+          `[lcm] refused replay-like message batch: conversation=${conversationId} createdAt=${createdAt} replicatedRows=${replicatedCount}`,
+        );
+      }
     }
   }
 

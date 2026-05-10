@@ -1681,6 +1681,35 @@ function messageIdentity(role: string, content: string): string {
   return `${role}\u0000${content}`;
 }
 
+function isBootstrapReplayCandidateMessage(message: AgentMessage): boolean {
+  const role = toStoredMessage(message).role;
+  return role === "assistant" || role === "tool";
+}
+
+function createBootstrapReplaySignature(message: AgentMessage): string {
+  const stored = toStoredMessage(message);
+  const parts = buildMessageParts({
+    sessionId: "bootstrap-replay-signature",
+    message,
+    fallbackContent: stored.content,
+  });
+
+  return JSON.stringify({
+    role: stored.role,
+    content: stored.content,
+    parts: parts.map((part) => ({
+      partType: part.partType,
+      ordinal: part.ordinal,
+      textContent: part.textContent ?? null,
+      toolCallId: part.toolCallId ?? null,
+      toolName: part.toolName ?? null,
+      toolInput: part.toolInput ?? null,
+      toolOutput: part.toolOutput ?? null,
+      metadata: part.metadata ?? null,
+    })),
+  });
+}
+
 function normalizeSummaryOverlapText(value: string): string {
   return value.replace(/\s+/g, " ").trim().toLowerCase();
 }
@@ -4790,7 +4819,12 @@ export class LcmContextEngine implements ContextEngine {
       return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
     }
 
-    const missingTail = historicalMessages.slice(anchorIndex + 1);
+    const missingTail = await this.filterBootstrapReplayMessages({
+      messages: historicalMessages.slice(anchorIndex + 1),
+      sessionContext,
+      source: "reconcileSessionTail",
+      priorMessages: historicalMessages.slice(0, anchorIndex + 1),
+    });
 
     const existingDbCount = await this.conversationStore.getMessageCount(conversationId);
     if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
@@ -4815,6 +4849,88 @@ export class LcmContextEngine implements ContextEngine {
       `[lcm] reconcileSessionTail: slow path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages}`,
     );
     return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+  }
+
+  /**
+   * Existing-conversation bootstrap is a rehydrate path. It may repair small
+   * crash gaps, but it must not replay already persisted transcript rows as
+   * fresh LCM seqs after a runtime re-instantiation.
+   */
+  private async filterBootstrapReplayMessages(params: {
+    messages: AgentMessage[];
+    sessionContext: string;
+    source: string;
+    priorMessages?: AgentMessage[];
+    sessionFile?: string;
+  }): Promise<AgentMessage[]> {
+    if (params.messages.length < 3) {
+      return params.messages;
+    }
+
+    let replayCandidateLength = 0;
+    while (
+      replayCandidateLength < params.messages.length &&
+      isBootstrapReplayCandidateMessage(params.messages[replayCandidateLength]!)
+    ) {
+      replayCandidateLength += 1;
+    }
+    if (replayCandidateLength < 3) {
+      return params.messages;
+    }
+
+    const priorMessages =
+      params.priorMessages ??
+      (params.sessionFile ? await readLeafPathMessages(params.sessionFile) : undefined);
+    if (!priorMessages || priorMessages.length === 0) {
+      return params.messages;
+    }
+
+    const replayCandidates = params.messages.slice(0, replayCandidateLength);
+    const earlierReplayCandidates = (
+      params.priorMessages ? priorMessages : priorMessages.slice(0, Math.max(0, priorMessages.length - params.messages.length))
+    ).filter(isBootstrapReplayCandidateMessage);
+    if (earlierReplayCandidates.length < 3) {
+      return params.messages;
+    }
+
+    const incomingSignatures = replayCandidates.map(createBootstrapReplaySignature);
+    const earlierSignatures = earlierReplayCandidates.map(createBootstrapReplaySignature);
+
+    let replayPrefixLength = 0;
+    prefixLoop:
+    for (
+      let candidatePrefixLength = incomingSignatures.length;
+      candidatePrefixLength >= 3;
+      candidatePrefixLength -= 1
+    ) {
+      for (
+        let startIndex = 0;
+        startIndex <= earlierSignatures.length - candidatePrefixLength;
+        startIndex += 1
+      ) {
+        let matched = true;
+        for (let offset = 0; offset < candidatePrefixLength; offset += 1) {
+          if (earlierSignatures[startIndex + offset] !== incomingSignatures[offset]) {
+            matched = false;
+            break;
+          }
+        }
+        if (matched) {
+          replayPrefixLength = candidatePrefixLength;
+          break prefixLoop;
+        }
+      }
+    }
+
+    if (replayPrefixLength > 0) {
+      this.deps.log.warn(
+        `[lcm] bootstrap replay guard: ${params.source} dropped ${replayPrefixLength}/${params.messages.length} replayed transcript messages for ${params.sessionContext}`,
+      );
+    }
+
+    return replayPrefixLength > 0
+      ? params.messages.slice(replayPrefixLength)
+      : params.messages;
   }
 
   private async reconcileTranscriptTailForAfterTurn(params: {
@@ -4851,8 +4967,18 @@ export class LcmContextEngine implements ContextEngine {
             offset: checkpoint.lastProcessedOffset,
           });
           if (appended.canUseAppendOnly) {
+            const replayFilteredMessages = await this.filterBootstrapReplayMessages({
+              messages: appended.messages,
+              sessionContext: this.formatSessionLogContext({
+                conversationId: conversation.conversationId,
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+              }),
+              source: "afterTurn transcript reconcile append-only",
+              sessionFile: params.sessionFile,
+            });
             let importedMessages = 0;
-            for (const message of appended.messages) {
+            for (const message of replayFilteredMessages) {
               const result = await this.ingestSingle({
                 sessionId: params.sessionId,
                 sessionKey: params.sessionKey,
@@ -5226,8 +5352,19 @@ export class LcmContextEngine implements ContextEngine {
                   await this.conversationStore.markConversationBootstrapped(conversationId);
                 }
 
+                const replayFilteredMessages = await this.filterBootstrapReplayMessages({
+                  messages: appended.messages,
+                  sessionContext: this.formatSessionLogContext({
+                    conversationId,
+                    sessionId: params.sessionId,
+                    sessionKey: params.sessionKey,
+                  }),
+                  source: "bootstrap append-only",
+                  sessionFile: params.sessionFile,
+                });
+
                 let importedMessages = 0;
-                for (const message of appended.messages) {
+                for (const message of replayFilteredMessages) {
                   const ingestResult = await this.ingestSingle({
                     sessionId: params.sessionId,
                     sessionKey: params.sessionKey,
@@ -5243,7 +5380,7 @@ export class LcmContextEngine implements ContextEngine {
                   this.clearStableOrphanStrippingOrdinal(conversationId);
                 }
                 this.deps.log.debug(
-                  `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
+                  `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} replayFilteredMessages=${replayFilteredMessages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
                 );
 
                 if (importedMessages > 0) {
@@ -6143,19 +6280,21 @@ export class LcmContextEngine implements ContextEngine {
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
-        let ingestedCount = 0;
-        for (const message of params.messages) {
-          const result = await this.ingestSingle({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            message,
-            isHeartbeat: params.isHeartbeat,
-          });
-          if (result.ingested) {
-            ingestedCount += 1;
+        return this.conversationStore.withTransaction(async () => {
+          let ingestedCount = 0;
+          for (const message of params.messages) {
+            const result = await this.ingestSingle({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              message,
+              isHeartbeat: params.isHeartbeat,
+            });
+            if (result.ingested) {
+              ingestedCount += 1;
+            }
           }
-        }
-        return { ingestedCount };
+          return { ingestedCount };
+        });
       },
       {
         operationName: "ingestBatch",
