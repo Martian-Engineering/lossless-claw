@@ -138,6 +138,8 @@ function toNonNegativeInteger(value: unknown): number | undefined {
   return Math.floor(value);
 }
 
+const RECOVERED_SYSTEM_PROMPT_TOKEN_FLOOR = 4_096;
+
 /** Estimate session total tokens from persisted LCM context + host usage counters. */
 function estimateRecoveredSessionTotalTokens(params: {
   contextTokenEstimate: number;
@@ -154,7 +156,9 @@ function estimateRecoveredSessionTotalTokens(params: {
   const cacheWrite = toNonNegativeInteger(entry.cacheWrite) ?? toNonNegativeInteger(entry.cache_write) ?? 0;
   const contextTokens = Math.max(0, Math.floor(params.contextTokenEstimate));
   const runtimePromptTokens = inputTokens + cacheRead + cacheWrite;
-  return Math.max(4_096, contextTokens + runtimePromptTokens);
+  // Include a conservative baseline for non-transcript prompt overhead
+  // (system prompt and policy wrappers) when rebuilding startup totals.
+  return Math.max(RECOVERED_SYSTEM_PROMPT_TOKEN_FLOOR, contextTokens + runtimePromptTokens);
 }
 
 type PluginEnvSnapshot = {
@@ -1528,12 +1532,14 @@ const lcmPlugin = {
       }
 
       if (recovered > 0) {
-        deps.log.info(`[lcm] startup totalTokens recovery updated ${recovered} session entr${recovered === 1 ? "y" : "ies"}`);
+        deps.log.info(
+          `[lcm] startup totalTokens recovery updated ${recovered} session ${recovered === 1 ? "entry" : "entries"}`,
+        );
       }
     }
 
     /** Run startup totalTokens recovery asynchronously to avoid delaying init. */
-    function scheduleStartupSessionTotalTokenRecovery(nextEngine: LcmContextEngine): void {
+    function scheduleStartupSessionTotalTokensRecovery(nextEngine: LcmContextEngine): void {
       void recoverStartupSessionTotalTokens(nextEngine).catch((error) => {
         deps.log.warn(
           `[lcm] startup totalTokens recovery failed: ${describeLogError(error)}`,
@@ -1554,7 +1560,7 @@ const lcmPlugin = {
           `[lcm] Engine initialized for db=${normalizedDbPath} duration=${Date.now() - startedAt}ms`,
         );
         scheduleStartupAutoRotate(nextEngine);
-        scheduleStartupSessionTotalTokenRecovery(nextEngine);
+        scheduleStartupSessionTotalTokensRecovery(nextEngine);
         return nextEngine;
       } catch (error) {
         closeLcmConnection(nextDatabase);

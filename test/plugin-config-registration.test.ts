@@ -848,15 +848,16 @@ describe("lcm plugin registration", () => {
       tmpdir(),
       `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
     );
-    const sessionId = `session-${Date.now()}`;
+    const sessionId = `test-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const sessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
+    const sessionFilePath = join(tmpdir(), `${sessionId}.jsonl`);
 
     writeFileSync(
       sessionStorePath,
       `${JSON.stringify({
         [sessionKey]: {
           sessionId,
-          sessionFile: `/tmp/${sessionId}.jsonl`,
+          sessionFile: sessionFilePath,
           totalTokens: null,
           totalTokensFresh: false,
           inputTokens: 1_200,
@@ -894,7 +895,7 @@ describe("lcm plugin registration", () => {
       resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
         typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
           ? entry.sessionFile
-          : `/tmp/${runtimeSessionId}.jsonl`,
+          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
     };
     lcmPlugin.register(first.api);
     const firstFactory = first.getFactory();
@@ -958,7 +959,7 @@ describe("lcm plugin registration", () => {
       resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
         typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
           ? entry.sessionFile
-          : `/tmp/${runtimeSessionId}.jsonl`,
+          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
     };
     lcmPlugin.register(second.api);
     const secondFactory = second.getFactory();
