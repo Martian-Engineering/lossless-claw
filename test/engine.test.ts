@@ -2667,6 +2667,111 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(duplicateContentRows).toHaveLength(0);
   });
 
+  it("keeps fresh tool-only rows after dropping a replayed assistant prefix", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("bootstrap-reinstantiation-tool-tail");
+    const sm = SessionManager.open(sessionFile);
+    const sessionId = "bootstrap-reinstantiation-tool-tail";
+
+    for (let turn = 1; turn <= 5; turn += 1) {
+      sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: `question ${turn}` }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: `answer ${turn}` }],
+      } as AgentMessage);
+    }
+
+    const engineA = createEngineAtDatabasePath(dbPath);
+    const first = await engineA.bootstrap({ sessionId, sessionFile });
+    expect(first).toEqual({ bootstrapped: true, importedMessages: 10 });
+
+    const conversation = await engineA.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const before = await engineA.getConversationStore().getMessages(conversation!.conversationId);
+    await engineA.dispose();
+
+    for (const answer of ["answer 3", "answer 4", "answer 5"]) {
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: answer }],
+      } as AgentMessage);
+    }
+    sm.appendMessage({
+      role: "toolResult",
+      toolCallId: "call_new",
+      content: [{ type: "tool_result", tool_use_id: "call_new", output: { ok: true } }],
+    } as AgentMessage);
+
+    const engineB = createEngineAtDatabasePath(dbPath);
+    const second = await engineB.bootstrap({ sessionId, sessionFile });
+    expect(second.bootstrapped).toBe(true);
+    expect(second.importedMessages).toBe(1);
+    expect(second.reason).toBe("reconciled missing session messages");
+
+    const after = await engineB.getConversationStore().getMessages(conversation!.conversationId);
+    expect(after).toHaveLength(before.length + 1);
+
+    const imported = after[after.length - 1]!;
+    expect(imported.role).toBe("tool");
+    expect(imported.content).toBe("");
+
+    const parts = await engineB.getConversationStore().getMessageParts(imported.messageId);
+    expect(parts.some((part) => part.toolCallId === "call_new")).toBe(true);
+  });
+
+  it("keeps legitimate repeated assistant text when the ordering does not match a prior replay", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("bootstrap-repeated-assistant-order");
+    const sm = SessionManager.open(sessionFile);
+    const sessionId = "bootstrap-repeated-assistant-order";
+
+    for (const [question, answer] of [
+      ["question 1", "alpha"],
+      ["question 2", "beta"],
+      ["question 3", "gamma"],
+    ] as const) {
+      sm.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: question }],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: answer }],
+      } as AgentMessage);
+    }
+
+    const engineA = createEngineAtDatabasePath(dbPath);
+    const first = await engineA.bootstrap({ sessionId, sessionFile });
+    expect(first).toEqual({ bootstrapped: true, importedMessages: 6 });
+    await engineA.dispose();
+
+    for (const answer of ["alpha", "gamma", "beta"]) {
+      sm.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: answer }],
+      } as AgentMessage);
+    }
+
+    const engineB = createEngineAtDatabasePath(dbPath);
+    const second = await engineB.bootstrap({ sessionId, sessionFile });
+    expect(second.bootstrapped).toBe(true);
+    expect(second.importedMessages).toBe(3);
+    expect(second.reason).toBe("reconciled missing session messages");
+
+    const conversation = await engineB.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const after = await engineB.getConversationStore().getMessages(conversation!.conversationId);
+    expect(after.slice(-3).map((message) => message.content)).toEqual(["alpha", "gamma", "beta"]);
+  });
+
   it("skips reopening the transcript when checkpoint stats match", async () => {
     const sessionFile = createSessionFilePath("unchanged-fast-path");
     const sm = SessionManager.open(sessionFile);
