@@ -190,21 +190,6 @@ function renderToolInputDisambiguator(rawInput, toolName) {
   }
   return `Tool: ${toolName}`;
 }
-const candidatesStmt = db.prepare(candidatesSql);
-const candidates = limit ? candidatesStmt.all(thresholdBytes, limit) : candidatesStmt.all(thresholdBytes);
-log(`candidates: ${candidates.length}`);
-
-const totalBytes = candidates.reduce((s, r) => s + r.bytes, 0);
-const summary = {
-  db: dbPath, thresholdBytes, storageDir,
-  candidateCount: candidates.length, totalCandidateBytes: totalBytes,
-  meanBytes: candidates.length > 0 ? Math.round(totalBytes / candidates.length) : 0,
-  largestBytes: candidates[0]?.bytes ?? 0,
-  dryRun, applied: 0, filesWritten: 0, errors: [],
-};
-
-if (dryRun && !revert) { console.log(JSON.stringify(summary, null, 2)); db.close(); process.exit(0); }
-
 if (revert) {
   // Wave-2 P1 + Wave-3 P1: complete reversibility — undo a previous
   // migration. Defenses against the "wrong DB" footgun:
@@ -301,6 +286,21 @@ if (revert) {
   process.exit(0);
 }
 
+
+const candidatesStmt = db.prepare(candidatesSql);
+const candidates = limit ? candidatesStmt.all(thresholdBytes, limit) : candidatesStmt.all(thresholdBytes);
+log(`candidates: ${candidates.length}`);
+
+const totalBytes = candidates.reduce((s, r) => s + r.bytes, 0);
+const summary = {
+  db: dbPath, thresholdBytes, storageDir,
+  candidateCount: candidates.length, totalCandidateBytes: totalBytes,
+  meanBytes: candidates.length > 0 ? Math.round(totalBytes / candidates.length) : 0,
+  largestBytes: candidates[0]?.bytes ?? 0,
+  dryRun, applied: 0, filesWritten: 0, errors: [],
+};
+
+if (dryRun) { console.log(JSON.stringify(summary, null, 2)); db.close(); process.exit(0); }
 
 if (!existsSync(storageDir)) {
   // Wave-2 P1: 0700 so other users on the box can't list filenames.
