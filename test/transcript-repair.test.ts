@@ -7,14 +7,22 @@ describe("sanitizeToolUseResultPairing", () => {
       {
         role: "assistant",
         content: [
-          { type: "function_call", call_id: "fc_1", name: "bash", arguments: '{"cmd":"pwd"}' },
+          {
+            type: "function_call",
+            call_id: "fc_1",
+            name: "bash",
+            arguments: '{"cmd":"pwd"}',
+          },
           { type: "reasoning", text: "Need tool output first." },
         ],
       },
     ]);
 
     const assistant = repaired[0] as { content?: Array<{ type?: string }> };
-    expect(assistant.content?.map((block) => block.type)).toEqual(["reasoning", "function_call"]);
+    expect(assistant.content?.map((block) => block.type)).toEqual([
+      "reasoning",
+      "function_call",
+    ]);
   });
 
   it("preserves interleaved reasoning when an assistant turn has multiple function calls", () => {
@@ -22,9 +30,19 @@ describe("sanitizeToolUseResultPairing", () => {
       {
         role: "assistant",
         content: [
-          { type: "function_call", call_id: "fc_1", name: "bash", arguments: '{"cmd":"pwd"}' },
+          {
+            type: "function_call",
+            call_id: "fc_1",
+            name: "bash",
+            arguments: '{"cmd":"pwd"}',
+          },
           { type: "reasoning", text: "Reasoning for the second call." },
-          { type: "function_call", call_id: "fc_2", name: "bash", arguments: '{"cmd":"ls"}' },
+          {
+            type: "function_call",
+            call_id: "fc_2",
+            name: "bash",
+            arguments: '{"cmd":"ls"}',
+          },
         ],
       },
     ]);
@@ -33,9 +51,19 @@ describe("sanitizeToolUseResultPairing", () => {
       content?: Array<{ type?: string; call_id?: string; text?: string }>;
     };
     expect(assistant.content).toEqual([
-      { type: "function_call", call_id: "fc_1", name: "bash", arguments: '{"cmd":"pwd"}' },
+      {
+        type: "function_call",
+        call_id: "fc_1",
+        name: "bash",
+        arguments: '{"cmd":"pwd"}',
+      },
       { type: "reasoning", text: "Reasoning for the second call." },
-      { type: "function_call", call_id: "fc_2", name: "bash", arguments: '{"cmd":"ls"}' },
+      {
+        type: "function_call",
+        call_id: "fc_2",
+        name: "bash",
+        arguments: '{"cmd":"ls"}',
+      },
     ]);
   });
 
@@ -43,7 +71,14 @@ describe("sanitizeToolUseResultPairing", () => {
     const messages = [
       {
         role: "assistant",
-        content: [{ type: "toolCall", id: "call_missing", name: "update_plan", input: { step: "x" } }],
+        content: [
+          {
+            type: "toolCall",
+            id: "call_missing",
+            name: "update_plan",
+            input: { step: "x" },
+          },
+        ],
       },
     ];
 
@@ -63,5 +98,37 @@ describe("sanitizeToolUseResultPairing", () => {
       ],
       isError: true,
     });
+  });
+
+  it("looks past display-only assistant turns for delayed tool results", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_bridge",
+            name: "tool_search_code",
+            input: { code: "run" },
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "tool progress" }],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_bridge",
+        toolName: "tool_search_code",
+        content: [{ type: "text", text: "real result" }],
+      },
+    ];
+
+    expect(sanitizeToolUseResultPairing(messages)).toEqual([
+      messages[0],
+      messages[2],
+      messages[1],
+    ]);
   });
 });

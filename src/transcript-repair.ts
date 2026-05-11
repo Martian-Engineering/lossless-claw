@@ -37,7 +37,10 @@ const TOOL_CALL_TYPES = new Set([
 ]);
 const OPENAI_FUNCTION_CALL_TYPES = new Set(["functionCall", "function_call"]);
 
-function extractToolCallId(block: { id?: unknown; call_id?: unknown }): string | null {
+function extractToolCallId(block: {
+  id?: unknown;
+  call_id?: unknown;
+}): string | null {
   if (typeof block.id === "string" && block.id) {
     return block.id;
   }
@@ -47,7 +50,9 @@ function extractToolCallId(block: { id?: unknown; call_id?: unknown }): string |
   return null;
 }
 
-function normalizeAssistantReasoningBlocks<T extends AgentMessageLike>(message: T): T {
+function normalizeAssistantReasoningBlocks<T extends AgentMessageLike>(
+  message: T
+): T {
   if (!Array.isArray(message.content)) {
     return message;
   }
@@ -113,7 +118,12 @@ function extractToolCallsFromAssistant(msg: AgentMessageLike): ToolCallLike[] {
     if (!block || typeof block !== "object") {
       continue;
     }
-    const rec = block as { type?: unknown; id?: unknown; call_id?: unknown; name?: unknown };
+    const rec = block as {
+      type?: unknown;
+      id?: unknown;
+      call_id?: unknown;
+      name?: unknown;
+    };
     const id = extractToolCallId(rec);
     if (!id) {
       continue;
@@ -168,7 +178,9 @@ function makeMissingToolResult(params: {
  * - Drops duplicate toolResults for the same ID
  * - Drops orphaned toolResults with no matching tool call
  */
-export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(messages: T[]): T[] {
+export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
+  messages: T[]
+): T[] {
   const out: T[] = [];
   const seenToolResultIds = new Set<string>();
   let droppedDuplicateCount = 0;
@@ -242,7 +254,14 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(message
 
       const nextRole = next.role;
       if (nextRole === "assistant") {
-        break;
+        const nextToolCalls = extractToolCallsFromAssistant(
+          normalizeAssistantReasoningBlocks(next)
+        );
+        if (nextToolCalls.length > 0) {
+          break;
+        }
+        remainder.push(next);
+        continue;
       }
 
       if (nextRole === "toolResult") {
