@@ -41,8 +41,6 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
@@ -83,14 +81,6 @@ if (!existsSync(dbPath)) {
   console.error(`DB not found: ${dbPath}`);
   process.exit(1);
 }
-const VEC0 = process.env.LCM_TEST_VEC0_PATH ??
-  join(homedir(), ".openclaw", "extensions", "node_modules", "sqlite-vec-darwin-arm64", "vec0.dylib");
-if (!existsSync(VEC0)) { console.error(`vec0 not found: ${VEC0}`); process.exit(1); }
-if (!process.env.VOYAGE_API_KEY?.trim()) {
-  console.error("VOYAGE_API_KEY env var required");
-  process.exit(1);
-}
-
 const cwd = process.cwd();
 if (!existsSync(`${cwd}/src/db/migration.ts`)) {
   console.error(`Run from repo root. cwd=${cwd}`);
@@ -102,8 +92,6 @@ const db = new DatabaseSync(dbPath, { allowExtension: true });
 db.exec("PRAGMA foreign_keys = ON");
 db.exec("PRAGMA journal_mode = WAL");
 
-const { tryLoadSqliteVec } = await import(`${cwd}/src/embeddings/store.ts`);
-tryLoadSqliteVec(db, { path: VEC0 });
 const { runLcmMigrations } = await import(`${cwd}/src/db/migration.ts`);
 runLcmMigrations(db, { fts5Available: true, seedDefaultPrompts: false });
 

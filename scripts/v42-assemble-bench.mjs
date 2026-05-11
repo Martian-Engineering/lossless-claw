@@ -21,7 +21,6 @@
 
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 const args = process.argv.slice(2);
@@ -47,19 +46,6 @@ if (!existsSync(dbPath)) {
   console.error(`DB not found: ${dbPath}`);
   process.exit(1);
 }
-if (!process.env.VOYAGE_API_KEY?.trim()) {
-  console.error("VOYAGE_API_KEY env var required (cat ~/.openclaw/credentials/voyage-api-key)");
-  process.exit(1);
-}
-
-const VEC0_PATH =
-  process.env.LCM_TEST_VEC0_PATH ??
-  join(homedir(), ".openclaw", "extensions", "node_modules", "sqlite-vec-darwin-arm64", "vec0.dylib");
-if (!existsSync(VEC0_PATH)) {
-  console.error(`vec0 dylib not found: ${VEC0_PATH}`);
-  process.exit(1);
-}
-
 const log = (msg) => { if (verbose) console.error(`[bench] ${msg}`); };
 
 const cwd = process.cwd();
@@ -73,14 +59,6 @@ if (!existsSync(`${cwd}/src/db/migration.ts`)) {
 const db = new DatabaseSync(dbPath, { allowExtension: true });
 db.exec("PRAGMA foreign_keys = ON");
 db.exec("PRAGMA journal_mode = WAL");
-
-const { tryLoadSqliteVec, vec0Version } = await import(`${cwd}/src/embeddings/store.ts`);
-const vecLoaded = tryLoadSqliteVec(db, { path: VEC0_PATH });
-if (!vecLoaded) {
-  console.error("vec0 load failed");
-  process.exit(1);
-}
-log(`vec0 ${vec0Version(db)} loaded`);
 
 const { runLcmMigrations } = await import(`${cwd}/src/db/migration.ts`);
 runLcmMigrations(db, { fts5Available: true, seedDefaultPrompts: false });
