@@ -92,6 +92,14 @@ export type LcmConfig = {
   /** When true, stateless session pattern matching is enforced. */
   skipStatelessSessions: boolean;
   contextThreshold: number;
+  /**
+   * When true, treat `contextThreshold` as a hard floor for incremental
+   * compaction: never propose a compaction pass while currentTokenCount is
+   * below `contextThreshold * tokenBudget`, regardless of cache state, leaf
+   * trigger, or activity band. Prevents cold-cache catch-up passes from
+   * bleeding context away during idle gaps. Default false (no behavior change).
+   */
+  respectThresholdAsHardFloor: boolean;
   freshTailCount: number;
   /** Optional token cap for the protected fresh tail; newest message is always preserved. */
   freshTailMaxTokens?: number;
@@ -433,6 +441,10 @@ export function resolveLcmConfigWithDiagnostics(
       contextThreshold:
         parseFiniteNumber(env.LCM_CONTEXT_THRESHOLD)
           ?? toNumber(pc.contextThreshold) ?? 0.75,
+      respectThresholdAsHardFloor:
+        env.LCM_RESPECT_THRESHOLD_AS_HARD_FLOOR !== undefined
+          ? env.LCM_RESPECT_THRESHOLD_AS_HARD_FLOOR === "true"
+          : toBool(pc.respectThresholdAsHardFloor) ?? false,
       freshTailCount:
         parseFiniteInt(env.LCM_FRESH_TAIL_COUNT)
           ?? toNumber(pc.freshTailCount) ?? 64,

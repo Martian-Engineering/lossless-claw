@@ -28,6 +28,7 @@ describe("resolveLcmConfig", () => {
     expect(config.statelessSessionPatterns).toEqual([]);
     expect(config.skipStatelessSessions).toBe(true);
     expect(config.contextThreshold).toBe(0.75);
+    expect(config.respectThresholdAsHardFloor).toBe(false);
     expect(config.freshTailCount).toBe(64);
     expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.promptAwareEviction).toBe(false);
@@ -68,6 +69,7 @@ describe("resolveLcmConfig", () => {
   it("reads values from plugin config", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: 0.5,
+      respectThresholdAsHardFloor: true,
       freshTailCount: 16,
       freshTailMaxTokens: 12000,
       promptAwareEviction: false,
@@ -111,6 +113,7 @@ describe("resolveLcmConfig", () => {
     expect(config.statelessSessionPatterns).toEqual(["agent:*:ephemeral:**"]);
     expect(config.skipStatelessSessions).toBe(false);
     expect(config.contextThreshold).toBe(0.5);
+    expect(config.respectThresholdAsHardFloor).toBe(true);
     expect(config.freshTailCount).toBe(16);
     expect(config.freshTailMaxTokens).toBe(12000);
     expect(config.promptAwareEviction).toBe(false);
@@ -147,6 +150,7 @@ describe("resolveLcmConfig", () => {
   it("env vars override plugin config", () => {
     const env = {
       LCM_CONTEXT_THRESHOLD: "0.9",
+      LCM_RESPECT_THRESHOLD_AS_HARD_FLOOR: "true",
       LCM_FRESH_TAIL_COUNT: "64",
       LCM_FRESH_TAIL_MAX_TOKENS: "32000",
       LCM_PROMPT_AWARE_EVICTION_ENABLED: "false",
@@ -225,6 +229,7 @@ describe("resolveLcmConfig", () => {
       runtime: "off",
     });
     expect(config.contextThreshold).toBe(0.9); // env wins
+    expect(config.respectThresholdAsHardFloor).toBe(true); // env wins
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.freshTailMaxTokens).toBe(32000); // env wins
     expect(config.promptAwareEviction).toBe(false); // env wins
