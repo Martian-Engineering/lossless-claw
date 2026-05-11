@@ -1,10 +1,8 @@
-import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, statSync } from "node:fs";
-import { mkdir, open, stat, writeFile } from "node:fs/promises";
-import type { FileHandle } from "node:fs/promises";
-import { join, resolve as resolvePath } from "node:path";
+import { createHash } from "node:crypto";
+import { statSync } from "node:fs";
+import { stat, writeFile } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { createInterface } from "node:readline";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import type {
   ContextEngine,
@@ -18,7 +16,6 @@ import type {
   SubagentSpawnPreparation,
 } from "./openclaw-bridge.js";
 import {
-  blockFromPart,
   contentFromParts,
   ContextAssembler,
   pickToolCallId,
@@ -37,14 +34,6 @@ import {
   resolveDelegatedExpansionGrantId,
   revokeDelegatedExpansionGrantForSession,
 } from "./expansion-auth.js";
-import {
-  extensionFromNameOrMime,
-  formatFileReference,
-  formatRawPayloadReference,
-  formatToolOutputReference,
-  generateExplorationSummary,
-  parseFileBlocks,
-} from "./large-files.js";
 import { describeLogError } from "./lcm-log.js";
 import {
   DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
@@ -65,14 +54,38 @@ import {
 import {
   ConversationStore,
   type ConversationRecord,
-  type CreateMessagePartInput,
-  type MessagePartRecord,
-  type MessagePartType,
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies, StartupSessionFileCandidate } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import {
+  buildMessageParts,
+  createBootstrapEntryHash,
+  estimateSessionTokenCountForAfterTurn,
+  extractStructuredText,
+  filterPersistableMessages,
+  hasPersistableMessageRole,
+  toStoredMessage,
+} from "./engine/message-normalization.js";
+import { PayloadExternalizer } from "./engine/payload-externalization.js";
+import {
+  SessionOperationQueue,
+  resolveSessionQueueKey,
+  type SessionOperationQueues,
+} from "./engine/session-operation-queue.js";
+import {
+  batchLooksLikeHeartbeatAckTurn,
+  pruneHeartbeatOkTurns,
+} from "./engine/heartbeat-pruning.js";
+import {
+  readAppendedLeafPathMessages,
+  readBootstrapMessageFromJsonLine,
+  readLastJsonlEntryBeforeOffset,
+  readLeafPathMessages,
+  resolveBootstrapMaxTokens,
+  trimBootstrapMessagesToBudget,
+} from "./engine/session-transcript.js";
 import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
 import {
   DatabaseTransactionTimeoutError,
@@ -473,743 +486,6 @@ function normalizeRotateTailMessageCount(value: number, branchMessageCount: numb
   return Math.max(1, Math.min(branchMessageCount, Math.floor(value)));
 }
 
-function appendTextValue(value: unknown, out: string[]): void {
-  if (typeof value === "string") {
-    out.push(value);
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      appendTextValue(entry, out);
-    }
-    return;
-  }
-  if (!value || typeof value !== "object") {
-    return;
-  }
-
-  const record = value as Record<string, unknown>;
-  appendTextValue(record.text, out);
-  appendTextValue(record.value, out);
-}
-
-const STRUCTURED_TEXT_FIELD_KEYS = ["text", "transcript", "transcription", "message", "summary"];
-const STRUCTURED_ARRAY_FIELD_KEYS = [
-  "segments",
-  "utterances",
-  "paragraphs",
-  "alternatives",
-  "words",
-  "items",
-  "results",
-];
-const STRUCTURED_NESTED_FIELD_KEYS = ["content", "output", "result", "payload", "data", "value"];
-const MAX_STRUCTURED_TEXT_DEPTH = 6;
-const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
-  "tool_use",
-  "toolUse",
-  "tool-use",
-  "toolCall",
-  "tool_call",
-  "functionCall",
-  "function_call",
-  "function_call_output",
-  "tool_result",
-  "toolResult",
-  "tool_use_result",
-]);
-const REPLAY_CRITICAL_RAW_TYPES: ReadonlySet<string> = new Set([
-  ...TOOL_RAW_TYPES,
-  "thinking",
-  "reasoning",
-]);
-const RAW_PAYLOAD_EXTERNALIZATION_REASON = "large_raw_message";
-
-function looksLikeJsonPayload(value: string): boolean {
-  if (typeof value !== "string") return false;
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return false;
-  }
-  return (
-    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-    (trimmed.startsWith("[") && trimmed.endsWith("]"))
-  );
-}
-
-function extractStructuredText(value: unknown, depth: number = 0): string | undefined {
-  if (value == null || depth > MAX_STRUCTURED_TEXT_DEPTH) {
-    return undefined;
-  }
-  if (typeof value === "string") {
-    if (looksLikeJsonPayload(value)) {
-      try {
-        const parsed = JSON.parse(value.trim());
-        const parsedText = extractStructuredText(parsed, depth + 1);
-        if (typeof parsedText === "string" && parsedText.length > 0) {
-          return parsedText;
-        }
-      } catch {
-        // Fall through to returning the original string when parsing fails.
-      }
-    }
-    return value;
-  }
-  if (Array.isArray(value)) {
-    const texts: string[] = [];
-    for (const entry of value) {
-      const text = extractStructuredText(entry, depth + 1);
-      if (typeof text === "string" && text.trim().length > 0) {
-        texts.push(text);
-      }
-    }
-    return texts.length > 0 ? texts.join("\n") : undefined;
-  }
-  if (typeof value !== "object") {
-    return undefined;
-  }
-
-  const record = value as Record<string, unknown>;
-
-  // Skip tool call/result objects — their structured data belongs in the parts table, not content
-  if (typeof record.type === "string" && TOOL_RAW_TYPES.has(record.type)) {
-    if (safeBoolean(record.toolOutputExternalized)) {
-      const externalizedText =
-        extractStructuredText(record.output, depth + 1) ??
-        extractStructuredText(record.content, depth + 1) ??
-        extractStructuredText(record.result, depth + 1);
-      if (typeof externalizedText === "string" && externalizedText.trim().length > 0) {
-        return externalizedText;
-      }
-    }
-    return undefined;
-  }
-
-  for (const key of STRUCTURED_TEXT_FIELD_KEYS) {
-    const candidate = record[key];
-    if (typeof candidate === "string" && candidate.trim().length > 0) {
-      return candidate;
-    }
-  }
-
-  for (const key of STRUCTURED_ARRAY_FIELD_KEYS) {
-    const candidate = record[key];
-    if (Array.isArray(candidate)) {
-      const texts: string[] = [];
-      for (const entry of candidate) {
-        const text = extractStructuredText(entry, depth + 1);
-        if (typeof text === "string" && text.trim().length > 0) {
-          texts.push(text);
-        }
-      }
-      if (texts.length > 0) {
-        return texts.join("\n");
-      }
-    }
-  }
-
-  for (const key of STRUCTURED_NESTED_FIELD_KEYS) {
-    const nested = record[key];
-    const nestedText = extractStructuredText(nested, depth + 1);
-    if (typeof nestedText === "string" && nestedText.trim().length > 0) {
-      return nestedText;
-    }
-  }
-
-  return undefined;
-}
-
-function extractReasoningText(record: Record<string, unknown>): string | undefined {
-  const chunks: string[] = [];
-  appendTextValue(record.summary, chunks);
-  if (chunks.length === 0) {
-    return undefined;
-  }
-
-  const normalized = chunks
-    .map((chunk) => chunk.trim())
-    .filter((chunk, idx, arr) => chunk.length > 0 && arr.indexOf(chunk) === idx);
-  return normalized.length > 0 ? normalized.join("\n") : undefined;
-}
-
-/** Return true when a raw block should remain structurally replayable. */
-function hasReplayCriticalRawBlock(value: unknown): boolean {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  if (Array.isArray(value)) {
-    return value.some((entry) => hasReplayCriticalRawBlock(entry));
-  }
-
-  const record = value as Record<string, unknown>;
-  const rawType = safeString(record.type) ?? safeString(record.rawType);
-  if (rawType && REPLAY_CRITICAL_RAW_TYPES.has(rawType)) {
-    return true;
-  }
-
-  for (const key of STRUCTURED_NESTED_FIELD_KEYS) {
-    if (hasReplayCriticalRawBlock(record[key])) {
-      return true;
-    }
-  }
-  for (const key of STRUCTURED_ARRAY_FIELD_KEYS) {
-    if (hasReplayCriticalRawBlock(record[key])) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-/** Serialize the original message content that backs a generic raw-payload reference. */
-function serializeRawPayloadContent(message: AgentMessage, fallbackContent: string): {
-  content: string;
-  mimeType: string;
-} | null {
-  if (!("content" in message)) {
-    return null;
-  }
-  if (typeof message.content === "string") {
-    return {
-      content: message.content,
-      mimeType: "text/plain",
-    };
-  }
-
-  const serialized = JSON.stringify(message.content);
-  if (typeof serialized !== "string") {
-    return null;
-  }
-  return {
-    content: serialized || fallbackContent,
-    mimeType: "application/json",
-  };
-}
-
-function normalizeUnknownBlock(value: unknown): {
-  type: string;
-  text?: string;
-  metadata: Record<string, unknown>;
-} {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return {
-      type: "agent",
-      metadata: { raw: value },
-    };
-  }
-
-  const record = value as Record<string, unknown>;
-  const rawType = safeString(record.type);
-  return {
-    type: rawType ?? "agent",
-    text:
-      safeString(record.text) ??
-      safeString(record.thinking) ??
-      ((rawType === "reasoning" || rawType === "thinking")
-        ? extractReasoningText(record)
-        : undefined),
-    metadata: { raw: record },
-  };
-}
-
-function toPartType(type: string): MessagePartType {
-  switch (type) {
-    case "text":
-      return "text";
-    case "thinking":
-    case "reasoning":
-      return "reasoning";
-    case "tool_use":
-    case "toolUse":
-    case "tool-use":
-    case "toolCall":
-    case "functionCall":
-    case "function_call":
-    case "function_call_output":
-    case "tool_result":
-    case "toolResult":
-    case "tool":
-      return "tool";
-    case "patch":
-      return "patch";
-    case "file":
-    case "image":
-      return "file";
-    case "subtask":
-      return "subtask";
-    case "compaction":
-      return "compaction";
-    case "step_start":
-    case "step-start":
-      return "step_start";
-    case "step_finish":
-    case "step-finish":
-      return "step_finish";
-    case "snapshot":
-      return "snapshot";
-    case "retry":
-      return "retry";
-    case "agent":
-      return "agent";
-    default:
-      return "agent";
-  }
-}
-
-/**
- * Convert AgentMessage content into plain text for DB storage.
- *
- * For content block arrays we keep only text blocks to avoid persisting raw
- * JSON syntax that can later pollute assembled model context.
- */
-function extractMessageContent(content: unknown): string {
-  const extracted = extractStructuredText(content);
-  if (typeof extracted === "string") {
-    return extracted;
-  }
-  if (content == null) {
-    return "";
-  }
-  if (Array.isArray(content) && content.length === 0) {
-    return "";
-  }
-  // If content is an array of only tool call/result objects, store as empty
-  // (structured data is preserved in the message parts table)
-  if (Array.isArray(content) && content.length > 0 && content.every(
-    (item) => typeof item === "object" && item !== null && !Array.isArray(item) &&
-      typeof (item as Record<string, unknown>).type === "string" &&
-      TOOL_RAW_TYPES.has((item as Record<string, unknown>).type as string)
-  )) {
-    return "";
-  }
-
-  const serialized = JSON.stringify(content);
-  return typeof serialized === "string" ? serialized : "";
-}
-
-function toRuntimeRoleForTokenEstimate(role: string): "user" | "assistant" | "toolResult" {
-  if (role === "tool" || role === "toolResult") {
-    return "toolResult";
-  }
-  if (role === "user" || role === "system") {
-    return "user";
-  }
-  return "assistant";
-}
-
-function isTextBlock(value: unknown): value is { type: "text"; text: string } {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const record = value as Record<string, unknown>;
-  return record.type === "text" && typeof record.text === "string";
-}
-
-function toSyntheticMessagePartRecord(
-  part: CreateMessagePartInput,
-  messageId: number,
-): MessagePartRecord {
-  return {
-    partId: `estimate-part-${part.ordinal}`,
-    messageId,
-    sessionId: part.sessionId,
-    partType: part.partType,
-    ordinal: part.ordinal,
-    textContent: part.textContent ?? null,
-    toolCallId: part.toolCallId ?? null,
-    toolName: part.toolName ?? null,
-    toolInput: part.toolInput ?? null,
-    toolOutput: part.toolOutput ?? null,
-    metadata: part.metadata ?? null,
-  };
-}
-
-function normalizeMessageContentForStorage(params: {
-  message: AgentMessage;
-  fallbackContent: string;
-}): unknown {
-  const { message, fallbackContent } = params;
-  if (!("content" in message)) {
-    return fallbackContent;
-  }
-
-  const role = toRuntimeRoleForTokenEstimate(message.role);
-  const parts = buildMessageParts({
-    sessionId: "storage-estimate",
-    message,
-    fallbackContent,
-  }).map((part) => toSyntheticMessagePartRecord(part, 0));
-
-  if (parts.length === 0) {
-    if (role === "assistant") {
-      return fallbackContent ? [{ type: "text", text: fallbackContent }] : [];
-    }
-    if (role === "toolResult") {
-      return [{ type: "text", text: fallbackContent }];
-    }
-    return fallbackContent;
-  }
-
-  const blocks = parts.map(blockFromPart);
-  if (role === "user" && blocks.length === 1 && isTextBlock(blocks[0])) {
-    return blocks[0].text;
-  }
-  return blocks;
-}
-
-/**
- * Estimate token usage for the content shape that the assembler will emit.
- *
- * LCM stores a plain-text fallback copy in messages.content, but message_parts
- * can rehydrate larger structured/raw blocks. This estimator mirrors the
- * rehydrated shape so compaction decisions use realistic token totals.
- */
-function estimateContentTokensForRole(params: {
-  role: "user" | "assistant" | "toolResult";
-  content: unknown;
-  fallbackContent: string;
-}): number {
-  const { role, content, fallbackContent } = params;
-
-  if (typeof content === "string") {
-    return estimateTokens(content);
-  }
-
-  if (Array.isArray(content)) {
-    if (content.length === 0) {
-      return estimateTokens(fallbackContent);
-    }
-
-    if (role === "user" && content.length === 1 && isTextBlock(content[0])) {
-      return estimateTokens(content[0].text);
-    }
-
-    const serialized = JSON.stringify(content);
-    return estimateTokens(typeof serialized === "string" ? serialized : "");
-  }
-
-  if (content && typeof content === "object") {
-    if (role === "user" && isTextBlock(content)) {
-      return estimateTokens(content.text);
-    }
-
-    const serialized = JSON.stringify([content]);
-    return estimateTokens(typeof serialized === "string" ? serialized : "");
-  }
-
-  return estimateTokens(fallbackContent);
-}
-
-function buildMessageParts(params: {
-  sessionId: string;
-  message: AgentMessage;
-  fallbackContent: string;
-}): import("./store/conversation-store.js").CreateMessagePartInput[] {
-  const { sessionId, message, fallbackContent } = params;
-  const role = typeof message.role === "string" ? message.role : "unknown";
-  const topLevel = message as unknown as Record<string, unknown>;
-  const topLevelToolCallId =
-    safeString(topLevel.toolCallId) ??
-    safeString(topLevel.tool_call_id) ??
-    safeString(topLevel.toolUseId) ??
-    safeString(topLevel.tool_use_id) ??
-    safeString(topLevel.call_id) ??
-    safeString(topLevel.id);
-  const topLevelToolName =
-    safeString(topLevel.toolName) ??
-    safeString(topLevel.tool_name);
-  const topLevelIsError =
-    safeBoolean(topLevel.isError) ??
-    safeBoolean(topLevel.is_error);
-  const rawPayloadExternalized = safeBoolean(topLevel.rawPayloadExternalized);
-  const externalizedFileId = safeString(topLevel.externalizedFileId);
-  const originalByteSize =
-    typeof topLevel.originalByteSize === "number"
-      ? topLevel.originalByteSize
-      : undefined;
-  const externalizationReason = safeString(topLevel.externalizationReason);
-
-  // BashExecutionMessage: preserve a synthetic text part so output is round-trippable.
-  if (!("content" in message) && "command" in message && "output" in message) {
-    return [
-      {
-        sessionId,
-        partType: "text",
-        ordinal: 0,
-        textContent: fallbackContent,
-        metadata: toJson({
-          originalRole: role,
-          source: "bash-exec",
-          command: safeString((message as { command?: unknown }).command),
-        }),
-      },
-    ];
-  }
-
-  if (!("content" in message)) {
-    return [
-      {
-        sessionId,
-        partType: "agent",
-        ordinal: 0,
-        textContent: fallbackContent || null,
-        metadata: toJson({
-          originalRole: role,
-          source: "unknown-message-shape",
-          raw: message,
-        }),
-      },
-    ];
-  }
-
-  if (typeof message.content === "string") {
-    return [
-      {
-        sessionId,
-        partType: "text",
-        ordinal: 0,
-        textContent: message.content,
-        metadata: toJson({
-          originalRole: role,
-          toolCallId: topLevelToolCallId,
-          toolName: topLevelToolName,
-          isError: topLevelIsError,
-          rawPayloadExternalized: rawPayloadExternalized || undefined,
-          externalizedFileId,
-          originalByteSize,
-          externalizationReason,
-        }),
-      },
-    ];
-  }
-
-  if (!Array.isArray(message.content)) {
-    return [
-      {
-        sessionId,
-        partType: "agent",
-        ordinal: 0,
-        textContent: fallbackContent || null,
-        metadata: toJson({
-          originalRole: role,
-          source: "non-array-content",
-          raw: message.content,
-        }),
-      },
-    ];
-  }
-
-  const parts: CreateMessagePartInput[] = [];
-  for (let ordinal = 0; ordinal < message.content.length; ordinal++) {
-    const block = normalizeUnknownBlock(message.content[ordinal]);
-    const metadataRecord = block.metadata.raw as Record<string, unknown> | undefined;
-    const rawBlockType = safeString(metadataRecord?.rawType) ?? block.type;
-    const partType = toPartType(rawBlockType);
-    const rawBlock =
-      metadataRecord && rawBlockType !== block.type
-        ? {
-            ...metadataRecord,
-            type: rawBlockType,
-          }
-        : (metadataRecord ?? message.content[ordinal]);
-    const toolCallId =
-      safeString(metadataRecord?.toolCallId) ??
-      safeString(metadataRecord?.tool_call_id) ??
-      safeString(metadataRecord?.toolUseId) ??
-      safeString(metadataRecord?.tool_use_id) ??
-      safeString(metadataRecord?.call_id) ??
-      (partType === "tool" ? safeString(metadataRecord?.id) : undefined) ??
-      topLevelToolCallId;
-
-    parts.push({
-      sessionId,
-      partType,
-      ordinal,
-      textContent: block.text ?? null,
-      toolCallId,
-      toolName:
-        safeString(metadataRecord?.name) ??
-        safeString(metadataRecord?.toolName) ??
-        safeString(metadataRecord?.tool_name) ??
-        topLevelToolName,
-      toolInput:
-        metadataRecord?.input !== undefined
-          ? toJson(metadataRecord.input)
-          : metadataRecord?.arguments !== undefined
-            ? toJson(metadataRecord.arguments)
-          : metadataRecord?.toolInput !== undefined
-            ? toJson(metadataRecord.toolInput)
-            : (safeString(metadataRecord?.tool_input) ?? null),
-      toolOutput:
-        metadataRecord?.output !== undefined
-          ? toJson(metadataRecord.output)
-          : metadataRecord?.toolOutput !== undefined
-            ? toJson(metadataRecord.toolOutput)
-            : (safeString(metadataRecord?.tool_output) ?? null),
-      metadata: toJson({
-        originalRole: role,
-        toolCallId: topLevelToolCallId,
-        toolName: topLevelToolName,
-        isError: topLevelIsError,
-        externalizedFileId: safeString(metadataRecord?.externalizedFileId),
-        originalByteSize:
-          typeof metadataRecord?.originalByteSize === "number"
-            ? metadataRecord.originalByteSize
-            : undefined,
-        toolOutputExternalized: safeBoolean(metadataRecord?.toolOutputExternalized),
-        externalizationReason: safeString(metadataRecord?.externalizationReason),
-        rawType: rawBlockType,
-        raw: rawBlock,
-      }),
-    });
-  }
-
-  return parts;
-}
-
-/**
- * Map AgentMessage role to the DB enum.
- *
- *   "user"      -> "user"
- *   "assistant" -> "assistant"
- *
- * AgentMessage only has user/assistant roles, but we keep the mapping
- * explicit for clarity and future-proofing.
- */
-function toDbRole(role: string): "user" | "assistant" | "system" | "tool" {
-  if (role === "tool" || role === "toolResult") {
-    return "tool";
-  }
-  if (role === "system") {
-    return "system";
-  }
-  if (role === "user") {
-    return "user";
-  }
-  if (role === "assistant") {
-    return "assistant";
-  }
-  // Direct callers should filter unknown roles before storage. Preserve the
-  // historical fallback for typed AgentMessage values that reach this helper.
-  return "assistant";
-}
-
-function hasPersistableMessageRole(message: AgentMessage): boolean {
-  const role = (message as { role?: unknown }).role;
-  return (
-    role === "user" ||
-    role === "assistant" ||
-    role === "system" ||
-    role === "tool" ||
-    role === "toolResult"
-  );
-}
-
-function filterPersistableMessages(messages: AgentMessage[]): AgentMessage[] {
-  return messages.filter(hasPersistableMessageRole);
-}
-
-type StoredMessage = {
-  role: "user" | "assistant" | "system" | "tool";
-  content: string;
-  tokenCount: number;
-};
-
-/**
- * Normalize AgentMessage variants into the storage shape used by LCM.
- */
-function toStoredMessage(message: AgentMessage): StoredMessage {
-  const content =
-    "content" in message
-      ? extractMessageContent(message.content)
-      : "output" in message
-        ? `$ ${(message as { command: string; output: string }).command}\n${(message as { command: string; output: string }).output}`
-        : "";
-  const runtimeRole = toRuntimeRoleForTokenEstimate(message.role);
-  const normalizedContent =
-    "content" in message
-      ? normalizeMessageContentForStorage({
-          message,
-          fallbackContent: content,
-        })
-      : content;
-  const tokenCount =
-    "content" in message
-      ? estimateContentTokensForRole({
-          role: runtimeRole,
-          content: normalizedContent,
-          fallbackContent: content,
-        })
-      : estimateTokens(content);
-
-  return {
-    role: toDbRole(message.role),
-    content,
-    tokenCount,
-  };
-}
-
-function createBootstrapEntryHash(message: StoredMessage | null): string | null {
-  if (!message) {
-    return null;
-  }
-  return createHash("sha256")
-    .update(JSON.stringify({ role: message.role, content: message.content }))
-    .digest("hex");
-}
-
-function estimateMessageContentTokensForAfterTurn(content: unknown): number {
-  if (typeof content === "string") {
-    return estimateTokens(content);
-  }
-  if (Array.isArray(content)) {
-    let total = 0;
-    for (const part of content) {
-      if (!part || typeof part !== "object") {
-        continue;
-      }
-      const record = part as Record<string, unknown>;
-      const text =
-        typeof record.text === "string"
-          ? record.text
-          : typeof record.thinking === "string"
-            ? record.thinking
-            : "";
-      if (text) {
-        total += estimateTokens(text);
-      }
-    }
-    return total;
-  }
-  if (content == null) {
-    return 0;
-  }
-  const serialized = JSON.stringify(content);
-  return estimateTokens(typeof serialized === "string" ? serialized : "");
-}
-
-function estimateSessionTokenCountForAfterTurn(messages: AgentMessage[]): number {
-  let total = 0;
-  for (const message of messages) {
-    if ("content" in message) {
-      total += estimateMessageContentTokensForAfterTurn(message.content);
-      continue;
-    }
-    if ("command" in message || "output" in message) {
-      const commandText =
-        typeof (message as { command?: unknown }).command === "string"
-          ? (message as { command?: string }).command
-          : "";
-      const outputText =
-        typeof (message as { output?: unknown }).output === "string"
-          ? (message as { output?: string }).output
-          : "";
-      total += estimateTokens(`${commandText}\n${outputText}`);
-    }
-  }
-  return total;
-}
-
 function normalizeNonNegativeInteger(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     return undefined;
@@ -1303,308 +579,6 @@ function extractRuntimePromptTokenCount(runtimeContext?: Record<string, unknown>
   return undefined;
 }
 
-function isBootstrapMessage(value: unknown): value is AgentMessage {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  const msg = value as { role?: unknown; content?: unknown; command?: unknown; output?: unknown };
-  if (typeof msg.role !== "string") {
-    return false;
-  }
-  return "content" in msg || ("command" in msg && "output" in msg);
-}
-
-function extractCanonicalBootstrapMessage(value: unknown): AgentMessage | null {
-  if (isBootstrapMessage(value)) {
-    return value;
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-  const entry = value as { type?: unknown; message?: unknown };
-  if ("message" in entry) {
-    if (entry.type !== undefined && entry.type !== "message") {
-      return null;
-    }
-    return isBootstrapMessage(entry.message) ? entry.message : null;
-  }
-  return null;
-}
-
-function extractBootstrapMessageCandidate(value: unknown): AgentMessage | null {
-  return extractCanonicalBootstrapMessage(value);
-}
-
-function parseBootstrapJsonl(raw: string, options?: {
-  strict?: boolean;
-}): { messages: AgentMessage[]; sawNonWhitespace: boolean; hadMalformedLine: boolean } {
-  const messages: AgentMessage[] = [];
-  const lines = raw.split(/\r?\n/);
-  let sawNonWhitespace = false;
-  let hadMalformedLine = false;
-  for (const line of lines) {
-    const item = line.trim();
-    if (!item) {
-      continue;
-    }
-    sawNonWhitespace = true;
-    try {
-      const parsed = JSON.parse(item);
-      const candidate = extractBootstrapMessageCandidate(parsed);
-      if (candidate) {
-        messages.push(candidate);
-        continue;
-      }
-    } catch {
-      if (options?.strict) {
-        hadMalformedLine = true;
-      }
-    }
-  }
-  return { messages, sawNonWhitespace, hadMalformedLine };
-}
-
-/** Load recoverable messages from a JSON/JSONL session file without full-file reads for JSONL. */
-async function readLeafPathMessages(sessionFile: string): Promise<AgentMessage[]> {
-  try {
-    let sawNonWhitespace = false;
-    let jsonArrayMode = false;
-    let jsonArrayBuffer = "";
-    const messages: AgentMessage[] = [];
-    const stream = createReadStream(sessionFile, { encoding: "utf8" });
-    const lines = createInterface({
-      input: stream,
-      crlfDelay: Infinity,
-    });
-
-    for await (const line of lines) {
-      if (!sawNonWhitespace) {
-        const trimmed = line.trim();
-        if (trimmed) {
-          sawNonWhitespace = true;
-          if (trimmed.startsWith("[")) {
-            jsonArrayMode = true;
-          }
-        }
-      }
-
-      if (jsonArrayMode) {
-        jsonArrayBuffer += `${line}\n`;
-        continue;
-      }
-
-      const parsed = parseBootstrapJsonl(line);
-      if (parsed.messages.length > 0) {
-        messages.push(...parsed.messages);
-      }
-    }
-
-    if (jsonArrayMode) {
-      const trimmed = jsonArrayBuffer.trim();
-      if (!trimmed) {
-        return [];
-      }
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (!Array.isArray(parsed)) {
-          return [];
-        }
-        return parsed.filter(isBootstrapMessage);
-      } catch {
-        return [];
-      }
-    }
-
-    return messages;
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Resolve the first-time bootstrap token budget.
- *
- * When unset, bootstrap keeps a modest suffix of the parent session rather than
- * inheriting the full raw history into a brand-new conversation.
- */
-function resolveBootstrapMaxTokens(config: Pick<LcmConfig, "bootstrapMaxTokens" | "leafChunkTokens">): number {
-  if (
-    typeof config.bootstrapMaxTokens === "number" &&
-    Number.isFinite(config.bootstrapMaxTokens) &&
-    config.bootstrapMaxTokens > 0
-  ) {
-    return Math.floor(config.bootstrapMaxTokens);
-  }
-
-  const leafChunkTokens =
-    typeof config.leafChunkTokens === "number" &&
-    Number.isFinite(config.leafChunkTokens) &&
-    config.leafChunkTokens > 0
-      ? Math.floor(config.leafChunkTokens)
-      : 20_000;
-  return Math.max(6000, Math.floor(leafChunkTokens * 0.3));
-}
-
-/**
- * Keep only the newest bootstrap messages that fit within the token budget.
- *
- * The newest message is always preserved so a fork never starts empty when the
- * parent transcript has any recoverable content at all.
- */
-function trimBootstrapMessagesToBudget(messages: AgentMessage[], maxTokens: number): AgentMessage[] {
-  if (messages.length === 0) {
-    return [];
-  }
-
-  const safeMaxTokens = Number.isFinite(maxTokens) ? Math.floor(maxTokens) : 0;
-  if (safeMaxTokens <= 0) {
-    return [messages[messages.length - 1]!];
-  }
-
-  const kept: AgentMessage[] = [];
-  let totalTokens = 0;
-
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]!;
-    const tokenCount = toStoredMessage(message).tokenCount;
-    if (kept.length > 0 && totalTokens + tokenCount > safeMaxTokens) {
-      break;
-    }
-    kept.push(message);
-    totalTokens += tokenCount;
-  }
-
-  // If a single oversized tail message exceeds the budget, return empty
-  // rather than silently bypassing the budget cap. An empty bootstrap is
-  // safer than an exploding one.
-  if (kept.length === 1 && totalTokens > safeMaxTokens) {
-    return [];
-  }
-
-  kept.reverse();
-  return kept;
-}
-
-async function readFileSegment(sessionFile: string, offset: number): Promise<string | null> {
-  let fh: FileHandle | null = null;
-  try {
-    fh = await open(sessionFile, "r");
-    const stats = await fh.stat();
-    const safeOffset = Math.max(0, Math.min(Math.floor(offset), stats.size));
-    const length = stats.size - safeOffset;
-    if (length <= 0) {
-      return "";
-    }
-    const buffer = Buffer.alloc(length);
-    await fh.read(buffer, 0, length, safeOffset);
-    return buffer.toString("utf8");
-  } catch {
-    return null;
-  } finally {
-    await fh?.close();
-  }
-}
-
-async function readLastJsonlEntryBeforeOffset(
-  sessionFile: string,
-  offset: number,
-  messageOnly = false,
-  matcher?: (message: AgentMessage) => boolean,
-): Promise<string | null> {
-  const chunkSize = 16_384;
-  const safeOffset = Math.max(0, Math.floor(offset));
-  if (safeOffset <= 0) {
-    return null;
-  }
-
-  let fh: FileHandle | null = null;
-  try {
-    fh = await open(sessionFile, "r");
-    let cursor = safeOffset;
-    let carry = "";
-    while (true) {
-      const trimmedEnd = carry.replace(/\s+$/u, "");
-      if (trimmedEnd) {
-        const newlineIndex = Math.max(trimmedEnd.lastIndexOf("\n"), trimmedEnd.lastIndexOf("\r"));
-        if (newlineIndex >= 0) {
-          const candidate = trimmedEnd.slice(newlineIndex + 1).trim();
-          if (candidate) {
-            if (messageOnly) {
-              let matchedMessage: AgentMessage | null = null;
-              try {
-                matchedMessage = extractBootstrapMessageCandidate(JSON.parse(candidate));
-              } catch { /* not valid JSON, skip */ }
-              if (!matchedMessage || (matcher && !matcher(matchedMessage))) {
-                carry = trimmedEnd.slice(0, newlineIndex);
-                continue;
-              }
-            }
-            return candidate;
-          }
-          carry = trimmedEnd.slice(0, newlineIndex);
-          continue;
-        }
-      }
-
-      // No more newlines in current carry — need more data from earlier in the file.
-      if (cursor <= 0) {
-        // Reached start-of-file: whatever is left is the first line.
-        const firstLine = trimmedEnd.trim() || null;
-        if (!firstLine) return null;
-        if (messageOnly) {
-          let matchedMessage: AgentMessage | null = null;
-          try {
-            matchedMessage = extractBootstrapMessageCandidate(JSON.parse(firstLine));
-          } catch { /* not valid JSON */ }
-          if (!matchedMessage || (matcher && !matcher(matchedMessage))) return null;
-        }
-        return firstLine;
-      }
-
-      const start = Math.max(0, cursor - chunkSize);
-      const length = cursor - start;
-      const buffer = Buffer.alloc(length);
-      await fh.read(buffer, 0, length, start);
-      carry = buffer.toString("utf8") + carry;
-      cursor = start;
-    }
-  } catch {
-    return null;
-  } finally {
-    await fh?.close();
-  }
-}
-
-async function readAppendedLeafPathMessages(params: {
-  sessionFile: string;
-  offset: number;
-}): Promise<{ messages: AgentMessage[]; canUseAppendOnly: boolean; sawNonWhitespace: boolean }> {
-  const raw = await readFileSegment(params.sessionFile, params.offset);
-  if (raw == null) {
-    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: false };
-  }
-
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return { messages: [], canUseAppendOnly: true, sawNonWhitespace: false };
-  }
-
-  if (trimmed.startsWith("[")) {
-    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: true };
-  }
-
-  const parsed = parseBootstrapJsonl(raw, { strict: true });
-  if (parsed.hadMalformedLine) {
-    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: parsed.sawNonWhitespace };
-  }
-
-  return {
-    messages: parsed.messages,
-    canUseAppendOnly: true,
-    sawNonWhitespace: parsed.sawNonWhitespace,
-  };
-}
-
 export type RotateSessionStorageResult =
   | {
       kind: "rotated";
@@ -1665,17 +639,6 @@ type StartupAutoRotateBatchResult = {
   backupPath?: string;
   backupCreated: number;
 };
-
-function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | null {
-  if (!line) {
-    return null;
-  }
-  try {
-    return extractBootstrapMessageCandidate(JSON.parse(line));
-  } catch {
-    return null;
-  }
-}
 
 function messageIdentity(role: string, content: string): string {
   return `${role}\u0000${content}`;
@@ -1783,6 +746,7 @@ export class LcmContextEngine implements ContextEngine {
 
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
+  private payloadExternalizer: PayloadExternalizer;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
   private assembler: ContextAssembler;
@@ -1793,10 +757,8 @@ export class LcmContextEngine implements ContextEngine {
   private readonly fts5Available: boolean;
   private readonly ignoreSessionPatterns: RegExp[];
   private readonly statelessSessionPatterns: RegExp[];
-  private sessionOperationQueues = new Map<
-    string,
-    { promise: Promise<void>; refCount: number }
-  >();
+  private readonly sessionQueue: SessionOperationQueue;
+  private readonly sessionOperationQueues: SessionOperationQueues;
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private stableOrphanStrippingOrdinalsByConversation = new Map<number, number>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
@@ -1846,6 +808,8 @@ export class LcmContextEngine implements ContextEngine {
     this.ignoreSessionPatterns = compileSessionPatterns(this.config.ignoreSessionPatterns);
     this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
     this.db = database;
+    this.sessionQueue = new SessionOperationQueue(this.deps.log);
+    this.sessionOperationQueues = this.sessionQueue.queues;
 
     // Run migrations eagerly at construction time so the schema exists
     // before any lifecycle hook fires.
@@ -1897,6 +861,11 @@ export class LcmContextEngine implements ContextEngine {
       fts5Available: this.fts5Available,
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    this.payloadExternalizer = new PayloadExternalizer({
+      config: this.config,
+      summaryStore: this.summaryStore,
+      resolveLargeFileTextSummarizer: () => this.resolveLargeFileTextSummarizer(),
+    });
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
 
@@ -2075,47 +1044,12 @@ export class LcmContextEngine implements ContextEngine {
     operation: () => Promise<T>,
     options?: { operationName?: string; context?: string },
   ): Promise<T> {
-    const entry = this.sessionOperationQueues.get(queueKey);
-    const previous = entry?.promise ?? Promise.resolve();
-    const queuedAhead = entry?.refCount ?? 0;
-    let releaseQueue: () => void = () => {};
-    const current = new Promise<void>((resolve) => {
-      releaseQueue = resolve;
-    });
-    const next = previous.catch(() => {}).then(() => current);
-
-    if (entry) {
-      entry.promise = next;
-      entry.refCount++;
-    } else {
-      this.sessionOperationQueues.set(queueKey, { promise: next, refCount: 1 });
-    }
-
-    const waitStartedAt = Date.now();
-    await previous.catch(() => {});
-    const waitMs = Date.now() - waitStartedAt;
-    if (options?.operationName) {
-      const detail = options.context ? ` ${options.context}` : "";
-      this.deps.log.debug(
-        `[lcm] ${options.operationName}: session queue acquired queueKey=${queueKey} queuedAhead=${queuedAhead} wait=${formatDurationMs(waitMs)}${detail}`,
-      );
-    }
-    try {
-      return await operation();
-    } finally {
-      releaseQueue();
-      const cur = this.sessionOperationQueues.get(queueKey);
-      if (cur && --cur.refCount === 0) {
-        this.sessionOperationQueues.delete(queueKey);
-      }
-    }
+    return this.sessionQueue.run(queueKey, operation, options);
   }
 
   /** Prefer stable session keys for queue serialization when available. */
   private resolveSessionQueueKey(sessionId?: string, sessionKey?: string): string {
-    const normalizedSessionKey = sessionKey?.trim();
-    const normalizedSessionId = sessionId?.trim();
-    return normalizedSessionKey || normalizedSessionId || "__lcm__";
+    return resolveSessionQueueKey(sessionId, sessionKey);
   }
 
   /** Normalize optional live token estimates supplied by runtime callers. */
@@ -3754,558 +2688,6 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
-  // ── Image detection & externalization ──────────────────────────────────────
-
-  private static readonly BASE64_IMAGE_MAGIC: ReadonlyArray<{
-    prefix: string;
-    extension: string;
-    mimeType: string;
-  }> = [
-    { prefix: "/9j/", extension: "jpg", mimeType: "image/jpeg" },
-    { prefix: "iVBOR", extension: "png", mimeType: "image/png" },
-    { prefix: "R0lGOD", extension: "gif", mimeType: "image/gif" },
-    { prefix: "UklGR", extension: "webp", mimeType: "image/webp" },
-    { prefix: "PHN2Zy", extension: "svg", mimeType: "image/svg+xml" },
-  ];
-
-  private static detectBase64ImageType(
-    base64Data: string,
-  ): { extension: string; mimeType: string } | null {
-    for (const sig of LcmContextEngine.BASE64_IMAGE_MAGIC) {
-      if (base64Data.startsWith(sig.prefix)) {
-        return { extension: sig.extension, mimeType: sig.mimeType };
-      }
-    }
-    return null;
-  }
-
-  private static extensionForImageMimeType(mimeType: string): string | null {
-    switch (mimeType.toLowerCase()) {
-      case "image/jpeg":
-      case "image/jpg":
-        return "jpg";
-      case "image/png":
-        return "png";
-      case "image/gif":
-        return "gif";
-      case "image/webp":
-        return "webp";
-      case "image/svg+xml":
-        return "svg";
-      default:
-        return null;
-    }
-  }
-
-  private static normalizeNativeImageBlock(value: unknown): {
-    base64Data: string;
-    extension: string;
-    mimeType: string;
-  } | null {
-    const record = asRecord(value);
-    if (!record || record.type !== "image") {
-      return null;
-    }
-
-    const rawData = safeString(record.data);
-    if (!rawData) {
-      return null;
-    }
-
-    const dataUrlMatch = rawData.match(/^data:([^;,]+);base64,(.*)$/s);
-    const declaredMimeType =
-      dataUrlMatch?.[1] ??
-      safeString(record.mimeType) ??
-      safeString(record.mime_type) ??
-      safeString(record.mediaType) ??
-      safeString(record.media_type);
-    const base64Data = (dataUrlMatch?.[2] ?? rawData).replace(/\s+/g, "");
-    if (!base64Data || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64Data)) {
-      return null;
-    }
-
-    const detected = LcmContextEngine.detectBase64ImageType(base64Data);
-    const mimeType = detected?.mimeType ?? declaredMimeType;
-    if (!mimeType?.toLowerCase().startsWith("image/")) {
-      return null;
-    }
-
-    const extension = detected?.extension ?? LcmContextEngine.extensionForImageMimeType(mimeType);
-    return extension ? { base64Data, extension, mimeType } : null;
-  }
-
-  private static basenameForImageReference(pathLike: string): string | null {
-    const baseName = pathLike.trim().split(/[\\/]/).filter(Boolean).pop();
-    if (!baseName) {
-      return null;
-    }
-    return baseName.replace(/[^\w.\-@]+/g, "_") || null;
-  }
-
-  private static inferNativeImageFileName(params: {
-    content: unknown[];
-    imageIndex: number;
-    extension: string;
-  }): string {
-    for (let index = params.imageIndex - 1; index >= 0; index -= 1) {
-      const entry = asRecord(params.content[index]);
-      const text = entry?.type === "text" ? safeString(entry.text) : undefined;
-      if (!text) {
-        continue;
-      }
-
-      const mediaMatch = text.match(/\[media attached(?:\s+\d+\/\d+)?:\s*([^\s\]|()]+)/i);
-      const fileName = mediaMatch?.[1]
-        ? LcmContextEngine.basenameForImageReference(mediaMatch[1])
-        : null;
-      if (fileName) {
-        return fileName;
-      }
-    }
-
-    return `user-image.${params.extension}`;
-  }
-
-  private static isExternalizedImageReference(value: string): boolean {
-    if (typeof value !== "string") return false;
-    return /^\[(?:User|Tool|Assistant|Image) image: .*LCM file: file_[a-f0-9]{16}\]$/.test(
-      value.trim(),
-    );
-  }
-
-  private static isExternalizedReferenceContent(value: string): boolean {
-    const trimmed = value.trim();
-    return (
-      trimmed.startsWith("[LCM File:") ||
-      trimmed.startsWith("[LCM Tool Output:") ||
-      trimmed.includes("LCM file: file_") ||
-      /\[(?:User|Tool|Assistant|Image) image: [^\]]*LCM file: file_[a-f0-9]{16}\]/.test(
-        trimmed,
-      )
-    );
-  }
-
-  /** Resolve the configured externalized-payload directory for one conversation. */
-  private largeFilesDirForConversation(conversationId: number): string {
-    return join(this.config.largeFilesDir, String(conversationId));
-  }
-
-  private async storeImageFileContent(params: {
-    conversationId: number;
-    fileId: string;
-    extension: string;
-    base64Data: string;
-  }): Promise<string> {
-    const dir = this.largeFilesDirForConversation(params.conversationId);
-    await mkdir(dir, { recursive: true });
-    const normalized = params.extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "bin";
-    const filePath = join(dir, `${params.fileId}.${normalized}`);
-    const buffer = Buffer.from(params.base64Data, "base64");
-    await writeFile(filePath, buffer);
-    return filePath;
-  }
-
-  private async externalizeImage(params: {
-    conversationId: number;
-    base64Data: string;
-    fileName?: string;
-    extension: string;
-    mimeType: string;
-    label: string;
-  }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
-    const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const byteSize = Buffer.from(params.base64Data, "base64").byteLength;
-    const storageUri = await this.storeImageFileContent({
-      conversationId: params.conversationId,
-      fileId,
-      extension: params.extension,
-      base64Data: params.base64Data,
-    });
-    const fileName = params.fileName ?? `image.${params.extension}`;
-    const summary = `Image file (${params.extension.toUpperCase()}, ${byteSize.toLocaleString("en-US")} bytes)${params.fileName ? ` — ${params.fileName}` : ""}`;
-
-    await this.summaryStore.insertLargeFile({
-      fileId,
-      conversationId: params.conversationId,
-      fileName,
-      mimeType: params.mimeType,
-      byteSize,
-      storageUri,
-      explorationSummary: summary,
-    });
-
-    const reference = `[${params.label}: ${fileName} (${params.mimeType}, ${byteSize.toLocaleString("en-US")} bytes) | LCM file: ${fileId}]`;
-    return { fileId, byteSize, summary, reference };
-  }
-
-  private async interceptNativeUserImageBlocks(params: {
-    conversationId: number;
-    message: AgentMessage;
-  }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
-    if (params.message.role !== "user" || !("content" in params.message)) {
-      return null;
-    }
-    if (!Array.isArray(params.message.content)) {
-      return null;
-    }
-
-    const rewrittenContent: unknown[] = [];
-    const fileIds: string[] = [];
-    let changed = false;
-
-    for (let index = 0; index < params.message.content.length; index += 1) {
-      const block = params.message.content[index];
-      const image = LcmContextEngine.normalizeNativeImageBlock(block);
-      if (!image) {
-        rewrittenContent.push(block);
-        continue;
-      }
-
-      const externalized = await this.externalizeImage({
-        conversationId: params.conversationId,
-        base64Data: image.base64Data,
-        fileName: LcmContextEngine.inferNativeImageFileName({
-          content: params.message.content,
-          imageIndex: index,
-          extension: image.extension,
-        }),
-        extension: image.extension,
-        mimeType: image.mimeType,
-        label: "User image",
-      });
-
-      rewrittenContent.push({ type: "text", text: externalized.reference });
-      fileIds.push(externalized.fileId);
-      changed = true;
-    }
-
-    if (!changed) {
-      return null;
-    }
-
-    return {
-      rewrittenMessage: {
-        ...params.message,
-        content: rewrittenContent,
-      } as AgentMessage,
-      fileIds,
-    };
-  }
-
-  private async interceptInlineImages(params: {
-    conversationId: number;
-    content: string;
-    role: string;
-  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
-    const mediaResult = await this.interceptUserMediaBase64(params);
-    if (mediaResult) {
-      return mediaResult;
-    }
-    return this.interceptPureBase64Image(params);
-  }
-
-  private async interceptUserMediaBase64(params: {
-    conversationId: number;
-    content: string;
-  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
-    const prefix = "[media attached:";
-    if (!params.content.startsWith(prefix)) {
-      return null;
-    }
-
-    const base64LineRe = /\n([A-Za-z0-9+/]{20,}={0,2})\n/m;
-    const base64Match = base64LineRe.exec(params.content);
-    if (!base64Match) {
-      return null;
-    }
-
-    const headerEnd = base64Match.index + 1;
-    const header = params.content.slice(0, headerEnd).trim();
-    const base64Data = params.content.slice(headerEnd);
-
-    if (estimateTokens(base64Data) < 100) {
-      return null;
-    }
-
-    const detected = LcmContextEngine.detectBase64ImageType(base64Data);
-    if (!detected) {
-      return null;
-    }
-
-    const pathMatch = header.match(/\[media attached:\s*([^\s(]+)/);
-    const fileName = pathMatch ? pathMatch[1] : `user-image.${detected.extension}`;
-
-    const externalized = await this.externalizeImage({
-      conversationId: params.conversationId,
-      base64Data,
-      fileName,
-      extension: detected.extension,
-      mimeType: detected.mimeType,
-      label: "User image",
-    });
-
-    return {
-      rewrittenContent: `${header}\n\n${externalized.reference}`,
-      fileIds: [externalized.fileId],
-    };
-  }
-
-  private async interceptPureBase64Image(params: {
-    conversationId: number;
-    content: string;
-    role: string;
-  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
-    const trimmed = params.content.trim();
-    if (estimateTokens(trimmed) < 100) {
-      return null;
-    }
-
-    const detected = LcmContextEngine.detectBase64ImageType(trimmed);
-    if (!detected) {
-      return null;
-    }
-
-    const b64Chars = trimmed.replace(/[^A-Za-z0-9+/=\s]/g, "");
-    if (b64Chars.length / trimmed.length < 0.8) {
-      return null;
-    }
-
-    const label = params.role === "tool" ? "Tool image" :
-                  params.role === "assistant" ? "Assistant image" : "Image";
-    const fileName = `${params.role}-image.${detected.extension}`;
-
-    const externalized = await this.externalizeImage({
-      conversationId: params.conversationId,
-      base64Data: trimmed,
-      fileName,
-      extension: detected.extension,
-      mimeType: detected.mimeType,
-      label,
-    });
-
-    return {
-      rewrittenContent: externalized.reference,
-      fileIds: [externalized.fileId],
-    };
-  }
-
-  /**
-   * Walk tool-result payload blocks and replace pure inline image strings with
-   * compact references before generic text-output externalization runs.
-   */
-  private async rewriteToolInlineImageValue(params: {
-    conversationId: number;
-    value: unknown;
-  }): Promise<{ rewrittenValue: unknown; fileIds: string[]; changed: boolean }> {
-    if (typeof params.value === "string") {
-      const intercepted = await this.interceptPureBase64Image({
-        conversationId: params.conversationId,
-        content: params.value,
-        role: "tool",
-      });
-      if (!intercepted) {
-        return { rewrittenValue: params.value, fileIds: [], changed: false };
-      }
-      return {
-        rewrittenValue: intercepted.rewrittenContent,
-        fileIds: intercepted.fileIds,
-        changed: true,
-      };
-    }
-
-    if (Array.isArray(params.value)) {
-      const rewrittenValues: unknown[] = [];
-      const fileIds: string[] = [];
-      let changed = false;
-
-      for (const entry of params.value) {
-        const rewritten = await this.rewriteToolInlineImageValue({
-          conversationId: params.conversationId,
-          value: entry,
-        });
-        rewrittenValues.push(rewritten.rewrittenValue);
-        fileIds.push(...rewritten.fileIds);
-        changed ||= rewritten.changed;
-      }
-
-      return changed
-        ? { rewrittenValue: rewrittenValues, fileIds, changed: true }
-        : { rewrittenValue: params.value, fileIds: [], changed: false };
-    }
-
-    if (!params.value || typeof params.value !== "object") {
-      return { rewrittenValue: params.value, fileIds: [], changed: false };
-    }
-
-    const record = params.value as Record<string, unknown>;
-    if (record.type === "text" && typeof record.text === "string") {
-      const intercepted = await this.interceptPureBase64Image({
-        conversationId: params.conversationId,
-        content: record.text,
-        role: "tool",
-      });
-      if (!intercepted) {
-        return { rewrittenValue: params.value, fileIds: [], changed: false };
-      }
-      return {
-        rewrittenValue: {
-          ...record,
-          text: intercepted.rewrittenContent,
-        },
-        fileIds: intercepted.fileIds,
-        changed: true,
-      };
-    }
-
-    const nestedKeys = ["output", "content", "result"] as const;
-    const rewrittenRecord: Record<string, unknown> = { ...record };
-    const fileIds: string[] = [];
-    let changed = false;
-
-    for (const key of nestedKeys) {
-      if (!(key in record)) {
-        continue;
-      }
-      const rewritten = await this.rewriteToolInlineImageValue({
-        conversationId: params.conversationId,
-        value: record[key],
-      });
-      if (!rewritten.changed) {
-        continue;
-      }
-      rewrittenRecord[key] = rewritten.rewrittenValue;
-      fileIds.push(...rewritten.fileIds);
-      changed = true;
-    }
-
-    return changed
-      ? { rewrittenValue: rewrittenRecord, fileIds, changed: true }
-      : { rewrittenValue: params.value, fileIds: [], changed: false };
-  }
-
-  private async interceptInlineImagesInToolMessage(params: {
-    conversationId: number;
-    message: AgentMessage;
-  }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
-    if (
-      (params.message.role !== "toolResult" && params.message.role !== "tool") ||
-      !("content" in params.message)
-    ) {
-      return null;
-    }
-
-    if (typeof params.message.content === "string") {
-      const intercepted = await this.interceptPureBase64Image({
-        conversationId: params.conversationId,
-        content: params.message.content,
-        role: "tool",
-      });
-      if (!intercepted) {
-        return null;
-      }
-      return {
-        rewrittenMessage: {
-          ...params.message,
-          content: intercepted.rewrittenContent,
-        } as AgentMessage,
-        fileIds: intercepted.fileIds,
-      };
-    }
-
-    if (!Array.isArray(params.message.content)) {
-      return null;
-    }
-
-    const rewrittenContent: unknown[] = [];
-    const fileIds: string[] = [];
-    let changed = false;
-
-    for (const item of params.message.content) {
-      const rewritten = await this.rewriteToolInlineImageValue({
-        conversationId: params.conversationId,
-        value: item,
-      });
-      rewrittenContent.push(rewritten.rewrittenValue);
-      fileIds.push(...rewritten.fileIds);
-      changed ||= rewritten.changed;
-    }
-
-    if (!changed) {
-      return null;
-    }
-
-    return {
-      rewrittenMessage: {
-        ...params.message,
-        content: rewrittenContent,
-      } as AgentMessage,
-      fileIds,
-    };
-  }
-
-  /** Persist intercepted large-file text payloads to the configured lcm-files directory. */
-  private async storeLargeFileContent(params: {
-    conversationId: number;
-    fileId: string;
-    extension: string;
-    content: string;
-  }): Promise<string> {
-    const dir = this.largeFilesDirForConversation(params.conversationId);
-    await mkdir(dir, { recursive: true });
-
-    const normalizedExtension = params.extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "txt";
-    const filePath = join(dir, `${params.fileId}.${normalizedExtension}`);
-    await writeFile(filePath, params.content, "utf8");
-    return filePath;
-  }
-
-  /** Persist a large text payload and return the resulting compact placeholder. */
-  private async externalizeLargeTextPayload(params: {
-    conversationId: number;
-    content: string;
-    fileName?: string;
-    mimeType?: string;
-    formatReference: (input: { fileId: string; byteSize: number; summary: string }) => string;
-  }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
-    const summarizeText = await this.resolveLargeFileTextSummarizer();
-    const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const extension = extensionFromNameOrMime(params.fileName, params.mimeType);
-    const storageUri = await this.storeLargeFileContent({
-      conversationId: params.conversationId,
-      fileId,
-      extension,
-      content: params.content,
-    });
-    const byteSize = Buffer.byteLength(params.content, "utf8");
-    const explorationSummary = await generateExplorationSummary({
-      content: params.content,
-      fileName: params.fileName,
-      mimeType: params.mimeType,
-      summarizeText,
-    });
-
-    await this.summaryStore.insertLargeFile({
-      fileId,
-      conversationId: params.conversationId,
-      fileName: params.fileName,
-      mimeType: params.mimeType,
-      byteSize,
-      storageUri,
-      explorationSummary,
-    });
-
-    return {
-      fileId,
-      byteSize,
-      summary: explorationSummary,
-      reference: params.formatReference({
-        fileId,
-        byteSize,
-        summary: explorationSummary,
-      }),
-    };
-  }
-
   /**
    * Return the most recent assembled snapshot for a conversation and refresh its
    * recency so the bounded debug cache behaves as an LRU.
@@ -4398,293 +2780,6 @@ export class LcmContextEngine implements ContextEngine {
   /** Drop any cached orphan-stripping state after a history rewrite or cold-cache transition. */
   private clearStableOrphanStrippingOrdinal(conversationId: number): void {
     this.stableOrphanStrippingOrdinalsByConversation.delete(conversationId);
-  }
-
-  /**
-   * Intercept oversized <file> blocks before persistence and replace them with
-   * compact file references backed by large_files records.
-   */
-  private async interceptLargeFiles(params: {
-    conversationId: number;
-    content: string;
-  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
-    const blocks = parseFileBlocks(params.content);
-    if (blocks.length === 0) {
-      return null;
-    }
-
-    const threshold = Math.max(1, this.config.largeFileTokenThreshold);
-    const fileIds: string[] = [];
-    const rewrittenSegments: string[] = [];
-    let cursor = 0;
-    let interceptedAny = false;
-
-    for (const block of blocks) {
-      const blockTokens = estimateTokens(block.text);
-      if (blockTokens < threshold) {
-        continue;
-      }
-
-      interceptedAny = true;
-      const externalized = await this.externalizeLargeTextPayload({
-        conversationId: params.conversationId,
-        content: block.text,
-        fileName: block.fileName,
-        mimeType: block.mimeType,
-        formatReference: ({ fileId, byteSize, summary }) =>
-          formatFileReference({
-            fileId,
-            fileName: block.fileName,
-            mimeType: block.mimeType,
-            byteSize,
-            summary,
-          }),
-      });
-
-      rewrittenSegments.push(params.content.slice(cursor, block.start));
-      rewrittenSegments.push(externalized.reference);
-      cursor = block.end;
-      fileIds.push(externalized.fileId);
-    }
-
-    if (!interceptedAny) {
-      return null;
-    }
-
-    rewrittenSegments.push(params.content.slice(cursor));
-    return {
-      rewrittenContent: rewrittenSegments.join(""),
-      fileIds,
-    };
-  }
-
-  /** Externalize oversized textual tool outputs before they are persisted inline. */
-  private async interceptLargeToolResults(params: {
-    conversationId: number;
-    message: AgentMessage;
-  }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
-    if (
-      (params.message.role !== "toolResult" && params.message.role !== "tool") ||
-      !("content" in params.message)
-    ) {
-      return null;
-    }
-
-    // Convert string content to array format for unified processing.
-    if (typeof params.message.content === "string") {
-      params = {
-        ...params,
-        message: {
-          ...params.message,
-          content: [{ type: "text", text: params.message.content }],
-        } as AgentMessage,
-      };
-    }
-
-    if (!Array.isArray(params.message.content)) {
-      return null;
-    }
-
-    const threshold = Math.max(1, this.config.largeFileTokenThreshold);
-    const rewrittenContent: unknown[] = [];
-    const fileIds: string[] = [];
-    let interceptedAny = false;
-    const topLevel = params.message as Record<string, unknown>;
-    const topLevelToolCallId =
-      safeString(topLevel.toolCallId) ??
-      safeString(topLevel.tool_call_id) ??
-      safeString(topLevel.toolUseId) ??
-      safeString(topLevel.tool_use_id) ??
-      safeString(topLevel.call_id) ??
-      safeString(topLevel.id);
-    const topLevelToolName =
-      safeString(topLevel.toolName) ??
-      safeString(topLevel.tool_name);
-    const topLevelIsError =
-      safeBoolean(topLevel.isError) ??
-      safeBoolean(topLevel.is_error);
-
-    for (const item of params.message.content) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) {
-        rewrittenContent.push(item);
-        continue;
-      }
-
-      const record = item as Record<string, unknown>;
-      const rawType = safeString(record.type);
-      const isStructuredToolResult =
-        rawType !== "tool_result" &&
-        rawType !== "toolResult" &&
-        rawType !== "function_call_output";
-      const isPlainTextToolResult =
-        rawType === "text" &&
-        typeof record.text === "string";
-      if (isStructuredToolResult && !isPlainTextToolResult) {
-        rewrittenContent.push(item);
-        continue;
-      }
-
-      const textSource =
-        isPlainTextToolResult
-          ? record.text
-          : record.output !== undefined
-          ? record.output
-          : record.content !== undefined
-            ? record.content
-            : record;
-      const extractedText = extractStructuredText(textSource);
-      if (
-        typeof extractedText === "string" &&
-        LcmContextEngine.isExternalizedImageReference(extractedText)
-      ) {
-        rewrittenContent.push(item);
-        continue;
-      }
-      if (typeof extractedText !== "string" || estimateTokens(extractedText) < threshold) {
-        rewrittenContent.push(item);
-        continue;
-      }
-
-      interceptedAny = true;
-      const toolName =
-        safeString(record.name) ??
-        topLevelToolName ??
-        "tool-result";
-      const externalized = await this.externalizeLargeTextPayload({
-        conversationId: params.conversationId,
-        content: extractedText,
-        fileName: `${toolName}.txt`,
-        mimeType: "text/plain",
-        formatReference: ({ fileId, byteSize, summary }) =>
-          formatToolOutputReference({
-            fileId,
-            toolName,
-            byteSize,
-            summary,
-          }),
-      });
-
-      const normalizedRawType =
-        rawType === "function_call_output" ? "function_call_output" : "tool_result";
-      const compactBlock: Record<string, unknown> = isPlainTextToolResult
-        ? {
-            type: "text",
-            text: externalized.reference,
-            rawType: normalizedRawType,
-            externalizedFileId: externalized.fileId,
-            originalByteSize: externalized.byteSize,
-            toolOutputExternalized: true,
-            externalizationReason: "large_tool_result",
-          }
-        : {
-            type: normalizedRawType,
-            output: externalized.reference,
-            externalizedFileId: externalized.fileId,
-            originalByteSize: externalized.byteSize,
-            toolOutputExternalized: true,
-            externalizationReason: "large_tool_result",
-          };
-      const callId =
-        safeString(record.tool_use_id) ??
-        safeString(record.toolUseId) ??
-        safeString(record.tool_call_id) ??
-        safeString(record.toolCallId) ??
-        safeString(record.call_id) ??
-        safeString(record.id) ??
-        topLevelToolCallId;
-      if (callId) {
-        if (normalizedRawType === "function_call_output") {
-          compactBlock.call_id = callId;
-        } else {
-          compactBlock.tool_use_id = callId;
-        }
-      }
-      if (typeof record.is_error === "boolean") {
-        compactBlock.is_error = record.is_error;
-      } else if (typeof record.isError === "boolean") {
-        compactBlock.isError = record.isError;
-      } else if (typeof topLevelIsError === "boolean") {
-        compactBlock.isError = topLevelIsError;
-      }
-      if (toolName) {
-        compactBlock.name = toolName;
-      }
-
-      rewrittenContent.push(compactBlock);
-      fileIds.push(externalized.fileId);
-    }
-
-    if (!interceptedAny) {
-      return null;
-    }
-
-    return {
-      rewrittenMessage: {
-        ...params.message,
-        content: rewrittenContent,
-      } as AgentMessage,
-      fileIds,
-    };
-  }
-
-  /** Externalize oversized raw messages that survived role-specific interceptors. */
-  private async interceptLargeRawPayload(params: {
-    conversationId: number;
-    message: AgentMessage;
-    stored: StoredMessage;
-  }): Promise<{ rewrittenMessage: AgentMessage; stored: StoredMessage } | null> {
-    const threshold = Math.max(1, this.config.largeFileTokenThreshold);
-    if (params.stored.tokenCount < threshold) {
-      return null;
-    }
-    if (params.stored.role === "tool") {
-      return null;
-    }
-    if (LcmContextEngine.isExternalizedReferenceContent(params.stored.content)) {
-      return null;
-    }
-    if ("content" in params.message && hasReplayCriticalRawBlock(params.message.content)) {
-      return null;
-    }
-
-    const rawPayload = serializeRawPayloadContent(params.message, params.stored.content);
-    if (!rawPayload || rawPayload.content.length === 0) {
-      return null;
-    }
-
-    const role = typeof params.message.role === "string" ? params.message.role : params.stored.role;
-    const externalized = await this.externalizeLargeTextPayload({
-      conversationId: params.conversationId,
-      content: rawPayload.content,
-      fileName: `raw-${role}-payload.${rawPayload.mimeType === "application/json" ? "json" : "txt"}`,
-      mimeType: rawPayload.mimeType,
-      formatReference: ({ fileId, byteSize, summary }) =>
-        formatRawPayloadReference({
-          fileId,
-          role,
-          byteSize,
-          reason: RAW_PAYLOAD_EXTERNALIZATION_REASON,
-          summary,
-        }),
-    });
-
-    const rewrittenMessage = {
-      ...params.message,
-      content: externalized.reference,
-      rawPayloadExternalized: true,
-      externalizedFileId: externalized.fileId,
-      originalByteSize: externalized.byteSize,
-      externalizationReason: RAW_PAYLOAD_EXTERNALIZATION_REASON,
-    } as AgentMessage;
-
-    return {
-      rewrittenMessage,
-      stored: {
-        ...params.stored,
-        content: externalized.reference,
-        tokenCount: estimateTokens(externalized.reference),
-      },
-    };
   }
 
   // ── ContextEngine interface ─────────────────────────────────────────────
@@ -5519,7 +3614,7 @@ export class LcmContextEngine implements ContextEngine {
             // Prune HEARTBEAT_OK turns from the freshly imported data
             let prunedMessages = 0;
             if (this.config.pruneHeartbeatOk) {
-              const pruned = await this.pruneHeartbeatOkTurns(conversationId);
+              const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversationId);
               prunedMessages = pruned;
               if (pruned > 0) {
                 this.clearStableOrphanStrippingOrdinal(conversationId);
@@ -5618,7 +3713,10 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
         });
         if (conversation) {
-          const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
+          const pruned = await pruneHeartbeatOkTurns(
+            this.conversationStore,
+            conversation.conversationId,
+          );
           if (pruned > 0) {
             this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
             await this.refreshBootstrapState({
@@ -6195,7 +4293,7 @@ export class LcmContextEngine implements ContextEngine {
     let messageForParts = message;
 
     if (stored.role === "tool") {
-      const imageIntercepted = await this.interceptInlineImagesInToolMessage({
+      const imageIntercepted = await this.payloadExternalizer.interceptInlineImagesInToolMessage({
         conversationId,
         message: messageForParts,
       });
@@ -6204,7 +4302,7 @@ export class LcmContextEngine implements ContextEngine {
         stored = toStoredMessage(messageForParts);
       }
     } else {
-      const nativeImageIntercepted = await this.interceptNativeUserImageBlocks({
+      const nativeImageIntercepted = await this.payloadExternalizer.interceptNativeUserImageBlocks({
         conversationId,
         message: messageForParts,
       });
@@ -6213,7 +4311,7 @@ export class LcmContextEngine implements ContextEngine {
         stored = toStoredMessage(messageForParts);
       }
 
-      const imageIntercepted = await this.interceptInlineImages({
+      const imageIntercepted = await this.payloadExternalizer.interceptInlineImages({
         conversationId,
         content: stored.content,
         role: stored.role,
@@ -6231,7 +4329,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (stored.role === "user") {
-      const intercepted = await this.interceptLargeFiles({
+      const intercepted = await this.payloadExternalizer.interceptLargeFiles({
         conversationId,
         content: stored.content,
       });
@@ -6246,7 +4344,7 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
     } else if (stored.role === "tool") {
-      const intercepted = await this.interceptLargeToolResults({
+      const intercepted = await this.payloadExternalizer.interceptLargeToolResults({
         conversationId,
         message: messageForParts,
       });
@@ -6258,7 +4356,7 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    const rawPayloadIntercepted = await this.interceptLargeRawPayload({
+    const rawPayloadIntercepted = await this.payloadExternalizer.interceptLargeRawPayload({
       conversationId,
       message: messageForParts,
       stored,
@@ -6610,7 +4708,10 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
         });
         if (conversation) {
-          const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
+          const pruned = await pruneHeartbeatOkTurns(
+            this.conversationStore,
+            conversation.conversationId,
+          );
           if (pruned > 0) {
             this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
             const sessionContext = this.formatSessionLogContext({
@@ -8715,111 +6816,6 @@ export class LcmContextEngine implements ContextEngine {
     return this.compactionMaintenanceStore;
   }
 
-  // ── Heartbeat pruning ──────────────────────────────────────────────────
-
-  /**
-   * Detect HEARTBEAT_OK turn cycles in a conversation and delete them.
-   *
-   * A HEARTBEAT_OK turn is: a user message (the heartbeat prompt), followed by
-   * any tool call/result messages, ending with an assistant message that is a
-   * heartbeat ack. The entire sequence has no durable information value for LCM.
-   *
-   * Detection: assistant content (trimmed, lowercased) starts with "heartbeat_ok"
-   * and any text after is not alphanumeric (matches OpenClaw core's ack detection).
-   * This catches both exact "HEARTBEAT_OK" and chatty variants like
-   * "HEARTBEAT_OK — weekend, no market".
-   *
-   * Returns the number of messages deleted.
-   */
-  private async pruneHeartbeatOkTurns(conversationId: number): Promise<number> {
-    const allMessages = await this.conversationStore.getMessages(conversationId);
-    if (allMessages.length === 0) {
-      return 0;
-    }
-
-    const toDelete: number[] = [];
-
-    // Walk through messages finding HEARTBEAT_OK assistant replies, then
-    // collect the entire turn (back to the preceding user message).
-    for (let i = 0; i < allMessages.length; i++) {
-      const msg = allMessages[i];
-      if (msg.role !== "assistant") {
-        continue;
-      }
-      if (!isHeartbeatOkContent(msg.content)) {
-        continue;
-      }
-
-      // Found an exact HEARTBEAT_OK reply. Walk backward to find the turn start
-      // (the preceding user message).
-      const turnMessages = [msg];
-      for (let j = i - 1; j >= 0; j--) {
-        const prev = allMessages[j];
-        turnMessages.push(prev);
-        if (prev.role === "user") {
-          break; // Found turn start
-        }
-      }
-
-      if (!turnMessages.some((record) => record.role === "user")) {
-        continue;
-      }
-      if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
-        continue;
-      }
-
-      toDelete.push(...turnMessages.map((record) => record.messageId));
-    }
-
-    if (toDelete.length === 0) {
-      return 0;
-    }
-
-    // Deduplicate (a message could theoretically appear in multiple turns)
-    const uniqueIds = [...new Set(toDelete)];
-    return this.conversationStore.deleteMessages(uniqueIds);
-  }
-}
-
-// ── Heartbeat detection ─────────────────────────────────────────────────────
-
-const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
-const HEARTBEAT_TURN_MARKER = "heartbeat.md";
-
-/**
- * Detect whether an assistant message is a heartbeat ack.
- *
- * Only exact (case-insensitive) "HEARTBEAT_OK" acknowledgements are pruned.
- * Any additional text indicates the heartbeat carried real content and should remain.
- */
-function isHeartbeatOkContent(content: string): boolean {
-  return content.trim().toLowerCase() === HEARTBEAT_OK_TOKEN;
-}
-
-function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolean {
-  let sawHeartbeatMarker = false;
-  let sawHeartbeatAck = false;
-
-  for (const message of messages) {
-    const stored = toStoredMessage(message);
-    if (!sawHeartbeatMarker && stored.content.toLowerCase().includes(HEARTBEAT_TURN_MARKER)) {
-      sawHeartbeatMarker = true;
-    }
-    if (!sawHeartbeatAck && stored.role === "assistant" && isHeartbeatOkContent(stored.content)) {
-      sawHeartbeatAck = true;
-    }
-    if (sawHeartbeatMarker && sawHeartbeatAck) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function turnLooksLikeHeartbeatTurn(turnMessages: Array<{ content: string }>): boolean {
-  return turnMessages.some((message) =>
-    message.content.toLowerCase().includes(HEARTBEAT_TURN_MARKER),
-  );
 }
 
 // ── Emergency fallback summarization ────────────────────────────────────────
