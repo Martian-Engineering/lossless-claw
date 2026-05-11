@@ -4825,7 +4825,12 @@ export class LcmContextEngine implements ContextEngine {
 
           let importedMessages = 0;
           for (const message of historicalMessages) {
-            const result = await this.ingestSingle({ sessionId, sessionKey: params.sessionKey, message });
+            const result = await this.ingestSingle({
+              sessionId,
+              sessionKey: params.sessionKey,
+              message,
+              skipReplayTimestampFloodGuard: true,
+            });
             if (result.ingested) {
               importedMessages += 1;
             }
@@ -5509,6 +5514,7 @@ export class LcmContextEngine implements ContextEngine {
                 sessionId: params.sessionId,
                 sessionKey: params.sessionKey,
                 message,
+                skipReplayTimestampFloodGuard: true,
               });
               if (result.ingested) {
                 importedMessages += 1;
@@ -6148,8 +6154,9 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     message: AgentMessage;
     isHeartbeat?: boolean;
+    skipReplayTimestampFloodGuard?: boolean;
   }): Promise<IngestResult> {
-    const { sessionId, sessionKey, message, isHeartbeat } = params;
+    const { sessionId, sessionKey, message, isHeartbeat, skipReplayTimestampFloodGuard } = params;
     if (isHeartbeat) {
       return { ingested: false };
     }
@@ -6279,6 +6286,7 @@ export class LcmContextEngine implements ContextEngine {
       role: stored.role,
       content: stored.content,
       tokenCount: stored.tokenCount,
+      skipReplayTimestampFloodGuard,
     });
     await this.conversationStore.createMessageParts(
       msgRecord.messageId,

@@ -33,6 +33,8 @@ export type CreateMessageInput = {
   content: string;
   tokenCount: number;
   identityHash?: string;
+  // Use only when the caller is intentionally importing a fresh transcript epoch.
+  skipReplayTimestampFloodGuard?: boolean;
 };
 
 type PreparedMessageInsert = CreateMessageInput & {
@@ -522,7 +524,9 @@ export class ConversationStore {
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
     const prepared = this.prepareMessageInsert(input);
-    this.assertNoReplayTimestampFlood([prepared]);
+    if (!prepared.skipReplayTimestampFloodGuard) {
+      this.assertNoReplayTimestampFlood([prepared]);
+    }
 
     const result = this.db
       .prepare(
@@ -559,7 +563,9 @@ export class ConversationStore {
     }
     const createdAt = this.currentSqliteTimestamp();
     const preparedInputs = inputs.map((input) => this.prepareMessageInsert(input, createdAt));
-    this.assertNoReplayTimestampFlood(preparedInputs);
+    this.assertNoReplayTimestampFlood(
+      preparedInputs.filter((input) => !input.skipReplayTimestampFloodGuard),
+    );
 
     const insertStmt = this.db.prepare(
       `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
