@@ -434,6 +434,79 @@ describe("transaction-mutex", () => {
     });
   });
 
+  describe("setImmediate-interleaved stress test (#474)", () => {
+    it("does not throw 'cannot start a transaction within a transaction' under aggressive interleaving", async () => {
+      // Issue #474: under multi-channel bridge load, concurrent
+      // ConversationStore.withTransaction() callers race into a
+      // mid-transaction BEGIN because the async function awaits operation()
+      // between BEGIN IMMEDIATE and COMMIT. Force the worst-case interleaving
+      // with `await new Promise(setImmediate)` so the event loop ticks between
+      // every step — without the per-DB mutex this triggers the race
+      // reliably.
+      const { db, fts5Available } = createTestDb();
+      const store = new ConversationStore(db, { fts5Available });
+
+      const conversations = await Promise.all(
+        Array.from({ length: 8 }, (_, i) =>
+          store.createConversation({
+            sessionId: `bridge-sess-${i}`,
+            sessionKey: `bridge-key-${i}`,
+          }),
+        ),
+      );
+
+      const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+      const errors: unknown[] = [];
+
+      const results = await Promise.allSettled(
+        conversations.flatMap((conv, i) => [
+          store.withTransaction(async () => {
+            await tick();
+            await tick();
+            await store.createMessage({
+              conversationId: conv.conversationId,
+              seq: 1,
+              role: "user",
+              content: `interleaved msg A from session ${i}`,
+              tokenCount: 5,
+            });
+            await tick();
+            await store.createMessage({
+              conversationId: conv.conversationId,
+              seq: 2,
+              role: "assistant",
+              content: `interleaved msg B from session ${i}`,
+              tokenCount: 5,
+            });
+          }),
+          store.withTransaction(async () => {
+            await tick();
+            await store.createMessage({
+              conversationId: conv.conversationId,
+              seq: 3,
+              role: "user",
+              content: `interleaved msg C from session ${i}`,
+              tokenCount: 5,
+            });
+            await tick();
+          }),
+        ]),
+      );
+
+      for (const result of results) {
+        if (result.status === "rejected") {
+          errors.push(result.reason);
+        }
+      }
+
+      // None of the transactions may throw the reentrancy SqliteError.
+      for (const err of errors) {
+        expect(String(err)).not.toMatch(/cannot start a transaction within a transaction/i);
+      }
+      expect(errors).toHaveLength(0);
+    });
+  });
+
   describe("high-concurrency stress test", () => {
     it("handles 10 concurrent transactions from different simulated sessions without errors", async () => {
       const { db, fts5Available } = createTestDb();
