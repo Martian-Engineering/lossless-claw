@@ -4608,6 +4608,183 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(stored[5].content).toBe("");
   });
 
+  it("bootstraps a bounded same-path transcript epoch after the file shrinks", async () => {
+    const warnLog = vi.fn();
+    const sessionFile = createSessionFilePath("bootstrap-same-path-shrink");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "old bootstrap shrink user" },
+      { role: "assistant", content: "old bootstrap shrink assistant" },
+    ]);
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({ type: "custom", payload: "x".repeat(20_000) })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "bootstrap-same-path-shrink";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(oldCheckpoint?.sessionFilePath).toBe(sessionFile);
+
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "missed bootstrap shrink user" },
+      { role: "assistant", content: "missed bootstrap shrink assistant" },
+    ]);
+    expect(oldCheckpoint!.lastProcessedOffset).toBeGreaterThan(statSync(sessionFile).size);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("same-path-shrink")),
+    ).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old bootstrap shrink user",
+      "old bootstrap shrink assistant",
+      "missed bootstrap shrink user",
+      "missed bootstrap shrink assistant",
+    ]);
+
+    const newCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(newCheckpoint?.sessionFilePath).toBe(sessionFile);
+    expect(newCheckpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("imports the full bounded same-path shrink epoch instead of trusting a stale externalized frontier", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-same-path-shrink-externalized");
+    const rawFrontier = "externalized raw shrink frontier";
+    writeLeafTranscript(sessionFile, [
+      { role: "assistant", content: rawFrontier },
+    ]);
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({ type: "custom", payload: "x".repeat(20_000) })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-same-path-shrink-externalized";
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const firstStored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(firstStored).toHaveLength(1);
+
+    const rawDb = createLcmDatabaseConnection(engine.config.databasePath);
+    try {
+      rawDb
+        .prepare(`UPDATE messages SET content = ?, token_count = ? WHERE message_id = ?`)
+        .run(
+          "[LCM externalized payload reference]",
+          estimateTokens("[LCM externalized payload reference]"),
+          firstStored[0].messageId,
+        );
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(oldCheckpoint?.lastProcessedEntryHash).toMatch(/^[a-f0-9]{64}$/);
+
+    writeLeafTranscript(sessionFile, [
+      { role: "assistant", content: rawFrontier },
+      { role: "user", content: "tail after externalized shrink" },
+    ]);
+    expect(oldCheckpoint!.lastProcessedOffset).toBeGreaterThan(statSync(sessionFile).size);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "[LCM externalized payload reference]",
+      rawFrontier,
+      "tail after externalized shrink",
+    ]);
+  });
+
+  it("imports a full same-path shrink epoch when new content repeats an old frontier message", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-same-path-shrink-duplicate-frontier");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "old duplicate frontier user" },
+      { role: "assistant", content: "OK" },
+    ]);
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({ type: "custom", payload: "x".repeat(20_000) })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-same-path-shrink-duplicate-frontier";
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "new duplicate frontier user" },
+      { role: "assistant", content: "OK" },
+      { role: "user", content: "new duplicate frontier tail" },
+    ]);
+    expect(oldCheckpoint!.lastProcessedOffset).toBeGreaterThan(statSync(sessionFile).size);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 3,
+      reason: "reconciled missing session messages",
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old duplicate frontier user",
+      "OK",
+      "new duplicate frontier user",
+      "OK",
+      "new duplicate frontier tail",
+    ]);
+  });
+
   it("does not append JSONL when no overlapping anchor exists in LCM", async () => {
     const sessionFile = createSessionFilePath("reconcile-no-overlap");
     const sm = SessionManager.open(sessionFile);
@@ -8229,6 +8406,304 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(stored.map((message) => message.content)).toEqual([
       "old no-anchor user",
       "old no-anchor assistant",
+    ]);
+  });
+
+  it("afterTurn imports a bounded same-path transcript epoch after the file shrinks", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-same-path-shrink";
+    const sessionKey = "agent:main:test:direct:same-path-shrink";
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 0,
+      threshold: 3_072,
+    });
+
+    const sessionFile = createSessionFilePath("after-turn-same-path-shrink");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "old shrink user" },
+      { role: "assistant", content: "old shrink assistant" },
+    ]);
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({ type: "custom", payload: "x".repeat(20_000) })}\n`,
+      "utf8",
+    );
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "old shrink user" }),
+        makeMessage({ role: "assistant", content: "old shrink assistant" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(oldCheckpoint?.sessionFilePath).toBe(sessionFile);
+
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "missed shrink prefix user" },
+      { role: "assistant", content: "missed shrink prefix assistant" },
+      { role: "user", content: "live shrink user" },
+      { role: "assistant", content: "live shrink assistant" },
+    ]);
+    expect(oldCheckpoint!.lastProcessedOffset).toBeGreaterThan(statSync(sessionFile).size);
+    const shrinkStats = statSync(sessionFile);
+    (
+      engine as unknown as {
+        afterTurnReconcileFullReadStates: Map<string, { size: number; mtimeMs: number }>;
+      }
+    ).afterTurnReconcileFullReadStates.set(`${sessionKey}\u0000${sessionFile}`, {
+      size: shrinkStats.size,
+      mtimeMs: Math.trunc(shrinkStats.mtimeMs),
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "live shrink user" }),
+        makeMessage({ role: "assistant", content: "live shrink assistant" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("same-path-shrink")),
+    ).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old shrink user",
+      "old shrink assistant",
+      "missed shrink prefix user",
+      "missed shrink prefix assistant",
+      "live shrink user",
+      "live shrink assistant",
+    ]);
+
+    const newCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(newCheckpoint?.sessionFilePath).toBe(sessionFile);
+    expect(newCheckpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("afterTurn imports the full bounded same-path shrink epoch instead of trusting a stale externalized frontier", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-same-path-shrink-externalized";
+    const sessionKey = "agent:main:test:direct:same-path-shrink-externalized";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 0,
+      threshold: 3_072,
+    });
+
+    const sessionFile = createSessionFilePath("after-turn-same-path-shrink-externalized");
+    const rawFrontier = "afterTurn externalized raw shrink frontier";
+    writeLeafTranscript(sessionFile, [
+      { role: "assistant", content: rawFrontier },
+    ]);
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({ type: "custom", payload: "x".repeat(20_000) })}\n`,
+      "utf8",
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: rawFrontier })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const firstStored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(firstStored).toHaveLength(1);
+
+    const rawDb = createLcmDatabaseConnection(engine.config.databasePath);
+    try {
+      rawDb
+        .prepare(`UPDATE messages SET content = ?, token_count = ? WHERE message_id = ?`)
+        .run(
+          "[LCM afterTurn externalized payload reference]",
+          estimateTokens("[LCM afterTurn externalized payload reference]"),
+          firstStored[0].messageId,
+        );
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(oldCheckpoint?.lastProcessedEntryHash).toMatch(/^[a-f0-9]{64}$/);
+
+    writeLeafTranscript(sessionFile, [
+      { role: "assistant", content: rawFrontier },
+      { role: "user", content: "afterTurn tail after externalized shrink" },
+    ]);
+    expect(oldCheckpoint!.lastProcessedOffset).toBeGreaterThan(statSync(sessionFile).size);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "user", content: "afterTurn tail after externalized shrink" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "[LCM afterTurn externalized payload reference]",
+      rawFrontier,
+      "afterTurn tail after externalized shrink",
+    ]);
+  });
+
+  it("afterTurn imports a full same-path shrink epoch when new content repeats an old frontier message", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-same-path-shrink-duplicate-frontier";
+    const sessionKey = "agent:main:test:direct:same-path-shrink-duplicate-frontier";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 0,
+      threshold: 3_072,
+    });
+
+    const sessionFile = createSessionFilePath("after-turn-same-path-shrink-duplicate-frontier");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "old afterTurn duplicate frontier user" },
+      { role: "assistant", content: "OK" },
+    ]);
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({ type: "custom", payload: "x".repeat(20_000) })}\n`,
+      "utf8",
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "old afterTurn duplicate frontier user" }),
+        makeMessage({ role: "assistant", content: "OK" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "new afterTurn duplicate frontier user" },
+      { role: "assistant", content: "OK" },
+      { role: "user", content: "new afterTurn duplicate frontier tail" },
+    ]);
+    expect(oldCheckpoint!.lastProcessedOffset).toBeGreaterThan(statSync(sessionFile).size);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "user", content: "new afterTurn duplicate frontier tail" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old afterTurn duplicate frontier user",
+      "OK",
+      "new afterTurn duplicate frontier user",
+      "OK",
+      "new afterTurn duplicate frontier tail",
     ]);
   });
 

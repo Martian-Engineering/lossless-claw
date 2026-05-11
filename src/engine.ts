@@ -137,6 +137,10 @@ type TranscriptRewriteReplacement = {
 type TranscriptRewriteRequest = {
   replacements: TranscriptRewriteReplacement[];
 };
+type BootstrapCheckpointFileState = {
+  lastProcessedOffset: number;
+  lastSeenSize: number;
+};
 type RotateTranscriptRewriteResult = {
   checkpointSize: number;
   bytesRemoved: number;
@@ -179,6 +183,16 @@ type DeferredCompactionDebtDrainParams = {
   currentTokenCount?: number;
   reason: string;
 };
+
+function checkpointIsPastTranscriptEof(
+  checkpoint: BootstrapCheckpointFileState | null | undefined,
+  fileSize: number,
+): boolean {
+  if (!checkpoint) {
+    return false;
+  }
+  return checkpoint.lastProcessedOffset > fileSize || checkpoint.lastSeenSize > fileSize;
+}
 
 function getErrorCode(error: unknown): string | undefined {
   if (!(error instanceof Error)) {
@@ -4711,6 +4725,7 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number;
     historicalMessages: AgentMessage[];
     checkpointEntryHash?: string | null;
+    skipContentAnchorScan?: boolean;
     allowNoAnchorImport?: boolean;
     noAnchorImportReason?: string;
   }): Promise<TranscriptReconcileResult> {
@@ -4742,7 +4757,10 @@ export class LcmContextEngine implements ContextEngine {
     // Fast path: one tail comparison for the common in-sync case.
     const latestHistorical = storedHistoricalMessages[storedHistoricalMessages.length - 1];
     const latestIdentity = messageIdentity(latestDbMessage.role, latestDbMessage.content);
-    if (latestIdentity === messageIdentity(latestHistorical.role, latestHistorical.content)) {
+    if (
+      !params.skipContentAnchorScan &&
+      latestIdentity === messageIdentity(latestHistorical.role, latestHistorical.content)
+    ) {
       const dbOccurrences = await this.conversationStore.countMessagesByIdentity(
         conversationId,
         latestDbMessage.role,
@@ -4771,42 +4789,44 @@ export class LcmContextEngine implements ContextEngine {
       historicalIdentityTotals.set(identity, (historicalIdentityTotals.get(identity) ?? 0) + 1);
     }
 
-    const historicalIdentityCountsAfterIndex = new Map<string, number>();
-    const dbIdentityCounts = new Map<string, number>();
-    for (let index = storedHistoricalMessages.length - 1; index >= 0; index--) {
-      const stored = storedHistoricalMessages[index];
-      const identity = messageIdentity(stored.role, stored.content);
-      const seenAfter = historicalIdentityCountsAfterIndex.get(identity) ?? 0;
-      const total = historicalIdentityTotals.get(identity) ?? 0;
-      const occurrencesThroughIndex = total - seenAfter;
-      const exists = await this.conversationStore.hasMessage(
-        conversationId,
-        stored.role,
-        stored.content,
-      );
-      historicalIdentityCountsAfterIndex.set(identity, seenAfter + 1);
-      if (!exists) {
-        continue;
-      }
-
-      let dbCountForIdentity = dbIdentityCounts.get(identity);
-      if (dbCountForIdentity === undefined) {
-        dbCountForIdentity = await this.conversationStore.countMessagesByIdentity(
+    if (!params.skipContentAnchorScan) {
+      const historicalIdentityCountsAfterIndex = new Map<string, number>();
+      const dbIdentityCounts = new Map<string, number>();
+      for (let index = storedHistoricalMessages.length - 1; index >= 0; index--) {
+        const stored = storedHistoricalMessages[index];
+        const identity = messageIdentity(stored.role, stored.content);
+        const seenAfter = historicalIdentityCountsAfterIndex.get(identity) ?? 0;
+        const total = historicalIdentityTotals.get(identity) ?? 0;
+        const occurrencesThroughIndex = total - seenAfter;
+        const exists = await this.conversationStore.hasMessage(
           conversationId,
           stored.role,
           stored.content,
         );
-        dbIdentityCounts.set(identity, dbCountForIdentity);
-      }
+        historicalIdentityCountsAfterIndex.set(identity, seenAfter + 1);
+        if (!exists) {
+          continue;
+        }
 
-      // Match the same occurrence index as the DB tail so repeated empty
-      // tool messages do not anchor against a later, still-missing entry.
-      if (dbCountForIdentity !== occurrencesThroughIndex) {
-        continue;
-      }
+        let dbCountForIdentity = dbIdentityCounts.get(identity);
+        if (dbCountForIdentity === undefined) {
+          dbCountForIdentity = await this.conversationStore.countMessagesByIdentity(
+            conversationId,
+            stored.role,
+            stored.content,
+          );
+          dbIdentityCounts.set(identity, dbCountForIdentity);
+        }
 
-      anchorIndex = index;
-      break;
+        // Match the same occurrence index as the DB tail so repeated empty
+        // tool messages do not anchor against a later, still-missing entry.
+        if (dbCountForIdentity !== occurrencesThroughIndex) {
+          continue;
+        }
+
+        anchorIndex = index;
+        break;
+      }
     }
 
     if (anchorIndex < 0) {
@@ -5005,10 +5025,25 @@ export class LcmContextEngine implements ContextEngine {
         const checkpoint = await this.summaryStore.getConversationBootstrapState(
           conversation.conversationId,
         );
+        let sessionFileState: { size: number; mtimeMs: number } | undefined;
+        try {
+          const sessionFileStats = await stat(params.sessionFile);
+          sessionFileState = {
+            size: sessionFileStats.size,
+            mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
+          };
+        } catch {
+          // Leave undefined: without stat proof, do not use append-only guards or slow-read caps.
+        }
+        const transcriptEpochShrank = checkpointIsPastTranscriptEof(
+          checkpoint,
+          sessionFileState?.size ?? Number.POSITIVE_INFINITY,
+        );
         if (
           checkpoint &&
           checkpoint.sessionFilePath === params.sessionFile &&
-          checkpoint.lastProcessedOffset >= 0
+          checkpoint.lastProcessedOffset >= 0 &&
+          !transcriptEpochShrank
         ) {
           const appended = await readAppendedLeafPathMessages({
             sessionFile: params.sessionFile,
@@ -5062,16 +5097,11 @@ export class LcmContextEngine implements ContextEngine {
           ? "checkpoint-missing"
           : checkpoint.sessionFilePath !== params.sessionFile
             ? "path-mismatch"
-            : "append-only-ineligible";
-        let sessionFileState: { size: number; mtimeMs: number } | undefined;
-        try {
-          const sessionFileStats = await stat(params.sessionFile);
-          sessionFileState = {
-            size: sessionFileStats.size,
-            mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
-          };
-        } catch {
-          // Leave undefined: without stat proof, do not use the slow-read cap.
+            : transcriptEpochShrank
+              ? "same-path-shrink"
+              : "append-only-ineligible";
+        if (reason === "same-path-shrink") {
+          this.afterTurnReconcileFullReadStates.delete(fullReadKey);
         }
         const rememberedFileState = this.afterTurnReconcileFullReadStates.get(fullReadKey);
         if (
@@ -5147,7 +5177,8 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
           conversationId: conversation.conversationId,
           historicalMessages,
-          allowNoAnchorImport: reason === "path-mismatch",
+          skipContentAnchorScan: reason === "same-path-shrink",
+          allowNoAnchorImport: reason === "path-mismatch" || reason === "same-path-shrink",
           noAnchorImportReason: reason,
         });
         if (reconcile.blockedByImportCap) {
@@ -5336,12 +5367,14 @@ export class LcmContextEngine implements ContextEngine {
           let existingCount = await this.conversationStore.getMessageCount(conversationId);
           let bootstrapState = await this.summaryStore.getConversationBootstrapState(conversationId);
           let transcriptEpochRotated = false;
+          let transcriptEpochReason: string | undefined;
 
           if (
             bootstrapState &&
             bootstrapState.sessionFilePath !== params.sessionFile
           ) {
             transcriptEpochRotated = true;
+            transcriptEpochReason = "path-mismatch";
             this.deps.log.warn(
               `[lcm] bootstrap: session file rotated conversation=${conversationId} ${sessionLabel} oldFile=${bootstrapState.sessionFilePath} newFile=${params.sessionFile}`,
             );
@@ -5350,6 +5383,20 @@ export class LcmContextEngine implements ContextEngine {
             // in-memory file-level guard, and any counters derived from the
             // old file's messages. Clear them all in one place so subsequent
             // reads treat this conversation as unbootstrapped.
+            this.lastFullReadFileState.delete(conversationId);
+            this.clearStableOrphanStrippingOrdinal(conversationId);
+            bootstrapState = null;
+          }
+          if (
+            bootstrapState &&
+            bootstrapState.sessionFilePath === params.sessionFile &&
+            checkpointIsPastTranscriptEof(bootstrapState, sessionFileSize)
+          ) {
+            transcriptEpochRotated = true;
+            transcriptEpochReason = "same-path-shrink";
+            this.deps.log.warn(
+              `[lcm] bootstrap: session file shrank past checkpoint conversation=${conversationId} ${sessionLabel} file=${params.sessionFile} checkpointOffset=${bootstrapState.lastProcessedOffset} checkpointSize=${bootstrapState.lastSeenSize} currentSize=${sessionFileSize}`,
+            );
             this.lastFullReadFileState.delete(conversationId);
             this.clearStableOrphanStrippingOrdinal(conversationId);
             bootstrapState = null;
@@ -5574,9 +5621,13 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             conversationId,
             historicalMessages,
-            checkpointEntryHash: bootstrapState?.lastProcessedEntryHash,
+            checkpointEntryHash:
+              transcriptEpochReason === "same-path-shrink"
+                ? undefined
+                : bootstrapState?.lastProcessedEntryHash,
+            skipContentAnchorScan: transcriptEpochReason === "same-path-shrink",
             allowNoAnchorImport: transcriptEpochRotated,
-            noAnchorImportReason: transcriptEpochRotated ? "path-mismatch" : undefined,
+            noAnchorImportReason: transcriptEpochReason,
           });
           this.deps.log.debug(
             `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - startedAt)}`,
