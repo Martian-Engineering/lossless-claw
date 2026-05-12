@@ -2886,6 +2886,13 @@ export class LcmContextEngine implements ContextEngine {
   private oversizedAutoRotateCheckpointByQueueKey = new Map<string, number>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
+  /**
+   * Dedup set for "compactionTargetFraction below the 0.05 safety floor"
+   * warnings. Under bursty Codex autonomous loops a misconfigured operator
+   * would otherwise log dozens of identical warnings per session — once
+   * per fraction value per process is plenty.
+   */
+  private readonly warnedFloorFractions = new Set<number>();
   private deps: LcmDependencies;
 
   /**
@@ -3792,9 +3799,7 @@ export class LcmContextEngine implements ContextEngine {
       && fractionInput > 0
       && fractionInput < 0.05
     ) {
-      this.log.warn(
-        `[lcm] compactionTargetFraction=${fractionInput} is below the 0.05 safety floor — falling back to the enum-based compaction target. Use a value in [0.05, 1].`,
-      );
+      this.warnBelowFloorOnce(fractionInput);
     }
     const targetTokens =
       validFraction !== undefined
@@ -7712,13 +7717,21 @@ export class LcmContextEngine implements ContextEngine {
       return { handled: false, reason: "stateless-session" };
     }
     // Guard 2: configuration says LCM should not intercept. If
-    // compactionTargetFraction is unset, the operator hasn't opted into
-    // the accordion cadence — fall back to codex's native compaction.
+    // compactionTargetFraction is unset (or below the 0.05 safety floor /
+    // outside (0, 1]), the operator hasn't opted into the accordion
+    // cadence — fall back to codex's native compaction.
+    //
+    // Validation MUST be coherent with the engine-level gate at
+    // executeCompactionCore (see src/engine.ts ~line 3528) and the
+    // lcm_compact tool's validator. Wave-B P1: divergence here meant
+    // a fraction in (0, 0.05) passed Guard 2 (proceeded with intercept)
+    // then triggered a warning + fallback inside compact() — wasted
+    // LLM call on a value the engine would refuse. Unify the gate.
     const targetFraction = this.config.compactionTargetFraction;
     if (
       typeof targetFraction !== "number"
       || !Number.isFinite(targetFraction)
-      || targetFraction <= 0
+      || targetFraction < 0.05
       || targetFraction > 1
     ) {
       return { handled: false, reason: "no-target-fraction-configured" };
@@ -9229,6 +9242,27 @@ export class LcmContextEngine implements ContextEngine {
     // Deduplicate (a message could theoretically appear in multiple turns)
     const uniqueIds = [...new Set(toDelete)];
     return this.conversationStore.deleteMessages(uniqueIds);
+  }
+
+  /**
+   * Warn once per unique fraction value when `compactionTargetFraction` is
+   * below the 0.05 safety floor. Codex autonomous loops can fire compaction
+   * 1-5× per turn; without dedup a misconfigured operator would see
+   * dozens of identical warnings per session.
+   *
+   * Dedup is per-fraction-value (not per-session) because a single
+   * misconfiguration usually shows up as the same wrong number repeatedly;
+   * a DIFFERENT wrong number is worth a fresh warning since it may signal
+   * the operator is iterating on the config.
+   */
+  private warnBelowFloorOnce(fraction: number): void {
+    if (this.warnedFloorFractions.has(fraction)) {
+      return;
+    }
+    this.warnedFloorFractions.add(fraction);
+    this.log.warn(
+      `[lcm] compactionTargetFraction=${fraction} is below the 0.05 safety floor — falling back to the enum-based compaction target. Use a value in [0.05, 1]. (Subsequent occurrences of this fraction value will be silent.)`,
+    );
   }
 }
 
