@@ -6342,6 +6342,16 @@ export class LcmContextEngine implements ContextEngine {
       stored = rawPayloadIntercepted.stored;
     }
 
+    const latestMessage = stored.content.length > 0
+      ? await this.conversationStore.getLastMessage(conversationId)
+      : null;
+    if (latestMessage?.role === stored.role && latestMessage.content === stored.content) {
+      this.deps.log.info(
+        `[lcm] ingestSingle: adjacent duplicate message skipped conversation=${conversationId} role=${stored.role}`,
+      );
+      return { ingested: false };
+    }
+
     // Determine next sequence number
     const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
     const seq = maxSeq + 1;

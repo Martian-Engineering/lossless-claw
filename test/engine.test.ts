@@ -824,6 +824,40 @@ describe("LcmContextEngine stateless sessions", () => {
     ).toBe(3);
   });
 
+  it("skips duplicate ingests with the same role and content in one conversation", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const sessionKey = "agent:poppy:main";
+
+    const first = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "same payload" }),
+    });
+    const duplicate = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "same payload" }),
+    });
+    const differentRole = await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "same payload" }),
+    });
+
+    expect(first).toEqual({ ingested: true });
+    expect(duplicate).toEqual({ ingested: false });
+    expect(differentRole).toEqual({ ingested: true });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(
+      await engine.getConversationStore().getMessageCount(conversation!.conversationId),
+    ).toBe(2);
+  });
+
   it("allows assemble reads for stateless session keys", async () => {
     const engine = createEngineWithConfig({
       statelessSessionPatterns: ["agent:*:subagent:worker-*"],
