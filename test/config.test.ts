@@ -297,6 +297,7 @@ describe("resolveLcmConfig", () => {
       statelessSessionPatternsSource: "env",
       ignoreSessionPatternsEnvOverridesPluginConfig: true,
       statelessSessionPatternsEnvOverridesPluginConfig: true,
+      codexOAuthProfileApplied: false,
     });
   });
 
@@ -951,5 +952,86 @@ describe("resolveLcmConfig databasePath uses OPENCLAW_STATE_DIR", () => {
       {},
     );
     expect(config.databasePath).toBe("/explicit/db.sqlite");
+  });
+});
+
+describe("resolveLcmConfig Codex OAuth profile (PR follow-up to #619)", () => {
+  it("does NOT apply OAuth defaults when oauthProfileActive is false (legacy behavior)", () => {
+    const { config, diagnostics } = resolveLcmConfigWithDiagnostics(
+      {} as NodeJS.ProcessEnv,
+      {},
+      /* oauthProfileActive */ false,
+    );
+    expect(config.contextThreshold).toBe(0.75); // legacy default, not 0.90
+    expect(config.compactionTargetFraction).toBeUndefined();
+    expect(config.codexOAuthProfile).toBe("auto");
+    expect(diagnostics.codexOAuthProfileApplied).toBe(false);
+  });
+
+  it("applies OAuth defaults when oauthProfileActive is true AND codexOAuthProfile is auto", () => {
+    const { config, diagnostics } = resolveLcmConfigWithDiagnostics(
+      {} as NodeJS.ProcessEnv,
+      {},
+      /* oauthProfileActive */ true,
+    );
+    expect(config.contextThreshold).toBe(0.90); // OAuth default
+    expect(config.compactionTargetFraction).toBe(0.35);
+    expect(config.proactiveThresholdCompactionMode).toBe("deferred");
+    expect(config.codexOAuthProfile).toBe("auto");
+    expect(diagnostics.codexOAuthProfileApplied).toBe(true);
+  });
+
+  it("does NOT apply OAuth defaults when codexOAuthProfile is 'off' even if oauthProfileActive", () => {
+    const { config, diagnostics } = resolveLcmConfigWithDiagnostics(
+      {} as NodeJS.ProcessEnv,
+      { codexOAuthProfile: "off" },
+      /* oauthProfileActive */ true,
+    );
+    expect(config.contextThreshold).toBe(0.75); // legacy default
+    expect(config.compactionTargetFraction).toBeUndefined();
+    expect(config.codexOAuthProfile).toBe("off");
+    expect(diagnostics.codexOAuthProfileApplied).toBe(false);
+  });
+
+  it("plugin config explicitly overrides OAuth defaults (operator's value wins)", () => {
+    const { config, diagnostics } = resolveLcmConfigWithDiagnostics(
+      {} as NodeJS.ProcessEnv,
+      { contextThreshold: 0.6 },
+      /* oauthProfileActive */ true,
+    );
+    expect(config.contextThreshold).toBe(0.6); // operator override wins
+    expect(config.compactionTargetFraction).toBe(0.35); // still applies (no explicit override)
+    expect(diagnostics.codexOAuthProfileApplied).toBe(true);
+  });
+
+  it("env vars override OAuth defaults (highest precedence)", () => {
+    const { config } = resolveLcmConfigWithDiagnostics(
+      {
+        LCM_CONTEXT_THRESHOLD: "0.5",
+        LCM_COMPACTION_TARGET_FRACTION: "0.5",
+      } as NodeJS.ProcessEnv,
+      {},
+      /* oauthProfileActive */ true,
+    );
+    expect(config.contextThreshold).toBe(0.5);
+    expect(config.compactionTargetFraction).toBe(0.5);
+  });
+
+  it("compactionTargetFraction default is undefined (legacy behavior preserved)", () => {
+    const config = resolveLcmConfig({} as NodeJS.ProcessEnv, {});
+    expect(config.compactionTargetFraction).toBeUndefined();
+  });
+
+  it("compactionTargetFraction set from plugin config without OAuth profile", () => {
+    const config = resolveLcmConfig({} as NodeJS.ProcessEnv, { compactionTargetFraction: 0.4 });
+    expect(config.compactionTargetFraction).toBe(0.4);
+  });
+
+  it("codexOAuthProfile defaults to 'auto' regardless of input", () => {
+    const c1 = resolveLcmConfig({} as NodeJS.ProcessEnv, {});
+    expect(c1.codexOAuthProfile).toBe("auto");
+
+    const c2 = resolveLcmConfig({} as NodeJS.ProcessEnv, { codexOAuthProfile: "invalid-value" });
+    expect(c2.codexOAuthProfile).toBe("auto"); // falls back to auto for invalid values
   });
 });
