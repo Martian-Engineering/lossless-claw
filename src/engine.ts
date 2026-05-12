@@ -1941,11 +1941,27 @@ export class LcmContextEngine implements ContextEngine {
     // Only claim ownership of compaction when the DB is operational.
     // Without a working schema, ownsCompaction would disable the runtime's
     // built-in compaction safeguard and inflate the context budget.
+    //
+    // `ownsCompaction` and `interceptsCompaction` advertise capability against
+    // distinct compaction flows in openclaw:
+    //   - `ownsCompaction` covers the openclaw queued-compaction lane
+    //     (afterTurn-driven, explicit `/compact`) — engine.compact() is
+    //     dispatched directly via `compact.queued.ts`.
+    //   - `interceptsCompaction` covers the pi-coding-agent SDK event lane
+    //     (`session_before_compact`), driven by codex's in-attempt overflow
+    //     auto-compact at ~90% context. Routed through
+    //     `engine.interceptCompaction()` by openclaw's compaction-intercept
+    //     extension factory.
+    // Both lanes use the same compaction code path (this.compact) and the
+    // same hard-floor / target-fraction settings; they differ only in WHO
+    // triggers the call. LCM advertises both so the SDK lane is intercepted
+    // instead of falling through to codex's lossy GPT summarization.
     this.info = {
       id: "lossless-claw",
       name: "Lossless Context Management Engine",
       version: "0.1.0",
       ownsCompaction: migrationOk,
+      interceptsCompaction: migrationOk,
       turnMaintenanceMode: "background",
     } as ContextEngineInfo;
 
@@ -2722,15 +2738,34 @@ export class LcmContextEngine implements ContextEngine {
     // Resolve effective fraction-target (if supplied, overrides the
     // enum-based target). PR follow-up to #619: introduces the
     // compactionTargetFraction knob used by the Codex OAuth accordion cadence
-    // (90% trigger → 35% target). Validated to (0, 1]; bad values are
-    // ignored and we fall back to the enum-based target.
+    // (90% trigger → 35% target). Validated to [0.05, 1]; bad values fall
+    // back to the enum-based target.
+    //
+    // Lower bound 0.05 is a SAFETY FLOOR: smaller fractions can land below
+    // the freshTail / system-prompt / tool-defs overhead on most contexts
+    // (typical overhead is ~2-5% of a 258K window), making the convergence
+    // loop spin until maxRounds. 0.05 of a 256K window = ~12.8K tokens,
+    // which is just above the typical overhead. Smaller fractions are most
+    // likely a user/config bug (e.g. typing 0.05 vs 0.5) — we conservatively
+    // bail to the enum-based default instead of executing them.
+    const fractionInput = params.compactionTargetFraction;
     const validFraction =
-      typeof params.compactionTargetFraction === "number"
-      && Number.isFinite(params.compactionTargetFraction)
-      && params.compactionTargetFraction > 0
-      && params.compactionTargetFraction <= 1
-        ? params.compactionTargetFraction
+      typeof fractionInput === "number"
+      && Number.isFinite(fractionInput)
+      && fractionInput >= 0.05
+      && fractionInput <= 1
+        ? fractionInput
         : undefined;
+    if (
+      typeof fractionInput === "number"
+      && Number.isFinite(fractionInput)
+      && fractionInput > 0
+      && fractionInput < 0.05
+    ) {
+      this.log.warn(
+        `[lcm] compactionTargetFraction=${fractionInput} is below the 0.05 safety floor — falling back to the enum-based compaction target. Use a value in [0.05, 1].`,
+      );
+    }
     const targetTokens =
       validFraction !== undefined
         ? Math.max(1, Math.floor(validFraction * tokenBudget))
