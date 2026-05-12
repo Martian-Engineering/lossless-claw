@@ -31,6 +31,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "condensedMinFanoutHard": 2,
   "incrementalMaxDepth": 1,
   "leafChunkTokens": 20000,
+  "compactionStartTokens": 0,
   "bootstrapMaxTokens": 6000,
   "leafTargetTokens": 2400,
   "condensedTargetTokens": 2000,
@@ -151,6 +152,7 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |
 | `incrementalMaxDepth` | `integer` | `1` | `LCM_INCREMENTAL_MAX_DEPTH` | Maximum automatic condensation depth after leaf compaction. Use `0` for leaf-only and `-1` for unlimited depth. |
 | `leafChunkTokens` | `integer` | `20000` | `LCM_LEAF_CHUNK_TOKENS` | Maximum source-token budget for a leaf compaction chunk. |
+| `compactionStartTokens` | `integer` | `0` | `LCM_COMPACTION_START_TOKENS` | Minimum current prompt tokens before optional LCM compaction may start. `0` disables this floor; critical budget pressure can bypass it before overflow. |
 | `bootstrapMaxTokens` | `integer` | `max(6000, floor(leafChunkTokens * 0.3))` | `LCM_BOOTSTRAP_MAX_TOKENS` | Maximum parent-history tokens imported when a new LCM conversation bootstraps. |
 | `leafTargetTokens` | `integer` | `2400` | `LCM_LEAF_TARGET_TOKENS` | Prompt target for leaf summary size. |
 | `condensedTargetTokens` | `integer` | `2000` | `LCM_CONDENSED_TARGET_TOKENS` | Prompt target for condensed summary size. |
@@ -204,6 +206,12 @@ Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capabil
 | --- | --- | --- | --- | --- |
 | `dynamicLeafChunkTokens.enabled` | `boolean` | `true` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED` | Enables dynamic working leaf chunk sizes for busier sessions. |
 | `dynamicLeafChunkTokens.max` | `integer` | `max(leafChunkTokens, floor(leafChunkTokens * 2))` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX` | Upper bound for the dynamic working chunk size. With the default `leafChunkTokens=20000`, this resolves to `40000`. |
+
+### Compaction start floor
+
+Set `compactionStartTokens` when you want LCM to preserve raw history until the assembled prompt reaches an explicit absolute size. For example, `compactionStartTokens: 120000` means leaf-trigger and proactive-threshold compaction stay inactive below 120k current prompt tokens, even if `leafChunkTokens` has already been exceeded.
+
+This floor only gates optional prompt-mutating compaction. Once `currentTokenCount >= cacheAwareCompaction.criticalBudgetPressureRatio * tokenBudget`, LCM may compact anyway so the prompt can stay under the model budget.
 
 ### Cache-aware incremental compaction
 

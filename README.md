@@ -135,6 +135,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
         "config": {
           "freshTailCount": 64,
           "leafChunkTokens": 80000,
+          "compactionStartTokens": 0,
           "newSessionRetainDepth": 2,
           "contextThreshold": 0.75,
           "incrementalMaxDepth": 1,
@@ -158,7 +159,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 }
 ```
 
-`leafChunkTokens` controls how many source tokens can accumulate in a leaf compaction chunk before summarization is triggered. The default is `20000`, but quota-limited summary providers may benefit from a larger value to reduce compaction frequency. `summaryModel` and `summaryProvider` let you request a cheaper or faster compaction model through OpenClaw's `api.runtime.llm.complete` capability; OpenClaw still owns provider dispatch and auth. Explicit summary model requests require `llm.allowModelOverride` and matching `llm.allowedModels` policy entries for `lossless-claw`. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). `delegationTimeoutMs` controls how long `lcm_expand_query` waits for that delegated sub-agent to finish before returning a timeout error; it defaults to `120000` (120s). `summaryTimeoutMs` controls the per-call timeout for model-backed LCM summarization; it defaults to `60000` (60s). When unset, the model settings still fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
+`leafChunkTokens` controls how many source tokens can accumulate in a leaf compaction chunk before summarization is triggered. The default is `20000`, but quota-limited summary providers may benefit from a larger value to reduce compaction frequency. `compactionStartTokens` is an optional absolute prompt-token floor: set it when you want LCM to keep raw history intact until the current prompt reaches that size. `summaryModel` and `summaryProvider` let you request a cheaper or faster compaction model through OpenClaw's `api.runtime.llm.complete` capability; OpenClaw still owns provider dispatch and auth. Explicit summary model requests require `llm.allowModelOverride` and matching `llm.allowedModels` policy entries for `lossless-claw`. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). `delegationTimeoutMs` controls how long `lcm_expand_query` waits for that delegated sub-agent to finish before returning a timeout error; it defaults to `120000` (120s). `summaryTimeoutMs` controls the per-call timeout for model-backed LCM summarization; it defaults to `60000` (60s). When unset, the model settings still fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
 
 ### Environment variables
 
@@ -177,6 +178,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_CONDENSED_MIN_FANOUT_HARD` | `2` | Relaxed fanout for forced compaction sweeps |
 | `LCM_INCREMENTAL_MAX_DEPTH` | `1` | How deep incremental compaction goes (0 = leaf only, 1 = one condensed pass, -1 = unlimited) |
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Max source tokens per leaf compaction chunk |
+| `LCM_COMPACTION_START_TOKENS` | `0` | Minimum current prompt tokens before optional LCM compaction may start |
 | `LCM_LEAF_TARGET_TOKENS` | `1200` | Target token count for leaf summaries |
 | `LCM_CONDENSED_TARGET_TOKENS` | `2000` | Target token count for condensed summaries |
 | `LCM_MAX_EXPAND_TOKENS` | `4000` | Token cap for sub-agent expansion queries |
@@ -265,6 +267,7 @@ Summary calls are dispatched through OpenClaw's runtime LLM layer, so auth profi
 ```
 LCM_FRESH_TAIL_COUNT=64
 LCM_LEAF_CHUNK_TOKENS=20000
+LCM_COMPACTION_START_TOKENS=0
 LCM_INCREMENTAL_MAX_DEPTH=1
 LCM_CONTEXT_THRESHOLD=0.75
 LCM_SUMMARY_MODEL=openai/gpt-5.4-mini
@@ -273,6 +276,7 @@ LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
 
 - **freshTailCount=64** protects the last 64 messages from compaction, giving the model more recent context for continuity.
 - **leafChunkTokens=20000** limits how large each leaf compaction chunk can grow before LCM summarizes it. Increase this when your summary provider is quota-limited and frequent leaf compactions are exhausting that quota.
+- **compactionStartTokens=0** leaves optional compaction available immediately. Set a positive value when you want LCM to fully preserve raw history until the current prompt reaches that absolute token count; critical budget pressure can still compact before overflow.
 - **incrementalMaxDepth=1** runs one condensed pass after each leaf compaction by default. Set to `0` for leaf-only behavior, a larger positive integer for a deeper cap, or `-1` for unlimited cascading.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
 

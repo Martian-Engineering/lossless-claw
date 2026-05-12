@@ -101,6 +101,25 @@ Use this when:
 - Your summarizer is rate-limited or expensive.
 - You want fewer but broader leaf summaries.
 
+### `compactionStartTokens`
+
+Sets an absolute current-prompt token floor before optional compaction may start.
+
+Why it matters:
+
+- It preserves fully raw history below a known prompt size.
+- It is easier to reason about than budget-headroom ratios when the operator's goal is "do not digest before N tokens."
+- It leaves emergency budget protection intact through `cacheAwareCompaction.criticalBudgetPressureRatio`.
+
+Good default:
+
+- `0`, which disables the floor
+
+Use this when:
+
+- You run long-context models and want raw recent-session material preserved until a specific token count.
+- You want to delay both leaf-trigger and proactive-threshold compaction while the prompt is still comfortably small.
+
 ### `cacheAwareCompaction`
 
 Controls how strongly lossless-claw preserves a healthy prompt cache during incremental maintenance.
@@ -324,6 +343,10 @@ Env override:
 - `LCM_STUB_LARGE_TOOL_PAYLOADS`
 
 ### `leafChunkTokens`
+
+See high-impact settings above.
+
+### `compactionStartTokens`
 
 See high-impact settings above.
 

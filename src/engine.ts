@@ -129,6 +129,7 @@ type DynamicLeafChunkBounds = {
   max: number;
 };
 const DEFERRED_COMPACTION_STILL_NEEDED_REASON = "deferred compaction still needed";
+const BELOW_COMPACTION_START_TOKENS_REASON = "below-compaction-start-tokens";
 const MAX_BUDGET_TRIGGER_CATCHUP_PASSES = 10;
 type TranscriptRewriteReplacement = {
   entryId: string;
@@ -2549,6 +2550,45 @@ export class LcmContextEngine implements ContextEngine {
     return params.currentTokenCount <= safeBudget;
   }
 
+  /**
+   * Keep optional compaction disabled until the assembled prompt reaches the
+   * operator's explicit start line. Critical budget pressure bypasses this so
+   * LCM can still compact before the runtime hits emergency overflow handling.
+   */
+  private isBelowCompactionStartTokens(params: {
+    currentTokenCount?: number;
+    tokenBudget: number;
+  }): boolean {
+    const startTokens = Math.max(0, Math.floor(this.config.compactionStartTokens));
+    if (startTokens <= 0) {
+      return false;
+    }
+    if (
+      typeof params.currentTokenCount !== "number"
+      || !Number.isFinite(params.currentTokenCount)
+      || params.currentTokenCount < 0
+    ) {
+      return false;
+    }
+    if (this.isUnderCriticalBudgetPressure(params)) {
+      return false;
+    }
+    return params.currentTokenCount < startTokens;
+  }
+
+  private shouldKeepDeferredLeafDebt(decision: IncrementalCompactionDecision): boolean {
+    if (decision.shouldCompact) {
+      return true;
+    }
+    if (
+      decision.reason === "hot-cache-budget-headroom"
+      || decision.reason === "hot-cache-defer"
+    ) {
+      return decision.rawTokensOutsideTail >= decision.threshold;
+    }
+    return false;
+  }
+
   /** Scale budget-trigger catch-up passes by how far the prompt exceeds threshold. */
   private resolveBudgetTriggerCatchupPasses(params: {
     currentTokens: number;
@@ -2975,6 +3015,33 @@ export class LcmContextEngine implements ContextEngine {
       });
     }
 
+    if (
+      this.isBelowCompactionStartTokens({
+        currentTokenCount: params.currentTokenCount,
+        tokenBudget: params.tokenBudget,
+      })
+    ) {
+      return this.logIncrementalCompactionDecision({
+        conversationId: params.conversationId,
+        cacheState,
+        activityBand,
+        tokenBudget: params.tokenBudget,
+        currentTokenCount: params.currentTokenCount,
+        cacheRead,
+        cacheWrite,
+        cachePromptTokenCount,
+        triggerLeafChunkTokens,
+        preferredLeafChunkTokens,
+        fallbackLeafChunkTokens,
+        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
+        threshold: leafTrigger.threshold,
+        shouldCompact: false,
+        maxPasses: 1,
+        allowCondensedPasses: false,
+        reason: BELOW_COMPACTION_START_TOKENS_REASON,
+      });
+    }
+
     const budgetDecision = await this.compaction.evaluate(
       params.conversationId,
       params.tokenBudget,
@@ -3282,10 +3349,9 @@ export class LcmContextEngine implements ContextEngine {
                   leafDecision,
                   currentTokenCount: resolvedCurrentTokenCount,
                   tokenBudget: resolvedTokenBudget,
-                });
+              });
               if (!leafDecision.shouldCompact) {
-                const deferredLeafStillNeeded =
-                  leafDecision.rawTokensOutsideTail >= leafDecision.threshold;
+                const deferredLeafStillNeeded = this.shouldKeepDeferredLeafDebt(leafDecision);
                 if (executionLeafDecision === leafDecision) {
                   return {
                     ok: true,
@@ -3457,6 +3523,27 @@ export class LcmContextEngine implements ContextEngine {
         reason: "missing token budget in compact params",
       };
     }
+    const observedTokens = this.normalizeObservedTokenCount(
+      params.currentTokenCount ??
+        (
+          lp as {
+            currentTokenCount?: unknown;
+          }
+        ).currentTokenCount,
+    );
+    if (
+      !forceCompaction
+      && this.isBelowCompactionStartTokens({
+        currentTokenCount: observedTokens,
+        tokenBudget,
+      })
+    ) {
+      return {
+        ok: true,
+        compacted: false,
+        reason: BELOW_COMPACTION_START_TOKENS_REASON,
+      };
+    }
 
     const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
       legacyParams: this.buildSummarizerLegacyParams({
@@ -3475,14 +3562,6 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const conversationId = params.conversationId;
-    const observedTokens = this.normalizeObservedTokenCount(
-      params.currentTokenCount ??
-        (
-          lp as {
-            currentTokenCount?: unknown;
-          }
-        ).currentTokenCount,
-    );
     const decision =
       observedTokens !== undefined
         ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
@@ -6829,6 +6908,12 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget,
         observedCurrentTokenCount,
       );
+      const belowCompactionStartTokens = this.isBelowCompactionStartTokens({
+        currentTokenCount: observedCurrentTokenCount,
+        tokenBudget,
+      });
+      const thresholdDebtNeeded =
+        thresholdDecision.shouldCompact && !belowCompactionStartTokens;
       if (this.config.proactiveThresholdCompactionMode === "inline") {
         let leafCompactionScheduled = false;
         if (leafDecision.shouldCompact) {
@@ -6848,27 +6933,29 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         if (!leafCompactionScheduled) {
-          const compactResult = await this.compact({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            sessionFile: params.sessionFile,
-            tokenBudget,
-            currentTokenCount: observedCurrentTokenCount,
-            compactionTarget: "threshold",
-            legacyParams,
-          });
+          const compactResult = belowCompactionStartTokens
+            ? {
+                ok: true,
+                compacted: false,
+                reason: BELOW_COMPACTION_START_TOKENS_REASON,
+              }
+            : await this.compact({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                sessionFile: params.sessionFile,
+                tokenBudget,
+                currentTokenCount: observedCurrentTokenCount,
+                compactionTarget: "threshold",
+                legacyParams,
+              });
           const retryReason = thresholdDecision.shouldCompact ? "threshold" : null;
           if (!compactResult.ok && retryReason) {
             shouldRefreshBootstrapState = false;
             await recordAfterTurnCompactionRetry(retryReason);
           }
         }
-      } else if (thresholdDecision.shouldCompact || rawLeafTrigger?.shouldCompact) {
-        const deferredReason = thresholdDecision.shouldCompact
-          ? "threshold"
-          : leafDecision.shouldCompact
-            ? leafDecision.reason
-            : "leaf-trigger";
+      } else if (thresholdDebtNeeded || this.shouldKeepDeferredLeafDebt(leafDecision)) {
+        const deferredReason = thresholdDebtNeeded ? "threshold" : leafDecision.reason;
         await this.recordDeferredCompactionDebt({
           conversationId: conversation.conversationId,
           reason: deferredReason,

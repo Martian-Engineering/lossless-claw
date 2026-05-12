@@ -34,6 +34,7 @@ describe("resolveLcmConfig", () => {
     expect(config.newSessionRetainDepth).toBe(2);
     expect(config.incrementalMaxDepth).toBe(1);
     expect(config.leafChunkTokens).toBe(20000);
+    expect(config.compactionStartTokens).toBe(0);
     expect(config.leafMinFanout).toBe(8);
     expect(config.condensedMinFanout).toBe(4);
     expect(config.condensedMinFanoutHard).toBe(2);
@@ -72,6 +73,7 @@ describe("resolveLcmConfig", () => {
       freshTailMaxTokens: 12000,
       promptAwareEviction: false,
       leafChunkTokens: 80000,
+      compactionStartTokens: 120000,
       newSessionRetainDepth: 3,
       incrementalMaxDepth: -1,
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
@@ -116,6 +118,7 @@ describe("resolveLcmConfig", () => {
     expect(config.promptAwareEviction).toBe(false);
     expect(config.newSessionRetainDepth).toBe(3);
     expect(config.leafChunkTokens).toBe(80000);
+    expect(config.compactionStartTokens).toBe(120000);
     expect(config.incrementalMaxDepth).toBe(-1);
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
@@ -152,6 +155,7 @@ describe("resolveLcmConfig", () => {
       LCM_PROMPT_AWARE_EVICTION_ENABLED: "false",
       LCM_NEW_SESSION_RETAIN_DEPTH: "5",
       LCM_INCREMENTAL_MAX_DEPTH: "3",
+      LCM_COMPACTION_START_TOKENS: "120000",
       LCM_ENABLED: "false",
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
       LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
@@ -178,6 +182,7 @@ describe("resolveLcmConfig", () => {
       freshTailMaxTokens: 12000,
       promptAwareEviction: true,
       incrementalMaxDepth: -1,
+      compactionStartTokens: 60000,
       ignoreSessionPatterns: ["agent:*:test:*"],
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
@@ -230,6 +235,7 @@ describe("resolveLcmConfig", () => {
     expect(config.promptAwareEviction).toBe(false); // env wins
     expect(config.newSessionRetainDepth).toBe(5); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
+    expect(config.compactionStartTokens).toBe(120000); // env wins
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
       cacheTTLSeconds: 600,
@@ -649,6 +655,18 @@ describe("resolveLcmConfig", () => {
       type: "string",
       enum: ["deferred", "inline"],
     });
+  });
+
+  it("ships a manifest with compactionStartTokens in schema", () => {
+    expect(manifest.configSchema.properties.compactionStartTokens).toEqual({
+      type: "integer",
+      minimum: 0,
+    });
+  });
+
+  it("clamps compactionStartTokens to a non-negative integer", () => {
+    expect(resolveLcmConfig({}, { compactionStartTokens: -1 }).compactionStartTokens).toBe(0);
+    expect(resolveLcmConfig({}, { compactionStartTokens: 1234.9 }).compactionStartTokens).toBe(1234);
   });
 
   it("ships a manifest with autoRotateSessionFiles in schema", () => {

@@ -48,6 +48,10 @@
       "label": "Leaf Chunk Tokens",
       "help": "Maximum source tokens per leaf compaction chunk before summarization"
     },
+    "compactionStartTokens": {
+      "label": "Compaction Start Tokens",
+      "help": "Minimum current prompt tokens before optional LCM compaction may start. Set to 0 to disable; critical budget pressure can still compact before overflow."
+    },
     "bootstrapMaxTokens": {
       "label": "Bootstrap Max Tokens",
       "help": "Maximum raw parent-history tokens imported into a brand-new conversation bootstrap; oldest turns are dropped first"
@@ -278,6 +282,10 @@
       "leafChunkTokens": {
         "type": "integer",
         "minimum": 1
+      },
+      "compactionStartTokens": {
+        "type": "integer",
+        "minimum": 0
       },
       "bootstrapMaxTokens": {
         "type": "integer",

@@ -108,6 +108,8 @@ export type LcmConfig = {
   condensedMinFanoutHard: number;
   incrementalMaxDepth: number;
   leafChunkTokens: number;
+  /** Minimum current prompt token count before optional compaction may start. */
+  compactionStartTokens: number;
   /** Maximum raw parent-history tokens imported during first-time bootstrap. */
   bootstrapMaxTokens?: number;
   leafTargetTokens: number;
@@ -471,6 +473,14 @@ export function resolveLcmConfigWithDiagnostics(
         parseFiniteInt(env.LCM_INCREMENTAL_MAX_DEPTH)
           ?? toNumber(pc.incrementalMaxDepth) ?? 1,
       leafChunkTokens: resolvedLeafChunkTokens,
+      compactionStartTokens: Math.max(
+        0,
+        Math.floor(
+          parseFiniteInt(env.LCM_COMPACTION_START_TOKENS)
+            ?? toNumber(pc.compactionStartTokens)
+            ?? 0,
+        ),
+      ),
       bootstrapMaxTokens: resolvedBootstrapMaxTokens,
       leafTargetTokens:
         parseFiniteInt(env.LCM_LEAF_TARGET_TOKENS)
