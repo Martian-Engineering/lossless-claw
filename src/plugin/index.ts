@@ -1114,6 +1114,17 @@ function detectCodexOAuthSync(
   return false;
 }
 
+/**
+ * Test-only export of the real {@link detectCodexOAuthSync} implementation.
+ *
+ * Tests import this binding instead of mirroring the function locally — that
+ * way a divergence between the implementation and the documented contract
+ * surfaces as a test failure, not silent drift. Do not import this from
+ * production code paths; it exists purely so `test/codex-oauth-detection.test.ts`
+ * can exercise the actual function under test.
+ */
+export const __test_only_detectCodexOAuthSync = detectCodexOAuthSync;
+
 /** Build the minimal model shape required by runtime.modelAuth.getApiKeyForModel(). */
 function buildModelAuthLookupModel(params: {
   provider: string;

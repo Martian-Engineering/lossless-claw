@@ -1,37 +1,13 @@
 import { describe, it, expect } from "vitest";
+import { __test_only_detectCodexOAuthSync as detectMirror } from "../src/plugin/index.js";
 
 /**
  * Tests for detectCodexOAuthSync (PR follow-up to #619).
  *
- * The function itself is not exported (kept internal to plugin/index.ts),
- * so these tests exercise the behavior contract by mirroring the
- * detection logic. If the implementation diverges from these expectations,
- * either update the tests or — better — surface the function for direct
- * testing via a `__test_only` export.
+ * Imports the REAL function via the `__test_only_detectCodexOAuthSync`
+ * export so any divergence between docstring and behavior surfaces here as
+ * a test failure (no longer a local-mirror copy of the logic).
  */
-
-// Mirror the detection logic from plugin/index.ts to verify the contract.
-// Tests the SHAPE of detection without coupling to the import path.
-function detectMirror(
-  envSnapshot: { openclawDefaultModel?: string },
-  pluginConfig?: Record<string, unknown>,
-): boolean {
-  const PROVIDER = "openai-codex";
-  const startsWithCodex = (s: unknown): boolean =>
-    typeof s === "string" && s.trim().toLowerCase().startsWith(`${PROVIDER}/`);
-  const isCodexProvider = (s: unknown): boolean =>
-    typeof s === "string" && s.trim().toLowerCase() === PROVIDER;
-
-  if (startsWithCodex(envSnapshot.openclawDefaultModel)) return true;
-  if (!pluginConfig) return false;
-  if (isCodexProvider(pluginConfig.summaryProvider)) return true;
-  if (startsWithCodex(pluginConfig.summaryModel)) return true;
-  if (isCodexProvider(pluginConfig.expansionProvider)) return true;
-  if (startsWithCodex(pluginConfig.expansionModel)) return true;
-  if (isCodexProvider(pluginConfig.largeFileSummaryProvider)) return true;
-  if (startsWithCodex(pluginConfig.largeFileSummaryModel)) return true;
-  return false;
-}
 
 describe("detectCodexOAuthSync contract (PR follow-up to #619)", () => {
   it("returns false when no signals indicate codex", () => {
