@@ -948,6 +948,16 @@ export class CompactionEngine {
       previousSummaryContent = leafResult.content;
       runningTokens = passTokensAfter;
 
+      // PR follow-up to #619: precise stop has highest priority. When set,
+      // stop regardless of force/threshold.
+      if (stopAtTokens !== undefined && passTokensAfter <= stopAtTokens) {
+        previousTokens = passTokensAfter;
+        break;
+      }
+      if (!force && passTokensAfter <= threshold) {
+        previousTokens = passTokensAfter;
+        break;
+      }
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
         break;
       }
@@ -1158,6 +1168,15 @@ export class CompactionEngine {
         };
       }
 
+      // PR follow-up to #619: forward our target as the precise stop point
+      // ONLY when the caller asked for something stricter than the default
+      // (tokenBudget). Without this guard we'd break legacy auth-recovery
+      // semantics that rely on force=true running the sweep to exhaustion
+      // — the existing circuit-breaker test depends on multiple
+      // summarizer invocations during a forced sweep that already has
+      // tokens below tokenBudget. Restricting stopAtTokens to the
+      // fraction-target case preserves that behavior.
+      const stopAtTokens = targetTokens < tokenBudget ? targetTokens : undefined;
       const result = await this.compact({
         conversationId,
         tokenBudget,
@@ -1165,6 +1184,7 @@ export class CompactionEngine {
         force: true,
         summaryModel: input.summaryModel,
         operationDeadlineAt,
+        ...(stopAtTokens !== undefined ? { stopAtTokens } : {}),
       });
 
       if (result.authFailure) {
