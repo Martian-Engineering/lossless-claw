@@ -267,6 +267,63 @@ function hashSerializedMessages(messages: string[]): string {
   return createHash("sha256").update(JSON.stringify(messages)).digest("hex").slice(0, 16);
 }
 
+/**
+ * PR follow-up to #619 — serialize assembled AgentMessage[] into a single
+ * string suitable for codex's `CompactionResult.summary` field.
+ *
+ * Codex embeds this string into a USER message in `replacement_history`.
+ * Openclaw wraps it with the "OpenClaw assembled context for this turn:"
+ * envelope at the gateway side, so we just produce the body.
+ *
+ * Format: one role-prefixed block per AgentMessage, separated by blank
+ * lines. Content blocks (arrays) are JSON-encoded to preserve structure
+ * (tool_use, tool_result, image, etc.). String content is emitted verbatim.
+ *
+ * This is intentionally simple — the actual richness of the conversation
+ * is preserved inside the summary blocks emitted by formatSummaryContent
+ * in src/assembler.ts (each LCM summary becomes a `<summary id=… kind=…
+ * depth=…>…</summary>` XML block). Concatenating those gives codex a
+ * navigable history equivalent to its native GPT summary, but lossless.
+ */
+function serializeAssembledMessagesForCompaction(messages: AgentMessage[]): string {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return "(LCM produced no assembled context post-compaction.)";
+  }
+  const blocks: string[] = [];
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    const role = (msg as { role?: unknown }).role;
+    const roleLabel = typeof role === "string" && role.length > 0 ? role : "unknown";
+    const content = (msg as { content?: unknown }).content;
+    let body: string;
+    if (typeof content === "string") {
+      body = content;
+    } else if (Array.isArray(content)) {
+      // Join text blocks plainly; JSON-encode anything else (tool_use,
+      // tool_result, image) so structure is preserved without losing
+      // fidelity.
+      const parts: string[] = [];
+      for (const block of content) {
+        if (!block || typeof block !== "object") {
+          parts.push(String(block ?? ""));
+          continue;
+        }
+        const blockRecord = block as { type?: unknown; text?: unknown };
+        if (blockRecord.type === "text" && typeof blockRecord.text === "string") {
+          parts.push(blockRecord.text);
+        } else {
+          parts.push(JSON.stringify(block));
+        }
+      }
+      body = parts.join("\n");
+    } else {
+      body = JSON.stringify(content ?? "");
+    }
+    blocks.push(`[${roleLabel}]\n${body}`);
+  }
+  return blocks.join("\n\n");
+}
+
 function normalizeDebugTextSnippet(value: string, maxLength: number = 48): string {
   const collapsed = value.replace(/\s+/g, " ").trim();
   if (collapsed.length <= maxLength) {
@@ -7489,6 +7546,13 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget?: number;
     currentTokenCount?: number;
     compactionTarget?: "budget" | "threshold";
+    /**
+     * PR follow-up to #619: optional post-compaction target as a fraction of
+     * tokenBudget. See `executeCompactionCore` for validation + plumbing.
+     * Forwarded from lcm_compact's `targetFraction` param and from
+     * interceptCompaction's config-driven default.
+     */
+    compactionTargetFraction?: number;
     customInstructions?: string;
     /** OpenClaw runtime param name (preferred). */
     runtimeContext?: Record<string, unknown>;
@@ -7542,6 +7606,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget: params.tokenBudget,
           currentTokenCount: params.currentTokenCount,
           compactionTarget: params.compactionTarget,
+          compactionTargetFraction: params.compactionTargetFraction,
           customInstructions: params.customInstructions,
           runtimeContext: params.runtimeContext,
           legacyParams: params.legacyParams,
@@ -7549,6 +7614,155 @@ export class LcmContextEngine implements ContextEngine {
         });
       },
     );
+  }
+
+  /**
+   * PR follow-up to #619 — intercept codex's `session_before_compact` event
+   * (via openclaw's context-engine plugin hook) and run lossless compaction
+   * instead of letting codex's native GPT-summarization fire.
+   *
+   * Flow:
+   *   1. Run engine.compact() with the configured `compactionTargetFraction`
+   *      (defaults from CODEX_OAUTH_DEFAULTS when OAuth profile is active —
+   *      currently 0.35). This is the accordion cadence: agent has filled
+   *      to 90%; codex requested compaction; we lossless-compact down to
+   *      35% of budget using leaf + condensed passes.
+   *   2. Assemble the post-compaction context to get the AgentMessage[]
+   *      that represents the conversation as LCM now sees it.
+   *   3. Serialize that to a single string. Openclaw wraps it with the
+   *      "OpenClaw assembled context for this turn:" envelope and passes
+   *      to codex as the replacement_history.
+   *   4. Codex's GPT summarization call is skipped entirely — the model
+   *      sees our lossless-derived summary instead.
+   *
+   * Return shape mirrors pi-coding-agent's `SessionBeforeCompactResult`:
+   *   { handled: true, summary, tokensAfter, firstKeptEntryId } → codex
+   *      uses our summary, skips its GPT call.
+   *   { handled: false, reason } → codex falls back to its native GPT
+   *      compaction (current behavior pre-PR).
+   *
+   * Errors / aborts / timeouts → return `handled: false` so codex
+   * recovers gracefully. Never throw across the SDK boundary.
+   */
+  async interceptCompaction(request: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    tokenBudget?: number;
+    currentTokenCount?: number;
+    /**
+     * Codex's chosen cut-point — the entry id from which messages are kept
+     * verbatim. We echo this back unchanged so codex's history-shape
+     * invariants stay intact.
+     */
+    firstKeptEntryId: string;
+    /**
+     * Tokens-before count from codex's `CompactionPreparation.tokensBefore`.
+     * Mirrored back into the result for telemetry symmetry.
+     */
+    tokensBefore: number;
+    trigger?: "in-attempt-auto" | "overflow" | "timeout" | "manual";
+    /** AbortSignal forwarded from codex's compaction lifecycle. */
+    signal?: AbortSignal;
+  }): Promise<
+    | { handled: true; summary: string; tokensAfter: number; firstKeptEntryId: string; tokensBefore: number }
+    | { handled: false; reason: string }
+  > {
+    // Guard 1: stateless/ignored sessions never intercept — codex can do
+    // whatever it wants for sessions LCM doesn't track.
+    if (this.shouldIgnoreSession({ sessionId: request.sessionId, sessionKey: request.sessionKey })) {
+      return { handled: false, reason: "session-ignored" };
+    }
+    if (this.isStatelessSession(request.sessionKey)) {
+      return { handled: false, reason: "stateless-session" };
+    }
+    // Guard 2: configuration says LCM should not intercept. If
+    // compactionTargetFraction is unset, the operator hasn't opted into
+    // the accordion cadence — fall back to codex's native compaction.
+    const targetFraction = this.config.compactionTargetFraction;
+    if (
+      typeof targetFraction !== "number"
+      || !Number.isFinite(targetFraction)
+      || targetFraction <= 0
+      || targetFraction > 1
+    ) {
+      return { handled: false, reason: "no-target-fraction-configured" };
+    }
+
+    // Guard 3: aborted before we even start.
+    if (request.signal?.aborted === true) {
+      return { handled: false, reason: "aborted-pre-compaction" };
+    }
+
+    this.ensureMigrated();
+
+    try {
+      // Step 1: run compaction. force=true because codex is asking — the
+      // operator decision (configured fraction) takes precedence over
+      // the engine's threshold gate.
+      const compactResult = await this.compact({
+        sessionId: request.sessionId,
+        sessionKey: request.sessionKey,
+        sessionFile: request.sessionFile,
+        tokenBudget: request.tokenBudget,
+        currentTokenCount: request.currentTokenCount,
+        compactionTargetFraction: targetFraction,
+        force: true,
+      });
+
+      if (!compactResult.ok) {
+        return {
+          handled: false,
+          reason: `compact-failed:${compactResult.reason ?? "unknown"}`,
+        };
+      }
+
+      // Guard 4: aborted during compaction. We already mutated the DB
+      // (compaction is lossless to raw, so this is recoverable on next
+      // assemble), but codex doesn't want our summary anymore.
+      if (request.signal?.aborted === true) {
+        return { handled: false, reason: "aborted-mid-compaction" };
+      }
+
+      // Step 2: assemble the post-compaction context.
+      const assembled = await this.assemble({
+        sessionId: request.sessionId,
+        sessionKey: request.sessionKey,
+        messages: [],
+        tokenBudget: request.tokenBudget,
+      });
+
+      // Guard 5: if LCM has no assembled context to provide (e.g. session
+      // not tracked, conversation lookup missed, or only live messages
+      // exist with no DB-backed history), fall through to codex's native
+      // compaction. Returning handled:true with a fallback marker would
+      // confuse codex into using a near-empty summary.
+      if (!Array.isArray(assembled.messages) || assembled.messages.length === 0) {
+        return { handled: false, reason: "lcm-produced-no-context" };
+      }
+
+      // Step 3: serialize AgentMessage[] → string. Codex puts this in a
+      // single user message. Format mirrors what codex's native GPT
+      // compaction produces (XML-flavored summary blocks), but the wrapper
+      // header ("OpenClaw assembled context for this turn:...") is added
+      // by openclaw, not us — we just return the BODY.
+      const summary = serializeAssembledMessagesForCompaction(assembled.messages);
+
+      return {
+        handled: true,
+        summary,
+        tokensAfter: assembled.estimatedTokens,
+        firstKeptEntryId: request.firstKeptEntryId,
+        tokensBefore: request.tokensBefore,
+      };
+    } catch (err) {
+      // Defensive: never throw across the SDK boundary. Codex falls back
+      // to its native compaction if we say handled:false.
+      this.deps.log.error(
+        `[lcm] interceptCompaction failed for session=${request.sessionId}: ${describeLogError(err)}`,
+      );
+      return { handled: false, reason: `error:${describeLogError(err).slice(0, 100)}` };
+    }
   }
 
   async prepareSubagentSpawn(params: {
