@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "lossless-codex": {
+      "command": "node",
+      "args": ["scripts/mcp-server.mjs"],
+      "cwd": "."
+    }
+  }
+}

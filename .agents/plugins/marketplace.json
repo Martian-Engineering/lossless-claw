@@ -1,0 +1,32 @@
+{
+  "name": "lossless-claw-local",
+  "interface": {
+    "displayName": "Lossless Claw Local"
+  },
+  "plugins": [
+    {
+      "name": "codex-lcm-reader",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-lcm-reader"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Engineering"
+    },
+    {
+      "name": "lossless-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/lossless-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Engineering"
+    }
+  ]
+}

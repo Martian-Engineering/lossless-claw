@@ -1133,6 +1133,58 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(execCalls.at(-1)).toBe("COMMIT");
   });
 
+  it("creates compact temporal enrichment storage for sidecar systems", () => {
+    const db = createTestDb("temporal-enrichments.db");
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const table = db
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'table' AND name = 'lcm_temporal_enrichments'`,
+      )
+      .get() as { name?: string } | undefined;
+    const indexes = db
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'index' AND tbl_name = 'lcm_temporal_enrichments'
+         ORDER BY name`,
+      )
+      .all() as Array<{ name: string }>;
+
+    expect(table?.name).toBe("lcm_temporal_enrichments");
+    expect(indexes.map((row) => row.name)).toEqual(
+      expect.arrayContaining([
+        "lcm_temporal_enrichments_period_idx",
+        "lcm_temporal_enrichments_project_period_idx",
+      ]),
+    );
+
+    db.prepare(
+      `INSERT INTO lcm_temporal_enrichments (
+        enrichment_id, source_system, period_kind, period_key, timezone, project_key,
+        summary, payload_json, source_ref, coverage_status
+      ) VALUES (?, 'lossless_codex', 'day', '2026-05-04', 'Asia/Bangkok',
+        'lossless-claw', 'Codex worked on Lossless Codex.', '{"projectsWorked":[]}',
+        'lossless-codex://project-day/lossless-claw/2026-05-04', 'complete')`,
+    ).run("enr_test");
+
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO lcm_temporal_enrichments (
+            enrichment_id, source_system, period_kind, period_key, timezone, project_key,
+            summary, payload_json, source_ref, coverage_status
+          ) VALUES (?, 'lossless_codex', 'hour', '2026-05-04T01', 'Asia/Bangkok',
+            'lossless-claw', 'Invalid period.', '{}',
+            'lossless-codex://invalid', 'complete')`,
+        )
+        .run("enr_invalid"),
+    ).toThrow();
+  });
+
   it("retries a versioned backfill cleanly after the state write fails", () => {
     const db = createTestDb("retry-state-write.db");
     seedLegacySummaryGraph(db);
