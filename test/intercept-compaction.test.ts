@@ -79,11 +79,19 @@ function makeMinimalConfig(databasePath: string, overrides: Partial<LcmConfig> =
   } as unknown as LcmConfig;
 }
 
-function makeMinimalDeps(config: LcmConfig): LcmDependencies {
+function makeMinimalDeps(
+  config: LcmConfig,
+  logOverrides?: Partial<{ info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void; debug: (msg: string) => void }>,
+): LcmDependencies {
   const noop = () => {};
   return {
     config,
-    log: { info: noop, warn: noop, error: noop, debug: noop } as unknown as LcmDependencies["log"],
+    log: {
+      info: logOverrides?.info ?? noop,
+      warn: logOverrides?.warn ?? noop,
+      error: logOverrides?.error ?? noop,
+      debug: logOverrides?.debug ?? noop,
+    } as unknown as LcmDependencies["log"],
     complete: vi.fn(async () => ({ content: [{ type: "text", text: "" }] })),
     callGateway: vi.fn(async () => ({})),
     resolveModel: vi.fn(() => ({ provider: "test", model: "test-model" })),
@@ -106,13 +114,16 @@ function makeMinimalDeps(config: LcmConfig): LcmDependencies {
   } as unknown as LcmDependencies;
 }
 
-function makeEngine(overrides: Partial<LcmConfig> = {}): { engine: LcmContextEngine; db: DatabaseSync; tempDir: string } {
+function makeEngine(
+  overrides: Partial<LcmConfig> = {},
+  logOverrides?: Parameters<typeof makeMinimalDeps>[1],
+): { engine: LcmContextEngine; db: DatabaseSync; tempDir: string } {
   const tempDir = mkdtempSync(join(tmpdir(), "intercept-test-"));
   tempDirs.push(tempDir);
   const dbPath = join(tempDir, "lcm.db");
   const config = makeMinimalConfig(dbPath, overrides);
   const db = createLcmDatabaseConnection(dbPath);
-  const engine = new LcmContextEngine(makeMinimalDeps(config), db);
+  const engine = new LcmContextEngine(makeMinimalDeps(config, logOverrides), db);
   return { engine, db, tempDir };
 }
 
@@ -161,6 +172,52 @@ describe("interceptCompaction (PR follow-up to #619)", () => {
       if (!result.handled) {
         expect(result.reason).toBe("no-target-fraction-configured");
       }
+    }
+  });
+
+  it("returns handled:false for compactionTargetFraction below the 0.05 safety floor (wave-B regression guard)", async () => {
+    // Wave-B P1: Guard 2's validation must match the engine.compact() floor.
+    // Values in (0, 0.05) cause convergence-loop spin and were previously
+    // accepted by Guard 2 (then refused inside compact() with wasted LLM tokens).
+    // This test guards against silent regression of the wave-B unification.
+    const belowFloor: number[] = [0.01, 0.02, 0.04, 0.0499];
+    for (const v of belowFloor) {
+      const { engine } = makeEngine({ compactionTargetFraction: v } as Partial<LcmConfig>);
+      const result = await engine.interceptCompaction({
+        sessionId: "test-session",
+        sessionKey: "agent:main:main",
+        sessionFile: "/tmp/test.jsonl",
+        tokenBudget: 258000,
+        firstKeptEntryId: "entry-1",
+        tokensBefore: 200000,
+      });
+      expect(result.handled).toBe(false);
+      if (!result.handled) {
+        expect(result.reason).toBe("no-target-fraction-configured");
+      }
+    }
+  });
+
+  it("accepts compactionTargetFraction at the 0.05 floor (boundary)", async () => {
+    // 0.05 is the lowest accepted value (wave-B fix to (0, 1] → [0.05, 1]).
+    // At-floor reaches the inner code path; success of the actual compaction
+    // depends on session content (likely lcm-produced-no-context for an
+    // empty session) but the boundary check itself MUST not refuse 0.05.
+    const { engine } = makeEngine({ compactionTargetFraction: 0.05 } as Partial<LcmConfig>);
+    const result = await engine.interceptCompaction({
+      sessionId: "test-boundary",
+      sessionKey: "agent:main:main",
+      sessionFile: "/tmp/test.jsonl",
+      tokenBudget: 258000,
+      currentTokenCount: 232000,
+      firstKeptEntryId: "entry-1",
+      tokensBefore: 232000,
+    });
+    // The fraction itself is accepted (no "no-target-fraction-configured").
+    // Downstream may decline for other reasons (empty conversation, etc.),
+    // but the boundary value itself MUST pass Guard 2.
+    if (!result.handled) {
+      expect(result.reason).not.toBe("no-target-fraction-configured");
     }
   });
 
@@ -271,6 +328,72 @@ describe("interceptCompaction (PR follow-up to #619)", () => {
     expect(validate(1.01)).toBe(false);
     expect(validate(NaN)).toBe(false);
     expect(validate(undefined)).toBe(false);
+  });
+});
+
+describe("warnBelowFloorOnce dedup (wave-B regression guard)", () => {
+  // The under-floor warning is emitted via this.log.warn when
+  // engine.compact() is called with `compactionTargetFraction` in (0, 0.05).
+  // Codex autonomous loops can fire compaction 1-5× per turn; without
+  // dedup, a misconfigured operator would see dozens of identical warnings.
+  // The dedup Set is per-engine-instance and keyed by the fraction value
+  // (a different bad number gets a fresh warning so operators iterating
+  // on the config see fresh feedback).
+  //
+  // These tests exercise the private `warnBelowFloorOnce` method directly
+  // via a TS-cast — driving it through `engine.compact()` requires seeding
+  // a real conversation, which is heavier than the dedup logic itself
+  // needs for verification.
+  type EngineWithPrivates = LcmContextEngine & {
+    warnBelowFloorOnce(fraction: number): void;
+    warnedFloorFractions: Set<number>;
+  };
+
+  it("warns once for repeated calls with the same fraction value", () => {
+    const warnSpy = vi.fn();
+    const { engine } = makeEngine({}, { warn: warnSpy });
+    const e = engine as EngineWithPrivates;
+    e.warnBelowFloorOnce(0.02);
+    e.warnBelowFloorOnce(0.02);
+    e.warnBelowFloorOnce(0.02);
+    const underFloorWarnings = warnSpy.mock.calls.filter(
+      (c) => typeof c[0] === "string" && c[0].includes("below the 0.05 safety floor"),
+    );
+    expect(underFloorWarnings.length).toBe(1);
+  });
+
+  it("warns separately for DIFFERENT fraction values", () => {
+    const warnSpy = vi.fn();
+    const { engine } = makeEngine({}, { warn: warnSpy });
+    const e = engine as EngineWithPrivates;
+    for (const v of [0.02, 0.03, 0.04, 0.02 /* repeat */]) {
+      e.warnBelowFloorOnce(v);
+    }
+    const underFloorWarnings = warnSpy.mock.calls.filter(
+      (c) => typeof c[0] === "string" && c[0].includes("below the 0.05 safety floor"),
+    );
+    // Three unique values triggered warnings; the 4th call (0.02 again) was deduped.
+    expect(underFloorWarnings.length).toBe(3);
+  });
+
+  it("warning text names the dedup behavior so operators understand why subsequent calls are silent", () => {
+    const warnSpy = vi.fn();
+    const { engine } = makeEngine({}, { warn: warnSpy });
+    const e = engine as EngineWithPrivates;
+    e.warnBelowFloorOnce(0.02);
+    const [msg] = warnSpy.mock.calls[0] ?? [];
+    expect(typeof msg).toBe("string");
+    expect(msg).toMatch(/Subsequent occurrences/i);
+  });
+
+  it("records the fraction value in the internal dedup set", () => {
+    const { engine } = makeEngine();
+    const e = engine as EngineWithPrivates;
+    e.warnBelowFloorOnce(0.02);
+    e.warnBelowFloorOnce(0.03);
+    expect(e.warnedFloorFractions.has(0.02)).toBe(true);
+    expect(e.warnedFloorFractions.has(0.03)).toBe(true);
+    expect(e.warnedFloorFractions.has(0.05)).toBe(false);
   });
 });
 

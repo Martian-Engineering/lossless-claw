@@ -9260,7 +9260,7 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
     this.warnedFloorFractions.add(fraction);
-    this.log.warn(
+    this.deps.log.warn(
       `[lcm] compactionTargetFraction=${fraction} is below the 0.05 safety floor — falling back to the enum-based compaction target. Use a value in [0.05, 1]. (Subsequent occurrences of this fraction value will be silent.)`,
     );
   }
