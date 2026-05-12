@@ -34,6 +34,12 @@ export interface CompactionResult {
 export interface CompactionConfig {
   /** Context threshold as fraction of budget (default 0.75) */
   contextThreshold: number;
+  /**
+   * PR #619 follow-up — when true, treat `contextThreshold` as a hard
+   * floor for ALL compaction paths (leaf-trigger, condensed-trigger,
+   * incremental, full sweep). Default false preserves existing behavior.
+   */
+  respectThresholdAsHardFloor?: boolean;
   /** Number of fresh tail turns to protect (default 8) */
   freshTailCount: number;
   /** Optional token cap for the protected fresh tail; newest message is always preserved. */
@@ -506,6 +512,30 @@ export class CompactionEngine {
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
     const leafTrigger = await this.evaluateLeafTrigger(conversationId, input.leafChunkTokens);
 
+    // PR #619 follow-up — hard-floor short-circuit for the leaf-trigger path.
+    // The original PR gated `evaluateIncrementalCompaction` and the afterTurn
+    // deferred-debt recording, but NOT `_compactLeafImpl` or its inner
+    // condensed passes. As a result, leaf-trigger (raw-frontier accumulation)
+    // and condensed-trigger (depth-1 fan-out) still fired below the floor.
+    // This produced ~616K source tokens worth of lossy compactions on a
+    // single conversation overnight (2026-05-11 23:32 → 05-12 04:31), all
+    // while the operator believed the floor was holding. Honor the same
+    // semantics the commit message promised: never compact when current
+    // tokens are below `contextThreshold * tokenBudget`, *regardless* of
+    // leaf trigger, cache state, or activity band.
+    if (
+      !force
+      && this.config.respectThresholdAsHardFloor
+      && tokensBefore < threshold
+    ) {
+      return {
+        actionTaken: false,
+        tokensBefore,
+        tokensAfter: tokensBefore,
+        condensed: false,
+      };
+    }
+
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {
         actionTaken: false,
@@ -567,6 +597,18 @@ export class CompactionEngine {
     let runningTokens = tokensAfterLeaf;
     if (incrementalMaxDepth > 0 && input.allowCondensedPasses !== false) {
       for (let targetDepth = 0; targetDepth < incrementalMaxDepth; targetDepth++) {
+        // PR #619 follow-up — re-check the hard-floor between condensed
+        // passes. The outer leaf pass may have legitimately fired (we
+        // started above the threshold), but its token-reduction could
+        // push runningTokens below the floor. From that point onward,
+        // subsequent condensed passes must respect the floor too.
+        if (
+          !force
+          && this.config.respectThresholdAsHardFloor
+          && runningTokens < threshold
+        ) {
+          break;
+        }
         const fanout = this.resolveFanoutForDepth(targetDepth, false);
         const chunk = await this.selectOldestChunkAtDepth(conversationId, targetDepth);
         if (chunk.items.length < fanout || chunk.summaryTokens < condensedMinChunkTokens) {
@@ -636,6 +678,23 @@ export class CompactionEngine {
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
     const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+
+    // PR #619 follow-up — hard-floor short-circuit for compactFullSweep,
+    // same semantics as _compactLeafImpl. Without this, a full sweep
+    // triggered while the conversation was below the floor would still
+    // chew through raw frontier via leaf-trigger.
+    if (
+      !force
+      && this.config.respectThresholdAsHardFloor
+      && tokensBefore < threshold
+    ) {
+      return {
+        actionTaken: false,
+        tokensBefore,
+        tokensAfter: tokensBefore,
+        condensed: false,
+      };
+    }
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {

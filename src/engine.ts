@@ -1899,6 +1899,11 @@ export class LcmContextEngine implements ContextEngine {
 
     const compactionConfig: CompactionConfig = {
       contextThreshold: this.config.contextThreshold,
+      // PR #619 follow-up — plumb hard-floor flag into the compaction
+      // engine so leaf-trigger / condensed paths respect it (was only
+      // gated in engine-level evaluateIncrementalCompaction + afterTurn
+      // deferred-debt recording before this).
+      respectThresholdAsHardFloor: this.config.respectThresholdAsHardFloor,
       freshTailCount: this.config.freshTailCount,
       freshTailMaxTokens: this.config.freshTailMaxTokens,
       leafMinFanout: this.config.leafMinFanout,
