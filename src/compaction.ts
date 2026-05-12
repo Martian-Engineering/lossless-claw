@@ -473,6 +473,18 @@ export class CompactionEngine {
     force?: boolean;
     hardTrigger?: boolean;
     summaryModel?: string;
+    /**
+     * PR follow-up to #619: optional precise stop point for the sweep. When
+     * set, the leaf and condensed loops both break the moment running tokens
+     * drop to or below this value, regardless of `force`. Used by the
+     * fraction-target accordion cadence to stop at the operator-configured
+     * post-compaction floor (e.g. 35% of budget) instead of running to
+     * exhaustion. When unset, legacy behavior is preserved exactly:
+     *   - !force: break at `contextThreshold * tokenBudget`
+     *   - force: run until no further progress (or all eligible chunks
+     *     exhausted, hitting freshTailMaxTokens floor ~9% of budget).
+     */
+    stopAtTokens?: number;
   }): Promise<CompactionResult> {
     return this.withContextCache(() => this.compactFullSweep(input));
   }
@@ -636,11 +648,19 @@ export class CompactionEngine {
     force?: boolean;
     hardTrigger?: boolean;
     summaryModel?: string;
+    /** See `compact()` JSDoc — caller-supplied precise stop point. */
+    stopAtTokens?: number;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
+    const stopAtTokens =
+      typeof input.stopAtTokens === "number"
+      && Number.isFinite(input.stopAtTokens)
+      && input.stopAtTokens > 0
+        ? Math.floor(input.stopAtTokens)
+        : null;
 
     if (!force && tokensBefore <= threshold) {
       return {
@@ -708,6 +728,10 @@ export class CompactionEngine {
       previousSummaryContent = leafResult.content;
       runningTokens = passTokensAfter;
 
+      if (stopAtTokens !== null && passTokensAfter <= stopAtTokens) {
+        previousTokens = passTokensAfter;
+        break;
+      }
       if (!force && passTokensAfter <= threshold) {
         previousTokens = passTokensAfter;
         break;
@@ -723,6 +747,18 @@ export class CompactionEngine {
     const summaryPrefixTargetTokens = this.resolveSummaryPrefixTargetTokens(tokenBudget);
     const hasSummaryPrefixPressure = async (): Promise<boolean> =>
       (await this.countSummaryTokensOutsideFreshTail(conversationId)) > summaryPrefixTargetTokens;
+    const hasCondensationPressure = async (): Promise<boolean> => {
+      if (stopAtTokens !== null) {
+        return previousTokens > stopAtTokens;
+      }
+      return previousTokens > threshold || await hasSummaryPrefixPressure();
+    };
+    const shouldRunPreferredCondensation = async (): Promise<boolean> => {
+      if (stopAtTokens !== null) {
+        return previousTokens > stopAtTokens;
+      }
+      return force || await hasCondensationPressure();
+    };
 
     const runCondensationPass = async (params: {
       enforcePreferredDepth: boolean;
@@ -767,6 +803,10 @@ export class CompactionEngine {
       level = condenseResult.level;
       runningTokens = passTokensAfter;
 
+      if (stopAtTokens !== null && passTokensAfter <= stopAtTokens) {
+        previousTokens = passTokensAfter;
+        return "progress";
+      }
       if (!force && passTokensAfter <= threshold) {
         previousTokens = passTokensAfter;
         return "progress";
@@ -778,7 +818,7 @@ export class CompactionEngine {
       return "progress";
     };
 
-    while (force || previousTokens > threshold || await hasSummaryPrefixPressure()) {
+    while (await shouldRunPreferredCondensation()) {
       const status = await runCondensationPass({
         enforcePreferredDepth: true,
         useHardFanout: hardTrigger === true,
@@ -794,7 +834,7 @@ export class CompactionEngine {
     while (
       !hadAuthFailure &&
       !stoppedForNoProgress &&
-      (previousTokens > threshold || await hasSummaryPrefixPressure())
+      await hasCondensationPressure()
     ) {
       const status = await runCondensationPass({
         enforcePreferredDepth: false,
@@ -868,12 +908,22 @@ export class CompactionEngine {
     }
 
     for (let round = 1; round <= this.config.maxRounds; round++) {
+      // PR follow-up to #619: forward our target as the precise stop point
+      // ONLY when the caller asked for something stricter than the default
+      // (tokenBudget). Without this guard we'd break legacy auth-recovery
+      // semantics that rely on force=true running the sweep to exhaustion
+      // — the existing circuit-breaker test depends on multiple
+      // summarizer invocations during a forced sweep that already has
+      // tokens below tokenBudget. Restricting stopAtTokens to the
+      // fraction-target case preserves that behavior.
+      const stopAtTokens = targetTokens < tokenBudget ? targetTokens : undefined;
       const result = await this.compact({
         conversationId,
         tokenBudget,
         summarize,
         force: true,
         summaryModel: input.summaryModel,
+        ...(stopAtTokens !== undefined ? { stopAtTokens } : {}),
       });
 
       if (result.authFailure) {

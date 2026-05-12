@@ -135,6 +135,20 @@ type CompactionExecutionParams = {
   tokenBudget: number;
   currentTokenCount?: number;
   compactionTarget?: "budget" | "threshold";
+  /**
+   * Optional post-compaction target as a fraction of `tokenBudget`. When set
+   * (typically by the OAuth profile via `config.compactionTargetFraction`,
+   * or explicitly by the `lcm_compact` tool's `targetFraction` param), the
+   * compaction sweep continues until tokens drop to
+   * `targetTokens = compactionTargetFraction * tokenBudget`. Overrides the
+   * `compactionTarget` enum's implied target when both are present.
+   *
+   * Constraints (validated at the call site, not at the type):
+   *   - Must be in (0, 1] — values <= 0 or > 1 are ignored
+   *   - Should be <= contextThreshold so the sweep makes progress; otherwise
+   *     the compaction loop will no-op (legal but useless)
+   */
+  compactionTargetFraction?: number;
   customInstructions?: string;
   /** OpenClaw runtime param name (preferred). */
   runtimeContext?: Record<string, unknown>;
@@ -2648,8 +2662,24 @@ export class LcmContextEngine implements ContextEngine {
       observedTokens !== undefined
         ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
         : await this.compaction.evaluate(conversationId, tokenBudget);
+    // Resolve effective fraction-target (if supplied, overrides the
+    // enum-based target). PR follow-up to #619: introduces the
+    // compactionTargetFraction knob used by the Codex OAuth accordion cadence
+    // (90% trigger → 35% target). Validated to (0, 1]; bad values are
+    // ignored and we fall back to the enum-based target.
+    const validFraction =
+      typeof params.compactionTargetFraction === "number"
+      && Number.isFinite(params.compactionTargetFraction)
+      && params.compactionTargetFraction > 0
+      && params.compactionTargetFraction <= 1
+        ? params.compactionTargetFraction
+        : undefined;
     const targetTokens =
-      params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
+      validFraction !== undefined
+        ? Math.max(1, Math.floor(validFraction * tokenBudget))
+        : params.compactionTarget === "threshold"
+          ? decision.threshold
+          : tokenBudget;
     const liveContextStillExceedsTarget =
       observedTokens !== undefined && observedTokens >= targetTokens;
 
@@ -2666,6 +2696,13 @@ export class LcmContextEngine implements ContextEngine {
 
     // Forced budget recovery should use the capped convergence loop so live
     // overflow counts can drive recovery even when persisted context is already small.
+    //
+    // NOTE on fraction-target routing: `compactFullSweep` only honors the
+    // engine's internal `contextThreshold` as its stop condition (it has no
+    // notion of a caller-supplied target). To respect `compactionTargetFraction`
+    // we must route through the convergence loop (`compactUntilUnder`) below,
+    // which accepts `targetTokens` directly. Therefore we explicitly do NOT
+    // include the fraction case in useSweep.
     const useSweep = manualCompactionRequested || params.compactionTarget === "threshold";
     if (useSweep) {
       const sweepResult = await this.compaction.compact({
@@ -2729,12 +2766,17 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    // When forced, use the token budget as target
-    const convergenceTargetTokens = forceCompaction
-      ? tokenBudget
-      : params.compactionTarget === "threshold"
-        ? decision.threshold
-        : tokenBudget;
+    // When forced, use the token budget as target unless a fraction-target
+    // is explicitly supplied (the fraction overrides even the force case
+    // because the operator/agent specifically asked for that target).
+    const convergenceTargetTokens =
+      validFraction !== undefined
+        ? Math.max(1, Math.floor(validFraction * tokenBudget))
+        : forceCompaction
+          ? tokenBudget
+          : params.compactionTarget === "threshold"
+            ? decision.threshold
+            : tokenBudget;
 
     // When forced (overflow recovery) and the caller did not supply an
     // observed token count, assume we are at least at the token budget so
