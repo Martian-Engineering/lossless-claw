@@ -1393,7 +1393,7 @@ export function createLcmCommand(params: {
       telegram: "Lossless Claw is working...",
     },
     description:
-      "Show Lossless Claw health, create DB backups, compact the current session transcript while preserving LCM context, inspect high-confidence junk candidates, and run scoped doctor actions.",
+      "Lossless Claw health, backups, compaction, junk review, and doctor tools.",
     acceptsArgs: true,
     handler: async (ctx) => {
       const parsed = parseLcmCommand(ctx.args);
