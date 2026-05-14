@@ -50,7 +50,7 @@
     },
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",
-      "help": "Maximum source tokens per leaf compaction chunk before summarization (default 40000)"
+      "help": "Maximum source tokens per leaf compaction chunk before summarization (default 20000)"
     },
     "summaryPrefixTargetTokens": {
       "label": "Summary Prefix Target Tokens",

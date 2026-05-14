@@ -29,7 +29,7 @@ The new design is intentionally simpler:
 | Full sweep trigger | No longer starts only because `evaluateLeafTrigger()` is true. |
 | Full sweep preferred depth | `compactFullSweep()` now respects `sweepMaxDepth` during routine condensation. |
 | Fresh tail | Kept. It remains independent of incremental compaction. |
-| Default leaf chunk size | Raised from 20k to 40k tokens to reduce sweep frequency. |
+| Default leaf chunk size | Kept at 20k tokens. |
 | Deprecated depth key | `incrementalMaxDepth` remains accepted as an alias for `sweepMaxDepth`. |
 | Pressure escape hatch | `summaryPrefixTargetTokens` lets sweeps condense beyond the preferred depth when summarized context remains too large. |
 | `cacheAwareCompaction.*` | Still visible and accepted, but documented as deprecated compatibility config. |
@@ -166,7 +166,7 @@ That policy is removed from automatic scheduling. The important reason is not th
 | `proactiveThresholdCompactionMode` | Chooses inline vs deferred threshold full sweep. |
 | `freshTailCount` | Protects newest raw messages during assembly and compaction. |
 | `freshTailMaxTokens` | Optional cap for protected fresh-tail size. |
-| `leafChunkTokens` | Maximum raw material per leaf summary during sweep; default is now 40k. |
+| `leafChunkTokens` | Maximum raw material per leaf summary during sweep; default remains 20k. |
 | `leafMinFanout` | Minimum raw-message or depth-0 summary fanout for useful compaction. |
 | `condensedMinFanout` | Normal same-depth condensation grouping for depth 1+. |
 | `condensedMinFanoutHard` | Hard-trigger/repair condensation grouping. |
@@ -239,5 +239,5 @@ Removed or rewritten coverage:
 ## Follow-Up Watch Items
 
 1. If repeated threshold re-entry happens in live use, tune `summaryPrefixTargetTokens`, `contextThreshold`, `leafChunkTokens`, and fanout before adding a total-context target floor.
-2. If 40k leaf chunks make individual summary calls too slow, consider 30k before changing summary prompts.
+2. If 20k leaf chunks make threshold sweeps too frequent, consider 30k before adding new mechanisms.
 3. If stable orphan stripping removal causes measurable cache regressions in tool-heavy sessions, revisit it as an assembly feature independent of cache-hotness inference.

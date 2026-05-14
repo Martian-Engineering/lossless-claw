@@ -63,7 +63,7 @@ When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
 The **leaf pass** converts raw messages into leaf summaries:
 
 1. Identify the oldest contiguous chunk of raw messages outside the **fresh tail** (protected recent messages).
-2. Cap the chunk at `leafChunkTokens` (default 40k tokens).
+2. Cap the chunk at `leafChunkTokens` (default 20k tokens).
 3. Concatenate message content with timestamps.
 4. Resolve the most recent prior summary for continuity (passed as `previous_context` so the LLM avoids repeating known information).
 5. Send to OpenClaw's host-owned `runtime.llm.complete` capability with the leaf prompt.

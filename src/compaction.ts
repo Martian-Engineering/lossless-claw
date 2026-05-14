@@ -48,7 +48,7 @@ export interface CompactionConfig {
   sweepMaxDepth?: number;
   /** Deprecated alias for sweepMaxDepth. */
   incrementalMaxDepth?: number;
-  /** Max source tokens to compact per leaf/condensed chunk (default 40000) */
+  /** Max source tokens to compact per leaf/condensed chunk (default 20000) */
   leafChunkTokens?: number;
   /** Optional target for summarized-prefix tokens after a full sweep. */
   summaryPrefixTargetTokens?: number;

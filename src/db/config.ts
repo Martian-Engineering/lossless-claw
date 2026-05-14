@@ -344,7 +344,7 @@ export function resolveLcmConfigWithDiagnostics(
       ?? DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES;
   const resolvedLeafChunkTokens =
     parseFiniteInt(env.LCM_LEAF_CHUNK_TOKENS)
-      ?? toNumber(pc.leafChunkTokens) ?? 40000;
+      ?? toNumber(pc.leafChunkTokens) ?? 20000;
   const resolvedBootstrapMaxTokens =
     parseFiniteInt(env.LCM_BOOTSTRAP_MAX_TOKENS)
       ?? toNumber(pc.bootstrapMaxTokens)

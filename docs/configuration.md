@@ -31,9 +31,9 @@ Most installations only need to override a handful of keys. If you want a comple
   "condensedMinFanoutHard": 2,
   "sweepMaxDepth": 1,
   "incrementalMaxDepth": 1,
-  "leafChunkTokens": 40000,
-  "summaryPrefixTargetTokens": 40000,
-  "bootstrapMaxTokens": 12000,
+  "leafChunkTokens": 20000,
+  "summaryPrefixTargetTokens": 20000,
+  "bootstrapMaxTokens": 6000,
   "leafTargetTokens": 2400,
   "condensedTargetTokens": 2000,
   "maxExpandTokens": 4000,
@@ -74,7 +74,7 @@ Most installations only need to override a handful of keys. If you want a comple
   },
   "dynamicLeafChunkTokens": {
     "enabled": true,
-    "max": 80000
+    "max": 40000
   }
 }
 ```
@@ -86,7 +86,7 @@ Notes on the example:
 - `largeFilesDir` shows the expanded default path shape. Both `databasePath` and `largeFilesDir` default to paths under `OPENCLAW_STATE_DIR` (which in turn falls back to `~/.openclaw`).
 - `timezone` has no fixed hardcoded default; at runtime it resolves from `TZ` first, then the system timezone. The example uses `America/Los_Angeles`.
 - `maxAssemblyTokenBudget` has no default. The example uses `30000` as a realistic cap for a 32k-class model.
-- `summaryPrefixTargetTokens` has no fixed default. The example uses `40000`, which matches the derived default for large-context models with the default `leafChunkTokens`.
+- `summaryPrefixTargetTokens` has no fixed default. The example uses `20000`, which matches the derived default for large-context models with the default `leafChunkTokens`.
 - `databasePath` is the preferred key. `dbPath` is an accepted alias.
 - `largeFileThresholdTokens` is the preferred key. `largeFileTokenThreshold` is an accepted alias.
 
@@ -154,7 +154,7 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |
 | `sweepMaxDepth` | `integer` | `1` | `LCM_SWEEP_MAX_DEPTH` | Preferred maximum condensation source depth during routine threshold sweeps. Use `0` for leaf-only and `-1` for unlimited depth. Pressure sweeps may go deeper when summarized context remains above target. |
 | `incrementalMaxDepth` | `integer` | alias of `sweepMaxDepth` | `LCM_INCREMENTAL_MAX_DEPTH` | Deprecated alias for `sweepMaxDepth`. Kept so existing configs continue to load. |
-| `leafChunkTokens` | `integer` | `40000` | `LCM_LEAF_CHUNK_TOKENS` | Maximum source-token budget for a leaf compaction chunk. Larger chunks reduce sweep frequency at the cost of slower individual summary calls. |
+| `leafChunkTokens` | `integer` | `20000` | `LCM_LEAF_CHUNK_TOKENS` | Maximum source-token budget for a leaf compaction chunk. Larger chunks reduce sweep frequency at the cost of slower individual summary calls. |
 | `summaryPrefixTargetTokens` | `integer` | derived | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | Optional target for summarized-prefix tokens after a full sweep. If unset, Lossless derives `max(condensedTargetTokens, min(leafChunkTokens, floor(contextThreshold * tokenBudget * 0.5)))`. |
 | `bootstrapMaxTokens` | `integer` | `max(6000, floor(leafChunkTokens * 0.3))` | `LCM_BOOTSTRAP_MAX_TOKENS` | Maximum parent-history tokens imported when a new LCM conversation bootstraps. |
 | `leafTargetTokens` | `integer` | `2400` | `LCM_LEAF_TARGET_TOKENS` | Prompt target for leaf summary size. |
@@ -208,7 +208,7 @@ Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capabil
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
 | `dynamicLeafChunkTokens.enabled` | `boolean` | `true` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED` | Deprecated. Accepted for config compatibility but no longer used by automatic compaction. |
-| `dynamicLeafChunkTokens.max` | `integer` | `max(leafChunkTokens, floor(leafChunkTokens * 2))` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX` | Deprecated. With the default `leafChunkTokens=40000`, this resolves to `80000`, but automatic compaction uses `leafChunkTokens`. |
+| `dynamicLeafChunkTokens.max` | `integer` | `max(leafChunkTokens, floor(leafChunkTokens * 2))` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX` | Deprecated. With the default `leafChunkTokens=20000`, this resolves to `40000`, but automatic compaction uses `leafChunkTokens`. |
 
 ### Threshold full-sweep compaction
 

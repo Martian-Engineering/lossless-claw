@@ -95,7 +95,7 @@ Why it matters:
 
 - Larger chunks reduce summarization frequency.
 - Smaller chunks create more summaries and more DAG fragmentation.
-- The default is 40000 tokens, which favors fewer threshold sweeps now that automatic incremental compaction has been removed.
+- The default is 20000 tokens.
 
 Use this when:
 
@@ -138,9 +138,9 @@ Good defaults:
 - `enabled: true`
 - `max: 2 * leafChunkTokens`
 
-With the default `leafChunkTokens=40000`, that means:
+With the default `leafChunkTokens=20000`, that means:
 
-- `dynamicLeafChunkTokens.max = 80000`
+- `dynamicLeafChunkTokens.max = 40000`
 
 ### `sweepMaxDepth`
 
@@ -584,7 +584,7 @@ Why it matters:
 3. Start with conservative defaults.
 4. Run `/lossless` after startup to confirm path, size, and summary health.
 5. If threshold sweeps happen too often, tune `contextThreshold`, `leafChunkTokens`, `summaryPrefixTargetTokens`, and fanout before adding new mechanisms.
-6. If individual sweeps are too slow, try a smaller `leafChunkTokens` value such as 30000 before changing summary prompts.
+6. If threshold sweeps happen too often, try a larger `leafChunkTokens` value such as 30000 before adding new mechanisms.
 7. If recall feels weak, revisit `freshTailCount`, `leafChunkTokens`, and summarizer model quality before changing anything else.
 8. Touch advanced knobs like fanout, large-file thresholds, custom instructions, and assembly caps only after a concrete symptom appears.
 
