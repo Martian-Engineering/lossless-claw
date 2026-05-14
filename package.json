@@ -1,7 +1,7 @@
 {
   "name": "@martian-engineering/lossless-claw",
   "version": "0.9.4",
-  "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with incremental compaction",
+  "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with threshold compaction",
   "type": "module",
   "main": "dist/index.js",
   "license": "MIT",

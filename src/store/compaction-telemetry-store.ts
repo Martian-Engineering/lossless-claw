@@ -94,7 +94,7 @@ function toConversationCompactionTelemetryRecord(
 
 /**
  * Persist and query per-conversation prompt-cache telemetry used by
- * cache-aware incremental compaction.
+ * status reporting and legacy cache-aware diagnostics.
  */
 export class CompactionTelemetryStore {
   constructor(private readonly db: DatabaseSync) {}

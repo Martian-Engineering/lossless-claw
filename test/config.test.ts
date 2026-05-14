@@ -33,7 +33,7 @@ describe("resolveLcmConfig", () => {
     expect(config.promptAwareEviction).toBe(false);
     expect(config.newSessionRetainDepth).toBe(2);
     expect(config.incrementalMaxDepth).toBe(1);
-    expect(config.leafChunkTokens).toBe(20000);
+    expect(config.leafChunkTokens).toBe(40000);
     expect(config.leafMinFanout).toBe(8);
     expect(config.condensedMinFanout).toBe(4);
     expect(config.condensedMinFanoutHard).toBe(2);
@@ -61,7 +61,7 @@ describe("resolveLcmConfig", () => {
     });
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
-      max: 40000,
+      max: 80000,
     });
   });
 
@@ -733,7 +733,7 @@ describe("resolveLcmConfig", () => {
   });
   it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {
     const config = resolveLcmConfig({}, {});
-    expect(config.bootstrapMaxTokens).toBe(6000);
+    expect(config.bootstrapMaxTokens).toBe(12000);
     expect(config.delegationTimeoutMs).toBe(120000);
     expect(config.summaryMaxOverageFactor).toBe(3);
     expect(config.maxAssemblyTokenBudget).toBeUndefined();

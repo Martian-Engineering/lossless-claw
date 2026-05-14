@@ -5,8 +5,8 @@ import { isEmptyMessageContent } from "../src/assembler.js";
  * Regression coverage for the asymmetric empty-content filter.
  *
  * Before the fix `cleanedEntries` only dropped empty content for `assistant`
- * messages, so an empty-array `user` or `toolResult` produced upstream during
- * incremental compaction would survive the assemble pass and hit Bedrock's
+ * messages, so an empty-array `user` or `toolResult` produced upstream would
+ * survive the assemble pass and hit Bedrock's
  * Converse validator with the literal wording:
  *
  *   `The content field in the Message object at messages.0 is empty.

@@ -2,4 +2,4 @@
 "@martian-engineering/lossless-claw": patch
 ---
 
-Allow deferred `cold-cache-catchup` compaction debt to drain despite a recent prompt-cache touch. Background, assemble, and host-approved maintain drains now treat recorded cold-cache debt, or telemetry with an effectively cold cache-read share, as eligible for execution instead of preserving a nominally hot cache that is not actually being reused.
+Treat existing `cold-cache-catchup` compaction debt as legacy threshold work. Background, assemble, and host-approved maintain drains now revalidate old non-threshold debt against `contextThreshold`, run a threshold full sweep when still needed, or clear the debt when the conversation is already under threshold.

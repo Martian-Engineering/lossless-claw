@@ -206,38 +206,6 @@ describe("Circuit Breaker", () => {
     expect(blocked.compacted).toBe(false);
   });
 
-  it("should also block compactLeafAsync when breaker is open", async () => {
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
-    
-    const failingSummarizer = async () => {
-      throw makeAuthError();
-    };
-    
-    // Trip the breaker
-    for (let i = 0; i < 3; i++) {
-      await engine.compact({
-        sessionId,
-        sessionKey,
-        sessionFile,
-        tokenBudget: 5000,
-        force: true,
-        legacyParams: { summarize: failingSummarizer },
-      });
-    }
-    
-    // compactLeafAsync should also be blocked
-    const leafResult = await engine.compactLeafAsync({
-      sessionId,
-      sessionKey,
-      sessionFile,
-      tokenBudget: 5000,
-      force: true,
-      legacyParams: { summarize: failingSummarizer },
-    });
-    
-    expect(leafResult.reason).toBe("circuit breaker open");
-  });
-
   it("should auto-reset after cooldown", async () => {
     await engine.bootstrap({ sessionId, sessionFile, sessionKey });
     

@@ -141,9 +141,8 @@ function isBlankContent(content: unknown[]): boolean {
  *     Add a ContentBlock object to the content field and try again.`
  *  This wording is reproducible only when `content === []`; bare strings or
  *  non-empty arrays produce different validation errors. The pre-existing
- *  filter only protected the assistant role, leaving an asymmetric gap that
- *  fires during incremental compaction when an empty user/toolResult shape
- *  can be momentarily produced upstream.
+ *  filter only protected the assistant role, leaving an asymmetric gap when
+ *  an empty user/toolResult shape is momentarily produced upstream.
  *
  * @internal Exported for testing only.
  */
@@ -181,8 +180,6 @@ export interface AssembleContextInput {
   prompt?: string;
   /** When false, evictable items are always retained chronologically even if a searchable prompt is present. */
   promptAwareEviction?: boolean;
-  /** Optional stable boundary for orphan tool-call stripping during hot-cache epochs. */
-  orphanStrippingOrdinal?: number;
   /**
    * v4.2 §B — when true, evictable tool messages whose row carries a
    * non-null `large_content` sidecar are replaced with a compact stub
@@ -203,7 +200,7 @@ export interface AssembleContextResult {
     summaryCount: number;
     totalContextItems: number;
   };
-  /** Optional local diagnostics for cache-stability debugging. */
+  /** Optional local diagnostics for assembly debugging. */
   debug?: {
     freshTailOrdinal: number;
     orphanStrippingOrdinal: number;
@@ -1277,12 +1274,7 @@ export class ContextAssembler {
       freshTailCount,
       input.freshTailMaxTokens,
     );
-    const orphanStrippingOrdinal =
-      typeof input.orphanStrippingOrdinal === "number"
-      && Number.isFinite(input.orphanStrippingOrdinal)
-      && input.orphanStrippingOrdinal >= 0
-        ? Math.floor(input.orphanStrippingOrdinal)
-        : freshTailOrdinal;
+    const orphanStrippingOrdinal = freshTailOrdinal;
     const allToolResultOrdinalsById = new Map<string, number[]>();
     for (const item of resolved) {
       const toolResultId = extractToolResultIdFromMessage(item.message);
@@ -1431,8 +1423,8 @@ export class ContextAssembler {
     // blocks, when an assistant turn contains only thinking/reasoning blocks
     // that will be stripped by the provider layer, when the stored content is
     // a `[{type:"text", text:""}]` blank-text shape, or when an upstream layer
-    // momentarily produces an empty `user` or `toolResult` content array
-    // during incremental compaction. Anthropic and Bedrock reject any of these
+    // momentarily produces an empty `user` or `toolResult` content array.
+    // Anthropic and Bedrock reject any of these
     // as empty; Bedrock's specific wording for `content === []` is
     // `The content field in the Message object at messages.N is empty.
     //  Add a ContentBlock object to the content field and try again.`

@@ -1,7 +1,7 @@
 /**
  * @martian-engineering/lossless-claw — Lossless Context Management plugin for OpenClaw
  *
- * DAG-based conversation summarization with incremental compaction,
+ * DAG-based conversation summarization with threshold compaction,
  * full-text search, and sub-agent expansion.
  */
 import { join } from "node:path";
@@ -1390,7 +1390,7 @@ const lcmPlugin = {
   id: "lossless-claw",
   name: "Lossless Context Management",
   description:
-    "DAG-based conversation summarization with incremental compaction, full-text search, and sub-agent expansion",
+    "DAG-based conversation summarization with threshold compaction, full-text search, and sub-agent expansion",
 
   configSchema: {
     parse(value: unknown) {

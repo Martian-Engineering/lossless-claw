@@ -30,8 +30,8 @@ Most installations only need to override a handful of keys. If you want a comple
   "condensedMinFanout": 4,
   "condensedMinFanoutHard": 2,
   "incrementalMaxDepth": 1,
-  "leafChunkTokens": 20000,
-  "bootstrapMaxTokens": 6000,
+  "leafChunkTokens": 40000,
+  "bootstrapMaxTokens": 12000,
   "leafTargetTokens": 2400,
   "condensedTargetTokens": 2000,
   "maxExpandTokens": 4000,
@@ -72,7 +72,7 @@ Most installations only need to override a handful of keys. If you want a comple
   },
   "dynamicLeafChunkTokens": {
     "enabled": true,
-    "max": 40000
+    "max": 80000
   }
 }
 ```
@@ -149,8 +149,8 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `leafMinFanout` | `integer` | `8` | `LCM_LEAF_MIN_FANOUT` | Minimum number of raw messages required before a leaf pass runs. |
 | `condensedMinFanout` | `integer` | `4` | `LCM_CONDENSED_MIN_FANOUT` | Number of same-depth summaries needed before condensation is attempted. |
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |
-| `incrementalMaxDepth` | `integer` | `1` | `LCM_INCREMENTAL_MAX_DEPTH` | Maximum automatic condensation depth after leaf compaction. Use `0` for leaf-only and `-1` for unlimited depth. |
-| `leafChunkTokens` | `integer` | `20000` | `LCM_LEAF_CHUNK_TOKENS` | Maximum source-token budget for a leaf compaction chunk. |
+| `incrementalMaxDepth` | `integer` | `1` | `LCM_INCREMENTAL_MAX_DEPTH` | Maximum condensation source depth during threshold full sweeps. Use `0` for leaf-only and `-1` for unlimited depth. |
+| `leafChunkTokens` | `integer` | `40000` | `LCM_LEAF_CHUNK_TOKENS` | Maximum source-token budget for a leaf compaction chunk. Larger chunks reduce sweep frequency at the cost of slower individual summary calls. |
 | `bootstrapMaxTokens` | `integer` | `max(6000, floor(leafChunkTokens * 0.3))` | `LCM_BOOTSTRAP_MAX_TOKENS` | Maximum parent-history tokens imported when a new LCM conversation bootstraps. |
 | `leafTargetTokens` | `integer` | `2400` | `LCM_LEAF_TARGET_TOKENS` | Prompt target for leaf summary size. |
 | `condensedTargetTokens` | `integer` | `2000` | `LCM_CONDENSED_TARGET_TOKENS` | Prompt target for condensed summary size. |
@@ -190,32 +190,31 @@ Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capabil
 
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
-| `cacheAwareCompaction.enabled` | `boolean` | `true` | `LCM_CACHE_AWARE_COMPACTION_ENABLED` | Defers incremental leaf compaction more aggressively when prompt-cache telemetry indicates a hot cache. |
-| `cacheAwareCompaction.cacheTTLSeconds` | `integer` | `300` | `LCM_CACHE_TTL_SECONDS` | Fallback cache TTL used when deferred Anthropic compaction has provider/model telemetry but no explicit runtime cache-retention window. |
-| `cacheAwareCompaction.maxColdCacheCatchupPasses` | `integer` | `2` | `LCM_MAX_COLD_CACHE_CATCHUP_PASSES` | Maximum bounded catch-up passes allowed in one maintenance cycle when cache telemetry is cold. |
-| `cacheAwareCompaction.hotCachePressureFactor` | `number` | `4` | `LCM_HOT_CACHE_PRESSURE_FACTOR` | Multiplier applied to the hot-cache leaf trigger before raw-history pressure overrides cache preservation. |
-| `cacheAwareCompaction.hotCacheBudgetHeadroomRatio` | `number` | `0.2` | `LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO` | Minimum fraction of the real token budget that must remain free before hot-cache incremental compaction is skipped entirely. |
-| `cacheAwareCompaction.coldCacheObservationThreshold` | `integer` | `3` | `LCM_COLD_CACHE_OBSERVATION_THRESHOLD` | Consecutive cold observations required before non-explicit cache misses are treated as truly cold. This dampens one-off routing noise and provider failover blips. |
-| `cacheAwareCompaction.criticalBudgetPressureRatio` | `number` | `0.90` | `LCM_CRITICAL_BUDGET_PRESSURE_RATIO` | Fraction of the token budget at which deferred compaction bypasses hot-cache delay so prompt-mutating debt can run before overflow. Set to `1` to disable this bypass. |
+| `cacheAwareCompaction.enabled` | `boolean` | `true` | `LCM_CACHE_AWARE_COMPACTION_ENABLED` | Deprecated. Accepted for config compatibility but no longer used for automatic compaction decisions. |
+| `cacheAwareCompaction.cacheTTLSeconds` | `integer` | `300` | `LCM_CACHE_TTL_SECONDS` | Deprecated. Accepted for config compatibility; threshold debt no longer waits for cache TTL. |
+| `cacheAwareCompaction.maxColdCacheCatchupPasses` | `integer` | `2` | `LCM_MAX_COLD_CACHE_CATCHUP_PASSES` | Deprecated. Automatic cold-cache catch-up passes were removed. |
+| `cacheAwareCompaction.hotCachePressureFactor` | `number` | `4` | `LCM_HOT_CACHE_PRESSURE_FACTOR` | Deprecated. Hot-cache raw-history pressure no longer drives automatic compaction. |
+| `cacheAwareCompaction.hotCacheBudgetHeadroomRatio` | `number` | `0.2` | `LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO` | Deprecated. Hot-cache budget headroom no longer defers automatic threshold compaction. |
+| `cacheAwareCompaction.coldCacheObservationThreshold` | `integer` | `3` | `LCM_COLD_CACHE_OBSERVATION_THRESHOLD` | Deprecated. Cold-cache streaks remain observable telemetry only. |
+| `cacheAwareCompaction.criticalBudgetPressureRatio` | `number` | `0.90` | `LCM_CRITICAL_BUDGET_PRESSURE_RATIO` | Deprecated. `contextThreshold` is the only automatic compaction threshold. |
 
 #### `dynamicLeafChunkTokens`
 
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
-| `dynamicLeafChunkTokens.enabled` | `boolean` | `true` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED` | Enables dynamic working leaf chunk sizes for busier sessions. |
-| `dynamicLeafChunkTokens.max` | `integer` | `max(leafChunkTokens, floor(leafChunkTokens * 2))` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX` | Upper bound for the dynamic working chunk size. With the default `leafChunkTokens=20000`, this resolves to `40000`. |
+| `dynamicLeafChunkTokens.enabled` | `boolean` | `true` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED` | Deprecated. Accepted for config compatibility but no longer used by automatic compaction. |
+| `dynamicLeafChunkTokens.max` | `integer` | `max(leafChunkTokens, floor(leafChunkTokens * 2))` | `LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX` | Deprecated. With the default `leafChunkTokens=40000`, this resolves to `80000`, but automatic compaction uses `leafChunkTokens`. |
 
-### Cache-aware incremental compaction
+### Threshold full-sweep compaction
 
-When cache-aware compaction is enabled:
+Automatic compaction is threshold-only:
 
-- hot cache stretches the incremental leaf trigger to `dynamicLeafChunkTokens.max`
-- hot cache skips incremental maintenance entirely when the assembled context is still comfortably below the real token budget
-- hot cache also gets a short hysteresis window so one ambiguous turn does not immediately discard a recently healthy cache signal
-- cold cache still allows bounded catch-up passes via `cacheAwareCompaction.maxColdCacheCatchupPasses`
-- once `currentTokenCount >= criticalBudgetPressureRatio * tokenBudget`, deferred compaction bypasses hot-cache delay so prompt-mutating debt can run before emergency overflow handling
+- `afterTurn()` evaluates `contextThreshold` against the active token budget
+- below threshold, no automatic compaction runs and no leaf debt is recorded
+- at or above threshold, inline mode runs a threshold full sweep immediately
+- deferred mode records one coalesced `"threshold"` maintenance row and drains it in the background, `maintain()`, or pre-assembly
 
-When incremental leaf compaction still runs on a hot cache, follow-on condensed passes are suppressed so the maintenance cycle only pays for the leaf pass that was explicitly justified.
+Lossless still records prompt-cache telemetry for status and diagnostics, but cache hotness no longer delays threshold debt. Legacy `cacheAwareCompaction.*` and `dynamicLeafChunkTokens.*` settings remain accepted so existing OpenClaw config continues to load, but they do not change automatic compaction behavior.
 
 ### Prompt-aware eviction
 
@@ -291,11 +290,12 @@ This keeps long-term history available while still giving users a real clean-sla
 Lossless-claw now defaults `proactiveThresholdCompactionMode` to `deferred`.
 
 - deferred mode records a single coalesced maintenance debt row per conversation
-- deferred mode persists provider/model/cache telemetry so Anthropic-family sessions can avoid rewriting a still-hot prompt cache
-- `maintain()` can still process non-prompt-mutating work when the host explicitly opts in to deferred execution, but it leaves prompt-mutating debt pending while Anthropic cache is still hot
-- `assemble()` consumes deferred prompt-mutating debt pre-assembly once the cache is cold or the next turn is already approaching overflow
+- new deferred compaction debt is only created for `contextThreshold` pressure and uses reason `"threshold"`
+- `maintain()` consumes threshold debt when the host explicitly opts in to deferred execution
+- `assemble()` consumes pending threshold debt before building the next prompt
+- old non-threshold debt from earlier builds is revalidated; if the conversation is no longer over threshold, it is cleared as a no-op
 - `/lcm status` / `/lossless status` shows the current maintenance state, including pending/running/last-failure details
-- status output also surfaces the latest API/cache telemetry so operators can see whether a deferred debt item is being preserved for cache-safety reasons
+- status output also surfaces the latest API/cache telemetry as diagnostics, not as a deferral gate
 - set `proactiveThresholdCompactionMode` to `inline` only if you need the legacy inline proactive compaction behavior for compatibility
 
 ### `/lcm rotate`

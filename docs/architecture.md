@@ -56,14 +56,14 @@ When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
 
 1. **bootstrap** — On session start, reconciles the JSONL session file with the LCM database. Imports any messages that exist in the file but not in LCM (crash recovery).
 2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
-3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether compaction should run.
+3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether `contextThreshold` requires compaction.
 
 ### Leaf compaction
 
 The **leaf pass** converts raw messages into leaf summaries:
 
 1. Identify the oldest contiguous chunk of raw messages outside the **fresh tail** (protected recent messages).
-2. Cap the chunk at `leafChunkTokens` (default 20k tokens).
+2. Cap the chunk at `leafChunkTokens` (default 40k tokens).
 3. Concatenate message content with timestamps.
 4. Resolve the most recent prior summary for continuity (passed as `previous_context` so the LLM avoids repeating known information).
 5. Send to OpenClaw's host-owned `runtime.llm.complete` capability with the leaf prompt.
@@ -84,15 +84,15 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 
 ### Compaction modes
 
-**Incremental (after each turn):**
-- Checks if raw tokens outside the fresh tail exceed `leafChunkTokens`
-- If so, runs one leaf pass
-- If `incrementalMaxDepth != 0`, follows with condensation passes up to that depth (`-1` for unlimited)
-- Best-effort: failures don't break the conversation
+**Automatic threshold sweep (after each turn):**
+- Checks if the assembled context crosses `contextThreshold`
+- Below threshold, does not compact and does not record leaf debt
+- In deferred mode, records one `"threshold"` maintenance row for background, `maintain()`, or pre-assembly execution
+- In inline mode, runs a full sweep before `afterTurn()` completes
 
-**Full sweep (manual `/compact` or overflow):**
+**Full sweep (threshold, manual `/compact`, or overflow):**
 - Phase 1: Repeatedly runs leaf passes until no more eligible chunks
-- Phase 2: Repeatedly runs condensation passes starting from the shallowest eligible depth
+- Phase 2: Repeatedly runs condensation passes starting from the shallowest eligible depth, respecting `incrementalMaxDepth` (`0` for leaf-only, `-1` for unlimited)
 - Each pass checks for progress; stops if no tokens were saved
 
 **Budget-targeted (`compactUntilUnder`):**

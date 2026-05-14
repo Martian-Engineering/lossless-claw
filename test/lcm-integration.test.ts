@@ -1446,7 +1446,7 @@ describe("LCM integration: compaction", () => {
   });
 
   it("compactLeaf uses preceding summary context for soft leaf continuity", async () => {
-    const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
+    const leafEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       freshTailCount: 1,
     });
@@ -1492,7 +1492,7 @@ describe("LCM integration: compaction", () => {
       },
     );
 
-    const result = await incrementalEngine.compactLeaf({
+    const result = await leafEngine.compactLeaf({
       conversationId: CONV_ID,
       tokenBudget: 200,
       summarize,
@@ -1505,8 +1505,8 @@ describe("LCM integration: compaction", () => {
     expect(summarizeCalls[0]?.isCondensed).toBe(false);
   });
 
-  it("compactLeaf keeps incremental behavior leaf-only when incrementalMaxDepth is zero", async () => {
-    const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
+  it("compactLeaf stays leaf-only when incrementalMaxDepth is zero", async () => {
+    const leafEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       freshTailCount: 0,
       condensedMinFanout: 2,
@@ -1550,7 +1550,7 @@ describe("LCM integration: compaction", () => {
         return options?.isCondensed ? "Condensed summary" : "Leaf summary";
       },
     );
-    const result = await incrementalEngine.compactLeaf({
+    const result = await leafEngine.compactLeaf({
       conversationId: CONV_ID,
       tokenBudget: 1_200,
       summarize,
@@ -1562,8 +1562,8 @@ describe("LCM integration: compaction", () => {
     expect(sumStore._summaries.filter((summary) => summary.kind === "condensed")).toHaveLength(0);
   });
 
-  it("compactLeaf suppresses follow-on condensed passes when cache-aware policy disallows them", async () => {
-    const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
+  it("compactLeaf suppresses follow-on condensed passes when the caller disallows them", async () => {
+    const leafEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       freshTailCount: 0,
       condensedMinFanout: 2,
@@ -1607,7 +1607,7 @@ describe("LCM integration: compaction", () => {
         return options?.isCondensed ? "Condensed summary" : "Leaf summary";
       },
     );
-    const result = await incrementalEngine.compactLeaf({
+    const result = await leafEngine.compactLeaf({
       conversationId: CONV_ID,
       tokenBudget: 1_200,
       summarize,
@@ -1624,7 +1624,7 @@ describe("LCM integration: compaction", () => {
   });
 
   it("compactLeaf performs one depth-zero condensation pass when incrementalMaxDepth is one", async () => {
-    const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
+    const leafEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       freshTailCount: 0,
       condensedMinFanout: 2,
@@ -1668,7 +1668,7 @@ describe("LCM integration: compaction", () => {
         return options?.isCondensed ? "Condensed summary" : "Leaf summary";
       },
     );
-    const result = await incrementalEngine.compactLeaf({
+    const result = await leafEngine.compactLeaf({
       conversationId: CONV_ID,
       tokenBudget: 1_200,
       summarize,
@@ -1684,7 +1684,7 @@ describe("LCM integration: compaction", () => {
   });
 
   it("compactLeaf cascades to depth two when incrementalMaxDepth is two", async () => {
-    const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
+    const leafEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       freshTailCount: 0,
       condensedMinFanout: 2,
@@ -1739,7 +1739,7 @@ describe("LCM integration: compaction", () => {
         return options?.isCondensed ? `Condensed summary ${summarizeCount}` : "Leaf summary";
       },
     );
-    const result = await incrementalEngine.compactLeaf({
+    const result = await leafEngine.compactLeaf({
       conversationId: CONV_ID,
       tokenBudget: 1_200,
       summarize,
@@ -1757,7 +1757,7 @@ describe("LCM integration: compaction", () => {
 
 
   it("compactLeaf cascades without depth limit when incrementalMaxDepth is -1 (unlimited)", async () => {
-    const incrementalEngine = new CompactionEngine(convStore as any, sumStore as any, {
+    const leafEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       freshTailCount: 0,
       leafMinFanout: 2,
@@ -1811,7 +1811,7 @@ describe("LCM integration: compaction", () => {
         return options?.isCondensed ? `Condensed at depth ${options.depth}` : "Leaf summary";
       },
     );
-    const result = await incrementalEngine.compactLeaf({
+    const result = await leafEngine.compactLeaf({
       conversationId: CONV_ID,
       tokenBudget: 1_200,
       summarize,
@@ -1830,6 +1830,94 @@ describe("LCM integration: compaction", () => {
 
     // Verify depth-0 condensation happened (produces a depth-1 summary)
     expect(depthsSummarized).toContain(1);
+  });
+
+  it("compactFullSweep respects incrementalMaxDepth during condensation", async () => {
+    const seedLeafSummaries = async (
+      store: ReturnType<typeof createMockSummaryStore>,
+      prefix: string,
+    ) => {
+      await convStore.createConversation({ sessionId: `${prefix}-session` });
+      for (const suffix of ["a", "b"]) {
+        const summaryId = `${prefix}_${suffix}`;
+        await store.insertSummary({
+          summaryId,
+          conversationId: CONV_ID,
+          kind: "leaf",
+          depth: 0,
+          content: `Depth zero leaf ${suffix}`,
+          tokenCount: 60,
+        });
+        await store.appendContextSummary(CONV_ID, summaryId);
+      }
+    };
+
+    const cappedEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafMinFanout: 2,
+      condensedMinFanout: 2,
+      leafChunkTokens: 200,
+      condensedTargetTokens: 10,
+      incrementalMaxDepth: 0,
+    });
+    await seedLeafSummaries(sumStore, "sum_sweep_depth_zero");
+
+    const cappedSummarize = vi.fn(async () => "Condensed summary");
+    const cappedResult = await cappedEngine.compactFullSweep({
+      conversationId: CONV_ID,
+      tokenBudget: 1_000,
+      summarize: cappedSummarize,
+      force: true,
+    });
+
+    expect(cappedResult.actionTaken).toBe(false);
+    expect(cappedSummarize).not.toHaveBeenCalled();
+    expect(sumStore._summaries.filter((summary) => summary.kind === "condensed")).toHaveLength(0);
+
+    const nextConvStore = createMockConversationStore();
+    const nextSumStore = createMockSummaryStore();
+    wireStores(nextConvStore, nextSumStore);
+    convStore = nextConvStore;
+    sumStore = nextSumStore;
+
+    const depthOneEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafMinFanout: 2,
+      condensedMinFanout: 2,
+      leafChunkTokens: 200,
+      condensedTargetTokens: 10,
+      incrementalMaxDepth: 1,
+    });
+    await seedLeafSummaries(sumStore, "sum_sweep_depth_one");
+
+    const depthOneSummarize = vi.fn(
+      async (
+        _text: string,
+        _aggressive?: boolean,
+        options?: { isCondensed?: boolean; depth?: number },
+      ) => {
+        return options?.isCondensed ? "Depth one condensed summary" : "Leaf summary";
+      },
+    );
+    const depthOneResult = await depthOneEngine.compactFullSweep({
+      conversationId: CONV_ID,
+      tokenBudget: 1_000,
+      summarize: depthOneSummarize,
+      force: true,
+    });
+
+    expect(depthOneResult.actionTaken).toBe(true);
+    expect(depthOneResult.condensed).toBe(true);
+    expect(depthOneSummarize).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Boolean),
+      expect.objectContaining({ isCondensed: true, depth: 1 }),
+    );
+    expect(
+      sumStore._summaries.some((summary) => summary.kind === "condensed" && summary.depth === 1),
+    ).toBe(true);
   });
 
 
@@ -1910,6 +1998,7 @@ describe("LCM integration: compaction", () => {
       leafMinFanout: 2,
       leafChunkTokens: 100,
       condensedTargetTokens: 10,
+      incrementalMaxDepth: 1,
     });
 
     await convStore.createConversation({ sessionId: "leaf-condensed-session" });
@@ -1963,6 +2052,7 @@ describe("LCM integration: compaction", () => {
       condensedMinFanout: 2,
       leafChunkTokens: 200,
       condensedTargetTokens: 10,
+      incrementalMaxDepth: 2,
     });
 
     await convStore.createConversation({ sessionId: "depth-aware-depth-assignment" });
@@ -2006,6 +2096,7 @@ describe("LCM integration: compaction", () => {
       condensedMinFanout: 3,
       leafChunkTokens: 200,
       condensedTargetTokens: 10,
+      incrementalMaxDepth: 1,
     });
 
     await convStore.createConversation({ sessionId: "depth-break-session" });
@@ -2069,6 +2160,7 @@ describe("LCM integration: compaction", () => {
       condensedMinFanout: 2,
       leafChunkTokens: 200,
       condensedTargetTokens: 10,
+      incrementalMaxDepth: 1,
     });
 
     await convStore.createConversation({ sessionId: "shallowest-first-session" });
@@ -2275,6 +2367,7 @@ describe("LCM integration: compaction", () => {
       condensedMinFanoutHard: 2,
       leafChunkTokens: 200,
       condensedTargetTokens: 10,
+      incrementalMaxDepth: 1,
     });
 
     await convStore.createConversation({ sessionId: "fanout-threshold-session" });
@@ -2323,6 +2416,7 @@ describe("LCM integration: compaction", () => {
       condensedMinFanout: 2,
       leafChunkTokens: 200,
       condensedTargetTokens: 10,
+      incrementalMaxDepth: 1,
     });
 
     await convStore.createConversation({ sessionId: "balanced-depth-sweep-session" });
@@ -3238,6 +3332,7 @@ describe("LCM integration: full round-trip", () => {
       leafMinFanout: 2,
       leafChunkTokens: 100,
       condensedTargetTokens: 10,
+      incrementalMaxDepth: 1,
     });
 
     // Ingest 12 messages with substantial content so that after the leaf pass,

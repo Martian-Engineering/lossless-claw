@@ -46,7 +46,7 @@ export interface CompactionConfig {
   condensedMinFanoutHard: number;
   /** Incremental depth passes to run after each leaf compaction (default 1). */
   incrementalMaxDepth: number;
-  /** Max source tokens to compact per leaf/condensed chunk (default 20000) */
+  /** Max source tokens to compact per leaf/condensed chunk (default 40000) */
   leafChunkTokens?: number;
   /** Target tokens for leaf summaries (default 600) */
   leafTargetTokens: number;
@@ -177,7 +177,7 @@ function generateSummaryId(content: string): string {
 
 /** Maximum estimated tokens for the deterministic fallback truncation. */
 const FALLBACK_MAX_TOKENS = 512;
-const DEFAULT_LEAF_CHUNK_TOKENS = 20_000;
+const DEFAULT_LEAF_CHUNK_TOKENS = 40_000;
 
 /**
  * Pattern matching MEDIA:/... file path references that appear in message content
@@ -441,8 +441,8 @@ export class CompactionEngine {
    * Evaluate whether the raw-message leaf trigger is active.
    *
    * Counts message tokens outside the protected fresh tail and compares against
-   * `leafChunkTokens`. This lets callers trigger a soft incremental leaf pass
-   * before the full context threshold is breached.
+   * `leafChunkTokens`. Automatic compaction no longer uses this as a trigger,
+   * but it remains useful for diagnostics and explicit maintenance commands.
    */
   async evaluateLeafTrigger(conversationId: number, leafChunkTokensOverride?: number): Promise<{
     shouldCompact: boolean;
@@ -476,7 +476,8 @@ export class CompactionEngine {
   /**
    * Run a single leaf pass against the oldest compactable raw chunk.
    *
-   * This is the soft-trigger path used for incremental maintenance.
+   * This lower-level helper is used by focused compaction tests and explicit
+   * leaf-pass callers; automatic maintenance uses threshold full sweeps.
    */
   async compactLeaf(input: {
     conversationId: number;
@@ -499,6 +500,7 @@ export class CompactionEngine {
     force?: boolean;
     previousSummaryContent?: string;
     summaryModel?: string;
+    allowCondensedPasses?: boolean;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force } = input;
 
@@ -617,7 +619,7 @@ export class CompactionEngine {
   }
 
   /**
-   * Run a hard-trigger sweep:
+   * Run a threshold-triggered full sweep:
    *
    * Phase 1: repeatedly compact raw-message chunks outside the fresh tail.
    * Phase 2: repeatedly condense oldest summary chunks while chunk utilization
@@ -635,9 +637,8 @@ export class CompactionEngine {
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
 
-    if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
+    if (!force && tokensBefore <= threshold) {
       return {
         actionTaken: false,
         tokensBefore,
@@ -713,12 +714,16 @@ export class CompactionEngine {
     }
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.
+    const maxCondensationSourceDepth = this.resolveIncrementalMaxDepth();
     while (force || previousTokens > threshold) {
       const candidate = await this.selectShallowestCondensationCandidate({
         conversationId,
         hardTrigger: hardTrigger === true,
       });
       if (!candidate) {
+        break;
+      }
+      if (candidate.targetDepth >= maxCondensationSourceDepth) {
         break;
       }
 

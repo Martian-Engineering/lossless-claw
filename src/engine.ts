@@ -46,10 +46,7 @@ import {
   parseFileBlocks,
 } from "./large-files.js";
 import { describeLogError } from "./lcm-log.js";
-import {
-  DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
-  describeLcmConfigSource,
-} from "./db/config.js";
+import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
@@ -57,7 +54,6 @@ import {
   CompactionTelemetryStore,
   type ConversationCompactionTelemetryRecord,
   type CacheState,
-  type ActivityBand,
 } from "./store/compaction-telemetry-store.js";
 import {
   CompactionMaintenanceStore,
@@ -93,8 +89,6 @@ type BootstrapImportObservation = {
 };
 
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
-const MAX_STABLE_ORPHAN_STRIPPING_BOUNDARIES = 100;
-const MIN_OBSERVED_CACHE_READ_SHARE_FOR_HOT = 0.2;
 type CircuitBreakerState = {
   failures: number;
   openSince: number | null;
@@ -110,26 +104,6 @@ type PromptCacheSnapshot = {
   provider?: string;
   model?: string;
 };
-type IncrementalCompactionDecision = {
-  shouldCompact: boolean;
-  cacheState: CacheState;
-  maxPasses: number;
-  rawTokensOutsideTail: number;
-  threshold: number;
-  reason: string;
-  leafChunkTokens: number;
-  fallbackLeafChunkTokens: number[];
-  activityBand: ActivityBand;
-  allowCondensedPasses: boolean;
-};
-type DynamicLeafChunkBounds = {
-  floor: number;
-  medium: number;
-  high: number;
-  max: number;
-};
-const DEFERRED_COMPACTION_STILL_NEEDED_REASON = "deferred compaction still needed";
-const MAX_BUDGET_TRIGGER_CATCHUP_PASSES = 10;
 type TranscriptRewriteReplacement = {
   entryId: string;
   message: AgentMessage;
@@ -213,13 +187,6 @@ function normalizeSessionFilePathForComparison(filePath: string): string {
 }
 
 const TRANSCRIPT_GC_BATCH_SIZE = 12;
-const HOT_CACHE_HYSTERESIS_TURNS = 2;
-const DYNAMIC_LEAF_CHUNK_MEDIUM_MULTIPLIER = 1.5;
-const DYNAMIC_LEAF_CHUNK_HIGH_MULTIPLIER = 2;
-const DYNAMIC_ACTIVITY_MEDIUM_UPSHIFT_FACTOR = 0.5;
-const DYNAMIC_ACTIVITY_MEDIUM_DOWNSHIFT_FACTOR = 0.35;
-const DYNAMIC_ACTIVITY_HIGH_UPSHIFT_FACTOR = 1.0;
-const DYNAMIC_ACTIVITY_HIGH_DOWNSHIFT_FACTOR = 0.75;
 const AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1455,7 +1422,7 @@ function resolveBootstrapMaxTokens(config: Pick<LcmConfig, "bootstrapMaxTokens" 
     Number.isFinite(config.leafChunkTokens) &&
     config.leafChunkTokens > 0
       ? Math.floor(config.leafChunkTokens)
-      : 20_000;
+      : 40_000;
   return Math.max(6000, Math.floor(leafChunkTokens * 0.3));
 }
 
@@ -1824,7 +1791,6 @@ export class LcmContextEngine implements ContextEngine {
     { promise: Promise<void>; refCount: number }
   >();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
-  private stableOrphanStrippingOrdinalsByConversation = new Map<number, number>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private oversizedAutoRotateCheckpointByQueueKey = new Map<string, number>();
   private largeFileTextSummarizerResolved = false;
@@ -1858,13 +1824,6 @@ export class LcmContextEngine implements ContextEngine {
    *  counts. */
   private afterTurnReconcileFullReadStates = new Map<string, { size: number; mtimeMs: number }>();
   private static readonly AFTER_TURN_RECONCILE_KEY_CAP = 4096;
-
-  /** Per-process dedupe for the `cache-context-unknown` info-level log
-   *  (PR #557 added the diagnostic; on long-running sessions without
-   *  provider telemetry it would otherwise fire every afterTurn that
-   *  records deferred debt). Keyed by conversationId so each session
-   *  emits the visibility log AT MOST ONCE per process. */
-  private cacheContextUnknownLogged = new Set<number>();
 
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
@@ -2190,504 +2149,6 @@ export class LcmContextEngine implements ContextEngine {
     return Math.floor(value);
   }
 
-  /** Treat a recent cache hit as still-hot for a couple of turns unless telemetry observed a later break. */
-  private shouldApplyHotCacheHysteresis(
-    telemetry: ConversationCompactionTelemetryRecord | null,
-  ): boolean {
-    if (!telemetry?.lastObservedCacheHitAt) {
-      return false;
-    }
-    if (
-      telemetry.lastObservedCacheBreakAt
-      && telemetry.lastObservedCacheBreakAt >= telemetry.lastObservedCacheHitAt
-    ) {
-      return false;
-    }
-    return telemetry.turnsSinceLeafCompaction <= HOT_CACHE_HYSTERESIS_TURNS;
-  }
-
-  /** Treat weak observed cache reuse without a cache write as cold, even if older telemetry still looks hot. */
-  private isObservedCacheReadShareCold(
-    telemetry: ConversationCompactionTelemetryRecord | null,
-  ): boolean {
-    const cacheRead = telemetry?.lastObservedCacheRead;
-    const cacheWrite = telemetry?.lastObservedCacheWrite;
-    const promptTokenCount = telemetry?.lastObservedPromptTokenCount;
-    if (typeof cacheWrite === "number" && Number.isFinite(cacheWrite) && cacheWrite > 0) {
-      return false;
-    }
-    if (
-      typeof cacheRead !== "number"
-      || !Number.isFinite(cacheRead)
-      || cacheRead < 0
-      || typeof promptTokenCount !== "number"
-      || !Number.isFinite(promptTokenCount)
-      || promptTokenCount <= 0
-    ) {
-      return false;
-    }
-    return cacheRead / promptTokenCount < MIN_OBSERVED_CACHE_READ_SHARE_FOR_HOT;
-  }
-
-  /** Resolve the effective cache state the incremental compaction policy should react to. */
-  private resolveCacheAwareState(
-    telemetry: ConversationCompactionTelemetryRecord | null,
-  ): CacheState {
-    if (!telemetry) {
-      return "unknown";
-    }
-    if (this.isObservedCacheReadShareCold(telemetry)) {
-      return "cold";
-    }
-    if (telemetry.cacheState === "hot") {
-      return "hot";
-    }
-    if (this.shouldApplyHotCacheHysteresis(telemetry)) {
-      return "hot";
-    }
-    if (
-      telemetry.lastObservedCacheBreakAt
-      && (
-        !telemetry.lastObservedCacheHitAt
-        || telemetry.lastObservedCacheBreakAt >= telemetry.lastObservedCacheHitAt
-      )
-    ) {
-      return "cold";
-    }
-    if (
-      telemetry.consecutiveColdObservations
-      >= this.config.cacheAwareCompaction.coldCacheObservationThreshold
-    ) {
-      return "cold";
-    }
-    if (telemetry.lastObservedCacheHitAt) {
-      return "hot";
-    }
-    if (telemetry.cacheState === "cold") {
-      return "unknown";
-    }
-    return telemetry.cacheState;
-  }
-
-  /** Resolve the effective prompt-cache TTL in milliseconds for the stored retention class. */
-  private resolvePromptCacheTtlMs(retention?: string | null): number | null {
-    const normalized = retention?.trim().toLowerCase();
-    if (normalized === "none") {
-      return null;
-    }
-    if (normalized === "long" || normalized === "1h") {
-      return 60 * 60 * 1000;
-    }
-    return Math.max(1, this.config.cacheAwareCompaction.cacheTTLSeconds) * 1000;
-  }
-
-  /** Detect prompt-cache families where local prompt rewrites can invalidate a hot prefix cache. */
-  private isPromptCacheMutationSensitiveFamily(
-    telemetry: ConversationCompactionTelemetryRecord | null,
-  ): boolean {
-    const provider = telemetry?.provider?.trim().toLowerCase() ?? "";
-    const model = telemetry?.model?.trim().toLowerCase() ?? "";
-    const modelUsesOpenAiPromptCache =
-      model.startsWith("gpt-")
-      || /^o[1-9](?:-|$)/.test(model);
-    if (modelUsesOpenAiPromptCache) {
-      return true;
-    }
-    const identifiers = [provider, model];
-    return identifiers.some((identifier) =>
-      identifier.includes("anthropic")
-      || identifier.includes("claude")
-      || identifier.includes("openai-codex")
-      || identifier.includes("openai_codex")
-      || identifier.includes("github-copilot")
-      || identifier.includes("github_copilot")
-      || identifier.includes("codex-cli")
-      || identifier.includes("codex_cli")
-    );
-  }
-
-  /** Determine whether the last prompt-cache touch is still within the active TTL window. */
-  private isPromptCacheStillHot(
-    telemetry: ConversationCompactionTelemetryRecord | null,
-    now: Date = new Date(),
-  ): boolean {
-    const ttlMs = this.resolvePromptCacheTtlMs(telemetry?.retention ?? null);
-    if (!ttlMs) {
-      return false;
-    }
-    const touchAt =
-      telemetry?.lastCacheTouchAt
-      ?? telemetry?.lastObservedCacheHitAt
-      ?? telemetry?.lastApiCallAt
-      ?? null;
-    if (!touchAt) {
-      return false;
-    }
-    return now.getTime() - touchAt.getTime() < ttlMs;
-  }
-
-  private latestPromptCacheTouchSignalAt(
-    telemetry: ConversationCompactionTelemetryRecord | null,
-  ): Date | null {
-    const candidates = [
-      telemetry?.lastCacheTouchAt,
-      telemetry?.lastObservedCacheHitAt,
-    ].filter((value): value is Date => value instanceof Date);
-    return candidates.reduce<Date | null>(
-      (latest, value) => (!latest || value > latest ? value : latest),
-      null,
-    );
-  }
-
-  /** Return true when an explicit prompt-cache break is newer than any cache touch signal. */
-  private hasFreshPromptCacheBreak(
-    telemetry: ConversationCompactionTelemetryRecord | null,
-  ): boolean {
-    const lastCacheTouchSignalAt = this.latestPromptCacheTouchSignalAt(telemetry);
-    return Boolean(
-      telemetry?.lastObservedCacheBreakAt
-        && (
-          !lastCacheTouchSignalAt
-          || telemetry.lastObservedCacheBreakAt >= lastCacheTouchSignalAt
-        ),
-    );
-  }
-
-  /**
-   * Delay prompt-mutating deferred compaction while a mutation-sensitive prompt
-   * cache is hot.
-   *
-   * Two bypass conditions:
-   *
-   * 1. `cacheAwareCompaction.enabled === false` — the operator explicitly
-   *    opted out of cache-aware throttling. Without this check the dispatcher
-   *    would silently keep deferring even though every other cache-aware code
-   *    path correctly respects the flag.
-   *
-   * 2. Critical token-budget pressure — when the prompt is approaching
-   *    overflow we MUST allow compaction regardless of cache state. Otherwise
-   *    high-velocity sessions can livelock the dispatcher: each turn refreshes
-   *    `lastCacheTouchAt`, the TTL window never expires, deferred work never
-   *    fires, and the runtime emergency overflow handler is left to do all
-   *    the work. The default 0.90 threshold (configurable via
-   *    `cacheAwareCompaction.criticalBudgetPressureRatio`) keeps ordinary
-   *    threshold compaction inside the cache-protected band while preserving
-   *    a final overflow-avoidance escape hatch.
-   */
-  private shouldDelayPromptMutatingDeferredCompaction(
-    telemetry: ConversationCompactionTelemetryRecord | null,
-    now: Date = new Date(),
-    currentTokenCount?: number,
-    tokenBudget?: number,
-  ): boolean {
-    // Use explicit `=== false` (not falsy) so undefined/null don't silently
-    // bypass the entire cache-aware gate. With falsy `!enabled`, a config
-    // missing the field altogether (e.g. constructed via partial literal in
-    // a test or downstream caller) would skip cache-aware logic — defense
-    // in depth even though resolveLcmConfig always normalizes `enabled` to
-    // a boolean via `... ?? true`.
-    if (this.config.cacheAwareCompaction.enabled === false) {
-      return false;
-    }
-    if (this.isUnderCriticalBudgetPressure({ currentTokenCount, tokenBudget })) {
-      return false;
-    }
-    return this.isPromptCacheMutationSensitiveFamily(telemetry)
-      && !this.hasFreshPromptCacheBreak(telemetry)
-      && this.isPromptCacheStillHot(telemetry, now);
-  }
-
-  /** Let already-recorded cold-cache debt drain even when the last cache touch is recent. */
-  private shouldBypassDeferredCompactionHotCacheDelay(params: {
-    telemetry: ConversationCompactionTelemetryRecord | null;
-    debtReason?: string | null;
-  }): boolean {
-    if (params.debtReason?.trim() === "cold-cache-catchup") {
-      return true;
-    }
-    return this.isObservedCacheReadShareCold(params.telemetry);
-  }
-
-  /** Apply the prompt-cache delay policy with the recorded deferred-debt reason in scope. */
-  private shouldDelayDeferredCompactionDebt(params: {
-    telemetry: ConversationCompactionTelemetryRecord | null;
-    now?: Date;
-    currentTokenCount?: number;
-    tokenBudget?: number;
-    debtReason?: string | null;
-  }): boolean {
-    if (this.shouldBypassDeferredCompactionHotCacheDelay(params)) {
-      return false;
-    }
-    return this.shouldDelayPromptMutatingDeferredCompaction(
-      params.telemetry,
-      params.now ?? new Date(),
-      params.currentTokenCount,
-      params.tokenBudget,
-    );
-  }
-
-  /**
-   * Return true when the live prompt is critically full relative to the
-   * token budget. Used to bypass cache-aware deferral so compaction can fire
-   * before the runtime falls back to emergency overflow truncation.
-   */
-  private isUnderCriticalBudgetPressure(params: {
-    currentTokenCount?: number;
-    tokenBudget?: number;
-  }): boolean {
-    if (
-      typeof params.currentTokenCount !== "number"
-      || !Number.isFinite(params.currentTokenCount)
-      || params.currentTokenCount <= 0
-      || typeof params.tokenBudget !== "number"
-      || !Number.isFinite(params.tokenBudget)
-      || params.tokenBudget <= 0
-    ) {
-      return false;
-    }
-    const ratio =
-      this.config.cacheAwareCompaction.criticalBudgetPressureRatio
-        ?? DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO;
-    // Honor the documented "set to >= 1 to disable" semantics. Without this
-    // explicit no-op, ratio=1 would still bypass deferral once
-    // currentTokenCount >= tokenBudget — which contradicts the help text in
-    // openclaw.plugin.json and the JSDoc on CacheAwareCompactionConfig.
-    if (ratio >= 1) {
-      return false;
-    }
-    // Symmetric guard: ratio <= 0 would make `currentTokenCount >= 0 * budget`
-    // always true once any tokens are observed → silently disables ALL
-    // cache-aware throttling on every dispatch, defeating the gate. Treat
-    // ratio <= 0 as a misconfig and refuse the bypass instead.
-    if (ratio <= 0) {
-      return false;
-    }
-    // Compare against the raw product (not floored) so the bypass triggers
-    // exactly at `currentTokenCount >= ratio * tokenBudget` per the docs.
-    // Using Math.floor here would shift the trigger up to almost 1 token
-    // earlier than documented (e.g. budget=10, ratio=0.85 trips at 8 instead
-    // of 9 because floor(10*0.85)=8.5→8).
-    return params.currentTokenCount >= params.tokenBudget * ratio;
-  }
-
-  /**
-   * Keep deferred mutation-sensitive leaf debt moving once the TTL-safe cache
-   * hold has expired.
-   *
-   * Plumbs `currentTokenCount`/`tokenBudget` through to
-   * `shouldDelayPromptMutatingDeferredCompaction` so the critical-pressure
-   * escape correctly applies to the deferred-leaf path. Without these args,
-   * the gate sees `currentTokenCount === undefined`, the pressure check
-   * short-circuits to `false`, and the system can stay cache-throttled past
-   * critical pressure — recreating the livelock this PR was meant to fix.
-   */
-  private shouldForceDeferredPromptCacheLeafCompaction(
-    telemetry: ConversationCompactionTelemetryRecord | null,
-    leafDecision: IncrementalCompactionDecision,
-    currentTokenCount?: number,
-    tokenBudget?: number,
-  ): boolean {
-    if (leafDecision.shouldCompact) {
-      return false;
-    }
-    if (
-      leafDecision.reason !== "hot-cache-budget-headroom"
-      && leafDecision.reason !== "hot-cache-defer"
-    ) {
-      return false;
-    }
-    if (!this.isPromptCacheMutationSensitiveFamily(telemetry)) {
-      return false;
-    }
-    return !this.shouldDelayPromptMutatingDeferredCompaction(
-      telemetry,
-      new Date(),
-      currentTokenCount,
-      tokenBudget,
-    );
-  }
-
-  /** Use the post-TTL catch-up envelope when stale cache debt must override hot-cache smoothing. */
-  private resolveDeferredLeafCompactionExecutionDecision(params: {
-    telemetry: ConversationCompactionTelemetryRecord | null;
-    leafDecision: IncrementalCompactionDecision;
-    currentTokenCount?: number;
-    tokenBudget?: number;
-  }): IncrementalCompactionDecision {
-    if (!this.shouldForceDeferredPromptCacheLeafCompaction(
-      params.telemetry,
-      params.leafDecision,
-      params.currentTokenCount,
-      params.tokenBudget,
-    )) {
-      return params.leafDecision;
-    }
-    return {
-      ...params.leafDecision,
-      maxPasses: Math.max(1, this.config.cacheAwareCompaction.maxColdCacheCatchupPasses),
-      allowCondensedPasses: true,
-    };
-  }
-
-  /** Decide whether a hot cache still has enough real token-budget headroom to skip incremental maintenance. */
-  private isComfortablyUnderTokenBudget(params: {
-    currentTokenCount?: number;
-    tokenBudget: number;
-  }): boolean {
-    if (
-      typeof params.currentTokenCount !== "number"
-      || !Number.isFinite(params.currentTokenCount)
-      || params.currentTokenCount < 0
-    ) {
-      return false;
-    }
-    const budget = Math.max(1, Math.floor(params.tokenBudget));
-    const safeBudget = Math.floor(
-      budget * (1 - this.config.cacheAwareCompaction.hotCacheBudgetHeadroomRatio),
-    );
-    return params.currentTokenCount <= safeBudget;
-  }
-
-  /** Scale budget-trigger catch-up passes by how far the prompt exceeds threshold. */
-  private resolveBudgetTriggerCatchupPasses(params: {
-    currentTokens: number;
-    threshold: number;
-    leafChunkTokens: number;
-  }): number {
-    const overage = Math.max(0, params.currentTokens - params.threshold);
-    if (overage <= 0) {
-      return 1;
-    }
-    const chunkTokens = Math.max(1, Math.floor(params.leafChunkTokens));
-    return Math.max(
-      1,
-      Math.min(MAX_BUDGET_TRIGGER_CATCHUP_PASSES, Math.ceil(overage / chunkTokens)),
-    );
-  }
-
-  /** Resolve bounded dynamic leaf chunk sizes from config and the active token budget. */
-  private resolveDynamicLeafChunkBounds(tokenBudget?: number): DynamicLeafChunkBounds {
-    const floor = Math.max(1, Math.floor(this.config.leafChunkTokens));
-    const configuredMax = this.config.dynamicLeafChunkTokens.enabled
-      ? Math.max(floor, Math.floor(this.config.dynamicLeafChunkTokens.max))
-      : floor;
-    const budgetCap =
-      typeof tokenBudget === "number" &&
-      Number.isFinite(tokenBudget) &&
-      tokenBudget > 0
-        ? Math.max(floor, Math.floor(tokenBudget * this.config.contextThreshold))
-        : configuredMax;
-    const max = Math.max(floor, Math.min(configuredMax, budgetCap));
-    const medium = Math.max(
-      floor,
-      Math.min(max, Math.floor(floor * DYNAMIC_LEAF_CHUNK_MEDIUM_MULTIPLIER)),
-    );
-    const high = Math.max(
-      floor,
-      Math.min(max, Math.floor(floor * DYNAMIC_LEAF_CHUNK_HIGH_MULTIPLIER)),
-    );
-    return { floor, medium, high, max };
-  }
-
-  /** Classify the current refill rate into a simple step band with downshift hysteresis. */
-  private classifyDynamicLeafActivityBand(params: {
-    lastActivityBand?: ActivityBand;
-    tokensAccumulatedSinceLeafCompaction: number;
-    turnsSinceLeafCompaction: number;
-    floor: number;
-  }): ActivityBand {
-    const turns = Math.max(1, params.turnsSinceLeafCompaction);
-    const tokensPerTurn = params.tokensAccumulatedSinceLeafCompaction / turns;
-    const mediumUpshift = params.floor * DYNAMIC_ACTIVITY_MEDIUM_UPSHIFT_FACTOR;
-    const mediumDownshift = params.floor * DYNAMIC_ACTIVITY_MEDIUM_DOWNSHIFT_FACTOR;
-    const highUpshift = params.floor * DYNAMIC_ACTIVITY_HIGH_UPSHIFT_FACTOR;
-    const highDownshift = params.floor * DYNAMIC_ACTIVITY_HIGH_DOWNSHIFT_FACTOR;
-    const lastBand = params.lastActivityBand ?? "low";
-
-    if (lastBand === "high") {
-      if (tokensPerTurn >= highDownshift) {
-        return "high";
-      }
-      return tokensPerTurn >= mediumDownshift ? "medium" : "low";
-    }
-    if (lastBand === "medium") {
-      if (tokensPerTurn >= highUpshift) {
-        return "high";
-      }
-      if (tokensPerTurn < mediumDownshift) {
-        return "low";
-      }
-      return "medium";
-    }
-    if (tokensPerTurn >= highUpshift) {
-      return "high";
-    }
-    if (tokensPerTurn >= mediumUpshift) {
-      return "medium";
-    }
-    return "low";
-  }
-
-  /** Map an activity band to the corresponding working leaf chunk size. */
-  private resolveLeafChunkTokensForBand(
-    band: ActivityBand,
-    bounds: DynamicLeafChunkBounds,
-  ): number {
-    switch (band) {
-      case "high":
-        return bounds.high;
-      case "medium":
-        return bounds.medium;
-      default:
-        return bounds.floor;
-    }
-  }
-
-  /** Build descending fallback chunk sizes used when a provider rejects a larger chunk. */
-  private buildLeafChunkFallbacks(params: {
-    preferred: number;
-    bounds: DynamicLeafChunkBounds;
-  }): number[] {
-    const ordered = [params.preferred, params.bounds.max, params.bounds.high, params.bounds.medium, params.bounds.floor];
-    const seen = new Set<number>();
-    const fallbacks: number[] = [];
-    for (const value of ordered) {
-      const normalized = Math.max(params.bounds.floor, Math.floor(value));
-      if (seen.has(normalized)) {
-        continue;
-      }
-      seen.add(normalized);
-      fallbacks.push(normalized);
-    }
-    return fallbacks.sort((a, b) => b - a);
-  }
-
-  /** Detect provider/model token-limit failures that should trigger a lower chunk retry. */
-  private isRecoverableLeafChunkOverflowError(error: unknown): boolean {
-    const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
-    if (!message) {
-      return false;
-    }
-    return [
-      "context length",
-      "context window",
-      "maximum context",
-      "max context",
-      "too many tokens",
-      "too many input tokens",
-      "input tokens",
-      "token limit",
-      "context limit",
-      "input is too large",
-      "input too large",
-      "prompt is too long",
-      "request too large",
-      "exceeds the model",
-      "exceeds context",
-    ].some((fragment) => message.includes(fragment));
-  }
-
   /** Extract the current prompt-cache snapshot from runtime context, if present. */
   private readPromptCacheSnapshot(runtimeContext?: Record<string, unknown>): PromptCacheSnapshot | null {
     const promptCache = asRecord(runtimeContext?.promptCache);
@@ -2763,7 +2224,6 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const now = new Date();
-    const bounds = this.resolveDynamicLeafChunkBounds(params.tokenBudget);
     const turnsSinceLeafCompaction =
       (existing?.turnsSinceLeafCompaction ?? 0) + 1;
     const tokensAccumulatedSinceLeafCompaction =
@@ -2778,21 +2238,12 @@ export class LcmContextEngine implements ContextEngine {
       );
     const consecutiveColdObservations =
       snapshot?.sawExplicitBreak
-        ? Math.max(
-          existing?.consecutiveColdObservations ?? 0,
-          this.config.cacheAwareCompaction.coldCacheObservationThreshold,
-        )
+        ? Math.max(existing?.consecutiveColdObservations ?? 0, 1)
         : snapshot?.cacheState === "hot"
           ? 0
           : snapshot?.cacheState === "cold"
             ? (existing?.consecutiveColdObservations ?? 0) + 1
             : existing?.consecutiveColdObservations ?? 0;
-    const lastActivityBand = this.classifyDynamicLeafActivityBand({
-      lastActivityBand: existing?.lastActivityBand,
-      tokensAccumulatedSinceLeafCompaction,
-      turnsSinceLeafCompaction,
-      floor: bounds.floor,
-    });
     await this.compactionTelemetryStore.upsertConversationCompactionTelemetry({
       conversationId: params.conversationId,
       lastObservedCacheRead: snapshot?.lastObservedCacheRead ?? existing?.lastObservedCacheRead ?? null,
@@ -2814,7 +2265,7 @@ export class LcmContextEngine implements ContextEngine {
       lastLeafCompactionAt: existing?.lastLeafCompactionAt ?? null,
       turnsSinceLeafCompaction,
       tokensAccumulatedSinceLeafCompaction,
-      lastActivityBand,
+      lastActivityBand: existing?.lastActivityBand ?? "low",
       lastApiCallAt: now,
       lastCacheTouchAt: touchedPromptCache,
       provider: snapshot?.provider ?? existing?.provider ?? null,
@@ -2831,10 +2282,9 @@ export class LcmContextEngine implements ContextEngine {
     return updated;
   }
 
-  /** Reset refill counters after any successful leaf-producing compaction. */
+  /** Reset refill counters after successful summary-producing compaction. */
   private async markLeafCompactionTelemetrySuccess(params: {
     conversationId: number;
-    activityBand?: ActivityBand;
   }): Promise<void> {
     const existing = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
       params.conversationId,
@@ -2852,240 +2302,15 @@ export class LcmContextEngine implements ContextEngine {
       lastLeafCompactionAt: new Date(),
       turnsSinceLeafCompaction: 0,
       tokensAccumulatedSinceLeafCompaction: 0,
-      lastActivityBand: params.activityBand ?? existing?.lastActivityBand ?? "low",
+      lastActivityBand: existing?.lastActivityBand ?? "low",
       lastApiCallAt: existing?.lastApiCallAt ?? null,
       lastCacheTouchAt: existing?.lastCacheTouchAt ?? null,
       provider: existing?.provider ?? null,
       model: existing?.model ?? null,
     });
     this.deps.log.debug(
-      `[lcm] compaction telemetry reset after leaf compaction: conversation=${params.conversationId} cacheState=${existing?.cacheState ?? "unknown"} activityBand=${params.activityBand ?? existing?.lastActivityBand ?? "low"}`,
+      `[lcm] compaction telemetry reset after compaction: conversation=${params.conversationId} cacheState=${existing?.cacheState ?? "unknown"} activityBand=${existing?.lastActivityBand ?? "low"}`,
     );
-  }
-
-  /** Emit an operational trace for the incremental compaction policy decision. */
-  private logIncrementalCompactionDecision(params: {
-    conversationId: number;
-    cacheState: CacheState;
-    activityBand: ActivityBand;
-    tokenBudget: number;
-    currentTokenCount?: number;
-    cacheRead?: number | null;
-    cacheWrite?: number | null;
-    cachePromptTokenCount?: number | null;
-    triggerLeafChunkTokens: number;
-    preferredLeafChunkTokens: number;
-    fallbackLeafChunkTokens: number[];
-    rawTokensOutsideTail: number;
-    threshold: number;
-    shouldCompact: boolean;
-    maxPasses: number;
-    allowCondensedPasses: boolean;
-    reason: string;
-  }): IncrementalCompactionDecision {
-    const cacheReadSharePct =
-      typeof params.cacheRead === "number"
-      && Number.isFinite(params.cacheRead)
-      && typeof params.cachePromptTokenCount === "number"
-      && Number.isFinite(params.cachePromptTokenCount)
-      && params.cachePromptTokenCount > 0
-        ? `${((params.cacheRead / params.cachePromptTokenCount) * 100).toFixed(1)}%`
-        : "null";
-    this.deps.log.debug(
-      `[lcm] incremental compaction decision: conversation=${params.conversationId} cacheState=${params.cacheState} activityBand=${params.activityBand} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"} cacheRead=${params.cacheRead ?? "null"} cacheWrite=${params.cacheWrite ?? "null"} cachePromptTokenCount=${params.cachePromptTokenCount ?? "null"} cacheReadSharePct=${cacheReadSharePct} triggerLeafChunkTokens=${params.triggerLeafChunkTokens} preferredLeafChunkTokens=${params.preferredLeafChunkTokens} fallbackLeafChunkTokens=${params.fallbackLeafChunkTokens.join(",")} rawTokensOutsideTail=${params.rawTokensOutsideTail} threshold=${params.threshold} shouldCompact=${params.shouldCompact} maxPasses=${params.maxPasses} allowCondensedPasses=${params.allowCondensedPasses} reason=${params.reason}`,
-    );
-    return {
-      shouldCompact: params.shouldCompact,
-      cacheState: params.cacheState,
-      maxPasses: params.maxPasses,
-      rawTokensOutsideTail: params.rawTokensOutsideTail,
-      threshold: params.threshold,
-      reason: params.reason,
-      leafChunkTokens: params.preferredLeafChunkTokens,
-      fallbackLeafChunkTokens: params.fallbackLeafChunkTokens,
-      activityBand: params.activityBand,
-      allowCondensedPasses: params.allowCondensedPasses,
-    };
-  }
-
-  /** Resolve the cache-aware incremental-compaction policy for the current session. */
-  private async evaluateIncrementalCompaction(params: {
-    conversationId: number;
-    tokenBudget: number;
-    currentTokenCount?: number;
-  }): Promise<IncrementalCompactionDecision> {
-    const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-      params.conversationId,
-    );
-    const cacheRead = telemetry?.lastObservedCacheRead ?? null;
-    const cacheWrite = telemetry?.lastObservedCacheWrite ?? null;
-    const cachePromptTokenCount = telemetry?.lastObservedPromptTokenCount ?? null;
-    const cacheState =
-      this.config.cacheAwareCompaction.enabled
-        ? this.resolveCacheAwareState(telemetry)
-        : "unknown";
-    const bounds = this.resolveDynamicLeafChunkBounds(params.tokenBudget);
-    const activityBand =
-      this.config.dynamicLeafChunkTokens.enabled
-        ? this.classifyDynamicLeafActivityBand({
-          lastActivityBand: telemetry?.lastActivityBand,
-          tokensAccumulatedSinceLeafCompaction:
-            telemetry?.tokensAccumulatedSinceLeafCompaction ?? 0,
-          turnsSinceLeafCompaction: telemetry?.turnsSinceLeafCompaction ?? 0,
-          floor: bounds.floor,
-        })
-        : "low";
-    const triggerLeafChunkTokens =
-      this.config.dynamicLeafChunkTokens.enabled && cacheState === "hot"
-        ? bounds.max
-        : this.config.dynamicLeafChunkTokens.enabled
-          ? this.resolveLeafChunkTokensForBand(activityBand, bounds)
-          : bounds.floor;
-    const preferredLeafChunkTokens =
-      this.config.cacheAwareCompaction.enabled && (cacheState === "cold" || cacheState === "hot")
-        ? bounds.max
-        : triggerLeafChunkTokens;
-    const fallbackLeafChunkTokens = this.buildLeafChunkFallbacks({
-      preferred: preferredLeafChunkTokens,
-      bounds,
-    });
-    const leafTrigger = await this.compaction.evaluateLeafTrigger(
-      params.conversationId,
-      triggerLeafChunkTokens,
-    );
-    if (!leafTrigger.shouldCompact) {
-      return this.logIncrementalCompactionDecision({
-        conversationId: params.conversationId,
-        cacheState,
-        activityBand,
-        tokenBudget: params.tokenBudget,
-        currentTokenCount: params.currentTokenCount,
-        cacheRead,
-        cacheWrite,
-        cachePromptTokenCount,
-        triggerLeafChunkTokens,
-        preferredLeafChunkTokens,
-        fallbackLeafChunkTokens,
-        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
-        threshold: leafTrigger.threshold,
-        shouldCompact: false,
-        maxPasses: 1,
-        allowCondensedPasses: false,
-        reason: "below-leaf-trigger",
-      });
-    }
-
-    const budgetDecision = await this.compaction.evaluate(
-      params.conversationId,
-      params.tokenBudget,
-      params.currentTokenCount,
-    );
-    if (budgetDecision.shouldCompact) {
-      const maxPasses = this.resolveBudgetTriggerCatchupPasses({
-        currentTokens: budgetDecision.currentTokens,
-        threshold: budgetDecision.threshold,
-        leafChunkTokens: preferredLeafChunkTokens,
-      });
-      return this.logIncrementalCompactionDecision({
-        conversationId: params.conversationId,
-        cacheState,
-        activityBand,
-        tokenBudget: params.tokenBudget,
-        currentTokenCount: params.currentTokenCount,
-        cacheRead,
-        cacheWrite,
-        cachePromptTokenCount,
-        triggerLeafChunkTokens,
-        preferredLeafChunkTokens,
-        fallbackLeafChunkTokens,
-        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
-        threshold: leafTrigger.threshold,
-        shouldCompact: true,
-        maxPasses,
-        allowCondensedPasses: true,
-        reason: "budget-trigger",
-      });
-    }
-
-    if (
-      cacheState === "hot"
-      && this.isComfortablyUnderTokenBudget({
-        currentTokenCount: params.currentTokenCount,
-        tokenBudget: params.tokenBudget,
-      })
-    ) {
-      return this.logIncrementalCompactionDecision({
-        conversationId: params.conversationId,
-        cacheState,
-        activityBand,
-        tokenBudget: params.tokenBudget,
-        currentTokenCount: params.currentTokenCount,
-        cacheRead,
-        cacheWrite,
-        cachePromptTokenCount,
-        triggerLeafChunkTokens,
-        preferredLeafChunkTokens,
-        fallbackLeafChunkTokens,
-        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
-        threshold: leafTrigger.threshold,
-        shouldCompact: false,
-        maxPasses: 1,
-        allowCondensedPasses: false,
-        reason: "hot-cache-budget-headroom",
-      });
-    }
-
-    if (
-      cacheState === "hot"
-      && leafTrigger.rawTokensOutsideTail
-        < Math.floor(
-          leafTrigger.threshold * this.config.cacheAwareCompaction.hotCachePressureFactor,
-        )
-    ) {
-      return this.logIncrementalCompactionDecision({
-        conversationId: params.conversationId,
-        cacheState,
-        activityBand,
-        tokenBudget: params.tokenBudget,
-        currentTokenCount: params.currentTokenCount,
-        cacheRead,
-        cacheWrite,
-        cachePromptTokenCount,
-        triggerLeafChunkTokens,
-        preferredLeafChunkTokens,
-        fallbackLeafChunkTokens,
-        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
-        threshold: leafTrigger.threshold,
-        shouldCompact: false,
-        maxPasses: 1,
-        allowCondensedPasses: false,
-        reason: "hot-cache-defer",
-      });
-    }
-
-    const maxPasses =
-      cacheState === "cold"
-        ? Math.max(1, this.config.cacheAwareCompaction.maxColdCacheCatchupPasses)
-        : 1;
-    return this.logIncrementalCompactionDecision({
-      conversationId: params.conversationId,
-      cacheState,
-      activityBand,
-      tokenBudget: params.tokenBudget,
-      currentTokenCount: params.currentTokenCount,
-      cacheRead,
-      cacheWrite,
-      cachePromptTokenCount,
-      triggerLeafChunkTokens,
-      preferredLeafChunkTokens,
-      fallbackLeafChunkTokens,
-      rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
-      threshold: leafTrigger.threshold,
-      shouldCompact: true,
-      maxPasses,
-      allowCondensedPasses: cacheState !== "hot",
-      reason: cacheState === "cold" ? "cold-cache-catchup" : "leaf-trigger",
-    });
   }
 
   /** Persist a coalesced proactive-compaction debt record for later maintenance. */
@@ -3122,9 +2347,10 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
-   * Consume durable debt only when the session queue is idle and cache policy says
-   * prompt mutation is safe. Any skipped attempt leaves the maintenance row
-   * pending for assemble() or a later host-approved maintain() pass.
+   * Consume durable threshold debt only when the session queue is idle.
+   *
+   * Any skipped busy-queue attempt leaves the maintenance row pending for
+   * assemble() or a later host-approved maintain() pass.
    */
   private async drainDeferredCompactionDebtIfIdle(
     params: DeferredCompactionDebtDrainParams & { queueKey: string },
@@ -3154,34 +2380,11 @@ export class LcmContextEngine implements ContextEngine {
           return;
         }
 
+        const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
         const telemetry =
           await this.compactionTelemetryStore.getConversationCompactionTelemetry(
             params.conversationId,
           );
-        // Apply the assembly cap once and use the SAME capped value for both
-        // the gate's pressure check and `consumeDeferredCompactionDebt`. The
-        // maintain() path was patched for this; the drain path needs symmetric
-        // treatment, otherwise when `maxAssemblyTokenBudget` is configured
-        // smaller than the runtime-supplied budget, the gate evaluates the
-        // pressure ratio against a larger budget than execution actually
-        // enforces — which can let the bypass fail to trip at pressures
-        // execution would consider critical.
-        const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
-        if (
-          this.shouldDelayDeferredCompactionDebt({
-            telemetry,
-            now: new Date(),
-            currentTokenCount: params.currentTokenCount,
-            tokenBudget: cappedTokenBudget,
-            debtReason: maintenance.reason ?? params.reason,
-          })
-        ) {
-          this.deps.log.debug(
-            `[lcm] background deferred compaction skipped conversation=${params.conversationId} ${sessionLabel} reason=hot-cache retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"} debtReason=${maintenance.reason ?? params.reason}`,
-          );
-          return;
-        }
-
         const legacyParams =
           telemetry?.provider || telemetry?.model
             ? {
@@ -3254,71 +2457,52 @@ export class LcmContextEngine implements ContextEngine {
         params.currentTokenCount ?? maintenance.currentTokenCount ?? undefined,
       );
 
-      const result =
-        maintenance.reason?.trim() === "threshold"
-          ? await this.executeCompactionCore({
-              conversationId: params.conversationId,
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              tokenBudget: resolvedTokenBudget,
-              currentTokenCount: resolvedCurrentTokenCount,
-              compactionTarget: "threshold",
-              runtimeContext: params.runtimeContext,
-              legacyParams: params.legacyParams,
-            })
-          : await (async (): Promise<CompactResult> => {
-              const telemetry =
-                await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-                  params.conversationId,
-                );
-              const leafDecision = await this.evaluateIncrementalCompaction({
-                conversationId: params.conversationId,
-                tokenBudget: resolvedTokenBudget,
-                currentTokenCount: resolvedCurrentTokenCount,
-              });
-              const executionLeafDecision =
-                this.resolveDeferredLeafCompactionExecutionDecision({
-                  telemetry,
-                  leafDecision,
-                  currentTokenCount: resolvedCurrentTokenCount,
-                  tokenBudget: resolvedTokenBudget,
-                });
-              if (!leafDecision.shouldCompact) {
-                const deferredLeafStillNeeded =
-                  leafDecision.rawTokensOutsideTail >= leafDecision.threshold;
-                if (executionLeafDecision === leafDecision) {
-                  return {
-                    ok: true,
-                    compacted: false,
-                    reason: deferredLeafStillNeeded
-                      ? DEFERRED_COMPACTION_STILL_NEEDED_REASON
-                      : "deferred compaction no longer needed",
-                  };
-                }
-                this.deps.log.debug(
-                  `[lcm] maintain: deferred prompt-cache leaf debt ignoring effective hot-cache state after TTL expiry conversation=${params.conversationId} ${sessionLabel} reason=${leafDecision.reason} retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"}`,
-                );
-              }
-              return this.executeLeafCompactionCore({
-                conversationId: params.conversationId,
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                tokenBudget: resolvedTokenBudget,
-                currentTokenCount: resolvedCurrentTokenCount,
-                runtimeContext: params.runtimeContext,
-                legacyParams: params.legacyParams,
-                maxPasses: executionLeafDecision.maxPasses,
-                leafChunkTokens: executionLeafDecision.leafChunkTokens,
-                fallbackLeafChunkTokens: executionLeafDecision.fallbackLeafChunkTokens,
-                activityBand: executionLeafDecision.activityBand,
-                allowCondensedPasses: executionLeafDecision.allowCondensedPasses,
-              });
-            })();
+      const isThresholdDebt = maintenance.reason?.trim() === "threshold";
+      if (!isThresholdDebt) {
+        const thresholdDecision = await this.compaction.evaluate(
+          params.conversationId,
+          resolvedTokenBudget,
+          resolvedCurrentTokenCount,
+        );
+        if (!thresholdDecision.shouldCompact) {
+          const result: CompactResult = {
+            ok: true,
+            compacted: false,
+            reason: "legacy deferred compaction no longer needed",
+          };
+          await this.compactionMaintenanceStore.markProactiveCompactionFinished({
+            conversationId: params.conversationId,
+            finishedAt: new Date(),
+            failureSummary: null,
+            keepPending: false,
+          });
+          this.deps.log.debug(
+            `[lcm] maintain: cleared legacy deferred compaction debt conversation=${params.conversationId} ${sessionLabel} debtReason=${maintenance.reason ?? "null"}`,
+          );
+          return {
+            changed: result.compacted,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: result.reason,
+          };
+        }
+      }
+
+      const result = await this.executeCompactionCore({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget: resolvedTokenBudget,
+        currentTokenCount: resolvedCurrentTokenCount,
+        compactionTarget: "threshold",
+        runtimeContext: params.runtimeContext,
+        legacyParams: params.legacyParams,
+      });
       await this.compactionMaintenanceStore.markProactiveCompactionFinished({
         conversationId: params.conversationId,
         finishedAt: new Date(),
         failureSummary: result.ok ? null : result.reason ?? "deferred compaction failed",
-        keepPending: !result.ok || result.reason === DEFERRED_COMPACTION_STILL_NEEDED_REASON,
+        keepPending: !result.ok,
       });
       this.deps.log.debug(
         `[lcm] maintain: deferred compaction ${result.compacted ? "completed" : "skipped"} conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} ok=${result.ok} reason=${result.reason ?? "none"}`,
@@ -3374,54 +2558,29 @@ export class LcmContextEngine implements ContextEngine {
           return;
         }
 
-        const telemetry =
-          await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-            params.conversationId,
-          );
-        // Apply the assembly cap once and use the SAME capped value for both
-        // the gate's pressure check and consumeDeferredCompactionDebt — same
-        // pattern as drain/maintain. Without this, when maxAssemblyTokenBudget
-        // is configured smaller than the runtime-supplied budget, the gate
-        // evaluates pressure against a larger budget than execution actually
-        // enforces, and the bypass can fail to trip at pressures execution
-        // would consider critical.
         const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
         const normalizedCurrentTokenCount = this.normalizeObservedTokenCount(
           params.currentTokenCount,
         );
-        const promptOverflowEmergency =
-          (normalizedCurrentTokenCount ?? 0) > cappedTokenBudget;
-        if (
-          promptOverflowEmergency
-          || !this.shouldDelayDeferredCompactionDebt({
-            telemetry,
-            now: new Date(),
-            currentTokenCount: normalizedCurrentTokenCount,
-            tokenBudget: cappedTokenBudget,
-            debtReason: maintenance.reason,
-          })
-        ) {
-          const deferredLegacyParams =
-            telemetry?.provider || telemetry?.model
-              ? {
-                  ...(telemetry.provider ? { provider: telemetry.provider } : {}),
-                  ...(telemetry.model ? { model: telemetry.model } : {}),
-                }
-              : undefined;
-          await this.consumeDeferredCompactionDebt({
-            conversationId: params.conversationId,
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            tokenBudget: cappedTokenBudget,
-            currentTokenCount: normalizedCurrentTokenCount,
-            legacyParams: deferredLegacyParams,
-          });
-          return;
-        }
-
-        this.deps.log.debug(
-          `[lcm] assemble: deferred compaction still cache-hot for conversation=${params.conversationId} ${sessionLabel} retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"}`,
-        );
+        const telemetry =
+          await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+            params.conversationId,
+          );
+        const deferredLegacyParams =
+          telemetry?.provider || telemetry?.model
+            ? {
+                ...(telemetry.provider ? { provider: telemetry.provider } : {}),
+                ...(telemetry.model ? { model: telemetry.model } : {}),
+              }
+            : undefined;
+        await this.consumeDeferredCompactionDebt({
+          conversationId: params.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget: cappedTokenBudget,
+          currentTokenCount: normalizedCurrentTokenCount,
+          legacyParams: deferredLegacyParams,
+        });
       },
       {
         operationName: "assembleDeferredCompaction",
@@ -3523,7 +2682,6 @@ export class LcmContextEngine implements ContextEngine {
       }
       if (sweepResult.actionTaken) {
         await this.markLeafCompactionTelemetrySuccess({ conversationId });
-        this.clearStableOrphanStrippingOrdinal(conversationId);
       }
       const sweepTokensAfter =
         typeof sweepResult.tokensAfter === "number" && Number.isFinite(sweepResult.tokensAfter)
@@ -3594,7 +2752,6 @@ export class LcmContextEngine implements ContextEngine {
     const didCompact = compactResult.rounds > 0;
     if (didCompact) {
       await this.markLeafCompactionTelemetrySuccess({ conversationId });
-      this.clearStableOrphanStrippingOrdinal(conversationId);
     }
 
     return {
@@ -4391,46 +3548,6 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
-   * Return the stable orphan-stripping ordinal for a conversation and refresh its
-   * recency so the bounded cache behaves as an LRU.
-   */
-  private getStableOrphanStrippingOrdinal(conversationId: number): number | undefined {
-    const ordinal = this.stableOrphanStrippingOrdinalsByConversation.get(conversationId);
-    if (typeof ordinal !== "number") {
-      return undefined;
-    }
-    this.stableOrphanStrippingOrdinalsByConversation.delete(conversationId);
-    this.stableOrphanStrippingOrdinalsByConversation.set(conversationId, ordinal);
-    return ordinal;
-  }
-
-  /** Remember the stable orphan-stripping ordinal for a hot-cache conversation. */
-  private setStableOrphanStrippingOrdinal(conversationId: number, ordinal: number): void {
-    if (!Number.isFinite(ordinal) || ordinal < 0) {
-      return;
-    }
-    const normalizedOrdinal = Math.floor(ordinal);
-    this.stableOrphanStrippingOrdinalsByConversation.delete(conversationId);
-    this.stableOrphanStrippingOrdinalsByConversation.set(conversationId, normalizedOrdinal);
-    while (
-      this.stableOrphanStrippingOrdinalsByConversation.size
-      > MAX_STABLE_ORPHAN_STRIPPING_BOUNDARIES
-    ) {
-      const oldestConversationId =
-        this.stableOrphanStrippingOrdinalsByConversation.keys().next().value;
-      if (typeof oldestConversationId !== "number") {
-        break;
-      }
-      this.stableOrphanStrippingOrdinalsByConversation.delete(oldestConversationId);
-    }
-  }
-
-  /** Drop any cached orphan-stripping state after a history rewrite or cold-cache transition. */
-  private clearStableOrphanStrippingOrdinal(conversationId: number): void {
-    this.stableOrphanStrippingOrdinalsByConversation.delete(conversationId);
-  }
-
-  /**
    * Intercept oversized <file> blocks before persistence and replace them with
    * compact file references backed by large_files records.
    */
@@ -5076,7 +4193,6 @@ export class LcmContextEngine implements ContextEngine {
               }
             }
             if (importedMessages > 0) {
-              this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
               this.recordRecentBootstrapImport(
                 conversation.conversationId,
                 importedMessages,
@@ -5189,7 +4305,6 @@ export class LcmContextEngine implements ContextEngine {
           return { importedMessages: 0, blockedByImportCap: true, hasOverlap: reconcile.hasOverlap };
         }
         if (reconcile.importedMessages > 0) {
-          this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
           this.recordRecentBootstrapImport(
             conversation.conversationId,
             reconcile.importedMessages,
@@ -5388,7 +4503,6 @@ export class LcmContextEngine implements ContextEngine {
             // old file's messages. Clear them all in one place so subsequent
             // reads treat this conversation as unbootstrapped.
             this.lastFullReadFileState.delete(conversationId);
-            this.clearStableOrphanStrippingOrdinal(conversationId);
             bootstrapState = null;
           }
           if (
@@ -5402,7 +4516,6 @@ export class LcmContextEngine implements ContextEngine {
               `[lcm] bootstrap: session file shrank past checkpoint conversation=${conversationId} ${sessionLabel} file=${params.sessionFile} checkpointOffset=${bootstrapState.lastProcessedOffset} checkpointSize=${bootstrapState.lastSeenSize} currentSize=${sessionFileSize}`,
             );
             this.lastFullReadFileState.delete(conversationId);
-            this.clearStableOrphanStrippingOrdinal(conversationId);
             bootstrapState = null;
           }
 
@@ -5502,9 +4615,6 @@ export class LcmContextEngine implements ContextEngine {
                 }
 
                 await persistBootstrapState(conversationId);
-                if (importedMessages > 0) {
-                  this.clearStableOrphanStrippingOrdinal(conversationId);
-                }
                 this.deps.log.debug(
                   `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} replayFilteredMessages=${replayFilteredMessages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
                 );
@@ -5591,7 +4701,6 @@ export class LcmContextEngine implements ContextEngine {
               const pruned = await this.pruneHeartbeatOkTurns(conversationId);
               prunedMessages = pruned;
               if (pruned > 0) {
-                this.clearStableOrphanStrippingOrdinal(conversationId);
                 this.deps.log.info(
                   `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
                 );
@@ -5605,9 +4714,6 @@ export class LcmContextEngine implements ContextEngine {
                   )
                 : undefined;
             await persistBootstrapState(conversationId, lastImportedHash);
-            if (importedMessages > 0) {
-              this.clearStableOrphanStrippingOrdinal(conversationId);
-            }
             this.deps.log.debug(
               `[lcm] bootstrap: initial import conversation=${conversationId} ${sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
             );
@@ -5650,7 +4756,6 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           if (reconcile.importedMessages > 0) {
-            this.clearStableOrphanStrippingOrdinal(conversationId);
             await persistBootstrapState(conversationId);
             return {
               bootstrapped: true,
@@ -5693,7 +4798,6 @@ export class LcmContextEngine implements ContextEngine {
         if (conversation) {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
-            this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
             await this.refreshBootstrapState({
               conversationId: conversation.conversationId,
               sessionFile: params.sessionFile,
@@ -6047,9 +5151,6 @@ export class LcmContextEngine implements ContextEngine {
         const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
           conversation.conversationId,
         );
-        const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-          conversation.conversationId,
-        );
         if (params.runtimeContext?.allowDeferredCompactionExecution === true) {
           const runtimeTokenBudget = (() => {
             const tokenBudget = asRecord(params.runtimeContext)?.tokenBudget;
@@ -6062,30 +5163,12 @@ export class LcmContextEngine implements ContextEngine {
             }
             return 128_000;
           })();
-          // Apply the assembly cap once and use the SAME capped value for both
-          // the gate's pressure check and the actual compaction execution.
-          // Otherwise, when maxAssemblyTokenBudget is configured lower than
-          // the runtime-supplied tokenBudget, the pressure ratio would be
-          // computed against the larger uncapped budget and could fail to
-          // trip even when the prompt is approaching the capped budget that
-          // execution actually enforces.
           const cappedTokenBudget = this.applyAssemblyBudgetCap(runtimeTokenBudget);
           const maintainCurrentTokenCount =
             typeof params.runtimeContext?.currentTokenCount === "number"
               ? Math.floor(params.runtimeContext.currentTokenCount as number)
               : undefined;
-          if ((maintenance?.pending || maintenance?.running)
-            && this.shouldDelayDeferredCompactionDebt({
-              telemetry,
-              now: new Date(),
-              currentTokenCount: maintainCurrentTokenCount,
-              tokenBudget: cappedTokenBudget,
-              debtReason: maintenance.reason,
-            })) {
-            this.deps.log.debug(
-              `[lcm] maintain: deferred compaction debt still hot-cache deferred conversation=${conversation.conversationId} ${sessionLabel} retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"}`,
-            );
-          } else {
+          if (maintenance?.pending || maintenance?.running) {
             deferredCompactionResult = await this.consumeDeferredCompactionDebt({
               conversationId: conversation.conversationId,
               sessionId: params.sessionId,
@@ -6184,7 +5267,6 @@ export class LcmContextEngine implements ContextEngine {
         });
 
         if (result.changed) {
-          this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
           try {
             await this.refreshBootstrapState({
               conversationId: conversation.conversationId,
@@ -6442,90 +5524,6 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
-  /**
-   * Run afterTurn inline leaf compaction and its state persistence in one queue slot.
-   *
-   * This preserves afterTurn's non-blocking behavior while ensuring later
-   * same-session work cannot observe stale bootstrap or retry-debt state between
-   * compaction completion and the follow-up persistence write.
-   */
-  private async runAfterTurnInlineLeafCompaction(params: {
-    conversationId: number;
-    sessionId: string;
-    sessionKey?: string;
-    sessionFile: string;
-    tokenBudget: number;
-    currentTokenCount: number;
-    legacyParams?: Record<string, unknown>;
-    leafDecision: IncrementalCompactionDecision;
-    sessionLabel: string;
-  }): Promise<void> {
-    try {
-      await this.withSessionQueue(
-        this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-        async () => {
-          const recordAfterTurnCompactionRetry = async (): Promise<void> => {
-            try {
-              await this.recordDeferredCompactionDebt({
-                conversationId: params.conversationId,
-                reason: params.leafDecision.reason,
-                tokenBudget: params.tokenBudget,
-                currentTokenCount: params.currentTokenCount,
-              });
-            } catch (err) {
-              this.deps.log.warn(
-                `[lcm] afterTurn: failed to persist deferred compaction retry for ${params.sessionLabel}: ${describeLogError(err)}`,
-              );
-            }
-          };
-
-          try {
-            const compactResult = await this.executeLeafCompactionCore({
-              conversationId: params.conversationId,
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              tokenBudget: params.tokenBudget,
-              currentTokenCount: params.currentTokenCount,
-              legacyParams: params.legacyParams,
-              maxPasses: params.leafDecision.maxPasses,
-              leafChunkTokens: params.leafDecision.leafChunkTokens,
-              fallbackLeafChunkTokens: params.leafDecision.fallbackLeafChunkTokens,
-              activityBand: params.leafDecision.activityBand,
-              allowCondensedPasses: params.leafDecision.allowCondensedPasses,
-            });
-            if (compactResult.ok) {
-              try {
-                await this.refreshBootstrapState({
-                  conversationId: params.conversationId,
-                  sessionFile: params.sessionFile,
-                });
-              } catch (err) {
-                this.deps.log.warn(
-                  `[lcm] afterTurn: bootstrap checkpoint refresh failed for ${params.sessionLabel}: ${describeLogError(err)}`,
-                );
-              }
-              return;
-            }
-            await recordAfterTurnCompactionRetry();
-          } catch (err) {
-            await recordAfterTurnCompactionRetry();
-            this.deps.log.warn(
-              `[lcm] afterTurn: inline leaf compaction failed for ${params.sessionLabel}: ${describeLogError(err)}`,
-            );
-          }
-        },
-        {
-          operationName: "afterTurnLeafCompaction",
-          context: params.sessionLabel,
-        },
-      );
-    } catch (err) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: failed to queue inline leaf compaction for ${params.sessionLabel}: ${describeLogError(err)}`,
-      );
-    }
-  }
-
   async afterTurn(params: {
     sessionId: string;
     sessionKey?: string;
@@ -6687,7 +5685,6 @@ export class LcmContextEngine implements ContextEngine {
         if (conversation) {
           const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
           if (pruned > 0) {
-            this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
             const sessionContext = this.formatSessionLogContext({
               conversationId: conversation.conversationId,
               sessionId: params.sessionId,
@@ -6795,22 +5792,11 @@ export class LcmContextEngine implements ContextEngine {
         }
       | null = null;
 
-    let rawLeafTrigger:
-      | {
-          shouldCompact: boolean;
-          rawTokensOutsideTail: number;
-          threshold: number;
-        }
-      | null = null;
-    let compactionTelemetry: ConversationCompactionTelemetryRecord | null = null;
-
     try {
-      rawLeafTrigger = await this.compaction.evaluateLeafTrigger(conversation.conversationId);
-      compactionTelemetry = await this.updateCompactionTelemetry({
+      await this.updateCompactionTelemetry({
         conversationId: conversation.conversationId,
         runtimeContext: legacyParams,
         tokenBudget,
-        rawTokensOutsideTail: rawLeafTrigger.rawTokensOutsideTail,
       });
     } catch (err) {
       this.deps.log.warn(
@@ -6819,35 +5805,13 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
-      const leafDecision = await this.evaluateIncrementalCompaction({
-        conversationId: conversation.conversationId,
-        tokenBudget,
-        currentTokenCount: observedCurrentTokenCount,
-      });
       const thresholdDecision = await this.compaction.evaluate(
         conversation.conversationId,
         tokenBudget,
         observedCurrentTokenCount,
       );
       if (this.config.proactiveThresholdCompactionMode === "inline") {
-        let leafCompactionScheduled = false;
-        if (leafDecision.shouldCompact) {
-          leafCompactionScheduled = true;
-          shouldRefreshBootstrapState = false;
-          void this.runAfterTurnInlineLeafCompaction({
-            conversationId: conversation.conversationId,
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            sessionFile: params.sessionFile,
-            tokenBudget,
-            currentTokenCount: observedCurrentTokenCount,
-            legacyParams,
-            leafDecision,
-            sessionLabel,
-          });
-        }
-
-        if (!leafCompactionScheduled) {
+        if (thresholdDecision.shouldCompact) {
           const compactResult = await this.compact({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
@@ -6857,45 +5821,22 @@ export class LcmContextEngine implements ContextEngine {
             compactionTarget: "threshold",
             legacyParams,
           });
-          const retryReason = thresholdDecision.shouldCompact ? "threshold" : null;
-          if (!compactResult.ok && retryReason) {
+          if (!compactResult.ok) {
             shouldRefreshBootstrapState = false;
-            await recordAfterTurnCompactionRetry(retryReason);
+            await recordAfterTurnCompactionRetry("threshold");
           }
         }
-      } else if (thresholdDecision.shouldCompact || rawLeafTrigger?.shouldCompact) {
-        const deferredReason = thresholdDecision.shouldCompact
-          ? "threshold"
-          : leafDecision.shouldCompact
-            ? leafDecision.reason
-            : "leaf-trigger";
+      } else if (thresholdDecision.shouldCompact) {
         await this.recordDeferredCompactionDebt({
           conversationId: conversation.conversationId,
-          reason: deferredReason,
+          reason: "threshold",
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
         });
-        // CLI-backend sessions (#472) never observe provider/model telemetry,
-        // so the previous gate skipped scheduling and accumulated debt
-        // forever. Schedule the drain unconditionally and let the inner
-        // cache-aware gate (`shouldDelayPromptMutatingDeferredCompaction`)
-        // decide whether prompt mutation is actually safe — that gate is
-        // robust to missing telemetry.
-        if (!compactionTelemetry?.provider && !compactionTelemetry?.model) {
-          // Dedupe the visibility log to once per conversation per process —
-          // long-running CLI-backend sessions otherwise emit this line on
-          // every afterTurn that records deferred debt.
-          if (!this.cacheContextUnknownLogged.has(conversation.conversationId)) {
-            this.cacheContextUnknownLogged.add(conversation.conversationId);
-            this.deps.log.debug(
-              `[lcm] background deferred compaction scheduled without cache context conversation=${conversation.conversationId} ${sessionLabel} reason=cache-context-unknown debtReason=${deferredReason}`,
-            );
-          }
-        }
         deferredCompactionDrain = {
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
-          reason: deferredReason,
+          reason: "threshold",
         };
       }
     } catch (err) {
@@ -6992,17 +5933,6 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
-      const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-        conversation.conversationId,
-      );
-      const cacheAwareState = this.resolveCacheAwareState(telemetry);
-      const stableOrphanStrippingOrdinal = cacheAwareState === "hot"
-        ? this.getStableOrphanStrippingOrdinal(conversation.conversationId)
-        : undefined;
-      if (cacheAwareState !== "hot") {
-        this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
-      }
-
       const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       if (contextItems.length === 0) {
         this.deps.log.debug(
@@ -7029,18 +5959,11 @@ export class LcmContextEngine implements ContextEngine {
         freshTailMaxTokens: this.config.freshTailMaxTokens,
         promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
-        orphanStrippingOrdinal: stableOrphanStrippingOrdinal,
         // v4.2 §B — gated by config.stubLargeToolPayloads (default false).
         // Off-by-default so v4.1 behavior is preserved until the migration
         // tool has populated `messages.large_content` for the running DB.
         stubLargeToolPayloads: this.config.stubLargeToolPayloads,
       });
-      if (cacheAwareState === "hot") {
-        this.setStableOrphanStrippingOrdinal(
-          conversation.conversationId,
-          assembled.debug?.orphanStrippingOrdinal ?? assembled.debug?.freshTailOrdinal ?? 0,
-        );
-      }
 
       // If assembly produced no messages for a non-empty live session,
       // fail safe to the live context.
@@ -7104,7 +6027,7 @@ export class LcmContextEngine implements ContextEngine {
             })}`
           : "";
         this.deps.log.debug(
-          `[lcm] assemble-debug conversation=${conversation.conversationId} ${sessionLabel} cacheAwareState=${cacheAwareState} messagesHash=${assembled.debug.finalMessagesHash} preSanitizeHash=${assembled.debug.preSanitizeMessagesHash} previousAssembledCount=${prefixChange.previousCount} commonPrefixCount=${prefixChange.commonPrefixCount} commonPrefixHash=${prefixChange.commonPrefixHash} previousWasPrefix=${prefixChange.previousWasPrefix} firstDivergenceIndex=${prefixChange.firstDivergenceIndex} previousDivergenceMessage=${prefixChange.previousDivergenceMessage} currentDivergenceMessage=${prefixChange.currentDivergenceMessage} evictableCount=${assembled.debug.preSanitizeEvictableCount} evictableHash=${assembled.debug.preSanitizeEvictableHash} freshTailSegmentCount=${assembled.debug.preSanitizeFreshTailCount} freshTailSegmentHash=${assembled.debug.preSanitizeFreshTailHash} selectionMode=${assembled.debug.selectionMode} freshTailOrdinal=${assembled.debug.freshTailOrdinal} orphanStrippingOrdinal=${assembled.debug.orphanStrippingOrdinal} baseFreshTailCount=${assembled.debug.baseFreshTailCount} freshTailCount=${assembled.debug.freshTailCount} tailTokens=${assembled.debug.tailTokens} remainingBudget=${assembled.debug.remainingBudget} evictableTotalTokens=${assembled.debug.evictableTotalTokens} promotedToolResults=${assembled.debug.promotedToolResultCount} promotedOrdinals=${promotedOrdinals} removedToolUseBlocks=${assembled.debug.removedToolUseBlockCount} touchedAssistantMessages=${assembled.debug.touchedAssistantMessageCount}${overflowDiagnostics}`,
+          `[lcm] assemble-debug conversation=${conversation.conversationId} ${sessionLabel} messagesHash=${assembled.debug.finalMessagesHash} preSanitizeHash=${assembled.debug.preSanitizeMessagesHash} previousAssembledCount=${prefixChange.previousCount} commonPrefixCount=${prefixChange.commonPrefixCount} commonPrefixHash=${prefixChange.commonPrefixHash} previousWasPrefix=${prefixChange.previousWasPrefix} firstDivergenceIndex=${prefixChange.firstDivergenceIndex} previousDivergenceMessage=${prefixChange.previousDivergenceMessage} currentDivergenceMessage=${prefixChange.currentDivergenceMessage} evictableCount=${assembled.debug.preSanitizeEvictableCount} evictableHash=${assembled.debug.preSanitizeEvictableHash} freshTailSegmentCount=${assembled.debug.preSanitizeFreshTailCount} freshTailSegmentHash=${assembled.debug.preSanitizeFreshTailHash} selectionMode=${assembled.debug.selectionMode} freshTailOrdinal=${assembled.debug.freshTailOrdinal} orphanStrippingOrdinal=${assembled.debug.orphanStrippingOrdinal} baseFreshTailCount=${assembled.debug.baseFreshTailCount} freshTailCount=${assembled.debug.freshTailCount} tailTokens=${assembled.debug.tailTokens} remainingBudget=${assembled.debug.remainingBudget} evictableTotalTokens=${assembled.debug.evictableTotalTokens} promotedToolResults=${assembled.debug.promotedToolResultCount} promotedOrdinals=${promotedOrdinals} removedToolUseBlocks=${assembled.debug.removedToolUseBlockCount} touchedAssistantMessages=${assembled.debug.touchedAssistantMessageCount}${overflowDiagnostics}`,
         );
       }
 
@@ -7121,7 +6044,7 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
-  /** Evaluate whether incremental leaf compaction should run for a session. */
+  /** Evaluate diagnostic raw-history pressure outside the protected fresh tail. */
   async evaluateLeafTrigger(sessionId: string, sessionKey?: string): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
@@ -7135,10 +6058,10 @@ export class LcmContextEngine implements ContextEngine {
     if (!conversation) {
       const fallbackThreshold =
         typeof this.config.leafChunkTokens === "number" &&
-        Number.isFinite(this.config.leafChunkTokens) &&
-        this.config.leafChunkTokens > 0
-          ? Math.floor(this.config.leafChunkTokens)
-          : 20_000;
+          Number.isFinite(this.config.leafChunkTokens) &&
+          this.config.leafChunkTokens > 0
+            ? Math.floor(this.config.leafChunkTokens)
+            : 40_000;
       return {
         shouldCompact: false,
         rawTokensOutsideTail: 0,
@@ -7146,241 +6069,6 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     return this.compaction.evaluateLeafTrigger(conversation.conversationId);
-  }
-
-  /** Run one or more incremental leaf compaction passes without taking the per-session queue. */
-  private async executeLeafCompactionCore(params: {
-    conversationId: number;
-    sessionId: string;
-    sessionKey?: string;
-    tokenBudget: number;
-    currentTokenCount?: number;
-    customInstructions?: string;
-    /** OpenClaw runtime param name (preferred). */
-    runtimeContext?: Record<string, unknown>;
-    /** Back-compat param name. */
-    legacyParams?: Record<string, unknown>;
-    force?: boolean;
-    previousSummaryContent?: string;
-    maxPasses?: number;
-    leafChunkTokens?: number;
-    fallbackLeafChunkTokens?: number[];
-    activityBand?: ActivityBand;
-    allowCondensedPasses?: boolean;
-  }): Promise<CompactResult> {
-    const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
-    const observedTokens = this.normalizeObservedTokenCount(
-      params.currentTokenCount ??
-        (
-          (legacyParams ?? {}) as {
-            currentTokenCount?: unknown;
-          }
-        ).currentTokenCount,
-    );
-    const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
-      legacyParams: this.buildSummarizerLegacyParams({
-        legacyParams,
-        sessionKey: params.sessionKey,
-      }),
-      customInstructions: params.customInstructions,
-      breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-    });
-    if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
-      return {
-        ok: true,
-        compacted: false,
-        reason: "circuit breaker open",
-      };
-    }
-
-    const storedTokensBefore = await this.summaryStore.getContextTokenCount(params.conversationId);
-    const maxPasses =
-      typeof params.maxPasses === "number" && Number.isFinite(params.maxPasses) && params.maxPasses > 0
-        ? Math.floor(params.maxPasses)
-        : 1;
-    const fallbackLeafChunkTokens = Array.isArray(params.fallbackLeafChunkTokens)
-      ? [...new Set(
-        params.fallbackLeafChunkTokens
-          .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0)
-          .map((value) => Math.floor(value)),
-      )].sort((a, b) => b - a)
-      : [];
-    let activeLeafChunkTokens =
-      typeof params.leafChunkTokens === "number"
-        && Number.isFinite(params.leafChunkTokens)
-        && params.leafChunkTokens > 0
-        ? Math.floor(params.leafChunkTokens)
-        : fallbackLeafChunkTokens[0];
-    this.deps.log.debug(
-      `[lcm] compactLeafAsync start: conversation=${params.conversationId} session=${params.sessionId} leafChunkTokens=${activeLeafChunkTokens ?? "null"} fallbackLeafChunkTokens=${fallbackLeafChunkTokens.join(",")} maxPasses=${maxPasses} activityBand=${params.activityBand ?? "unknown"} allowCondensedPasses=${params.allowCondensedPasses !== false}`,
-    );
-
-    let rounds = 0;
-    let finalTokens = observedTokens ?? storedTokensBefore;
-    let authFailure = false;
-
-    for (let pass = 0; pass < maxPasses; pass += 1) {
-      let leafResult: Awaited<ReturnType<typeof this.compaction.compactLeaf>> | undefined;
-      while (true) {
-        try {
-          leafResult = await this.compaction.compactLeaf({
-            conversationId: params.conversationId,
-            tokenBudget: params.tokenBudget,
-            summarize,
-            ...(activeLeafChunkTokens !== undefined ? { leafChunkTokens: activeLeafChunkTokens } : {}),
-            force: params.force,
-            previousSummaryContent: pass === 0 ? params.previousSummaryContent : undefined,
-            summaryModel,
-            allowCondensedPasses: params.allowCondensedPasses,
-          });
-          break;
-        } catch (err) {
-          const nextLeafChunkTokens = fallbackLeafChunkTokens.find(
-            (value) => activeLeafChunkTokens !== undefined && value < activeLeafChunkTokens,
-          );
-          if (!this.isRecoverableLeafChunkOverflowError(err) || nextLeafChunkTokens === undefined) {
-            throw err;
-          }
-          this.deps.log.warn(
-            `[lcm] compactLeafAsync: retrying with smaller leafChunkTokens=${nextLeafChunkTokens} after provider token-limit error: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          activeLeafChunkTokens = nextLeafChunkTokens;
-        }
-      }
-      if (!leafResult) {
-        break;
-      }
-      finalTokens = leafResult.tokensAfter;
-
-      if (leafResult.authFailure) {
-        authFailure = true;
-        break;
-      }
-      if (!leafResult.actionTaken) {
-        break;
-      }
-      rounds += 1;
-      if (leafResult.tokensAfter >= leafResult.tokensBefore) {
-        break;
-      }
-    }
-
-    if (authFailure && breakerKey) {
-      this.recordCompactionAuthFailure(breakerKey);
-    } else if (rounds > 0 && breakerKey) {
-      this.recordCompactionSuccess(breakerKey);
-    }
-    if (rounds > 0) {
-      await this.markLeafCompactionTelemetrySuccess({
-        conversationId: params.conversationId,
-        activityBand: params.activityBand,
-      });
-      this.clearStableOrphanStrippingOrdinal(params.conversationId);
-    }
-
-    const tokensBefore = observedTokens ?? storedTokensBefore;
-    this.deps.log.debug(
-      `[lcm] compactLeafAsync result: conversation=${params.conversationId} session=${params.sessionId} rounds=${rounds} compacted=${rounds > 0} authFailure=${authFailure} finalLeafChunkTokens=${activeLeafChunkTokens ?? "null"} finalTokens=${finalTokens}`,
-    );
-
-    return {
-      ok: !authFailure,
-      compacted: rounds > 0,
-      reason: authFailure
-        ? "provider auth failure"
-        : rounds > 0
-          ? "compacted"
-          : "below threshold",
-      result: {
-        tokensBefore,
-        tokensAfter: finalTokens,
-        details: {
-          rounds,
-          targetTokens: params.tokenBudget,
-          mode: "leaf",
-          maxPasses,
-        },
-      },
-    };
-  }
-
-  /** Run one or more incremental leaf compaction passes in the per-session queue. */
-  async compactLeafAsync(params: {
-    sessionId: string;
-    sessionKey?: string;
-    sessionFile: string;
-    tokenBudget?: number;
-    currentTokenCount?: number;
-    customInstructions?: string;
-    /** OpenClaw runtime param name (preferred). */
-    runtimeContext?: Record<string, unknown>;
-    /** Back-compat param name. */
-    legacyParams?: Record<string, unknown>;
-    force?: boolean;
-    previousSummaryContent?: string;
-    maxPasses?: number;
-    leafChunkTokens?: number;
-    fallbackLeafChunkTokens?: number[];
-    activityBand?: ActivityBand;
-    allowCondensedPasses?: boolean;
-  }): Promise<CompactResult> {
-    if (this.isStatelessSession(params.sessionKey)) {
-      return {
-        ok: true,
-        compacted: false,
-        reason: "stateless session",
-      };
-    }
-    this.ensureMigrated();
-    return this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () => {
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-        });
-        if (!conversation) {
-          return {
-            ok: true,
-            compacted: false,
-            reason: "no conversation found for session",
-          };
-        }
-        const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
-        const resolvedTokenBudget = this.resolveTokenBudget({
-          tokenBudget: params.tokenBudget,
-          runtimeContext: params.runtimeContext,
-          legacyParams,
-        });
-        const tokenBudget = resolvedTokenBudget
-          ? this.applyAssemblyBudgetCap(resolvedTokenBudget)
-          : resolvedTokenBudget;
-        if (!tokenBudget) {
-          return {
-            ok: false,
-            compacted: false,
-            reason: "missing token budget in compact params",
-          };
-        }
-        return this.executeLeafCompactionCore({
-          conversationId: conversation.conversationId,
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          tokenBudget,
-          currentTokenCount: params.currentTokenCount,
-          customInstructions: params.customInstructions,
-          runtimeContext: params.runtimeContext,
-          legacyParams: params.legacyParams,
-          force: params.force,
-          previousSummaryContent: params.previousSummaryContent,
-          maxPasses: params.maxPasses,
-          leafChunkTokens: params.leafChunkTokens,
-          fallbackLeafChunkTokens: params.fallbackLeafChunkTokens,
-          activityBand: params.activityBand,
-          allowCondensedPasses: params.allowCondensedPasses,
-        });
-      },
-    );
   }
 
   async compact(params: {
@@ -8478,7 +7166,6 @@ export class LcmContextEngine implements ContextEngine {
       ...linearizedEntries.map((entry) => JSON.stringify(entry)),
     ].join("\n") + "\n";
     await writeFile(params.sessionFile, serialized, "utf8");
-    this.clearStableOrphanStrippingOrdinal(params.conversationId);
 
     const rewrittenStats = await stat(params.sessionFile);
     await this.refreshBootstrapState({
