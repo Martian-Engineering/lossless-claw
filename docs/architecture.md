@@ -92,7 +92,8 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 
 **Full sweep (threshold, manual `/compact`, or overflow):**
 - Phase 1: Repeatedly runs leaf passes until no more eligible chunks
-- Phase 2: Repeatedly runs condensation passes starting from the shallowest eligible depth, respecting `incrementalMaxDepth` (`0` for leaf-only, `-1` for unlimited)
+- Phase 2: Repeatedly runs condensation passes starting from the shallowest eligible depth, respecting the preferred `sweepMaxDepth` (`0` for leaf-only, `-1` for unlimited)
+- Pressure phase: If the context is still over threshold or the summarized prefix is above `summaryPrefixTargetTokens`, condensation may go beyond `sweepMaxDepth` using the hard fanout floor
 - Each pass checks for progress; stops if no tokens were saved
 
 **Budget-targeted (`compactUntilUnder`):**

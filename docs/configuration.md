@@ -29,8 +29,10 @@ Most installations only need to override a handful of keys. If you want a comple
   "leafMinFanout": 8,
   "condensedMinFanout": 4,
   "condensedMinFanoutHard": 2,
+  "sweepMaxDepth": 1,
   "incrementalMaxDepth": 1,
   "leafChunkTokens": 40000,
+  "summaryPrefixTargetTokens": 40000,
   "bootstrapMaxTokens": 12000,
   "leafTargetTokens": 2400,
   "condensedTargetTokens": 2000,
@@ -84,6 +86,7 @@ Notes on the example:
 - `largeFilesDir` shows the expanded default path shape. Both `databasePath` and `largeFilesDir` default to paths under `OPENCLAW_STATE_DIR` (which in turn falls back to `~/.openclaw`).
 - `timezone` has no fixed hardcoded default; at runtime it resolves from `TZ` first, then the system timezone. The example uses `America/Los_Angeles`.
 - `maxAssemblyTokenBudget` has no default. The example uses `30000` as a realistic cap for a 32k-class model.
+- `summaryPrefixTargetTokens` has no fixed default. The example uses `40000`, which matches the derived default for large-context models with the default `leafChunkTokens`.
 - `databasePath` is the preferred key. `dbPath` is an accepted alias.
 - `largeFileThresholdTokens` is the preferred key. `largeFileTokenThreshold` is an accepted alias.
 
@@ -149,8 +152,10 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `leafMinFanout` | `integer` | `8` | `LCM_LEAF_MIN_FANOUT` | Minimum number of raw messages required before a leaf pass runs. |
 | `condensedMinFanout` | `integer` | `4` | `LCM_CONDENSED_MIN_FANOUT` | Number of same-depth summaries needed before condensation is attempted. |
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |
-| `incrementalMaxDepth` | `integer` | `1` | `LCM_INCREMENTAL_MAX_DEPTH` | Maximum condensation source depth during threshold full sweeps. Use `0` for leaf-only and `-1` for unlimited depth. |
+| `sweepMaxDepth` | `integer` | `1` | `LCM_SWEEP_MAX_DEPTH` | Preferred maximum condensation source depth during routine threshold sweeps. Use `0` for leaf-only and `-1` for unlimited depth. Pressure sweeps may go deeper when summarized context remains above target. |
+| `incrementalMaxDepth` | `integer` | alias of `sweepMaxDepth` | `LCM_INCREMENTAL_MAX_DEPTH` | Deprecated alias for `sweepMaxDepth`. Kept so existing configs continue to load. |
 | `leafChunkTokens` | `integer` | `40000` | `LCM_LEAF_CHUNK_TOKENS` | Maximum source-token budget for a leaf compaction chunk. Larger chunks reduce sweep frequency at the cost of slower individual summary calls. |
+| `summaryPrefixTargetTokens` | `integer` | derived | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | Optional target for summarized-prefix tokens after a full sweep. If unset, Lossless derives `max(condensedTargetTokens, min(leafChunkTokens, floor(contextThreshold * tokenBudget * 0.5)))`. |
 | `bootstrapMaxTokens` | `integer` | `max(6000, floor(leafChunkTokens * 0.3))` | `LCM_BOOTSTRAP_MAX_TOKENS` | Maximum parent-history tokens imported when a new LCM conversation bootstraps. |
 | `leafTargetTokens` | `integer` | `2400` | `LCM_LEAF_TARGET_TOKENS` | Prompt target for leaf summary size. |
 | `condensedTargetTokens` | `integer` | `2000` | `LCM_CONDENSED_TARGET_TOKENS` | Prompt target for condensed summary size. |
@@ -215,6 +220,8 @@ Automatic compaction is threshold-only:
 - deferred mode records one coalesced `"threshold"` maintenance row and drains it in the background, `maintain()`, or pre-assembly
 
 Lossless still records prompt-cache telemetry for status and diagnostics, but cache hotness no longer delays threshold debt. Legacy `cacheAwareCompaction.*` and `dynamicLeafChunkTokens.*` settings remain accepted so existing OpenClaw config continues to load, but they do not change automatic compaction behavior.
+
+Full sweeps treat `sweepMaxDepth` as the normal depth target, not an absolute safety ceiling. The routine condensation phase obeys `sweepMaxDepth`; if the context is still over threshold or the summarized prefix remains above `summaryPrefixTargetTokens`, a pressure phase may use `condensedMinFanoutHard` and condense deeper. This keeps ordinary sweeps shallow while still giving Lossless a way out when too many same-depth summaries would otherwise leave the prompt near full.
 
 ### Prompt-aware eviction
 

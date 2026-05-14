@@ -24,9 +24,13 @@
       "label": "Context Threshold",
       "help": "Fraction of context window that triggers compaction (0.0–1.0)"
     },
-    "incrementalMaxDepth": {
+    "sweepMaxDepth": {
       "label": "Sweep Max Depth",
-      "help": "Maximum condensation source depth during threshold full sweeps (0 = leaf only, -1 = unlimited)"
+      "help": "Preferred maximum condensation source depth during routine full sweeps (0 = leaf only, -1 = unlimited). Pressure sweeps may go deeper when summarized context remains above target."
+    },
+    "incrementalMaxDepth": {
+      "label": "Incremental Max Depth (Deprecated)",
+      "help": "Deprecated alias for sweepMaxDepth. Kept for existing configs."
     },
     "freshTailCount": {
       "label": "Fresh Tail Count",
@@ -47,6 +51,10 @@
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",
       "help": "Maximum source tokens per leaf compaction chunk before summarization (default 40000)"
+    },
+    "summaryPrefixTargetTokens": {
+      "label": "Summary Prefix Target Tokens",
+      "help": "Optional target for summarized-prefix tokens after a full sweep. When omitted, Lossless derives a pressure target from contextThreshold and leafChunkTokens."
     },
     "bootstrapMaxTokens": {
       "label": "Bootstrap Max Tokens",
@@ -257,6 +265,10 @@
         "minimum": 0,
         "maximum": 1
       },
+      "sweepMaxDepth": {
+        "type": "integer",
+        "minimum": -1
+      },
       "incrementalMaxDepth": {
         "type": "integer",
         "minimum": -1
@@ -276,6 +288,10 @@
         "type": "boolean"
       },
       "leafChunkTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "summaryPrefixTargetTokens": {
         "type": "integer",
         "minimum": 1
       },

@@ -44,10 +44,14 @@ export interface CompactionConfig {
   condensedMinFanout: number;
   /** Relaxed minimum fanout for hard-trigger sweeps. */
   condensedMinFanoutHard: number;
-  /** Incremental depth passes to run after each leaf compaction (default 1). */
-  incrementalMaxDepth: number;
+  /** Preferred source depth for routine full-sweep condensation (default 1). */
+  sweepMaxDepth?: number;
+  /** Deprecated alias for sweepMaxDepth. */
+  incrementalMaxDepth?: number;
   /** Max source tokens to compact per leaf/condensed chunk (default 40000) */
   leafChunkTokens?: number;
+  /** Optional target for summarized-prefix tokens after a full sweep. */
+  summaryPrefixTargetTokens?: number;
   /** Target tokens for leaf summaries (default 600) */
   leafTargetTokens: number;
   /** Target tokens for condensed summaries (default 900) */
@@ -564,11 +568,11 @@ export class CompactionEngine {
     let createdSummaryId = leafResult.summaryId;
     let level = leafResult.level;
 
-    const incrementalMaxDepth = this.resolveIncrementalMaxDepth();
+    const sweepMaxDepth = this.resolveSweepMaxDepth();
     const condensedMinChunkTokens = this.resolveCondensedMinChunkTokens();
     let runningTokens = tokensAfterLeaf;
-    if (incrementalMaxDepth > 0 && input.allowCondensedPasses !== false) {
-      for (let targetDepth = 0; targetDepth < incrementalMaxDepth; targetDepth++) {
+    if (sweepMaxDepth > 0 && input.allowCondensedPasses !== false) {
+      for (let targetDepth = 0; targetDepth < sweepMaxDepth; targetDepth++) {
         const fanout = this.resolveFanoutForDepth(targetDepth, false);
         const chunk = await this.selectOldestChunkAtDepth(conversationId, targetDepth);
         if (chunk.items.length < fanout || chunk.summaryTokens < condensedMinChunkTokens) {
@@ -664,6 +668,7 @@ export class CompactionEngine {
     let previousSummaryContent: string | undefined;
     let previousTokens = tokensBefore;
     let hadAuthFailure = false;
+    let stoppedForNoProgress = false;
 
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
     // Delta tracking: maintain a running token count instead of re-querying DB
@@ -714,17 +719,24 @@ export class CompactionEngine {
     }
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.
-    const maxCondensationSourceDepth = this.resolveIncrementalMaxDepth();
-    while (force || previousTokens > threshold) {
+    const preferredMaxSourceDepth = this.resolveSweepMaxDepth();
+    const summaryPrefixTargetTokens = this.resolveSummaryPrefixTargetTokens(tokenBudget);
+    const hasSummaryPrefixPressure = async (): Promise<boolean> =>
+      (await this.countSummaryTokensOutsideFreshTail(conversationId)) > summaryPrefixTargetTokens;
+
+    const runCondensationPass = async (params: {
+      enforcePreferredDepth: boolean;
+      useHardFanout: boolean;
+    }): Promise<"progress" | "no-candidate" | "depth-cap" | "auth-failure" | "no-progress"> => {
       const candidate = await this.selectShallowestCondensationCandidate({
         conversationId,
-        hardTrigger: hardTrigger === true,
+        hardTrigger: params.useHardFanout,
       });
       if (!candidate) {
-        break;
+        return "no-candidate";
       }
-      if (candidate.targetDepth >= maxCondensationSourceDepth) {
-        break;
+      if (params.enforcePreferredDepth && candidate.targetDepth >= preferredMaxSourceDepth) {
+        return "depth-cap";
       }
 
       const passTokensBefore = runningTokens;
@@ -737,7 +749,7 @@ export class CompactionEngine {
       );
       if (!condenseResult) {
         hadAuthFailure = true;
-        break;
+        return "auth-failure";
       }
       const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
       await this.persistCompactionEvents({
@@ -757,12 +769,43 @@ export class CompactionEngine {
 
       if (!force && passTokensAfter <= threshold) {
         previousTokens = passTokensAfter;
-        break;
+        return "progress";
       }
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
-        break;
+        return "no-progress";
       }
       previousTokens = passTokensAfter;
+      return "progress";
+    };
+
+    while (force || previousTokens > threshold || await hasSummaryPrefixPressure()) {
+      const status = await runCondensationPass({
+        enforcePreferredDepth: true,
+        useHardFanout: hardTrigger === true,
+      });
+      if (status !== "progress") {
+        if (status === "no-progress") {
+          stoppedForNoProgress = true;
+        }
+        break;
+      }
+    }
+
+    while (
+      !hadAuthFailure &&
+      !stoppedForNoProgress &&
+      (previousTokens > threshold || await hasSummaryPrefixPressure())
+    ) {
+      const status = await runCondensationPass({
+        enforcePreferredDepth: false,
+        useHardFanout: true,
+      });
+      if (status !== "progress") {
+        if (status === "no-progress") {
+          stoppedForNoProgress = true;
+        }
+        break;
+      }
     }
 
     const tokensAfter = runningTokens;
@@ -1001,6 +1044,28 @@ export class CompactionEngine {
     return rawTokens;
   }
 
+  /** Sum summary tokens outside the protected fresh tail. */
+  private async countSummaryTokensOutsideFreshTail(conversationId: number): Promise<number> {
+    const contextItems = await this.getContextItemsCached(conversationId);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
+    let summaryTokens = 0;
+
+    for (const item of contextItems) {
+      if (item.ordinal >= freshTailOrdinal) {
+        break;
+      }
+      if (item.itemType !== "summary" || item.summaryId == null) {
+        continue;
+      }
+      const summary = await this.summaryStore.getSummary(item.summaryId);
+      if (summary) {
+        summaryTokens += this.resolveSummaryTokenCount(summary);
+      }
+    }
+
+    return summaryTokens;
+  }
+
   /**
    * Select the oldest contiguous raw-message chunk outside fresh tail.
    *
@@ -1165,15 +1230,36 @@ export class CompactionEngine {
     return 2;
   }
 
-  private resolveIncrementalMaxDepth(): number {
+  private resolveSweepMaxDepth(): number {
+    const configured =
+      typeof this.config.sweepMaxDepth === "number" && Number.isFinite(this.config.sweepMaxDepth)
+        ? this.config.sweepMaxDepth
+        : this.config.incrementalMaxDepth;
     if (
-      typeof this.config.incrementalMaxDepth === "number" &&
-      Number.isFinite(this.config.incrementalMaxDepth)
+      typeof configured === "number" &&
+      Number.isFinite(configured)
     ) {
-      if (this.config.incrementalMaxDepth < 0) return Infinity;
-      if (this.config.incrementalMaxDepth > 0) return Math.floor(this.config.incrementalMaxDepth);
+      if (configured < 0) return Infinity;
+      if (configured > 0) return Math.floor(configured);
     }
     return 0;
+  }
+
+  /** Resolve the summarized-prefix pressure target for this token budget. */
+  private resolveSummaryPrefixTargetTokens(tokenBudget: number): number {
+    if (
+      typeof this.config.summaryPrefixTargetTokens === "number" &&
+      Number.isFinite(this.config.summaryPrefixTargetTokens) &&
+      this.config.summaryPrefixTargetTokens > 0
+    ) {
+      return Math.floor(this.config.summaryPrefixTargetTokens);
+    }
+    const threshold = Math.max(1, Math.floor(this.config.contextThreshold * tokenBudget));
+    const derivedTarget = Math.floor(threshold * 0.5);
+    return Math.max(
+      this.config.condensedTargetTokens,
+      Math.min(this.resolveLeafChunkTokens(), derivedTarget),
+    );
   }
   private resolveFanoutForDepth(targetDepth: number, hardTrigger: boolean): number {
     if (hardTrigger) {

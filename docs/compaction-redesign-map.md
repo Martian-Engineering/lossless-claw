@@ -15,7 +15,7 @@ The new design is intentionally simpler:
 3. When `contextThreshold` is crossed, run the existing full-sweep mechanism.
 4. Keep the fresh tail as the protected boundary for recent verbatim context.
 5. Reuse existing summary sizing and fanout configuration.
-6. Tune existing knobs first instead of adding a separate target compaction floor.
+6. Use a summarized-prefix pressure target only as the escape hatch when a preferred-depth sweep does not reduce enough context.
 
 ## Implemented Decisions
 
@@ -27,10 +27,11 @@ The new design is intentionally simpler:
 | Cache hotness | No longer delays automatic threshold compaction. |
 | Legacy non-threshold debt | Revalidated against threshold, then swept or marked finished as obsolete. |
 | Full sweep trigger | No longer starts only because `evaluateLeafTrigger()` is true. |
-| Full sweep depth cap | `compactFullSweep()` now respects `incrementalMaxDepth`. |
+| Full sweep preferred depth | `compactFullSweep()` now respects `sweepMaxDepth` during routine condensation. |
 | Fresh tail | Kept. It remains independent of incremental compaction. |
 | Default leaf chunk size | Raised from 20k to 40k tokens to reduce sweep frequency. |
-| Target compaction floor | Not added. Tune `contextThreshold`, `leafChunkTokens`, and fanout first. |
+| Deprecated depth key | `incrementalMaxDepth` remains accepted as an alias for `sweepMaxDepth`. |
+| Pressure escape hatch | `summaryPrefixTargetTokens` lets sweeps condense beyond the preferred depth when summarized context remains too large. |
 | `cacheAwareCompaction.*` | Still visible and accepted, but documented as deprecated compatibility config. |
 | `dynamicLeafChunkTokens.*` | Still visible and accepted, but documented as deprecated compatibility config. |
 | Engine `compactLeafAsync()` | Removed. Automatic and public engine compaction should go through threshold/full-sweep paths. |
@@ -103,21 +104,24 @@ The sweep has two phases:
 1. Leaf phase: repeatedly summarize the oldest raw chunks outside the fresh tail.
 2. Condensed phase: repeatedly summarize same-depth summary chunks, shallowest first.
 
-Non-forced threshold sweeps stop once they get under the computed threshold. Forced sweeps still stop when no eligible chunk remains or when a pass stops making token progress.
+Routine threshold sweeps stop once they get under the computed threshold and summarized-prefix target. Forced sweeps still stop when no eligible chunk remains or when a pass stops making token progress.
 
-`incrementalMaxDepth` now applies to full-sweep condensation:
+`sweepMaxDepth` is the preferred source-depth cap for routine full-sweep condensation:
 
 - `0`: leaf summaries only
 - `1`: depth-0 summaries may condense into depth 1, then stop
 - `2`: depth 0 -> 1 and depth 1 -> 2 are allowed
 - `-1`: unlimited
 
+The cap is intentionally aspirational. If a sweep that obeys `sweepMaxDepth` still leaves the conversation over `contextThreshold`, or if summary tokens outside the fresh tail exceed `summaryPrefixTargetTokens`, Lossless runs a pressure condensation phase that may go deeper using `condensedMinFanoutHard`.
+
 Relevant code:
 
 - `src/compaction.ts`: `compactFullSweep()`
 - `src/compaction.ts`: `selectOldestLeafChunk()`
 - `src/compaction.ts`: `selectShallowestCondensationCandidate()`
-- `src/compaction.ts`: `resolveIncrementalMaxDepth()`
+- `src/compaction.ts`: `resolveSweepMaxDepth()`
+- `src/compaction.ts`: `resolveSummaryPrefixTargetTokens()`
 
 ### Fresh Tail
 
@@ -166,7 +170,8 @@ That policy is removed from automatic scheduling. The important reason is not th
 | `leafMinFanout` | Minimum raw-message or depth-0 summary fanout for useful compaction. |
 | `condensedMinFanout` | Normal same-depth condensation grouping for depth 1+. |
 | `condensedMinFanoutHard` | Hard-trigger/repair condensation grouping. |
-| `incrementalMaxDepth` | Existing depth cap, now applied to threshold full sweep too. |
+| `sweepMaxDepth` | Preferred source-depth cap for routine threshold full sweep. |
+| `summaryPrefixTargetTokens` | Optional target for summarized-prefix tokens; pressure condensation may go deeper if this target is missed. |
 | `leafTargetTokens` | Leaf summary target. |
 | `condensedTargetTokens` | Condensed summary target. |
 
@@ -174,6 +179,7 @@ That policy is removed from automatic scheduling. The important reason is not th
 
 | Key | Status |
 | --- | --- |
+| `incrementalMaxDepth` | Accepted as a deprecated alias for `sweepMaxDepth`. New config should use `sweepMaxDepth`. |
 | `cacheAwareCompaction.*` | Accepted and visible as deprecated config. It no longer changes automatic compaction decisions. |
 | `dynamicLeafChunkTokens.*` | Accepted and visible as deprecated config. Automatic compaction uses `leafChunkTokens` directly. |
 
@@ -209,7 +215,8 @@ The implementation should cover:
 - pre-assembly drain consumes threshold debt without prompt-cache delay
 - legacy non-threshold debt is cleared when threshold no longer applies
 - legacy non-threshold debt is upgraded to threshold full sweep when threshold still applies
-- `compactFullSweep()` respects `incrementalMaxDepth`
+- `compactFullSweep()` treats `sweepMaxDepth` as a preferred depth
+- `compactFullSweep()` pressure-condenses past `sweepMaxDepth` when threshold or summary-prefix pressure remains
 - the fresh tail remains verbatim and un-compacted
 
 Removed or rewritten coverage:
@@ -223,7 +230,7 @@ Removed or rewritten coverage:
 
 ## Non-Goals
 
-- Do not add a target compaction floor in this pass.
+- Do not add a total-context target floor in this pass.
 - Do not remove persisted telemetry or maintenance tables.
 - Do not parallelize full-sweep leaf summaries yet. The current leaf prompt uses prior summary continuity, so parallelization would require a separate semantic design.
 - Do not depend on provider cache `expiresAt`.
@@ -231,6 +238,6 @@ Removed or rewritten coverage:
 
 ## Follow-Up Watch Items
 
-1. If repeated threshold re-entry happens in live use, tune `contextThreshold`, `leafChunkTokens`, and fanout before introducing a target floor.
-2. If 40k leaf chunks make individual summary calls too slow, consider 30k before adding new mechanisms.
+1. If repeated threshold re-entry happens in live use, tune `summaryPrefixTargetTokens`, `contextThreshold`, `leafChunkTokens`, and fanout before adding a total-context target floor.
+2. If 40k leaf chunks make individual summary calls too slow, consider 30k before changing summary prompts.
 3. If stable orphan stripping removal causes measurable cache regressions in tool-heavy sessions, revisit it as an assembly feature independent of cache-hotness inference.

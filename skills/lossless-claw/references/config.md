@@ -142,15 +142,36 @@ With the default `leafChunkTokens=40000`, that means:
 
 - `dynamicLeafChunkTokens.max = 80000`
 
-### `incrementalMaxDepth`
+### `sweepMaxDepth`
 
-Controls how far threshold full-sweep condensation can cascade after leaf compaction.
+Controls how far routine threshold full-sweep condensation tries to cascade after leaf compaction.
 
 Why it matters:
 
 - `0` keeps only leaf summaries moving automatically.
 - `1` is a practical default for long-running sessions.
 - `-1` allows unlimited cascading, which can be useful for very long histories but is more aggressive.
+- This is a preferred depth, not an absolute cap. Pressure sweeps may go deeper when summarized context remains too large.
+
+### `summaryPrefixTargetTokens`
+
+Optional target for summarized-prefix tokens after a full sweep.
+
+Why it matters:
+
+- Gives Lossless an escape hatch when too many summaries at the preferred depth still leave the prompt near full.
+- When unset, Lossless derives a target from `contextThreshold`, the active token budget, and `leafChunkTokens`.
+- Sweeps first honor `sweepMaxDepth`; pressure condensation can go deeper only when threshold or summary-prefix pressure remains.
+
+### `incrementalMaxDepth`
+
+Deprecated alias for `sweepMaxDepth`.
+
+Why it matters:
+
+- Existing OpenClaw configs continue to load.
+- New config should use `sweepMaxDepth`.
+- If both aliases are set in the same source, `sweepMaxDepth` wins.
 
 ### `summaryModel` and `summaryProvider`
 
@@ -349,9 +370,29 @@ Why it matters:
 - acts as the guardrail when normal fanout preferences cannot be met cleanly
 - mostly useful for advanced tuning or pathological summary-tree shapes
 
-### `incrementalMaxDepth`
+### `sweepMaxDepth`
 
 See high-impact settings above.
+
+Env override:
+
+- `LCM_SWEEP_MAX_DEPTH`
+
+### `summaryPrefixTargetTokens`
+
+See high-impact settings above.
+
+Env override:
+
+- `LCM_SUMMARY_PREFIX_TARGET_TOKENS`
+
+### `incrementalMaxDepth`
+
+Deprecated alias for `sweepMaxDepth`.
+
+Env override:
+
+- `LCM_INCREMENTAL_MAX_DEPTH`
 
 ### `bootstrapMaxTokens`
 
@@ -542,7 +583,7 @@ Why it matters:
 2. Set the context-engine slot to `lossless-claw`.
 3. Start with conservative defaults.
 4. Run `/lossless` after startup to confirm path, size, and summary health.
-5. If threshold sweeps happen too often, tune `contextThreshold`, `leafChunkTokens`, and fanout before adding new mechanisms.
+5. If threshold sweeps happen too often, tune `contextThreshold`, `leafChunkTokens`, `summaryPrefixTargetTokens`, and fanout before adding new mechanisms.
 6. If individual sweeps are too slow, try a smaller `leafChunkTokens` value such as 30000 before changing summary prompts.
 7. If recall feels weak, revisit `freshTailCount`, `leafChunkTokens`, and summarizer model quality before changing anything else.
 8. Touch advanced knobs like fanout, large-file thresholds, custom instructions, and assembly caps only after a concrete symptom appears.

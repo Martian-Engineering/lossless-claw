@@ -91,8 +91,13 @@ export type LcmConfig = {
   leafMinFanout: number;
   condensedMinFanout: number;
   condensedMinFanoutHard: number;
+  /** Preferred source depth for routine full-sweep condensation. */
+  sweepMaxDepth: number;
+  /** Deprecated alias for `sweepMaxDepth`; kept for config compatibility. */
   incrementalMaxDepth: number;
   leafChunkTokens: number;
+  /** Optional target for summarized-prefix tokens after a full sweep. */
+  summaryPrefixTargetTokens?: number;
   /** Maximum raw parent-history tokens imported during first-time bootstrap. */
   bootstrapMaxTokens?: number;
   leafTargetTokens: number;
@@ -344,6 +349,16 @@ export function resolveLcmConfigWithDiagnostics(
     parseFiniteInt(env.LCM_BOOTSTRAP_MAX_TOKENS)
       ?? toNumber(pc.bootstrapMaxTokens)
       ?? Math.max(6000, Math.floor(resolvedLeafChunkTokens * 0.3));
+  const resolvedSweepMaxDepth =
+    parseFiniteInt(env.LCM_SWEEP_MAX_DEPTH)
+      ?? parseFiniteInt(env.LCM_INCREMENTAL_MAX_DEPTH)
+      ?? toNumber(pc.sweepMaxDepth)
+      ?? toNumber(pc.incrementalMaxDepth)
+      ?? 1;
+  const resolvedSummaryPrefixTargetTokens = toPositiveInteger(
+    parseFiniteInt(env.LCM_SUMMARY_PREFIX_TARGET_TOKENS)
+      ?? toNumber(pc.summaryPrefixTargetTokens),
+  );
   const envDelegationTimeoutMs =
     env.LCM_DELEGATION_TIMEOUT_MS !== undefined
       ? toNumber(env.LCM_DELEGATION_TIMEOUT_MS)
@@ -452,10 +467,10 @@ export function resolveLcmConfigWithDiagnostics(
       condensedMinFanoutHard:
         parseFiniteInt(env.LCM_CONDENSED_MIN_FANOUT_HARD)
           ?? toNumber(pc.condensedMinFanoutHard) ?? 2,
-      incrementalMaxDepth:
-        parseFiniteInt(env.LCM_INCREMENTAL_MAX_DEPTH)
-          ?? toNumber(pc.incrementalMaxDepth) ?? 1,
+      sweepMaxDepth: resolvedSweepMaxDepth,
+      incrementalMaxDepth: resolvedSweepMaxDepth,
       leafChunkTokens: resolvedLeafChunkTokens,
+      summaryPrefixTargetTokens: resolvedSummaryPrefixTargetTokens,
       bootstrapMaxTokens: resolvedBootstrapMaxTokens,
       leafTargetTokens:
         parseFiniteInt(env.LCM_LEAF_TARGET_TOKENS)

@@ -32,8 +32,10 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.promptAwareEviction).toBe(false);
     expect(config.newSessionRetainDepth).toBe(2);
+    expect(config.sweepMaxDepth).toBe(1);
     expect(config.incrementalMaxDepth).toBe(1);
     expect(config.leafChunkTokens).toBe(40000);
+    expect(config.summaryPrefixTargetTokens).toBeUndefined();
     expect(config.leafMinFanout).toBe(8);
     expect(config.condensedMinFanout).toBe(4);
     expect(config.condensedMinFanoutHard).toBe(2);
@@ -72,8 +74,10 @@ describe("resolveLcmConfig", () => {
       freshTailMaxTokens: 12000,
       promptAwareEviction: false,
       leafChunkTokens: 80000,
+      sweepMaxDepth: 2,
       newSessionRetainDepth: 3,
       incrementalMaxDepth: -1,
+      summaryPrefixTargetTokens: 48000,
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:ephemeral:**"],
       skipStatelessSessions: false,
@@ -116,7 +120,9 @@ describe("resolveLcmConfig", () => {
     expect(config.promptAwareEviction).toBe(false);
     expect(config.newSessionRetainDepth).toBe(3);
     expect(config.leafChunkTokens).toBe(80000);
-    expect(config.incrementalMaxDepth).toBe(-1);
+    expect(config.sweepMaxDepth).toBe(2);
+    expect(config.incrementalMaxDepth).toBe(2);
+    expect(config.summaryPrefixTargetTokens).toBe(48000);
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
     expect(config.pruneHeartbeatOk).toBe(true);
@@ -151,7 +157,6 @@ describe("resolveLcmConfig", () => {
       LCM_FRESH_TAIL_MAX_TOKENS: "32000",
       LCM_PROMPT_AWARE_EVICTION_ENABLED: "false",
       LCM_NEW_SESSION_RETAIN_DEPTH: "5",
-      LCM_INCREMENTAL_MAX_DEPTH: "3",
       LCM_ENABLED: "false",
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
       LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
@@ -171,13 +176,18 @@ describe("resolveLcmConfig", () => {
       LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED: "true",
       LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX: "60000",
       LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE: "inline",
+      LCM_SWEEP_MAX_DEPTH: "4",
+      LCM_INCREMENTAL_MAX_DEPTH: "3",
+      LCM_SUMMARY_PREFIX_TARGET_TOKENS: "45000",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
       freshTailCount: 16,
       freshTailMaxTokens: 12000,
       promptAwareEviction: true,
+      sweepMaxDepth: 2,
       incrementalMaxDepth: -1,
+      summaryPrefixTargetTokens: 32000,
       ignoreSessionPatterns: ["agent:*:test:*"],
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
@@ -229,7 +239,9 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailMaxTokens).toBe(32000); // env wins
     expect(config.promptAwareEviction).toBe(false); // env wins
     expect(config.newSessionRetainDepth).toBe(5); // env wins
-    expect(config.incrementalMaxDepth).toBe(3); // env wins
+    expect(config.sweepMaxDepth).toBe(4); // new env wins deprecated env/config
+    expect(config.incrementalMaxDepth).toBe(4); // alias mirrors sweepMaxDepth
+    expect(config.summaryPrefixTargetTokens).toBe(45000); // env wins
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
       cacheTTLSeconds: 600,
@@ -284,8 +296,35 @@ describe("resolveLcmConfig", () => {
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(16); // plugin config
     expect(config.newSessionRetainDepth).toBe(4); // plugin config
+    expect(config.sweepMaxDepth).toBe(-1); // deprecated plugin config alias
     expect(config.incrementalMaxDepth).toBe(-1); // plugin config
     expect(config.leafMinFanout).toBe(8); // hardcoded default
+  });
+
+  it("resolves sweep depth aliases by source precedence", () => {
+    const config = resolveLcmConfig({
+      LCM_INCREMENTAL_MAX_DEPTH: "2",
+    } as NodeJS.ProcessEnv, {
+      sweepMaxDepth: 5,
+      incrementalMaxDepth: 4,
+    });
+
+    expect(config.sweepMaxDepth).toBe(2);
+    expect(config.incrementalMaxDepth).toBe(2);
+
+    const envWithBoth = resolveLcmConfig({
+      LCM_SWEEP_MAX_DEPTH: "6",
+      LCM_INCREMENTAL_MAX_DEPTH: "2",
+    } as NodeJS.ProcessEnv, {});
+    expect(envWithBoth.sweepMaxDepth).toBe(6);
+    expect(envWithBoth.incrementalMaxDepth).toBe(6);
+
+    const pluginOnly = resolveLcmConfig({}, {
+      sweepMaxDepth: 5,
+      incrementalMaxDepth: 4,
+    });
+    expect(pluginOnly.sweepMaxDepth).toBe(5);
+    expect(pluginOnly.incrementalMaxDepth).toBe(5);
   });
 
   it("handles string values in plugin config (from JSON)", () => {
@@ -595,8 +634,16 @@ describe("resolveLcmConfig", () => {
     expect(config.summaryModel).toBe("");
   });
 
-  it("ships a manifest that accepts unlimited incremental depth", () => {
+  it("ships a manifest that accepts sweep depth and deprecated incremental depth", () => {
+    expect(manifest.configSchema.properties.sweepMaxDepth).toEqual({
+      type: "integer",
+      minimum: -1,
+    });
     expect(manifest.configSchema.properties.incrementalMaxDepth.minimum).toBe(-1);
+    expect(manifest.configSchema.properties.summaryPrefixTargetTokens).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
     expect(manifest.configSchema.properties.newSessionRetainDepth.minimum).toBe(-1);
   });
 
