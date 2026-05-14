@@ -5,7 +5,7 @@ import type { FileHandle } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline";
-import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
   ContextEngine,
   ContextEngineInfo,
