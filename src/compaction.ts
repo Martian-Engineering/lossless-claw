@@ -569,6 +569,8 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
+    /** Optional persisted-context target used when host runtime overhead is known. */
+    stopAtTokens?: number;
     summaryModel?: string;
   }): Promise<CompactionResult> {
     return this.withContextCache(() => this.compactFullSweep(input));
@@ -732,14 +734,26 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
+    /** Optional persisted-context target used when host runtime overhead is known. */
+    stopAtTokens?: number;
     summaryModel?: string;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
+    const stopAtTokens =
+      typeof input.stopAtTokens === "number" &&
+      Number.isFinite(input.stopAtTokens) &&
+      input.stopAtTokens > 0
+        ? Math.floor(input.stopAtTokens)
+        : undefined;
 
-    if (!force && tokensBefore <= threshold) {
+    if (
+      !force &&
+      tokensBefore <= threshold &&
+      (stopAtTokens === undefined || tokensBefore <= stopAtTokens)
+    ) {
       return {
         actionTaken: false,
         tokensBefore,
@@ -816,6 +830,10 @@ export class CompactionEngine {
     const summaryPrefixTargetTokens = this.resolveSummaryPrefixTargetTokens(tokenBudget);
     const hasSummaryPrefixPressure = async (): Promise<boolean> =>
       (await this.countSummaryTokensOutsideFreshTail(conversationId)) > summaryPrefixTargetTokens;
+    const hasStopTargetPressure = (): boolean =>
+      stopAtTokens !== undefined && runningTokens > stopAtTokens;
+    const hasCondensationPressure = async (): Promise<boolean> =>
+      hasStopTargetPressure() || await hasSummaryPrefixPressure();
 
     const runCondensationPass = async (params: {
       enforcePreferredDepth: boolean;
@@ -860,6 +878,10 @@ export class CompactionEngine {
       level = condenseResult.level;
       runningTokens = passTokensAfter;
 
+      if (stopAtTokens !== undefined && passTokensAfter <= stopAtTokens) {
+        previousTokens = passTokensAfter;
+        return "progress";
+      }
       if (!force && passTokensAfter <= threshold) {
         previousTokens = passTokensAfter;
         return "progress";
@@ -871,7 +893,7 @@ export class CompactionEngine {
       return "progress";
     };
 
-    while (await hasSummaryPrefixPressure()) {
+    while (await hasCondensationPressure()) {
       const status = await runCondensationPass({
         enforcePreferredDepth: true,
         useHardFanout: hardTrigger === true,
@@ -887,7 +909,7 @@ export class CompactionEngine {
     while (
       !hadAuthFailure &&
       !stoppedForNoProgress &&
-      await hasSummaryPrefixPressure()
+      await hasCondensationPressure()
     ) {
       const status = await runCondensationPass({
         enforcePreferredDepth: false,

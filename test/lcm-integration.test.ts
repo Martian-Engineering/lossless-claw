@@ -2134,6 +2134,64 @@ describe("LCM integration: compaction", () => {
     ).toBe(false);
   });
 
+  it("compactFullSweep uses stopAtTokens to pressure-condense live-runtime overages", async () => {
+    const pressureEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 2,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      leafChunkTokens: 500,
+      condensedTargetTokens: 10,
+      sweepMaxDepth: 1,
+      summaryPrefixTargetTokens: 10_000,
+    });
+
+    await convStore.createConversation({ sessionId: "stop-target-pressure-depth" });
+    for (const suffix of ["a", "b"]) {
+      const summaryId = `sum_stop_target_depth_one_${suffix}`;
+      await sumStore.insertSummary({
+        summaryId,
+        conversationId: CONV_ID,
+        kind: "condensed",
+        depth: 1,
+        content: `Depth one stop target summary ${suffix}`,
+        tokenCount: 80,
+      });
+      await sumStore.appendContextSummary(CONV_ID, summaryId);
+    }
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => `Fresh tail message ${i}`,
+      tokenCountFn: () => 1_000,
+    });
+
+    const summarize = vi.fn(
+      async (
+        _text: string,
+        _aggressive?: boolean,
+        options?: { isCondensed?: boolean; depth?: number },
+      ) => {
+        return options?.isCondensed ? "Depth two stop target summary" : "Leaf summary";
+      },
+    );
+    const result = await pressureEngine.compactFullSweep({
+      conversationId: CONV_ID,
+      tokenBudget: 100,
+      summarize,
+      stopAtTokens: 1_000,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.condensed).toBe(true);
+    expect(summarize).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Boolean),
+      expect.objectContaining({ isCondensed: true, depth: 2 }),
+    );
+    expect(
+      sumStore._summaries.some((summary) => summary.kind === "condensed" && summary.depth === 2),
+    ).toBe(true);
+  });
+
 
   it("compaction propagates referenced file ids into summary metadata", async () => {
     const productionTailEngine = new CompactionEngine(convStore as any, sumStore as any, {
