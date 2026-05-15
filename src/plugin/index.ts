@@ -79,6 +79,26 @@ type RuntimeAgentSessionApi = {
 };
 type RuntimeAgentSessionApiCandidate = Partial<RuntimeAgentSessionApi>;
 
+type RuntimeConfigSnapshotApi = {
+  current?: () => unknown;
+  loadConfig?: () => unknown;
+};
+
+/** Read the host runtime config snapshot without using deprecated APIs on newer hosts. */
+function readRuntimeConfigSnapshot(api: OpenClawPluginApi): unknown {
+  const configApi = (api.runtime as unknown as { config?: RuntimeConfigSnapshotApi }).config;
+  if (!configApi) {
+    return undefined;
+  }
+  if (typeof configApi.current === "function") {
+    return configApi.current();
+  }
+  if (typeof configApi.loadConfig === "function") {
+    return configApi.loadConfig();
+  }
+  return undefined;
+}
+
 /** Return the runtime session registry API when the host exposes it. */
 function getRuntimeAgentSessionApi(api: OpenClawPluginApi): RuntimeAgentSessionApi | undefined {
   const runtime = api.runtime as unknown as {
@@ -450,7 +470,7 @@ function readDefaultModelFromConfig(config: unknown): string {
 /** Load the best available validated OpenClaw config during plugin registration. */
 function loadEffectiveOpenClawConfig(api: OpenClawPluginApi): unknown {
   try {
-    const runtimeConfig = api.runtime.config.loadConfig();
+    const runtimeConfig = readRuntimeConfigSnapshot(api);
     if (runtimeConfig !== undefined) {
       if (isRecord(runtimeConfig) && Object.keys(runtimeConfig).length > 0) {
         return runtimeConfig;
@@ -460,7 +480,7 @@ function loadEffectiveOpenClawConfig(api: OpenClawPluginApi): unknown {
       }
     }
   } catch {
-    // Older runtimes or early startup can leave loadConfig unavailable.
+    // Older runtimes or early startup can leave runtime config unavailable.
   }
   return api.config;
 }
@@ -1190,10 +1210,11 @@ function createLcmDependencies(
         if (!sessionApi) {
           return undefined;
         }
-        const cfg = api.runtime.config.loadConfig();
+        const cfg = readRuntimeConfigSnapshot(api);
+        const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
         const parsed = parseAgentSessionKey(key);
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = sessionApi.resolveStorePath(cfg.session?.store, {
+        const storePath = sessionApi.resolveStorePath(getStringField(sessionConfig, "store"), {
           agentId,
         });
         const store = sessionApi.loadSessionStore(storePath) as Record<
@@ -1217,11 +1238,12 @@ function createLcmDependencies(
         if (!sessionApi) {
           return undefined;
         }
-        const cfg = api.runtime.config.loadConfig();
+        const cfg = readRuntimeConfigSnapshot(api);
+        const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
         const normalizedSessionKey = sessionKey?.trim();
         const parsed = normalizedSessionKey ? parseAgentSessionKey(normalizedSessionKey) : null;
         const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = sessionApi.resolveStorePath(cfg.session?.store, {
+        const storePath = sessionApi.resolveStorePath(getStringField(sessionConfig, "store"), {
           agentId,
         });
         const store = sessionApi.loadSessionStore(storePath) as Record<
@@ -1252,7 +1274,10 @@ function createLcmDependencies(
 
       let cfg: unknown = registrationConfig.openClawConfig;
       try {
-        cfg = api.runtime.config.loadConfig();
+        const liveConfig = readRuntimeConfigSnapshot(api);
+        if (liveConfig !== undefined) {
+          cfg = liveConfig;
+        }
       } catch {
         // Fall back to the registration config snapshot when live config is unavailable.
       }
@@ -1451,7 +1476,10 @@ const lcmPlugin = {
 
       let cfg: unknown = registrationConfig.openClawConfig;
       try {
-        cfg = api.runtime.config.loadConfig();
+        const liveConfig = readRuntimeConfigSnapshot(api);
+        if (liveConfig !== undefined) {
+          cfg = liveConfig;
+        }
       } catch {
         // Fall back to the registration config snapshot when live config is unavailable.
       }
