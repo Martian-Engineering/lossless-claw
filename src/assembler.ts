@@ -167,6 +167,20 @@ export function isEmptyMessageContent(message: {
   return false;
 }
 
+function freshTailProtectionMessageHashes(messages: AgentMessage[]): string[] {
+  const hashes: string[] = [];
+  for (const message of messages) {
+    const messageHashes = new Set<string>();
+    messageHashes.add(hashMessages([message]));
+    const repairedVariants = sanitizeToolUseResultPairing([message]) as AgentMessage[];
+    for (const repaired of repairedVariants) {
+      messageHashes.add(hashMessages([repaired]));
+    }
+    hashes.push(...messageHashes);
+  }
+  return hashes;
+}
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface AssembleContextInput {
@@ -218,6 +232,8 @@ export interface AssembleContextResult {
     preSanitizeFreshTailCount: number;
     preSanitizeEvictableHash: string;
     preSanitizeFreshTailHash: string;
+    preSanitizeFreshTailMessageHashes: string[];
+    freshTailProtectionMessageHashes: string[];
     preSanitizeMessagesHash: string;
     finalMessagesHash: string;
     overflowDiagnostics: AssemblyOverflowDiagnostics;
@@ -1467,6 +1483,12 @@ export class ContextAssembler {
         preSanitizeFreshTailCount: preSanitizeFreshTailMessages.length,
         preSanitizeEvictableHash: hashMessages(preSanitizeEvictableMessages),
         preSanitizeFreshTailHash: hashMessages(preSanitizeFreshTailMessages),
+        preSanitizeFreshTailMessageHashes: preSanitizeFreshTailMessages.map((message) =>
+          hashMessages([message]),
+        ),
+        freshTailProtectionMessageHashes: freshTailProtectionMessageHashes(
+          preSanitizeFreshTailMessages,
+        ),
         preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
         finalMessagesHash: hashMessages(repaired),
         overflowDiagnostics,
