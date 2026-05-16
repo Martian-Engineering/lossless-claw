@@ -4,6 +4,7 @@ import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
 import type { RotateSessionStorageWithBackupResult } from "../engine.js";
+import { runDelegatedFocusBrief } from "../focus-briefs.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
 import type { OpenClawPluginCommandDefinition, PluginCommandContext } from "../openclaw-bridge.js";
@@ -27,6 +28,7 @@ import {
   type ConversationCompactionMaintenanceRecord,
 } from "../store/compaction-maintenance-store.js";
 import { CompactionTelemetryStore } from "../store/compaction-telemetry-store.js";
+import { FocusBriefStore, hashFocusSourceContext } from "../store/focus-brief-store.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
@@ -70,6 +72,9 @@ type ParsedLcmCommand =
   | { kind: "status" }
   | { kind: "backup" }
   | { kind: "rotate" }
+  | { kind: "focus_status" }
+  | { kind: "focus_generate"; prompt: string }
+  | { kind: "unfocus" }
   | { kind: "doctor"; apply: boolean }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "help"; error?: string };
@@ -201,6 +206,19 @@ function parseDoctorCleanerApplyArgs(tokens: string[]):
 }
 
 function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
+  const raw = (rawArgs ?? "").trim();
+  if (raw === "") {
+    return { kind: "status" };
+  }
+  const focusMatch = raw.match(/^focus(?:\s+([\s\S]*))?$/i);
+  if (focusMatch) {
+    const prompt = focusMatch[1]?.trim() ?? "";
+    return prompt ? { kind: "focus_generate", prompt } : { kind: "focus_status" };
+  }
+  if (/^unfocus$/i.test(raw)) {
+    return { kind: "unfocus" };
+  }
+
   const tokens = splitArgs(rawArgs);
   if (tokens.length === 0) {
     return { kind: "status" };
@@ -251,7 +269,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, backup, rotate, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, focus, unfocus, backup, rotate, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -563,6 +581,18 @@ function buildHelpText(error?: string): string {
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} rotate`),
         "Compact the current session transcript while preserving the same LCM conversation and live session identity.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} focus <prompt>`),
+        "Generate a draft focus brief with a delegated recall sub-agent.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} focus`),
+        "Show the latest focus brief draft for the current conversation.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} unfocus`),
+        "Deactivate focus mode once active overlays are available.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
@@ -1135,6 +1165,275 @@ async function buildRotateText(params: {
   return lines.join("\n");
 }
 
+function formatFocusPreview(content: string, maxChars = 1200): string {
+  const trimmed = content.trim();
+  if (trimmed.length <= maxChars) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function formatFocusBriefTime(value: Date | null, timezone: string): string {
+  return value ? formatTimestamp(value, timezone) : "unknown";
+}
+
+// Build the read-only status response for the current conversation's latest focus brief.
+async function buildFocusStatusText(params: {
+  ctx: PluginCommandContext;
+  db: DatabaseSync;
+  config: LcmConfig;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🎯 Lossless Claw Focus",
+    "",
+  ];
+  const current = await resolveCurrentConversation({ ctx: params.ctx, db: params.db });
+  if (current.kind === "unavailable") {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", current.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const store = new FocusBriefStore(params.db);
+  const latest = await store.getLatestFocusBrief(current.stats.conversationId);
+  lines.push(
+    buildSection("📍 Current conversation", [
+      buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
+      buildStatLine(
+        "session key",
+        current.stats.sessionKey ? formatCommand(truncateMiddle(current.stats.sessionKey, 44)) : "missing",
+      ),
+    ]),
+    "",
+  );
+
+  if (!latest) {
+    lines.push(
+      buildSection("🎯 Focus", [
+        buildStatLine("status", "none"),
+        buildStatLine("usage", formatCommand(`${VISIBLE_COMMAND} focus <prompt>`)),
+        buildStatLine("behavior", "generates a persisted draft brief without changing active context"),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const sources = await store.getFocusBriefSources(latest.briefId);
+  const cited = sources.filter((source) => source.role === "cited").map((source) => source.summaryId);
+  lines.push(
+    buildSection("🎯 Latest focus brief", [
+      buildStatLine("brief id", formatCommand(latest.briefId)),
+      buildStatLine("status", latest.status),
+      buildStatLine("created", formatFocusBriefTime(latest.createdAt, params.config.timezone)),
+      buildStatLine("prompt", JSON.stringify(formatFocusPreview(latest.prompt, 240))),
+      buildStatLine("tokens", formatNumber(latest.tokenCount)),
+      buildStatLine("target tokens", formatNumber(latest.targetTokens)),
+      buildStatLine("source summaries", formatNumber(sources.filter((source) => source.role === "active_input").length)),
+      buildStatLine("cited summaries", cited.length > 0 ? cited.slice(0, 8).join(", ") : "none"),
+      buildStatLine("generator run", latest.generatorRunId ?? "unknown"),
+    ]),
+  );
+  if (latest.error) {
+    lines.push("", buildSection("⚠️ Error", [latest.error]));
+  }
+  if (latest.content.trim()) {
+    lines.push("", buildSection("📝 Preview", [formatFocusPreview(latest.content)]));
+  }
+  return lines.join("\n");
+}
+
+// Generate a draft focus brief through a delegated subagent and persist the result.
+async function buildFocusGenerateText(params: {
+  ctx: PluginCommandContext;
+  db: DatabaseSync;
+  config: LcmConfig;
+  deps?: LcmDependencies;
+  prompt: string;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🎯 Lossless Claw Focus",
+    "",
+  ];
+  if (!params.deps) {
+    lines.push(
+      buildSection("🛠️ Focus", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", "Focus generation requires runtime dependencies for delegated subagents."),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const requesterSessionKey = normalizeIdentity(params.ctx.sessionKey);
+  if (!requesterSessionKey) {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine(
+          "reason",
+          "OpenClaw must expose the active session key for Lossless Claw to spawn a focus subagent.",
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const current = await resolveCurrentConversation({ ctx: params.ctx, db: params.db });
+  if (current.kind === "unavailable") {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", current.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const store = new FocusBriefStore(params.db);
+  const summaries = await store.getActiveContextSummaries(current.stats.conversationId);
+  if (summaries.length === 0) {
+    lines.push(
+      buildSection("🎯 Focus", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", "The current conversation has no active summary context items to focus."),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const sourceContextHash = hashFocusSourceContext(summaries);
+  const watermark = await store.getCoveredWatermark(current.stats.conversationId);
+  const generation = await runDelegatedFocusBrief({
+    deps: params.deps,
+    requesterSessionKey,
+    conversationId: current.stats.conversationId,
+    focusPrompt: params.prompt,
+    summaries,
+  });
+  const ordinalBySummaryId = new Map(summaries.map((summary) => [summary.summaryId, summary.ordinal]));
+  const sources = [
+    ...summaries.map((summary) => ({
+      summaryId: summary.summaryId,
+      ordinal: summary.ordinal,
+      role: "active_input" as const,
+    })),
+    ...generation.citedSummaryIds.map((summaryId) => ({
+      summaryId,
+      ordinal: ordinalBySummaryId.get(summaryId) ?? null,
+      role: "cited" as const,
+    })),
+    ...generation.expandedSummaryIds.map((summaryId) => ({
+      summaryId,
+      ordinal: ordinalBySummaryId.get(summaryId) ?? null,
+      role: "expanded" as const,
+    })),
+    ...generation.irrelevantSummaryIds.map((summaryId) => ({
+      summaryId,
+      ordinal: ordinalBySummaryId.get(summaryId) ?? null,
+      role: "irrelevant" as const,
+    })),
+  ];
+
+  const ok = generation.status === "ok";
+  const brief = await store.createFocusBrief({
+    conversationId: current.stats.conversationId,
+    sessionKey: requesterSessionKey,
+    prompt: params.prompt,
+    content: ok ? generation.briefMarkdown : "",
+    status: ok ? "draft" : "failed",
+    tokenCount: generation.tokenCount,
+    targetTokens: generation.targetTokens,
+    coveredLatestAt: watermark.coveredLatestAt,
+    coveredMessageSeq: watermark.coveredMessageSeq,
+    sourceContextHash,
+    generatorRunId: generation.runId,
+    generatorSessionKey: generation.childSessionKey,
+    rawResultJson:
+      generation.rawResultJson ??
+      JSON.stringify({
+        status: generation.status,
+        error: generation.error,
+        rawReply: generation.rawReply,
+      }),
+    error: generation.error ?? null,
+    sources,
+    supersedeCurrentDrafts: ok,
+  });
+
+  lines.push(
+    buildSection("📍 Current conversation", [
+      buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
+      buildStatLine("session key", formatCommand(truncateMiddle(requesterSessionKey, 44))),
+      buildStatLine("source summaries", formatNumber(summaries.length)),
+      buildStatLine("source context hash", sourceContextHash.slice(0, 16)),
+    ]),
+    "",
+    buildSection("🎯 Focus draft", [
+      buildStatLine("brief id", formatCommand(brief.briefId)),
+      buildStatLine("status", brief.status),
+      buildStatLine("prompt", JSON.stringify(formatFocusPreview(params.prompt, 240))),
+      buildStatLine("tokens", formatNumber(brief.tokenCount)),
+      buildStatLine("target tokens", formatNumber(brief.targetTokens)),
+      buildStatLine("generator run", generation.runId),
+      buildStatLine("generator session", truncateMiddle(generation.childSessionKey, 60)),
+      buildStatLine("truncated", formatBoolean(generation.truncated)),
+    ]),
+  );
+  if (!ok) {
+    lines.push(
+      "",
+      buildSection("⚠️ Generation failed", [
+        generation.error ?? "Focus brief generation failed without a specific error.",
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    "",
+    buildSection("📝 Preview", [formatFocusPreview(generation.briefMarkdown)]),
+  );
+  return lines.join("\n");
+}
+
+// Report unfocus behavior before active overlay assembly is implemented.
+async function buildUnfocusText(params: {
+  ctx: PluginCommandContext;
+  db: DatabaseSync;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🎯 Lossless Claw Focus",
+    "",
+  ];
+  const current = await resolveCurrentConversation({ ctx: params.ctx, db: params.db });
+  if (current.kind === "unavailable") {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", current.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+  lines.push(
+    buildSection("🎯 Focus", [
+      buildStatLine("status", "unchanged"),
+      buildStatLine("reason", "Active focus overlays are not implemented yet; draft briefs do not affect context."),
+    ]),
+  );
+  return lines.join("\n");
+}
+
 async function buildDoctorCleanersApplyText(params: {
   db: DatabaseSync;
   config: LcmConfig;
@@ -1417,6 +1716,20 @@ export function createLcmCommand(params: {
               getLcm: params.getLcm,
             }),
           };
+        case "focus_status":
+          return { text: await buildFocusStatusText({ ctx, db: await getDb(), config: params.config }) };
+        case "focus_generate":
+          return {
+            text: await buildFocusGenerateText({
+              ctx,
+              db: await getDb(),
+              config: params.config,
+              deps: params.deps,
+              prompt: parsed.prompt,
+            }),
+          };
+        case "unfocus":
+          return { text: await buildUnfocusText({ ctx, db: await getDb() }) };
         case "doctor":
           return parsed.apply
             ? {

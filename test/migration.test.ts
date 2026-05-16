@@ -402,6 +402,51 @@ describe("runLcmMigrations summary depth backfill", () => {
     ).toThrow();
   });
 
+  it("creates focus brief tables and indexes outside the summary DAG", () => {
+    const db = createTestDb("focus-briefs.db");
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const tableRows = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`)
+      .all() as Array<{ name: string }>;
+    const tableNames = new Set(tableRows.map((row) => row.name));
+    expect(tableNames.has("focus_briefs")).toBe(true);
+    expect(tableNames.has("focus_brief_sources")).toBe(true);
+
+    const indexRows = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`)
+      .all() as Array<{ name: string }>;
+    const indexNames = new Set(indexRows.map((row) => row.name));
+    expect(indexNames.has("focus_briefs_conversation_status_idx")).toBe(true);
+    expect(indexNames.has("focus_brief_sources_summary_idx")).toBe(true);
+
+    db.prepare(`INSERT INTO conversations (session_id, session_key) VALUES (?, ?)`).run(
+      "focus-migration-session",
+      "agent:main:telegram:direct:focus-migration",
+    );
+    const conversationId = (db.prepare(`SELECT last_insert_rowid() AS id`).get() as { id: number }).id;
+    db.prepare(
+      `INSERT INTO focus_briefs (
+         brief_id, conversation_id, prompt, content, status, source_context_hash
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("focus_migration", conversationId, "prompt", "content", "draft", "hash");
+    db.prepare(
+      `INSERT INTO focus_brief_sources (brief_id, summary_id, ordinal, role)
+       VALUES (?, ?, ?, ?)`,
+    ).run("focus_migration", "summary_a", 0, "active_input");
+
+    const stored = db
+      .prepare(
+        `SELECT fb.status, fbs.role
+         FROM focus_briefs fb
+         JOIN focus_brief_sources fbs ON fbs.brief_id = fb.brief_id
+         WHERE fb.brief_id = ?`,
+      )
+      .get("focus_migration") as { status: string; role: string };
+    expect(stored).toEqual({ status: "draft", role: "active_input" });
+  });
+
   it("backfills message identity hashes and indexes conversation hash lookups", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
     tempDirs.push(tempDir);

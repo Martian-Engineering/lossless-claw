@@ -42,3 +42,13 @@ export { CompactionMaintenanceStore } from "./compaction-maintenance-store.js";
 export type {
   ConversationCompactionMaintenanceRecord,
 } from "./compaction-maintenance-store.js";
+
+export { FocusBriefStore, hashFocusSourceContext } from "./focus-brief-store.js";
+export type {
+  ActiveFocusSummaryRecord,
+  CreateFocusBriefInput,
+  FocusBriefRecord,
+  FocusBriefSourceRecord,
+  FocusBriefSourceRole,
+  FocusBriefStatus,
+} from "./focus-brief-store.js";

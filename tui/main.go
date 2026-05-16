@@ -25,6 +25,7 @@ const (
 	screenSummaries
 	screenFiles
 	screenContext
+	screenFocusBriefs
 	screenCodexContextCompare
 )
 
@@ -117,6 +118,10 @@ type model struct {
 
 	contextItems  []contextItemEntry
 	contextCursor int
+
+	focusBriefs       []focusBriefEntry
+	focusBriefCursor  int
+	focusDetailScroll int
 
 	agentCursor         int
 	sessionCursor       int
@@ -339,6 +344,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleFilesKey(msg)
 	case screenContext:
 		return m.handleContextKey(msg)
+	case screenFocusBriefs:
+		return m.handleFocusBriefsKey(msg)
 	case screenCodexContextCompare:
 		return m.handleCodexContextCompareKey(msg)
 	default:
@@ -545,6 +552,26 @@ func (m model) handleConversationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.status = fmt.Sprintf("Context: %d summaries + %d messages = %d items, %dk tokens",
 				summaryCount, messageCount, len(items), totalTokens/1000)
+		}
+	case "o":
+		session, ok := m.currentSession()
+		if !ok {
+			m.status = "No session selected"
+			return m, nil
+		}
+		briefs, err := loadFocusBriefs(m.paths.lcmDBPath, session.id)
+		if err != nil {
+			m.status = "Error: " + err.Error()
+			return m, nil
+		}
+		m.focusBriefs = briefs
+		m.focusBriefCursor = 0
+		m.focusDetailScroll = 0
+		m.screen = screenFocusBriefs
+		if len(briefs) == 0 {
+			m.status = "No focus briefs for this session"
+		} else {
+			m.status = fmt.Sprintf("Loaded %d focus briefs", len(briefs))
 		}
 	case "v":
 		session, ok := m.currentSession()
@@ -830,6 +857,46 @@ func (m model) handleContextKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.contextItems = items
 		m.contextCursor = clamp(m.contextCursor, 0, len(m.contextItems)-1)
 		m.status = fmt.Sprintf("Reloaded %d context items", len(items))
+	case "b", "backspace":
+		m.screen = screenConversation
+		m.status = "Back to conversation"
+	}
+	return m, nil
+}
+
+// handleFocusBriefsKey navigates the read-only focus brief browser.
+func (m model) handleFocusBriefsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		m.focusBriefCursor = clamp(m.focusBriefCursor-1, 0, len(m.focusBriefs)-1)
+		m.focusDetailScroll = 0
+	case "down", "j":
+		m.focusBriefCursor = clamp(m.focusBriefCursor+1, 0, len(m.focusBriefs)-1)
+		m.focusDetailScroll = 0
+	case "g":
+		m.focusBriefCursor = 0
+		m.focusDetailScroll = 0
+	case "G":
+		m.focusBriefCursor = max(0, len(m.focusBriefs)-1)
+		m.focusDetailScroll = 0
+	case "J":
+		m.focusDetailScroll++
+	case "K":
+		m.focusDetailScroll = max(0, m.focusDetailScroll-1)
+	case "r":
+		session, ok := m.currentSession()
+		if !ok {
+			m.status = "No session selected"
+			return m, nil
+		}
+		briefs, err := loadFocusBriefs(m.paths.lcmDBPath, session.id)
+		if err != nil {
+			m.status = "Error: " + err.Error()
+			return m, nil
+		}
+		m.focusBriefs = briefs
+		m.focusBriefCursor = clamp(m.focusBriefCursor, 0, len(m.focusBriefs)-1)
+		m.status = fmt.Sprintf("Reloaded %d focus briefs", len(briefs))
 	case "b", "backspace":
 		m.screen = screenConversation
 		m.status = "Back to conversation"
@@ -1666,6 +1733,11 @@ func (m model) renderHeader() string {
 		if conversationID, ok := m.currentConversationID(); ok {
 			title += fmt.Sprintf(" | conv_id:%d", conversationID)
 		}
+	case screenFocusBriefs:
+		title += " | LCM Focus Briefs"
+		if conversationID, ok := m.currentConversationID(); ok {
+			title += fmt.Sprintf(" | conv_id:%d", conversationID)
+		}
 	case screenCodexContextCompare:
 		title += " | Codex ↔ LCM Context"
 		if session, ok := m.currentSession(); ok {
@@ -1687,7 +1759,7 @@ func (m model) renderHelp() string {
 	case screenSessions:
 		return "up/down: move | enter: open conversation | x: Codex backend | v: Codex↔LCM compare | b: back | r: reload | q: quit"
 	case screenConversation:
-		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | [ / ]: older/newer window | r: reload | l: LCM summaries | c: context | f: LCM files | v: compare | b: back | q: quit"
+		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | [ / ]: older/newer window | r: reload | l: LCM summaries | c: context | o: focus briefs | f: LCM files | v: compare | b: back | q: quit"
 	case screenSummaries:
 		if m.pendingRewrite != nil {
 			switch m.pendingRewrite.phase {
@@ -1715,6 +1787,8 @@ func (m model) renderHelp() string {
 		return "up/down: move | g/G: top/bottom | r: reload | b: back | q: quit"
 	case screenContext:
 		return "up/down: move | g/G: top/bottom | r: reload | b: back | q: quit"
+	case screenFocusBriefs:
+		return "up/down: move | g/G: top/bottom | J/K: scroll detail | r: reload | b: back | q: quit"
 	case screenCodexContextCompare:
 		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | r: reload | b: back | q: quit"
 	default:
@@ -1736,6 +1810,8 @@ func (m model) renderBody() string {
 		return m.renderFiles()
 	case screenContext:
 		return m.renderContext()
+	case screenFocusBriefs:
+		return m.renderFocusBriefs()
 	case screenCodexContextCompare:
 		return m.renderCodexContextCompare()
 	default:
@@ -2296,6 +2372,96 @@ func (m *model) renderContextDetail(detailHeight int) []string {
 		}
 	}
 
+	return padLines(visible, detailHeight)
+}
+
+// renderFocusBriefs draws the focus brief list and selected detail pane.
+func (m model) renderFocusBriefs() string {
+	if len(m.focusBriefs) == 0 {
+		return "No focus briefs found for this session"
+	}
+
+	available := max(4, m.height-4)
+	detailHeight := max(9, available/2)
+	listHeight := max(3, available-detailHeight-1)
+
+	listOffsetValue := listOffset(m.focusBriefCursor, len(m.focusBriefs), listHeight)
+	listLines := make([]string, 0, listHeight)
+	for idx := listOffsetValue; idx < min(len(m.focusBriefs), listOffsetValue+listHeight); idx++ {
+		brief := m.focusBriefs[idx]
+		line := m.formatFocusBriefLine(brief)
+		if idx == m.focusBriefCursor {
+			line = selectedStyle.Render(line)
+		}
+		listLines = append(listLines, line)
+	}
+
+	detailLines := m.renderFocusBriefDetail(detailHeight)
+	return strings.Join(listLines, "\n") + "\n" + helpStyle.Render(strings.Repeat("-", max(20, m.width-1))) + "\n" + strings.Join(detailLines, "\n")
+}
+
+// formatFocusBriefLine builds one compact list row for a focus brief.
+func (m model) formatFocusBriefLine(brief focusBriefEntry) string {
+	maxPrompt := max(8, m.width-80)
+	prompt := truncateString(oneLine(brief.prompt), maxPrompt)
+	id := brief.briefID[:min(18, len(brief.briefID))]
+	tokenLabel := fmt.Sprintf("%dt", brief.tokenCount)
+	if brief.targetTokens > 0 {
+		tokenLabel = fmt.Sprintf("%d/%dt", brief.tokenCount, brief.targetTokens)
+	}
+	return fmt.Sprintf("  %-10s %-19s [%s, %s] %s",
+		brief.status, formatTimestamp(brief.createdAt), id, tokenLabel, prompt)
+}
+
+// renderFocusBriefDetail renders metadata, prompt, and content for the selected brief.
+func (m *model) renderFocusBriefDetail(detailHeight int) []string {
+	if m.focusBriefCursor < 0 || m.focusBriefCursor >= len(m.focusBriefs) {
+		return padLines([]string{"No focus brief selected"}, detailHeight)
+	}
+	brief := m.focusBriefs[m.focusBriefCursor]
+
+	allLines := []string{
+		fmt.Sprintf("Focus brief: %s [%s]", brief.briefID, brief.status),
+		fmt.Sprintf("Created: %s  Updated: %s", formatTimestamp(brief.createdAt), formatTimestamp(brief.updatedAt)),
+		fmt.Sprintf("Tokens: %d / %d  Sources: active=%d cited=%d expanded=%d irrelevant=%d",
+			brief.tokenCount, brief.targetTokens, brief.sourceCount, brief.citedCount, brief.expandedCount, brief.irrelevantCount),
+	}
+	if brief.generatorRunID != "" || brief.generatorSessionKey != "" {
+		allLines = append(allLines, fmt.Sprintf("Generator: run=%s session=%s", brief.generatorRunID, brief.generatorSessionKey))
+	}
+	if len(brief.citedSummaryIDs) > 0 {
+		allLines = append(allLines, "Cited: "+strings.Join(brief.citedSummaryIDs, ", "))
+	}
+	if len(brief.expandedSummaryIDs) > 0 {
+		allLines = append(allLines, "Expanded: "+strings.Join(brief.expandedSummaryIDs, ", "))
+	}
+	if brief.errorText != "" {
+		allLines = append(allLines, "Error: "+brief.errorText)
+	}
+	allLines = append(allLines, "", "Prompt:")
+	for _, line := range strings.Split(wrapText(strings.TrimSpace(brief.prompt), max(20, m.width-4)), "\n") {
+		allLines = append(allLines, "  "+line)
+	}
+	allLines = append(allLines, "", "Brief:")
+	content := strings.TrimSpace(brief.content)
+	if content == "" {
+		content = "(empty)"
+	}
+	for _, line := range strings.Split(wrapText(content, max(20, m.width-4)), "\n") {
+		allLines = append(allLines, "  "+line)
+	}
+
+	maxScroll := max(0, len(allLines)-detailHeight)
+	m.focusDetailScroll = clamp(m.focusDetailScroll, 0, maxScroll)
+	start := m.focusDetailScroll
+	end := min(len(allLines), start+detailHeight)
+	visible := allLines[start:end]
+	if maxScroll > 0 {
+		indicator := fmt.Sprintf(" [%d/%d lines, Shift+J/K to scroll]", m.focusDetailScroll+detailHeight, len(allLines))
+		if len(visible) > 0 {
+			visible[0] = visible[0] + helpStyle.Render(indicator)
+		}
+	}
 	return padLines(visible, detailHeight)
 }
 

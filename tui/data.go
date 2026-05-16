@@ -130,6 +130,29 @@ type contextItemEntry struct {
 	createdAt  string
 }
 
+// focusBriefEntry represents a generated focus brief for a conversation.
+type focusBriefEntry struct {
+	briefID             string
+	conversationID      int64
+	prompt              string
+	content             string
+	status              string
+	tokenCount          int
+	targetTokens        int
+	createdAt           string
+	updatedAt           string
+	generatorRunID      string
+	generatorSessionKey string
+	errorText           string
+	sourceCount         int
+	citedCount          int
+	expandedCount       int
+	irrelevantCount     int
+	citedSummaryIDs     []string
+	expandedSummaryIDs  []string
+	preview             string
+}
+
 // summaryGraph is the in-memory DAG used by the summary drill-down view.
 type summaryGraph struct {
 	conversationID int64
@@ -1384,6 +1407,142 @@ func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {
 		return nil, fmt.Errorf("iterate context items: %w", err)
 	}
 	return items, nil
+}
+
+// sqliteTableExists checks optional feature tables without treating older DBs as broken.
+func sqliteTableExists(db *sql.DB, tableName string) (bool, error) {
+	var count int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = ?
+	`, tableName).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// loadFocusBriefs returns persisted focus briefs for the selected LCM conversation.
+func loadFocusBriefs(dbPath, sessionID string) ([]focusBriefEntry, error) {
+	db, err := openLCMDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	conversationID, err := lookupConversationID(db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	exists, err := sqliteTableExists(db, "focus_briefs")
+	if err != nil {
+		return nil, fmt.Errorf("check focus brief schema: %w", err)
+	}
+	if !exists {
+		return nil, nil
+	}
+
+	rows, err := db.Query(`
+		SELECT
+			brief_id,
+			conversation_id,
+			COALESCE(prompt, ''),
+			COALESCE(content, ''),
+			COALESCE(status, ''),
+			COALESCE(token_count, 0),
+			COALESCE(target_tokens, 0),
+			COALESCE(created_at, ''),
+			COALESCE(updated_at, ''),
+			COALESCE(generator_run_id, ''),
+			COALESCE(generator_session_key, ''),
+			COALESCE(error, '')
+		FROM focus_briefs
+		WHERE conversation_id = ?
+		ORDER BY created_at DESC, rowid DESC
+	`, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("query focus briefs for conversation %d: %w", conversationID, err)
+	}
+	defer rows.Close()
+
+	briefs := make([]focusBriefEntry, 0)
+	for rows.Next() {
+		var brief focusBriefEntry
+		if err := rows.Scan(
+			&brief.briefID,
+			&brief.conversationID,
+			&brief.prompt,
+			&brief.content,
+			&brief.status,
+			&brief.tokenCount,
+			&brief.targetTokens,
+			&brief.createdAt,
+			&brief.updatedAt,
+			&brief.generatorRunID,
+			&brief.generatorSessionKey,
+			&brief.errorText,
+		); err != nil {
+			return nil, fmt.Errorf("scan focus brief: %w", err)
+		}
+		brief.content = sanitizeForTerminal(brief.content)
+		brief.prompt = sanitizeForTerminal(brief.prompt)
+		brief.errorText = sanitizeForTerminal(brief.errorText)
+		brief.preview = oneLine(brief.content)
+		if err := populateFocusBriefSourceStats(db, &brief); err != nil {
+			return nil, err
+		}
+		briefs = append(briefs, brief)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate focus briefs: %w", err)
+	}
+	return briefs, nil
+}
+
+// populateFocusBriefSourceStats adds source/citation counts and IDs to one brief.
+func populateFocusBriefSourceStats(db *sql.DB, brief *focusBriefEntry) error {
+	exists, err := sqliteTableExists(db, "focus_brief_sources")
+	if err != nil {
+		return fmt.Errorf("check focus brief source schema: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+
+	rows, err := db.Query(`
+		SELECT role, summary_id
+		FROM focus_brief_sources
+		WHERE brief_id = ?
+		ORDER BY role, ordinal, summary_id
+	`, brief.briefID)
+	if err != nil {
+		return fmt.Errorf("query focus brief sources for %s: %w", brief.briefID, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var role string
+		var summaryID string
+		if err := rows.Scan(&role, &summaryID); err != nil {
+			return fmt.Errorf("scan focus brief source: %w", err)
+		}
+		switch role {
+		case "active_input":
+			brief.sourceCount++
+		case "cited":
+			brief.citedCount++
+			brief.citedSummaryIDs = append(brief.citedSummaryIDs, summaryID)
+		case "expanded":
+			brief.expandedCount++
+			brief.expandedSummaryIDs = append(brief.expandedSummaryIDs, summaryID)
+		case "irrelevant":
+			brief.irrelevantCount++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate focus brief sources: %w", err)
+	}
+	return nil
 }
 
 func formatTimeForList(ts time.Time) string {

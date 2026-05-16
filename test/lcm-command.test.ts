@@ -34,7 +34,7 @@ function createCommandFixture(options?: {
     deps: options?.deps,
     getLcm: options?.getLcm,
   });
-  return { tempDir, dbPath, db, command, conversationStore, summaryStore };
+  return { tempDir, dbPath, db, config, command, conversationStore, summaryStore };
 }
 
 function createCommandContext(
@@ -226,6 +226,205 @@ describe("lcm command", () => {
     expect(result.text).toContain("tokens in context: 5");
     expect(result.text).toContain("compression ratio: 1:6");
     expect(result.text).toContain("doctor: 1 issue(s) in this conversation");
+  });
+
+  it("reports focus usage when no brief exists for the current conversation", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    await fixture.conversationStore.createConversation({
+      sessionId: "focus-empty-session",
+      sessionKey: "agent:main:telegram:direct:focus-empty",
+      title: "Focus empty fixture",
+    });
+
+    const result = await fixture.command.handler(
+      createCommandContext("focus", {
+        sessionKey: "agent:main:telegram:direct:focus-empty",
+      }),
+    );
+
+    expect(result.text).toContain("Lossless Claw Focus");
+    expect(result.text).toContain("status: none");
+    expect(result.text).toContain("usage: `/lossless focus <prompt>`");
+  });
+
+  it("generates and persists a draft focus brief through a delegated subagent", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const sessionKey = "agent:main:telegram:direct:focus-generate";
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "focus-generate-session",
+      sessionKey,
+      title: "Focus generation fixture",
+    });
+    const [firstMessage, secondMessage] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "Alpha auth work started.",
+        tokenCount: 6,
+      },
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "Alpha auth work reached the review stage.",
+        tokenCount: 8,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "focus_leaf",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Alpha auth implementation details.",
+      tokenCount: 50,
+      sourceMessageTokenCount: 14,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("focus_leaf", [
+      firstMessage.messageId,
+      secondMessage.messageId,
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "focus_parent",
+      conversationId: currentConversation.conversationId,
+      kind: "condensed",
+      depth: 1,
+      content: "Alpha auth current state and review notes.",
+      tokenCount: 20,
+      descendantTokenCount: 50,
+      sourceMessageTokenCount: 14,
+    });
+    await fixture.summaryStore.linkSummaryToParents("focus_parent", ["focus_leaf"]);
+    await fixture.summaryStore.replaceContextRangeWithSummary({
+      conversationId: currentConversation.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 1,
+      summaryId: "focus_parent",
+    });
+
+    const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
+      if (request.method === "agent") {
+        expect(String(request.params?.message)).toContain("Generate a Lossless focus context brief.");
+        expect(String(request.params?.message)).toContain("lcm_grep");
+        expect(String(request.params?.message)).toContain("do NOT call lcm_expand_query");
+        return { runId: "focus-run-1" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: JSON.stringify({
+                briefMarkdown: "## Focused Narrative\nAlpha auth is ready for review.",
+                citedSummaryIds: ["focus_parent"],
+                expandedSummaryIds: ["focus_leaf"],
+                irrelevantSummaryIds: ["unrelated_summary"],
+                expansionPrompts: [
+                  {
+                    prompt: "Expand the alpha auth implementation details.",
+                    summaryIds: ["focus_leaf"],
+                  },
+                ],
+                confidenceNotes: ["focus_parent was in active context"],
+                truncated: false,
+              }),
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      throw new Error(`unexpected gateway method ${request.method}`);
+    });
+    const deps = {
+      config: fixture.config,
+      complete: vi.fn(),
+      callGateway,
+      resolveModel: () => ({ provider: "test", model: "test-model" }),
+      parseAgentSessionKey: (key: string) => {
+        const match = /^agent:([^:]+):(.*)$/.exec(key);
+        return match ? { agentId: match[1] ?? "main", suffix: match[2] ?? "" } : null;
+      },
+      isSubagentSessionKey: (key: string) => key.includes(":subagent:"),
+      normalizeAgentId: (id?: string) => id?.trim() || "main",
+      buildSubagentSystemPrompt: () => "subagent system prompt",
+      readLatestAssistantReply: (messages: unknown[]) => {
+        const latest = messages.at(-1) as { content?: unknown } | undefined;
+        return typeof latest?.content === "string" ? latest.content : undefined;
+      },
+      resolveAgentDir: () => fixture.tempDir,
+      resolveSessionIdFromSessionKey: async () => undefined,
+      resolveSessionTranscriptFile: async () => undefined,
+      agentLaneSubagent: "subagent",
+      log: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    } as unknown as LcmDependencies;
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      deps,
+    });
+
+    const result = await command.handler(
+      createCommandContext("focus alpha auth review state", {
+        sessionKey,
+      }),
+    );
+
+    expect(result.text).toContain("Focus draft");
+    expect(result.text).toContain("status: draft");
+    expect(result.text).toContain("Alpha auth is ready for review.");
+    expect(callGateway.mock.calls.map((call) => call[0].method)).toEqual([
+      "agent",
+      "agent.wait",
+      "sessions.get",
+      "sessions.delete",
+    ]);
+    const brief = fixture.db
+      .prepare(`SELECT brief_id, prompt, status, content, generator_run_id FROM focus_briefs`)
+      .get() as {
+      brief_id: string;
+      prompt: string;
+      status: string;
+      content: string;
+      generator_run_id: string;
+    };
+    expect(brief.prompt).toBe("alpha auth review state");
+    expect(brief.status).toBe("draft");
+    expect(brief.content).toContain("Alpha auth is ready for review.");
+    expect(brief.generator_run_id).toBe("focus-run-1");
+    const sources = fixture.db
+      .prepare(`SELECT summary_id, role FROM focus_brief_sources ORDER BY role, summary_id`)
+      .all() as Array<{ summary_id: string; role: string }>;
+    expect(sources).toEqual([
+      { summary_id: "focus_parent", role: "active_input" },
+      { summary_id: "focus_parent", role: "cited" },
+      { summary_id: "focus_leaf", role: "expanded" },
+      { summary_id: "unrelated_summary", role: "irrelevant" },
+    ]);
+
+    const status = await command.handler(
+      createCommandContext("focus", {
+        sessionKey,
+      }),
+    );
+    expect(status.text).toContain(`brief id: \`${brief.brief_id}\``);
+    expect(status.text).toContain("source summaries: 1");
+    expect(status.text).toContain("cited summaries: focus_parent");
   });
 
   it("reports deferred compaction maintenance state in status output", async () => {
@@ -1716,6 +1915,15 @@ describe("lcm command", () => {
 });
 
 describe("lcm command helpers", () => {
+  it("parses focus command forms without flag syntax", () => {
+    expect(__testing.parseLcmCommand("focus alpha auth review")).toEqual({
+      kind: "focus_generate",
+      prompt: "alpha auth review",
+    });
+    expect(__testing.parseLcmCommand("focus")).toEqual({ kind: "focus_status" });
+    expect(__testing.parseLcmCommand("unfocus")).toEqual({ kind: "unfocus" });
+  });
+
   it("treats only the canonical engine id and empty slot state as selected", () => {
     expect(__testing.resolvePluginSelected({})).toBe(true);
     expect(
