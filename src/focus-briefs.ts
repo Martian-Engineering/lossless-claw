@@ -57,6 +57,17 @@ type ParsedFocusBriefReply = {
   rawResultJson?: string;
 };
 
+type ParsedFocusEvidenceReply = {
+  evidenceMarkdown: string;
+  citedSummaryIds: string[];
+  expandedSummaryIds: string[];
+  irrelevantSummaryIds: string[];
+  expansionPrompts: FocusBriefExpansionPrompt[];
+  confidenceNotes: string[];
+  truncated: boolean;
+  rawResultJson?: string;
+};
+
 type FocusBriefDeps = Pick<
   LcmDependencies,
   | "agentLaneSubagent"
@@ -68,11 +79,11 @@ type FocusBriefDeps = Pick<
   | "readLatestAssistantReply"
 >;
 
-type FocusBriefAttemptResult =
+type FocusAttemptResult<TParsed> =
   | {
       status: "ok";
       runId: string;
-      parsed: ParsedFocusBriefReply;
+      parsed: TParsed;
       tokenCount: number;
       rawReply?: string;
     }
@@ -124,6 +135,30 @@ function normalizeExpansionPrompts(value: unknown): FocusBriefExpansionPrompt[] 
   return output;
 }
 
+// Preserve evidence and synthesis follow-up prompts while collapsing exact
+// duplicates so the stored source metadata stays compact.
+function mergeExpansionPrompts(
+  left: FocusBriefExpansionPrompt[],
+  right: FocusBriefExpansionPrompt[],
+): FocusBriefExpansionPrompt[] {
+  const seen = new Set<string>();
+  const output: FocusBriefExpansionPrompt[] = [];
+  for (const prompt of [...left, ...right]) {
+    const normalizedPrompt = prompt.prompt.trim();
+    if (!normalizedPrompt) {
+      continue;
+    }
+    const summaryIds = normalizeStringArray(prompt.summaryIds);
+    const key = `${normalizedPrompt}\0${summaryIds.join("\0")}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push({ prompt: normalizedPrompt, summaryIds });
+  }
+  return output;
+}
+
 function parseFocusBriefReply(rawReply: string | undefined): ParsedFocusBriefReply {
   const reply = rawReply?.trim();
   if (!reply) {
@@ -164,6 +199,47 @@ function parseFocusBriefReply(rawReply: string | undefined): ParsedFocusBriefRep
   }
 
   throw new Error("Focus brief subagent did not return valid JSON.");
+}
+
+// Evidence gathering uses the same source metadata shape as the final brief,
+// but stores the markdown under evidenceMarkdown so we never mistake it for the
+// user-facing context artifact.
+function parseFocusEvidenceReply(rawReply: string | undefined): ParsedFocusEvidenceReply {
+  const reply = rawReply?.trim();
+  if (!reply) {
+    throw new Error("Focus evidence subagent returned an empty reply.");
+  }
+
+  const candidates: string[] = [reply];
+  const fenced = reply.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    candidates.unshift(fenced[1].trim());
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as Record<string, unknown>;
+      const evidenceMarkdown =
+        typeof parsed.evidenceMarkdown === "string" ? parsed.evidenceMarkdown.trim() : "";
+      if (!evidenceMarkdown) {
+        throw new Error("Focus evidence JSON did not include evidenceMarkdown.");
+      }
+      return {
+        evidenceMarkdown,
+        citedSummaryIds: normalizeStringArray(parsed.citedSummaryIds),
+        expandedSummaryIds: normalizeStringArray(parsed.expandedSummaryIds),
+        irrelevantSummaryIds: normalizeStringArray(parsed.irrelevantSummaryIds),
+        expansionPrompts: normalizeExpansionPrompts(parsed.expansionPrompts),
+        confidenceNotes: normalizeStringArray(parsed.confidenceNotes),
+        truncated: parsed.truncated === true,
+        rawResultJson: candidate,
+      };
+    } catch {
+      // Keep trying alternate candidates before surfacing a parse failure.
+    }
+  }
+
+  throw new Error("Focus evidence subagent did not return valid JSON.");
 }
 
 function truncatePreview(value: string, maxChars: number): string {
@@ -225,7 +301,7 @@ function resolveFocusDelegationTimeoutMs(params: {
   );
 }
 
-function buildFocusBriefTask(params: {
+function buildFocusEvidenceTask(params: {
   focusPrompt: string;
   conversationId: number;
   summaries: ActiveFocusSummaryRecord[];
@@ -235,24 +311,24 @@ function buildFocusBriefTask(params: {
 }): string {
   const minimumTokens = resolveFocusMinimumTokens(params.targetTokens);
   // The prompt is deliberately prescriptive because this artifact is meant to
-  // occupy context budget as working memory, not summarize the topic briefly.
+  // gather enough source material for a later synthesis turn.
   return [
-    "Generate a Lossless focus context brief.",
+    "Gather Lossless focus evidence.",
     "",
-    "You are a delegated subagent. Your job is to build a rich, evidence-oriented brief that a future model can use as task-shaped memory. This is not a concise summary.",
+    "You are a delegated subagent. Your job is to gather rich, prompt-oriented evidence for a later focus context brief. This is not the final brief.",
     "",
     "Focus prompt:",
     `<focus_prompt>${params.focusPrompt}</focus_prompt>`,
     "",
     `Conversation ID: ${params.conversationId}`,
-    `Target brief length: ${minimumTokens}-${params.targetTokens} tokens`,
-    `Minimum acceptable length: ${minimumTokens} tokens`,
+    `Target brief length for the later synthesis turn: ${minimumTokens}-${params.targetTokens} tokens`,
+    `Minimum acceptable final brief length: ${minimumTokens} tokens`,
     `Request ID: ${params.requestId}`,
     `Origin session key: ${params.originSessionKey}`,
     "",
-    "Length and density requirements:",
-    "- Use the available budget aggressively. Prefer dense, specific working memory over a short overview.",
-    "- If the brief would be shorter than the minimum acceptable length, continue searching and expanding relevant summaries before finalizing.",
+    "Evidence density requirements:",
+    "- Use this turn to search, inspect, and expand; do not write the final context brief yet.",
+    "- Prefer dense, specific working memory over a short overview.",
     "- Include concrete decisions, file paths, command names, issue IDs, summary IDs, constraints, rejected options, unresolved questions, and handoff details when relevant.",
     "- Do not pad with generic prose. Add detail by expanding evidence, recording provenance, and spelling out useful operational context.",
     "",
@@ -261,12 +337,65 @@ function buildFocusBriefTask(params: {
     "2. Use lcm_describe on promising summary IDs to inspect metadata, parent/child relationships, and expansion costs.",
     "3. Identify the newest summaries that pertain to the focus prompt, using lcm_grep recency ordering, latest_at values, and active summary context.",
     "4. Use lcm_expand directly on high-value summary IDs to recover key details. Expand enough evidence to support a long brief. You are in delegated context, so do NOT call lcm_expand_query.",
-    "5. Synthesize the brief from evidence. Mark uncertainty when you only inferred something from summaries.",
+    "5. Record synthesis-relevant uncertainty when you only inferred something from summaries.",
     "",
     "Active summary context at generation time:",
     "<active_summary_context>",
     buildActiveSummaryManifest(params.summaries),
     "</active_summary_context>",
+    "",
+    "Return ONLY JSON with this shape:",
+    "{",
+    '  "evidenceMarkdown": "markdown evidence dossier for later synthesis",',
+    '  "citedSummaryIds": ["sum_xxx"],',
+    '  "expandedSummaryIds": ["sum_xxx"],',
+    '  "irrelevantSummaryIds": ["sum_xxx"],',
+    '  "expansionPrompts": [{"prompt": "question to ask later", "summaryIds": ["sum_xxx"]}],',
+    '  "confidenceNotes": ["what is expanded evidence vs inferred synthesis"],',
+    '  "truncated": false',
+    "}",
+    "",
+    "The evidenceMarkdown dossier must include:",
+    "- Focused Narrative Evidence: chronological, decision-rich source notes.",
+    "- Relevant Recent Context: the newest summaries that pertain to the focus prompt, with dates, current state, recency-sensitive decisions, and summary IDs.",
+    "- Current Working State Evidence: active branches, files, tests, commands, blockers, and next actions.",
+    "- Evidence Map with summary IDs: claims tied to summary IDs and expanded material.",
+    "- Expansion Guide with concrete future recall prompts: exact lcm_grep or lcm_expand follow-ups.",
+    "- Risks And Gaps: contradictions, stale assumptions, and unknowns.",
+    "- Likely Irrelevant Context: brief but explicit, with summary IDs when possible.",
+    "- Confidence Notes: separate expanded evidence from inferred synthesis.",
+  ].join("\n");
+}
+
+function buildFocusSynthesisTask(params: {
+  focusPrompt: string;
+  evidenceMarkdown: string;
+  targetTokens: number;
+}): string {
+  const minimumTokens = resolveFocusMinimumTokens(params.targetTokens);
+  // The synthesis turn receives a bounded evidence dossier so it can spend the
+  // turn writing the artifact instead of doing a broad open-ended search.
+  return [
+    "Synthesize the final Lossless focus context brief.",
+    "",
+    "Focus prompt:",
+    `<focus_prompt>${params.focusPrompt}</focus_prompt>`,
+    "",
+    `Target brief length: ${minimumTokens}-${params.targetTokens} tokens`,
+    `Minimum acceptable length: ${minimumTokens} tokens`,
+    "",
+    "Instructions:",
+    "- Use the evidence dossier below as the primary source material.",
+    "- Do not repeat the evidence dossier mechanically; turn it into a rich, task-shaped context brief.",
+    "- Use the available budget aggressively. Prefer dense, specific working memory over a short overview.",
+    "- Include concrete decisions, file paths, command names, issue IDs, summary IDs, constraints, rejected options, unresolved questions, and handoff details when relevant.",
+    "- Do not pad with generic prose. Add detail by preserving evidence, recording provenance, and spelling out useful operational context.",
+    "- Do NOT call lcm_expand_query from this delegated context.",
+    "",
+    "Evidence dossier:",
+    "<focus_evidence>",
+    params.evidenceMarkdown,
+    "</focus_evidence>",
     "",
     "Return ONLY JSON with this shape:",
     "{",
@@ -329,8 +458,8 @@ function buildFocusAgentParams(params: {
   childSessionKey: string;
   message: string;
 }): Record<string, unknown> {
-  // Keep provider/model and subagent-lane handling identical across initial and
-  // retry turns so length enforcement does not change runtime policy.
+  // Keep provider/model and subagent-lane handling identical across evidence,
+  // synthesis, and retry turns so runtime policy is stable for the full brief.
   const agentParams: Record<string, unknown> = {
     message: params.message,
     sessionKey: params.childSessionKey,
@@ -342,22 +471,28 @@ function buildFocusAgentParams(params: {
       taskSummary: "Generate a Lossless focus brief using lcm_grep, lcm_describe, and lcm_expand.",
     }),
   };
-  if (params.deps.config.expansionProvider.trim()) {
-    agentParams.provider = params.deps.config.expansionProvider.trim();
+  const summaryModel = params.deps.config.summaryModel.trim();
+  if (!summaryModel) {
+    return agentParams;
   }
-  if (params.deps.config.expansionModel.trim()) {
-    agentParams.model = params.deps.config.expansionModel.trim();
+  const summaryProvider = params.deps.config.summaryProvider.trim();
+  if (summaryProvider) {
+    agentParams.provider = summaryProvider;
   }
+  agentParams.model = summaryModel;
   return agentParams;
 }
 
-// Run one child-session turn and parse its JSON focus brief response.
-async function runFocusBriefAttempt(params: {
+// Run one child-session turn and parse its JSON response for the requested phase.
+async function runFocusAttempt<TParsed>(params: {
   deps: FocusBriefDeps;
   childSessionKey: string;
   message: string;
   timeoutMs: number;
-}): Promise<FocusBriefAttemptResult> {
+  phaseName: string;
+  parseReply: (rawReply: string | undefined) => TParsed;
+  estimateText: (parsed: TParsed) => string;
+}): Promise<FocusAttemptResult<TParsed>> {
   let runId = "";
   try {
     const response = (await params.deps.callGateway({
@@ -385,14 +520,14 @@ async function runFocusBriefAttempt(params: {
       return {
         status: "timeout",
         runId,
-        error: "delegated focus brief generation timed out",
+        error: `delegated ${params.phaseName} timed out`,
       };
     }
     if (status !== "ok") {
       return {
         status: "error",
         runId,
-        error: typeof wait?.error === "string" ? wait.error : "delegated focus brief generation failed",
+        error: typeof wait?.error === "string" ? wait.error : `delegated ${params.phaseName} failed`,
       };
     }
 
@@ -404,12 +539,12 @@ async function runFocusBriefAttempt(params: {
     const rawReply = params.deps.readLatestAssistantReply(
       Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
     );
-    const parsed = parseFocusBriefReply(rawReply);
+    const parsed = params.parseReply(rawReply);
     return {
       status: "ok",
       runId,
       parsed,
-      tokenCount: estimateTokens(parsed.briefMarkdown),
+      tokenCount: estimateTokens(params.estimateText(parsed)),
       rawReply,
     };
   } catch (err) {
@@ -467,7 +602,7 @@ export async function runDelegatedFocusBrief(params: {
   });
 
   try {
-    const message = buildFocusBriefTask({
+    const evidenceMessage = buildFocusEvidenceTask({
       focusPrompt: params.focusPrompt,
       conversationId: params.conversationId,
       summaries: params.summaries,
@@ -475,17 +610,20 @@ export async function runDelegatedFocusBrief(params: {
       requestId,
       originSessionKey: params.requesterSessionKey,
     });
-    let attempt = await runFocusBriefAttempt({
+    const evidenceAttempt = await runFocusAttempt({
       deps: params.deps,
       childSessionKey,
-      message,
+      message: evidenceMessage,
       timeoutMs,
+      phaseName: "focus evidence gathering",
+      parseReply: parseFocusEvidenceReply,
+      estimateText: (parsed) => parsed.evidenceMarkdown,
     });
-    runId = attempt.runId;
-    if (attempt.status === "timeout") {
+    runId = evidenceAttempt.runId;
+    if (evidenceAttempt.status === "timeout") {
       return {
         status: "timeout",
-        runId: attempt.runId,
+        runId: evidenceAttempt.runId,
         childSessionKey,
         briefMarkdown: "",
         citedSummaryIds: [],
@@ -496,13 +634,13 @@ export async function runDelegatedFocusBrief(params: {
         tokenCount: 0,
         targetTokens,
         truncated: true,
-        error: attempt.error,
+        error: evidenceAttempt.error,
       };
     }
-    if (attempt.status !== "ok") {
+    if (evidenceAttempt.status !== "ok") {
       return {
         status: "error",
-        runId: attempt.runId,
+        runId: evidenceAttempt.runId,
         childSessionKey,
         briefMarkdown: "",
         citedSummaryIds: [],
@@ -513,13 +651,46 @@ export async function runDelegatedFocusBrief(params: {
         tokenCount: 0,
         targetTokens,
         truncated: true,
+        error: evidenceAttempt.error,
+      };
+    }
+
+    let attempt = await runFocusAttempt({
+      deps: params.deps,
+      childSessionKey,
+      message: buildFocusSynthesisTask({
+        focusPrompt: params.focusPrompt,
+        evidenceMarkdown: evidenceAttempt.parsed.evidenceMarkdown,
+        targetTokens,
+      }),
+      timeoutMs,
+      phaseName: "focus brief synthesis",
+      parseReply: parseFocusBriefReply,
+      estimateText: (parsed) => parsed.briefMarkdown,
+    });
+    runId = attempt.runId;
+    if (attempt.status === "timeout" || attempt.status === "error") {
+      return {
+        status: attempt.status,
+        runId: attempt.runId,
+        childSessionKey,
+        briefMarkdown: "",
+        citedSummaryIds: evidenceAttempt.parsed.citedSummaryIds,
+        expandedSummaryIds: evidenceAttempt.parsed.expandedSummaryIds,
+        irrelevantSummaryIds: evidenceAttempt.parsed.irrelevantSummaryIds,
+        expansionPrompts: evidenceAttempt.parsed.expansionPrompts,
+        confidenceNotes: evidenceAttempt.parsed.confidenceNotes,
+        tokenCount: 0,
+        targetTokens,
+        truncated: true,
+        rawResultJson: evidenceAttempt.parsed.rawResultJson,
         error: attempt.error,
       };
     }
 
     let shortRetryError: string | undefined;
     if (attempt.tokenCount < minimumTokens) {
-      const retry = await runFocusBriefAttempt({
+      const retry = await runFocusAttempt({
         deps: params.deps,
         childSessionKey,
         message: buildFocusBriefExpansionTask({
@@ -529,6 +700,9 @@ export async function runDelegatedFocusBrief(params: {
           targetTokens,
         }),
         timeoutMs,
+        phaseName: "focus brief retry synthesis",
+        parseReply: parseFocusBriefReply,
+        estimateText: (parsed) => parsed.briefMarkdown,
       });
       if (retry.status === "ok") {
         attempt = retry;
@@ -540,19 +714,23 @@ export async function runDelegatedFocusBrief(params: {
 
     const parsed = attempt.parsed;
     const stillShort = attempt.tokenCount < minimumTokens;
+    const evidence = evidenceAttempt.parsed;
     return {
       status: "ok",
       runId: attempt.runId,
       childSessionKey,
       briefMarkdown: parsed.briefMarkdown,
-      citedSummaryIds: parsed.citedSummaryIds,
-      expandedSummaryIds: parsed.expandedSummaryIds,
-      irrelevantSummaryIds: parsed.irrelevantSummaryIds,
-      expansionPrompts: parsed.expansionPrompts,
-      confidenceNotes: parsed.confidenceNotes,
+      citedSummaryIds: normalizeStringArray([...evidence.citedSummaryIds, ...parsed.citedSummaryIds]),
+      expandedSummaryIds: normalizeStringArray([...evidence.expandedSummaryIds, ...parsed.expandedSummaryIds]),
+      irrelevantSummaryIds: normalizeStringArray([
+        ...evidence.irrelevantSummaryIds,
+        ...parsed.irrelevantSummaryIds,
+      ]),
+      expansionPrompts: mergeExpansionPrompts(evidence.expansionPrompts, parsed.expansionPrompts),
+      confidenceNotes: normalizeStringArray([...evidence.confidenceNotes, ...parsed.confidenceNotes]),
       tokenCount: attempt.tokenCount,
       targetTokens,
-      truncated: parsed.truncated,
+      truncated: evidence.truncated || parsed.truncated,
       rawReply: attempt.rawReply,
       rawResultJson: parsed.rawResultJson,
       error:
@@ -594,7 +772,9 @@ export async function runDelegatedFocusBrief(params: {
 
 export const __focusBriefTesting = {
   buildActiveSummaryManifest,
-  buildFocusBriefTask,
+  buildFocusEvidenceTask,
+  buildFocusSynthesisTask,
+  parseFocusEvidenceReply,
   parseFocusBriefReply,
   resolveFocusDelegationTimeoutMs,
   resolveFocusMinimumTokens,

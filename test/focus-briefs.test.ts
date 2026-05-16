@@ -4,9 +4,12 @@ import { __focusBriefTesting, runDelegatedFocusBrief } from "../src/focus-briefs
 import type { ActiveFocusSummaryRecord } from "../src/store/focus-brief-store.js";
 import type { LcmDependencies } from "../src/types.js";
 
-function createDeps(callGateway: LcmDependencies["callGateway"]): LcmDependencies {
+function createDeps(
+  callGateway: LcmDependencies["callGateway"],
+  configInput: Record<string, unknown> = {},
+): LcmDependencies {
   return {
-    config: resolveLcmConfig({}, { dbPath: ":memory:" }),
+    config: resolveLcmConfig({}, { dbPath: ":memory:", ...configInput }),
     complete: vi.fn(),
     callGateway,
     resolveModel: () => ({ provider: "test", model: "test-model" }),
@@ -51,9 +54,26 @@ function longBrief(label = "Alpha detail"): string {
   return `## Focused Narrative\n${`${label}. `.repeat(8_000)}`;
 }
 
+function evidenceReply(): string {
+  return JSON.stringify({
+    evidenceMarkdown: [
+      "## Evidence Dossier",
+      "- summary_focus_a contains alpha review state.",
+      "## Relevant Recent Context",
+      "- The newest alpha review summary is summary_focus_a.",
+    ].join("\n"),
+    citedSummaryIds: ["summary_focus_a"],
+    expandedSummaryIds: ["summary_focus_a"],
+    irrelevantSummaryIds: [],
+    expansionPrompts: [{ prompt: "Recover alpha review details.", summaryIds: ["summary_focus_a"] }],
+    confidenceNotes: ["Expanded summary_focus_a."],
+    truncated: false,
+  });
+}
+
 describe("focus brief generation", () => {
-  it("builds a prompt that requires direct delegated recall tools", () => {
-    const prompt = __focusBriefTesting.buildFocusBriefTask({
+  it("builds an evidence prompt that requires direct delegated recall tools", () => {
+    const prompt = __focusBriefTesting.buildFocusEvidenceTask({
       focusPrompt: "alpha review",
       conversationId: 42,
       summaries: activeSummaries,
@@ -66,13 +86,27 @@ describe("focus brief generation", () => {
     expect(prompt).toContain("Use lcm_describe");
     expect(prompt).toContain("Use lcm_expand directly");
     expect(prompt).toContain("do NOT call lcm_expand_query");
-    expect(prompt).toContain("Target brief length: 7200-12000 tokens");
-    expect(prompt).toContain("This is not a concise summary");
-    expect(prompt).toContain("Use the available budget aggressively");
+    expect(prompt).toContain("Target brief length for the later synthesis turn: 7200-12000 tokens");
+    expect(prompt).toContain("This is not the final brief");
+    expect(prompt).toContain("Prefer dense, specific working memory");
     expect(prompt).toContain("Relevant Recent Context");
     expect(prompt).toContain("newest summaries that pertain to the focus prompt");
     expect(prompt).toContain("summary_focus_a");
+    expect(prompt).toContain('"evidenceMarkdown"');
+  });
+
+  it("builds a synthesis prompt from the evidence dossier", () => {
+    const prompt = __focusBriefTesting.buildFocusSynthesisTask({
+      focusPrompt: "alpha review",
+      evidenceMarkdown: "## Evidence Dossier\n- summary_focus_a has alpha details.",
+      targetTokens: 12_000,
+    });
+
+    expect(prompt).toContain("Synthesize the final Lossless focus context brief");
+    expect(prompt).toContain("Target brief length: 7200-12000 tokens");
+    expect(prompt).toContain("Relevant Recent Context");
     expect(prompt).toContain('"briefMarkdown"');
+    expect(prompt).toContain("summary_focus_a has alpha details");
   });
 
   it("targets a much larger brief than the active summary token total", () => {
@@ -125,31 +159,169 @@ describe("focus brief generation", () => {
     ]);
   });
 
-  it("spawns, waits, reads, and cleans up a focus subagent", async () => {
+  it("parses evidence JSON replies from the delegated subagent", () => {
+    const parsed = __focusBriefTesting.parseFocusEvidenceReply(evidenceReply());
+
+    expect(parsed).toMatchObject({
+      evidenceMarkdown: expect.stringContaining("summary_focus_a"),
+      citedSummaryIds: ["summary_focus_a"],
+      expandedSummaryIds: ["summary_focus_a"],
+      truncated: false,
+    });
+    expect(parsed.expansionPrompts).toEqual([
+      { prompt: "Recover alpha review details.", summaryIds: ["summary_focus_a"] },
+    ]);
+  });
+
+  it("uses the configured summary model for focus subagent turns", async () => {
+    const agentParams: Array<Record<string, unknown>> = [];
+    let sessionReads = 0;
     const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
       if (request.method === "agent") {
-        expect(request.params?.sessionKey).toMatch(/^agent:main:subagent:/);
-        expect(request.params?.lane).toBe("subagent");
-        expect(String(request.params?.message)).toContain("alpha review");
-        return { runId: "focus-run-ok" };
+        agentParams.push(request.params ?? {});
+        return { runId: `focus-run-${agentParams.length}` };
       }
       if (request.method === "agent.wait") {
         return { status: "ok" };
       }
       if (request.method === "sessions.get") {
+        sessionReads += 1;
         return {
           messages: [
             {
               role: "assistant",
-              content: JSON.stringify({
-                briefMarkdown: longBrief(),
-                citedSummaryIds: ["summary_focus_a"],
-                expandedSummaryIds: [],
-                irrelevantSummaryIds: [],
-                expansionPrompts: [],
-                confidenceNotes: ["direct context"],
-                truncated: false,
-              }),
+              content:
+                sessionReads === 1
+                  ? evidenceReply()
+                  : JSON.stringify({
+                      briefMarkdown: longBrief(),
+                      citedSummaryIds: ["summary_focus_a"],
+                      expandedSummaryIds: ["summary_focus_a"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["direct context"],
+                      truncated: false,
+                    }),
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      throw new Error(`unexpected gateway method ${request.method}`);
+    });
+
+    const result = await runDelegatedFocusBrief({
+      deps: createDeps(callGateway as LcmDependencies["callGateway"], {
+        summaryProvider: "openai",
+        summaryModel: "gpt-5.5",
+        expansionProvider: "openrouter",
+        expansionModel: "anthropic/claude-haiku-4-5",
+      }),
+      requesterSessionKey: "agent:main:telegram:direct:origin",
+      conversationId: 42,
+      focusPrompt: "alpha review",
+      summaries: activeSummaries,
+    });
+
+    expect(result.status).toBe("ok");
+    expect(agentParams).toHaveLength(2);
+    for (const params of agentParams) {
+      expect(params.provider).toBe("openai");
+      expect(params.model).toBe("gpt-5.5");
+    }
+  });
+
+  it("does not override the conversation model when no summary model is configured", async () => {
+    const agentParams: Array<Record<string, unknown>> = [];
+    let sessionReads = 0;
+    const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
+      if (request.method === "agent") {
+        agentParams.push(request.params ?? {});
+        return { runId: `focus-run-${agentParams.length}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionReads += 1;
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content:
+                sessionReads === 1
+                  ? evidenceReply()
+                  : JSON.stringify({
+                      briefMarkdown: longBrief(),
+                      citedSummaryIds: ["summary_focus_a"],
+                      expandedSummaryIds: ["summary_focus_a"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["direct context"],
+                      truncated: false,
+                    }),
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      throw new Error(`unexpected gateway method ${request.method}`);
+    });
+
+    const result = await runDelegatedFocusBrief({
+      deps: createDeps(callGateway as LcmDependencies["callGateway"], {
+        summaryProvider: "openai",
+        expansionProvider: "openrouter",
+        expansionModel: "anthropic/claude-haiku-4-5",
+      }),
+      requesterSessionKey: "agent:main:telegram:direct:origin",
+      conversationId: 42,
+      focusPrompt: "alpha review",
+      summaries: activeSummaries,
+    });
+
+    expect(result.status).toBe("ok");
+    expect(agentParams).toHaveLength(2);
+    for (const params of agentParams) {
+      expect(params).not.toHaveProperty("provider");
+      expect(params).not.toHaveProperty("model");
+    }
+  });
+
+  it("spawns evidence and synthesis turns, waits, reads, and cleans up a focus subagent", async () => {
+    let sessionReads = 0;
+    const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
+      if (request.method === "agent") {
+        expect(request.params?.sessionKey).toMatch(/^agent:main:subagent:/);
+        expect(request.params?.lane).toBe("subagent");
+        expect(String(request.params?.message)).toContain("alpha review");
+        return { runId: `focus-run-${callGateway.mock.calls.filter((call) => call[0].method === "agent").length}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionReads += 1;
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content:
+                sessionReads === 1
+                  ? evidenceReply()
+                  : JSON.stringify({
+                      briefMarkdown: longBrief(),
+                      citedSummaryIds: ["summary_focus_a"],
+                      expandedSummaryIds: ["summary_focus_a"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["direct context"],
+                      truncated: false,
+                    }),
             },
           ],
         };
@@ -170,13 +342,17 @@ describe("focus brief generation", () => {
 
     expect(result).toMatchObject({
       status: "ok",
-      runId: "focus-run-ok",
+      runId: "focus-run-2",
       citedSummaryIds: ["summary_focus_a"],
       truncated: false,
     });
     expect(result.briefMarkdown).toContain("Alpha detail");
+    expect(result.expandedSummaryIds).toEqual(["summary_focus_a"]);
     expect(result.tokenCount).toBeGreaterThanOrEqual(7200);
     expect(callGateway.mock.calls.map((call) => call[0].method)).toEqual([
+      "agent",
+      "agent.wait",
+      "sessions.get",
       "agent",
       "agent.wait",
       "sessions.get",
@@ -184,13 +360,13 @@ describe("focus brief generation", () => {
     ]);
   });
 
-  it("retries in the same child session when the first brief is too short", async () => {
+  it("retries synthesis in the same child session when the first brief is too short", async () => {
     let agentRuns = 0;
     let sessionReads = 0;
     const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
       if (request.method === "agent") {
         agentRuns += 1;
-        if (agentRuns === 2) {
+        if (agentRuns === 3) {
           expect(String(request.params?.message)).toContain("previous focus brief was too short");
           expect(String(request.params?.message)).toContain("Required minimum length: 7200 tokens");
         }
@@ -206,16 +382,28 @@ describe("focus brief generation", () => {
             {
               role: "assistant",
               content: JSON.stringify({
-                briefMarkdown:
-                  sessionReads === 1
-                    ? "## Focused Narrative\nToo short."
-                    : longBrief("Expanded alpha detail"),
-                citedSummaryIds: ["summary_focus_a"],
-                expandedSummaryIds: sessionReads === 1 ? [] : ["summary_focus_a"],
-                irrelevantSummaryIds: [],
-                expansionPrompts: [],
-                confidenceNotes: ["direct context"],
-                truncated: false,
+                ...(sessionReads === 1
+                  ? {
+                      evidenceMarkdown: "## Evidence Dossier\n- summary_focus_a has alpha details.",
+                      citedSummaryIds: ["summary_focus_a"],
+                      expandedSummaryIds: ["summary_focus_a"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["direct context"],
+                      truncated: false,
+                    }
+                  : {
+                      briefMarkdown:
+                        sessionReads === 2
+                          ? "## Focused Narrative\nToo short."
+                          : longBrief("Expanded alpha detail"),
+                      citedSummaryIds: ["summary_focus_a"],
+                      expandedSummaryIds: ["summary_focus_a"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["direct context"],
+                      truncated: false,
+                    }),
               }),
             },
           ],
@@ -236,11 +424,14 @@ describe("focus brief generation", () => {
     });
 
     expect(result.status).toBe("ok");
-    expect(result.runId).toBe("focus-run-2");
+    expect(result.runId).toBe("focus-run-3");
     expect(result.briefMarkdown).toContain("Expanded alpha detail");
     expect(result.expandedSummaryIds).toEqual(["summary_focus_a"]);
     expect(result.tokenCount).toBeGreaterThanOrEqual(7200);
     expect(callGateway.mock.calls.map((call) => call[0].method)).toEqual([
+      "agent",
+      "agent.wait",
+      "sessions.get",
       "agent",
       "agent.wait",
       "sessions.get",

@@ -308,35 +308,61 @@ describe("lcm command", () => {
       summaryId: "focus_parent",
     });
 
+    let agentRuns = 0;
+    let sessionReads = 0;
     const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
       if (request.method === "agent") {
-        expect(String(request.params?.message)).toContain("Generate a Lossless focus context brief.");
-        expect(String(request.params?.message)).toContain("lcm_grep");
-        expect(String(request.params?.message)).toContain("do NOT call lcm_expand_query");
-        return { runId: "focus-run-1" };
+        agentRuns += 1;
+        if (agentRuns === 1) {
+          expect(String(request.params?.message)).toContain("Gather Lossless focus evidence.");
+          expect(String(request.params?.message)).toContain("lcm_grep");
+          expect(String(request.params?.message)).toContain("do NOT call lcm_expand_query");
+        } else {
+          expect(String(request.params?.message)).toContain("Synthesize the final Lossless focus context brief.");
+          expect(String(request.params?.message)).toContain("Evidence dossier");
+        }
+        return { runId: `focus-run-${agentRuns}` };
       }
       if (request.method === "agent.wait") {
         return { status: "ok" };
       }
       if (request.method === "sessions.get") {
+        sessionReads += 1;
         return {
           messages: [
             {
-	              role: "assistant",
-	              content: JSON.stringify({
-	                briefMarkdown: `## Focused Narrative\n${"Alpha auth is ready for review. ".repeat(8_000)}`,
-	                citedSummaryIds: ["focus_parent"],
-                expandedSummaryIds: ["focus_leaf"],
-                irrelevantSummaryIds: ["unrelated_summary"],
-                expansionPrompts: [
-                  {
-                    prompt: "Expand the alpha auth implementation details.",
-                    summaryIds: ["focus_leaf"],
-                  },
-                ],
-                confidenceNotes: ["focus_parent was in active context"],
-                truncated: false,
-              }),
+              role: "assistant",
+              content:
+                sessionReads === 1
+                  ? JSON.stringify({
+                      evidenceMarkdown:
+                        "## Evidence Dossier\n- focus_parent cites alpha auth review state.\n- focus_leaf expands implementation details.",
+                      citedSummaryIds: ["focus_parent"],
+                      expandedSummaryIds: ["focus_leaf"],
+                      irrelevantSummaryIds: ["unrelated_summary"],
+                      expansionPrompts: [
+                        {
+                          prompt: "Expand the alpha auth implementation details.",
+                          summaryIds: ["focus_leaf"],
+                        },
+                      ],
+                      confidenceNotes: ["focus_parent was in active context"],
+                      truncated: false,
+                    })
+                  : JSON.stringify({
+                      briefMarkdown: `## Focused Narrative\n${"Alpha auth is ready for review. ".repeat(8_000)}`,
+                      citedSummaryIds: ["focus_parent"],
+                      expandedSummaryIds: ["focus_leaf"],
+                      irrelevantSummaryIds: ["unrelated_summary"],
+                      expansionPrompts: [
+                        {
+                          prompt: "Expand the alpha auth implementation details.",
+                          summaryIds: ["focus_leaf"],
+                        },
+                      ],
+                      confidenceNotes: ["focus_parent was in active context"],
+                      truncated: false,
+                    }),
             },
           ],
         };
@@ -392,6 +418,9 @@ describe("lcm command", () => {
       "agent",
       "agent.wait",
       "sessions.get",
+      "agent",
+      "agent.wait",
+      "sessions.get",
       "sessions.delete",
     ]);
     const brief = fixture.db
@@ -406,7 +435,7 @@ describe("lcm command", () => {
     expect(brief.prompt).toBe("alpha auth review state");
     expect(brief.status).toBe("draft");
     expect(brief.content).toContain("Alpha auth is ready for review.");
-    expect(brief.generator_run_id).toBe("focus-run-1");
+    expect(brief.generator_run_id).toBe("focus-run-2");
     const sources = fixture.db
       .prepare(`SELECT summary_id, role FROM focus_brief_sources ORDER BY role, summary_id`)
       .all() as Array<{ summary_id: string; role: string }>;
