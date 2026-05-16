@@ -69,6 +69,8 @@ describe("focus brief generation", () => {
     expect(prompt).toContain("Target brief length: 7200-12000 tokens");
     expect(prompt).toContain("This is not a concise summary");
     expect(prompt).toContain("Use the available budget aggressively");
+    expect(prompt).toContain("Relevant Recent Context");
+    expect(prompt).toContain("newest summaries that pertain to the focus prompt");
     expect(prompt).toContain("summary_focus_a");
     expect(prompt).toContain('"briefMarkdown"');
   });
