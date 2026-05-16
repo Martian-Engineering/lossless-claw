@@ -679,6 +679,102 @@ describe("lcm plugin registration", () => {
     );
   });
 
+  it("prefers runtime config current() over deprecated loadConfig()", () => {
+    const { api, infoLog } = buildApi({});
+    const current = vi.fn(() => ({
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            enabled: true,
+            config: {
+              summaryModel: "openai-codex/gpt-5.5",
+            },
+          },
+        },
+      },
+    }));
+    const loadConfig = vi.fn(() => {
+      throw new Error("deprecated loadConfig should not be called");
+    });
+    (api.runtime as unknown as {
+      config: {
+        current: typeof current;
+        loadConfig: typeof loadConfig;
+      };
+    }).config = { current, loadConfig };
+    api.config = {} as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(current).toHaveBeenCalled();
+    expect(loadConfig).not.toHaveBeenCalled();
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Compaction summarization model: openai-codex/gpt-5.5 (override)",
+    );
+  });
+
+  it("preserves registration config fallback when live runtime config is unavailable for startup scans", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const sessionStorePath = join(
+      tmpdir(),
+      `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
+    );
+    const sessionId = `alpha-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const sessionKey = `agent:alpha:chat:${Math.random().toString(16).slice(2)}`;
+    const sessionFile = join(tmpdir(), `${sessionId}.jsonl`);
+
+    writeFileSync(
+      sessionStorePath,
+      `${JSON.stringify({
+        [sessionKey]: {
+          sessionId,
+          sessionFile,
+        },
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
+    const { api, getFactory } = buildApi({ enabled: true, dbPath });
+    api.config = {
+      session: {
+        store: sessionStorePath,
+      },
+      agents: {
+        list: [{ id: "alpha", enabled: true }],
+      },
+    } as OpenClawPluginApi["config"];
+    attachSessionStoreApi(api, sessionStorePath);
+    delete (api.runtime as unknown as { config?: unknown }).config;
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+    const engine = factory!() as {
+      deps?: {
+        listStartupSessionFileCandidates: () => Promise<Array<{
+          sessionId: string;
+          sessionKey: string;
+          sessionFile: string;
+          agentId: string;
+          storePath: string;
+        }>>;
+      };
+    };
+
+    await expect(engine.deps?.listStartupSessionFileCandidates()).resolves.toEqual([
+      {
+        sessionId,
+        sessionKey,
+        sessionFile,
+        agentId: "alpha",
+        storePath: sessionStorePath,
+      },
+    ]);
+    rmSync(sessionStorePath, { force: true });
+  });
+
   it("uses runtime OpenClaw defaults when api.pluginConfig is ready before api.config", () => {
     const { api, getFactory, infoLog } = buildApi(
       {
