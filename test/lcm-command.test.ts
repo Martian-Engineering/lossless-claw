@@ -322,10 +322,10 @@ describe("lcm command", () => {
         return {
           messages: [
             {
-              role: "assistant",
-              content: JSON.stringify({
-                briefMarkdown: "## Focused Narrative\nAlpha auth is ready for review.",
-                citedSummaryIds: ["focus_parent"],
+	              role: "assistant",
+	              content: JSON.stringify({
+	                briefMarkdown: `## Focused Narrative\n${"Alpha auth is ready for review. ".repeat(8_000)}`,
+	                citedSummaryIds: ["focus_parent"],
                 expandedSummaryIds: ["focus_leaf"],
                 irrelevantSummaryIds: ["unrelated_summary"],
                 expansionPrompts: [
