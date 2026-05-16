@@ -49,6 +49,12 @@ export type SummarySubtreeNodeRecord = SummaryRecord & {
   childCount: number;
 };
 
+/** Message sequence range directly linked to a summary. */
+export type SummaryMessageSeqRangeRecord = {
+  minSeq: number | null;
+  maxSeq: number | null;
+};
+
 export type MessageLeafSummaryLinkRecord = {
   messageId: number;
   summaryId: string;
@@ -491,6 +497,23 @@ export class SummaryStore {
       )
       .get(summaryId) as unknown as SummaryRow | undefined;
     return row ? toSummaryRecord(row) : null;
+  }
+
+  /** Return the min/max source message sequence directly linked to a summary. */
+  async getSummaryMessageSeqRange(summaryId: string): Promise<SummaryMessageSeqRangeRecord> {
+    const row = this.db
+      .prepare(
+        `SELECT MIN(m.seq) AS min_seq,
+                MAX(m.seq) AS max_seq
+         FROM summary_messages sm
+         JOIN messages m ON m.message_id = sm.message_id
+         WHERE sm.summary_id = ?`,
+      )
+      .get(summaryId) as unknown as { min_seq: number | null; max_seq: number | null } | undefined;
+    return {
+      minSeq: row?.min_seq ?? null,
+      maxSeq: row?.max_seq ?? null,
+    };
   }
 
   async getSummariesByConversation(conversationId: number): Promise<SummaryRecord[]> {

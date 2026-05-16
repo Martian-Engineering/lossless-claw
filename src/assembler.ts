@@ -6,12 +6,14 @@ import type {
   MessagePartRecord,
   MessageRole,
 } from "./store/conversation-store.js";
+import type { FocusBriefRecord, FocusBriefStore } from "./store/focus-brief-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import { formatToolOutputReference } from "./large-files.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssemblySegment = "evictable" | "freshTail";
+type FocusBriefLookup = Pick<FocusBriefStore, "getActiveFocusBrief">;
 
 export interface AssemblyOverflowContributor {
   /** Context item ordinal in the persisted conversation window. */
@@ -910,6 +912,14 @@ function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 
+function escapeXmlAttribute(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 /** Format a Date for XML attributes in the agent's timezone. */
 function formatDateForAttribute(date: Date, timezone?: string): string {
   const tz = timezone ?? "UTC";
@@ -976,6 +986,30 @@ async function formatSummaryContent(
   return lines.join("\n");
 }
 
+function formatFocusBriefContent(brief: FocusBriefRecord, timezone?: string): string {
+  const attributes = [
+    `id="${escapeXmlAttribute(brief.briefId)}"`,
+    `prompt="${escapeXmlAttribute(brief.prompt)}"`,
+    `token_count="${brief.tokenCount}"`,
+    `target_tokens="${brief.targetTokens}"`,
+    `created_at="${formatDateForAttribute(brief.createdAt, timezone)}"`,
+  ];
+  if (brief.coveredLatestAt) {
+    attributes.push(`covered_latest_at="${formatDateForAttribute(brief.coveredLatestAt, timezone)}"`);
+  }
+  if (brief.coveredMessageSeq != null) {
+    attributes.push(`covered_message_seq="${brief.coveredMessageSeq}"`);
+  }
+
+  return [
+    `<focus_brief ${attributes.join(" ")}>`,
+    "  <content>",
+    brief.content,
+    "  </content>",
+    "</focus_brief>",
+  ].join("\n");
+}
+
 // ── Resolved context item (after fetching underlying message/summary) ────────
 
 interface ResolvedItem {
@@ -997,6 +1031,10 @@ interface ResolvedItem {
   sourceRole?: MessageRole;
   /** Source summary record when this item resolves a summary. */
   summary?: SummaryRecord;
+  /** Directly linked source-message max seq for summary watermark checks. */
+  summaryMaxSourceSeq?: number | null;
+  /** True when this is a synthetic active focus brief overlay. */
+  isFocusBrief?: boolean;
   /**
    * v4.2 §B (Option C) — externalized `file_xxx` id for this row's
    * tool-result payload, set by the migration tool. Non-null marks the
@@ -1226,6 +1264,7 @@ export class ContextAssembler {
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
     private timezone?: string,
+    private focusBriefStore?: FocusBriefLookup,
   ) {}
 
   /**
@@ -1254,8 +1293,10 @@ export class ContextAssembler {
       };
     }
 
-    // Step 2: Resolve each context item into a ResolvedItem
-    const resolved = await this.resolveItems(contextItems);
+    // Step 2: Resolve each context item into a ResolvedItem, then apply any
+    // active focus overlay without mutating canonical context_items rows.
+    const canonicalResolved = await this.resolveItems(contextItems);
+    const resolved = await this.applyFocusOverlay(conversationId, canonicalResolved);
 
     // Count stats from the full (pre-truncation) set
     let rawMessageCount = 0;
@@ -1263,7 +1304,7 @@ export class ContextAssembler {
     for (const item of resolved) {
       if (item.isMessage) {
         rawMessageCount++;
-      } else {
+      } else if (!item.isFocusBrief) {
         summaryCount++;
       }
     }
@@ -1288,8 +1329,9 @@ export class ContextAssembler {
         allToolResultOrdinalsById.set(toolResultId, [item.ordinal]);
       }
     }
-    const baseFreshTail = resolved.filter((item) => item.ordinal >= freshTailOrdinal);
-    const evictable = resolved.filter((item) => item.ordinal < freshTailOrdinal);
+    const focusBriefItems = resolved.filter((item) => item.isFocusBrief);
+    const baseFreshTail = resolved.filter((item) => !item.isFocusBrief && item.ordinal >= freshTailOrdinal);
+    const evictable = resolved.filter((item) => !item.isFocusBrief && item.ordinal < freshTailOrdinal);
     const freshTail = baseFreshTail;
 
     // v4.2 §B — stub-tier substitution. Replace evictable tool-result
@@ -1302,7 +1344,11 @@ export class ContextAssembler {
     }
 
     // Step 4: Budget-aware selection
-    // First, compute the token cost of the fresh tail (always included).
+    // First, compute the token cost of protected focus overlays and fresh tail.
+    let focusBriefTokens = 0;
+    for (const item of focusBriefItems) {
+      focusBriefTokens += item.tokens;
+    }
     let tailTokens = 0;
     for (const item of freshTail) {
       tailTokens += item.tokens;
@@ -1311,7 +1357,7 @@ export class ContextAssembler {
     // Fill remaining budget from evictable items, oldest first.
     // If the fresh tail alone exceeds the budget we still include it
     // (we never drop fresh items), but we skip all evictable items.
-    const remainingBudget = Math.max(0, tokenBudget - tailTokens);
+    const remainingBudget = Math.max(0, tokenBudget - tailTokens - focusBriefTokens);
     const selected: ResolvedItem[] = [];
     let evictableTokens = 0;
 
@@ -1373,10 +1419,13 @@ export class ContextAssembler {
       evictableTokens = accum;
     }
 
-    // Append fresh tail after the evictable prefix
+    // Append protected focus overlays and fresh tail, then restore context
+    // order. Focus overlays are always included while active.
+    selected.push(...focusBriefItems);
     selected.push(...freshTail);
+    selected.sort((a, b) => a.ordinal - b.ordinal || (a.isFocusBrief ? -1 : b.isFocusBrief ? 1 : 0));
 
-    const estimatedTokens = evictableTokens + tailTokens;
+    const estimatedTokens = evictableTokens + tailTokens + focusBriefTokens;
     const overflowDiagnostics = buildOverflowDiagnostics({
       resolved,
       selected,
@@ -1476,6 +1525,68 @@ export class ContextAssembler {
   }
 
   // ── Private helpers ──────────────────────────────────────────────────────
+
+  private isSummaryCoveredByFocus(item: ResolvedItem, brief: FocusBriefRecord): boolean {
+    if (!item.summary) {
+      return false;
+    }
+    if (brief.coveredMessageSeq != null && item.summaryMaxSourceSeq != null) {
+      return item.summaryMaxSourceSeq <= brief.coveredMessageSeq;
+    }
+    if (brief.coveredLatestAt && item.summary.latestAt) {
+      return item.summary.latestAt.getTime() <= brief.coveredLatestAt.getTime();
+    }
+    return false;
+  }
+
+  private async applyFocusOverlay(
+    conversationId: number,
+    resolved: ResolvedItem[],
+  ): Promise<ResolvedItem[]> {
+    const brief = await this.focusBriefStore?.getActiveFocusBrief(conversationId);
+    if (!brief?.content.trim()) {
+      return resolved;
+    }
+
+    const covered = new Set<ResolvedItem>();
+    let firstCoveredOrdinal = Infinity;
+    for (const item of resolved) {
+      if (!this.isSummaryCoveredByFocus(item, brief)) {
+        continue;
+      }
+      covered.add(item);
+      firstCoveredOrdinal = Math.min(firstCoveredOrdinal, item.ordinal);
+    }
+    if (covered.size === 0 || firstCoveredOrdinal === Infinity) {
+      return resolved;
+    }
+
+    const content = formatFocusBriefContent(brief, this.timezone);
+    const focusItem: ResolvedItem = {
+      ordinal: firstCoveredOrdinal,
+      message: { role: "user" as const, content } as AgentMessage,
+      tokens: estimateTokens(content),
+      isMessage: false,
+      isFocusBrief: true,
+      text: brief.content,
+    };
+    const output: ResolvedItem[] = [];
+    let inserted = false;
+    for (const item of resolved) {
+      if (covered.has(item)) {
+        continue;
+      }
+      if (!inserted && item.ordinal > firstCoveredOrdinal) {
+        output.push(focusItem);
+        inserted = true;
+      }
+      output.push(item);
+    }
+    if (!inserted) {
+      output.push(focusItem);
+    }
+    return output;
+  }
 
   /**
    * Resolve a list of context items into ResolvedItems by fetching the
@@ -1624,6 +1735,10 @@ export class ContextAssembler {
 
     const content = await formatSummaryContent(summary, this.summaryStore, this.timezone);
     const tokens = estimateTokens(content);
+    const seqRange =
+      typeof this.summaryStore.getSummaryMessageSeqRange === "function"
+        ? await this.summaryStore.getSummaryMessageSeqRange(summary.summaryId)
+        : { maxSeq: null };
 
     // Cast: summaries are synthetic user messages without full AgentMessage metadata
     return {
@@ -1633,6 +1748,7 @@ export class ContextAssembler {
       isMessage: false,
       text: summary.content,
       summary,
+      summaryMaxSourceSeq: seqRange.maxSeq,
     };
   }
 }

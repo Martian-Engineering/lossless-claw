@@ -49,7 +49,7 @@ export type ActiveFocusSummaryRecord = {
   content: string;
 };
 
-/** Input for creating a focus brief draft or failed generation record. */
+/** Input for creating a focus brief generation record. */
 export type CreateFocusBriefInput = {
   conversationId: number;
   sessionKey?: string | null;
@@ -70,6 +70,7 @@ export type CreateFocusBriefInput = {
     ordinal?: number | null;
     role: FocusBriefSourceRole;
   }>;
+  /** Supersede any current focus row after a new successful focus is ready. */
   supersedeCurrentDrafts?: boolean;
 };
 
@@ -244,7 +245,7 @@ export class FocusBriefStore {
                  superseded_at = datetime('now'),
                  updated_at = datetime('now')
              WHERE conversation_id = ?
-               AND status = 'draft'`,
+               AND status IN ('draft', 'active')`,
           )
           .run(input.conversationId);
       }
@@ -365,6 +366,55 @@ export class FocusBriefStore {
       )
       .get(conversationId) as FocusBriefRow | undefined;
     return row ? toFocusBriefRecord(row) : null;
+  }
+
+  /** Load the current active focus overlay for a conversation, if one exists. */
+  async getActiveFocusBrief(conversationId: number): Promise<FocusBriefRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT
+           brief_id,
+           conversation_id,
+           session_key,
+           prompt,
+           content,
+           status,
+           token_count,
+           target_tokens,
+           covered_latest_at,
+           covered_message_seq,
+           source_context_hash,
+           generator_run_id,
+           generator_session_key,
+           raw_result_json,
+           error,
+           created_at,
+           updated_at,
+           superseded_at
+         FROM focus_briefs
+         WHERE conversation_id = ?
+           AND status = 'active'
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1`,
+      )
+      .get(conversationId) as FocusBriefRow | undefined;
+    return row ? toFocusBriefRecord(row) : null;
+  }
+
+  /** Deactivate active focus overlays for a conversation without deleting history. */
+  async deactivateActiveFocusBriefs(conversationId: number): Promise<number> {
+    const result = await this.withTransaction(() =>
+      this.db
+        .prepare(
+          `UPDATE focus_briefs
+           SET status = 'inactive',
+               updated_at = datetime('now')
+           WHERE conversation_id = ?
+             AND status = 'active'`,
+        )
+        .run(conversationId),
+    );
+    return Number(result.changes ?? 0);
   }
 
   /** List recent focus briefs for a conversation, newest first. */

@@ -135,6 +135,30 @@ describe("FocusBriefStore", () => {
       expect.objectContaining({ summaryId: "focus_store_leaf", role: "expanded" }),
     ]);
 
+    const activeBrief = await focusStore.createFocusBrief({
+      conversationId: conversation.conversationId,
+      prompt: "activate the focus",
+      content: "Active focus brief.",
+      status: "active",
+      tokenCount: 6,
+      targetTokens: 12,
+      sourceContextHash,
+      sources: [{ summaryId: "focus_store_parent", ordinal: 0, role: "active_input" }],
+      supersedeCurrentDrafts: true,
+    });
+    expect(await focusStore.getActiveFocusBrief(conversation.conversationId)).toMatchObject({
+      briefId: activeBrief.briefId,
+      status: "active",
+    });
+    expect(await focusStore.getFocusBrief(secondBrief.briefId)).toMatchObject({
+      status: "superseded",
+    });
+    expect(await focusStore.deactivateActiveFocusBriefs(conversation.conversationId)).toBe(1);
+    expect(await focusStore.getActiveFocusBrief(conversation.conversationId)).toBeNull();
+    expect(await focusStore.getFocusBrief(activeBrief.briefId)).toMatchObject({
+      status: "inactive",
+    });
+
     const contextItems = db
       .prepare(`SELECT item_type, summary_id FROM context_items WHERE conversation_id = ? ORDER BY ordinal`)
       .all(conversation.conversationId);

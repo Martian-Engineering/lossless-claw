@@ -20,7 +20,7 @@ Use command words rather than flags so the interface works well on mobile:
 /lossless unfocus
 ```
 
-- `/lossless focus <prompt>` generates or refocuses around the prompt.
+- `/lossless focus <prompt>` generates or refocuses around the prompt and, once overlays are enabled, activates the resulting brief.
 - `/lossless focus` reports active/draft focus state, prompt, preview, and diagnostics.
 - `/lossless unfocus` deactivates the active focus overlay once overlays exist.
 
@@ -82,7 +82,7 @@ used as later overlay inputs. Add TUI visibility for generated focus briefs.
 
 - Add migrations for focus brief tables.
 - Add a store for focus brief creation, lookup, superseding, and listing.
-- Update `/lossless focus <prompt>` to persist generated briefs as drafts.
+- Update `/lossless focus <prompt>` to persist generated briefs as drafts in the pre-overlay phase.
 - Update `/lossless focus` to show latest draft/active state, prompt, preview,
   source count, cited IDs, generation status, and stale/error diagnostics.
 - Add `/lossless unfocus` as a no-op or draft-state deactivation command until
@@ -175,6 +175,8 @@ Make active focus mode affect assembled context.
 - Preserve fresh tail and post-focus delta.
 - Keep canonical `context_items` unchanged.
 - Ensure compaction never reads focus brief rows as source material.
+- Promote successful `/lossless focus <prompt>` generations to active overlays.
+- Make `/lossless unfocus` deactivate active overlays without deleting brief history.
 
 ### Acceptance Criteria
 
@@ -189,8 +191,7 @@ Complete the operational lifecycle.
 
 ### Scope
 
-- Make `/lossless unfocus` deactivate the active overlay.
-- Make refocus atomic: failed new generation must not destroy the old active
+- Harden refocus atomicity: failed new generation must not destroy the old active
   focus.
 - Show delta since focus: message count, summary count, and estimated tokens.
 - Warn when active focus is stale, truncated, or generated from an obsolete

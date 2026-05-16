@@ -584,15 +584,15 @@ function buildHelpText(error?: string): string {
       ),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} focus <prompt>`),
-        "Generate a draft focus brief with a delegated recall sub-agent.",
+        "Generate an active focus brief with a delegated recall sub-agent.",
       ),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} focus`),
-        "Show the latest focus brief draft for the current conversation.",
+        "Show the latest focus brief for the current conversation.",
       ),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} unfocus`),
-        "Deactivate focus mode once active overlays are available.",
+        "Deactivate the active focus overlay without deleting focus history.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
@@ -1218,7 +1218,7 @@ async function buildFocusStatusText(params: {
       buildSection("🎯 Focus", [
         buildStatLine("status", "none"),
         buildStatLine("usage", formatCommand(`${VISIBLE_COMMAND} focus <prompt>`)),
-        buildStatLine("behavior", "generates a persisted draft brief without changing active context"),
+        buildStatLine("behavior", "generates an active focus brief overlay"),
       ]),
     );
     return lines.join("\n");
@@ -1248,7 +1248,7 @@ async function buildFocusStatusText(params: {
   return lines.join("\n");
 }
 
-// Generate a draft focus brief through a delegated subagent and persist the result.
+// Generate an active focus brief through a delegated subagent and persist the result.
 async function buildFocusGenerateText(params: {
   ctx: PluginCommandContext;
   db: DatabaseSync;
@@ -1348,7 +1348,7 @@ async function buildFocusGenerateText(params: {
     sessionKey: requesterSessionKey,
     prompt: params.prompt,
     content: ok ? generation.briefMarkdown : "",
-    status: ok ? "draft" : "failed",
+    status: ok ? "active" : "failed",
     tokenCount: generation.tokenCount,
     targetTokens: generation.targetTokens,
     coveredLatestAt: watermark.coveredLatestAt,
@@ -1376,7 +1376,7 @@ async function buildFocusGenerateText(params: {
       buildStatLine("source context hash", sourceContextHash.slice(0, 16)),
     ]),
     "",
-    buildSection("🎯 Focus draft", [
+    buildSection("🎯 Focus brief", [
       buildStatLine("brief id", formatCommand(brief.briefId)),
       buildStatLine("status", brief.status),
       buildStatLine("prompt", JSON.stringify(formatFocusPreview(params.prompt, 240))),
@@ -1404,7 +1404,7 @@ async function buildFocusGenerateText(params: {
   return lines.join("\n");
 }
 
-// Report unfocus behavior before active overlay assembly is implemented.
+// Deactivate the current focus overlay without deleting focus history.
 async function buildUnfocusText(params: {
   ctx: PluginCommandContext;
   db: DatabaseSync;
@@ -1425,10 +1425,12 @@ async function buildUnfocusText(params: {
     );
     return lines.join("\n");
   }
+  const store = new FocusBriefStore(params.db);
+  const deactivated = await store.deactivateActiveFocusBriefs(current.stats.conversationId);
   lines.push(
     buildSection("🎯 Focus", [
-      buildStatLine("status", "unchanged"),
-      buildStatLine("reason", "Active focus overlays are not implemented yet; draft briefs do not affect context."),
+      buildStatLine("status", deactivated > 0 ? "inactive" : "none active"),
+      buildStatLine("deactivated briefs", formatNumber(deactivated)),
     ]),
   );
   return lines.join("\n");

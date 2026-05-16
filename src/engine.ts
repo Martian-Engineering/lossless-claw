@@ -65,6 +65,7 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
+import { FocusBriefStore } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies, StartupSessionFileCandidate } from "./types.js";
@@ -1806,6 +1807,7 @@ export class LcmContextEngine implements ContextEngine {
 
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
+  private focusBriefStore: FocusBriefStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
   private assembler: ContextAssembler;
@@ -1912,6 +1914,7 @@ export class LcmContextEngine implements ContextEngine {
       fts5Available: this.fts5Available,
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    this.focusBriefStore = new FocusBriefStore(this.db);
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
 
@@ -1945,6 +1948,7 @@ export class LcmContextEngine implements ContextEngine {
       this.conversationStore,
       this.summaryStore,
       this.config.timezone,
+      this.focusBriefStore,
     );
 
     const compactionConfig: CompactionConfig = {
@@ -7595,6 +7599,10 @@ export class LcmContextEngine implements ContextEngine {
 
   getSummaryStore(): SummaryStore {
     return this.summaryStore;
+  }
+
+  getFocusBriefStore(): FocusBriefStore {
+    return this.focusBriefStore;
   }
 
   getCompactionTelemetryStore(): CompactionTelemetryStore {

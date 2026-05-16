@@ -24,6 +24,7 @@ export type {
   ContextItemRecord,
   SummarySearchInput,
   SummarySearchResult,
+  SummaryMessageSeqRangeRecord,
   CreateLargeFileInput,
   LargeFileRecord,
   UpsertConversationBootstrapStateInput,

@@ -250,7 +250,7 @@ describe("lcm command", () => {
     expect(result.text).toContain("usage: `/lossless focus <prompt>`");
   });
 
-  it("generates and persists a draft focus brief through a delegated subagent", async () => {
+  it("generates and persists an active focus brief through a delegated subagent", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -411,8 +411,8 @@ describe("lcm command", () => {
       }),
     );
 
-    expect(result.text).toContain("Focus draft");
-    expect(result.text).toContain("status: draft");
+    expect(result.text).toContain("Focus brief");
+    expect(result.text).toContain("status: active");
     expect(result.text).toContain("Alpha auth is ready for review.");
     expect(callGateway.mock.calls.map((call) => call[0].method)).toEqual([
       "agent",
@@ -433,7 +433,7 @@ describe("lcm command", () => {
       generator_run_id: string;
     };
     expect(brief.prompt).toBe("alpha auth review state");
-    expect(brief.status).toBe("draft");
+    expect(brief.status).toBe("active");
     expect(brief.content).toContain("Alpha auth is ready for review.");
     expect(brief.generator_run_id).toBe("focus-run-2");
     const sources = fixture.db
@@ -454,6 +454,19 @@ describe("lcm command", () => {
     expect(status.text).toContain(`brief id: \`${brief.brief_id}\``);
     expect(status.text).toContain("source summaries: 1");
     expect(status.text).toContain("cited summaries: focus_parent");
+
+    const unfocus = await command.handler(
+      createCommandContext("unfocus", {
+        sessionKey,
+      }),
+    );
+    expect(unfocus.text).toContain("status: inactive");
+    expect(unfocus.text).toContain("deactivated briefs: 1");
+    expect(
+      fixture.db
+        .prepare(`SELECT status FROM focus_briefs WHERE brief_id = ?`)
+        .get(brief.brief_id),
+    ).toEqual({ status: "inactive" });
   });
 
   it("reports deferred compaction maintenance state in status output", async () => {
