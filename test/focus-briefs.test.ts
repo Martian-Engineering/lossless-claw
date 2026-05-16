@@ -360,16 +360,12 @@ describe("focus brief generation", () => {
     ]);
   });
 
-  it("retries synthesis in the same child session when the first brief is too short", async () => {
+  it("does not retry synthesis when the first brief is too short", async () => {
     let agentRuns = 0;
     let sessionReads = 0;
     const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
       if (request.method === "agent") {
         agentRuns += 1;
-        if (agentRuns === 3) {
-          expect(String(request.params?.message)).toContain("previous focus brief was too short");
-          expect(String(request.params?.message)).toContain("Required minimum length: 7200 tokens");
-        }
         return { runId: `focus-run-${agentRuns}` };
       }
       if (request.method === "agent.wait") {
@@ -393,10 +389,7 @@ describe("focus brief generation", () => {
                       truncated: false,
                     }
                   : {
-                      briefMarkdown:
-                        sessionReads === 2
-                          ? "## Focused Narrative\nToo short."
-                          : longBrief("Expanded alpha detail"),
+                      briefMarkdown: "## Focused Narrative\nToo short.",
                       citedSummaryIds: ["summary_focus_a"],
                       expandedSummaryIds: ["summary_focus_a"],
                       irrelevantSummaryIds: [],
@@ -424,14 +417,12 @@ describe("focus brief generation", () => {
     });
 
     expect(result.status).toBe("ok");
-    expect(result.runId).toBe("focus-run-3");
-    expect(result.briefMarkdown).toContain("Expanded alpha detail");
+    expect(result.runId).toBe("focus-run-2");
+    expect(result.briefMarkdown).toContain("Too short.");
     expect(result.expandedSummaryIds).toEqual(["summary_focus_a"]);
-    expect(result.tokenCount).toBeGreaterThanOrEqual(7200);
+    expect(result.tokenCount).toBeLessThan(7200);
+    expect(result.error).toBe("Focus brief remained below the 7200-token minimum.");
     expect(callGateway.mock.calls.map((call) => call[0].method)).toEqual([
-      "agent",
-      "agent.wait",
-      "sessions.get",
       "agent",
       "agent.wait",
       "sessions.get",

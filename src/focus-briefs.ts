@@ -420,46 +420,13 @@ function buildFocusSynthesisTask(params: {
   ].join("\n");
 }
 
-function buildFocusBriefExpansionTask(params: {
-  focusPrompt: string;
-  previousBrief: string;
-  tokenCount: number;
-  targetTokens: number;
-}): string {
-  const minimumTokens = resolveFocusMinimumTokens(params.targetTokens);
-  // Retry in the same child session so the agent can reuse its earlier recall
-  // work while being forced to produce a denser final JSON payload.
-  return [
-    "The previous focus brief was too short. Expand it substantially.",
-    "",
-    "Focus prompt:",
-    `<focus_prompt>${params.focusPrompt}</focus_prompt>`,
-    "",
-    `Previous estimated length: ${params.tokenCount} tokens`,
-    `Required minimum length: ${minimumTokens} tokens`,
-    `Target length: ${params.targetTokens} tokens`,
-    "",
-    "Instructions:",
-    "- Preserve the useful material from the previous brief, but produce a new complete final brief.",
-    "- Use more lcm_grep, lcm_describe, and lcm_expand calls before finalizing.",
-    "- Add concrete details, provenance, edge cases, unresolved questions, commands, file paths, issue IDs, and summary IDs.",
-    "- Do NOT call lcm_expand_query from this delegated context.",
-    "- Return ONLY the same JSON shape requested previously.",
-    "",
-    "Previous brief:",
-    "<previous_brief>",
-    params.previousBrief,
-    "</previous_brief>",
-  ].join("\n");
-}
-
 function buildFocusAgentParams(params: {
   deps: FocusBriefDeps;
   childSessionKey: string;
   message: string;
 }): Record<string, unknown> {
-  // Keep provider/model and subagent-lane handling identical across evidence,
-  // synthesis, and retry turns so runtime policy is stable for the full brief.
+  // Keep provider/model and subagent-lane handling identical across evidence
+  // and synthesis turns so runtime policy is stable for the full brief.
   const agentParams: Record<string, unknown> = {
     message: params.message,
     sessionKey: params.childSessionKey,
@@ -508,8 +475,8 @@ async function runFocusAttempt<TParsed>(params: {
       typeof response?.runId === "string" && response.runId ? response.runId : crypto.randomUUID();
 
     // Wait for the subagent turn, then read the latest assistant response from
-    // the session. Reusing the session key for retries keeps the previous brief
-    // and recall work visible to the child.
+    // the session. Reusing the session key lets synthesis see the evidence
+    // gathering turn and its recalled material.
     const wait = (await params.deps.callGateway({
       method: "agent.wait",
       params: { runId, timeoutMs: params.timeoutMs },
@@ -655,7 +622,7 @@ export async function runDelegatedFocusBrief(params: {
       };
     }
 
-    let attempt = await runFocusAttempt({
+    const attempt = await runFocusAttempt({
       deps: params.deps,
       childSessionKey,
       message: buildFocusSynthesisTask({
@@ -688,30 +655,6 @@ export async function runDelegatedFocusBrief(params: {
       };
     }
 
-    let shortRetryError: string | undefined;
-    if (attempt.tokenCount < minimumTokens) {
-      const retry = await runFocusAttempt({
-        deps: params.deps,
-        childSessionKey,
-        message: buildFocusBriefExpansionTask({
-          focusPrompt: params.focusPrompt,
-          previousBrief: attempt.parsed.briefMarkdown,
-          tokenCount: attempt.tokenCount,
-          targetTokens,
-        }),
-        timeoutMs,
-        phaseName: "focus brief retry synthesis",
-        parseReply: parseFocusBriefReply,
-        estimateText: (parsed) => parsed.briefMarkdown,
-      });
-      if (retry.status === "ok") {
-        attempt = retry;
-      } else {
-        shortRetryError = `Short-output retry failed: ${retry.error}`;
-      }
-      runId = retry.runId;
-    }
-
     const parsed = attempt.parsed;
     const stillShort = attempt.tokenCount < minimumTokens;
     const evidence = evidenceAttempt.parsed;
@@ -733,11 +676,7 @@ export async function runDelegatedFocusBrief(params: {
       truncated: evidence.truncated || parsed.truncated,
       rawReply: attempt.rawReply,
       rawResultJson: parsed.rawResultJson,
-      error:
-        shortRetryError ??
-        (stillShort
-          ? `Focus brief remained below the ${minimumTokens}-token minimum after retry.`
-          : undefined),
+      error: stillShort ? `Focus brief remained below the ${minimumTokens}-token minimum.` : undefined,
     };
   } catch (err) {
     return {
