@@ -727,6 +727,12 @@ function buildRuntimeModelRef(provider: string | undefined, model: string): stri
   if (!modelId) {
     return undefined;
   }
+  const slash = modelId.indexOf("/");
+  if (slash > 0 && slash < modelId.length - 1) {
+    const directProvider = modelId.slice(0, slash).trim();
+    const directModel = modelId.slice(slash + 1).trim();
+    return directProvider && directModel ? `${directProvider}/${directModel}` : undefined;
+  }
   const providerId = provider?.trim();
   return providerId ? `${providerId}/${modelId}` : modelId;
 }
