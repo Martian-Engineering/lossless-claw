@@ -1,5 +1,11 @@
 # @martian-engineering/lossless-claw
 
+## 0.11.1
+
+### Patch Changes
+
+- [#709](https://github.com/Martian-Engineering/lossless-claw/pull/709) [`78697ce`](https://github.com/Martian-Engineering/lossless-claw/commit/78697ced6be0922f7173cfb3fe0d6638416b9f95) Thanks [@jalehman](https://github.com/jalehman)! - Keep generated focus briefs usable when they are shorter than the target length, surfacing a warning instead of failing the command after generation.
+
 ## 0.11.0
 
 ### Minor Changes
