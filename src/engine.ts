@@ -3713,17 +3713,9 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
-  /** Image references emitted by `externalizeImage` come in two label
-   *  shapes:
-   *    - `[<Role> image: ...]` from `interceptNativeImageBlocks` (label is
-   *      "User image" / "Assistant image" / "System image" / "Tool image")
-   *    - `[Image: ...]` from `interceptPureBase64Image` for the user/system
-   *      pure-base64 fast path (label is just "Image", no second "image"
-   *      word)
-   *  The regex must match both — a previous shape required the literal
-   *  word "image:" after the label, which silently dropped the
-   *  `[Image: ...]` case and let those references fall through into raw-
-   *  payload externalization. */
+  /** Image references emitted by `externalizeImage` can use either role-specific
+   *  labels (`User image`, `Assistant image`, `System image`, `Tool image`) or
+   *  the generic `Image` label used by pure-base64 user/system content. */
   private static readonly IMAGE_REFERENCE_REGEX =
     /^\[(?:(?:User|System|Tool|Assistant) image|Image): [^\]]*LCM file: file_[a-f0-9]{16}\]$/;
   private static readonly IMAGE_REFERENCE_REGEX_GLOBAL =
@@ -4534,16 +4526,10 @@ export class LcmContextEngine implements ContextEngine {
     if (params.stored.role === "tool") {
       return null;
     }
-    // Skip when this message has already been raw-payload-externalized OR
-    // when its stored content is — by itself — *just* an externalized
-    // reference. The previous loose substring check
-    // (`isExternalizedReferenceContent` matching anywhere via
-    // `includes("LCM file: file_")`) tripped on mixed content like
-    // `"...intro... [User image: file_xyz] ... long body text..."`,
-    // blocking legitimate raw-payload externalization for messages that
-    // embed an image reference alongside other oversized content. The
-    // tightened helper requires the WHOLE trimmed content to be a single
-    // externalized-reference shape.
+    // Skip when this message has already been raw-payload-externalized, or
+    // when its whole stored content is just an externalized reference.
+    // Mixed content that embeds an image reference alongside other oversized
+    // content remains eligible for raw-payload externalization.
     const externalizedFlag = (
       params.message as { rawPayloadExternalized?: unknown }
     ).rawPayloadExternalized;
