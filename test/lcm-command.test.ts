@@ -664,7 +664,7 @@ describe("lcm command", () => {
                       truncated: false,
                     })
                   : JSON.stringify({
-                      briefMarkdown: "Existing baseline plus refocus_delta update.",
+                      briefMarkdown: `Existing baseline plus refocus_delta update. ${"Merged relevant delta. ".repeat(8_000)}`,
                       citedSummaryIds: ["refocus_delta"],
                       expandedSummaryIds: ["refocus_delta"],
                       irrelevantSummaryIds: [],
@@ -745,7 +745,7 @@ describe("lcm command", () => {
       expect.objectContaining({
         prompt: "agent configuration",
         status: "active",
-        content: "Existing baseline plus refocus_delta update.",
+        content: expect.stringContaining("Existing baseline plus refocus_delta update."),
       }),
     ]);
     const sources = fixture.db

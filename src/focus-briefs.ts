@@ -113,6 +113,32 @@ function normalizeStringArray(value: unknown): string[] {
   return output;
 }
 
+function collectFocusFailureText(value: unknown, output: string[], depth = 0): void {
+  if (value == null || depth > 3) {
+    return;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed) {
+      output.push(trimmed);
+    }
+    return;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    for (const key of ["message", "error", "reason", "details", "response", "cause", "code"]) {
+      collectFocusFailureText(record[key], output, depth + 1);
+    }
+  }
+}
+
+function formatFocusGatewayFailure(value: unknown, fallback: string): string {
+  const parts: string[] = [];
+  collectFocusFailureText(value, parts);
+  const message = parts.join(" ").replace(/\s+/g, " ").trim();
+  return message || fallback;
+}
+
 function normalizeExpansionPrompts(value: unknown): FocusBriefExpansionPrompt[] {
   if (!Array.isArray(value)) {
     return [];
@@ -240,6 +266,22 @@ function parseFocusEvidenceReply(rawReply: string | undefined): ParsedFocusEvide
   }
 
   throw new Error("Focus evidence subagent did not return valid JSON.");
+}
+
+function buildPersistedFocusResultJson(
+  parsed: ParsedFocusBriefReply,
+  truncated: boolean,
+): string | undefined {
+  if (!parsed.rawResultJson || !truncated) {
+    return parsed.rawResultJson;
+  }
+  try {
+    const raw = JSON.parse(parsed.rawResultJson) as Record<string, unknown>;
+    raw.truncated = true;
+    return JSON.stringify(raw);
+  } catch {
+    return parsed.rawResultJson;
+  }
 }
 
 function truncatePreview(value: string, maxChars: number): string {
@@ -590,9 +632,18 @@ async function runFocusAttempt<TParsed>(params: {
         message: params.message,
       }),
       timeoutMs: 10_000,
-    })) as { runId?: string };
-    runId =
-      typeof response?.runId === "string" && response.runId ? response.runId : crypto.randomUUID();
+    })) as { runId?: unknown; error?: unknown };
+    runId = typeof response?.runId === "string" ? response.runId.trim() : "";
+    if (!runId) {
+      return {
+        status: "error",
+        runId,
+        error: formatFocusGatewayFailure(
+          response?.error ?? response,
+          `delegated ${params.phaseName} did not return a runId`,
+        ),
+      };
+    }
 
     // Wait for the subagent turn, then read the latest assistant response from
     // the session. Reusing the session key lets synthesis see the evidence
@@ -637,7 +688,7 @@ async function runFocusAttempt<TParsed>(params: {
   } catch (err) {
     return {
       status: "error",
-      runId: runId || crypto.randomUUID(),
+      runId,
       error: err instanceof Error ? err.message : String(err),
     };
   }
@@ -780,8 +831,9 @@ async function runDelegatedFocusWorkflow(params: {
     const parsed = attempt.parsed;
     const stillShort = attempt.tokenCount < minimumTokens;
     const evidence = evidenceAttempt.parsed;
+    const truncated = evidence.truncated || parsed.truncated;
     return {
-      status: "ok",
+      status: stillShort ? "error" : "ok",
       runId: attempt.runId,
       childSessionKey,
       briefMarkdown: parsed.briefMarkdown,
@@ -795,9 +847,9 @@ async function runDelegatedFocusWorkflow(params: {
       confidenceNotes: normalizeStringArray([...evidence.confidenceNotes, ...parsed.confidenceNotes]),
       tokenCount: attempt.tokenCount,
       targetTokens,
-      truncated: evidence.truncated || parsed.truncated,
+      truncated,
       rawReply: attempt.rawReply,
-      rawResultJson: parsed.rawResultJson,
+      rawResultJson: buildPersistedFocusResultJson(parsed, truncated),
       error: stillShort ? `Focus brief remained below the ${minimumTokens}-token minimum.` : undefined,
     };
   } catch (err) {
@@ -820,7 +872,9 @@ async function runDelegatedFocusWorkflow(params: {
     try {
       await params.deps.callGateway({
         method: "sessions.delete",
-        params: { key: childSessionKey, deleteTranscript: true },
+        // Keep the transcript available through generatorSessionKey; focus/refocus
+        // is not an explicit user request to remove generated recall/evidence data.
+        params: { key: childSessionKey, deleteTranscript: false },
         timeoutMs: 10_000,
       });
     } catch {

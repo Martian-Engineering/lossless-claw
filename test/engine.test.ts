@@ -5575,6 +5575,83 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(afterSummary.contextProjection?.epoch).not.toBe(first.contextProjection?.epoch);
   });
 
+  it("changes projection epochs when active focus state changes", async () => {
+    const engine = createEngine();
+    const sessionId = "session-projection-focus";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "covered source message" } as AgentMessage,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const [sourceMessage] = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId, { limit: 1 });
+    expect(sourceMessage).toBeDefined();
+
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_projection_focus",
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Covered summary projection content",
+      tokenCount: 8,
+      latestAt: new Date("2026-05-16T00:00:00.000Z"),
+      descendantCount: 0,
+    });
+    await engine
+      .getSummaryStore()
+      .linkSummaryToMessages("sum_projection_focus", [sourceMessage!.messageId]);
+    await engine
+      .getSummaryStore()
+      .replaceContextRangeWithSummary({
+        conversationId: conversation!.conversationId,
+        startOrdinal: 0,
+        endOrdinal: 0,
+        summaryId: "sum_projection_focus",
+      });
+
+    const baseline = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    const focusStore = engine.getFocusBriefStore();
+    const watermark = await focusStore.getCoveredWatermark(conversation!.conversationId);
+    const activeBrief = await focusStore.createFocusBrief({
+      conversationId: conversation!.conversationId,
+      prompt: "focus projection",
+      content: "Active focus brief content.",
+      status: "active",
+      tokenCount: 5,
+      targetTokens: 12,
+      coveredLatestAt: watermark.coveredLatestAt,
+      coveredMessageSeq: watermark.coveredMessageSeq,
+      sourceContextHash: "projection-focus-test",
+      sources: [{ summaryId: "sum_projection_focus", ordinal: 0, role: "active_input" }],
+      supersedeCurrentDrafts: true,
+    });
+
+    const focused = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    expect(focused.contextProjection?.epoch).not.toBe(baseline.contextProjection?.epoch);
+
+    await focusStore.deactivateActiveFocusBriefs(conversation!.conversationId);
+    const unfocused = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    expect(unfocused.contextProjection?.epoch).toBe(baseline.contextProjection?.epoch);
+    expect(await focusStore.getFocusBrief(activeBrief.briefId)).toMatchObject({
+      status: "inactive",
+    });
+  });
+
   it("respects token budget in assembled output", async () => {
     const engine = createEngine();
     const sessionId = "session-budget";

@@ -207,4 +207,80 @@ describe("focus brief assembly overlay", () => {
     expect(joined).toContain("Focus brief survives DAG reshaping.");
     expect(joined).not.toContain("Reshaped covered summary content that should be masked.");
   });
+
+  it("masks covered condensed summaries without direct message links", async () => {
+    const db = createTestDb();
+    dbs.add(db);
+    const conversationStore = new ConversationStore(db, { fts5Available: false });
+    const summaryStore = new SummaryStore(db, { fts5Available: false });
+    const focusStore = new FocusBriefStore(db);
+    const assembler = new ContextAssembler(conversationStore, summaryStore, "UTC", focusStore);
+
+    const conversation = await conversationStore.createConversation({
+      sessionId: "focus-overlay-condensed-session",
+    });
+    const [sourceMessage] = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "Covered source inside condensed summary.",
+        tokenCount: 5,
+      },
+    ]);
+    await summaryStore.insertSummary({
+      summaryId: "condensed_leaf_summary",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Leaf summary content.",
+      tokenCount: 5,
+      latestAt: new Date("2026-03-01T00:00:00.000Z"),
+      sourceMessageTokenCount: 5,
+    });
+    await summaryStore.linkSummaryToMessages("condensed_leaf_summary", [sourceMessage.messageId]);
+    await summaryStore.insertSummary({
+      summaryId: "covered_condensed_summary",
+      conversationId: conversation.conversationId,
+      kind: "condensed",
+      depth: 1,
+      content: "Condensed summary content that should be masked.",
+      tokenCount: 8,
+      latestAt: null,
+      sourceMessageTokenCount: 0,
+    });
+    await summaryStore.linkSummaryToParents("covered_condensed_summary", ["condensed_leaf_summary"]);
+    await summaryStore.replaceContextRangeWithSummary({
+      conversationId: conversation.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 0,
+      summaryId: "covered_condensed_summary",
+    });
+    const watermark = await focusStore.getCoveredWatermark(conversation.conversationId);
+
+    await focusStore.createFocusBrief({
+      conversationId: conversation.conversationId,
+      prompt: "focus condensed summary",
+      content: "Focus brief masks condensed summary.",
+      status: "active",
+      tokenCount: 6,
+      targetTokens: 12,
+      coveredLatestAt: watermark.coveredLatestAt,
+      coveredMessageSeq: watermark.coveredMessageSeq,
+      sourceContextHash: "condensed-test",
+      sources: [{ summaryId: "covered_condensed_summary", ordinal: 0, role: "active_input" }],
+      supersedeCurrentDrafts: true,
+    });
+
+    const result = await assembler.assemble({
+      conversationId: conversation.conversationId,
+      tokenBudget: 10_000,
+      freshTailCount: 8,
+    });
+    const joined = result.messages.map((message) => String(message.content)).join("\n");
+
+    expect(watermark.coveredMessageSeq).toBe(0);
+    expect(joined).toContain("Focus brief masks condensed summary.");
+    expect(joined).not.toContain("Condensed summary content that should be masked.");
+  });
 });

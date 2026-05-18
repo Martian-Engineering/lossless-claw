@@ -364,6 +364,10 @@ describe("focus brief generation", () => {
       "sessions.get",
       "sessions.delete",
     ]);
+    expect(callGateway.mock.calls.at(-1)?.[0].params).toMatchObject({
+      key: result.childSessionKey,
+      deleteTranscript: false,
+    });
   });
 
   it("does not retry synthesis when the first brief is too short", async () => {
@@ -422,7 +426,7 @@ describe("focus brief generation", () => {
       summaries: activeSummaries,
     });
 
-    expect(result.status).toBe("ok");
+    expect(result.status).toBe("error");
     expect(result.runId).toBe("focus-run-2");
     expect(result.briefMarkdown).toContain("Too short.");
     expect(result.expandedSummaryIds).toEqual(["summary_focus_a"]);
@@ -437,5 +441,93 @@ describe("focus brief generation", () => {
       "sessions.get",
       "sessions.delete",
     ]);
+  });
+
+  it("fails immediately when focus subagent launch returns no run id", async () => {
+    const callGateway = vi.fn(async (request: { method: string }) => {
+      if (request.method === "agent") {
+        return { error: { message: "subagent launch failed" } };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      throw new Error(`unexpected gateway method ${request.method}`);
+    });
+
+    const result = await runDelegatedFocusBrief({
+      deps: createDeps(callGateway as LcmDependencies["callGateway"]),
+      requesterSessionKey: "agent:main:telegram:direct:origin",
+      conversationId: 42,
+      focusPrompt: "alpha review",
+      summaries: activeSummaries,
+    });
+
+    expect(result.status).toBe("error");
+    expect(result.runId).toBe("");
+    expect(result.error).toBe("subagent launch failed");
+    expect(callGateway.mock.calls.map((call) => call[0].method)).toEqual([
+      "agent",
+      "sessions.delete",
+    ]);
+  });
+
+  it("preserves evidence-phase truncation in persisted result JSON", async () => {
+    let sessionReads = 0;
+    const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
+      if (request.method === "agent") {
+        return { runId: `focus-run-${callGateway.mock.calls.filter((call) => call[0].method === "agent").length}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionReads += 1;
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content:
+                sessionReads === 1
+                  ? JSON.stringify({
+                      evidenceMarkdown: "## Evidence Dossier\n- summary_focus_a has alpha details.",
+                      citedSummaryIds: ["summary_focus_a"],
+                      expandedSummaryIds: ["summary_focus_a"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["evidence was truncated"],
+                      truncated: true,
+                    })
+                  : JSON.stringify({
+                      briefMarkdown: longBrief(),
+                      citedSummaryIds: ["summary_focus_a"],
+                      expandedSummaryIds: ["summary_focus_a"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["direct context"],
+                      truncated: false,
+                    }),
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      throw new Error(`unexpected gateway method ${request.method}`);
+    });
+
+    const result = await runDelegatedFocusBrief({
+      deps: createDeps(callGateway as LcmDependencies["callGateway"]),
+      requesterSessionKey: "agent:main:telegram:direct:origin",
+      conversationId: 42,
+      focusPrompt: "alpha review",
+      summaries: activeSummaries,
+    });
+
+    expect(result.status).toBe("ok");
+    expect(result.truncated).toBe(true);
+    expect(JSON.parse(result.rawResultJson ?? "{}")).toMatchObject({
+      truncated: true,
+    });
   });
 });

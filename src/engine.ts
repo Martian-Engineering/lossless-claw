@@ -65,7 +65,7 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
-import { FocusBriefStore } from "./store/focus-brief-store.js";
+import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies, StartupSessionFileCandidate } from "./types.js";
@@ -163,6 +163,7 @@ type DeferredCompactionDebtDrainParams = {
 function buildContextEngineProjectionEpoch(
   conversationId: number,
   contextItems: ContextItemRecord[],
+  activeFocusBrief?: FocusBriefRecord | null,
 ): string {
   const hash = createHash("sha256");
   hash.update(CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION);
@@ -181,12 +182,32 @@ function buildContextEngineProjectionEpoch(
     hash.update(":");
     hash.update(item.summaryId);
   }
+  const focusProjectionKey = buildFocusProjectionKey(activeFocusBrief);
+  if (focusProjectionKey) {
+    hash.update("\0focus:");
+    hash.update(focusProjectionKey);
+  }
 
   return [
     CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION,
     conversationId,
     hash.digest("hex").slice(0, 32),
   ].join(":");
+}
+
+function buildFocusProjectionKey(brief?: FocusBriefRecord | null): string | null {
+  if (!brief) {
+    return null;
+  }
+  const hash = createHash("sha256");
+  hash.update(brief.briefId);
+  hash.update("\0");
+  hash.update(brief.updatedAt.toISOString());
+  hash.update("\0");
+  hash.update(brief.prompt);
+  hash.update("\0");
+  hash.update(brief.content);
+  return hash.digest("hex").slice(0, 32);
 }
 
 function checkpointIsPastTranscriptEof(
@@ -6096,9 +6117,13 @@ export class LcmContextEngine implements ContextEngine {
       const stubStatsLog = assembled.debug?.stubStats
         ? ` stubbed=${assembled.debug.stubStats.stubbedCount} tokensSaved=${assembled.debug.stubStats.tokensSaved}`
         : "";
+      const activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
+        conversation.conversationId,
+      );
       const contextProjectionEpoch = buildContextEngineProjectionEpoch(
         conversation.conversationId,
         contextItems,
+        activeFocusBrief,
       );
       const summaryContextItems = contextItems.filter((item) => item.itemType === "summary").length;
       this.deps.log.info(
