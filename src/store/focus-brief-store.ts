@@ -56,6 +56,7 @@ export type ActiveFocusSummaryRecord = {
   tokenCount: number;
   createdAt: string;
   latestAt: string | null;
+  maxSourceSeq: number | null;
   content: string;
 };
 
@@ -121,6 +122,7 @@ type ActiveFocusSummaryRow = {
   token_count: number;
   created_at: string;
   latest_at: string | null;
+  max_source_seq: number | null;
   content: string;
 };
 
@@ -171,6 +173,7 @@ function toActiveFocusSummaryRecord(row: ActiveFocusSummaryRow): ActiveFocusSumm
     tokenCount: row.token_count,
     createdAt: row.created_at,
     latestAt: row.latest_at,
+    maxSourceSeq: row.max_source_seq,
     content: row.content,
   };
 }
@@ -227,11 +230,15 @@ export class FocusBriefStore {
            COALESCE(s.token_count, 0) AS token_count,
            COALESCE(s.created_at, '') AS created_at,
            s.latest_at,
+           MAX(m.seq) AS max_source_seq,
            COALESCE(s.content, '') AS content
          FROM context_items ci
          JOIN summaries s ON s.summary_id = ci.summary_id
+         LEFT JOIN summary_messages sm ON sm.summary_id = s.summary_id
+         LEFT JOIN messages m ON m.message_id = sm.message_id
          WHERE ci.conversation_id = ?
            AND ci.item_type = 'summary'
+         GROUP BY ci.ordinal, s.summary_id
          ORDER BY ci.ordinal`,
       )
       .all(conversationId) as ActiveFocusSummaryRow[];

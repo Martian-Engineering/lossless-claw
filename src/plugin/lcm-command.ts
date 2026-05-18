@@ -4,7 +4,7 @@ import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
 import type { RotateSessionStorageWithBackupResult } from "../engine.js";
-import { runDelegatedFocusBrief } from "../focus-briefs.js";
+import { runDelegatedFocusBrief, runDelegatedRefocusBrief } from "../focus-briefs.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
 import type {
@@ -78,6 +78,7 @@ type ParsedLcmCommand =
   | { kind: "rotate" }
   | { kind: "focus_status" }
   | { kind: "focus_generate"; prompt: string }
+  | { kind: "refocus" }
   | { kind: "unfocus" }
   | { kind: "doctor"; apply: boolean }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
@@ -234,6 +235,9 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     const prompt = focusMatch[1]?.trim() ?? "";
     return prompt ? { kind: "focus_generate", prompt } : { kind: "focus_status" };
   }
+  if (/^refocus$/i.test(raw)) {
+    return { kind: "refocus" };
+  }
   if (/^unfocus$/i.test(raw)) {
     return { kind: "unfocus" };
   }
@@ -288,7 +292,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, focus, unfocus, backup, rotate, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, rotate, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -695,6 +699,10 @@ function buildHelpText(error?: string): string {
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} focus`),
         "Show the latest focus brief for the current conversation.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} refocus`),
+        "Refresh the active focus brief from post-focus summary deltas.",
       ),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} unfocus`),
@@ -1637,6 +1645,255 @@ async function buildFocusGenerateText(params: {
   return lines.join("\n");
 }
 
+function isSummaryAfterFocusWatermark(
+  summary: { latestAt: string | null; createdAt: string; maxSourceSeq?: number | null },
+  brief: { coveredMessageSeq: number | null; coveredLatestAt: Date | null },
+): boolean {
+  if (brief.coveredMessageSeq != null && summary.maxSourceSeq != null) {
+    return summary.maxSourceSeq > brief.coveredMessageSeq;
+  }
+  if (!brief.coveredLatestAt) {
+    return true;
+  }
+  const timestamp = summary.latestAt ?? summary.createdAt;
+  const parsed = Date.parse(timestamp);
+  if (!Number.isFinite(parsed)) {
+    return true;
+  }
+  return parsed > brief.coveredLatestAt.getTime();
+}
+
+// Refresh the active focus brief by merging relevant post-focus summary deltas
+// into the existing brief. The old active brief is superseded only after a new
+// active replacement is generated and persisted successfully.
+async function buildRefocusText(params: {
+  ctx: PluginCommandContext;
+  db: DatabaseSync;
+  config: LcmConfig;
+  deps?: LcmDependencies;
+  getLcm?: () => Promise<RuntimeCommandEngine>;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🎯 Lossless Claw Refocus",
+    "",
+  ];
+  if (!params.deps || !params.getLcm) {
+    lines.push(
+      buildSection("🛠️ Refocus", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine(
+          "reason",
+          "Refocus requires runtime dependencies for pre-refocus compaction and delegated subagents.",
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const requesterSessionKey = normalizeIdentity(params.ctx.sessionKey);
+  if (!requesterSessionKey) {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", "OpenClaw must expose the active session key for Lossless Claw to refocus."),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  let current = await resolveCurrentConversation({ ctx: params.ctx, db: params.db });
+  if (current.kind === "unavailable") {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", current.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const store = new FocusBriefStore(params.db);
+  const active = await store.getActiveFocusBrief(current.stats.conversationId);
+  if (!active?.content.trim()) {
+    lines.push(
+      buildSection("🎯 Refocus", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", "The current conversation has no active focus brief to refresh."),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const preRefocusCompaction = await runFocusLifecycleCompaction({
+    ctx: params.ctx,
+    deps: params.deps,
+    getLcm: params.getLcm,
+    config: params.config,
+    current,
+    sessionKey: requesterSessionKey,
+  });
+  if (preRefocusCompaction.status !== "ok") {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
+        buildStatLine("session key", formatCommand(truncateMiddle(requesterSessionKey, 44))),
+      ]),
+      "",
+      buildSection("🧹 Pre-refocus compaction", [
+        buildStatLine("status", preRefocusCompaction.status),
+        buildStatLine("reason", preRefocusCompaction.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  current = await resolveCurrentConversation({ ctx: params.ctx, db: params.db });
+  if (current.kind === "unavailable") {
+    lines.push(
+      buildSection("🧹 Pre-refocus compaction", [
+        buildStatLine("status", "completed"),
+        buildStatLine("result", preRefocusCompaction.result.reason ?? "done"),
+      ]),
+      "",
+      buildSection("📍 Current conversation", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", current.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const activeSummaries = await store.getActiveContextSummaries(current.stats.conversationId);
+  const deltaSummaries = activeSummaries.filter((summary) =>
+    isSummaryAfterFocusWatermark(summary, active),
+  );
+  if (deltaSummaries.length === 0) {
+    lines.push(
+      buildSection("📍 Current conversation", [
+        buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
+        buildStatLine("session key", formatCommand(truncateMiddle(requesterSessionKey, 44))),
+      ]),
+      "",
+      buildSection("🧹 Pre-refocus compaction", [
+        buildStatLine("status", "completed"),
+        buildStatLine("compacted", formatBoolean(preRefocusCompaction.result.compacted)),
+        buildStatLine("result", preRefocusCompaction.result.reason ?? "done"),
+      ]),
+      "",
+      buildSection("🎯 Refocus", [
+        buildStatLine("status", "already current"),
+        buildStatLine("active brief", formatCommand(active.briefId)),
+        buildStatLine("delta summaries", "0"),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const sourceContextHash = hashFocusSourceContext(activeSummaries);
+  const watermark = await store.getCoveredWatermark(current.stats.conversationId);
+  const generation = await runDelegatedRefocusBrief({
+    deps: params.deps,
+    requesterSessionKey,
+    conversationId: current.stats.conversationId,
+    focusPrompt: active.prompt,
+    existingBriefMarkdown: active.content,
+    deltaSummaries,
+  });
+  const ordinalBySummaryId = new Map(activeSummaries.map((summary) => [summary.summaryId, summary.ordinal]));
+  const sources = [
+    ...deltaSummaries.map((summary) => ({
+      summaryId: summary.summaryId,
+      ordinal: summary.ordinal,
+      role: "active_input" as const,
+    })),
+    ...generation.citedSummaryIds.map((summaryId) => ({
+      summaryId,
+      ordinal: ordinalBySummaryId.get(summaryId) ?? null,
+      role: "cited" as const,
+    })),
+    ...generation.expandedSummaryIds.map((summaryId) => ({
+      summaryId,
+      ordinal: ordinalBySummaryId.get(summaryId) ?? null,
+      role: "expanded" as const,
+    })),
+    ...generation.irrelevantSummaryIds.map((summaryId) => ({
+      summaryId,
+      ordinal: ordinalBySummaryId.get(summaryId) ?? null,
+      role: "irrelevant" as const,
+    })),
+  ];
+
+  const ok = generation.status === "ok";
+  const brief = await store.createFocusBrief({
+    conversationId: current.stats.conversationId,
+    sessionKey: requesterSessionKey,
+    prompt: active.prompt,
+    content: ok ? generation.briefMarkdown : "",
+    status: ok ? "active" : "failed",
+    tokenCount: generation.tokenCount,
+    targetTokens: generation.targetTokens,
+    coveredLatestAt: watermark.coveredLatestAt,
+    coveredMessageSeq: watermark.coveredMessageSeq,
+    sourceContextHash,
+    generatorRunId: generation.runId,
+    generatorSessionKey: generation.childSessionKey,
+    rawResultJson:
+      generation.rawResultJson ??
+      JSON.stringify({
+        status: generation.status,
+        error: generation.error,
+        rawReply: generation.rawReply,
+      }),
+    error: generation.error ?? null,
+    sources,
+    supersedeCurrentDrafts: ok,
+  });
+
+  lines.push(
+    buildSection("📍 Current conversation", [
+      buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
+      buildStatLine("session key", formatCommand(truncateMiddle(requesterSessionKey, 44))),
+      buildStatLine("active brief", formatCommand(active.briefId)),
+      buildStatLine("delta summaries", formatNumber(deltaSummaries.length)),
+      buildStatLine("source context hash", sourceContextHash.slice(0, 16)),
+    ]),
+    "",
+    buildSection("🧹 Pre-refocus compaction", [
+      buildStatLine("status", "completed"),
+      buildStatLine("compacted", formatBoolean(preRefocusCompaction.result.compacted)),
+      buildStatLine("result", preRefocusCompaction.result.reason ?? "done"),
+    ]),
+    "",
+    buildSection("🎯 Focus brief", [
+      buildStatLine("brief id", formatCommand(brief.briefId)),
+      buildStatLine("status", brief.status),
+      buildStatLine("prompt", JSON.stringify(formatFocusPreview(active.prompt, 240))),
+      buildStatLine("tokens", formatNumber(brief.tokenCount)),
+      buildStatLine("target tokens", formatNumber(brief.targetTokens)),
+      buildStatLine("generator run", generation.runId),
+      buildStatLine("generator session", truncateMiddle(generation.childSessionKey, 60)),
+      buildStatLine("truncated", formatBoolean(generation.truncated)),
+    ]),
+  );
+  if (!ok) {
+    lines.push(
+      "",
+      buildSection("⚠️ Generation failed", [
+        generation.error ?? "Refocus brief generation failed without a specific error.",
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    "",
+    buildSection("📝 Preview", [formatFocusPreview(generation.briefMarkdown)]),
+  );
+  return lines.join("\n");
+}
+
 // Deactivate the current focus overlay without deleting focus history.
 async function buildUnfocusText(params: {
   ctx: PluginCommandContext;
@@ -2002,6 +2259,16 @@ export function createLcmCommand(params: {
               deps: params.deps,
               getLcm: params.getLcm,
               prompt: parsed.prompt,
+            }),
+          };
+        case "refocus":
+          return {
+            text: await buildRefocusText({
+              ctx,
+              db: await getDb(),
+              config: params.config,
+              deps: params.deps,
+              getLcm: params.getLcm,
             }),
           };
         case "unfocus":

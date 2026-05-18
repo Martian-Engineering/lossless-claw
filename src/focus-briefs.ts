@@ -255,7 +255,7 @@ function buildActiveSummaryManifest(summaries: ActiveFocusSummaryRecord[]): stri
     .map((summary) => {
       const preview = truncatePreview(summary.content, 600);
       return [
-        `<summary_ref ordinal="${summary.ordinal}" id="${summary.summaryId}" kind="${summary.kind}" depth="${summary.depth}" token_count="${summary.tokenCount}" latest_at="${summary.latestAt ?? ""}">`,
+        `<summary_ref ordinal="${summary.ordinal}" id="${summary.summaryId}" kind="${summary.kind}" depth="${summary.depth}" token_count="${summary.tokenCount}" latest_at="${summary.latestAt ?? ""}" max_source_seq="${summary.maxSourceSeq ?? ""}">`,
         preview,
         "</summary_ref>",
       ].join("\n");
@@ -420,6 +420,126 @@ function buildFocusSynthesisTask(params: {
   ].join("\n");
 }
 
+function buildRefocusEvidenceTask(params: {
+  focusPrompt: string;
+  existingBriefMarkdown: string;
+  conversationId: number;
+  deltaSummaries: ActiveFocusSummaryRecord[];
+  targetTokens: number;
+  requestId: string;
+  originSessionKey: string;
+}): string {
+  const minimumTokens = resolveFocusMinimumTokens(params.targetTokens);
+  // Refocus is a delta-refresh task: the existing brief remains the baseline,
+  // and this turn gathers only the post-watermark evidence that should change it.
+  return [
+    "Gather Lossless refocus delta evidence.",
+    "",
+    "You are a delegated subagent. Your job is to evaluate new summary context against an existing Lossless focus brief and gather evidence for a refreshed brief. This is not the final brief.",
+    "",
+    "Original focus prompt:",
+    `<focus_prompt>${params.focusPrompt}</focus_prompt>`,
+    "",
+    `Conversation ID: ${params.conversationId}`,
+    `Target refreshed brief length for the later synthesis turn: ${minimumTokens}-${params.targetTokens} tokens`,
+    `Minimum acceptable final brief length: ${minimumTokens} tokens`,
+    `Request ID: ${params.requestId}`,
+    `Origin session key: ${params.originSessionKey}`,
+    "",
+    "Existing focus brief baseline:",
+    "<existing_focus_brief>",
+    params.existingBriefMarkdown,
+    "</existing_focus_brief>",
+    "",
+    "Delta summary context after the previous focus watermark:",
+    "<delta_summary_context>",
+    buildActiveSummaryManifest(params.deltaSummaries),
+    "</delta_summary_context>",
+    "",
+    "Evidence requirements:",
+    "- Treat the existing focus brief as the baseline working memory.",
+    "- Evaluate only the delta summaries as possible additions, corrections, or removals.",
+    "- Preserve relevant baseline details unless the delta clearly supersedes them.",
+    "- Include concrete new decisions, file paths, command names, issue IDs, constraints, test results, deployment details, and next actions when relevant to the original prompt.",
+    "- Identify obsolete baseline details if the delta contradicts or supersedes them.",
+    "",
+    "Required recall workflow:",
+    "1. Use lcm_grep with mode='full_text', scope='summaries', and this conversationId to search for delta evidence matching the original focus prompt.",
+    "2. Use lcm_describe on promising delta summary IDs to inspect metadata, parent/child relationships, and expansion costs.",
+    "3. Use lcm_expand directly on high-value delta summary IDs to recover details. You are in delegated context, so do NOT call lcm_expand_query.",
+    "4. Separate genuinely new relevant delta from repeated baseline material.",
+    "",
+    "Return ONLY JSON with this shape:",
+    "{",
+    '  "evidenceMarkdown": "markdown delta evidence dossier for later synthesis",',
+    '  "citedSummaryIds": ["sum_xxx"],',
+    '  "expandedSummaryIds": ["sum_xxx"],',
+    '  "irrelevantSummaryIds": ["sum_xxx"],',
+    '  "expansionPrompts": [{"prompt": "question to ask later", "summaryIds": ["sum_xxx"]}],',
+    '  "confidenceNotes": ["what is expanded evidence vs inferred synthesis"],',
+    '  "truncated": false',
+    "}",
+    "",
+    "The evidenceMarkdown dossier must include:",
+    "- Baseline Retained: important existing brief claims that should remain.",
+    "- Relevant Delta: new or changed details tied to summary IDs.",
+    "- Superseded Or Contradicted Baseline Details: what should be revised or removed.",
+    "- Current Working State Delta: active branches, files, tests, commands, blockers, and next actions from new summaries.",
+    "- Evidence Map with delta summary IDs.",
+    "- Expansion Guide with concrete future recall prompts.",
+    "- Irrelevant Delta: new summaries inspected but not relevant to the original prompt.",
+    "- Confidence Notes.",
+  ].join("\n");
+}
+
+function buildRefocusSynthesisTask(params: {
+  focusPrompt: string;
+  existingBriefMarkdown: string;
+  evidenceMarkdown: string;
+  targetTokens: number;
+}): string {
+  const minimumTokens = resolveFocusMinimumTokens(params.targetTokens);
+  // The final refocus artifact is a complete replacement brief, not a patch.
+  return [
+    "Synthesize the refreshed Lossless focus context brief.",
+    "",
+    "Original focus prompt:",
+    `<focus_prompt>${params.focusPrompt}</focus_prompt>`,
+    "",
+    `Target refreshed brief length: ${minimumTokens}-${params.targetTokens} tokens`,
+    `Minimum acceptable length: ${minimumTokens} tokens`,
+    "",
+    "Existing focus brief baseline:",
+    "<existing_focus_brief>",
+    params.existingBriefMarkdown,
+    "</existing_focus_brief>",
+    "",
+    "Delta evidence dossier:",
+    "<refocus_delta_evidence>",
+    params.evidenceMarkdown,
+    "</refocus_delta_evidence>",
+    "",
+    "Instructions:",
+    "- Produce a complete updated focus context brief, not a diff or addendum.",
+    "- Preserve useful structure, specificity, and provenance from the existing brief.",
+    "- Merge in relevant delta details that match the original focus prompt.",
+    "- Remove or rewrite obsolete baseline details when the delta supersedes them.",
+    "- Keep summary IDs and future expansion prompts visible for later recall.",
+    "- Do NOT call lcm_expand_query from this delegated context.",
+    "",
+    "Return ONLY JSON with this shape:",
+    "{",
+    '  "briefMarkdown": "complete refreshed markdown context brief",',
+    '  "citedSummaryIds": ["sum_xxx"],',
+    '  "expandedSummaryIds": ["sum_xxx"],',
+    '  "irrelevantSummaryIds": ["sum_xxx"],',
+    '  "expansionPrompts": [{"prompt": "question to ask later", "summaryIds": ["sum_xxx"]}],',
+    '  "confidenceNotes": ["what is expanded evidence vs inferred synthesis"],',
+    '  "truncated": false',
+    "}",
+  ].join("\n");
+}
+
 function buildFocusAgentParams(params: {
   deps: FocusBriefDeps;
   childSessionKey: string;
@@ -523,21 +643,27 @@ async function runFocusAttempt<TParsed>(params: {
   }
 }
 
-/**
- * Spawn a delegated subagent to build an evidence-oriented focus brief from the
- * current active summary context without mutating canonical Lossless state.
- */
-export async function runDelegatedFocusBrief(params: {
+async function runDelegatedFocusWorkflow(params: {
   deps: FocusBriefDeps;
   requesterSessionKey: string;
   conversationId: number;
-  focusPrompt: string;
-  summaries: ActiveFocusSummaryRecord[];
+  summaryTokens: number;
+  buildEvidenceMessage(input: {
+    targetTokens: number;
+    requestId: string;
+    originSessionKey: string;
+  }): string;
+  buildSynthesisMessage(input: {
+    evidenceMarkdown: string;
+    targetTokens: number;
+  }): string;
+  evidencePhaseName: string;
+  synthesisPhaseName: string;
+  stampedBy: string;
 }): Promise<FocusBriefGeneration> {
-  const summaryTokens = params.summaries.reduce((sum, summary) => sum + Math.max(0, summary.tokenCount), 0);
-  const targetTokens = resolveFocusTargetTokens(summaryTokens);
+  const targetTokens = resolveFocusTargetTokens(params.summaryTokens);
   const tokenCap = resolveFocusExpansionTokenCap({
-    summaryTokens,
+    summaryTokens: params.summaryTokens,
     targetTokens,
     defaultExpandTokens: params.deps.config.maxExpandTokens,
   });
@@ -565,14 +691,11 @@ export async function runDelegatedFocusBrief(params: {
     requestId,
     expansionDepth: 1,
     originSessionKey: params.requesterSessionKey,
-    stampedBy: "runDelegatedFocusBrief",
+    stampedBy: params.stampedBy,
   });
 
   try {
-    const evidenceMessage = buildFocusEvidenceTask({
-      focusPrompt: params.focusPrompt,
-      conversationId: params.conversationId,
-      summaries: params.summaries,
+    const evidenceMessage = params.buildEvidenceMessage({
       targetTokens,
       requestId,
       originSessionKey: params.requesterSessionKey,
@@ -582,7 +705,7 @@ export async function runDelegatedFocusBrief(params: {
       childSessionKey,
       message: evidenceMessage,
       timeoutMs,
-      phaseName: "focus evidence gathering",
+      phaseName: params.evidencePhaseName,
       parseReply: parseFocusEvidenceReply,
       estimateText: (parsed) => parsed.evidenceMarkdown,
     });
@@ -625,18 +748,17 @@ export async function runDelegatedFocusBrief(params: {
     const attempt = await runFocusAttempt({
       deps: params.deps,
       childSessionKey,
-      message: buildFocusSynthesisTask({
-        focusPrompt: params.focusPrompt,
+      message: params.buildSynthesisMessage({
         evidenceMarkdown: evidenceAttempt.parsed.evidenceMarkdown,
         targetTokens,
       }),
       timeoutMs,
-      phaseName: "focus brief synthesis",
+      phaseName: params.synthesisPhaseName,
       parseReply: parseFocusBriefReply,
       estimateText: (parsed) => parsed.briefMarkdown,
     });
     runId = attempt.runId;
-    if (attempt.status === "timeout" || attempt.status === "error") {
+    if (attempt.status !== "ok") {
       return {
         status: attempt.status,
         runId: attempt.runId,
@@ -709,10 +831,93 @@ export async function runDelegatedFocusBrief(params: {
   }
 }
 
+/**
+ * Spawn a delegated subagent to build an evidence-oriented focus brief from the
+ * current active summary context without mutating canonical Lossless state.
+ */
+export async function runDelegatedFocusBrief(params: {
+  deps: FocusBriefDeps;
+  requesterSessionKey: string;
+  conversationId: number;
+  focusPrompt: string;
+  summaries: ActiveFocusSummaryRecord[];
+}): Promise<FocusBriefGeneration> {
+  const summaryTokens = params.summaries.reduce((sum, summary) => sum + Math.max(0, summary.tokenCount), 0);
+  return runDelegatedFocusWorkflow({
+    deps: params.deps,
+    requesterSessionKey: params.requesterSessionKey,
+    conversationId: params.conversationId,
+    summaryTokens,
+    evidencePhaseName: "focus evidence gathering",
+    synthesisPhaseName: "focus brief synthesis",
+    stampedBy: "runDelegatedFocusBrief",
+    buildEvidenceMessage: ({ targetTokens, requestId, originSessionKey }) =>
+      buildFocusEvidenceTask({
+        focusPrompt: params.focusPrompt,
+        conversationId: params.conversationId,
+        summaries: params.summaries,
+        targetTokens,
+        requestId,
+        originSessionKey,
+      }),
+    buildSynthesisMessage: ({ evidenceMarkdown, targetTokens }) =>
+      buildFocusSynthesisTask({
+        focusPrompt: params.focusPrompt,
+        evidenceMarkdown,
+        targetTokens,
+      }),
+  });
+}
+
+/**
+ * Spawn a delegated subagent to refresh an existing focus brief from post-focus
+ * delta summaries while preserving the previous brief on failure.
+ */
+export async function runDelegatedRefocusBrief(params: {
+  deps: FocusBriefDeps;
+  requesterSessionKey: string;
+  conversationId: number;
+  focusPrompt: string;
+  existingBriefMarkdown: string;
+  deltaSummaries: ActiveFocusSummaryRecord[];
+}): Promise<FocusBriefGeneration> {
+  const summaryTokens =
+    estimateTokens(params.existingBriefMarkdown) +
+    params.deltaSummaries.reduce((sum, summary) => sum + Math.max(0, summary.tokenCount), 0);
+  return runDelegatedFocusWorkflow({
+    deps: params.deps,
+    requesterSessionKey: params.requesterSessionKey,
+    conversationId: params.conversationId,
+    summaryTokens,
+    evidencePhaseName: "refocus delta evidence gathering",
+    synthesisPhaseName: "refocus brief synthesis",
+    stampedBy: "runDelegatedRefocusBrief",
+    buildEvidenceMessage: ({ targetTokens, requestId, originSessionKey }) =>
+      buildRefocusEvidenceTask({
+        focusPrompt: params.focusPrompt,
+        existingBriefMarkdown: params.existingBriefMarkdown,
+        conversationId: params.conversationId,
+        deltaSummaries: params.deltaSummaries,
+        targetTokens,
+        requestId,
+        originSessionKey,
+      }),
+    buildSynthesisMessage: ({ evidenceMarkdown, targetTokens }) =>
+      buildRefocusSynthesisTask({
+        focusPrompt: params.focusPrompt,
+        existingBriefMarkdown: params.existingBriefMarkdown,
+        evidenceMarkdown,
+        targetTokens,
+      }),
+  });
+}
+
 export const __focusBriefTesting = {
   buildActiveSummaryManifest,
   buildFocusEvidenceTask,
   buildFocusSynthesisTask,
+  buildRefocusEvidenceTask,
+  buildRefocusSynthesisTask,
   parseFocusEvidenceReply,
   parseFocusBriefReply,
   resolveFocusDelegationTimeoutMs,

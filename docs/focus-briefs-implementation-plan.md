@@ -17,6 +17,7 @@ Use command words rather than flags so the interface works well on mobile:
 ```text
 /lossless focus
 /lossless focus <prompt>
+/lossless refocus
 /lossless unfocus
 ```
 
@@ -24,6 +25,8 @@ Use command words rather than flags so the interface works well on mobile:
   refocuses around the prompt from the fresh summary frontier, and activates the
   resulting brief.
 - `/lossless focus` reports active/draft focus state, prompt, preview, and diagnostics.
+- `/lossless refocus` refreshes the active focus brief from post-focus summary
+  deltas, preserving the original prompt and using the old brief as the baseline.
 - `/lossless unfocus` deactivates the active focus overlay once overlays exist,
   then runs a forced full-sweep compaction.
 
@@ -42,10 +45,10 @@ Use command words rather than flags so the interface works well on mobile:
 - New summaries while focus is active should remain visible as post-focus delta.
   The later overlay implementation should use a coverage watermark rather than
   relying only on masked summary IDs.
-- Focus and unfocus are prompt-prefix lifecycle operations. Because they break
-  prompt caching just like compaction does, they deliberately pair the prefix
-  mutation with forced full-sweep compaction: focus compacts before brief
-  generation, while unfocus compacts after deactivation.
+- Focus, refocus, and unfocus are prompt-prefix lifecycle operations. Because
+  they break prompt caching just like compaction does, they deliberately pair
+  the prefix mutation with forced full-sweep compaction: focus and refocus
+  compact before generation, while unfocus compacts after deactivation.
 
 ## Phase 1: Slash Command Generates A Draft Brief
 
@@ -186,6 +189,11 @@ Make active focus mode affect assembled context.
 - Make `/lossless unfocus` deactivate active overlays without deleting brief history.
 - Run forced full-sweep compaction before focus generation so the delegated
   subagent reads the freshest balanced summary frontier.
+- Run forced full-sweep compaction before refocus generation, then give the
+  delegated subagent the old active brief plus summaries beyond the old focus
+  watermark as delta input. A successful refocus writes a new active brief with
+  advanced coverage watermarks; a failed refocus leaves the old active brief in
+  place.
 - Run forced full-sweep compaction after unfocus so the normal DAG view is
   restored with the same cache break that removed the overlay.
 
