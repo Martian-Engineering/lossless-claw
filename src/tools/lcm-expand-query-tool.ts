@@ -218,6 +218,8 @@ function shouldRetryWithoutOverride(message: string): boolean {
     "forbidden",
     "provider/model overrides are not authorized",
     "model override is not authorized",
+    "not allowed for agent",
+    "not allowlisted for plugin",
     "unknown model",
     "model not found",
     "invalid model",

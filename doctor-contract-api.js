@@ -22,18 +22,26 @@ function readConfig(cfg) {
   return isRecord(config) ? config : undefined;
 }
 
-function readLlmPolicy(cfg) {
-  const llm = readEntry(cfg)?.llm;
-  if (!isRecord(llm)) {
+function readModelOverridePolicy(cfg, policyKey) {
+  const policy = readEntry(cfg)?.[policyKey];
+  if (!isRecord(policy)) {
     return {
       allowModelOverride: false,
       allowedModels: [],
     };
   }
   return {
-    allowModelOverride: llm.allowModelOverride === true,
-    allowedModels: Array.isArray(llm.allowedModels) ? llm.allowedModels : [],
+    allowModelOverride: policy.allowModelOverride === true,
+    allowedModels: Array.isArray(policy.allowedModels) ? policy.allowedModels : [],
   };
+}
+
+function readLlmPolicy(cfg) {
+  return readModelOverridePolicy(cfg, "llm");
+}
+
+function readSubagentPolicy(cfg) {
+  return readModelOverridePolicy(cfg, "subagent");
 }
 
 function toModelRef(provider, model) {
@@ -49,6 +57,18 @@ function toModelRef(provider, model) {
   }
   const providerId = readString(provider);
   return providerId ? `${providerId}/${modelId}` : undefined;
+}
+
+function uniqueModelRefs(modelRefs) {
+  const seen = new Set();
+  return modelRefs.filter((entry) => {
+    const key = `${entry.field}:${entry.modelRef}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 /** Collect configured Lossless summary model refs that doctor can safely allowlist. */
@@ -119,16 +139,42 @@ function collectLosslessRuntimeLlmModelRefs(cfg) {
     }
   }
 
-  const seen = new Set();
   return {
-    modelRefs: modelRefs.filter((entry) => {
-      const key = `${entry.field}:${entry.modelRef}`;
-      if (seen.has(key)) {
-        return false;
-      }
-      seen.add(key);
-      return true;
-    }),
+    modelRefs: uniqueModelRefs(modelRefs),
+    skipped,
+  };
+}
+
+/** Collect configured Lossless expansion model refs that doctor can safely allowlist. */
+function collectLosslessSubagentModelRefs(cfg) {
+  const config = readConfig(cfg);
+  if (!config) {
+    return { modelRefs: [], skipped: [] };
+  }
+
+  const modelRefs = [];
+  const skipped = [];
+  const modelId = readString(config.expansionModel);
+  if (modelId) {
+    const modelRef = toModelRef(config.expansionProvider, modelId);
+    if (modelRef) {
+      modelRefs.push({
+        field: "expansionModel",
+        modelRef,
+        configPath: [...CONFIG_PATH, "expansionModel"].join("."),
+      });
+    } else {
+      skipped.push({
+        field: "expansionModel",
+        configPath: [...CONFIG_PATH, "expansionModel"].join("."),
+        reason:
+          `expansionModel is a bare model without a provider; use provider/model or set plugins.entries.${PLUGIN_ID}.config.expansionProvider so doctor can update plugins.entries.${PLUGIN_ID}.subagent.allowedModels.`,
+      });
+    }
+  }
+
+  return {
+    modelRefs: uniqueModelRefs(modelRefs),
     skipped,
   };
 }
@@ -136,6 +182,19 @@ function collectLosslessRuntimeLlmModelRefs(cfg) {
 function collectMissingPolicyEntries(cfg) {
   const { modelRefs, skipped } = collectLosslessRuntimeLlmModelRefs(cfg);
   const policy = readLlmPolicy(cfg);
+  const allowedStrings = new Set(policy.allowedModels.filter((entry) => typeof entry === "string"));
+  const missingRefs = modelRefs.filter((entry) => !allowedStrings.has(entry.modelRef));
+  return {
+    modelRefs,
+    skipped,
+    missingRefs,
+    missingAllowModelOverride: modelRefs.length > 0 && policy.allowModelOverride !== true,
+  };
+}
+
+function collectMissingSubagentPolicyEntries(cfg) {
+  const { modelRefs, skipped } = collectLosslessSubagentModelRefs(cfg);
+  const policy = readSubagentPolicy(cfg);
   const allowedStrings = new Set(policy.allowedModels.filter((entry) => typeof entry === "string"));
   const missingRefs = modelRefs.filter((entry) => !allowedStrings.has(entry.modelRef));
   return {
@@ -155,7 +214,16 @@ function hasIssueForField(cfg, field) {
   );
 }
 
-/** Doctor warning rules for Lossless runtime LLM model override policy. */
+function hasSubagentIssueForField(cfg, field) {
+  const issues = collectMissingSubagentPolicyEntries(cfg);
+  return (
+    issues.missingAllowModelOverride ||
+    issues.missingRefs.some((entry) => entry.field === field) ||
+    issues.skipped.some((entry) => entry.field === field)
+  );
+}
+
+/** Doctor warning rules for Lossless runtime LLM and subagent model override policy. */
 export const legacyConfigRules = [
   {
     path: [...CONFIG_PATH, "summaryModel"],
@@ -175,39 +243,46 @@ export const legacyConfigRules = [
       'Lossless fallbackProviders use api.runtime.llm.complete model overrides. Configure plugins.entries.lossless-claw.llm.allowModelOverride and allowedModels, or run "openclaw doctor --fix".',
     match: (_value, root) => hasIssueForField(root, "fallbackProviders"),
   },
+  {
+    path: [...CONFIG_PATH, "expansionModel"],
+    message:
+      'Lossless expansionModel uses delegated sub-agent model overrides. Configure plugins.entries.lossless-claw.subagent.allowModelOverride and allowedModels, or run "openclaw doctor --fix".',
+    match: (_value, root) => hasSubagentIssueForField(root, "expansionModel"),
+  },
 ];
 
-function cloneRootWithLosslessLlm(cfg) {
+function cloneRootWithLosslessEntry(cfg) {
   const root = isRecord(cfg) ? { ...cfg } : {};
   const plugins = isRecord(root.plugins) ? { ...root.plugins } : {};
   const entries = isRecord(plugins.entries) ? { ...plugins.entries } : {};
   const entry = isRecord(entries[PLUGIN_ID]) ? { ...entries[PLUGIN_ID] } : {};
-  const llm = isRecord(entry.llm) ? { ...entry.llm } : {};
 
   root.plugins = plugins;
   plugins.entries = entries;
   entries[PLUGIN_ID] = entry;
-  entry.llm = llm;
 
-  return { root, llm };
+  return { root, entry };
 }
 
-/** Add the minimal plugin runtime LLM policy needed for configured Lossless summary models. */
-export function normalizeCompatibilityConfig({ cfg }) {
-  const issues = collectMissingPolicyEntries(cfg);
+function ensurePolicy(entry, policyKey) {
+  const policy = isRecord(entry[policyKey]) ? { ...entry[policyKey] } : {};
+  entry[policyKey] = policy;
+  return policy;
+}
+
+function applyModelOverridePolicyRepair({ policy, issues, changes, policyPath, subject }) {
   if (issues.modelRefs.length === 0) {
-    return { config: cfg, changes: [] };
+    return;
   }
 
-  const { root, llm } = cloneRootWithLosslessLlm(cfg);
-  const changes = [];
-
-  if (llm.allowModelOverride !== true) {
-    llm.allowModelOverride = true;
-    changes.push("Set plugins.entries.lossless-claw.llm.allowModelOverride = true for configured Lossless summary model overrides.");
+  if (policy.allowModelOverride !== true) {
+    policy.allowModelOverride = true;
+    changes.push(
+      `Set plugins.entries.lossless-claw.${policyPath}.allowModelOverride = true for configured Lossless ${subject} model overrides.`,
+    );
   }
 
-  const currentAllowed = Array.isArray(llm.allowedModels) ? [...llm.allowedModels] : [];
+  const currentAllowed = Array.isArray(policy.allowedModels) ? [...policy.allowedModels] : [];
   const allowedStrings = new Set(currentAllowed.filter((entry) => typeof entry === "string"));
   const added = [];
   for (const { modelRef } of issues.modelRefs) {
@@ -218,14 +293,45 @@ export function normalizeCompatibilityConfig({ cfg }) {
     }
   }
 
-  if (added.length > 0 || !Array.isArray(llm.allowedModels)) {
-    llm.allowedModels = currentAllowed;
+  if (added.length > 0 || !Array.isArray(policy.allowedModels)) {
+    policy.allowedModels = currentAllowed;
     changes.push(
-      `Added plugins.entries.lossless-claw.llm.allowedModels entries for configured Lossless summary models: ${added.join(", ")}`,
+      `Added plugins.entries.lossless-claw.${policyPath}.allowedModels entries for configured Lossless ${subject} models: ${added.join(", ")}`,
     );
+  }
+}
+
+/** Add the minimal plugin policies needed for configured Lossless model overrides. */
+export function normalizeCompatibilityConfig({ cfg }) {
+  const issues = collectMissingPolicyEntries(cfg);
+  const subagentIssues = collectMissingSubagentPolicyEntries(cfg);
+  if (issues.modelRefs.length === 0 && subagentIssues.modelRefs.length === 0) {
+    return { config: cfg, changes: [] };
+  }
+
+  const { root, entry } = cloneRootWithLosslessEntry(cfg);
+  const changes = [];
+
+  if (issues.modelRefs.length > 0) {
+    applyModelOverridePolicyRepair({
+      policy: ensurePolicy(entry, "llm"),
+      issues,
+      changes,
+      policyPath: "llm",
+      subject: "summary",
+    });
+  }
+  if (subagentIssues.modelRefs.length > 0) {
+    applyModelOverridePolicyRepair({
+      policy: ensurePolicy(entry, "subagent"),
+      issues: subagentIssues,
+      changes,
+      policyPath: "subagent",
+      subject: "expansion",
+    });
   }
 
   return { config: root, changes };
 }
 
-export { collectLosslessRuntimeLlmModelRefs };
+export { collectLosslessRuntimeLlmModelRefs, collectLosslessSubagentModelRefs };

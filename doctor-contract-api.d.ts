@@ -27,3 +27,8 @@ export function collectLosslessRuntimeLlmModelRefs(cfg: unknown): {
   modelRefs: LosslessRuntimeLlmModelRef[];
   skipped: LosslessRuntimeLlmSkippedModelRef[];
 };
+
+export function collectLosslessSubagentModelRefs(cfg: unknown): {
+  modelRefs: LosslessRuntimeLlmModelRef[];
+  skipped: LosslessRuntimeLlmSkippedModelRef[];
+};
