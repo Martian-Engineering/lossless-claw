@@ -370,7 +370,7 @@ describe("focus brief generation", () => {
     });
   });
 
-  it("does not retry synthesis when the first brief is too short", async () => {
+  it("keeps a generated focus brief usable when the first brief is too short", async () => {
     let agentRuns = 0;
     let sessionReads = 0;
     const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
@@ -426,12 +426,15 @@ describe("focus brief generation", () => {
       summaries: activeSummaries,
     });
 
-    expect(result.status).toBe("error");
+    expect(result.status).toBe("ok");
     expect(result.runId).toBe("focus-run-2");
     expect(result.briefMarkdown).toContain("Too short.");
     expect(result.expandedSummaryIds).toEqual(["summary_focus_a"]);
     expect(result.tokenCount).toBeLessThan(7200);
-    expect(result.error).toBe("Focus brief remained below the 7200-token minimum.");
+    expect(result.warning).toBe("Focus brief is shorter than the requested 7200-token minimum.");
+    expect(JSON.parse(result.rawResultJson ?? "{}")).toMatchObject({
+      warning: "Focus brief is shorter than the requested 7200-token minimum.",
+    });
     expect(callGateway.mock.calls.map((call) => call[0].method)).toEqual([
       "agent",
       "agent.wait",

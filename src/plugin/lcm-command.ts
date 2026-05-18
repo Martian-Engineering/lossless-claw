@@ -1628,6 +1628,9 @@ async function buildFocusGenerateText(params: {
       buildStatLine("truncated", formatBoolean(generation.truncated)),
     ]),
   );
+  if (generation.warning) {
+    lines.push("", buildSection("⚠️ Generation warning", [generation.warning]));
+  }
   if (!ok) {
     lines.push(
       "",
@@ -1877,6 +1880,9 @@ async function buildRefocusText(params: {
       buildStatLine("truncated", formatBoolean(generation.truncated)),
     ]),
   );
+  if (generation.warning) {
+    lines.push("", buildSection("⚠️ Generation warning", [generation.warning]));
+  }
   if (!ok) {
     lines.push(
       "",

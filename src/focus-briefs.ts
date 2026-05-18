@@ -43,6 +43,7 @@ export type FocusBriefGeneration = {
   truncated: boolean;
   rawReply?: string;
   rawResultJson?: string;
+  warning?: string;
   error?: string;
 };
 
@@ -271,13 +272,19 @@ function parseFocusEvidenceReply(rawReply: string | undefined): ParsedFocusEvide
 function buildPersistedFocusResultJson(
   parsed: ParsedFocusBriefReply,
   truncated: boolean,
+  warning?: string,
 ): string | undefined {
-  if (!parsed.rawResultJson || !truncated) {
+  if (!parsed.rawResultJson || (!truncated && !warning)) {
     return parsed.rawResultJson;
   }
   try {
     const raw = JSON.parse(parsed.rawResultJson) as Record<string, unknown>;
-    raw.truncated = true;
+    if (truncated) {
+      raw.truncated = true;
+    }
+    if (warning) {
+      raw.warning = warning;
+    }
     return JSON.stringify(raw);
   } catch {
     return parsed.rawResultJson;
@@ -830,10 +837,13 @@ async function runDelegatedFocusWorkflow(params: {
 
     const parsed = attempt.parsed;
     const stillShort = attempt.tokenCount < minimumTokens;
+    const warning = stillShort
+      ? `Focus brief is shorter than the requested ${minimumTokens}-token minimum.`
+      : undefined;
     const evidence = evidenceAttempt.parsed;
     const truncated = evidence.truncated || parsed.truncated;
     return {
-      status: stillShort ? "error" : "ok",
+      status: "ok",
       runId: attempt.runId,
       childSessionKey,
       briefMarkdown: parsed.briefMarkdown,
@@ -849,8 +859,8 @@ async function runDelegatedFocusWorkflow(params: {
       targetTokens,
       truncated,
       rawReply: attempt.rawReply,
-      rawResultJson: buildPersistedFocusResultJson(parsed, truncated),
-      error: stillShort ? `Focus brief remained below the ${minimumTokens}-token minimum.` : undefined,
+      rawResultJson: buildPersistedFocusResultJson(parsed, truncated, warning),
+      warning,
     };
   } catch (err) {
     return {
