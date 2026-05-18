@@ -183,7 +183,9 @@ function collectMissingPolicyEntries(cfg) {
   const { modelRefs, skipped } = collectLosslessRuntimeLlmModelRefs(cfg);
   const policy = readLlmPolicy(cfg);
   const allowedStrings = new Set(policy.allowedModels.filter((entry) => typeof entry === "string"));
-  const missingRefs = modelRefs.filter((entry) => !allowedStrings.has(entry.modelRef));
+  const missingRefs = allowedStrings.has("*")
+    ? []
+    : modelRefs.filter((entry) => !allowedStrings.has(entry.modelRef));
   return {
     modelRefs,
     skipped,
@@ -196,7 +198,9 @@ function collectMissingSubagentPolicyEntries(cfg) {
   const { modelRefs, skipped } = collectLosslessSubagentModelRefs(cfg);
   const policy = readSubagentPolicy(cfg);
   const allowedStrings = new Set(policy.allowedModels.filter((entry) => typeof entry === "string"));
-  const missingRefs = modelRefs.filter((entry) => !allowedStrings.has(entry.modelRef));
+  const missingRefs = allowedStrings.has("*")
+    ? []
+    : modelRefs.filter((entry) => !allowedStrings.has(entry.modelRef));
   return {
     modelRefs,
     skipped,
@@ -221,6 +225,10 @@ function hasSubagentIssueForField(cfg, field) {
     issues.missingRefs.some((entry) => entry.field === field) ||
     issues.skipped.some((entry) => entry.field === field)
   );
+}
+
+function needsPolicyRepair(issues) {
+  return issues.missingAllowModelOverride || issues.missingRefs.length > 0;
 }
 
 /** Doctor warning rules for Lossless runtime LLM and subagent model override policy. */
@@ -285,11 +293,13 @@ function applyModelOverridePolicyRepair({ policy, issues, changes, policyPath, s
   const currentAllowed = Array.isArray(policy.allowedModels) ? [...policy.allowedModels] : [];
   const allowedStrings = new Set(currentAllowed.filter((entry) => typeof entry === "string"));
   const added = [];
-  for (const { modelRef } of issues.modelRefs) {
-    if (!allowedStrings.has(modelRef)) {
-      currentAllowed.push(modelRef);
-      allowedStrings.add(modelRef);
-      added.push(modelRef);
+  if (!allowedStrings.has("*")) {
+    for (const { modelRef } of issues.modelRefs) {
+      if (!allowedStrings.has(modelRef)) {
+        currentAllowed.push(modelRef);
+        allowedStrings.add(modelRef);
+        added.push(modelRef);
+      }
     }
   }
 
@@ -305,14 +315,16 @@ function applyModelOverridePolicyRepair({ policy, issues, changes, policyPath, s
 export function normalizeCompatibilityConfig({ cfg }) {
   const issues = collectMissingPolicyEntries(cfg);
   const subagentIssues = collectMissingSubagentPolicyEntries(cfg);
-  if (issues.modelRefs.length === 0 && subagentIssues.modelRefs.length === 0) {
+  const repairRuntimeLlmPolicy = needsPolicyRepair(issues);
+  const repairSubagentPolicy = needsPolicyRepair(subagentIssues);
+  if (!repairRuntimeLlmPolicy && !repairSubagentPolicy) {
     return { config: cfg, changes: [] };
   }
 
   const { root, entry } = cloneRootWithLosslessEntry(cfg);
   const changes = [];
 
-  if (issues.modelRefs.length > 0) {
+  if (repairRuntimeLlmPolicy) {
     applyModelOverridePolicyRepair({
       policy: ensurePolicy(entry, "llm"),
       issues,
@@ -321,7 +333,7 @@ export function normalizeCompatibilityConfig({ cfg }) {
       subject: "summary",
     });
   }
-  if (subagentIssues.modelRefs.length > 0) {
+  if (repairSubagentPolicy) {
     applyModelOverridePolicyRepair({
       policy: ensurePolicy(entry, "subagent"),
       issues: subagentIssues,

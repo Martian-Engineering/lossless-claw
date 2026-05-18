@@ -179,7 +179,7 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `summaryTimeoutMs` | `integer` | `60000` | `LCM_SUMMARY_TIMEOUT_MS` | Maximum time to wait for one model-backed summarizer call. |
 | `customInstructions` | `string` | `""` | `LCM_CUSTOM_INSTRUCTIONS` | Extra natural-language instructions injected into every summarization prompt. |
 
-Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capability. If you configure an explicit Lossless summary model (`summaryModel`, `largeFileSummaryModel`, or `fallbackProviders`), OpenClaw must allow that runtime LLM override under `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`. `openclaw doctor --fix` can add the minimal policy entries for configured Lossless summary models.
+Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capability. If you configure an explicit Lossless summary model (`summaryModel`, `largeFileSummaryModel`, or `fallbackProviders`), OpenClaw must allow that runtime LLM override under `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`. `openclaw doctor --fix` can add the minimal policy entries for configured Lossless summary models. Delegated expansion calls use OpenClaw's runtime sub-agent layer; explicit `expansionModel` values require `plugins.entries.lossless-claw.subagent.allowModelOverride` and a matching `subagent.allowedModels` entry, or `"*"` if you intentionally trust any expansion target. `openclaw doctor --fix` can add the minimal subagent policy, and `lcm_expand_query` retries once without the override if the host rejects it.
 
 ### Fallbacks, circuit breaking, and safety rails
 

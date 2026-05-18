@@ -144,6 +144,39 @@ describe("doctor contract runtime LLM compatibility", () => {
     expect(expansionRule?.match?.("openai/gpt-5.4-mini", cfg)).toBe(true);
   });
 
+  it("treats wildcard allowedModels as covering configured summary and expansion models", () => {
+    const cfg = {
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              summaryModel: "openai-codex/gpt-5.5",
+              expansionModel: "openai/gpt-5.4-mini",
+            },
+            llm: {
+              allowModelOverride: true,
+              allowedModels: ["*"],
+            },
+            subagent: {
+              allowModelOverride: true,
+              allowedModels: ["*"],
+            },
+          },
+        },
+      },
+    };
+
+    const summaryRule = legacyConfigRules.find((rule) => rule.path.at(-1) === "summaryModel");
+    const expansionRule = legacyConfigRules.find((rule) => rule.path.at(-1) === "expansionModel");
+    const mutation = normalizeCompatibilityConfig({ cfg });
+
+    expect(summaryRule?.match?.("openai-codex/gpt-5.5", cfg)).toBe(false);
+    expect(expansionRule?.match?.("openai/gpt-5.4-mini", cfg)).toBe(false);
+    expect(mutation.changes).toEqual([]);
+    expect(mutation.config.plugins.entries["lossless-claw"].llm.allowedModels).toEqual(["*"]);
+    expect(mutation.config.plugins.entries["lossless-claw"].subagent.allowedModels).toEqual(["*"]);
+  });
+
   it("reports bare fallback models as skipped instead of inventing refs", () => {
     const result = collectLosslessRuntimeLlmModelRefs({
       plugins: {
