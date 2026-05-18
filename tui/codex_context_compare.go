@@ -57,6 +57,8 @@ func renderCompareContextBlock(idx int, item contextItemEntry, width int) []stri
 		if item.summaryID != "" {
 			label += " " + item.summaryID
 		}
+	} else if item.itemType == "focus_brief" {
+		label = "focus " + item.focusBriefID
 	} else if item.messageID > 0 {
 		label += fmt.Sprintf(" #%d", item.messageID)
 	}

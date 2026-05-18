@@ -547,16 +547,25 @@ func (m model) handleConversationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			totalTokens := 0
 			summaryCount := 0
 			messageCount := 0
+			focusCount := 0
 			for _, it := range items {
 				totalTokens += it.tokenCount
-				if it.itemType == "summary" {
+				switch it.itemType {
+				case "summary":
 					summaryCount++
-				} else {
+				case "focus_brief":
+					focusCount++
+				default:
 					messageCount++
 				}
 			}
-			m.status = fmt.Sprintf("Context: %d summaries + %d messages = %d items, %dk tokens",
-				summaryCount, messageCount, len(items), totalTokens/1000)
+			if focusCount > 0 {
+				m.status = fmt.Sprintf("Context: %d focus + %d summaries + %d messages = %d items, %dk tokens",
+					focusCount, summaryCount, messageCount, len(items), totalTokens/1000)
+			} else {
+				m.status = fmt.Sprintf("Context: %d summaries + %d messages = %d items, %dk tokens",
+					summaryCount, messageCount, len(items), totalTokens/1000)
+			}
 		}
 	case "o":
 		session, ok := m.currentSession()
@@ -2346,6 +2355,10 @@ func (m model) formatContextItemLine(item contextItemEntry) string {
 		return fmt.Sprintf("  %3d  %-10s [%s, %dt] %s",
 			item.ordinal, kindLabel, item.summaryID[:min(16, len(item.summaryID))], item.tokenCount, preview)
 	}
+	if item.itemType == "focus_brief" {
+		return fmt.Sprintf("  %3d  %-10s [%s, %dt] %s",
+			item.ordinal, "focus", item.focusBriefID[:min(16, len(item.focusBriefID))], item.tokenCount, preview)
+	}
 	// message
 	roleStyle := roleUserStyle
 	switch item.kind {
@@ -2373,6 +2386,9 @@ func (m *model) renderContextDetail(detailHeight int) []string {
 			kindLabel = fmt.Sprintf("condensed d%d", item.depth)
 		}
 		allLines = append(allLines, fmt.Sprintf("Summary: %s [%s]", item.summaryID, kindLabel))
+		allLines = append(allLines, fmt.Sprintf("Tokens: %d  Created: %s", item.tokenCount, formatTimestamp(item.createdAt)))
+	} else if item.itemType == "focus_brief" {
+		allLines = append(allLines, fmt.Sprintf("Focus brief: %s", item.focusBriefID))
 		allLines = append(allLines, fmt.Sprintf("Tokens: %d  Created: %s", item.tokenCount, formatTimestamp(item.createdAt)))
 	} else {
 		allLines = append(allLines, fmt.Sprintf("Message: #%d [%s]", item.messageID, item.kind))
