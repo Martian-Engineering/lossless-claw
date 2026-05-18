@@ -387,6 +387,33 @@ function safeString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function extractRawIdsFromPartMetadata(metadata: string | null | undefined): string[] {
+  if (!metadata) {
+    return [];
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(metadata);
+  } catch {
+    return [];
+  }
+
+  const raw = asRecord(asRecord(parsed)?.raw);
+  if (!raw) {
+    return [];
+  }
+
+  return [
+    safeString(raw.id),
+    safeString(raw.call_id),
+    safeString(raw.toolCallId),
+    safeString(raw.tool_call_id),
+    safeString(raw.toolUseId),
+    safeString(raw.tool_use_id),
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
 function formatDurationMs(durationMs: number): string {
   return `${durationMs}ms`;
 }
@@ -2717,6 +2744,7 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
 
 type TranscriptReconcileResult = {
   blockedByImportCap: boolean;
+  blockedReason?: "import-cap" | "cross-conversation-raw-id";
   importedMessages: number;
   hasOverlap: boolean;
 };
@@ -5085,7 +5113,34 @@ export class LcmContextEngine implements ContextEngine {
             this.deps.log.debug(
               `[lcm] reconcileSessionTail: blocked no-anchor import for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} existingDbCount=${existingDbCount} cap=${importCap} overlap=false`,
             );
-            return { blockedByImportCap: true, importedMessages: 0, hasOverlap: false };
+            return {
+              blockedByImportCap: true,
+              blockedReason: "import-cap",
+              importedMessages: 0,
+              hasOverlap: false,
+            };
+          }
+
+          if (params.noAnchorImportReason === "same-path-shrink") {
+            const rawIdMatches = this.countActiveCrossConversationRawIdMatches({
+              conversationId,
+              sessionId,
+              messages: historicalMessages,
+            });
+            if (rawIdMatches.matchedRawIds > 0) {
+              this.deps.log.warn(
+                `[lcm] reconcileSessionTail: blocked same-path-shrink no-anchor import for ${sessionContext} because ${rawIdMatches.matchedRawIds}/${rawIdMatches.candidateRawIds} candidate raw ids already exist in other active conversations`,
+              );
+              this.deps.log.debug(
+                `[lcm] reconcileSessionTail: blocked cross-conversation raw-id duplicate for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateRawIds=${rawIdMatches.candidateRawIds} matchedRawIds=${rawIdMatches.matchedRawIds} overlap=false`,
+              );
+              return {
+                blockedByImportCap: true,
+                blockedReason: "cross-conversation-raw-id",
+                importedMessages: 0,
+                hasOverlap: false,
+              };
+            }
           }
 
           let importedMessages = 0;
@@ -5132,7 +5187,12 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.debug(
         `[lcm] reconcileSessionTail: blocked for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} missingTail=${missingTail.length} existingDbCount=${existingDbCount}`,
       );
-      return { blockedByImportCap: true, importedMessages: 0, hasOverlap: true };
+      return {
+        blockedByImportCap: true,
+        blockedReason: "import-cap",
+        importedMessages: 0,
+        hasOverlap: true,
+      };
     }
 
     let importedMessages = 0;
@@ -5147,6 +5207,70 @@ export class LcmContextEngine implements ContextEngine {
       `[lcm] reconcileSessionTail: slow path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages}`,
     );
     return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+  }
+
+  /** Count candidate raw event IDs that already belong to another active conversation. */
+  private countActiveCrossConversationRawIdMatches(params: {
+    conversationId: number;
+    sessionId: string;
+    messages: AgentMessage[];
+  }): { candidateRawIds: number; matchedRawIds: number } {
+    const candidateRawIds = new Set<string>();
+    for (const message of params.messages) {
+      const stored = toStoredMessage(message);
+      const parts = buildMessageParts({
+        sessionId: params.sessionId,
+        message,
+        fallbackContent: stored.content,
+      });
+      for (const part of parts) {
+        for (const rawId of extractRawIdsFromPartMetadata(part.metadata)) {
+          candidateRawIds.add(rawId);
+        }
+      }
+    }
+
+    if (candidateRawIds.size === 0) {
+      return { candidateRawIds: 0, matchedRawIds: 0 };
+    }
+
+    const matchStmt = this.db.prepare(
+      `SELECT 1 AS found
+       FROM message_parts mp
+       JOIN messages m ON m.message_id = mp.message_id
+       JOIN conversations c ON c.conversation_id = m.conversation_id
+       WHERE c.active = 1
+         AND m.conversation_id <> ?
+         AND mp.metadata IS NOT NULL
+         AND json_valid(mp.metadata)
+         AND (
+           json_extract(mp.metadata, '$.raw.id') = ?
+           OR json_extract(mp.metadata, '$.raw.call_id') = ?
+           OR json_extract(mp.metadata, '$.raw.toolCallId') = ?
+           OR json_extract(mp.metadata, '$.raw.tool_call_id') = ?
+           OR json_extract(mp.metadata, '$.raw.toolUseId') = ?
+           OR json_extract(mp.metadata, '$.raw.tool_use_id') = ?
+         )
+       LIMIT 1`,
+    );
+
+    let matchedRawIds = 0;
+    for (const rawId of candidateRawIds) {
+      const row = matchStmt.get(
+        params.conversationId,
+        rawId,
+        rawId,
+        rawId,
+        rawId,
+        rawId,
+        rawId,
+      ) as { found: number } | undefined;
+      if (row?.found === 1) {
+        matchedRawIds += 1;
+      }
+    }
+
+    return { candidateRawIds: candidateRawIds.size, matchedRawIds };
   }
 
   /**
@@ -5926,7 +6050,10 @@ export class LcmContextEngine implements ContextEngine {
             return {
               bootstrapped: false,
               importedMessages: 0,
-              reason: "reconcile import capped",
+              reason:
+                reconcile.blockedReason === "cross-conversation-raw-id"
+                  ? "reconcile duplicate raw ids"
+                  : "reconcile import capped",
             };
           }
 

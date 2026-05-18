@@ -192,6 +192,14 @@ function writeLeafTranscript(
   );
 }
 
+function writeLeafTranscriptMessages(sessionFile: string, messages: AgentMessage[]): void {
+  writeFileSync(
+    sessionFile,
+    messages.map((message) => JSON.stringify({ message })).join("\n") + "\n",
+    "utf8",
+  );
+}
+
 function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContextEngine {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
   tempDirs.push(tempDir);
@@ -4962,6 +4970,95 @@ describe("LcmContextEngine.bootstrap", () => {
       .getConversationBootstrapState(conversation!.conversationId);
     expect(newCheckpoint?.sessionFilePath).toBe(sessionFile);
     expect(newCheckpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("blocks same-path shrink import when raw ids belong to another active conversation", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+
+    const mainSessionId = "bootstrap-same-path-shrink-cross-main";
+    const mainSessionKey = "agent:main:main";
+    const mainSessionFile = createSessionFilePath("bootstrap-same-path-shrink-cross-main");
+    writeLeafTranscript(mainSessionFile, [
+      { role: "user", content: "main old user" },
+      { role: "assistant", content: "main old assistant" },
+    ]);
+    appendFileSync(
+      mainSessionFile,
+      `${JSON.stringify({ type: "custom", payload: "x".repeat(20_000) })}\n`,
+      "utf8",
+    );
+
+    const first = await engine.bootstrap({
+      sessionId: mainSessionId,
+      sessionKey: mainSessionKey,
+      sessionFile: mainSessionFile,
+    });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+
+    const mainConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: mainSessionId,
+      sessionKey: mainSessionKey,
+    });
+    expect(mainConversation).not.toBeNull();
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(mainConversation!.conversationId);
+    expect(oldCheckpoint?.sessionFilePath).toBe(mainSessionFile);
+
+    const duplicateMessages = [
+      makeMessage({
+        role: "user",
+        content: [{ type: "text", id: "raw-cross-user", text: "telegram duplicate user" }],
+      }),
+      makeMessage({
+        role: "assistant",
+        content: [{ type: "text", id: "raw-cross-assistant", text: "telegram duplicate assistant" }],
+      }),
+    ];
+    const directSessionFile = createSessionFilePath("bootstrap-same-path-shrink-cross-direct");
+    writeLeafTranscriptMessages(directSessionFile, duplicateMessages);
+    await engine.bootstrap({
+      sessionId: "bootstrap-same-path-shrink-cross-direct",
+      sessionKey: "agent:main:telegram:default:direct:8455538490",
+      sessionFile: directSessionFile,
+    });
+
+    writeLeafTranscriptMessages(mainSessionFile, duplicateMessages);
+    expect(oldCheckpoint!.lastProcessedOffset).toBeGreaterThan(statSync(mainSessionFile).size);
+
+    const second = await engine.bootstrap({
+      sessionId: mainSessionId,
+      sessionKey: mainSessionKey,
+      sessionFile: mainSessionFile,
+    });
+    expect(second).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "reconcile duplicate raw ids",
+    });
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("blocked same-path-shrink no-anchor import")),
+    ).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(mainConversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "main old user",
+      "main old assistant",
+    ]);
+
+    const checkpointAfterBlock = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(mainConversation!.conversationId);
+    expect(checkpointAfterBlock?.lastProcessedOffset).toBe(oldCheckpoint?.lastProcessedOffset);
   });
 
   it("imports the full bounded same-path shrink epoch instead of trusting a stale externalized frontier", async () => {
