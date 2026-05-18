@@ -1,5 +1,38 @@
 # @martian-engineering/lossless-claw
 
+## 0.11.0
+
+### Minor Changes
+
+- [#692](https://github.com/Martian-Engineering/lossless-claw/pull/692) [`a13905a`](https://github.com/Martian-Engineering/lossless-claw/commit/a13905a832bfe843de472cb408222bed1b5f8ca7) Thanks [@jalehman](https://github.com/jalehman)! - Add focus brief generation through `/lossless focus <prompt>`, active focus overlays, unfocus/refocus lifecycle handling, and TUI/status diagnostics for generated briefs.
+
+### Patch Changes
+
+- [#688](https://github.com/Martian-Engineering/lossless-claw/pull/688) [`d1bef05`](https://github.com/Martian-Engineering/lossless-claw/commit/d1bef053326bd65e2736889ef4fa916f6e8bf1ec) Thanks [@jetd1](https://github.com/jetd1)! - Preserve unpersisted OpenClaw inter-session live input when assembling context from LCM's durable DB frontier.
+
+- [#685](https://github.com/Martian-Engineering/lossless-claw/pull/685) [`a6640b6`](https://github.com/Martian-Engineering/lossless-claw/commit/a6640b648fc87d895b94ee277a9218a1f4a735a8) Thanks [@jetd1](https://github.com/jetd1)! - Seed a placeholder `conversation_bootstrap_state` row in the afterTurn slow-path stat-fail branch so the next turn can recover.
+
+  `[#649](https://github.com/Martian-Engineering/lossless-claw/issues/649)` added a stat-fail fallback that returns `hasOverlap:true` to permit live `afterTurn` persistence even when `stat(sessionFile)` fails, expecting the subsequent `refreshAfterTurnBootstrapState` hook to refresh the checkpoint. That hook calls `refreshBootstrapState`, which independently calls `stat(sessionFile)` and throws on failure, so the catch block in the hook swallows the error and `conversation_bootstrap_state` stays `NULL`. Every subsequent `afterTurn` then re-enters the slow path with `reason="checkpoint-missing"`, which is intentionally excluded from `allowNoAnchorImport`, and the conversation gets stuck: LCM degrades into a transparent passthrough where the assemble safe-fallback returns `params.messages` verbatim and compaction never runs.
+
+  This restores the contract that "permissive return ⟹ checkpoint exists" without re-introducing the unconditional refresh `[#649](https://github.com/Martian-Engineering/lossless-claw/issues/649)` deliberately removed. The placeholder is written via `summaryStore.upsertConversationBootstrapState` directly so it does not depend on stat success. Subsequent turns recover from offset=0 once the transcript becomes statable, but route that placeholder recovery through the existing DB-anchor reconciliation path so already-persisted live afterTurn messages are not replayed as new rows.
+
+- [#704](https://github.com/Martian-Engineering/lossless-claw/pull/704) [`f806bb9`](https://github.com/Martian-Engineering/lossless-claw/commit/f806bb9691dd58fd6e19c70091cef9ba0f001718) Thanks [@jalehman](https://github.com/jalehman)! - Declare OpenClaw 2026.5.12 as the minimum supported host version for runtime LLM summarization.
+
+- [#696](https://github.com/Martian-Engineering/lossless-claw/pull/696) [`1869c6c`](https://github.com/Martian-Engineering/lossless-claw/commit/1869c6c574e02e54ae1d69f94263e374de06234b) Thanks [@jalehman](https://github.com/jalehman)! - Mark OpenClaw as an optional peer dependency so standalone plugin installs do not pull a second OpenClaw runtime tree.
+
+- [#573](https://github.com/Martian-Engineering/lossless-claw/pull/573) [`5621e8f`](https://github.com/Martian-Engineering/lossless-claw/commit/5621e8f2f37c0f5f9ee68e2334d6ab43d3887a06) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Generalize the native-image-block externalizer to assistant, system, tool, and toolResult messages. PR [#521](https://github.com/Martian-Engineering/lossless-claw/issues/521) in v0.9.3 only ran on user-role messages, so:
+
+  - Assistant or system messages carrying native `{type:"image", data:...}` blocks fell through to the generic raw-payload externalizer and were stored as `raw-{role}-payload.json` blobs with embedded base64 instead of dedupe-friendly image files.
+  - Tool and toolResult messages (which skip raw-payload externalization entirely) had their image blocks persisted inline through the standard `message_parts` pipeline, embedding base64 directly in the DB row.
+
+  In both cases the result was the same: no large*file row, no `lcm_describe` rendering, and no inter-conversation dedupe. The interceptor now runs for every persistable role, replacing native image blocks with `[<Role> image: ... | LCM file: file*…]` references and storing the image file once.
+
+  `interceptLargeRawPayload` also no longer skips externalization based on a content substring match (`isExternalizedReferenceContent`); it now only skips when the message already carries the explicit `rawPayloadExternalized: true` flag, so a still-oversized message that merely embeds an image reference alongside other content is still externalized.
+
+  Extension map: added `image/heic`, `image/avif`, and `image/bmp` so MIME-detection misses for those formats produce a sensible filename.
+
+- [#706](https://github.com/Martian-Engineering/lossless-claw/pull/706) [`f1e1806`](https://github.com/Martian-Engineering/lossless-claw/commit/f1e1806adb23e8d6f70ad9250001f663326b3ffd) Thanks [@jalehman](https://github.com/jalehman)! - Block same-path-shrink no-anchor bootstrap imports when candidate raw event IDs already belong to another active conversation.
+
 ## 0.10.0
 
 ### Minor Changes
