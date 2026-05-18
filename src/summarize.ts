@@ -163,6 +163,17 @@ export class LcmRuntimeLlmPolicyError extends Error {
   }
 }
 
+/**
+ * Signals that the host OpenClaw runtime is too old to expose the runtime LLM
+ * completion capability required for Lossless summarization.
+ */
+export class LcmRuntimeLlmUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LcmRuntimeLlmUnavailableError";
+  }
+}
+
 /** Signals that a provider returned an explicit non-auth error response. */
 class LcmProviderResponseError extends Error {
   readonly provider: string;
@@ -667,6 +678,20 @@ function extractRuntimeLlmPolicyFailure(value: unknown): {
     return undefined;
   }
   return { configField, modelRef, message };
+}
+
+function extractRuntimeLlmUnavailableFailure(value: unknown): string | undefined {
+  if (!isRecord(value) || !isRecord(value.error)) {
+    return undefined;
+  }
+  const message = typeof value.error.message === "string" ? value.error.message.trim() : "";
+  if (
+    value.error.kind !== "provider_error" ||
+    !message.includes("runtime.llm.complete is unavailable")
+  ) {
+    return undefined;
+  }
+  return message;
 }
 
 function buildProviderResponseWarning(params: {
@@ -1396,6 +1421,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               message: policyFailure.message,
             });
           }
+          const runtimeUnavailableFailure = extractRuntimeLlmUnavailableFailure(result);
+          if (runtimeUnavailableFailure) {
+            throw new LcmRuntimeLlmUnavailableError(runtimeUnavailableFailure);
+          }
           // Use requireStructuralSignal so that LLM summary text containing
           // auth-related words (e.g. "provider auth error") is NOT mistaken
           // for an actual API auth failure.
@@ -1418,6 +1447,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         } catch (err) {
           if (
             err instanceof LcmRuntimeLlmPolicyError ||
+            err instanceof LcmRuntimeLlmUnavailableError ||
             err instanceof LcmProviderAuthError ||
             err instanceof LcmProviderResponseError
           ) {
@@ -1436,6 +1466,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         result = await attemptSummarizerCall("initial");
       } catch (err) {
         if (err instanceof LcmRuntimeLlmPolicyError) {
+          params.deps.log.error(err.message);
+          throw err;
+        }
+        if (err instanceof LcmRuntimeLlmUnavailableError) {
           params.deps.log.error(err.message);
           throw err;
         }
@@ -1570,6 +1604,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           }
         } catch (retryErr) {
           if (retryErr instanceof LcmRuntimeLlmPolicyError) {
+            params.deps.log.error(retryErr.message);
+            throw retryErr;
+          }
+          if (retryErr instanceof LcmRuntimeLlmUnavailableError) {
             params.deps.log.error(retryErr.message);
             throw retryErr;
           }

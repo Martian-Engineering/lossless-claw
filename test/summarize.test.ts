@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createLcmSummarizeFromLegacyParams,
   LcmProviderAuthError,
+  LcmRuntimeLlmUnavailableError,
   LcmRuntimeLlmPolicyError,
   type LcmSummarizeFn,
 } from "../src/summarize.js";
@@ -902,6 +903,42 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).not.toContain("summarizer auth retry");
+    });
+
+    it("fails clearly when runtime.llm.complete is unavailable", async () => {
+      const deps = makeDeps({
+        config: {
+          ...makeDeps().config,
+          fallbackProviders: [{ provider: "openai", model: "gpt-4.1-mini" }],
+        },
+        resolveModel: vi.fn((modelRef?: string, providerHint?: string) => ({
+          provider: providerHint ?? "openai-codex",
+          model: modelRef ?? "gpt-5.4",
+        })),
+        complete: vi.fn(async () => ({
+          content: [],
+          error: {
+            kind: "provider_error",
+            message:
+              "[lcm] OpenClaw runtime.llm.complete is unavailable. Install OpenClaw >=2026.5.12.",
+          },
+        })),
+      });
+
+      const result = await createLcmSummarizeFromLegacyParams({
+        deps,
+        legacyParams: { provider: "openai-codex", model: "gpt-5.4" },
+      });
+
+      await expect(result!.fn("R".repeat(8_000), false)).rejects.toBeInstanceOf(
+        LcmRuntimeLlmUnavailableError,
+      );
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+
+      const diagnostics = getDepsLogText(deps);
+      expect(diagnostics).toContain("runtime.llm.complete is unavailable");
+      expect(diagnostics).not.toContain("PROVIDER FALLBACK");
+      expect(diagnostics).not.toContain("ALL PROVIDERS EXHAUSTED");
     });
 
     it("surfaces custom provider auth failures without direct-credential retry", async () => {
