@@ -11204,4 +11204,146 @@ describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
     expect(volatileIndex).toBeLessThan(toolIndex);
   });
 
+  it("appends suppressed fallback retry prompts that lack internal context markers", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const sessionId = "session-fallback-retry-volatile";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "Original task that persisted before retry." } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "The first model attempt failed." } as AgentMessage,
+    });
+
+    const retryPrompt =
+      "Prior retry context from the session transcript.\n\n" +
+      "[Retry after the previous model attempt failed or timed out]\n\n" +
+      "Original task that persisted before retry.";
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [
+        { role: "user", content: "Original task that persisted before retry." },
+        { role: "assistant", content: "The first model attempt failed." },
+        { role: "user", content: retryPrompt },
+      ] as AgentMessage[],
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("[Retry after the previous model attempt"))).toBe(
+      true,
+    );
+    expect(rendered.some((content) => content.includes("Prior retry context"))).toBe(true);
+  });
+
+  it("evicts historical tool-call pairs together when volatile input forces trimming", async () => {
+    const engine = createEngineWithConfig({ freshTailCount: 8 });
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const sessionId = "session-volatile-budget-tool-pair";
+    const toolCallId = "call_budget_pair";
+    const toolOutput = "large paired tool output " + "x ".repeat(900);
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "Question before tool use." } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: toolCallId, name: "read", input: { path: "big.txt" } }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId,
+        toolName: "read",
+        content: [{ type: "text", text: toolOutput }],
+      } as AgentMessage,
+    });
+    for (let index = 0; index < 8; index++) {
+      await engine.ingest({
+        sessionId,
+        message: { role: "user", content: `fresh protected tail message ${index}` } as AgentMessage,
+      });
+    }
+
+    const assembledWithoutVolatile = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    expect(
+      assembledWithoutVolatile.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          Array.isArray(message.content) &&
+          message.content.some(
+            (block) =>
+              block &&
+              typeof block === "object" &&
+              "id" in block &&
+              (block as { id?: unknown }).id === toolCallId,
+          ),
+      ),
+    ).toBe(true);
+    expect(
+      assembledWithoutVolatile.messages.some(
+        (message) =>
+          message.role === "toolResult" &&
+          (message as { toolCallId?: string }).toolCallId === toolCallId,
+      ),
+    ).toBe(true);
+
+    const volatileEvent =
+      "[Inter-session message] sourceSession=agent:main:subagent:budget sourceTool=subagent_announce\n" +
+      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n" +
+      "[Internal task completion event]\n" +
+      "Child result: volatile input should not leave a synthetic tool repair.\n" +
+      "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [{ role: "user", content: volatileEvent }] as AgentMessage[],
+      tokenBudget: assembledWithoutVolatile.estimatedTokens + estimateTokens(volatileEvent) - 50,
+    });
+
+    const rendered = result.messages
+      .map((message) => (typeof message.content === "string" ? message.content : JSON.stringify(message.content)))
+      .join("\n");
+    expect(rendered).toContain("volatile input should not leave a synthetic tool repair");
+    expect(rendered).not.toContain(
+      "[lossless-claw] missing tool result in session history; inserted synthetic error result",
+    );
+    expect(
+      result.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          Array.isArray(message.content) &&
+          message.content.some(
+            (block) =>
+              block &&
+              typeof block === "object" &&
+              "id" in block &&
+              (block as { id?: unknown }).id === toolCallId,
+          ),
+      ),
+    ).toBe(false);
+    expect(
+      result.messages.some(
+        (message) =>
+          message.role === "toolResult" &&
+          (message as { toolCallId?: string }).toolCallId === toolCallId,
+      ),
+    ).toBe(false);
+  });
+
 });

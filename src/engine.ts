@@ -1789,10 +1789,16 @@ const INTER_SESSION_MESSAGE_MARKER = "[Inter-session message]";
 const INTERNAL_CONTEXT_BEGIN_MARKER = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
 const INTERNAL_CONTEXT_END_MARKER = "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
 const INTERNAL_TASK_COMPLETION_EVENT_MARKER = "[Internal task completion event]";
+const FALLBACK_RETRY_PROMPT_MARKER =
+  "[Retry after the previous model attempt failed or timed out]";
 const NORMALIZED_INTER_SESSION_MESSAGE_MARKER = normalizeSummaryOverlapText(INTER_SESSION_MESSAGE_MARKER);
 const NORMALIZED_INTERNAL_TASK_COMPLETION_EVENT_MARKER = normalizeSummaryOverlapText(
   INTERNAL_TASK_COMPLETION_EVENT_MARKER,
 );
+
+function hasFallbackRetryPromptMarker(content: string): boolean {
+  return content.split(/\r?\n/).some((line) => line.trim() === FALLBACK_RETRY_PROMPT_MARKER);
+}
 
 function hasCompleteInternalContextBlock(content: string): boolean {
   const beginIndex = content.indexOf(INTERNAL_CONTEXT_BEGIN_MARKER);
@@ -1809,6 +1815,9 @@ function hasCompleteInternalContextBlock(content: string): boolean {
 
 function isVolatileLiveInputContent(content: string): boolean {
   const trimmed = content.trimStart();
+  if (hasFallbackRetryPromptMarker(trimmed)) {
+    return true;
+  }
   if (!hasCompleteInternalContextBlock(trimmed)) {
     return false;
   }
@@ -2007,6 +2016,80 @@ function expandToolPairLiveSortIndexes(params: {
   }
 
   return liveSortIndexes;
+}
+
+function buildToolPairIndexesByAssembledIndex(
+  assembledMessages: AgentMessage[],
+): Map<number, Set<number>> {
+  const assistantIndexesByToolCallId = new Map<string, number[]>();
+  const toolResultIndexesByToolCallId = new Map<string, number[]>();
+
+  // First index both sides by tool call id so matching assistant/result turns
+  // can be treated as one eviction unit.
+  for (let index = 0; index < assembledMessages.length; index++) {
+    const message = assembledMessages[index] as AgentMessage;
+    for (const toolCallId of extractAssistantToolCallIdsForPairing(message)) {
+      const indexes = assistantIndexesByToolCallId.get(toolCallId);
+      if (indexes) {
+        indexes.push(index);
+      } else {
+        assistantIndexesByToolCallId.set(toolCallId, [index]);
+      }
+    }
+    const toolResultId = extractToolResultIdForPairing(message);
+    if (toolResultId) {
+      const indexes = toolResultIndexesByToolCallId.get(toolResultId);
+      if (indexes) {
+        indexes.push(index);
+      } else {
+        toolResultIndexesByToolCallId.set(toolResultId, [index]);
+      }
+    }
+  }
+
+  const neighborsByIndex = new Map<number, Set<number>>();
+  // Link matched pairs as an undirected graph; the final groups are connected
+  // components, which handles multi-tool assistant turns and duplicate ids.
+  const linkIndexes = (left: number, right: number) => {
+    const leftNeighbors = neighborsByIndex.get(left) ?? new Set<number>([left]);
+    leftNeighbors.add(right);
+    neighborsByIndex.set(left, leftNeighbors);
+
+    const rightNeighbors = neighborsByIndex.get(right) ?? new Set<number>([right]);
+    rightNeighbors.add(left);
+    neighborsByIndex.set(right, rightNeighbors);
+  };
+
+  for (const [toolCallId, assistantIndexes] of assistantIndexesByToolCallId.entries()) {
+    const toolResultIndexes = toolResultIndexesByToolCallId.get(toolCallId) ?? [];
+    for (const assistantIndex of assistantIndexes) {
+      for (const toolResultIndex of toolResultIndexes) {
+        linkIndexes(assistantIndex, toolResultIndex);
+      }
+    }
+  }
+
+  const groupsByIndex = new Map<number, Set<number>>();
+  // Materialize every index's component so budget trimming can cheaply ask
+  // "what else must be evicted with this message?"
+  for (let index = 0; index < assembledMessages.length; index++) {
+    const group = new Set<number>();
+    const pending = [index];
+    while (pending.length > 0) {
+      const current = pending.pop() as number;
+      if (group.has(current)) {
+        continue;
+      }
+      group.add(current);
+      for (const neighbor of neighborsByIndex.get(current) ?? [current]) {
+        if (!group.has(neighbor)) {
+          pending.push(neighbor);
+        }
+      }
+    }
+    groupsByIndex.set(index, group);
+  }
+  return groupsByIndex;
 }
 
 function normalizeLiveMessageForAssemblyReconciliation(message: AgentMessage): AgentMessage {
@@ -2516,8 +2599,9 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     };
   }
 
-  const retained = params.assembledMessages.map((message, index) => ({ message, index }));
+  let retained = params.assembledMessages.map((message, index) => ({ message, index }));
   let appendedEntries = uncovered.entries.slice();
+  const toolPairIndexesByIndex = buildToolPairIndexesByAssembledIndex(params.assembledMessages);
   const exactLiveSortIndexes = resolveExactAssembledLiveSortIndexes({
     assembledMessages: params.assembledMessages,
     liveMessages,
@@ -2545,7 +2629,7 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
   while (retained.length > 0 && estimatedTokens > params.tokenBudget) {
     let bestCandidate:
       | {
-          evictIndex: number;
+          evictAssembledIndexes: Set<number>;
           output: AgentMessage[];
           estimatedTokens: number;
           appendedEntries: VolatileLiveInputEntry[];
@@ -2553,12 +2637,22 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
       | undefined;
     for (let evictIndex = 0; evictIndex < retained.length; evictIndex++) {
       const entry = retained[evictIndex] as RetainedAssembledEntry;
-      const candidateEvictsExactLiveTurn = exactLiveProtectedIndexes.has(entry.index);
-      if (candidateEvictsExactLiveTurn || protectedAssembledIndexes.has(entry.index)) {
+      const evictAssembledIndexes = toolPairIndexesByIndex.get(entry.index) ?? new Set([entry.index]);
+      const candidateEvictsExactLiveTurn = Array.from(evictAssembledIndexes).some((index) =>
+        exactLiveProtectedIndexes.has(index)
+      );
+      const candidateEvictsProtectedTurn = Array.from(evictAssembledIndexes).some((index) =>
+        protectedAssembledIndexes.has(index)
+      );
+      if (candidateEvictsExactLiveTurn || candidateEvictsProtectedTurn) {
         continue;
       }
-      const restoredCoveredEntries = uncovered.coveredEntriesByAssembledIndex.get(entry.index) ?? [];
-      const candidateRetained = retained.filter((_, index) => index !== evictIndex);
+      const restoredCoveredEntries = Array.from(evictAssembledIndexes).flatMap(
+        (index) => uncovered.coveredEntriesByAssembledIndex.get(index) ?? [],
+      );
+      const candidateRetained = retained.filter(
+        (retainedEntry) => !evictAssembledIndexes.has(retainedEntry.index),
+      );
       const candidateAppendedEntries =
         restoredCoveredEntries.length > 0
           ? [...appendedEntries, ...restoredCoveredEntries]
@@ -2583,7 +2677,7 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
           candidateEstimatedTokens < bestCandidate.estimatedTokens)
       ) {
         bestCandidate = {
-          evictIndex,
+          evictAssembledIndexes,
           output: candidateOutput,
           estimatedTokens: candidateEstimatedTokens,
           appendedEntries: candidateAppendedEntries,
@@ -2593,11 +2687,16 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     if (!bestCandidate) {
       break;
     }
-    const [removed] = retained.splice(bestCandidate.evictIndex, 1);
+    const removedEntries = retained.filter((entry) =>
+      bestCandidate.evictAssembledIndexes.has(entry.index),
+    );
+    retained = retained.filter((entry) => !bestCandidate.evictAssembledIndexes.has(entry.index));
     appendedEntries = bestCandidate.appendedEntries;
-    uncovered.coveredEntriesByAssembledIndex.delete(removed.index);
-    evictedMessages += 1;
-    evictedTokens += toStoredMessage(removed.message).tokenCount;
+    for (const removed of removedEntries) {
+      uncovered.coveredEntriesByAssembledIndex.delete(removed.index);
+      evictedTokens += toStoredMessage(removed.message).tokenCount;
+    }
+    evictedMessages += removedEntries.length;
     output = bestCandidate.output;
     estimatedTokens = bestCandidate.estimatedTokens;
   }
