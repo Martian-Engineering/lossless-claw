@@ -235,11 +235,14 @@ describe("Circuit Breaker", () => {
       legacyParams: { summarize: failingSummarizer },
     });
     expect(result.reason).toBe("circuit breaker open");
-    
-    // Advance time past cooldown (5 seconds)
-    vi.useFakeTimers();
+
+    // Advance time past cooldown (5 seconds). Only `Date` is faked: the
+    // breaker cooldown is `Date.now()`-based, and the subsequent compact()
+    // call yields the event loop via setImmediate during its sweep, which
+    // must still run for real.
+    vi.useFakeTimers({ toFake: ["Date"] });
     vi.advanceTimersByTime(6000);
-    
+
     // Should no longer be blocked (breaker auto-reset)
     result = await engine.compact({
       sessionId,
