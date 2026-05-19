@@ -3203,6 +3203,81 @@ describe("LCM integration: compactFullSweep bounds", () => {
     expect(result.tokensAfter).toBeLessThanOrEqual(result.tokensBefore);
   });
 
+  it("does not start a leaf summarizer pass when selection consumes the deadline", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      manyPassConfig({ maxSweepIterations: 1000, sweepDeadlineMs: 1 }),
+    );
+    await seedManyMessages();
+
+    const selectOldestLeafChunk = (engine as any).selectOldestLeafChunk.bind(engine);
+    vi.spyOn(engine as any, "selectOldestLeafChunk").mockImplementation(async (...args: unknown[]) => {
+      await new Promise((r) => setTimeout(r, 10));
+      return selectOldestLeafChunk(...args);
+    });
+    const summarize = vi.fn(async (text: string) => `S(${text.length})`);
+
+    const result = await engine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(summarize).not.toHaveBeenCalled();
+    expect(result.actionTaken).toBe(false);
+    expect(result.tokensAfter).toBe(result.tokensBefore);
+  });
+
+  it("does not start a condensed summarizer pass when candidate selection consumes the deadline", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      manyPassConfig({
+        maxSweepIterations: 1000,
+        sweepDeadlineMs: 1,
+        summaryPrefixTargetTokens: 1,
+      }),
+    );
+    await convStore.createConversation({ sessionId: "deadline-condensed-selection" });
+    for (const [summaryId, content] of [
+      ["sum_deadline_a", "Depth zero summary A"],
+      ["sum_deadline_b", "Depth zero summary B"],
+      ["sum_deadline_c", "Depth zero summary C"],
+    ] as const) {
+      await sumStore.insertSummary({
+        summaryId,
+        conversationId: CONV_ID,
+        kind: "leaf",
+        depth: 0,
+        content,
+        tokenCount: 80,
+      });
+      await sumStore.appendContextSummary(CONV_ID, summaryId);
+    }
+
+    const selectCandidate = (engine as any).selectShallowestCondensationCandidate.bind(engine);
+    vi.spyOn(engine as any, "selectShallowestCondensationCandidate").mockImplementation(
+      async (...args: unknown[]) => {
+        await new Promise((r) => setTimeout(r, 10));
+        return selectCandidate(...args);
+      },
+    );
+    const summarize = vi.fn(async (text: string) => `S(${text.length})`);
+
+    const result = await engine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(summarize).not.toHaveBeenCalled();
+    expect(result.actionTaken).toBe(false);
+    expect(result.tokensAfter).toBe(result.tokensBefore);
+  });
+
   it("a bounded sweep returns within a small multiple of the deadline", async () => {
     const sweepDeadlineMs = 60;
     const engine = new CompactionEngine(

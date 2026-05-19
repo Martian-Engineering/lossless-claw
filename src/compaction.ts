@@ -915,6 +915,9 @@ export class CompactionEngine {
       if (leafChunk.items.length === 0) {
         break;
       }
+      if (sweepBudgetExhausted("leaf")) {
+        break;
+      }
 
       sweepIterations++;
       const passTokensBefore = runningTokens;
@@ -967,7 +970,9 @@ export class CompactionEngine {
     const runCondensationPass = async (params: {
       enforcePreferredDepth: boolean;
       useHardFanout: boolean;
-    }): Promise<"progress" | "no-candidate" | "depth-cap" | "auth-failure" | "no-progress"> => {
+    }): Promise<
+      "progress" | "no-candidate" | "depth-cap" | "budget" | "auth-failure" | "no-progress"
+    > => {
       const candidate = await this.selectShallowestCondensationCandidate({
         conversationId,
         hardTrigger: params.useHardFanout,
@@ -977,6 +982,9 @@ export class CompactionEngine {
       }
       if (params.enforcePreferredDepth && candidate.targetDepth >= preferredMaxSourceDepth) {
         return "depth-cap";
+      }
+      if (sweepBudgetExhausted("condensed")) {
+        return "budget";
       }
 
       sweepIterations++;
