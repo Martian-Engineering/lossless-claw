@@ -23,6 +23,12 @@ import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmGetEntityTool } from "../tools/lcm-get-entity-tool.js";
 import { createLcmSearchEntitiesTool } from "../tools/lcm-search-entities-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
+import {
+  tryStartBackfillAutostart,
+  type AutostartHandle,
+} from "../operator/backfill-autostart.js";
+import { tryStartExtractionAutostart } from "../operator/extraction-autostart.js";
+import { initSemanticInfraIfPossible } from "../operator/semantic-infra-init.js";
 import type {
   LcmDependencies,
   RuntimeLlmCompleteFn,
@@ -1772,6 +1778,17 @@ const lcmPlugin = {
     api.on("gateway_stop", async () => {
       stopped = true;
       shared.stopped = true;
+      // v4.1 Wire-2: stop the backfill autostart loop (if running) so
+      // we don't make a Voyage call after the DB connection closes.
+      if (shared.backfillAutostart) {
+        shared.backfillAutostart.stop();
+        shared.backfillAutostart = null;
+      }
+      // v4.1 cycle-2: stop the extraction autostart loop too.
+      if (shared.extractionAutostart) {
+        shared.extractionAutostart.stop();
+        shared.extractionAutostart = null;
+      }
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
@@ -1784,6 +1801,51 @@ const lcmPlugin = {
     });
 
     wirePluginHandlers(api, deps, shared);
+
+    // v4.1 Wire-2: try to start the embedding-backfill autostart loop.
+    // Best-effort + opt-in (gated on VOYAGE_API_KEY env var). If any
+    // pre-flight fails (no key / no vec0 / no active model), the helper
+    // logs once and returns a NO_OP_HANDLE — gateway boots normally.
+    //
+    // The autostart needs an OPEN db handle. waitForDatabase resolves
+    // either immediately (if eager init succeeded) or once the deferred
+    // init completes; we await it here in a fire-and-forget so plugin
+    // load isn't blocked.
+    void (async () => {
+      try {
+        const db = await shared.waitForDatabase();
+        if (shared.stopped) return; // gateway_stop fired during wait
+        // v4.1 Final.review P1 #1 fix: load sqlite-vec, register the
+        // active embedding profile, and ensure the per-model vec0 table
+        // exists. Without this, the backfill autostart's pre-flight
+        // checks fail and the entire v4.1 semantic feature is inert.
+        // Best-effort + graceful degrade — see semantic-infra-init.ts.
+        initSemanticInfraIfPossible(db, { log: deps.log });
+        const handle = tryStartBackfillAutostart(db, { log: deps.log });
+        shared.backfillAutostart = handle;
+      } catch (e) {
+        deps.log.warn(
+          `[lcm] backfill autostart: skipped — DB init failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    })();
+
+    // v4.1 cycle-2: extraction (entity coref) autostart. Default ON
+    // (opt-out via LCM_EXTRACTION_LLM_ENABLED=false); uses deps.complete
+    // for the LLM call (reuses existing model/auth resolution chain).
+    // Drains lcm_extraction_queue every 60s.
+    void (async () => {
+      try {
+        const db = await shared.waitForDatabase();
+        if (shared.stopped) return;
+        const handle = tryStartExtractionAutostart(db, { log: deps.log, deps });
+        shared.extractionAutostart = handle;
+      } catch (e) {
+        deps.log.warn(
+          `[lcm] extraction autostart: skipped — DB init failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    })();
 
     logStartupBannerOnce({
       key: "plugin-loaded",
