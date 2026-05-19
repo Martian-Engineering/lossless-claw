@@ -20,6 +20,8 @@ import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
+import { createLcmGetEntityTool } from "../tools/lcm-get-entity-tool.js";
+import { createLcmSearchEntitiesTool } from "../tools/lcm-search-entities-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type {
   LcmDependencies,
@@ -249,6 +251,7 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "1. `lcm_grep` — search by regex or full-text across messages and summaries",
   "2. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
   "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
+  "- **Entity / pattern** (\"who is this person?\", \"history of project X\"): `lcm_get_entity` (exact name) or `lcm_search_entities` (fuzzy). Entity catalog is populated by an async worker; if empty, the tools return a `catalogStatus` field.",
   "",
   "**`lcm_grep` routing guidance:**",
   '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for regular expressions and literal patterns that use regex syntax.',
@@ -1406,6 +1409,27 @@ function wirePluginHandlers(
         requesterSessionKey: ctx.sessionKey,
       }),
     { name: "lcm_expand_query" },
+  );
+  // Final.review.3 — entity tool surface (Scenario 4 fix). Read tools over
+  // lcm_entities + lcm_entity_mentions, populated by the async coreference
+  // worker. Without these the entity worker writes records that no agent can
+  // query, which the doc audit (Slice 1 BLOCKER) flagged as vapor.
+  api.registerTool(
+    (ctx) => createLcmGetEntityTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+    }),
+    { name: "lcm_get_entity" },
+  );
+  api.registerTool(
+    (ctx) =>
+      createLcmSearchEntitiesTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+      }),
+    { name: "lcm_search_entities" },
   );
 
   api.registerCommand(
