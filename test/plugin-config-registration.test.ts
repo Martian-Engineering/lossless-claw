@@ -326,6 +326,42 @@ describe("lcm plugin registration", () => {
     expect(api.on).toHaveBeenCalledWith("session_end", expect.any(Function));
   });
 
+  it("applies Codex OAuth profile defaults during plugin registration", () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+
+    const { api, getFactory, infoLog } = buildApi({
+      enabled: true,
+      dbPath,
+      summaryProvider: "openai-codex",
+    });
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as {
+      config: Record<string, unknown>;
+      deps?: {
+        configDiagnostics?: Record<string, unknown>;
+      };
+    };
+
+    expect(engine.config).toMatchObject({
+      contextThreshold: 0.90,
+      compactionTargetFraction: 0.35,
+      proactiveThresholdCompactionMode: "deferred",
+      codexOAuthProfile: "auto",
+    });
+    expect(engine.deps?.configDiagnostics).toMatchObject({
+      codexOAuthProfileApplied: true,
+    });
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("Codex OAuth profile defaults applied"),
+    );
+  });
+
   it("logs env-backed pattern sources and override warnings during register", () => {
     vi.stubEnv("LCM_IGNORE_SESSION_PATTERNS", "agent:*:cron:*, agent:main:subagent:**");
     vi.stubEnv("LCM_STATELESS_SESSION_PATTERNS", "agent:*:ephemeral:**");

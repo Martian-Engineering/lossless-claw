@@ -8,6 +8,7 @@ type StartupBannerKey =
   | "stateless-session-patterns"
   | "ignore-session-patterns-env-override"
   | "stateless-session-patterns-env-override"
+  | "codex-oauth-profile-applied"
   | "runtime-llm-unavailable"
   | "runtime-llm-policy-summary-models"
   | "state-dir";

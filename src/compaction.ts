@@ -628,8 +628,6 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
-    /** Optional persisted-context target used when host runtime overhead is known. */
-    stopAtTokens?: number;
     summaryModel?: string;
     /** Optional operation-wide wall-clock deadline shared across rounds. */
     operationDeadlineAt?: number;
@@ -951,10 +949,6 @@ export class CompactionEngine {
       // PR follow-up to #619: precise stop has highest priority. When set,
       // stop regardless of force/threshold.
       if (stopAtTokens !== undefined && passTokensAfter <= stopAtTokens) {
-        previousTokens = passTokensAfter;
-        break;
-      }
-      if (!force && passTokensAfter <= threshold) {
         previousTokens = passTokensAfter;
         break;
       }

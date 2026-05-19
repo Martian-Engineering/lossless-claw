@@ -5,6 +5,7 @@
  * full-text search, and sub-agent expansion.
  */
 import { join } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "../openclaw-bridge.js";
@@ -209,6 +210,15 @@ type RuntimeLlm = {
   complete: RuntimeLlmCompleteFn;
 };
 
+type ReadEnvFn = (key: string) => string | undefined;
+
+type CompleteSimpleOptions = {
+  apiKey?: string;
+  maxTokens: number;
+  temperature?: number;
+  reasoning?: string;
+};
+
 type RuntimeModelRequestAuthOverride =
   | {
       mode: "provider-default";
@@ -246,6 +256,30 @@ type RuntimeModelAuthResult = {
    * field, and downstream comparisons check the exact value "oauth".
    */
   mode?: string;
+};
+
+type RuntimeModelAuthModel = {
+  id: string;
+  name: string;
+  provider: string;
+  api: string;
+  reasoning?: boolean;
+  input?: string[];
+  cost: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
+  contextWindow: number;
+  maxTokens: number;
+};
+
+type RuntimeModelAuth = {
+  getApiKeyForModel?: (model: RuntimeModelAuthModel) => Promise<RuntimeModelAuthResult | undefined>;
+  resolveApiKeyForProvider?: (
+    provider: string | { provider?: string; model?: string; api?: string },
+  ) => Promise<RuntimeModelAuthResult | undefined>;
 };
 
 type SessionEndLifecycleEvent = {
@@ -1234,17 +1268,19 @@ function attachRuntimeAuthRequestTransport<TModel extends object>(
   if (!request) {
     return model;
   }
-  const next = { ...model } as TModel & Record<symbol, unknown>;
-  next[Symbol.for("openclaw.modelProviderRequestTransport")] = request;
+  const next = { ...model };
+  Object.defineProperty(next, Symbol.for("openclaw.modelProviderRequestTransport"), {
+    value: request,
+    enumerable: false,
+    configurable: true,
+  });
   return next;
 }
 
 function buildLegacyAuthFallbackWarning(): string {
   return [
     "[lcm] OpenClaw runtime.modelAuth is unavailable; using legacy auth-profiles fallback.",
-    `Stock lossless-claw 0.2.7 expects OpenClaw plugin runtime support from PR #41090 (${MODEL_AUTH_PR_URL}).`,
-    `OpenClaw 2026.3.8 and 2026.3.8-beta.1 do not include merge commit ${MODEL_AUTH_MERGE_COMMIT};`,
-    `${MODEL_AUTH_REQUIRED_RELEASE} is required for stock lossless-claw 0.2.7 without this fallback patch.`,
+    "Upgrade OpenClaw to a release with runtime.modelAuth support to use host-owned provider credential resolution.",
   ].join(" ");
 }
 
@@ -1575,8 +1611,9 @@ async function resolveApiKeyFromAuthProfiles(params: {
     const expires = credential.expires;
     const isExpired =
       typeof expires === "number" && Number.isFinite(expires) && expires > 0 && Date.now() >= expires;
+    const oauthHelper = params.piAiModule.getOAuthApiKey;
     const shouldPreferOAuthHelper =
-      typeof params.piAiModule.getOAuthApiKey === "function" &&
+      typeof oauthHelper === "function" &&
       normalizeProviderId(params.provider) === "openai-codex";
 
     if (shouldPreferOAuthHelper) {
@@ -1588,7 +1625,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
           ...(typeof credential.projectId === "string" ? { projectId: credential.projectId } : {}),
           ...(typeof credential.accountId === "string" ? { accountId: credential.accountId } : {}),
         };
-        const refreshed = await params.piAiModule.getOAuthApiKey(params.provider, {
+        const refreshed = await oauthHelper(params.provider, {
           [params.provider]: oauthCredential,
         });
         if (refreshed?.apiKey) {
@@ -1637,7 +1674,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
       return access;
     }
 
-    if (typeof params.piAiModule.getOAuthApiKey !== "function") {
+    if (typeof oauthHelper !== "function") {
       continue;
     }
 
@@ -1649,7 +1686,7 @@ async function resolveApiKeyFromAuthProfiles(params: {
         ...(typeof credential.projectId === "string" ? { projectId: credential.projectId } : {}),
         ...(typeof credential.accountId === "string" ? { accountId: credential.accountId } : {}),
       };
-      const refreshed = await params.piAiModule.getOAuthApiKey(params.provider, {
+      const refreshed = await oauthHelper(params.provider, {
         [params.provider]: oauthCredential,
       });
       if (!refreshed?.apiKey) {
@@ -2061,6 +2098,7 @@ function createLcmDependencies(
   envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(registrationConfig.openClawConfig);
   const pluginConfig = registrationConfig.pluginConfig;
   const log = createLcmLogger(api);
+  const modelAuth = getRuntimeModelAuth(api);
 
   // PR follow-up to #619: detect whether the host is authenticated via
   // Codex OAuth. When true AND the operator's `codexOAuthProfile` is
@@ -2480,7 +2518,7 @@ function wirePluginHandlers(
   deps: LcmDependencies,
   shared: SharedLcmInit,
 ): void {
-  api.on("before_reset", async (event, ctx) => {
+  api.on("before_reset", async (event: any, ctx: any) => {
     await (await shared.waitForEngine()).handleBeforeReset({
       reason: event.reason,
       sessionId: ctx.sessionId,
@@ -2490,7 +2528,7 @@ function wirePluginHandlers(
   api.on("before_prompt_build", () => ({
     prependSystemContext: LOSSLESS_RECALL_POLICY_PROMPT,
   }));
-  api.on("session_end", async (event) => {
+  api.on("session_end", async (event: any) => {
     const lifecycleEvent = event as SessionEndLifecycleEvent;
     await (await shared.waitForEngine()).handleSessionEnd({
       reason: lifecycleEvent.reason,
@@ -2504,19 +2542,19 @@ function wirePluginHandlers(
   api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
 
   api.registerTool(
-    (ctx) => createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx: any) => createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
     { name: "lcm_grep" },
   );
   api.registerTool(
-    (ctx) => createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx: any) => createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
     { name: "lcm_describe" },
   );
   api.registerTool(
-    (ctx) => createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx: any) => createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
     { name: "lcm_expand" },
   );
   api.registerTool(
-    (ctx) =>
+    (ctx: any) =>
       createLcmExpandQueryTool({
         deps,
         getLcm: shared.waitForEngine,
