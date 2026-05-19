@@ -181,6 +181,10 @@ describe("createLcmExpandQueryTool", () => {
 
     expect(tool.description).toContain("focused natural-language question");
     expect(tool.description).toContain("same full-text rules as lcm_grep");
+    const schema = tool.parameters as {
+      properties: Record<string, { description?: string }>;
+      required?: string[];
+    };
     const properties = (
       tool.parameters as {
         properties: Record<string, { description?: string }>;
@@ -190,6 +194,12 @@ describe("createLcmExpandQueryTool", () => {
     expect(properties.query?.description).toContain("FTS5 defaults to AND matching");
     expect(properties.query?.description).toContain("Use 1-3 distinctive terms or a quoted phrase");
     expect(properties.prompt?.description).toContain("Put the answer request here, not in query");
+    expect(properties.timeoutMs?.description).toContain("dynamic tool RPC timeout");
+    expect(properties.timeoutMs).toMatchObject({
+      default: 150000,
+      minimum: 1,
+    });
+    expect(schema.required).toContain("timeoutMs");
   });
 
   it("returns a focused delegated answer for explicit summaryIds", async () => {
@@ -1095,6 +1105,67 @@ describe("createLcmExpandQueryTool", () => {
       {
         paramsTimeoutMs: 300000,
         timeoutMs: 300000,
+      },
+    ]);
+  });
+
+  it("caps delegated wait below caller-provided dynamic tool timeout", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    const waitCalls: Array<{ paramsTimeoutMs?: unknown; timeoutMs?: unknown }> = [];
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as {
+        method?: string;
+        params?: Record<string, unknown>;
+        timeoutMs?: unknown;
+      };
+      if (request.method === "agent") {
+        return { runId: "run-timeout-capped" };
+      }
+      if (request.method === "agent.wait") {
+        waitCalls.push({
+          paramsTimeoutMs: request.params?.timeoutMs,
+          timeoutMs: request.timeoutMs,
+        });
+        return { status: "timeout" };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const deps = makeDeps();
+    const tool = createLcmExpandQueryTool({
+      deps: {
+        ...deps,
+        config: {
+          ...deps.config,
+          delegationTimeoutMs: 120000,
+        },
+      },
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-timeout-capped", {
+      summaryIds: ["sum_a"],
+      prompt: "Summarize root cause",
+      conversationId: 42,
+      timeoutMs: 60000,
+    });
+
+    expect(result.details).toMatchObject({
+      error: "lcm_expand_query timed out waiting for delegated expansion (30s).",
+    });
+    expect(waitCalls).toEqual([
+      {
+        paramsTimeoutMs: 30000,
+        timeoutMs: 30000,
       },
     ]);
   });

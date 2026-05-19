@@ -143,7 +143,7 @@ describe("lcm plugin prompt hook", () => {
       "`lcm_expand_query` usage",
     );
     expect(result.prependSystemContext).toContain(
-      "lcm_expand_query(summaryIds: [\"sum_xxx\"], prompt: \"What config changes were discussed?\")",
+      "lcm_expand_query(summaryIds: [\"sum_xxx\"], prompt: \"What config changes were discussed?\", timeoutMs: 150000)",
     );
     expect(result.prependSystemContext).toContain(
       "`query` uses the same FTS5 full-text search path as `lcm_grep`",

@@ -25,51 +25,86 @@ import {
 
 const DEFAULT_DELEGATED_WAIT_TIMEOUT_MS = 120_000;
 const GATEWAY_TIMEOUT_MS = 10_000;
+const DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS = 30_000;
+const MAX_DYNAMIC_TOOL_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_ANSWER_TOKENS = 2_000;
 const DEFAULT_MAX_CONVERSATION_BUCKETS = 3;
 
-const LcmExpandQuerySchema = Type.Object({
-  summaryIds: Type.Optional(
-    Type.Array(Type.String(), {
-      description: "Summary IDs to expand (sum_xxx). Required when query is not provided.",
-    }),
-  ),
-  query: Type.Optional(
-    Type.String({
+function clampPositiveTimeoutMs(value: number): number {
+  return Math.max(1, Math.min(MAX_DYNAMIC_TOOL_TIMEOUT_MS, Math.floor(value)));
+}
+
+function resolveAdvertisedDynamicToolTimeoutMs(delegatedWaitTimeoutMs: number): number {
+  return clampPositiveTimeoutMs(delegatedWaitTimeoutMs + DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS);
+}
+
+function resolveDelegatedWaitTimeoutMs(params: {
+  configuredTimeoutMs: number;
+  requestedDynamicToolTimeoutMs?: number;
+}): number {
+  if (
+    params.requestedDynamicToolTimeoutMs == null
+    || !Number.isFinite(params.requestedDynamicToolTimeoutMs)
+    || params.requestedDynamicToolTimeoutMs <= DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS
+  ) {
+    return params.configuredTimeoutMs;
+  }
+  return Math.min(
+    params.configuredTimeoutMs,
+    Math.max(1, Math.floor(params.requestedDynamicToolTimeoutMs - DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS)),
+  );
+}
+
+function createLcmExpandQuerySchema(dynamicToolTimeoutMs: number) {
+  return Type.Object({
+    summaryIds: Type.Optional(
+      Type.Array(Type.String(), {
+        description: "Summary IDs to expand (sum_xxx). Required when query is not provided.",
+      }),
+    ),
+    query: Type.Optional(
+      Type.String({
+        description:
+          "FTS5 query used to find summaries via the same full-text search path as lcm_grep before expansion. Use 1-3 distinctive terms or a quoted phrase; FTS5 defaults to AND matching, so extra terms make matches stricter. Required when summaryIds is not provided.",
+      }),
+    ),
+    prompt: Type.String({
       description:
-        "FTS5 query used to find summaries via the same full-text search path as lcm_grep before expansion. Use 1-3 distinctive terms or a quoted phrase; FTS5 defaults to AND matching, so extra terms make matches stricter. Required when summaryIds is not provided.",
+        "Natural-language question or task to answer using expanded context. Put the answer request here, not in query.",
     }),
-  ),
-  prompt: Type.String({
-    description:
-      "Natural-language question or task to answer using expanded context. Put the answer request here, not in query.",
-  }),
-  conversationId: Type.Optional(
-    Type.Number({
+    conversationId: Type.Optional(
+      Type.Number({
+        description:
+          "Physical conversation ID to scope expansion to. If omitted, uses the current session family.",
+      }),
+    ),
+    allConversations: Type.Optional(
+      Type.Boolean({
+        description:
+          "Set true to explicitly allow cross-conversation lookup. Ignored when conversationId is provided.",
+      }),
+    ),
+    maxTokens: Type.Optional(
+      Type.Number({
+        description: `Maximum answer tokens to target (default: ${DEFAULT_MAX_ANSWER_TOKENS}).`,
+        minimum: 1,
+      }),
+    ),
+    tokenCap: Type.Optional(
+      Type.Number({
+        description:
+          "Expansion retrieval token budget across all delegated lcm_expand calls for this query.",
+        minimum: 1,
+      }),
+    ),
+    timeoutMs: Type.Number({
       description:
-        "Physical conversation ID to scope expansion to. If omitted, uses the current session family.",
-    }),
-  ),
-  allConversations: Type.Optional(
-    Type.Boolean({
-      description:
-        "Set true to explicitly allow cross-conversation lookup. Ignored when conversationId is provided.",
-    }),
-  ),
-  maxTokens: Type.Optional(
-    Type.Number({
-      description: `Maximum answer tokens to target (default: ${DEFAULT_MAX_ANSWER_TOKENS}).`,
+        "Total OpenClaw dynamic tool RPC timeout in milliseconds. Use the default value unless the user asks for a shorter recall attempt; this keeps delegated recall open before the host watchdog fires.",
+      default: dynamicToolTimeoutMs,
       minimum: 1,
     }),
-  ),
-  tokenCap: Type.Optional(
-    Type.Number({
-      description:
-        "Expansion retrieval token budget across all delegated lcm_expand calls for this query.",
-      minimum: 1,
-    }),
-  ),
-});
+  });
+}
 
 type ConversationBreakdown = {
   conversationId: number;
@@ -947,9 +982,11 @@ export function createLcmExpandQueryTool(input: {
   /** Session key for scope fallback when sessionId is unavailable. */
   sessionKey?: string;
 }): AnyAgentTool {
-  const delegatedWaitTimeoutMs =
+  const configuredDelegatedWaitTimeoutMs =
     input.deps.config.delegationTimeoutMs || DEFAULT_DELEGATED_WAIT_TIMEOUT_MS;
-  const delegatedWaitTimeoutSeconds = Math.ceil(delegatedWaitTimeoutMs / 1000);
+  const advertisedDynamicToolTimeoutMs = resolveAdvertisedDynamicToolTimeoutMs(
+    configuredDelegatedWaitTimeoutMs,
+  );
 
   return {
     name: "lcm_expand_query",
@@ -958,7 +995,7 @@ export function createLcmExpandQueryTool(input: {
       "Answer a focused natural-language question using delegated LCM expansion. " +
       "Find candidate summaries (by IDs or a short FTS5 query that follows the same full-text rules as lcm_grep), expand them in a delegated sub-agent, " +
       "and return a compact prompt-focused answer. Tool output includes cited summary IDs for follow-up.",
-    parameters: LcmExpandQuerySchema,
+    parameters: createLcmExpandQuerySchema(advertisedDynamicToolTimeoutMs),
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
@@ -980,6 +1017,15 @@ export function createLcmExpandQueryTool(input: {
         typeof requestedTokenCap === "number" && Number.isFinite(requestedTokenCap)
           ? Math.max(1, requestedTokenCap)
           : Math.max(1, Math.trunc(input.deps.config.maxExpandTokens));
+      const requestedDynamicToolTimeoutMs =
+        typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs)
+          ? clampPositiveTimeoutMs(p.timeoutMs)
+          : undefined;
+      const delegatedWaitTimeoutMs = resolveDelegatedWaitTimeoutMs({
+        configuredTimeoutMs: configuredDelegatedWaitTimeoutMs,
+        requestedDynamicToolTimeoutMs,
+      });
+      const delegatedWaitTimeoutSeconds = Math.ceil(delegatedWaitTimeoutMs / 1000);
 
       if (!prompt) {
         return jsonResult({
