@@ -98,6 +98,10 @@ export type LcmConfig = {
   leafChunkTokens: number;
   /** Optional target for summarized-prefix tokens after a full sweep. */
   summaryPrefixTargetTokens?: number;
+  /** Hard cap on per-pass iterations within a single full sweep (default 12). */
+  maxSweepIterations: number;
+  /** Wall-clock budget for a single full sweep, in milliseconds (default 120000). */
+  sweepDeadlineMs: number;
   /** Maximum raw parent-history tokens imported during first-time bootstrap. */
   bootstrapMaxTokens?: number;
   leafTargetTokens: number;
@@ -359,6 +363,16 @@ export function resolveLcmConfigWithDiagnostics(
     parseFiniteInt(env.LCM_SUMMARY_PREFIX_TARGET_TOKENS)
       ?? toNumber(pc.summaryPrefixTargetTokens),
   );
+  const resolvedMaxSweepIterations =
+    toPositiveInteger(
+      parseFiniteInt(env.LCM_MAX_SWEEP_ITERATIONS)
+        ?? toNumber(pc.maxSweepIterations),
+    ) ?? 12;
+  const resolvedSweepDeadlineMs =
+    toPositiveInteger(
+      parseFiniteInt(env.LCM_SWEEP_DEADLINE_MS)
+        ?? toNumber(pc.sweepDeadlineMs),
+    ) ?? 120_000;
   const envDelegationTimeoutMs =
     env.LCM_DELEGATION_TIMEOUT_MS !== undefined
       ? toNumber(env.LCM_DELEGATION_TIMEOUT_MS)
@@ -471,6 +485,8 @@ export function resolveLcmConfigWithDiagnostics(
       incrementalMaxDepth: resolvedSweepMaxDepth,
       leafChunkTokens: resolvedLeafChunkTokens,
       summaryPrefixTargetTokens: resolvedSummaryPrefixTargetTokens,
+      maxSweepIterations: resolvedMaxSweepIterations,
+      sweepDeadlineMs: resolvedSweepDeadlineMs,
       bootstrapMaxTokens: resolvedBootstrapMaxTokens,
       leafTargetTokens:
         parseFiniteInt(env.LCM_LEAF_TARGET_TOKENS)

@@ -36,6 +36,8 @@ describe("resolveLcmConfig", () => {
     expect(config.incrementalMaxDepth).toBe(1);
     expect(config.leafChunkTokens).toBe(20000);
     expect(config.summaryPrefixTargetTokens).toBeUndefined();
+    expect(config.maxSweepIterations).toBe(12);
+    expect(config.sweepDeadlineMs).toBe(120_000);
     expect(config.leafMinFanout).toBe(8);
     expect(config.condensedMinFanout).toBe(4);
     expect(config.condensedMinFanoutHard).toBe(2);
@@ -78,6 +80,8 @@ describe("resolveLcmConfig", () => {
       newSessionRetainDepth: 3,
       incrementalMaxDepth: -1,
       summaryPrefixTargetTokens: 48000,
+      maxSweepIterations: 6,
+      sweepDeadlineMs: 45000,
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:ephemeral:**"],
       skipStatelessSessions: false,
@@ -123,6 +127,8 @@ describe("resolveLcmConfig", () => {
     expect(config.sweepMaxDepth).toBe(2);
     expect(config.incrementalMaxDepth).toBe(2);
     expect(config.summaryPrefixTargetTokens).toBe(48000);
+    expect(config.maxSweepIterations).toBe(6);
+    expect(config.sweepDeadlineMs).toBe(45000);
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
     expect(config.pruneHeartbeatOk).toBe(true);
@@ -179,6 +185,8 @@ describe("resolveLcmConfig", () => {
       LCM_SWEEP_MAX_DEPTH: "4",
       LCM_INCREMENTAL_MAX_DEPTH: "3",
       LCM_SUMMARY_PREFIX_TARGET_TOKENS: "45000",
+      LCM_MAX_SWEEP_ITERATIONS: "8",
+      LCM_SWEEP_DEADLINE_MS: "90000",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
@@ -188,6 +196,8 @@ describe("resolveLcmConfig", () => {
       sweepMaxDepth: 2,
       incrementalMaxDepth: -1,
       summaryPrefixTargetTokens: 32000,
+      maxSweepIterations: 4,
+      sweepDeadlineMs: 30000,
       ignoreSessionPatterns: ["agent:*:test:*"],
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
@@ -242,6 +252,8 @@ describe("resolveLcmConfig", () => {
     expect(config.sweepMaxDepth).toBe(4); // new env wins deprecated env/config
     expect(config.incrementalMaxDepth).toBe(4); // alias mirrors sweepMaxDepth
     expect(config.summaryPrefixTargetTokens).toBe(45000); // env wins
+    expect(config.maxSweepIterations).toBe(8); // env wins
+    expect(config.sweepDeadlineMs).toBe(90000); // env wins
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
       cacheTTLSeconds: 600,

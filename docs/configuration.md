@@ -33,6 +33,8 @@ Most installations only need to override a handful of keys. If you want a comple
   "incrementalMaxDepth": 1,
   "leafChunkTokens": 20000,
   "summaryPrefixTargetTokens": 20000,
+  "maxSweepIterations": 12,
+  "sweepDeadlineMs": 120000,
   "bootstrapMaxTokens": 6000,
   "leafTargetTokens": 2400,
   "condensedTargetTokens": 2000,
@@ -156,6 +158,8 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `incrementalMaxDepth` | `integer` | alias of `sweepMaxDepth` | `LCM_INCREMENTAL_MAX_DEPTH` | Deprecated alias for `sweepMaxDepth`. Kept so existing configs continue to load. |
 | `leafChunkTokens` | `integer` | `20000` | `LCM_LEAF_CHUNK_TOKENS` | Maximum source-token budget for a leaf compaction chunk. Larger chunks reduce sweep frequency at the cost of slower individual summary calls. |
 | `summaryPrefixTargetTokens` | `integer` | derived | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | Optional target for summarized-prefix tokens after a full sweep. If unset, Lossless derives `max(condensedTargetTokens, min(leafChunkTokens, floor(contextThreshold * tokenBudget * 0.5)))`. |
+| `maxSweepIterations` | `integer` | `12` | `LCM_MAX_SWEEP_ITERATIONS` | Hard cap on summarizer passes within a single full sweep. On hitting the cap the sweep stops cleanly and returns the partial result; bounds how long a sweep can run on the turn-critical path. |
+| `sweepDeadlineMs` | `integer` | `120000` | `LCM_SWEEP_DEADLINE_MS` | Wall-clock budget for a single full sweep, in milliseconds. When exceeded the sweep stops before starting another pass, so a slow or rate-limited summarizer cannot hang the agent turn. |
 | `bootstrapMaxTokens` | `integer` | `max(6000, floor(leafChunkTokens * 0.3))` | `LCM_BOOTSTRAP_MAX_TOKENS` | Maximum parent-history tokens imported when a new LCM conversation bootstraps. |
 | `leafTargetTokens` | `integer` | `2400` | `LCM_LEAF_TARGET_TOKENS` | Prompt target for leaf summary size. |
 | `condensedTargetTokens` | `integer` | `2000` | `LCM_CONDENSED_TARGET_TOKENS` | Prompt target for condensed summary size. |
@@ -222,6 +226,8 @@ Automatic compaction is threshold-only:
 Lossless still records prompt-cache telemetry for status and diagnostics, but cache hotness no longer delays threshold debt. Legacy `cacheAwareCompaction.*` and `dynamicLeafChunkTokens.*` settings remain accepted so existing OpenClaw config continues to load, but they do not change automatic compaction behavior.
 
 Full sweeps first run leaf passes until there are no more eligible raw-message chunks outside the fresh tail. Condensation is then driven by summarized-prefix pressure: the routine condensation phase obeys `sweepMaxDepth`, and if the summarized prefix still exceeds `summaryPrefixTargetTokens`, a pressure phase may use `condensedMinFanoutHard` and condense deeper. Total context pressure starts the sweep, but does not by itself force deeper condensation once the raw prefix has been summarized.
+
+A single sweep is bounded by both `maxSweepIterations` (a hard cap on summarizer passes) and `sweepDeadlineMs` (a wall-clock budget). When either limit is reached the sweep stops before starting another pass and returns the consistent partial result built so far, logging a `compactFullSweep stopped at …` warning. This keeps a slow or rate-limited summarizer from hanging the agent turn — remaining context pressure is picked up by the next sweep.
 
 ### Prompt-aware eviction
 

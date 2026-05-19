@@ -56,6 +56,14 @@
       "label": "Summary Prefix Target Tokens",
       "help": "Optional target for summarized-prefix tokens after a full sweep. When omitted, Lossless derives a pressure target from contextThreshold and leafChunkTokens."
     },
+    "maxSweepIterations": {
+      "label": "Max Sweep Iterations",
+      "help": "Hard cap on summarizer passes within a single full compaction sweep (default 12). Bounds how long a sweep can run on the turn-critical path; on hitting the cap the sweep stops cleanly with a partial result."
+    },
+    "sweepDeadlineMs": {
+      "label": "Sweep Deadline (ms)",
+      "help": "Wall-clock budget for a single full compaction sweep, in milliseconds (default 120000). When exceeded the sweep stops before starting another pass, so a slow or rate-limited summarizer cannot hang the agent turn."
+    },
     "bootstrapMaxTokens": {
       "label": "Bootstrap Max Tokens",
       "help": "Maximum raw parent-history tokens imported into a brand-new conversation bootstrap; oldest turns are dropped first"
@@ -292,6 +300,14 @@
         "minimum": 1
       },
       "summaryPrefixTargetTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "maxSweepIterations": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "sweepDeadlineMs": {
         "type": "integer",
         "minimum": 1
       },

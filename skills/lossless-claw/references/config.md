@@ -163,6 +163,26 @@ Why it matters:
 - When unset, Lossless derives a target from `contextThreshold`, the active token budget, and `leafChunkTokens`.
 - Sweeps first exhaust eligible raw-message leaf chunks, then honor `sweepMaxDepth`; pressure condensation can go deeper only when summary-prefix pressure remains.
 
+### `maxSweepIterations`
+
+Hard cap on summarizer passes within a single full sweep. Default `12`.
+
+Why it matters:
+
+- A large conversation can otherwise drive an unbounded number of leaf/condensed passes in one sweep.
+- On hitting the cap the sweep stops cleanly and returns the partial result; the next sweep resumes the remaining work.
+- Bounds how long a sweep can run on the turn-critical path (the `assemble()` deferred-debt drain).
+
+### `sweepDeadlineMs`
+
+Wall-clock budget for a single full sweep, in milliseconds. Default `120000`.
+
+Why it matters:
+
+- A slow or rate-limited summarizer can burn a full `summaryTimeoutMs` per pass; without a deadline, many passes compound into tens of minutes.
+- When the deadline is exceeded the sweep stops before starting another pass and returns the partial result.
+- Pairs with `maxSweepIterations`: whichever limit is reached first stops the sweep.
+
 ### `incrementalMaxDepth`
 
 Deprecated alias for `sweepMaxDepth`.
@@ -385,6 +405,22 @@ See high-impact settings above.
 Env override:
 
 - `LCM_SUMMARY_PREFIX_TARGET_TOKENS`
+
+### `maxSweepIterations`
+
+See high-impact settings above.
+
+Env override:
+
+- `LCM_MAX_SWEEP_ITERATIONS`
+
+### `sweepDeadlineMs`
+
+See high-impact settings above.
+
+Env override:
+
+- `LCM_SWEEP_DEADLINE_MS`
 
 ### `incrementalMaxDepth`
 

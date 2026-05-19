@@ -69,6 +69,18 @@ export interface CompactionConfig {
   condensedTargetTokens: number;
   /** Maximum compaction rounds (default 10) */
   maxRounds: number;
+  /**
+   * Hard cap on per-pass iterations within a single full sweep (default 12).
+   * Bounds Phase 1 leaf passes and Phase 2 condensed passes so a large
+   * conversation cannot trigger an unbounded sweep on the turn-critical path.
+   */
+  maxSweepIterations?: number;
+  /**
+   * Wall-clock budget for a single full sweep, in milliseconds (default
+   * 120000). When exceeded, the sweep stops cleanly and returns the
+   * consistent partial result instead of starting another pass.
+   */
+  sweepDeadlineMs?: number;
   /** IANA timezone for timestamps in summaries (default: UTC) */
   timezone?: string;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
@@ -193,6 +205,34 @@ function generateSummaryId(content: string): string {
 /** Maximum estimated tokens for the deterministic fallback truncation. */
 const FALLBACK_MAX_TOKENS = 512;
 const DEFAULT_LEAF_CHUNK_TOKENS = 20_000;
+
+/**
+ * Default hard cap on per-pass iterations within a single full sweep. Each
+ * pass summarizes one raw or summary chunk; large conversations would
+ * otherwise drive an unbounded number of passes (observed: 16 passes on a
+ * 308K-token conversation), each potentially burning a full summarizer
+ * timeout on the turn-critical path.
+ */
+const DEFAULT_MAX_SWEEP_ITERATIONS = 12;
+
+/**
+ * Default wall-clock budget for a single full sweep, in milliseconds. Once a
+ * sweep has run this long it stops before starting another pass and returns
+ * the consistent partial result, so a slow/rate-limited summarizer cannot
+ * hang the agent turn for tens of minutes.
+ */
+const DEFAULT_SWEEP_DEADLINE_MS = 120_000;
+
+/**
+ * Yield the Node event loop for one macrotask. Each leaf/condensed pass runs
+ * synchronous `node:sqlite` scans that block the event loop; awaiting this
+ * between passes lets the gateway service other work during a long sweep.
+ */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+}
 
 /**
  * Pattern matching MEDIA:/... file path references that appear in message content
@@ -781,16 +821,59 @@ export class CompactionEngine {
     let hadAuthFailure = false;
     let stoppedForNoProgress = false;
 
+    // Sweep bounds: a single full sweep must not run an unbounded number of
+    // summarizer passes, nor exceed a wall-clock budget. Both phases share
+    // these counters so the *total* sweep stays bounded — important because
+    // this can run inline on the turn-critical path (assemble() deferred-debt
+    // drain). On hitting either limit the sweep stops cleanly and returns the
+    // consistent partial result built so far.
+    const maxSweepIterations = this.resolveMaxSweepIterations();
+    const sweepDeadlineMs = this.resolveSweepDeadlineMs();
+    const sweepStartedAt = Date.now();
+    const sweepDeadlineAt = sweepStartedAt + sweepDeadlineMs;
+    let sweepIterations = 0;
+    let stoppedAtBudget = false;
+    /**
+     * Check whether another pass is permitted. Logs a single warning the
+     * first time a limit is hit, then returns false for all later checks.
+     */
+    const sweepBudgetExhausted = (phase: "leaf" | "condensed"): boolean => {
+      if (stoppedAtBudget) {
+        return true;
+      }
+      const hitIterationCap = sweepIterations >= maxSweepIterations;
+      const hitDeadline = Date.now() >= sweepDeadlineAt;
+      if (hitIterationCap || hitDeadline) {
+        stoppedAtBudget = true;
+        const limit = hitIterationCap
+          ? `iteration cap ${maxSweepIterations}`
+          : `wall-clock deadline ${sweepDeadlineMs}ms`;
+        this.log.warn(
+          `[lcm] compactFullSweep stopped at ${limit} in ${phase} phase: ` +
+            `conversation=${conversationId} passes=${sweepIterations} ` +
+            `elapsedMs=${Date.now() - sweepStartedAt} ` +
+            `tokensBefore=${tokensBefore} tokensSoFar=${runningTokens} ` +
+            `(returning partial result)`,
+        );
+        return true;
+      }
+      return false;
+    };
+
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
     // Delta tracking: maintain a running token count instead of re-querying DB
     // after each pass. The arithmetic is exact: tokensAfter = tokensBefore - removed + added.
     let runningTokens = tokensBefore;
     while (true) {
+      if (sweepBudgetExhausted("leaf")) {
+        break;
+      }
       const leafChunk = await this.selectOldestLeafChunk(conversationId);
       if (leafChunk.items.length === 0) {
         break;
       }
 
+      sweepIterations++;
       const passTokensBefore = runningTokens;
       const leafResult = await this.leafPass(
         conversationId,
@@ -823,6 +906,9 @@ export class CompactionEngine {
         break;
       }
       previousTokens = passTokensAfter;
+      // Yield the event loop between the synchronous node:sqlite scans so a
+      // long sweep does not freeze the gateway for its entire duration.
+      await yieldToEventLoop();
     }
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.
@@ -850,6 +936,7 @@ export class CompactionEngine {
         return "depth-cap";
       }
 
+      sweepIterations++;
       const passTokensBefore = runningTokens;
       const condenseResult = await this.condensedPass(
         conversationId,
@@ -894,6 +981,9 @@ export class CompactionEngine {
     };
 
     while (await hasCondensationPressure()) {
+      if (sweepBudgetExhausted("condensed")) {
+        break;
+      }
       const status = await runCondensationPass({
         enforcePreferredDepth: true,
         useHardFanout: hardTrigger === true,
@@ -904,13 +994,19 @@ export class CompactionEngine {
         }
         break;
       }
+      // Yield between the synchronous node:sqlite scans of consecutive passes.
+      await yieldToEventLoop();
     }
 
     while (
       !hadAuthFailure &&
       !stoppedForNoProgress &&
+      !stoppedAtBudget &&
       await hasCondensationPressure()
     ) {
+      if (sweepBudgetExhausted("condensed")) {
+        break;
+      }
       const status = await runCondensationPass({
         enforcePreferredDepth: false,
         useHardFanout: true,
@@ -921,6 +1017,8 @@ export class CompactionEngine {
         }
         break;
       }
+      // Yield between the synchronous node:sqlite scans of consecutive passes.
+      await yieldToEventLoop();
     }
 
     const tokensAfter = runningTokens;
@@ -1358,6 +1456,24 @@ export class CompactionEngine {
       if (configured > 0) return Math.floor(configured);
     }
     return 0;
+  }
+
+  /** Resolve the hard per-pass iteration cap for a single full sweep. */
+  private resolveMaxSweepIterations(): number {
+    const configured = this.config.maxSweepIterations;
+    if (typeof configured === "number" && Number.isFinite(configured) && configured >= 1) {
+      return Math.floor(configured);
+    }
+    return DEFAULT_MAX_SWEEP_ITERATIONS;
+  }
+
+  /** Resolve the wall-clock budget (ms) for a single full sweep. */
+  private resolveSweepDeadlineMs(): number {
+    const configured = this.config.sweepDeadlineMs;
+    if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
+      return Math.floor(configured);
+    }
+    return DEFAULT_SWEEP_DEADLINE_MS;
   }
 
   /** Resolve the summarized-prefix pressure target for this token budget. */
