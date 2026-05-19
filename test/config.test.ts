@@ -39,7 +39,7 @@ describe("resolveLcmConfig", () => {
     expect(config.leafMinFanout).toBe(8);
     expect(config.condensedMinFanout).toBe(4);
     expect(config.condensedMinFanoutHard).toBe(2);
-    expect(config.leafTargetTokens).toBe(2400);
+    expect(config.leafTargetTokens).toBe(4000); // v4.1 (A.10): raised from 2400
     expect(config.summaryProvider).toBe("");
     expect(config.summaryModel).toBe("");
     expect(config.pruneHeartbeatOk).toBe(false);
