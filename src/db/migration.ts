@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { getLcmDbFeatures } from "./features.js";
 import { buildMessageIdentityHash } from "../store/message-identity.js";
 import { parseUtcTimestampOrNull } from "../store/parse-utc-timestamp.js";
+import { seedDefaultPrompts } from "../synthesis/seed-default-prompts.js";
 
 type MigrationLogger = {
   info?: (message: string) => void;
@@ -956,15 +957,20 @@ export function runLcmMigrations(
     fts5Available?: boolean;
     log?: MigrationLogger;
     /**
-     * Accepted for forward-compatibility. This migration creates the
-     * lcm_prompt_registry table; seeding it with default prompts is
-     * performed by the synthesis layer in a later PR. Until then this
-     * option is a no-op (schema/concurrency tests pass `false`).
+     * When true (production default), seeds the §12 default prompts into
+     * lcm_prompt_registry if not already present. Tests pass `false` to
+     * keep the registry empty so they can register their own prompts at
+     * version 1 without UNIQUE collision with the seed.
+     *
+     * v4.1 Final.review.2 — caught by smoke test that the registry was
+     * empty in production, causing dispatchSynthesis + lcm_synthesize_around
+     * to return missing_prompt on every call.
      */
     seedDefaultPrompts?: boolean;
   },
 ): void {
   const log = options?.log;
+  const seedPrompts = options?.seedDefaultPrompts !== false; // default true
   let transactionActive = false;
   // v4.2 adversarial review P1: prevent instant SQLITE_BUSY when the
   // gateway has a writer in flight on the live DB.
@@ -1523,6 +1529,23 @@ export function runLcmMigrations(
           )
       `);
     });
+
+    // v4.1 Final.review.2 — seed default prompts from §12 Appendix A.
+    // Without this step, dispatchSynthesis + lcm_synthesize_around return
+    // `missing_prompt` errors on every call (the registry table is created
+    // but no row inserts happen). Caught by the v4.1-synthesize-around-smoke.mjs.
+    // Idempotent: only seeds prompts where the (memory_type, tier_label,
+    // pass_kind) triple has NO existing rows. Operator-registered prompts
+    // (which would have version > 1 OR a different active state) are NEVER
+    // overwritten.
+    if (seedPrompts) {
+      runMigrationStep("seedDefaultSynthesisPrompts", log, () => {
+        const result = seedDefaultPrompts(db);
+        log?.info?.(
+          `[migration] seedDefaultSynthesisPrompts: seeded=${result.seeded} skipped=${result.skipped}`,
+        );
+      });
+    }
 
     // v4.1 Final.review.3 (Loop 4 Bug 4.4) — widen lcm_synthesis_cache.tier_label
     // CHECK to include all tier values dispatch may produce. Original CHECK
