@@ -2952,6 +2952,7 @@ export class LcmContextEngine implements ContextEngine {
       summaryPrefixTargetTokens: this.config.summaryPrefixTargetTokens,
       maxSweepIterations: this.config.maxSweepIterations,
       sweepDeadlineMs: this.config.sweepDeadlineMs,
+      compactUntilUnderDeadlineMs: this.config.compactUntilUnderDeadlineMs,
       leafTargetTokens: this.config.leafTargetTokens,
       condensedTargetTokens: this.config.condensedTargetTokens,
       maxRounds: 10,

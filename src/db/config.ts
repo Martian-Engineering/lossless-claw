@@ -102,6 +102,8 @@ export type LcmConfig = {
   maxSweepIterations: number;
   /** Wall-clock budget for a single full sweep, in milliseconds (default 120000). */
   sweepDeadlineMs: number;
+  /** Wall-clock budget for a whole compactUntilUnder run, in milliseconds (default 300000). */
+  compactUntilUnderDeadlineMs: number;
   /** Maximum raw parent-history tokens imported during first-time bootstrap. */
   bootstrapMaxTokens?: number;
   leafTargetTokens: number;
@@ -373,6 +375,11 @@ export function resolveLcmConfigWithDiagnostics(
       parseFiniteInt(env.LCM_SWEEP_DEADLINE_MS)
         ?? toNumber(pc.sweepDeadlineMs),
     ) ?? 120_000;
+  const resolvedCompactUntilUnderDeadlineMs =
+    toPositiveInteger(
+      parseFiniteInt(env.LCM_COMPACT_UNTIL_UNDER_DEADLINE_MS)
+        ?? toNumber(pc.compactUntilUnderDeadlineMs),
+    ) ?? 300_000;
   const envDelegationTimeoutMs =
     env.LCM_DELEGATION_TIMEOUT_MS !== undefined
       ? toNumber(env.LCM_DELEGATION_TIMEOUT_MS)
@@ -487,6 +494,7 @@ export function resolveLcmConfigWithDiagnostics(
       summaryPrefixTargetTokens: resolvedSummaryPrefixTargetTokens,
       maxSweepIterations: resolvedMaxSweepIterations,
       sweepDeadlineMs: resolvedSweepDeadlineMs,
+      compactUntilUnderDeadlineMs: resolvedCompactUntilUnderDeadlineMs,
       bootstrapMaxTokens: resolvedBootstrapMaxTokens,
       leafTargetTokens:
         parseFiniteInt(env.LCM_LEAF_TARGET_TOKENS)

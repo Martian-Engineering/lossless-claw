@@ -64,6 +64,10 @@
       "label": "Sweep Deadline (ms)",
       "help": "Wall-clock budget for a single full compaction sweep, in milliseconds (default 120000). When exceeded the sweep stops before starting another pass, so a slow or rate-limited summarizer cannot hang the agent turn."
     },
+    "compactUntilUnderDeadlineMs": {
+      "label": "Compact-Until-Under Deadline (ms)",
+      "help": "Wall-clock budget for a whole compact-until-under operation, in milliseconds (default 300000). A compact-until-under run executes several sweeps; this caps the total so it cannot run maxRounds times the per-sweep deadline (~20 minutes at defaults)."
+    },
     "bootstrapMaxTokens": {
       "label": "Bootstrap Max Tokens",
       "help": "Maximum raw parent-history tokens imported into a brand-new conversation bootstrap; oldest turns are dropped first"
@@ -308,6 +312,10 @@
         "minimum": 1
       },
       "sweepDeadlineMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "compactUntilUnderDeadlineMs": {
         "type": "integer",
         "minimum": 1
       },

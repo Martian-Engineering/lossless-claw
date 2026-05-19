@@ -81,6 +81,15 @@ export interface CompactionConfig {
    * consistent partial result instead of starting another pass.
    */
   sweepDeadlineMs?: number;
+  /**
+   * Wall-clock budget for a whole `compactUntilUnder` operation, in
+   * milliseconds (default 300000). `compactUntilUnder` runs up to
+   * `maxRounds` sweeps, each of which re-arms its own `sweepDeadlineMs`;
+   * without an operation-wide budget the worst case is `maxRounds ×
+   * sweepDeadlineMs`. When exceeded, `compactUntilUnder` stops before the
+   * next round and returns the consistent partial result.
+   */
+  compactUntilUnderDeadlineMs?: number;
   /** IANA timezone for timestamps in summaries (default: UTC) */
   timezone?: string;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
@@ -222,6 +231,16 @@ const DEFAULT_MAX_SWEEP_ITERATIONS = 12;
  * hang the agent turn for tens of minutes.
  */
 const DEFAULT_SWEEP_DEADLINE_MS = 120_000;
+
+/**
+ * Default wall-clock budget for a whole `compactUntilUnder` operation, in
+ * milliseconds. `compactUntilUnder` runs up to `maxRounds` sweeps, each of
+ * which re-arms its own `DEFAULT_SWEEP_DEADLINE_MS`; without an
+ * operation-wide budget the worst case is `maxRounds × sweepDeadlineMs`
+ * (~20 minutes at the defaults). 5 minutes leaves room for a few
+ * full-deadline sweeps while capping the worst case well below that.
+ */
+const DEFAULT_COMPACT_UNTIL_UNDER_DEADLINE_MS = 300_000;
 
 /**
  * Yield the Node event loop for one macrotask. Each leaf/condensed pass runs
@@ -612,6 +631,8 @@ export class CompactionEngine {
     /** Optional persisted-context target used when host runtime overhead is known. */
     stopAtTokens?: number;
     summaryModel?: string;
+    /** Optional operation-wide wall-clock deadline shared across rounds. */
+    operationDeadlineAt?: number;
   }): Promise<CompactionResult> {
     return this.withContextCache(() => this.compactFullSweep(input));
   }
@@ -777,6 +798,14 @@ export class CompactionEngine {
     /** Optional persisted-context target used when host runtime overhead is known. */
     stopAtTokens?: number;
     summaryModel?: string;
+    /**
+     * Optional absolute wall-clock deadline (epoch ms) shared by a
+     * multi-round caller (`compactUntilUnder`). When set, the sweep stops
+     * at whichever is sooner — its own `sweepDeadlineMs` or this deadline —
+     * so per-round sweeps cannot each re-arm a fresh full budget and let
+     * the whole operation run `maxRounds × sweepDeadlineMs`.
+     */
+    operationDeadlineAt?: number;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
@@ -827,10 +856,20 @@ export class CompactionEngine {
     // this can run inline on the turn-critical path (assemble() deferred-debt
     // drain). On hitting either limit the sweep stops cleanly and returns the
     // consistent partial result built so far.
+    //
+    // When a multi-round caller (compactUntilUnder) passes operationDeadlineAt,
+    // the sweep stops at whichever is sooner: its own sweepDeadlineMs or the
+    // operation-wide deadline. Without this clamp each round re-arms a fresh
+    // full sweepDeadlineMs and the whole operation can run maxRounds × that.
     const maxSweepIterations = this.resolveMaxSweepIterations();
     const sweepDeadlineMs = this.resolveSweepDeadlineMs();
     const sweepStartedAt = Date.now();
-    const sweepDeadlineAt = sweepStartedAt + sweepDeadlineMs;
+    const ownSweepDeadlineAt = sweepStartedAt + sweepDeadlineMs;
+    const sweepDeadlineAt =
+      typeof input.operationDeadlineAt === "number" &&
+      Number.isFinite(input.operationDeadlineAt)
+        ? Math.min(ownSweepDeadlineAt, input.operationDeadlineAt)
+        : ownSweepDeadlineAt;
     let sweepIterations = 0;
     let stoppedAtBudget = false;
     /**
@@ -845,9 +884,13 @@ export class CompactionEngine {
       const hitDeadline = Date.now() >= sweepDeadlineAt;
       if (hitIterationCap || hitDeadline) {
         stoppedAtBudget = true;
+        const clampedByOperation =
+          hitDeadline && sweepDeadlineAt < ownSweepDeadlineAt;
         const limit = hitIterationCap
           ? `iteration cap ${maxSweepIterations}`
-          : `wall-clock deadline ${sweepDeadlineMs}ms`;
+          : clampedByOperation
+            ? `compactUntilUnder operation deadline`
+            : `wall-clock deadline ${sweepDeadlineMs}ms`;
         this.log.warn(
           `[lcm] compactFullSweep stopped at ${limit} in ${phase} phase: ` +
             `conversation=${conversationId} passes=${sweepIterations} ` +
@@ -1080,13 +1123,40 @@ export class CompactionEngine {
       return { success: true, rounds: 0, finalTokens: lastTokens };
     }
 
+    // Operation-wide wall-clock bound. Each round runs a compactFullSweep that
+    // re-arms its own sweepDeadlineMs; without an operation-wide deadline the
+    // worst case is maxRounds × sweepDeadlineMs (~20 min at the defaults). The
+    // shared deadline is threaded into each sweep (so a sweep stops at
+    // whichever is sooner) and checked here before starting the next round.
+    const operationDeadlineMs = this.resolveCompactUntilUnderDeadlineMs();
+    const operationStartedAt = Date.now();
+    const operationDeadlineAt = operationStartedAt + operationDeadlineMs;
+
     for (let round = 1; round <= this.config.maxRounds; round++) {
+      // Stop before starting another round once the operation budget is spent.
+      // The in-flight round may overrun by at most one clamped sweep.
+      if (round > 1 && Date.now() >= operationDeadlineAt) {
+        this.log.warn(
+          `[lcm] compactUntilUnder stopped at wall-clock deadline ` +
+            `${operationDeadlineMs}ms: conversation=${conversationId} ` +
+            `rounds=${round - 1} elapsedMs=${Date.now() - operationStartedAt} ` +
+            `finalTokens=${lastTokens} targetTokens=${targetTokens} ` +
+            `(returning partial result)`,
+        );
+        return {
+          success: lastTokens <= targetTokens,
+          rounds: round - 1,
+          finalTokens: lastTokens,
+        };
+      }
+
       const result = await this.compact({
         conversationId,
         tokenBudget,
         summarize,
         force: true,
         summaryModel: input.summaryModel,
+        operationDeadlineAt,
       });
 
       if (result.authFailure) {
@@ -1474,6 +1544,15 @@ export class CompactionEngine {
       return Math.floor(configured);
     }
     return DEFAULT_SWEEP_DEADLINE_MS;
+  }
+
+  /** Resolve the wall-clock budget (ms) for a whole compactUntilUnder run. */
+  private resolveCompactUntilUnderDeadlineMs(): number {
+    const configured = this.config.compactUntilUnderDeadlineMs;
+    if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
+      return Math.floor(configured);
+    }
+    return DEFAULT_COMPACT_UNTIL_UNDER_DEADLINE_MS;
   }
 
   /** Resolve the summarized-prefix pressure target for this token budget. */

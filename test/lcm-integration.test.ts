@@ -3233,6 +3233,142 @@ describe("LCM integration: compactFullSweep bounds", () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Test Suite: compactUntilUnder bounds
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("LCM integration: compactUntilUnder bounds", () => {
+  let convStore: ReturnType<typeof createMockConversationStore>;
+  let sumStore: ReturnType<typeof createMockSummaryStore>;
+
+  beforeEach(() => {
+    convStore = createMockConversationStore();
+    sumStore = createMockSummaryStore();
+    wireStores(convStore, sumStore);
+  });
+
+  // Config that drives many sweep rounds: a small leaf chunk plus a low
+  // per-sweep iteration cap means each compactFullSweep makes only partial
+  // progress, so compactUntilUnder keeps issuing rounds. `sweepDeadlineMs` is
+  // left large on purpose so the *operation* deadline — not the per-sweep
+  // deadline — is what must stop the loop.
+  const multiRoundConfig = (overrides: Partial<CompactionConfig>): CompactionConfig => ({
+    ...defaultCompactionConfig,
+    freshTailCount: 2,
+    leafChunkTokens: 60,
+    leafMinFanout: 1,
+    maxSweepIterations: 2,
+    sweepDeadlineMs: 100_000,
+    ...overrides,
+  });
+
+  // ~60 messages of ~12 tokens each outside a 2-message fresh tail: far more
+  // raw chunks than a single 2-iteration sweep can summarize, so reaching a
+  // tight target needs many rounds.
+  const seedManyMessages = async (): Promise<void> => {
+    await ingestMessages(convStore, sumStore, 60, {
+      contentFn: (i) => `Turn ${i}: ${"w".repeat(40)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+  };
+
+  it("stops at the operation deadline instead of running maxRounds x sweepDeadlineMs", async () => {
+    const compactUntilUnderDeadlineMs = 80;
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      // maxRounds 10 x sweepDeadlineMs 100000 => a 1000s worst case absent an
+      // operation-wide bound. The operation deadline must cap it far below that.
+      multiRoundConfig({ maxRounds: 10, compactUntilUnderDeadlineMs }),
+    );
+    await seedManyMessages();
+
+    // Each summarizer call sleeps ~20ms; a few passes spend the 80ms budget.
+    const summarize = vi.fn(async (text: string) => {
+      await new Promise((r) => setTimeout(r, 20));
+      return `S(${text.length})`;
+    });
+
+    const startedAt = Date.now();
+    const result = await engine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      // Target far below the seeded ~720 tokens so a single sweep cannot reach it.
+      targetTokens: 50,
+      summarize,
+    });
+    const elapsed = Date.now() - startedAt;
+
+    // The operation deadline is shared into each round's sweep and checked
+    // before the next round: total time may overrun by at most one clamped
+    // sweep, never maxRounds x sweepDeadlineMs.
+    expect(elapsed).toBeLessThan(compactUntilUnderDeadlineMs * 8);
+    expect(elapsed).toBeLessThan(5_000);
+    // It stopped on the deadline, not by reaching the (unreachable) target.
+    expect(result.success).toBe(false);
+    expect(result.rounds).toBeGreaterThanOrEqual(1);
+    expect(result.rounds).toBeLessThan(10);
+  });
+
+  it("returns a consistent partial result when the operation deadline is hit", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      multiRoundConfig({ maxRounds: 10, compactUntilUnderDeadlineMs: 80 }),
+    );
+    await seedManyMessages();
+
+    const summarize = vi.fn(async (text: string) => {
+      await new Promise((r) => setTimeout(r, 20));
+      return `S(${text.length})`;
+    });
+
+    const result = await engine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      targetTokens: 50,
+      summarize,
+    });
+
+    // finalTokens is the real post-compaction context size: progress was made
+    // (below the seeded total) but the target was not reached.
+    const liveTokens = await sumStore.getContextTokenCount(CONV_ID);
+    expect(result.finalTokens).toBe(liveTokens);
+    expect(result.finalTokens).toBeGreaterThan(50);
+    // Context is internally consistent: the swept prefix is now summaries and
+    // the un-swept remainder is still raw messages.
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    expect(contextItems.some((ci) => ci.itemType === "summary")).toBe(true);
+    expect(contextItems.some((ci) => ci.itemType === "message")).toBe(true);
+  });
+
+  it("a generous operation deadline does not cut a legitimate multi-round run short", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      // Deadline comfortably above what a fast multi-round compaction needs.
+      multiRoundConfig({ maxRounds: 10, compactUntilUnderDeadlineMs: 60_000 }),
+    );
+    await seedManyMessages();
+
+    // Fast summarizer: rounds complete well within the operation deadline.
+    const summarize = vi.fn(async (text: string) => `S(${text.length})`);
+
+    const result = await engine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      targetTokens: 300,
+      summarize,
+    });
+
+    // The deadline did not interfere: multiple rounds ran and drove context
+    // under the target.
+    expect(result.rounds).toBeGreaterThan(1);
+    expect(result.success).toBe(true);
+    expect(result.finalTokens).toBeLessThanOrEqual(300);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Test Suite: Retrieval
 // ═════════════════════════════════════════════════════════════════════════════
 

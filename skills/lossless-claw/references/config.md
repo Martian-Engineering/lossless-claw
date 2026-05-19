@@ -183,6 +183,16 @@ Why it matters:
 - When the deadline is exceeded the sweep stops before starting another pass and returns the partial result.
 - Pairs with `maxSweepIterations`: whichever limit is reached first stops the sweep.
 
+### `compactUntilUnderDeadlineMs`
+
+Wall-clock budget for a whole `compactUntilUnder` (overflow recovery) operation, in milliseconds. Default `300000`.
+
+Why it matters:
+
+- `compactUntilUnder` runs up to `maxRounds` sweeps, and each sweep re-arms its own `sweepDeadlineMs`; without an operation-wide budget the worst case is `maxRounds × sweepDeadlineMs` (~20 minutes at the defaults).
+- The deadline is shared into each round's sweep — a sweep stops at whichever deadline is sooner — and is also checked before starting the next round.
+- On hitting it, `compactUntilUnder` returns the consistent partial result; the default leaves room for a few full-deadline sweeps while capping the worst case well below 20 minutes.
+
 ### `incrementalMaxDepth`
 
 Deprecated alias for `sweepMaxDepth`.
@@ -421,6 +431,14 @@ See high-impact settings above.
 Env override:
 
 - `LCM_SWEEP_DEADLINE_MS`
+
+### `compactUntilUnderDeadlineMs`
+
+See high-impact settings above.
+
+Env override:
+
+- `LCM_COMPACT_UNTIL_UNDER_DEADLINE_MS`
 
 ### `incrementalMaxDepth`
 
