@@ -3557,8 +3557,10 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
-   * Re-check and consume deferred debt for assemble() while holding the
-   * session queue so pre-assembly writes cannot race queued maintenance.
+   * Consume deferred debt for assemble() only after the caller has established
+   * that the live prompt is already over budget. Routine threshold debt is
+   * drained after turns or by host-approved maintain() calls so the next user
+   * turn is not held hostage by proactive compaction work.
    */
   private async maybeConsumeDeferredCompactionDebtForAssemble(params: {
     conversationId: number;
@@ -7249,17 +7251,26 @@ export class LcmContextEngine implements ContextEngine {
         conversation.conversationId,
       );
       if (maintenance?.pending || maintenance?.running) {
-        try {
-          await this.maybeConsumeDeferredCompactionDebtForAssemble({
-            conversationId: conversation.conversationId,
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            tokenBudget,
-            currentTokenCount: liveContextTokens,
-          });
-        } catch (error) {
-          this.deps.log.warn(
-            `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
+        if (liveContextTokens > tokenBudget) {
+          this.deps.log.debug(
+            `[lcm] assemble: deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${liveContextTokens} tokenBudget=${tokenBudget} reason=over-budget`,
+          );
+          try {
+            await this.maybeConsumeDeferredCompactionDebtForAssemble({
+              conversationId: conversation.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              tokenBudget,
+              currentTokenCount: liveContextTokens,
+            });
+          } catch (error) {
+            this.deps.log.warn(
+              `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
+            );
+          }
+        } else {
+          this.deps.log.debug(
+            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${liveContextTokens} tokenBudget=${tokenBudget} reason=not-over-budget`,
           );
         }
       }

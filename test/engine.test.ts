@@ -9696,12 +9696,12 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(result.reason).toBe("compacted but still over target");
   });
 
-  it("assemble() consumes pending threshold debt before returning context", async () => {
+  it("assemble() leaves pending threshold debt for post-turn maintenance while under budget", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
       executeCompactionCore: (params: unknown) => Promise<unknown>;
     };
-    const sessionId = "assemble-threshold-debt-drains";
+    const sessionId = "assemble-threshold-debt-left-pending";
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
@@ -9729,11 +9729,50 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(executeCompactionCoreSpy).not.toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(assembleResult.messages).toHaveLength(1);
+  });
+
+  it("assemble() consumes pending threshold debt before returning context when already over budget", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-threshold-debt-over-budget-drains";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+    });
+    const executeCompactionCoreSpy = vi.spyOn(
+      privateEngine,
+      "executeCompactionCore",
+    ).mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "hello ".repeat(200) })],
+      tokenBudget: 10,
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
     expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: conversation.conversationId,
         sessionId,
-        tokenBudget: 4_096,
+        tokenBudget: 10,
         compactionTarget: "threshold",
       }),
     );
@@ -9742,7 +9781,55 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(assembleResult.messages).toHaveLength(1);
   });
 
-  it("assemble() waits for the session queue before consuming deferred threshold debt", async () => {
+  it("assemble() does not wait for the session queue when deferred threshold debt is not urgent", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      withSessionQueue<T>(queueKey: string, operation: () => Promise<T>): Promise<T>;
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-deferred-compaction-not-urgent";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    const consumeSpy = vi.spyOn(privateEngine, "consumeDeferredCompactionDebt");
+
+    let releaseQueue!: () => void;
+    const heldQueue = privateEngine.withSessionQueue(sessionId, async () => {
+      await new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+    });
+
+    let assembleSettled = false;
+    const assemblePromise = engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "hello" })],
+      tokenBudget: 4_096,
+    }).then((result) => {
+      assembleSettled = true;
+      return result;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(consumeSpy).not.toHaveBeenCalled();
+    expect(assembleSettled).toBe(true);
+
+    releaseQueue();
+    await heldQueue;
+    const assembleResult = await assemblePromise;
+
+    expect(consumeSpy).not.toHaveBeenCalled();
+    expect(assembleResult.messages).toHaveLength(1);
+  });
+
+  it("assemble() waits for the session queue before emergency deferred threshold compaction", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
       withSessionQueue<T>(queueKey: string, operation: () => Promise<T>): Promise<T>;
@@ -9770,8 +9857,8 @@ describe("LcmContextEngine fidelity and token budget", () => {
     let assembleSettled = false;
     const assemblePromise = engine.assemble({
       sessionId,
-      messages: [makeMessage({ role: "user", content: "hello" })],
-      tokenBudget: 4_096,
+      messages: [makeMessage({ role: "user", content: "hello ".repeat(200) })],
+      tokenBudget: 10,
     }).then((result) => {
       assembleSettled = true;
       return result;
