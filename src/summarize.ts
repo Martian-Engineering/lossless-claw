@@ -1129,12 +1129,26 @@ function buildDeterministicFallbackSummary(text: string, targetTokens: number): 
     return "";
   }
 
+  // Wave-4 Auditor #18 P0 fix: ALWAYS tag fallback output, even when the
+  // source text is short enough to fit within targetTokens. Previously
+  // the under-cap branch returned the raw `trimmed` source verbatim with
+  // no marker — downstream tiers in the pyramid would treat raw user/tool
+  // content as a compacted summary, hiding the fact that the LLM
+  // summarizer was unavailable. Operators reading /lcm health, doctor
+  // scans, or eval reports could not distinguish "LLM down, fallback
+  // shipped raw content" from "LLM ran cleanly, summary is the source".
+  // Now both branches carry an explicit marker.
+  const FALLBACK_MARKER =
+    "[LCM fallback summary — model unavailable; raw source preserved verbatim below]";
+  const FALLBACK_MARKER_TRUNC =
+    "[LCM fallback summary — model unavailable; raw source truncated for context management]";
+
   const maxChars = Math.max(256, targetTokens * 4);
   if (trimmed.length <= maxChars) {
-    return trimmed;
+    return `${FALLBACK_MARKER}\n${trimmed}`;
   }
 
-  return `${trimmed.slice(0, maxChars)}\n[LCM fallback summary; truncated for context management]`;
+  return `${FALLBACK_MARKER_TRUNC}\n${trimmed.slice(0, maxChars)}`;
 }
 
 /** Normalize model refs from string or `{ primary }` config shapes. */

@@ -34,14 +34,38 @@ import {
 import { CompactionTelemetryStore } from "../store/compaction-telemetry-store.js";
 import { FocusBriefStore, hashFocusSourceContext } from "../store/focus-brief-store.js";
 import {
+  getV41HealthSnapshot,
+  type V41HealthSnapshot,
+  type WorkerStatus,
+} from "../operator/health.js";
+import {
+  listLegacyCandidates,
+  reconcileSessionKeys,
+  ReconcileError,
+  type ReconcileResult,
+} from "../operator/reconcile-session-keys.js";
+import {
   EvalRunnerError,
   formatEvalReport,
   runEval,
   type EvalMode,
   type RunEvalArgs,
 } from "../operator/eval-runner.js";
+import {
+  PurgeError,
+  previewPurgeAffected,
+  runPurge,
+  type PurgeOptions,
+} from "../operator/purge.js";
+import {
+  getWorkerStatusSnapshot,
+  tickEmbeddingBackfill,
+} from "../operator/worker-orchestrator.js";
+import { countPendingDocs as countBackfillPending } from "../embeddings/backfill.js";
+import { getActiveEmbeddingModel } from "../embeddings/semantic-search.js";
 import { runHybridSearch } from "../embeddings/hybrid-search.js";
 import { vec0Version } from "../embeddings/store.js";
+import { MAX_TOKENS_PER_EMBED_DOC } from "../voyage/client.js";
 import { SummaryStore } from "../store/summary-store.js";
 import { getLcmDbFeatures } from "../db/features.js";
 
@@ -93,7 +117,33 @@ type ParsedLcmCommand =
   | { kind: "unfocus" }
   | { kind: "doctor"; apply: boolean }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
+  | { kind: "health" }
+  | { kind: "worker_status" }
+  | { kind: "worker_tick_backfill" }
+  | { kind: "reconcile_session_keys_list" }
+  | {
+      kind: "reconcile_session_keys_apply";
+      fromSessionKeys: string[];
+      toSessionKey: string;
+      reason: string;
+      allowMainSession: boolean;
+    }
   | { kind: "eval"; mode: EvalMode; querySetName: string; querySetVersion: number }
+  | {
+      // Wave-1 Auditor #8 BLOCKER #1 fix: wire /lcm purge so the runPurge
+      // module isn't dead code. Soft mode only (immediate cut). Required:
+      // a reason + at least one criterion. allowMainSession gates Eva's
+      // primary thread.
+      kind: "purge";
+      reason: string;
+      sessionKey?: string;
+      summaryIds?: string[];
+      since?: Date;
+      before?: Date;
+      minTokenCount?: number;
+      allowMainSession: boolean;
+      apply: boolean;
+    }
   | { kind: "help"; error?: string };
 
 type RotateCommandEngine = {
@@ -310,6 +360,64 @@ function parseEvalArgs(tokens: string[]):
   return { ok: true, parsed: result };
 }
 
+interface ReconcileParseResult {
+  fromSessionKeys: string[];
+  toSessionKey?: string;
+  reason?: string;
+  allowMainSession: boolean;
+  list: boolean;
+  apply: boolean;
+}
+
+function parseReconcileArgs(tokens: string[]):
+  | { ok: true; parsed: ReconcileParseResult }
+  | { ok: false; error: string } {
+  const result: ReconcileParseResult = {
+    fromSessionKeys: [],
+    allowMainSession: false,
+    list: false,
+    apply: false,
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    switch (t) {
+      case "--list-candidates":
+        result.list = true;
+        break;
+      case "--apply":
+        result.apply = true;
+        break;
+      case "--allow-main-session":
+        result.allowMainSession = true;
+        break;
+      case "--from": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--from` requires a comma-separated session_key list." };
+        result.fromSessionKeys = v.split(",").map((s) => s.trim()).filter(Boolean);
+        i += 1;
+        break;
+      }
+      case "--to": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--to` requires a session_key." };
+        result.toSessionKey = v;
+        i += 1;
+        break;
+      }
+      case "--reason": {
+        const v = tokens[i + 1];
+        if (!v) return { ok: false, error: "`--reason` requires a string." };
+        result.reason = v;
+        i += 1;
+        break;
+      }
+      default:
+        return { ok: false, error: `Unknown argument \`${t}\` for \`/lcm reconcile-session-keys\`.` };
+    }
+  }
+  return { ok: true, parsed: result };
+}
+
 function parseDoctorCleanerApplyArgs(tokens: string[]):
   | { ok: true; filterId?: DoctorCleanerId; vacuum: boolean }
   | { ok: false; error: string } {
@@ -372,6 +480,10 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return rest.length === 0
         ? { kind: "rotate" }
         : { kind: "help", error: "`/lcm rotate` does not accept extra arguments." };
+    case "health":
+      return rest.length === 0
+        ? { kind: "health" }
+        : { kind: "help", error: "`/lcm health` does not accept extra arguments." };
     case "eval": {
       const idx = (rawArgs ?? "").toLowerCase().indexOf("eval");
       const remainder = idx >= 0 ? (rawArgs ?? "").slice(idx + "eval".length) : "";
@@ -397,6 +509,80 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
         mode,
         querySetName,
         querySetVersion,
+      };
+    }
+    case "reconcile-session-keys": {
+      // Re-tokenize via the quote-aware splitter so `--reason "..."`
+      // survives. We strip the leading subcommand token from the raw
+      // arg string and re-parse the remainder.
+      const idx = (rawArgs ?? "").toLowerCase().indexOf("reconcile-session-keys");
+      const remainder = idx >= 0
+        ? (rawArgs ?? "").slice(idx + "reconcile-session-keys".length)
+        : "";
+      const quoted = splitArgsQuoted(remainder);
+      const r = parseReconcileArgs(quoted);
+      if (!r.ok) {
+        return { kind: "help", error: r.error };
+      }
+      const { parsed } = r;
+      if (parsed.list && parsed.apply) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys` cannot combine `--list-candidates` with `--apply`." };
+      }
+      if (parsed.list) {
+        return { kind: "reconcile_session_keys_list" };
+      }
+      if (!parsed.apply) {
+        return {
+          kind: "help",
+          error: "`/lcm reconcile-session-keys` requires `--list-candidates` or `--apply --from k1,k2 --to k3 --reason \"...\"`.",
+        };
+      }
+      if (parsed.fromSessionKeys.length === 0) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys --apply` requires `--from <comma-separated session_keys>`." };
+      }
+      if (!parsed.toSessionKey) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys --apply` requires `--to <destination session_key>`." };
+      }
+      if (!parsed.reason || parsed.reason.trim().length === 0) {
+        return { kind: "help", error: "`/lcm reconcile-session-keys --apply` requires `--reason \"...\"`." };
+      }
+      return {
+        kind: "reconcile_session_keys_apply",
+        fromSessionKeys: parsed.fromSessionKeys,
+        toSessionKey: parsed.toSessionKey,
+        reason: parsed.reason,
+        allowMainSession: parsed.allowMainSession,
+      };
+    }
+    case "worker": {
+      // /lcm worker [status | tick <kind>]
+      if (rest.length === 0 || rest[0]?.toLowerCase() === "status") {
+        return { kind: "worker_status" };
+      }
+      if (rest[0]?.toLowerCase() === "tick") {
+        const kind = rest[1]?.toLowerCase();
+        if (!kind) {
+          return {
+            kind: "help",
+            error:
+              `\`${VISIBLE_COMMAND} worker tick\` requires a job kind. ` +
+              `Supported: \`embedding-backfill\`.`,
+          };
+        }
+        if (kind !== "embedding-backfill") {
+          return {
+            kind: "help",
+            error:
+              `\`${VISIBLE_COMMAND} worker tick ${kind}\` not supported. ` +
+              `Only \`embedding-backfill\` is wired (no LLM call needed; uses Voyage HTTP directly). ` +
+              `Entity coreference auto-ticks in the background; themes/procedures workers are deferred (see PR #616).`,
+          };
+        }
+        return { kind: "worker_tick_backfill" };
+      }
+      return {
+        kind: "help",
+        error: `\`${VISIBLE_COMMAND} worker\` accepts \`status\` (default) or \`tick <kind>\`.`,
       };
     }
     case "doctor":
@@ -425,12 +611,134 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
         error:
           `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, or \`apply\` for the scoped summary repair path.`,
       };
+    case "purge": {
+      // Wave-1 Auditor #8 BLOCKER #1 fix: wire /lcm purge so the runPurge
+      // module is reachable. SOFT mode only (immediate was cut from PR).
+      // Re-tokenize quote-aware so --reason "complex text" parses.
+      const startIdx = (rawArgs ?? "").toLowerCase().indexOf("purge");
+      const tokens = startIdx >= 0
+        ? splitArgsQuoted((rawArgs ?? "").slice(startIdx).slice("purge".length).trim())
+        : [];
+      let reason = "";
+      let sessionKey: string | undefined;
+      let summaryIds: string[] | undefined;
+      let since: Date | undefined;
+      let before: Date | undefined;
+      let minTokenCount: number | undefined;
+      let allowMainSession = false;
+      let apply = false;
+      let parseError: string | undefined;
+      for (let i = 0; i < tokens.length; i++) {
+        const t = tokens[i];
+        switch (t) {
+          case "--apply":
+            apply = true;
+            break;
+          case "--allow-main-session":
+            allowMainSession = true;
+            break;
+          case "--reason": {
+            const v = tokens[++i];
+            if (!v) {
+              parseError = "`--reason` requires a value (in quotes if multi-word).";
+              break;
+            }
+            reason = v;
+            break;
+          }
+          case "--session-key": {
+            const v = tokens[++i];
+            if (!v) {
+              parseError = "`--session-key` requires a value.";
+              break;
+            }
+            sessionKey = v;
+            break;
+          }
+          case "--summary-ids": {
+            const v = tokens[++i];
+            if (!v) {
+              parseError = "`--summary-ids` requires a comma-separated list.";
+              break;
+            }
+            summaryIds = v.split(",").map((s) => s.trim()).filter(Boolean);
+            break;
+          }
+          case "--since": {
+            const v = tokens[++i];
+            if (!v) {
+              parseError = "`--since` requires an ISO timestamp.";
+              break;
+            }
+            const d = new Date(v);
+            if (Number.isNaN(d.getTime())) {
+              parseError = `\`--since\` value \`${v}\` is not a valid ISO timestamp.`;
+              break;
+            }
+            since = d;
+            break;
+          }
+          case "--before": {
+            const v = tokens[++i];
+            if (!v) {
+              parseError = "`--before` requires an ISO timestamp.";
+              break;
+            }
+            const d = new Date(v);
+            if (Number.isNaN(d.getTime())) {
+              parseError = `\`--before\` value \`${v}\` is not a valid ISO timestamp.`;
+              break;
+            }
+            before = d;
+            break;
+          }
+          case "--min-token-count": {
+            const v = tokens[++i];
+            const n = v ? Number(v) : NaN;
+            if (!Number.isFinite(n) || n < 0) {
+              parseError = "`--min-token-count` requires a non-negative integer.";
+              break;
+            }
+            minTokenCount = Math.trunc(n);
+            break;
+          }
+          default:
+            // Wave-12 reviewer P2 fix: previously only `--`-prefixed unknowns
+            // were rejected; bare positional args (e.g. user typoing
+            // `purge sk1` instead of `purge --session-key sk1`) were
+            // silently swallowed and the command ran with no scope.
+            if (t === undefined || t === "") break;
+            if (t.startsWith("--")) {
+              parseError = `Unknown flag for \`${VISIBLE_COMMAND} purge\`: ${t}`;
+            } else {
+              parseError =
+                `Unexpected positional arg for \`${VISIBLE_COMMAND} purge\`: \`${t}\`. ` +
+                `Did you mean \`--session-key ${t}\`? Use \`${VISIBLE_COMMAND} help\` for usage.`;
+            }
+        }
+        if (parseError) break;
+      }
+      if (parseError) {
+        return { kind: "help", error: parseError };
+      }
+      return {
+        kind: "purge",
+        reason,
+        sessionKey,
+        summaryIds,
+        since,
+        before,
+        minTokenCount,
+        allowMainSession,
+        apply,
+      };
+    }
     case "help":
       return { kind: "help" };
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, rotate, eval, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, rotate, health, worker, reconcile-session-keys, eval, purge, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -847,12 +1155,36 @@ function buildHelpText(error?: string): string {
         "Deactivate the active focus overlay without deleting focus history.",
       ),
       buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} health`),
+        "Show LCM v4.1 subsystem health: embeddings, workers, synthesis, eval, suppression.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} worker status`),
+        "Show worker locks (held by whom, expires when) + pending counts for backfill / extraction.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} worker tick embedding-backfill`),
+        "Manually run one backfill tick (useful when autostart is off or queue is bursting).",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --list-candidates`),
+        "List `legacy:conv_*` session keys that may be candidates for merging.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --apply --from k1,k2 --to k3 --reason "..."`),
+        "Merge multiple legacy session keys into one logical session.",
+      ),
+      buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} eval --baseline`),
         "Run the baseline eval (default: eva-baseline v1, fts_only) and report recall + drift.",
       ),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} eval --mode hybrid --query-set <name> --version <n>`),
         "Run an eval against a specific query set + retrieval mode.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} purge --reason "<text>" [--session-key K | --summary-ids id1,id2 | --since ISO | --before ISO | --min-token-count N]`),
+        "Soft-purge leaves matching the criteria. Defaults to dry-run preview. Add --apply to actually suppress; --allow-main-session to target agent:main:main.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
@@ -2118,6 +2450,354 @@ async function buildUnfocusText(params: {
   return lines.join("\n");
 }
 
+function formatWorkerLine(worker: WorkerStatus): string {
+  if (!worker.active) {
+    return `${worker.jobKind}: (idle)`;
+  }
+  const expiredFlag = worker.expired ? " EXPIRED" : "";
+  const id = worker.workerId ?? "unknown";
+  const acquired = worker.acquiredAt ?? "unknown";
+  const expires = worker.expiresAt ?? "unknown";
+  return `${worker.jobKind}: worker_id=${id}${expiredFlag} acquired_at=${acquired} expires_at=${expires}`;
+}
+
+function formatHealthSnapshot(snapshot: V41HealthSnapshot): string[] {
+  const lines: string[] = [];
+
+  // ── Embeddings ───────────────────────────────────────────────────
+  const embeddingsLines: string[] = [];
+  if (snapshot.embeddings.activeProfile) {
+    const p = snapshot.embeddings.activeProfile;
+    embeddingsLines.push(buildStatLine("active model", `${p.modelName} (dim=${formatNumber(p.dim)})`));
+  } else {
+    embeddingsLines.push(buildStatLine("active model", "NOT REGISTERED"));
+  }
+  embeddingsLines.push(
+    buildStatLine(
+      "vec0 status",
+      snapshot.embeddings.vec0Version ?? "NOT LOADED",
+    ),
+  );
+  embeddingsLines.push(
+    buildStatLine("pending backfill", `${formatNumber(snapshot.embeddings.pendingBackfill)} docs`),
+  );
+  embeddingsLines.push(buildStatLine("embedded count", formatNumber(snapshot.embeddings.embeddedCount)));
+  // v4.1 Final.review P2 #4: surface over-cap leaves so "pending=0"
+  // doesn't lie about coverage.
+  if (snapshot.embeddings.overCapPending > 0) {
+    embeddingsLines.push(
+      buildStatLine(
+        `over-cap leaves (>${formatNumber(MAX_TOKENS_PER_EMBED_DOC)} tokens, NOT embeddable)`,
+        `${formatNumber(snapshot.embeddings.overCapPending)} — re-summarize at lower cap to bring into range`,
+      ),
+    );
+  }
+  lines.push(buildSection("Embeddings", embeddingsLines));
+
+  // ── Workers ──────────────────────────────────────────────────────
+  lines.push("");
+  lines.push(buildSection("Workers", snapshot.workers.map(formatWorkerLine)));
+
+  // ── Synthesis ────────────────────────────────────────────────────
+  lines.push("");
+  lines.push(
+    buildSection("Synthesis", [
+      buildStatLine(
+        "active prompts",
+        `${formatNumber(snapshot.synthesis.activePromptCount)} across ${formatNumber(snapshot.synthesis.distinctMemoryTypeCount)} memory_types`,
+      ),
+      buildStatLine(
+        "recent synthesis runs",
+        `${formatNumber(snapshot.synthesis.recentSynthesisRuns7d)} (last 7 days)`,
+      ),
+    ]),
+  );
+
+  // ── Eval ─────────────────────────────────────────────────────────
+  lines.push("");
+  const evalLines = [
+    buildStatLine("query sets registered", formatNumber(snapshot.eval.querySetCount)),
+  ];
+  if (snapshot.eval.mostRecentRun) {
+    const r = snapshot.eval.mostRecentRun;
+    evalLines.push(
+      buildStatLine(
+        "most-recent run",
+        `${r.querySetId} mode=${r.mode} recall=${r.recallScore.toFixed(3)} (run_id=${r.runId})`,
+      ),
+    );
+  } else {
+    evalLines.push(buildStatLine("most-recent run", "(none)"));
+  }
+  if (snapshot.eval.driftIndex === null) {
+    evalLines.push(buildStatLine("drift index", "(no baseline)"));
+  } else {
+    const sign = snapshot.eval.driftIndex >= 0 ? "+" : "";
+    evalLines.push(buildStatLine("drift index", `${sign}${snapshot.eval.driftIndex.toFixed(4)}`));
+  }
+  lines.push(buildSection("Eval", evalLines));
+
+  // ── Suppression ──────────────────────────────────────────────────
+  lines.push("");
+  lines.push(
+    buildSection("Suppression", [
+      buildStatLine("suppressed leaves", formatNumber(snapshot.suppression.suppressedLeaves)),
+    ]),
+  );
+
+  return lines;
+}
+
+function buildHealthText(params: { db: DatabaseSync }): string {
+  const snapshot = getV41HealthSnapshot(params.db);
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "### v4.1 Health",
+    "",
+    ...formatHealthSnapshot(snapshot),
+  ];
+  return lines.join("\n");
+}
+
+function buildWorkerStatusText(params: { db: DatabaseSync }): string {
+  // Final review #3 partial fix: surface worker-orchestrator state.
+  // Manual `tick <kind>` deferred — the underlying services exist
+  // (src/operator/worker-orchestrator.ts) but their LLM-call wiring
+  // through the plugin lifecycle is cycle-2 work.
+  const snapshot = getWorkerStatusSnapshot(params.db);
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "### Worker Status",
+    "",
+  ];
+  for (const [kind, lockInfo] of Object.entries(snapshot.locks)) {
+    if (lockInfo) {
+      lines.push(
+        `- **${kind}**: HELD by \`${lockInfo.workerId}\` (acquired ${lockInfo.acquiredAt}, expires ${lockInfo.expiresAt}); jobMetadata=${lockInfo.jobMetadata ?? "(none)"}`,
+      );
+    } else {
+      lines.push(`- **${kind}**: idle (no lock held)`);
+    }
+  }
+  lines.push("");
+  lines.push("### Pending Work");
+  lines.push("");
+  lines.push(
+    `- Embedding backfill pending: ${snapshot.pending.embeddingBackfill === -1 ? "(model not specified)" : snapshot.pending.embeddingBackfill}`,
+  );
+  lines.push(`- Extraction queue: ${snapshot.pending.extractionQueue}`);
+  lines.push("");
+  lines.push("### Note");
+  lines.push("");
+  lines.push(
+    "Manual `/lcm worker tick embedding-backfill` is wired. Entity coreference " +
+      "auto-ticks in the background (default-on; opt-out via " +
+      "`LCM_EXTRACTION_LLM_ENABLED=false`). Themes consolidation and procedure " +
+      "mining workers were preserved in deferred-features draft PR (#616) and " +
+      "will ship as focused PRs with auto-tick + agent tools together.",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * /lcm worker tick embedding-backfill
+ *
+ * Runs ONE tick of the embedding-backfill cron against the active
+ * embedding profile. Reads VOYAGE_API_KEY from env. perTickLimit
+ * default 200 (covers ~7-15 minutes of work at 0.5 RPS); operator
+ * can re-invoke until pending count is 0.
+ *
+ * Returns markdown summary of the tick result + a hint about the next
+ * tick if work remains.
+ */
+async function buildWorkerTickBackfillText(params: { db: DatabaseSync }): Promise<string> {
+  const lines: string[] = [...buildHeaderLines(), "", "### Worker Tick — embedding-backfill", ""];
+
+  // 1. Pre-flight checks
+  if (!process.env.VOYAGE_API_KEY?.trim()) {
+    lines.push("**ERROR**: `VOYAGE_API_KEY` env var is empty.");
+    lines.push("");
+    lines.push("Set it via your shell or `.envrc` and retry. See `~/.openclaw/credentials/voyage-api-key`.");
+    return lines.join("\n");
+  }
+  if (vec0Version(params.db) === null) {
+    lines.push("**ERROR**: sqlite-vec extension not loaded.");
+    lines.push("");
+    lines.push(
+      "Embedding backfill requires sqlite-vec. Install via `pnpm add sqlite-vec` (or upstream's preferred path) and restart the gateway.",
+    );
+    return lines.join("\n");
+  }
+  const active = getActiveEmbeddingModel(params.db);
+  if (!active) {
+    lines.push("**ERROR**: no active embedding model registered in `lcm_embedding_profile`.");
+    lines.push("");
+    lines.push(
+      "Register one before backfilling. Example for voyage-4-large (1024 dims):",
+    );
+    lines.push("```sql");
+    lines.push(
+      "INSERT INTO lcm_embedding_profile (model_name, dim, active) VALUES ('voyage-4-large', 1024, 1);",
+    );
+    lines.push("```");
+    lines.push(
+      "Then call `ensureEmbeddingsTable(db, 'voyage-4-large', 1024)` from a Node script (it creates the vec0 virtual table + cascade triggers).",
+    );
+    return lines.join("\n");
+  }
+
+  // 2. Pre-tick stats
+  const pendingBefore = countBackfillPending(params.db, { modelName: active.modelName });
+  lines.push(`**Active model**: ${active.modelName} (dim=${active.dim})`);
+  lines.push(`**Pending docs before tick**: ${pendingBefore}`);
+  if (pendingBefore === 0) {
+    lines.push("");
+    lines.push("Nothing to do. All eligible leaves already embedded.");
+    return lines.join("\n");
+  }
+
+  // 3. Run the tick
+  lines.push("");
+  lines.push("Running tick (perTickLimit=200; may take 5-15 min at 0.5 RPS)...");
+  const startedAt = Date.now();
+  let result;
+  try {
+    result = await tickEmbeddingBackfill(params.db, {
+      modelName: active.modelName,
+      voyageModel: active.modelName as Parameters<typeof tickEmbeddingBackfill>[1]["voyageModel"],
+      inputType: "document",
+      // Wave-12 reviewer P1 fix: pass profile.dim so non-default
+      // (256/512/2048) profiles get the right-shape vectors. Without
+      // this, Voyage returns 1024-dim vectors and recordEmbedding
+      // rejects them as length-mismatched.
+      voyageOutputDimension: active.dim,
+      // v4.1 Final.review.3 fix: drop to 1 retry to keep worst-case
+      // tick time under WORKER_LOCK_TTL_MS (90s). Was 2 → ~91s worst case.
+      voyageMaxRetries: 1,
+      voyageTimeoutMs: 30_000,
+      maxRequestsPerSecond: 0.5,
+      perTickLimit: 200,
+    });
+  } catch (e) {
+    lines.push("");
+    lines.push(`**ERROR**: backfill tick failed: ${e instanceof Error ? e.message : String(e)}`);
+    return lines.join("\n");
+  }
+  const durationMs = Date.now() - startedAt;
+
+  // 4. Result + next-step hint
+  lines.push("");
+  lines.push("### Result");
+  lines.push("");
+  lines.push(`- **Embedded**: ${result.embeddedCount}`);
+  lines.push(`- **Skipped (over-cap)**: ${result.skippedOverCap}`);
+  lines.push(`- **Skipped (other failures)**: ${result.skipped.length}`);
+  lines.push(`- **Voyage tokens consumed**: ${result.voyageTokensConsumed.toLocaleString()}`);
+  lines.push(`- **Duration**: ${(durationMs / 1000).toFixed(1)}s`);
+  if (result.lockNotAcquired) {
+    lines.push("- **Lock contention**: another worker held the lock; this tick was a no-op");
+  }
+
+  const pendingAfter = countBackfillPending(params.db, { modelName: active.modelName });
+  // Wave-10 reviewer P2 fix: countBackfillPending excludes leaves with
+  // token_count > MAX_TOKENS_PER_EMBED_DOC, so an "over-cap" leaf is
+  // neither pending nor backfilled — invisible to the in-range count.
+  // Previously the "Backfill complete" message printed even when over-cap
+  // leaves remained unembedded, lying about coverage. Count them
+  // separately and include in the completion message.
+  const overCapPending = countOverCapPendingForBackfill(
+    params.db,
+    active.modelName,
+  );
+  lines.push("");
+  lines.push(`**Pending docs after tick** (in-range): ${pendingAfter}`);
+  if (overCapPending > 0) {
+    lines.push(
+      `**Over-cap leaves** (>${MAX_TOKENS_PER_EMBED_DOC.toLocaleString()} tokens, NOT embeddable): ${overCapPending} — re-summarize at a smaller cap to bring them into range.`,
+    );
+  }
+  if (pendingAfter > 0) {
+    lines.push("");
+    lines.push(`Re-run \`${VISIBLE_COMMAND} worker tick embedding-backfill\` to continue.`);
+  } else if (overCapPending > 0) {
+    lines.push("");
+    lines.push(
+      `⚠️  In-range backfill complete, but ${overCapPending} over-cap leaves remain unembedded. Semantic recall coverage is partial — over-cap leaves will not surface via \`lcm_grep --mode semantic\` or \`lcm_grep --mode hybrid\`.`,
+    );
+  } else {
+    lines.push("");
+    lines.push("✅ Backfill complete. `lcm_grep --mode semantic` and `lcm_grep --mode hybrid` should now return real results.");
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Wave-10 reviewer P2 fix: count over-cap leaves not yet embedded for
+ * the active profile. Mirrors the SQL in src/operator/health.ts but
+ * scoped here so the worker-tick output is honest.
+ */
+function countOverCapPendingForBackfill(
+  db: DatabaseSync,
+  modelName: string,
+): number {
+  try {
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM summaries s
+           WHERE s.kind = 'leaf'
+             AND s.suppressed_at IS NULL
+             AND s.token_count > ?
+             AND NOT EXISTS (
+               SELECT 1 FROM lcm_embedding_meta m
+                 WHERE m.embedded_id = s.summary_id
+                   AND m.embedded_kind = 'summary'
+                   AND m.embedding_model = ?
+                   AND m.archived = 0
+             )`,
+      )
+      .get(MAX_TOKENS_PER_EMBED_DOC, modelName) as { n?: number } | undefined;
+    return row?.n ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+function buildReconcileListText(params: { db: DatabaseSync }): string {
+  const candidates = listLegacyCandidates(params.db);
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "🔗 Lossless Claw Reconcile Session Keys",
+    "",
+    buildSection("📋 Legacy candidates", [
+      buildStatLine("matched session keys", formatNumber(candidates.length)),
+    ]),
+  ];
+  if (candidates.length === 0) {
+    lines.push(
+      "",
+      buildSection("✅ Result", ["No `legacy:conv_*` session keys present."]),
+    );
+    return lines.join("\n");
+  }
+  lines.push(
+    "",
+    buildSection(
+      "🧷 Candidates",
+      candidates.map((c) =>
+        `${formatCommand(truncateMiddle(c.sessionKey, 44))} · convs=${formatNumber(c.conversationCount)} · leaves=${formatNumber(c.leafCount)}`,
+      ),
+    ),
+    "",
+    buildSection("🛠️ Next step", [
+      `${formatCommand(`${VISIBLE_COMMAND} reconcile-session-keys --apply --from k1,k2 --to my-thread --reason "..."`)} merges the listed keys.`,
+    ]),
+  );
+  return lines.join("\n");
+}
+
 /**
  * Build a recall search adapter that wraps `summaryStore.searchSummaries`
  * in `mode='full_text'`. Returns IDs in rank order. Used by the
@@ -2266,6 +2946,246 @@ async function buildEvalText(params: {
     }
     lines.push(
       buildSection("🛠️ Eval", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(e)),
+      ]),
+    );
+  }
+  return lines.join("\n");
+}
+
+function buildReconcileApplyText(params: {
+  db: DatabaseSync;
+  fromSessionKeys: string[];
+  toSessionKey: string;
+  reason: string;
+  allowMainSession: boolean;
+}): string {
+  const lines: string[] = [
+    ...buildHeaderLines(),
+    "",
+    "🔗 Lossless Claw Reconcile Session Keys",
+    "",
+    buildSection("📋 Plan", [
+      buildStatLine("from", params.fromSessionKeys.map((k) => formatCommand(truncateMiddle(k, 44))).join(", ")),
+      buildStatLine("to", formatCommand(truncateMiddle(params.toSessionKey, 44))),
+      buildStatLine("reason", params.reason),
+      buildStatLine("allow main session", formatBoolean(params.allowMainSession)),
+    ]),
+    "",
+  ];
+
+  let result: ReconcileResult;
+  try {
+    result = reconcileSessionKeys(params.db, {
+      fromSessionKeys: params.fromSessionKeys,
+      toSessionKey: params.toSessionKey,
+      reason: params.reason,
+      allowMainSession: params.allowMainSession,
+    });
+  } catch (e) {
+    if (e instanceof ReconcileError) {
+      lines.push(
+        buildSection("🛠️ Apply", [
+          buildStatLine("status", "failed"),
+          buildStatLine("kind", e.kind),
+          buildStatLine("reason", e.message),
+        ]),
+      );
+      return lines.join("\n");
+    }
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", formatFailureReason(e)),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const fromLabel = params.fromSessionKeys.map((k) => `\`${truncateMiddle(k, 32)}\``).join(", ");
+  lines.push(
+    buildSection("🛠️ Apply", [
+      buildStatLine("status", "completed"),
+      buildStatLine("conversations moved", formatNumber(result.conversationsMoved)),
+      buildStatLine("summaries moved", formatNumber(result.summariesMoved)),
+      buildStatLine("audit entries", formatNumber(result.auditEntries)),
+      buildStatLine(
+        "summary",
+        `Moved ${formatNumber(result.conversationsMoved)} conversations, ${formatNumber(result.summariesMoved)} summaries from {${fromLabel}} to ${formatCommand(truncateMiddle(params.toSessionKey, 44))}`,
+      ),
+    ]),
+  );
+  return lines.join("\n");
+}
+
+// Wave-1 Auditor #8 BLOCKER #1 fix: operator-reachable purge command.
+// Soft mode only (immediate cut from PR #613). Defaults to dry-run
+// preview unless --apply is explicitly passed.
+async function buildPurgeText(params: {
+  db: DatabaseSync;
+  reason: string;
+  sessionKey?: string;
+  summaryIds?: string[];
+  since?: Date;
+  before?: Date;
+  minTokenCount?: number;
+  allowMainSession: boolean;
+  apply: boolean;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🧹 Lossless Claw Purge (soft mode)",
+    "",
+    buildSection("📋 Criteria", [
+      buildStatLine(
+        "session-key",
+        params.sessionKey ? formatCommand(truncateMiddle(params.sessionKey, 44)) : "(none)",
+      ),
+      buildStatLine(
+        "summary-ids",
+        params.summaryIds && params.summaryIds.length > 0
+          ? `${params.summaryIds.length} ids`
+          : "(none)",
+      ),
+      buildStatLine("since", params.since ? params.since.toISOString() : "(none)"),
+      buildStatLine("before", params.before ? params.before.toISOString() : "(none)"),
+      buildStatLine(
+        "min-token-count",
+        params.minTokenCount != null ? String(params.minTokenCount) : "(none)",
+      ),
+      buildStatLine("reason", params.reason || "(EMPTY)"),
+      buildStatLine("allow main session", formatBoolean(params.allowMainSession)),
+      buildStatLine("apply", formatBoolean(params.apply)),
+    ]),
+    "",
+  ];
+
+  if (!params.reason || params.reason.trim().length === 0) {
+    lines.push(
+      buildSection("🛠️ Outcome", [
+        buildStatLine("status", "rejected"),
+        buildStatLine("kind", "missing_reason"),
+        buildStatLine(
+          "fix",
+          `Pass \`--reason "free text describing why this is being purged"\``,
+        ),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const opts: PurgeOptions = {
+    reason: params.reason,
+    sessionKey: params.sessionKey,
+    summaryIds: params.summaryIds,
+    since: params.since,
+    before: params.before,
+    minTokenCount: params.minTokenCount,
+    allowMainSession: params.allowMainSession,
+  };
+
+  // Dry-run preview: count what WOULD be affected without actually
+  // suppressing. Wave-2 Auditor #6 fix BUG-2 + BUG-3: uses
+  // previewPurgeAffected (a thin wrapper over the same resolveTargetLeafIds
+  // that runPurge calls) so the dry-run count is GUARANTEED to match
+  // apply count. Fixes:
+  //   - BUG-2: dry-run had its own predicate using `datetime(created_at)
+  //     >= datetime(?)` while runPurge used raw `created_at >= ?`. Edge
+  //     cases (timezone offsets, microseconds) gave divergent counts.
+  //   - BUG-3: --summary-ids dry-run returned `opts.summaryIds.length`
+  //     blindly, even when half the IDs didn't exist or were already
+  //     suppressed. Now COUNTs only the IDs runPurge would actually touch.
+  //   - BUG-4: --allow-main-session safety not surfaced in preview;
+  //     now annotated below.
+  //   - BUG-5: empty-criteria dry-run scared operators with whole-DB
+  //     count; now surface no_criteria error explicitly before counting.
+  if (!params.apply) {
+    // Mirror runPurge's validation so we don't return a misleading whole-DB
+    // count for an empty-criteria preview.
+    const hasCriteria =
+      (opts.summaryIds && opts.summaryIds.length > 0) ||
+      Boolean(opts.sessionKey) ||
+      Boolean(opts.since) ||
+      Boolean(opts.before) ||
+      Boolean(opts.minTokenCount);
+    if (!hasCriteria) {
+      lines.push(
+        buildSection("🛠️ Preview", [
+          buildStatLine("status", "rejected"),
+          buildStatLine("kind", "no_criteria"),
+          buildStatLine(
+            "fix",
+            "Pass at least one of: --session-key, --summary-ids, --since, --before, --min-token-count",
+          ),
+        ]),
+      );
+      return lines.join("\n");
+    }
+    let previewCount = 0;
+    try {
+      previewCount = previewPurgeAffected(params.db, opts);
+    } catch (e) {
+      lines.push(
+        buildSection("🛠️ Outcome", [
+          buildStatLine("status", "preview_failed"),
+          buildStatLine("reason", formatFailureReason(e)),
+        ]),
+      );
+      return lines.join("\n");
+    }
+    const previewWarnings: string[] = [];
+    if (
+      params.sessionKey === "agent:main:main" &&
+      !params.allowMainSession
+    ) {
+      previewWarnings.push(
+        "WARNING: --session-key=agent:main:main without --allow-main-session — apply WILL be blocked. Pass --allow-main-session to unblock.",
+      );
+    }
+    const previewSection = [
+      buildStatLine("would-affect-leaves", formatNumber(previewCount)),
+      buildStatLine(
+        "to apply",
+        "Re-run with the same flags plus `--apply` to actually suppress.",
+      ),
+      buildStatLine(
+        "race window",
+        "Preview is best-effort; --apply re-resolves under transaction. Counts may differ if leaves are written or suppressed in the meantime.",
+      ),
+    ];
+    if (previewWarnings.length > 0) {
+      for (const w of previewWarnings) previewSection.push(buildStatLine("warning", w));
+    }
+    lines.push(buildSection("🛠️ Preview", previewSection));
+    return lines.join("\n");
+  }
+
+  // --apply path
+  try {
+    const result = runPurge(params.db, opts);
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "completed"),
+        buildStatLine("mode", result.mode),
+        buildStatLine("affected leaves", formatNumber(result.affectedLeafIds.length)),
+        buildStatLine("purge session id", result.purgeSessionId),
+      ]),
+    );
+  } catch (e) {
+    if (e instanceof PurgeError) {
+      lines.push(
+        buildSection("🛠️ Apply", [
+          buildStatLine("status", "failed"),
+          buildStatLine("kind", e.kind),
+          buildStatLine("reason", e.message),
+        ]),
+      );
+      return lines.join("\n");
+    }
+    lines.push(
+      buildSection("🛠️ Apply", [
         buildStatLine("status", "failed"),
         buildStatLine("reason", formatFailureReason(e)),
       ]),
@@ -2589,7 +3509,28 @@ export function createLcmCommand(params: {
               getLcm: params.getLcm,
             }),
           };
-        case "doctor":
+        case "doctor": {
+          // Wave-11 reviewer P1 fix: `/lcm doctor apply` calls the summarizer
+          // (cost surface) AND mutates summaries (state surface). Read-only
+          // `/lcm doctor` (without --apply) stays open. Mirror the
+          // purge / reconcile / worker-tick / eval gate pattern.
+          if (parsed.apply && !ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "🩺 Doctor apply — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm doctor apply requires owner privileges (ctx.senderIsOwner=true). It runs the summarizer (cost) and updates summaries (mutation) — non-owner callers cannot invoke it. /lcm doctor (without --apply) is read-only and remains open.",
+                  ),
+                ]),
+              ].join("\n"),
+            };
+          }
           return parsed.apply
             ? {
                 text: await buildDoctorApplyText({
@@ -2601,7 +3542,33 @@ export function createLcmCommand(params: {
                 }),
               }
             : { text: await buildDoctorText({ ctx, db: await getDb() }) };
-        case "doctor_cleaners":
+        }
+        case "doctor_cleaners": {
+          // Wave-12 reviewer P1 fix: gate the WHOLE doctor_cleaners case
+          // on senderIsOwner, not just `--apply`. The read-only path
+          // emits per-filter top-3 conversations including session_keys
+          // (truncated) and `JSON.stringify`'d first-message previews
+          // across the global conversation set — leaks of conversational
+          // content + session-identity to non-owners that mirrors the
+          // gate already on `purge` / `reconcile-session-keys --apply`.
+          // Wave-11 had only gated --apply.
+          if (!ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "🧽 Doctor clean — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm doctor clean requires owner privileges (ctx.senderIsOwner=true). The read-only listing surfaces session_keys + first-message previews across the global conversation set; the apply variant is destructive. Both are owner-only.",
+                  ),
+                ]),
+              ].join("\n"),
+            };
+          }
           return parsed.apply
             ? {
                 text: await buildDoctorCleanersApplyText({
@@ -2612,6 +3579,78 @@ export function createLcmCommand(params: {
                 }),
               }
             : { text: await buildDoctorCleanersText({ db: await getDb() }) };
+        }
+        case "health":
+          return { text: buildHealthText({ db: await getDb() }) };
+        case "worker_status":
+          return { text: buildWorkerStatusText({ db: await getDb() }) };
+        case "worker_tick_backfill": {
+          // Wave-9 Agent #10 P1 fix: same gate as `case "purge"` — non-owner
+          // agents calling /lcm worker tick embedding-backfill burn Voyage
+          // quota at-will (200 paid embeddings per invocation × intervalMs).
+          // DoS-by-billing on the operator's account. Gate on senderIsOwner.
+          if (!ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "⚙️  Worker tick — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm worker tick requires owner privileges (ctx.senderIsOwner=true). Embedding backfill makes paid Voyage calls — non-owner callers cannot invoke it.",
+                  ),
+                ]),
+              ].join("\n"),
+            };
+          }
+          return { text: await buildWorkerTickBackfillText({ db: await getDb() }) };
+        }
+        case "reconcile_session_keys_list":
+          return { text: buildReconcileListText({ db: await getDb() }) };
+        case "reconcile_session_keys_apply": {
+          // Wave-9 Agent #10 P0 fix: same gate as `case "purge"`.
+          //
+          // /lcm reconcile-session-keys --apply is destructive: it UPDATEs
+          // both `conversations.session_key` AND `summaries.session_key`
+          // for matching rows, plus inserts audit rows. With
+          // --allow-main-session it can target `agent:main:main` (Eva's
+          // primary thread). Without an owner gate, any agent that can
+          // issue /lcm slash commands could re-key the operator's primary
+          // thread into an attacker-controlled bucket → cross-session
+          // data theft + audit-trail confusion.
+          //
+          // Wave-7 P0-1 added the gate to `case "purge"` ONLY. This is
+          // the missed sister-case at the same severity.
+          if (!ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "🔄 Reconcile session keys — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm reconcile-session-keys --apply requires owner privileges (ctx.senderIsOwner=true). It rewrites session_key on conversations + summaries — non-owner callers cannot invoke it.",
+                  ),
+                ]),
+              ].join("\n"),
+            };
+          }
+          return {
+            text: buildReconcileApplyText({
+              db: await getDb(),
+              fromSessionKeys: parsed.fromSessionKeys,
+              toSessionKey: parsed.toSessionKey,
+              reason: parsed.reason,
+              allowMainSession: parsed.allowMainSession,
+            }),
+          };
+        }
         case "eval": {
           // Wave-10 reviewer P1 fix: /lcm eval mutates lcm_eval_run +
           // lcm_eval_query_result tables AND can cost Voyage tokens
@@ -2642,6 +3681,55 @@ export function createLcmCommand(params: {
               mode: parsed.mode,
               querySetName: parsed.querySetName,
               querySetVersion: parsed.querySetVersion,
+            }),
+          };
+        }
+        case "purge": {
+          // Wave-7 Auditor #14 P0-1 fix: operator-session gate.
+          //
+          // /lcm purge mutates the LCM DB by suppressing leaves +
+          // cascading suppression to messages, vec0 metadata, and
+          // synthesis cache. Without a gate, ANY agent that can issue
+          // /lcm slash commands could purge another session's data —
+          // e.g. cross-session leaks via `--session-key`, or even Eva's
+          // primary thread via `--allow-main-session`.
+          //
+          // Gate via `ctx.senderIsOwner` (the OpenClaw plugin SDK's
+          // explicit owner-only flag). Authorized non-owner senders are
+          // also rejected — purge requires explicit owner privilege.
+          //
+          // Dry-run preview is also gated since it reveals which leaves
+          // exist for the targeted criteria — leaking that information
+          // is itself a confidentiality concern.
+          if (!ctx.senderIsOwner) {
+            return {
+              text: [
+                ...buildHeaderLines(),
+                "",
+                "🧹 Lossless Claw Purge — operator-only",
+                "",
+                buildSection("🚫 Rejected", [
+                  buildStatLine("status", "operator-only"),
+                  buildStatLine(
+                    "reason",
+                    "/lcm purge requires owner privileges (ctx.senderIsOwner=true). Soft-purge cascades through messages, vec0 metadata, and synthesis cache — non-owner callers cannot invoke it.",
+                  ),
+                  buildStatLine("hint", "If you are the operator, ensure your channel surface marks you as owner."),
+                ]),
+              ].join("\n"),
+            };
+          }
+          return {
+            text: await buildPurgeText({
+              db: await getDb(),
+              reason: parsed.reason,
+              sessionKey: parsed.sessionKey,
+              summaryIds: parsed.summaryIds,
+              since: parsed.since,
+              before: parsed.before,
+              minTokenCount: parsed.minTokenCount,
+              allowMainSession: parsed.allowMainSession,
+              apply: parsed.apply,
             }),
           };
         }
