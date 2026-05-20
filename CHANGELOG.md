@@ -1,5 +1,19 @@
 # @martian-engineering/lossless-claw
 
+## 0.11.2
+
+### Patch Changes
+
+- [#714](https://github.com/Martian-Engineering/lossless-claw/pull/714) [`561b275`](https://github.com/Martian-Engineering/lossless-claw/commit/561b27562e318f3b6c8daa3f8011d836d75d13a4) Thanks [@jalehman](https://github.com/jalehman)! - Remove a stale stable-orphan invalidation call from afterTurn placeholder-checkpoint recovery. Stable orphan stripping was removed with the cache-state-dependent assembly path, but the placeholder recovery branch still referenced the deleted method and could throw `clearStableOrphanStrippingOrdinal is not a function` during transcript reconcile.
+
+- [#712](https://github.com/Martian-Engineering/lossless-claw/pull/712) [`67b7f51`](https://github.com/Martian-Engineering/lossless-claw/commit/67b7f515eb66d662b7b0e85fe4aa49dfcd56b83c) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Bound `compactFullSweep` so a single compaction cannot hang the agent turn. The leaf/condensed pass loop now stops at a hard iteration cap (`maxSweepIterations`, default 12) and a wall-clock deadline (`sweepDeadlineMs`, default 120000), returning the consistent partial result instead of running unbounded passes. The sweep also yields the Node event loop between its synchronous `node:sqlite` scans so a long sweep cannot freeze the gateway for its whole duration. Both limits are configurable via plugin config or `LCM_MAX_SWEEP_ITERATIONS` / `LCM_SWEEP_DEADLINE_MS`.
+
+  Also bound the whole `compactUntilUnder` overflow-recovery operation. It runs up to `maxRounds` sweeps, and each sweep re-arms its own `sweepDeadlineMs`, so without an operation-wide budget the worst case was `maxRounds × sweepDeadlineMs` (~20 minutes at the defaults). `compactUntilUnder` now computes one wall-clock deadline (`compactUntilUnderDeadlineMs`, default 300000), shares it into every round's sweep so a sweep stops at whichever deadline is sooner, and checks it before starting the next round — returning the consistent partial result on expiry. Configurable via plugin config or `LCM_COMPACT_UNTIL_UNDER_DEADLINE_MS`.
+
+- [#717](https://github.com/Martian-Engineering/lossless-claw/pull/717) [`23c91d5`](https://github.com/Martian-Engineering/lossless-claw/commit/23c91d57643bd54005e802693ec7bbb13343f0e9) Thanks [@jalehman](https://github.com/jalehman)! - Advertise and honor a longer `lcm_expand_query` dynamic tool timeout so delegated recall does not outlive OpenClaw's tool RPC watchdog.
+
+- [#672](https://github.com/Martian-Engineering/lossless-claw/pull/672) [`7741606`](https://github.com/Martian-Engineering/lossless-claw/commit/7741606957597d03c82be1e4da91b197bdad07e6) Thanks [@holgergruenhagen](https://github.com/holgergruenhagen)! - Shorten the `/lossless` native command description so Discord no longer truncates it during command registration.
+
 ## 0.11.1
 
 ### Patch Changes
