@@ -300,6 +300,74 @@ describe("interceptCompaction (PR follow-up to #619)", () => {
     }
   });
 
+  it("advances the projection epoch when intercepted compaction changes summary context", async () => {
+    const { engine } = makeEngine({ compactionTargetFraction: 0.35 } as Partial<LcmConfig>);
+    const sessionId = "test-session-projection-intercept";
+    const sessionKey = "agent:main:main";
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: { role: "user", content: "pre-intercept raw message" } as AgentMessage,
+    });
+    const baseline = await engine.assemble({
+      sessionId,
+      sessionKey,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    expect(baseline.contextProjection?.mode).toBe("thread_bootstrap");
+
+    vi.spyOn(engine, "compact").mockImplementation(async () => {
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationForSession({ sessionId, sessionKey });
+      expect(conversation).not.toBeNull();
+      await engine.getSummaryStore().insertSummary({
+        summaryId: "sum_intercept_projection_epoch",
+        conversationId: conversation!.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Compacted summary after intercepted compaction",
+        tokenCount: 8,
+        descendantCount: 0,
+      });
+      await engine
+        .getSummaryStore()
+        .appendContextSummary(conversation!.conversationId, "sum_intercept_projection_epoch");
+      return {
+        ok: true,
+        compacted: true,
+        result: {
+          summary: "Compacted summary after intercepted compaction",
+          firstKeptEntryId: "entry-keep-me",
+          tokensBefore: 9_000,
+        },
+      };
+    });
+
+    const result = await engine.interceptCompaction({
+      sessionId,
+      sessionKey,
+      sessionFile: "/tmp/test.jsonl",
+      tokenBudget: 10_000,
+      currentTokenCount: 9_000,
+      firstKeptEntryId: "entry-keep-me",
+      tokensBefore: 9_000,
+    });
+
+    expect(result.handled).toBe(true);
+    if (result.handled) {
+      expect(result.summary).toContain("Compacted summary after intercepted compaction");
+    }
+    const afterIntercept = await engine.assemble({
+      sessionId,
+      sessionKey,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    expect(afterIntercept.contextProjection?.epoch).not.toBe(baseline.contextProjection?.epoch);
+  });
+
   it("never throws — catches exceptions and returns handled:false", async () => {
     const { engine } = makeEngine({ compactionTargetFraction: 0.35 } as Partial<LcmConfig>);
     // Pass a session that will trigger a code path; even pathological inputs

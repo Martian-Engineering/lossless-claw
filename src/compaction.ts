@@ -628,6 +628,8 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
+    /** Optional persisted-context target used when host runtime overhead is known. */
+    stopAtTokens?: number;
     summaryModel?: string;
     /** Optional operation-wide wall-clock deadline shared across rounds. */
     operationDeadlineAt?: number;
