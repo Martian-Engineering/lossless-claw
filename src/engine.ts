@@ -7708,12 +7708,25 @@ export class LcmContextEngine implements ContextEngine {
     | { handled: true; summary: string; tokensAfter: number; firstKeptEntryId: string; tokensBefore: number }
     | { handled: false; reason: string }
   > {
+    const sessionLabel = [`session=${request.sessionId}`];
+    const trimmedSessionKey = request.sessionKey?.trim();
+    if (trimmedSessionKey) {
+      sessionLabel.push(`sessionKey=${trimmedSessionKey}`);
+    }
+    const interceptContext = sessionLabel.join(" ");
+
     // Guard 1: stateless/ignored sessions never intercept — codex can do
     // whatever it wants for sessions LCM doesn't track.
     if (this.shouldIgnoreSession({ sessionId: request.sessionId, sessionKey: request.sessionKey })) {
+      this.deps.log.info(
+        `[lcm] interceptCompaction: declined ${interceptContext} reason=session_ignored`,
+      );
       return { handled: false, reason: "session-ignored" };
     }
     if (this.isStatelessSession(request.sessionKey)) {
+      this.deps.log.info(
+        `[lcm] interceptCompaction: declined ${interceptContext} reason=stateless_session`,
+      );
       return { handled: false, reason: "stateless-session" };
     }
     // Guard 2: configuration says LCM should not intercept. If
@@ -7734,11 +7747,17 @@ export class LcmContextEngine implements ContextEngine {
       || targetFraction < 0.05
       || targetFraction > 1
     ) {
+      this.deps.log.info(
+        `[lcm] interceptCompaction: declined ${interceptContext} reason=no_target_fraction_configured`,
+      );
       return { handled: false, reason: "no-target-fraction-configured" };
     }
 
     // Guard 3: aborted before we even start.
     if (request.signal?.aborted === true) {
+      this.deps.log.info(
+        `[lcm] interceptCompaction: declined ${interceptContext} reason=aborted_pre_compaction`,
+      );
       return { handled: false, reason: "aborted-pre-compaction" };
     }
 
@@ -7759,6 +7778,9 @@ export class LcmContextEngine implements ContextEngine {
       });
 
       if (!compactResult.ok) {
+        this.deps.log.info(
+          `[lcm] interceptCompaction: declined ${interceptContext} reason=compact_failed compactReason=${compactResult.reason?.replaceAll(" ", "_") ?? "unknown"}`,
+        );
         return {
           handled: false,
           reason: `compact-failed:${compactResult.reason ?? "unknown"}`,
@@ -7769,6 +7791,9 @@ export class LcmContextEngine implements ContextEngine {
       // (compaction is lossless to raw, so this is recoverable on next
       // assemble), but codex doesn't want our summary anymore.
       if (request.signal?.aborted === true) {
+        this.deps.log.info(
+          `[lcm] interceptCompaction: declined ${interceptContext} reason=aborted_mid_compaction`,
+        );
         return { handled: false, reason: "aborted-mid-compaction" };
       }
 
@@ -7786,6 +7811,9 @@ export class LcmContextEngine implements ContextEngine {
       // compaction. Returning handled:true with a fallback marker would
       // confuse codex into using a near-empty summary.
       if (!Array.isArray(assembled.messages) || assembled.messages.length === 0) {
+        this.deps.log.info(
+          `[lcm] interceptCompaction: declined ${interceptContext} reason=lcm_produced_no_context`,
+        );
         return { handled: false, reason: "lcm-produced-no-context" };
       }
 
@@ -7795,6 +7823,9 @@ export class LcmContextEngine implements ContextEngine {
       // header ("OpenClaw assembled context for this turn:...") is added
       // by openclaw, not us — we just return the BODY.
       const summary = serializeAssembledMessagesForCompaction(assembled.messages);
+      this.deps.log.info(
+        `[lcm] interceptCompaction: handled ${interceptContext} targetFraction=${targetFraction} tokensBefore=${request.tokensBefore} tokensAfter=${assembled.estimatedTokens} firstKeptEntryId=${request.firstKeptEntryId} summaryChars=${summary.length}`,
+      );
 
       return {
         handled: true,

@@ -139,7 +139,10 @@ afterEach(() => {
 
 describe("interceptCompaction (PR follow-up to #619)", () => {
   it("returns handled:false when compactionTargetFraction is unset (legacy behavior)", async () => {
-    const { engine } = makeEngine({ compactionTargetFraction: undefined } as Partial<LcmConfig>);
+    const info = vi.fn();
+    const { engine } = makeEngine({ compactionTargetFraction: undefined } as Partial<LcmConfig>, {
+      info,
+    });
     const result = await engine.interceptCompaction({
       sessionId: "test-session",
       sessionKey: "agent:main:main",
@@ -154,6 +157,9 @@ describe("interceptCompaction (PR follow-up to #619)", () => {
     if (!result.handled) {
       expect(result.reason).toBe("no-target-fraction-configured");
     }
+    expect(info).toHaveBeenCalledWith(
+      "[lcm] interceptCompaction: declined session=test-session sessionKey=agent:main:main reason=no_target_fraction_configured",
+    );
   });
 
   it("returns handled:false for invalid compactionTargetFraction (0, negative, >1, NaN)", async () => {
@@ -301,7 +307,10 @@ describe("interceptCompaction (PR follow-up to #619)", () => {
   });
 
   it("advances the projection epoch when intercepted compaction changes summary context", async () => {
-    const { engine } = makeEngine({ compactionTargetFraction: 0.35 } as Partial<LcmConfig>);
+    const info = vi.fn();
+    const { engine } = makeEngine({ compactionTargetFraction: 0.35 } as Partial<LcmConfig>, {
+      info,
+    });
     const sessionId = "test-session-projection-intercept";
     const sessionKey = "agent:main:main";
     await engine.ingest({
@@ -359,6 +368,12 @@ describe("interceptCompaction (PR follow-up to #619)", () => {
     if (result.handled) {
       expect(result.summary).toContain("Compacted summary after intercepted compaction");
     }
+    expect(info).toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] interceptCompaction: handled session=test-session-projection-intercept"),
+    );
+    expect(info).toHaveBeenCalledWith(expect.stringContaining("targetFraction=0.35"));
+    expect(info).toHaveBeenCalledWith(expect.stringContaining("tokensBefore=9000"));
+    expect(info).toHaveBeenCalledWith(expect.stringContaining("firstKeptEntryId=entry-keep-me"));
     const afterIntercept = await engine.assemble({
       sessionId,
       sessionKey,
