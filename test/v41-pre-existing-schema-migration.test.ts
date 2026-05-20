@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
 
@@ -37,6 +38,10 @@ const EXPECTED_V41_TABLES = [
   "lcm_embedding_meta",
   "lcm_feature_flags",
 ] as const;
+
+function legacySessionKey(sessionId: string): string {
+  return `legacy:session:${createHash("sha256").update(sessionId).digest("hex").slice(0, 16)}`;
+}
 
 function seedUpstreamPreV41Schema(db: DatabaseSync): void {
   // Upstream pre-v4.1 baseline shape (the schema Eva's live DB had right
@@ -126,7 +131,7 @@ describe("v4.1 migration against a partially pre-existing schema (B.fix Gap 9)",
     // Run the v4.1 migration — must not throw.
     expect(() => runLcmMigrations(db, { fts5Available: false })).not.toThrow();
 
-    // ── Conversations: NULL session_keys were backfilled to legacy:conv_<id>
+    // ── Conversations: safe NULL session_keys were backfilled to legacy session families
     const convs = db
       .prepare(
         `SELECT conversation_id, session_key FROM conversations ORDER BY conversation_id`,
@@ -137,8 +142,8 @@ describe("v4.1 migration against a partially pre-existing schema (B.fix Gap 9)",
       expect(typeof c.session_key).toBe("string");
       expect(c.session_key.length).toBeGreaterThan(0);
     }
-    expect(convs[0].session_key).toBe("legacy:conv_1");
-    expect(convs[1].session_key).toBe("legacy:conv_2");
+    expect(convs[0].session_key).toBe(legacySessionKey("s_null_a"));
+    expect(convs[1].session_key).toBe(legacySessionKey("s_null_b"));
     expect(convs[2].session_key).toBe("agent:main:main");
 
     // ── Audit rows for the NULL-backfilled conversations
@@ -153,8 +158,8 @@ describe("v4.1 migration against a partially pre-existing schema (B.fix Gap 9)",
       new_session_key: string;
     }>;
     expect(audits).toEqual([
-      { conversation_id: 1, original_session_key: null, new_session_key: "legacy:conv_1" },
-      { conversation_id: 2, original_session_key: null, new_session_key: "legacy:conv_2" },
+      { conversation_id: 1, original_session_key: null, new_session_key: legacySessionKey("s_null_a") },
+      { conversation_id: 2, original_session_key: null, new_session_key: legacySessionKey("s_null_b") },
     ]);
 
     // ── Summaries.session_key populated via the JOIN backfill
@@ -165,8 +170,8 @@ describe("v4.1 migration against a partially pre-existing schema (B.fix Gap 9)",
       expect(typeof s.session_key).toBe("string");
       expect(s.session_key.length).toBeGreaterThan(0);
     }
-    expect(sums.find((s) => s.summary_id === "sum_a")?.session_key).toBe("legacy:conv_1");
-    expect(sums.find((s) => s.summary_id === "sum_b")?.session_key).toBe("legacy:conv_2");
+    expect(sums.find((s) => s.summary_id === "sum_a")?.session_key).toBe(legacySessionKey("s_null_a"));
+    expect(sums.find((s) => s.summary_id === "sum_b")?.session_key).toBe(legacySessionKey("s_null_b"));
     expect(sums.find((s) => s.summary_id === "sum_c")?.session_key).toBe("agent:main:main");
 
     // ── All v4.1 tables present in sqlite_master

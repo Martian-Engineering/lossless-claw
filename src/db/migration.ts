@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { getLcmDbFeatures } from "./features.js";
 import { buildMessageIdentityHash } from "../store/message-identity.js";
@@ -40,6 +41,12 @@ type MessageIdentityBackfillRow = {
   message_id: number;
   role: string;
   content: string;
+};
+
+type LegacySessionBackfillRow = {
+  conversation_id: number;
+  session_id: string;
+  active: number;
 };
 
 type FtsTableSpec = {
@@ -192,6 +199,74 @@ function ensureLcmFeatureFlagsTable(db: DatabaseSync): void {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
+}
+
+function legacySessionFamilyKey(sessionId: string): string {
+  const digest = createHash("sha256").update(sessionId).digest("hex").slice(0, 16);
+  return `legacy:session:${digest}`;
+}
+
+function legacyConversationKey(conversationId: number): string {
+  return `legacy:conv_${conversationId}`;
+}
+
+function backfillConversationSessionKeys(db: DatabaseSync): void {
+  const rows = db
+    .prepare(
+      `SELECT conversation_id, session_id, active
+         FROM conversations
+         WHERE session_key IS NULL
+         ORDER BY session_id, conversation_id`,
+    )
+    .all() as LegacySessionBackfillRow[];
+  if (rows.length === 0) {
+    return;
+  }
+
+  const bySessionId = new Map<string, LegacySessionBackfillRow[]>();
+  for (const row of rows) {
+    const key = row.session_id.trim();
+    const bucket = bySessionId.get(key) ?? [];
+    bucket.push(row);
+    bySessionId.set(key, bucket);
+  }
+
+  const audit = db.prepare(
+    `INSERT OR IGNORE INTO lcm_session_key_audit
+       (audit_id, conversation_id, original_session_key, new_session_key, reason, applied_by)
+     VALUES (?, ?, NULL, ?, ?, 'migration')`,
+  );
+  const update = db.prepare(
+    `UPDATE conversations
+        SET session_key = ?
+      WHERE conversation_id = ?
+        AND session_key IS NULL`,
+  );
+  const activeKeyExists = db.prepare(
+    `SELECT COUNT(*) AS n
+       FROM conversations
+       WHERE session_key = ?
+         AND active = 1`,
+  );
+
+  for (const [sessionId, bucket] of bySessionId.entries()) {
+    const activeCount = bucket.reduce((count, row) => count + (row.active === 1 ? 1 : 0), 0);
+    const candidateKey = sessionId.length > 0 ? legacySessionFamilyKey(sessionId) : null;
+    const candidateActiveClash =
+      candidateKey != null
+        ? ((activeKeyExists.get(candidateKey) as { n: number } | undefined)?.n ?? 0) > 0
+        : false;
+    const useFamilyKey = candidateKey != null && activeCount <= 1 && !candidateActiveClash;
+
+    for (const row of bucket) {
+      const newSessionKey = useFamilyKey ? candidateKey : legacyConversationKey(row.conversation_id);
+      const reason = useFamilyKey
+        ? "v4.1 A.09: NULL session_key backfilled from legacy session_id family"
+        : "v4.1 A.09: NULL session_key backfilled per conversation because legacy session_id family was ambiguous";
+      audit.run(`audit-backfill-conv-${row.conversation_id}`, row.conversation_id, newSessionKey, reason);
+      update.run(newSessionKey, row.conversation_id);
+    }
+  }
 }
 
 function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
@@ -1987,34 +2062,14 @@ export function runLcmMigrations(
     // migration code.
     //
     // Steps (each idempotent + audited):
-    //   1. Backfill conversations.session_key NULL → 'legacy:conv_<id>'
-    //      Records each re-key in lcm_session_key_audit.
+    //   1. Backfill conversations.session_key NULL → a derived legacy
+    //      session family key when safe, or a per-conversation fallback when
+    //      ambiguous. Records each re-key in lcm_session_key_audit.
     //   2. Backfill summaries.session_key='' → conversations.session_key
     //      (JOIN). This targets the rows that A.02 added with the default
     //      empty-string value.
     runMigrationStep("backfillConversationSessionKeys", log, () => {
-      // Audit each re-key BEFORE applying it (so the audit row exists even
-      // if the UPDATE fails for any row). Uses ULID-shape audit_id derived
-      // from conversation_id for idempotency (re-running won't duplicate
-      // audit rows for already-keyed convs).
-      db.exec(`
-        INSERT OR IGNORE INTO lcm_session_key_audit
-          (audit_id, conversation_id, original_session_key, new_session_key, reason, applied_by)
-        SELECT
-          'audit-backfill-conv-' || conversation_id,
-          conversation_id,
-          NULL,
-          'legacy:conv_' || conversation_id,
-          'v4.1 A.09: NULL session_key backfilled with legacy: prefix to enable cross-conv lookups',
-          'migration'
-        FROM conversations
-        WHERE session_key IS NULL
-      `);
-      db.exec(`
-        UPDATE conversations
-        SET session_key = 'legacy:conv_' || conversation_id
-        WHERE session_key IS NULL
-      `);
+      backfillConversationSessionKeys(db);
     });
 
     runMigrationStep("backfillSummarySessionKeys", log, () => {

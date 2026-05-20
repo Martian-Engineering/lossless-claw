@@ -1,9 +1,14 @@
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
 
+function legacySessionKey(sessionId: string): string {
+  return `legacy:session:${createHash("sha256").update(sessionId).digest("hex").slice(0, 16)}`;
+}
+
 describe("v4.1 conversation session_key backfill (A.09)", () => {
-  it("backfills NULL session_keys to 'legacy:conv_<id>' AND writes audit rows", () => {
+  it("backfills NULL session_keys to safe legacy session families AND writes audit rows", () => {
     const db = new DatabaseSync(":memory:");
     // Pre-populate conversations BEFORE running migrations (simulating
     // existing DB with legacy NULL session_keys)
@@ -29,8 +34,8 @@ describe("v4.1 conversation session_key backfill (A.09)", () => {
     const rows = db
       .prepare(`SELECT conversation_id, session_key FROM conversations ORDER BY conversation_id`)
       .all() as Array<{ conversation_id: number; session_key: string }>;
-    expect(rows[0]).toEqual({ conversation_id: 1, session_key: "legacy:conv_1" });
-    expect(rows[1]).toEqual({ conversation_id: 2, session_key: "legacy:conv_2" });
+    expect(rows[0]).toEqual({ conversation_id: 1, session_key: legacySessionKey("s1") });
+    expect(rows[1]).toEqual({ conversation_id: 2, session_key: legacySessionKey("s2") });
     expect(rows[2]).toEqual({ conversation_id: 3, session_key: "agent:main:main" }); // unchanged
 
     // Audit rows recorded for the 2 backfilled
@@ -38,8 +43,72 @@ describe("v4.1 conversation session_key backfill (A.09)", () => {
       .prepare(`SELECT conversation_id, original_session_key, new_session_key FROM lcm_session_key_audit ORDER BY conversation_id`)
       .all() as Array<{ conversation_id: number; original_session_key: string | null; new_session_key: string }>;
     expect(audits).toEqual([
-      { conversation_id: 1, original_session_key: null, new_session_key: "legacy:conv_1" },
-      { conversation_id: 2, original_session_key: null, new_session_key: "legacy:conv_2" },
+      { conversation_id: 1, original_session_key: null, new_session_key: legacySessionKey("s1") },
+      { conversation_id: 2, original_session_key: null, new_session_key: legacySessionKey("s2") },
+    ]);
+    db.close();
+  });
+
+  it("preserves legacy family continuity for one active plus archived rows sharing session_id", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        session_key TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        archived_at TEXT,
+        title TEXT,
+        bootstrapped_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.prepare(
+      `INSERT INTO conversations (session_id, session_key, active, archived_at) VALUES ('shared', NULL, 0, datetime('now'))`,
+    ).run();
+    db.prepare(
+      `INSERT INTO conversations (session_id, session_key, active) VALUES ('shared', NULL, 1)`,
+    ).run();
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const rows = db
+      .prepare(`SELECT conversation_id, session_key FROM conversations ORDER BY conversation_id`)
+      .all() as Array<{ conversation_id: number; session_key: string }>;
+    expect(rows).toEqual([
+      { conversation_id: 1, session_key: legacySessionKey("shared") },
+      { conversation_id: 2, session_key: legacySessionKey("shared") },
+    ]);
+    db.close();
+  });
+
+  it("falls back to per-conversation keys for ambiguous legacy groups with multiple active rows", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        session_key TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        archived_at TEXT,
+        title TEXT,
+        bootstrapped_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.prepare(`INSERT INTO conversations (session_id, session_key, active) VALUES ('shared', NULL, 1)`).run();
+    db.prepare(`INSERT INTO conversations (session_id, session_key, active) VALUES ('shared', NULL, 1)`).run();
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const rows = db
+      .prepare(`SELECT conversation_id, session_key FROM conversations ORDER BY conversation_id`)
+      .all() as Array<{ conversation_id: number; session_key: string }>;
+    expect(rows).toEqual([
+      { conversation_id: 1, session_key: "legacy:conv_1" },
+      { conversation_id: 2, session_key: "legacy:conv_2" },
     ]);
     db.close();
   });
@@ -93,7 +162,7 @@ describe("v4.1 summaries session_key backfill (A.09)", () => {
       )
     `);
     db.prepare(`INSERT INTO conversations (session_id, session_key) VALUES ('s1', 'agent:main:main')`).run();
-    db.prepare(`INSERT INTO conversations (session_id, session_key) VALUES ('s2', NULL)`).run(); // → legacy:conv_2
+    db.prepare(`INSERT INTO conversations (session_id, session_key) VALUES ('s2', NULL)`).run(); // → legacy session family key
 
     runLcmMigrations(db, { fts5Available: false });
 
@@ -119,7 +188,7 @@ describe("v4.1 summaries session_key backfill (A.09)", () => {
       .prepare(`SELECT summary_id, session_key FROM summaries ORDER BY summary_id`)
       .all() as Array<{ summary_id: string; session_key: string }>;
     expect(after[0].session_key).toBe("agent:main:main");
-    expect(after[1].session_key).toBe("legacy:conv_2");
+    expect(after[1].session_key).toBe(legacySessionKey("s2"));
     db.close();
   });
 
