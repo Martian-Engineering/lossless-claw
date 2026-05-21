@@ -1461,7 +1461,56 @@ function wirePluginHandlers(
     });
   });
 
-  api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
+  // Fix: Ensure host memory supplements (wiki digest, etc.) are included in assembled context.
+  // When lossless-claw is the active context engine, OpenClaw delegates prompt assembly entirely
+  // to the engine. Without this wrapper, buildMemorySystemPromptAddition() is never called and
+  // registered memory supplements are silently dropped from the prompt.
+  api.registerContextEngine("lossless-claw", () => {
+    type BuildMemoryFn = (params: { availableTools: Set<string>; citationsMode?: string }) => string | undefined;
+    let _buildMemoryAddition: BuildMemoryFn | false | null = null;
+
+    async function ensureBuildMemoryAddition(): Promise<BuildMemoryFn | false> {
+      if (_buildMemoryAddition !== null) return _buildMemoryAddition;
+      try {
+        // openclaw is a peer dependency; plugin-sdk/core exports buildMemorySystemPromptAddition
+        const mod = await import("openclaw/plugin-sdk/core");
+        _buildMemoryAddition = (mod as any).buildMemorySystemPromptAddition ?? false;
+      } catch {
+        try {
+          const mod = await import("openclaw/plugin-sdk");
+          _buildMemoryAddition = (mod as any).buildMemorySystemPromptAddition ?? false;
+        } catch {
+          _buildMemoryAddition = false;
+        }
+      }
+      return _buildMemoryAddition;
+    }
+
+    function wrapEngineWithMemorySupplements<T extends { assemble: (...args: any[]) => any }>(engine: T): T {
+      if ((engine as any)._lcmMemorySupplementPatched) return engine;
+      const originalAssemble = engine.assemble.bind(engine);
+      (engine as any).assemble = async (params: any) => {
+        const result = await originalAssemble(params);
+        if (!result.systemPromptAddition) {
+          const builder = await ensureBuildMemoryAddition();
+          if (builder) {
+            const addition = builder({
+              availableTools: params.availableTools ?? new Set(),
+              citationsMode: params.citationsMode,
+            });
+            if (addition) result.systemPromptAddition = addition;
+          }
+        }
+        return result;
+      };
+      (engine as any)._lcmMemorySupplementPatched = true;
+      return engine;
+    }
+
+    const cached = shared.getCachedEngine();
+    if (cached) return wrapEngineWithMemorySupplements(cached);
+    return shared.waitForEngine().then(wrapEngineWithMemorySupplements);
+  });
 
   api.registerTool(
     (ctx) => createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
