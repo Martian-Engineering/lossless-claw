@@ -25,6 +25,50 @@ export function resolveOpenclawStateDir(env: NodeJS.ProcessEnv = process.env): s
 export const DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO = 0.90;
 export const DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES = 2 * 1024 * 1024;
 
+/**
+ * Codex OAuth profile — defaults applied when the resolved provider for the
+ * current session is `openai-codex` with auth mode `"oauth"`. Applied as an
+ * INTERMEDIATE tier in `resolveLcmConfigWithDiagnostics`:
+ *
+ *     env  >  pluginConfig  >  oauthDefaults  >  hardcoded defaults
+ *
+ * Operator overrides always win. To opt out entirely, set
+ * `codexOAuthProfile: "off"` in plugin config.
+ *
+ * Values:
+ *   contextThreshold: 0.90
+ *     Matches Codex's actual auto-compact trigger
+ *     (`codex-rs/protocol/src/openai_models.rs:322`:
+ *     `(context_window * 9) / 10`). Codex fires at 90%; we mirror so a
+ *     turn that doesn't trip codex's trigger doesn't trip ours either.
+ *
+ *   compactionTargetFraction: 0.35
+ *     Post-compaction target. Codex's native floor is `20000 / context_window`
+ *     (~8% of a 258K window) per `codex-rs/core/src/compact.rs:48`. We
+ *     deliberately target HIGHER than codex because lossless-claw preserves
+ *     full lineage on disk and the agent can drill down via lcm_describe;
+ *     keeping ~35% of budget filled with summaries lets a typical
+ *     30-tool-call follow-up burst complete without re-triggering
+ *     compaction. NOT a "codex parity" claim — this is lossless-claw's
+ *     heuristic, documented honestly.
+ *
+ *   proactiveThresholdCompactionMode: "deferred"
+ *     The "accordion" cadence (one big compaction at 90% trigger →
+ *     35% target → repeat) only makes sense in deferred mode. Inline
+ *     mode would convert each tool-call boundary into a synchronous
+ *     compaction check, defeating the cadence.
+ *
+ * NOTE: PR #619 (`respectThresholdAsHardFloor`) is a complementary in-flight
+ * change that, once merged, will add a hard-floor enforcement field to the
+ * OAuth defaults. Filed separately so this PR's review surface stays focused
+ * on the codex OAuth profile + interceptCompaction wiring.
+ */
+export const CODEX_OAUTH_DEFAULTS = {
+  contextThreshold: 0.90,
+  compactionTargetFraction: 0.35,
+  proactiveThresholdCompactionMode: "deferred" as const,
+} as const;
+
 export type CacheAwareCompactionConfig = {
   enabled: boolean;
   cacheTTLSeconds: number;
@@ -59,6 +103,13 @@ export type LcmConfigDiagnostics = {
   statelessSessionPatternsSource: LcmConfigSource;
   ignoreSessionPatternsEnvOverridesPluginConfig: boolean;
   statelessSessionPatternsEnvOverridesPluginConfig: boolean;
+  /**
+   * True iff the CODEX_OAUTH_DEFAULTS tier was active during this config
+   * resolution (i.e., oauthProfileActive was true AND codexOAuthProfile
+   * resolved to "auto"). Operators / tests can read this to verify whether
+   * the OAuth-tuned defaults shaped the resolved config.
+   */
+  codexOAuthProfileApplied: boolean;
 };
 
 export type LcmConfig = {
@@ -73,6 +124,44 @@ export type LcmConfig = {
   /** When true, stateless session pattern matching is enforced. */
   skipStatelessSessions: boolean;
   contextThreshold: number;
+  /**
+   * Post-compaction target as a fraction of token budget. When LCM completes
+   * a compaction sweep (whether triggered by threshold or by an
+   * `interceptCompaction` request from a host like codex), it continues
+   * compacting until current tokens drop to AT MOST `compactionTargetFraction
+   * * tokenBudget`.
+   *
+   * Default: undefined (sweep stops at `contextThreshold` per legacy v4.1
+   * behavior — i.e., compact down to the trigger floor).
+   *
+   * Recommended for Codex OAuth (auto-set when codexOAuthProfile is active):
+   * 0.35 — gives ~65% of budget as post-compaction headroom for the next
+   * burst of autonomous tool calls. This is lossless-claw's heuristic
+   * (NOT a mirror of codex's native 20K-token floor); the goal is to
+   * leave enough room that a typical 30-tool-call burst completes before
+   * the next compaction event.
+   *
+   * Must be strictly less than `contextThreshold` so the sweep makes progress.
+   */
+  compactionTargetFraction?: number;
+  /**
+   * Codex OAuth profile selector.
+   *   "auto"  (default) — when the resolved provider for this session is
+   *                       openai-codex with OAuth auth, apply codex-tuned
+   *                       defaults for compaction-related fields (see
+   *                       `CODEX_OAUTH_DEFAULTS` in this file). Explicit
+   *                       env / pluginConfig values still win.
+   *   "off"             — never apply OAuth-mode defaults; use the standard
+   *                       defaults regardless of detected auth.
+   *
+   * Detection: `api.runtime.modelAuth.resolveApiKeyForProvider({ provider:
+   * "openai-codex" }).mode === "oauth"`. Resolution is cached per
+   * sessionKey×provider and re-evaluated on `model_call_started`.
+   *
+   * Optional in the type to keep backward compat with test fixtures that
+   * predate this field; consumers should treat `undefined` as `"auto"`.
+   */
+  codexOAuthProfile?: "auto" | "off";
   freshTailCount: number;
   /** Optional token cap for the protected fresh tail; newest message is always preserved. */
   freshTailMaxTokens?: number;
@@ -336,14 +425,33 @@ export function describeLcmConfigSource(source: LcmConfigSource): string {
 export function resolveLcmConfigWithDiagnostics(
   env: NodeJS.ProcessEnv = process.env,
   pluginConfig?: Record<string, unknown>,
+  /**
+   * Optional input from the plugin runtime indicating whether the current
+   * session is authenticated via Codex OAuth. Detected by the plugin's
+   * `register()` function via `api.runtime.modelAuth.resolveApiKeyForProvider({
+   * provider: "openai-codex" }).mode === "oauth"` and passed in. When true
+   * AND `codexOAuthProfile === "auto"` (the default), the OAuth defaults tier
+   * from `CODEX_OAUTH_DEFAULTS` is applied between pluginConfig and the
+   * hardcoded defaults. Env / pluginConfig overrides still win.
+   */
+  oauthProfileActive: boolean = false,
 ): { config: LcmConfig; diagnostics: LcmConfigDiagnostics } {
   const pc = pluginConfig ?? {};
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
   const autoRotateSessionFiles = toRecord(pc.autoRotateSessionFiles);
+  // Resolve the Codex OAuth profile selector first — it gates whether the
+  // OAuth defaults tier applies to the rest of the config resolution.
+  const codexOAuthProfile: "auto" | "off" =
+    pc.codexOAuthProfile === "off" ? "off" : "auto";
+  const applyOAuthDefaults = oauthProfileActive && codexOAuthProfile === "auto";
+  const oauthDefaults = applyOAuthDefaults ? CODEX_OAUTH_DEFAULTS : null;
   const proactiveThresholdCompactionMode = toProactiveThresholdCompactionMode(
     env.LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE,
-  ) ?? toProactiveThresholdCompactionMode(pc.proactiveThresholdCompactionMode) ?? "deferred";
+  )
+    ?? toProactiveThresholdCompactionMode(pc.proactiveThresholdCompactionMode)
+    ?? oauthDefaults?.proactiveThresholdCompactionMode
+    ?? "deferred";
   const autoRotateSessionFileSizeBytes =
     toPositiveInteger(parseFiniteInt(env.LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES))
       ?? toPositiveInteger(toNumber(autoRotateSessionFiles?.sizeBytes))
@@ -458,7 +566,14 @@ export function resolveLcmConfigWithDiagnostics(
           : toBool(pc.skipStatelessSessions) ?? true,
       contextThreshold:
         parseFiniteNumber(env.LCM_CONTEXT_THRESHOLD)
-          ?? toNumber(pc.contextThreshold) ?? 0.75,
+          ?? toNumber(pc.contextThreshold)
+          ?? oauthDefaults?.contextThreshold
+          ?? 0.75,
+      compactionTargetFraction:
+        parseFiniteNumber(env.LCM_COMPACTION_TARGET_FRACTION)
+          ?? toNumber(pc.compactionTargetFraction)
+          ?? oauthDefaults?.compactionTargetFraction,
+      codexOAuthProfile,
       freshTailCount:
         parseFiniteInt(env.LCM_FRESH_TAIL_COUNT)
           ?? toNumber(pc.freshTailCount) ?? 64,
@@ -604,6 +719,7 @@ export function resolveLcmConfigWithDiagnostics(
       ignoreSessionPatternsEnvOverridesPluginConfig: ignoreSessionPatterns.envOverridesPluginConfig,
       statelessSessionPatternsEnvOverridesPluginConfig:
         statelessSessionPatterns.envOverridesPluginConfig,
+      codexOAuthProfileApplied: applyOAuthDefaults,
     },
   };
 }
@@ -617,6 +733,7 @@ export function resolveLcmConfigWithDiagnostics(
 export function resolveLcmConfig(
   env: NodeJS.ProcessEnv = process.env,
   pluginConfig?: Record<string, unknown>,
+  oauthProfileActive: boolean = false,
 ): LcmConfig {
-  return resolveLcmConfigWithDiagnostics(env, pluginConfig).config;
+  return resolveLcmConfigWithDiagnostics(env, pluginConfig, oauthProfileActive).config;
 }

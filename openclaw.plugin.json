@@ -28,6 +28,14 @@
       "label": "Sweep Max Depth",
       "help": "Preferred maximum condensation source depth during routine full sweeps (0 = leaf only, -1 = unlimited). Pressure sweeps may go deeper when summarized context remains above target."
     },
+    "compactionTargetFraction": {
+      "label": "Compaction Target Fraction",
+      "help": "Post-compaction target as a fraction of token budget (0.0–1.0). When set, a compaction sweep continues until current tokens drop to compactionTargetFraction × tokenBudget. Pairs with contextThreshold to define the 'accordion' cadence: compact when at threshold, fall to target, repeat. Default unset (sweep stops at contextThreshold per legacy behavior)."
+    },
+    "codexOAuthProfile": {
+      "label": "Codex OAuth Profile",
+      "help": "When 'auto' (default) and the host is configured for Codex (openai-codex provider), Codex-tuned defaults apply: contextThreshold=0.90, compactionTargetFraction=0.35, proactiveThresholdCompactionMode=deferred. Operator overrides (env / plugin config) still win. Set to 'off' to disable the profile entirely."
+    },
     "incrementalMaxDepth": {
       "label": "Incremental Max Depth (Deprecated)",
       "help": "Deprecated alias for sweepMaxDepth. Kept for existing configs."
@@ -277,10 +285,19 @@
         "minimum": 0,
         "maximum": 1
       },
-      "sweepMaxDepth": {
-        "type": "integer",
-        "minimum": -1
+    "sweepMaxDepth": {
+      "type": "integer",
+      "minimum": -1
+    },
+    "compactionTargetFraction": {
+      "type": "number",
+      "minimum": 0.05,
+        "maximum": 1
       },
+    "codexOAuthProfile": {
+      "type": "string",
+      "enum": ["auto", "off"]
+    },
       "incrementalMaxDepth": {
         "type": "integer",
         "minimum": -1

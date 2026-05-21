@@ -340,6 +340,15 @@ describe("LcmContextEngine metadata", () => {
     expect(engine.info.ownsCompaction).toBe(true);
   });
 
+  it("advertises interceptsCompaction capability (codex session_before_compact path)", () => {
+    const engine = createEngine();
+    // openclaw's compaction-intercept extension gates on this flag to decide
+    // whether to register the `session_before_compact` handler that routes
+    // through engine.interceptCompaction(). Without this, codex's native
+    // GPT compaction fires at 90% context instead of LCM's lossless path.
+    expect((engine.info as { interceptsCompaction?: boolean }).interceptsCompaction).toBe(true);
+  });
+
   it("configures file-backed sqlite connections with WAL and busy_timeout", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-db-"));
     tempDirs.push(tempDir);
