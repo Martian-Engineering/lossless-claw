@@ -1695,6 +1695,7 @@ describe("lcm command", () => {
       createCommandContext("doctor apply", {
         sessionKey: "agent:main:telegram:direct:doctor-apply-runtime-config",
         runtimeContext: {
+          authProfileId: "openai-codex:work",
           llm: {
             complete: hostBoundComplete,
           },
@@ -1726,6 +1727,7 @@ describe("lcm command", () => {
     expect(runtimeComplete).toHaveBeenCalled();
     expect(runtimeComplete.mock.calls[0]?.[0]).toMatchObject({
       agentId: "main",
+      authProfileId: "openai-codex:work",
       runtimeLlmComplete: hostBoundComplete,
     });
     expect(hostBoundComplete).not.toHaveBeenCalled();

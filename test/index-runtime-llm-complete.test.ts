@@ -97,6 +97,7 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
         };
         runtimeLlmComplete?: RuntimeLlmComplete;
         agentId?: string;
+        authProfileId?: string;
         system?: string;
         messages: Array<{ role: string; content: unknown }>;
         maxTokens: number;
@@ -143,6 +144,7 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
         messages: [{ role: "user", content: "Summarize this." }],
         maxTokens: 256,
         temperature: 0.2,
+        authProfileId: "openai-codex:work",
         reasoningIfSupported: "low",
       });
 
@@ -154,6 +156,7 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
         temperature: 0.2,
         systemPrompt: "System summary policy.",
         purpose: "lossless-claw compaction summarization",
+        authProfileId: "openai-codex:work",
       });
       expect(result).toMatchObject({
         content: [{ type: "text", text: "summary output" }],

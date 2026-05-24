@@ -50,6 +50,7 @@ export type RuntimeLlmCompleteFn = (params: {
   purpose?: string;
   agentId?: string;
   reasoning?: string;
+  authProfileId?: string;
 }) => Promise<{
   text: string;
   provider: string;
@@ -65,6 +66,7 @@ export type CompleteFn = (params: {
   runtimeModelOverride?: RuntimeLlmModelOverride;
   runtimeLlmComplete?: RuntimeLlmCompleteFn;
   agentId?: string;
+  authProfileId?: string;
   messages: Array<{ role: string; content: unknown }>;
   system?: string;
   maxTokens: number;
