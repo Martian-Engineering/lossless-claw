@@ -49,6 +49,7 @@ export type RuntimeLlmCompleteFn = (params: {
   systemPrompt?: string;
   purpose?: string;
   agentId?: string;
+  reasoning?: string;
 }) => Promise<{
   text: string;
   provider: string;

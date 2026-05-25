@@ -1108,6 +1108,7 @@ function createLcmDependencies(
           // agentId. Plugin-wide api.runtime.llm.complete is gateway-scoped and rejects
           // target-agent overrides unless OpenClaw is explicitly configured otherwise.
           ...(isBoundRuntimeLlm && agentId?.trim() ? { agentId: agentId.trim() } : {}),
+          ...(reasoning !== undefined ? { reasoning } : {}),
         });
         const text = typeof result.text === "string" ? result.text : "";
         return {
