@@ -22,7 +22,7 @@
     },
     "contextThreshold": {
       "label": "Context Threshold",
-      "help": "Fraction of context window that triggers compaction (0.0–1.0)"
+      "help": "Fraction of context window that triggers compaction (0.0\u20131.0)"
     },
     "sweepMaxDepth": {
       "label": "Sweep Max Depth",
@@ -46,7 +46,7 @@
     },
     "stubLargeToolPayloads": {
       "label": "Stub Large Tool Payloads",
-      "help": "When enabled, evictable tool-result rows whose payload was externalized via lcm-blob-migrate are replaced with a [LCM Tool Output: file_xxx | …] reference at assemble time. Fresh tail is never stubbed. The agent recovers the original output via lcm_describe(id=file_xxx, expandFile=true). Default off; requires running scripts/lcm-blob-migrate.mjs first to populate messages.large_content."
+      "help": "When enabled, evictable tool-result rows whose payload was externalized via lcm-blob-migrate are replaced with a [LCM Tool Output: file_xxx | \u2026] reference at assemble time. Fresh tail is never stubbed. The agent recovers the original output via lcm_describe(id=file_xxx, expandFile=true). Default off; requires running scripts/lcm-blob-migrate.mjs first to populate messages.large_content."
     },
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",
@@ -110,10 +110,6 @@
     },
     "largeFilesDir": {
       "label": "Large Files Directory",
-      "help": "Directory for persisting large-file text payloads (default: <stateDir>/lcm-files). Uses OPENCLAW_STATE_DIR when set."
-    },
-    "largeFilesDir": {
-      "label": "Large Files Directory",
       "help": "Directory for externalized large files and inline-image payloads (default: ~/.openclaw/lcm-files)"
     },
     "ignoreSessionPatterns": {
@@ -170,7 +166,7 @@
     },
     "maxAssemblyTokenBudget": {
       "label": "Max Assembly Token Budget",
-      "help": "Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
+      "help": "Hard ceiling for assembly token budget \u2014 caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
     },
     "summaryMaxOverageFactor": {
       "label": "Summary Max Overage Factor",
@@ -263,6 +259,14 @@
     "fallbackProviders": {
       "label": "Fallback Providers",
       "help": "Explicit runtime LLM fallback provider/model pairs for compaction summarization; entries require plugins.entries.lossless-claw.llm policy"
+    },
+    "agentDbPaths": {
+      "label": "Agent Database Paths",
+      "help": "Map of agentId to database path for per-agent memory isolation. Relative paths resolve against OPENCLAW_STATE_DIR."
+    },
+    "defaultAgentDbPath": {
+      "label": "Default Agent Database Path",
+      "help": "Default database path for agents not explicitly configured in agentDbPaths"
     }
   },
   "configSchema": {
@@ -355,6 +359,7 @@
         "type": "string"
       },
       "largeFilesDir": {
+        "description": "Directory for persisting large-file text payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)",
         "type": "string"
       },
       "ignoreSessionPatterns": {
@@ -525,21 +530,36 @@
         "description": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)",
         "type": "string"
       },
-      "largeFilesDir": {
-        "description": "Directory for persisting large-file text payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)",
-        "type": "string"
-      },
       "fallbackProviders": {
         "type": "array",
         "items": {
           "type": "object",
           "properties": {
-            "provider": { "type": "string" },
-            "model": { "type": "string" }
+            "provider": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
           },
-          "required": ["provider", "model"],
+          "required": [
+            "provider",
+            "model"
+          ],
           "additionalProperties": false
         }
+      },
+      "agentDbPaths": {
+        "description": "Agent-specific database paths. Key: agentId, Value: database path.",
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "description": "Absolute or relative path to agent-specific LCM database"
+        }
+      },
+      "defaultAgentDbPath": {
+        "description": "Default database path for agents not in agentDbPaths",
+        "type": "string"
       }
     }
   }

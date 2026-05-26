@@ -22,9 +22,11 @@ export type SharedLcmInit = {
   /** Sync accessor — returns the engine if already initialized, null otherwise. */
   getCachedEngine: () => LcmContextEngine | null;
   /** Async accessor for the initialized engine (waits for deferred init). */
-  waitForEngine: () => Promise<LcmContextEngine>;
+  waitForEngine: (sessionKey?: string) => Promise<LcmContextEngine>;
   /** Async accessor for the initialized DB handle (waits for deferred init). */
   waitForDatabase: () => Promise<DatabaseSync>;
+  /** Hot-reload-aware config resolver. */
+  getLiveLcmConfig: () => LcmConfig;
 };
 
 const SHARED_KEY = Symbol.for(

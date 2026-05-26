@@ -1,5 +1,7 @@
 import { homedir } from "os";
-import { join } from "path";
+import { join, dirname, basename } from "path";
+import { realpathSync } from "node:fs";
+import { normalizePath } from "./connection.js";
 
 /**
  * Resolve the active OpenClaw state directory.
@@ -64,6 +66,10 @@ export type LcmConfigDiagnostics = {
 export type LcmConfig = {
   enabled: boolean;
   databasePath: string;
+  /** Agent-specific database paths. Key: agentId, Value: database path. */
+  agentDbPaths: Record<string, string>;
+  /** Default database path for agents not in agentDbPaths. */
+  defaultAgentDbPath?: string;
   /** Directory for persisting large-file text payloads. */
   largeFilesDir: string;
   /** Glob patterns for session keys to exclude from LCM storage entirely. */
@@ -196,6 +202,223 @@ function parseFallbackProviders(value: string | undefined): Array<{ provider: st
     }
   }
   return entries.length > 0 ? entries : undefined;
+}
+
+/** Parse agent-specific database paths from plugin config. */
+function parseAgentDbPaths(
+  value: unknown,
+  env: NodeJS.ProcessEnv,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return result;
+  }
+  const record = value as Record<string, unknown>;
+  const stateDir = resolveOpenclawStateDir(env);
+  const normalizedStateDir = normalizePath(stateDir);
+  
+  // P0-C1: Prototype Pollution prevention
+  const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+  
+  for (const [agentId, path] of Object.entries(record)) {
+    // P0-C1: Skip prototype pollution keys
+    if (FORBIDDEN_KEYS.has(agentId)) {
+      continue;
+    }
+    
+    // P2-M1: Validate agentId format (alphanumeric, hyphens, underscores only)
+    const trimmedAgentId = agentId.trim();
+    if (!trimmedAgentId || !/^[a-zA-Z0-9_-]+$/.test(trimmedAgentId)) {
+      continue;
+    }
+    
+    const trimmedPath = typeof path === "string" ? path.trim() : undefined;
+    if (!trimmedPath) {
+      continue;
+    }
+    
+    let resolvedPath: string;
+    let normalizedPath: string;
+    
+    if (trimmedPath.startsWith("/")) {
+      // P0-C2/P0-C3: Absolute path - validate with realpath
+      resolvedPath = trimmedPath;
+      normalizedPath = normalizePath(resolvedPath);
+      
+      // P0-C3: Symlink attack prevention - resolve real path
+      try {
+        // Check if path exists and resolve symlink
+        const realPath = realpathSync(resolvedPath);
+        normalizedPath = normalizePath(realPath);
+      } catch {
+        // Path doesn't exist yet - check parent directory
+        const parentDir = dirname(resolvedPath);
+        try {
+          const realParent = realpathSync(parentDir);
+          normalizedPath = normalizePath(join(realParent, basename(resolvedPath)));
+        } catch {
+          // Parent doesn't exist, skip this path
+          continue;
+        }
+      }
+      
+      // P1-H1: Validate absolute path is within allowed directories
+      const ALLOWED_ABSOLUTE_PREFIXES = [normalizedStateDir];
+      const isAllowed = ALLOWED_ABSOLUTE_PREFIXES.some(prefix => 
+        normalizedPath === prefix || normalizedPath.startsWith(prefix + '/')
+      );
+      if (!isAllowed) {
+        // Absolute path outside allowed directories, skip
+        continue;
+      }
+    } else {
+      // Relative path - resolve against stateDir
+      const candidate = join(stateDir, trimmedPath);
+      normalizedPath = normalizePath(candidate);
+      
+      // Security: prevent path traversal
+      if (normalizedPath.includes('..') || !normalizedPath.startsWith(normalizedStateDir)) {
+        continue;
+      }
+      
+      // P0-C3: Symlink prevention for relative paths
+      try {
+        const realParent = realpathSync(stateDir);
+        normalizedPath = normalizePath(join(realParent, trimmedPath));
+        if (!normalizedPath.startsWith(normalizePath(realParent))) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      
+      resolvedPath = normalizedPath;
+    }
+    
+    result[trimmedAgentId] = normalizedPath;
+  }
+  return result;
+}
+
+/** Parse and validate defaultAgentDbPath with same security policy. */
+function parseDefaultAgentDbPath(
+  value: unknown,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmedPath = value.trim();
+  if (!trimmedPath) {
+    return undefined;
+  }
+  
+  const stateDir = resolveOpenclawStateDir(env);
+  const normalizedStateDir = normalizePath(stateDir);
+  const ALLOWED_ABSOLUTE_PREFIXES = [normalizedStateDir];
+  
+  let normalizedPath: string;
+  
+  if (trimmedPath.startsWith("/")) {
+    // Absolute path - validate with realpathSync
+    try {
+      const realPath = realpathSync(trimmedPath);
+      normalizedPath = normalizePath(realPath);
+    } catch {
+      // Path doesn't exist - check parent
+      const parentDir = dirname(trimmedPath);
+      try {
+        const realParent = realpathSync(parentDir);
+        normalizedPath = normalizePath(join(realParent, basename(trimmedPath)));
+      } catch {
+        // Parent doesn't exist, reject
+        return undefined;
+      }
+    }
+    
+    // Validate absolute path is within allowed directories
+    const isAllowed = ALLOWED_ABSOLUTE_PREFIXES.some(prefix => 
+      normalizedPath === prefix || normalizedPath.startsWith(prefix + '/')
+    );
+    if (!isAllowed) {
+      return undefined;
+    }
+  } else {
+    // Relative path - resolve against stateDir
+    const candidate = join(stateDir, trimmedPath);
+    normalizedPath = normalizePath(candidate);
+    
+    // Prevent path traversal
+    if (normalizedPath.includes('..') || !normalizedPath.startsWith(normalizedStateDir)) {
+      return undefined;
+    }
+    
+    // Symlink prevention
+    try {
+      const realParent = realpathSync(stateDir);
+      normalizedPath = normalizePath(join(realParent, trimmedPath));
+      if (!normalizedPath.startsWith(normalizePath(realParent))) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  
+  return normalizedPath;
+}
+
+/**
+ * Resolve database path for a given session.
+ * Uses agentDbPaths if configured for the session's agent, otherwise falls back.
+ * 
+ * Session key format: "agent:<agentId>:<sessionType>:<uuid>"
+ * 
+ * @param sessionKey - The session key to parse
+ * @param config - The LCM configuration with agentDbPaths
+ * @returns The resolved database path for this session
+ */
+export function resolveDbPathForSession(
+  sessionKey: string,
+  config: LcmConfig,
+): string {
+  // Extract agent_id from session_key
+  // Session key format: "agent:<agentId>:<sessionType>:<uuid>"
+  const value = sessionKey.trim();
+  if (!value.startsWith("agent:")) {
+    return config.databasePath;
+  }
+  const parts = value.split(":");
+  if (parts.length < 3) {
+    return config.databasePath;
+  }
+  const agentId = parts[1]?.trim();
+  if (!agentId) {
+    return config.databasePath;
+  }
+  
+  // P2-M1: Validate agentId format
+  if (!/^[a-zA-Z0-9_-]+$/.test(agentId)) {
+    return config.databasePath;
+  }
+  
+  // P0-C1: Use Object.hasOwn to prevent prototype pollution
+  if (Object.hasOwn(config.agentDbPaths, agentId)) {
+    return config.agentDbPaths[agentId];
+  }
+  
+  // P1-H2: Validate defaultAgentDbPath before using
+  if (config.defaultAgentDbPath) {
+    const trimmedDefaultPath = config.defaultAgentDbPath.trim();
+    if (trimmedDefaultPath) {
+      // Security validation (already done in parseAgentDbPaths-like logic)
+      // Here we trust it was validated during config parsing
+      return trimmedDefaultPath;
+    }
+  }
+  
+  // Fall back to global databasePath
+  return config.databasePath;
 }
 
 /** Parse fallback providers from plugin config array (object items only). */
@@ -446,6 +669,8 @@ export function resolveLcmConfigWithDiagnostics(
         ?? toStr(pc.dbPath)
         ?? toStr(pc.databasePath)
         ?? join(resolveOpenclawStateDir(env), "lcm.db"),
+      agentDbPaths: parseAgentDbPaths(pc.agentDbPaths, env),
+      defaultAgentDbPath: parseDefaultAgentDbPath(pc.defaultAgentDbPath, env),
       largeFilesDir:
         env.LCM_LARGE_FILES_DIR?.trim()
         ?? toStr(pc.largeFilesDir)

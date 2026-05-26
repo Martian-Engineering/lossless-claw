@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "../openclaw-bridge.js";
-import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
+import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir, resolveDbPathForSession } from "../db/config.js";
 import type { LcmConfig } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
@@ -1363,7 +1363,7 @@ function wirePluginHandlers(
   shared: SharedLcmInit,
 ): void {
   api.on("before_reset", async (event, ctx) => {
-    await (await shared.waitForEngine()).handleBeforeReset({
+    await (await shared.waitForEngine(ctx.sessionKey ?? "")).handleBeforeReset({
       reason: event.reason,
       sessionId: ctx.sessionId,
       sessionKey: ctx.sessionKey,
@@ -1374,7 +1374,7 @@ function wirePluginHandlers(
   }));
   api.on("session_end", async (event) => {
     const lifecycleEvent = event as SessionEndLifecycleEvent;
-    await (await shared.waitForEngine()).handleSessionEnd({
+    await (await shared.waitForEngine(lifecycleEvent.sessionKey ?? "")).handleSessionEnd({
       reason: lifecycleEvent.reason,
       sessionId: lifecycleEvent.sessionId,
       sessionKey: lifecycleEvent.sessionKey,
@@ -1383,25 +1383,90 @@ function wirePluginHandlers(
     });
   });
 
-  api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
+  // ── Session-aware context engine proxy ──────────────────────────────────
+  // Context engine methods receive sessionKey in params, but registerContextEngine
+  // factory doesn't receive session context. We create a proxy that routes to
+  // the correct per-agent engine based on sessionKey in method params.
+  const sessionAwareEngineProxy: ContextEngine = {
+    info: {
+      id: "lossless-claw",
+      name: "Lossless Claw",
+      description: "Lossless conversation memory with agent-level database isolation",
+    },
+
+    async bootstrap(params) {
+      const engine = await shared.waitForEngine(params.sessionKey ?? "");
+      return engine.bootstrap?.(params) ?? { ok: true, imported: false };
+    },
+
+    async maintain(params) {
+      const engine = await shared.waitForEngine(params.sessionKey ?? "");
+      return engine.maintain?.(params) ?? null;
+    },
+
+    async ingest(params) {
+      const engine = await shared.waitForEngine(params.sessionKey ?? "");
+      return engine.ingest(params);
+    },
+
+    async ingestBatch(params) {
+      const engine = await shared.waitForEngine(params.sessionKey ?? "");
+      return engine.ingestBatch?.(params) ?? { ingested: false, ingestedCount: 0 };
+    },
+
+    async assemble(params) {
+      const engine = await shared.waitForEngine(params.sessionKey ?? "");
+      return engine.assemble(params);
+    },
+
+    async compact(params) {
+      const engine = await shared.waitForEngine(params.sessionKey ?? "");
+      return engine.compact?.(params) ?? { ok: true, compacted: false, reason: "not-supported" }; 
+    },
+
+    async handleBeforeReset(params) {
+      const engine = await shared.waitForEngine(params.sessionKey ?? "");
+      return engine.handleBeforeReset(params);
+    },
+
+    async handleSessionEnd(params) {
+      const engine = await shared.waitForEngine(params.sessionKey ?? "");
+      return engine.handleSessionEnd(params);
+    },
+
+    async prepareSubagentSpawn(params) {
+      const engine = await shared.waitForEngine(params.sessionKey ?? "");
+      return engine.prepareSubagentSpawn?.(params) ?? null;
+    },
+
+    async handleSubagentEnd(params) {
+      const engine = await shared.waitForEngine(params.sessionKey ?? "");
+      return engine.handleSubagentEnd?.(params) ?? null;
+    },
+  }; 
+
+  api.registerContextEngine("lossless-claw", () => sessionAwareEngineProxy);
+
+  // Wrapper function to pass sessionKey to waitForEngine
+  const getLcmForSession = (sessionKey: string) => () => shared.waitForEngine(sessionKey);
 
   api.registerTool(
-    (ctx) => createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) => createLcmGrepTool({ deps, getLcm: getLcmForSession(ctx.sessionKey ?? ""), sessionKey: ctx.sessionKey }),
     { name: "lcm_grep" },
   );
   api.registerTool(
-    (ctx) => createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) => createLcmDescribeTool({ deps, getLcm: getLcmForSession(ctx.sessionKey ?? ""), sessionKey: ctx.sessionKey }),
     { name: "lcm_describe" },
   );
   api.registerTool(
-    (ctx) => createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) => createLcmExpandTool({ deps, getLcm: getLcmForSession(ctx.sessionKey ?? ""), sessionKey: ctx.sessionKey }),
     { name: "lcm_expand" },
   );
   api.registerTool(
     (ctx) =>
       createLcmExpandQueryTool({
         deps,
-        getLcm: shared.waitForEngine,
+        getLcm: getLcmForSession(ctx.sessionKey ?? ""),
         sessionKey: ctx.sessionKey,
         requesterSessionKey: ctx.sessionKey,
       }),
@@ -1439,6 +1504,27 @@ const lcmPlugin = {
     const deps = createLcmDependencies(api, registrationConfig);
     const dbPath = deps.config.databasePath;
     const normalizedDbPath = normalizePath(dbPath);
+    const pluginConfig = registrationConfig.pluginConfig;
+
+    // ── Runtime config resolver for hot reload support ──────────────────
+    // deps.config is captured at registration time and becomes stale after
+    // gateway hot reload. This helper reads the current live config.
+    function getLiveLcmConfig(): LcmConfig {
+      try {
+        const snapshot = api.runtime.config.current();
+        const pluginEntry = (snapshot as Record<string, unknown>)?.plugins
+          ? ((snapshot as Record<string, unknown>).plugins as Record<string, unknown>)?.entries
+            ? (((snapshot as Record<string, unknown>).plugins as Record<string, unknown>).entries as Record<string, unknown>)?.["lossless-claw"]
+            : undefined
+          : undefined;
+        const pluginCfg = pluginEntry && typeof pluginEntry === "object"
+          ? (pluginEntry as Record<string, unknown>).config ?? {}
+          : {};
+        return resolveLcmConfigWithDiagnostics(process.env, pluginCfg as Record<string, unknown>).config;
+      } catch {
+        return deps.config;
+      }
+    }
 
     // ── Singleton check ─────────────────────────────────────────────
     // OpenClaw v2026.4.5+ calls register() per-agent-context (main,
@@ -1459,12 +1545,72 @@ const lcmPlugin = {
     let resolveDeferredInit: ((engine: LcmContextEngine) => void) | null = null;
     let rejectDeferredInit: ((error: Error) => void) | null = null;
     let stopped = false;
+    
+    // ── Multi-database connection pool for agent-level isolation ────────
+    // P0-C2: Use mutex-like pattern to prevent race conditions
+    const enginesByPath = new Map<string, LcmContextEngine>();
+    const databasesByPath = new Map<string, DatabaseSync>();
+    const pendingInitByPath = new Map<string, Promise<LcmContextEngine>>();
 
     /** Normalize unknown failures into stable Error instances. */
     function toInitError(error: unknown): Error {
       return error instanceof Error ? error : new Error(String(error));
     }
 
+    /** Get or create engine for a specific database path (async with mutex). */
+    async function getOrCreateEngineForPath(dbPath: string): Promise<LcmContextEngine> {
+      const normalizedPath = normalizePath(dbPath);
+      
+      // Check for existing engine
+      const existing = enginesByPath.get(normalizedPath);
+      if (existing) {
+        return existing;
+      }
+      
+      // P0-C2: Check for pending initialization (mutex)
+      const pending = pendingInitByPath.get(normalizedPath);
+      if (pending) {
+        return pending;
+      }
+      
+      // Safety limit to prevent unbounded growth
+      const MAX_ENGINES = 32;
+      if (enginesByPath.size >= MAX_ENGINES) {
+        deps.log.warn(`[lcm] Max engine pool size (${MAX_ENGINES}) exceeded, rejecting ${normalizedPath}`);
+        throw new Error(`[lcm] Max engine pool size (${MAX_ENGINES}) exceeded`);
+      }
+      
+      // Create pending promise (mutex)
+      const initPromise = (async () => {
+        const startedAt = Date.now();
+        const nextDatabase = createLcmDatabaseConnection(dbPath);
+        try {
+          const nextEngine = new LcmContextEngine(deps, nextDatabase);
+          enginesByPath.set(normalizedPath, nextEngine);
+          databasesByPath.set(normalizedPath, nextDatabase);
+          deps.log.info(
+            `[lcm] Engine initialized for agent-db=${normalizedPath} duration=${Date.now() - startedAt}ms`,
+          );
+          scheduleStartupAutoRotate(nextEngine);
+          scheduleStartupSessionTotalTokensRecovery(nextEngine);
+          pendingInitByPath.delete(normalizedPath);
+          return nextEngine;
+        } catch (error) {
+          closeLcmConnection(nextDatabase);
+          pendingInitByPath.delete(normalizedPath);
+          deps.log.info(
+            `[lcm] Engine init failed for agent-db=${normalizedPath} duration=${Date.now() - startedAt}ms error=${toInitError(error).message}`,
+          );
+          throw error;
+        }
+      })();
+      
+      // Register pending promise
+      pendingInitByPath.set(normalizedPath, initPromise);
+      return initPromise;
+    }
+
+    /** Get engine for a session, using agentDbPaths if configured. */
     /** Start the non-blocking startup scan for oversized LCM-managed transcripts. */
     function scheduleStartupAutoRotate(nextEngine: LcmContextEngine): void {
       void nextEngine.autoRotateManagedSessionFilesAtStartup().catch((error) => {
@@ -1669,11 +1815,34 @@ const lcmPlugin = {
       reject?.(error);
     }
 
-    /** Return the initialized engine, waiting for deferred startup when the DB is lock-contended. */
-    async function waitForEngine(): Promise<LcmContextEngine> {
+    /** Return the initialized engine, waiting for deferred startup when the DB is lock-contended.
+     *  If sessionKey is provided and agentDbPaths is configured, returns engine for that agent.
+     */
+    async function waitForEngine(sessionKey?: string): Promise<LcmContextEngine> {
       if (stopped) {
         throw new Error("[lcm] Database connection closed after gateway_stop");
       }
+      
+      // If sessionKey provided and agentDbPaths configured, use per-agent engine
+      if (sessionKey) {
+        // Use live config to support hot reload, fallback to deps.config
+        const config = shared.getLiveLcmConfig();
+        if (Object.keys(config.agentDbPaths).length > 0 || config.defaultAgentDbPath) {
+          const resolvedDbPath = resolveDbPathForSession(sessionKey, config);
+          const normalizedPath = normalizePath(resolvedDbPath);
+          
+          // Check if we already have an engine for this path
+          const existingEngine = enginesByPath.get(normalizedPath);
+          if (existingEngine) {
+            return existingEngine;
+          }
+          
+          // P0-C2: Use async getOrCreateEngineForPath with mutex
+          return await getOrCreateEngineForPath(resolvedDbPath);
+        }
+      }
+      
+      // Default: use global engine
       if (initError) {
         throw initError;
       }
@@ -1742,12 +1911,32 @@ const lcmPlugin = {
       getCachedEngine: () => lcm,
       waitForEngine,
       waitForDatabase,
+      getLiveLcmConfig,
     };
     setSharedInit(normalizedDbPath, shared);
 
     api.on("gateway_stop", async () => {
       stopped = true;
       shared.stopped = true;
+      
+      // P2-M4: Proper cleanup order
+      // 1. Cancel pending initializations
+      pendingInitByPath.clear();
+      
+      // 2. Close all per-agent engines (engines hold references to DBs)
+      for (const [path, engine] of enginesByPath) {
+        deps.log.info(`[lcm] Clearing engine reference for ${path}`);
+        // Engine cleanup is implicit via database closure
+      }
+      enginesByPath.clear();
+      
+      // 3. Close all per-agent databases
+      for (const [path, db] of databasesByPath) {
+        closeLcmConnection(db);
+        deps.log.info(`[lcm] Closed agent-db connection: ${path}`);
+      }
+      databasesByPath.clear();
+      
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
