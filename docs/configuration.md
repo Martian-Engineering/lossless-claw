@@ -2,7 +2,7 @@
 
 Lossless-claw reads plugin configuration from `plugins.entries.lossless-claw.config`.
 
-Lossless-claw requires OpenClaw `2026.5.19` or newer so the host can enforce
+Lossless-claw requires OpenClaw `2026.5.22` or newer so the host can enforce
 context-engine runtime capabilities before an agent run starts. Agent runs need
 a native host that provides the full context-engine lifecycle: session bootstrap,
 pre-prompt assembly, after-turn ingestion, maintenance, compaction, and runtime
