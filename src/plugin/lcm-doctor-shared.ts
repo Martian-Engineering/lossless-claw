@@ -1,6 +1,16 @@
 import type { DatabaseSync } from "node:sqlite";
 
+// Wave-4 Auditor #18 P0 fix: the v4.1 fallback marker text was tightened
+// (was "[LCM fallback summary; truncated for context management]" — a
+// trailing-suffix on truncated content only; under-cap content was
+// silently shipped UNMARKED). New v4.1 markers are explicit prefixes that
+// land on every fallback. Doctor still detects the legacy text on old
+// DBs to support clean upgrade migration, plus the new prefix forms.
 export const FALLBACK_SUMMARY_MARKER = "[LCM fallback summary; truncated for context management]";
+export const FALLBACK_SUMMARY_MARKER_V41_TRUNC =
+  "[LCM fallback summary — model unavailable; raw source truncated for context management]";
+export const FALLBACK_SUMMARY_MARKER_V41_FULL =
+  "[LCM fallback summary — model unavailable; raw source preserved verbatim below]";
 export const TRUNCATED_SUMMARY_PREFIX = "[Truncated from ";
 export const TRUNCATED_SUMMARY_WINDOW = 40;
 export const FALLBACK_SUMMARY_WINDOW = 80;
@@ -54,8 +64,39 @@ type DoctorTargetRow = {
 
 /**
  * Detect broken summary markers that doctor should flag or repair.
+ *
+ * Marker classification:
+ * - `"old"` — startsWith the legacy FALLBACK_SUMMARY_MARKER. Practically
+ *   unreachable: pre-Wave-4 summarize.ts emitted the legacy marker as a
+ *   trailing SUFFIX on truncated content, never as a prefix. Kept for
+ *   defense-in-depth in case any future code path emits the legacy
+ *   marker as a prefix; legacy data is detected via the trailing-suffix
+ *   `fallbackIndex` branch below and classified `"fallback"`.
+ * - `"fallback"` — legacy SUFFIX marker on truncated content (pre-Wave-4
+ *   data) OR new v4.1 PREFIX markers (both truncated + full variants
+ *   from Wave-4). Both classifications collapse to "fallback" because
+ *   the repair semantics are identical (re-summarize the source).
+ * - `"new"` — TRUNCATED_SUMMARY_PREFIX trailing-suffix marker (different
+ *   condition: "summary was emitted but content was truncated for size",
+ *   distinct from "summarizer fell back").
+ *
+ * Wave-5 P3 clarification: the comment-vs-code intent gap noted by the
+ * Wave-5 audit; the "old" branch was historically dead code for legitimate
+ * data, but the v4.1 prefix markers MAY trigger it (start-of-string check
+ * is correct for them — but they take the v4.1 branch first since it
+ * checks for the LONGER prefix).
  */
 export function detectDoctorMarker(content: string): DoctorMarkerKind | null {
+  // v4.1 fallback markers: always at start (prefix form). Check FIRST
+  // because the v4.1 truncated marker prefix is longer than the legacy
+  // marker — though the strings differ at "; truncated" vs " — model"
+  // so there's no actual collision; this ordering is just for clarity.
+  if (
+    content.startsWith(FALLBACK_SUMMARY_MARKER_V41_TRUNC) ||
+    content.startsWith(FALLBACK_SUMMARY_MARKER_V41_FULL)
+  ) {
+    return "fallback";
+  }
   if (content.startsWith(FALLBACK_SUMMARY_MARKER)) {
     return "old";
   }
@@ -80,6 +121,10 @@ export function loadDoctorTargets(
   db: DatabaseSync,
   conversationId?: number,
 ): DoctorTargetRecord[] {
+  // Wave-4 Auditor #18 P0 fix: include the new v4.1 fallback markers in
+  // the INSTR pre-filter so doctor still finds rows with the new prefix
+  // form on a freshly-summarized DB. Detection still uses
+  // detectDoctorMarker per-row for severity classification.
   const statement = conversationId === undefined
     ? db.prepare(
         `SELECT
@@ -98,6 +143,8 @@ export function loadDoctorTargets(
            GROUP BY summary_id
          ) spc ON spc.summary_id = s.summary_id
          WHERE INSTR(COALESCE(s.content, ''), ?) > 0
+            OR INSTR(COALESCE(s.content, ''), ?) > 0
+            OR INSTR(COALESCE(s.content, ''), ?) > 0
             OR INSTR(COALESCE(s.content, ''), ?) > 0
          ORDER BY s.conversation_id ASC, COALESCE(s.depth, 0) ASC, s.created_at ASC, s.summary_id ASC`,
       )
@@ -121,13 +168,26 @@ export function loadDoctorTargets(
            AND (
              INSTR(COALESCE(s.content, ''), ?) > 0
              OR INSTR(COALESCE(s.content, ''), ?) > 0
+             OR INSTR(COALESCE(s.content, ''), ?) > 0
+             OR INSTR(COALESCE(s.content, ''), ?) > 0
            )
          ORDER BY COALESCE(s.depth, 0) ASC, s.created_at ASC, s.summary_id ASC`,
       );
 
   const rows = (conversationId === undefined
-    ? statement.all(FALLBACK_SUMMARY_MARKER, TRUNCATED_SUMMARY_PREFIX)
-    : statement.all(conversationId, FALLBACK_SUMMARY_MARKER, TRUNCATED_SUMMARY_PREFIX)) as DoctorTargetRow[];
+    ? statement.all(
+        FALLBACK_SUMMARY_MARKER,
+        FALLBACK_SUMMARY_MARKER_V41_TRUNC,
+        FALLBACK_SUMMARY_MARKER_V41_FULL,
+        TRUNCATED_SUMMARY_PREFIX,
+      )
+    : statement.all(
+        conversationId,
+        FALLBACK_SUMMARY_MARKER,
+        FALLBACK_SUMMARY_MARKER_V41_TRUNC,
+        FALLBACK_SUMMARY_MARKER_V41_FULL,
+        TRUNCATED_SUMMARY_PREFIX,
+      )) as DoctorTargetRow[];
 
   const targets: DoctorTargetRecord[] = [];
   for (const row of rows) {

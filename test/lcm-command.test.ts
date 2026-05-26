@@ -43,9 +43,15 @@ function createCommandContext(
   args?: string,
   overrides: Record<string, unknown> = {},
 ) {
+  // Wave-11 reviewer P1 fix: default `senderIsOwner: true` so existing
+  // tests exercising operator-mutating commands (doctor apply, etc.)
+  // continue to pass after the Wave-11 doctor-apply gate. Negative-case
+  // tests (e.g., Wave-9 P0 regression) explicitly pass `senderIsOwner:
+  // false` via `overrides` and continue to work.
   return {
     channel: "telegram",
     isAuthorizedSender: true,
+    senderIsOwner: true,
     commandBody: args ? `/lossless ${args}` : "/lossless",
     args,
     config: {
@@ -1564,7 +1570,7 @@ describe("lcm command", () => {
       conversationId: currentConversation.conversationId,
       kind: "condensed",
       depth: 1,
-      content: `${"[LCM fallback summary; truncated for context management]"}\nold parent`,
+      content: `${"[LCM fallback summary — model unavailable; raw source truncated for context management]"}\nold parent`,
       tokenCount: 9,
     });
     await fixture.summaryStore.linkSummaryToParents("sum_parent_fix", ["sum_leaf_fix"]);
@@ -2359,5 +2365,72 @@ describe("lcm command helpers", () => {
         },
       }),
     ).toBe(false);
+  });
+});
+
+// Wave-9 Agent #10 P0+P1 regression coverage: senderIsOwner gate is
+// load-bearing for /lcm purge (already covered above), and now ALSO
+// for /lcm reconcile-session-keys --apply and /lcm worker tick.
+// Without these tests a future refactor that drops the gate (which is
+// exactly how the original Wave-7 P0 vulnerability sat unnoticed for
+// reconcile + worker_tick until Wave-9) would not break a test.
+describe("operator-only gates (Wave-9 Agent #10 regression coverage)", () => {
+  const tempDirs = new Set<string>();
+  const dbPaths = new Set<string>();
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const dbPath of dbPaths) {
+      closeLcmConnection(dbPath);
+    }
+    dbPaths.clear();
+    for (const dir of tempDirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    tempDirs.clear();
+  });
+
+  function setupGated() {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    return fixture;
+  }
+
+  it("rejects /lcm reconcile-session-keys --apply when sender is not owner", async () => {
+    const { command } = setupGated();
+    const ctx = createCommandContext(
+      `reconcile-session-keys --apply --from legacy:conv_1 --to agent:main:main --reason test`,
+      { senderIsOwner: false },
+    );
+    const result = await command.handler(ctx);
+    expect(result).toBeDefined();
+    const text = (result as { text: string }).text;
+    expect(text).toMatch(/operator-only/i);
+    expect(text).toMatch(/owner privileges/i);
+  });
+
+  it("rejects /lcm worker tick embedding-backfill when sender is not owner", async () => {
+    const { command } = setupGated();
+    const ctx = createCommandContext(`worker tick embedding-backfill`, {
+      senderIsOwner: false,
+    });
+    const result = await command.handler(ctx);
+    expect(result).toBeDefined();
+    const text = (result as { text: string }).text;
+    expect(text).toMatch(/operator-only/i);
+    expect(text).toMatch(/owner privileges/i);
+  });
+
+  it("allows /lcm worker status (read-only) when sender is not owner", async () => {
+    // Read-only commands intentionally don't require owner privilege —
+    // verify status remains readable so misconfigured non-owner sessions
+    // can still introspect the system.
+    const { command } = setupGated();
+    const ctx = createCommandContext(`worker status`, { senderIsOwner: false });
+    const result = await command.handler(ctx);
+    expect(result).toBeDefined();
+    const text = (result as { text: string }).text;
+    expect(text).not.toMatch(/operator-only/i);
   });
 });

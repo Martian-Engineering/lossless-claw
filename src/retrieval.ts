@@ -29,6 +29,14 @@ export interface DescribeResult {
   /** Summary-specific fields */
   summary?: {
     conversationId: number;
+    /**
+     * v4.1 §13 / Group C.05: session_key sourced from the parent
+     * conversations row. summaries.session_key is atomically populated
+     * at write time per Gap 8 (B.05); we pull through the conversation
+     * record so callers don't need a separate lookup. Empty string when
+     * the parent conversation has no session_key set.
+     */
+    sessionKey: string;
     kind: "leaf" | "condensed";
     content: string;
     depth: number;
@@ -42,6 +50,17 @@ export interface DescribeResult {
     messageIds: number[];
     earliestAt: Date | null;
     latestAt: Date | null;
+    /**
+     * v4.1 §13 / Group C.05: normalized time bracket — earliest covered
+     * content, latest covered content, and the row's own creation time.
+     * Mirrors earliestAt/latestAt/createdAt above for callers (esp.
+     * agents) that prefer a single struct.
+     */
+    timeRange: {
+      earliestAt: Date | null;
+      latestAt: Date | null;
+      createdAt: Date;
+    };
     subtree: Array<{
       summaryId: string;
       parentSummaryId: string | null;
@@ -171,19 +190,27 @@ export class RetrievalEngine {
       return null;
     }
 
-    // Fetch lineage in parallel
-    const [parents, children, messageIds, subtree] = await Promise.all([
+    // Fetch lineage + parent conversation (for session_key) in parallel.
+    // session_key is atomically populated on summaries (Gap 8 / B.05) but
+    // SummaryRecord doesn't carry it through the public store API; pull
+    // from the parent conversation, which holds the same value by
+    // invariant.
+    const [parents, children, messageIds, subtree, conversation] = await Promise.all([
       this.summaryStore.getSummaryParents(id),
       this.summaryStore.getSummaryChildren(id),
       this.summaryStore.getSummaryMessages(id),
       this.summaryStore.getSummarySubtree(id),
+      this.conversationStore.getConversation(summary.conversationId),
     ]);
+
+    const sessionKey = conversation?.sessionKey ?? "";
 
     return {
       id,
       type: "summary",
       summary: {
         conversationId: summary.conversationId,
+        sessionKey,
         kind: summary.kind,
         content: summary.content,
         depth: summary.depth,
@@ -197,6 +224,11 @@ export class RetrievalEngine {
         messageIds,
         earliestAt: summary.earliestAt,
         latestAt: summary.latestAt,
+        timeRange: {
+          earliestAt: summary.earliestAt,
+          latestAt: summary.latestAt,
+          createdAt: summary.createdAt,
+        },
         subtree: subtree.map((node) => ({
           summaryId: node.summaryId,
           parentSummaryId: node.parentSummaryId,
@@ -378,7 +410,17 @@ export class RetrievalEngine {
       truncated: false,
     };
 
-    await this.expandRecursive(input.summaryId, depth, includeMessages, tokenCap, result);
+    // Wave-4 Auditor #7 P1 fix + Wave-5 P1 fix: cycle-guard. The DAG is
+    // acyclic by invariant, but if a doctor bug or migration produces a
+    // cycle, the recursion would loop forever (default tokenCap is
+    // Infinity in some call paths). Track ACTIVE call-stack ancestors
+    // (in-flight DFS path) — NOT all-time visits. This prevents cycles
+    // without breaking legitimate cross-path re-entry: if A→B and C→B
+    // (B reachable from two distinct ancestors), B's subtree is
+    // explored under each ancestor as before. We `add` on entry, `delete`
+    // on return, so the set always reflects the current call stack only.
+    const stackAncestors = new Set<string>();
+    await this.expandRecursive(input.summaryId, depth, includeMessages, tokenCap, result, stackAncestors);
 
     return result;
   }
@@ -389,6 +431,7 @@ export class RetrievalEngine {
     includeMessages: boolean,
     tokenCap: number,
     result: ExpandResult,
+    stackAncestors: Set<string>,
   ): Promise<void> {
     if (depth <= 0) {
       return;
@@ -396,7 +439,27 @@ export class RetrievalEngine {
     if (result.truncated) {
       return;
     }
+    // Cycle guard: if this id is an ancestor on the current call stack,
+    // we've hit a cycle — return without exploring (would loop forever).
+    if (stackAncestors.has(summaryId)) {
+      return;
+    }
+    stackAncestors.add(summaryId);
+    try {
+      await this.expandRecursiveInner(summaryId, depth, includeMessages, tokenCap, result, stackAncestors);
+    } finally {
+      stackAncestors.delete(summaryId);
+    }
+  }
 
+  private async expandRecursiveInner(
+    summaryId: string,
+    depth: number,
+    includeMessages: boolean,
+    tokenCap: number,
+    result: ExpandResult,
+    stackAncestors: Set<string>,
+  ): Promise<void> {
     const summary = await this.summaryStore.getSummary(summaryId);
     if (!summary) {
       return;
@@ -430,7 +493,7 @@ export class RetrievalEngine {
 
         // Recurse into children if depth allows
         if (depth > 1) {
-          await this.expandRecursive(child.summaryId, depth - 1, includeMessages, tokenCap, result);
+          await this.expandRecursive(child.summaryId, depth - 1, includeMessages, tokenCap, result, stackAncestors);
         }
       }
     } else if (summary.kind === "leaf" && includeMessages) {
