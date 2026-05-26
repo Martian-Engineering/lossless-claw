@@ -8,6 +8,7 @@ import {
 import type { LcmDependencies } from "../types.js";
 import { jsonResult, type AnyAgentTool } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import { runWithTokenGate } from "../plugin/needs-compact-gate.js";
 import {
   normalizeSummaryIds,
   resolveRequesterConversationScopeId,
@@ -125,6 +126,16 @@ type ExpandQueryReply = {
   truncated: boolean;
   conversationBreakdown?: ConversationBreakdown[];
   sourceConversationId?: number;
+  /**
+   * Wave-9 Agent #5 P1 fix: surface fabrication validation results to
+   * the agent. Previously runDelegatedExpandQuery computed these counts
+   * (Wave-4 P1-02 + Wave-6 P2) but buildExpandQueryReply silently dropped
+   * them, leaving the agent with NO programmatic signal that the LLM
+   * hallucinated IDs - empty `citedIds: []` looked identical to "no
+   * citations" vs "all citations were fabricated and dropped".
+   */
+  citedIdsRejectedAsFabricated?: number;
+  citedIdsExceededValidationCap?: number;
 };
 
 type DelegatedExpandQueryReply = {
@@ -133,6 +144,13 @@ type DelegatedExpandQueryReply = {
   expandedSummaryCount: number;
   totalSourceTokens: number;
   truncated: boolean;
+  /** Wave-4 Auditor #10 P1-02: count of citedIds the LLM emitted that
+   *  weren't found in the summaries table — i.e., fabricated. */
+  citedIdsRejectedAsFabricated?: number;
+  /** Wave-6 P2 fix: count of citedIds that exceeded the 1000-cap and
+   *  were therefore not validated against the summaries table.
+   *  Distinguishes "fabricated" from "too many to verify cheaply". */
+  citedIdsExceededValidationCap?: number;
 };
 
 type ParsedExpandQueryReply =
@@ -179,6 +197,12 @@ type BucketExecutionResult =
 
 type RunDelegatedExpandQueryParams = {
   deps: LcmDependencies;
+  // Wave-8 Auditor #7-12 P0 fix: previously the citation validation
+  // path called `params.lcm.getDb()` but `lcm` was NOT a field on this
+  // type — the call threw TypeError silently swallowed by the empty
+  // catch, making the entire Wave-4 + Wave-6 anti-fabrication validation
+  // a NO-OP in production. Added explicitly here so call sites pass it.
+  lcm: LcmContextEngine;
   callerSessionKey: string;
   requesterAgentId: string;
   bucket: ConversationBucket;
@@ -439,6 +463,9 @@ function buildExpandQueryReply(params: {
   totalSourceTokens: number;
   truncated: boolean;
   conversationBreakdown?: ConversationBreakdown[];
+  /** Wave-9 Agent #5 P1 fix: thread fabrication-validation counts. */
+  citedIdsRejectedAsFabricated?: number;
+  citedIdsExceededValidationCap?: number;
 }): ExpandQueryReply {
   const sourceConversationIds = [...params.sourceConversationIds].sort((left, right) => left - right);
 
@@ -453,6 +480,15 @@ function buildExpandQueryReply(params: {
     totalSourceTokens: params.totalSourceTokens,
     truncated: params.truncated,
     ...(params.conversationBreakdown ? { conversationBreakdown: params.conversationBreakdown } : {}),
+    // Wave-9 Agent #5 P1 fix: surface fabrication-validation counts only
+    // when non-zero so successful well-cited replies don't include zero
+    // chaff in their JSON.
+    ...(params.citedIdsRejectedAsFabricated && params.citedIdsRejectedAsFabricated > 0
+      ? { citedIdsRejectedAsFabricated: params.citedIdsRejectedAsFabricated }
+      : {}),
+    ...(params.citedIdsExceededValidationCap && params.citedIdsExceededValidationCap > 0
+      ? { citedIdsExceededValidationCap: params.citedIdsExceededValidationCap }
+      : {}),
   };
 }
 
@@ -918,6 +954,89 @@ async function runDelegatedExpandQuery(
       if (!parsed.ok) {
         throw new Error(parsed.error);
       }
+
+      // Wave-4 Auditor #10 P1-02 fix: validate citedIds against the
+      // database. Previously the LLM could fabricate `sum_xxx` strings
+      // that look real and the wrapper would surface them unchecked.
+      // Now we intersect with the set of summary_ids actually in the DB —
+      // any IDs not found are dropped + counted into a separate field
+      // so the caller can detect fabrication.
+      let citedIdsValidated: string[] = parsed.value.citedIds;
+      let citedIdsRejectedAsFabricated = 0;
+      let citedIdsExceededValidationCap = 0;
+      if (parsed.value.citedIds.length > 0) {
+        // Wave-5 P2 fix: cap IN-list size before query so an LLM that
+        // emitted thousands of fabricated IDs doesn't blow SQLite's
+        // SQLITE_MAX_VARIABLE_NUMBER (default 32766). 1000 is well above
+        // any realistic citation count and well under the SQLite cap.
+        const CITATION_VALIDATION_CAP = 1000;
+        const idsToCheck = parsed.value.citedIds.slice(0, CITATION_VALIDATION_CAP);
+        try {
+          const dbForValidation = params.lcm.getDb();
+          const placeholders = idsToCheck.map(() => "?").join(",");
+          const rows = dbForValidation
+            .prepare(
+              `SELECT summary_id FROM summaries WHERE summary_id IN (${placeholders})`,
+            )
+            .all(...idsToCheck) as Array<{ summary_id: string }>;
+          const real = new Set(rows.map((r) => r.summary_id));
+          // Wave-6 P2 fix: distinguish "rejected as fabricated" from
+          // "exceeded validation cap" so caller diagnostics aren't
+          // misleadingly labeled. Filter ONLY the validated slice; IDs
+          // beyond the cap are reported separately.
+          const filtered = idsToCheck.filter((id) => real.has(id));
+          citedIdsRejectedAsFabricated = idsToCheck.length - filtered.length;
+          citedIdsExceededValidationCap = Math.max(
+            0,
+            parsed.value.citedIds.length - CITATION_VALIDATION_CAP,
+          );
+          // Preserve the over-cap IDs in the result (un-validated but
+          // returned for the caller's UI; only the first 1000 are
+          // confirmed real).
+          citedIdsValidated = [
+            ...filtered,
+            ...parsed.value.citedIds.slice(CITATION_VALIDATION_CAP),
+          ];
+        } catch (validationErr) {
+          // Wave-8 P0 fix: previously this catch was empty {} which
+          // SILENTLY swallowed the TypeError from `params.lcm` being
+          // undefined — making the entire W4+W6 validation a no-op for
+          // months. Now log the error so operators see if validation
+          // breaks again. Fallback to unvalidated set is preserved as
+          // graceful degradation (better to ship un-validated answer
+          // than to fail the whole request on a validation glitch).
+          if (params.deps.log?.error) {
+            params.deps.log.error(
+              `[lcm_expand_query] citedIds validation failed (falling back to unvalidated): ${
+                validationErr instanceof Error ? validationErr.message : String(validationErr)
+              }`,
+            );
+          }
+        }
+      }
+
+      // Wave-4 Auditor #10 P1-03 fix: maxTokens was advisory-only ("target
+      // <= N tokens" in the prompt). Now ENFORCE post-hoc: truncate the
+      // answer to ~params.maxTokens × 4 chars (loose token estimate;
+      // tighter by truncating at a sentence boundary if possible).
+      let answerEnforced = parsed.value.answer;
+      let answerWasTruncated = false;
+      const maxAnswerChars = Math.max(256, params.maxTokens * 4);
+      if (answerEnforced.length > maxAnswerChars) {
+        // Truncate at the last sentence-ish boundary within the cap
+        const cut = answerEnforced.slice(0, maxAnswerChars);
+        const lastBoundary = Math.max(
+          cut.lastIndexOf(". "),
+          cut.lastIndexOf(".\n"),
+          cut.lastIndexOf("!\n"),
+          cut.lastIndexOf("?\n"),
+        );
+        answerEnforced =
+          (lastBoundary > maxAnswerChars * 0.7 ? cut.slice(0, lastBoundary + 1) : cut) +
+          `\n\n[Truncated by lcm_expand_query: answer exceeded maxTokens=${params.maxTokens}]`;
+        answerWasTruncated = true;
+      }
+
       recordExpansionDelegationTelemetry({
         deps: params.deps,
         component: "lcm_expand_query",
@@ -929,7 +1048,14 @@ async function runDelegatedExpandQuery(
         runId,
       });
 
-      return parsed.value;
+      return {
+        ...parsed.value,
+        answer: answerEnforced,
+        citedIds: citedIdsValidated,
+        truncated: parsed.value.truncated || answerWasTruncated,
+        citedIdsRejectedAsFabricated,
+        citedIdsExceededValidationCap,
+      };
     } finally {
       try {
         await params.deps.callGateway({
@@ -981,6 +1107,11 @@ export function createLcmExpandQueryTool(input: {
   requesterSessionKey?: string;
   /** Session key for scope fallback when sessionId is unavailable. */
   sessionKey?: string;
+  /** Wave-14 token-state runtime context. */
+  getRuntimeContext?: () => {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  };
 }): AnyAgentTool {
   const configuredDelegatedWaitTimeoutMs =
     input.deps.config.delegationTimeoutMs || DEFAULT_DELEGATED_WAIT_TIMEOUT_MS;
@@ -997,6 +1128,12 @@ export function createLcmExpandQueryTool(input: {
       "and return a compact prompt-focused answer. Tool output includes cited summary IDs for follow-up.",
     parameters: createLcmExpandQuerySchema(advertisedDynamicToolTimeoutMs),
     async execute(_toolCallId, params) {
+      return runWithTokenGate({
+        toolName: "lcm_expand_query",
+        toolParams: params as Record<string, unknown>,
+        sessionKey: input.sessionKey,
+        getRuntimeContext: input.getRuntimeContext,
+        inner: async () => {
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -1189,6 +1326,13 @@ export function createLcmExpandQueryTool(input: {
           });
           const delegatedReply = await runDelegatedExpandQuery({
             deps: input.deps,
+            // Wave-8 P0 fix: thread `lcm` so citation validation can
+            // call `lcm.getDb()`. Without this, the W4+W6 anti-
+            // fabrication validation silently no-ops.
+            // Wave-9 TS-tightening: use the resolved `lcm` local
+            // (line 1064) so the engine is non-nullable at the
+            // boundary — the ! guard already early-returned above.
+            lcm,
             callerSessionKey,
             requesterAgentId,
             bucket,
@@ -1211,6 +1355,11 @@ export function createLcmExpandQueryTool(input: {
               expandedSummaryCount: delegatedReply.expandedSummaryCount,
               totalSourceTokens: delegatedReply.totalSourceTokens,
               truncated: delegatedReply.truncated,
+              // Wave-9 Agent #5 P1 fix: thread fabrication-validation
+              // counts so the agent has a programmatic signal that the
+              // LLM hallucinated IDs.
+              citedIdsRejectedAsFabricated: delegatedReply.citedIdsRejectedAsFabricated,
+              citedIdsExceededValidationCap: delegatedReply.citedIdsExceededValidationCap,
             }),
           );
         }
@@ -1236,6 +1385,8 @@ export function createLcmExpandQueryTool(input: {
           try {
             const delegatedReply = await runDelegatedExpandQuery({
               deps: input.deps,
+              // Wave-9 TS-tightening: use resolved `lcm` local (1064).
+              lcm,
               callerSessionKey,
               requesterAgentId,
               bucket,
@@ -1330,6 +1481,19 @@ export function createLcmExpandQueryTool(input: {
               successfulResults.some((result) => result.reply.truncated)
               || bucketResults.some((result) => result.status !== "success"),
             conversationBreakdown,
+            // Wave-9 Agent #5 P1 fix: SUM fabrication-validation counts
+            // across buckets so one rogue bucket's hallucinations are
+            // visible in the rolled-up reply.
+            citedIdsRejectedAsFabricated: successfulResults.reduce(
+              (total, result) =>
+                total + (result.reply.citedIdsRejectedAsFabricated ?? 0),
+              0,
+            ),
+            citedIdsExceededValidationCap: successfulResults.reduce(
+              (total, result) =>
+                total + (result.reply.citedIdsExceededValidationCap ?? 0),
+              0,
+            ),
           }),
         );
       } catch (error) {
@@ -1344,6 +1508,8 @@ export function createLcmExpandQueryTool(input: {
           requestId,
         });
       }
+        },
+      });
     },
   };
 }

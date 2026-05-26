@@ -1,13 +1,26 @@
-export type {
-  AnyAgentTool,
-} from "openclaw/plugin-sdk";
-
 /**
  * Compatibility bridge for plugin-sdk context-engine symbols.
  *
  * This module intentionally keeps the context-engine contract local because
  * older OpenClaw SDK packages do not publish these newer type symbols yet.
+ * `AnyAgentTool` is kept local for the same reason — re-exporting it from
+ * `openclaw/plugin-sdk` left it unresolved (and the tool `execute` params
+ * implicitly `any`) wherever that subpath is not published.
  */
+
+export type AnyAgentTool = {
+  name: string;
+  label?: string;
+  description?: string;
+  parameters?: unknown;
+  execute(
+    toolCallId: string,
+    params: Record<string, unknown>,
+  ): Promise<{
+    content: Array<{ type: string; text: string }>;
+    details?: unknown;
+  }>;
+};
 
 export type ContextEngineProjection = {
   mode: "per_turn" | "thread_bootstrap";

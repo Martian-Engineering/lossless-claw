@@ -6757,32 +6757,48 @@ export class LcmContextEngine implements ContextEngine {
       stored = rawPayloadIntercepted.stored;
     }
 
-    // Determine next sequence number
-    const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
-    const seq = maxSeq + 1;
+    // Wave-4 Auditor #18 P0 fix: wrap the three-write ingest path in a
+    // single SQLite transaction. Previously these ran as separate ops:
+    //   1. getMaxSeq + createMessage
+    //   2. createMessageParts
+    //   3. appendContextMessage
+    // Failure modes if any one threw mid-sequence:
+    //   - createMessageParts throws after createMessage → orphan message
+    //     row with no parts → assembler emits malformed turn.
+    //   - appendContextMessage throws after the first two → message
+    //     persisted but invisible to assembler → permanent context gap.
+    //   - Concurrent ingest race: two callers both read seq=N, both INSERT
+    //     seq=N+1 → UNIQUE conflict, second caller's exception bubbles up
+    //     after partial writes were already committed.
+    // BEGIN IMMEDIATE locks SQLite for write so seq computation + message
+    // INSERT happen atomically; any throw rolls back the whole sequence.
+    return await this.conversationStore.withTransaction(async () => {
+      const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
+      const seq = maxSeq + 1;
 
-    // Persist the message
-    const msgRecord = await this.conversationStore.createMessage({
-      conversationId,
-      seq,
-      role: stored.role,
-      content: stored.content,
-      tokenCount: stored.tokenCount,
-      skipReplayTimestampFloodGuard,
+      // Persist the message
+      const msgRecord = await this.conversationStore.createMessage({
+        conversationId,
+        seq,
+        role: stored.role,
+        content: stored.content,
+        tokenCount: stored.tokenCount,
+        skipReplayTimestampFloodGuard,
+      });
+      await this.conversationStore.createMessageParts(
+        msgRecord.messageId,
+        buildMessageParts({
+          sessionId,
+          message: messageForParts,
+          fallbackContent: stored.content,
+        }),
+      );
+
+      // Append to context items so assembler can see it
+      await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
+
+      return { ingested: true };
     });
-    await this.conversationStore.createMessageParts(
-      msgRecord.messageId,
-      buildMessageParts({
-        sessionId,
-        message: messageForParts,
-        fallbackContent: stored.content,
-      }),
-    );
-
-    // Append to context items so assembler can see it
-    await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
-
-    return { ingested: true };
   }
 
   async ingest(params: {
@@ -7183,6 +7199,11 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (deferredCompactionDrain) {
+      // Deferred compaction debt drains asynchronously after the turn.
+      // (The fork's Wave-14 critical-pressure synchronous-drain branch was
+      // dropped: upstream's accordion compaction redesign removed the
+      // per-turn / cache-pressure machinery it stood on — see
+      // docs/compaction-redesign-map.md.)
       this.scheduleDeferredCompactionDebtDrain({
         conversationId: conversation.conversationId,
         sessionId: params.sessionId,
@@ -7438,6 +7459,81 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     return this.compaction.evaluateLeafTrigger(conversation.conversationId);
+  }
+
+  /**
+   * Agent-compaction gate state (Wave-14). The `lcm_compact` tool consults
+   * this BEFORE calling `compact()` so the agent gets a fast, structured
+   * refusal reason without incurring an LLM call when the gate refuses.
+   * Gates (first refusal wins): (1) ownsCompaction — engine migration
+   * succeeded at boot; (2) below-floor — currentTokens/tokenBudget below
+   * reserveFraction. Prompt-cache state is deliberately NOT gated here.
+   */
+  async getAgentCompactionGateState(params: {
+    sessionId: string;
+    sessionKey?: string;
+    currentTokenCount?: number;
+    tokenBudget?: number;
+    /** Lower bound on (currentTokens / tokenBudget) before compaction is allowed. Default 0.5. */
+    reserveFraction?: number;
+  }): Promise<{
+    ownsCompaction: boolean;
+    belowFloor: boolean;
+    shouldRefuse: boolean;
+    refusalReason?: "engine-unhealthy" | "below-floor";
+    refusalNote?: string;
+    /** Echo back for diagnostics. */
+    contextRatio?: number;
+  }> {
+    const ownsCompaction = this.info.ownsCompaction === true;
+    if (!ownsCompaction) {
+      return {
+        ownsCompaction: false,
+        belowFloor: false,
+        shouldRefuse: true,
+        refusalReason: "engine-unhealthy",
+        refusalNote:
+          "LCM engine migration did not complete at boot — compaction unavailable until the gateway restarts cleanly.",
+      };
+    }
+
+    const reserveFraction = (() => {
+      const r = params.reserveFraction;
+      if (typeof r !== "number" || !Number.isFinite(r)) return 0.5;
+      return Math.max(0.5, Math.min(1.0, r));  // clamp [0.5, 1.0]
+    })();
+
+    // Floor check: only meaningful if both numbers are present.
+    const haveBudget =
+      typeof params.tokenBudget === "number"
+      && Number.isFinite(params.tokenBudget)
+      && params.tokenBudget > 0;
+    const haveCurrent =
+      typeof params.currentTokenCount === "number"
+      && Number.isFinite(params.currentTokenCount)
+      && params.currentTokenCount >= 0;
+    const contextRatio = haveBudget && haveCurrent
+      ? (params.currentTokenCount! / params.tokenBudget!)
+      : undefined;
+    const belowFloor =
+      contextRatio !== undefined && contextRatio < reserveFraction;
+    if (belowFloor) {
+      return {
+        ownsCompaction: true,
+        belowFloor: true,
+        shouldRefuse: true,
+        refusalReason: "below-floor",
+        refusalNote: `Context is at ${(contextRatio! * 100).toFixed(1)}% of budget — below the ${(reserveFraction * 100).toFixed(0)}% floor. No need to compact yet; chained tool calls have headroom.`,
+        contextRatio,
+      };
+    }
+
+    return {
+      ownsCompaction: true,
+      belowFloor: false,
+      shouldRefuse: false,
+      contextRatio,
+    };
   }
 
   async compact(params: {
@@ -8853,6 +8949,17 @@ export class LcmContextEngine implements ContextEngine {
 
   getRetrieval(): RetrievalEngine {
     return this.retrieval;
+  }
+
+  /**
+   * Expose the active SQLite connection for v4.1 retrieval surfaces
+   * (lcm_grep semantic and hybrid modes) that need to call
+   * `runSemanticSearch` / `runHybridSearch` directly. Tools should treat
+   * the returned handle as read-mostly; long-running writes should still
+   * route through the appropriate store helper.
+   */
+  getDb(): DatabaseSync {
+    return this.db;
   }
 
   getConversationStore(): ConversationStore {

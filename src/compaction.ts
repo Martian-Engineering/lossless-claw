@@ -1749,20 +1749,41 @@ export class CompactionEngine {
   }): Promise<{ content: string; level: CompactionLevel } | null> {
     const sourceText = typeof params.sourceText === "string" ? params.sourceText.trim() : "";
     if (!sourceText) {
+      // Wave-9 Agent #1 P1 fix: tag empty-source fallback for parity
+      // with the truncated-source path below (also tagged) and with
+      // summarize.ts's buildDeterministicFallbackSummary.
       return {
-        content: "[Truncated from 0 tokens]",
+        content: "[LCM fallback summary - model unavailable; empty source]\n[Truncated from 0 tokens]",
         level: "fallback",
       };
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
     const buildDeterministicFallback = (): { content: string; level: CompactionLevel } => {
+      // Wave-9 Agent #1 P1 fix: Wave-4 P0 ensured summarize.ts's
+      // buildDeterministicFallbackSummary tags fallback content with
+      // "[LCM fallback summary - model unavailable; raw source preserved
+      // verbatim below]" so operators + agents can distinguish "LLM was
+      // down" from "LLM produced this". But because that marker adds
+      // ~25 tokens, the resulting summary is LARGER than the source -
+      // summarizeWithEscalation's "didn't compress" guard rejects it,
+      // calls aggressive (still tagged), still rejects, and falls
+      // through to THIS function which previously emitted the raw
+      // truncated source with NO marker, silently undoing the Wave-4
+      // P0 fix for any source <= max(targetTokens*4, 256) chars.
+      // Prepend the same marker here so the safety property holds end-
+      // to-end through the compaction escalation path.
+      const marker =
+        "[LCM fallback summary - model unavailable; raw source preserved verbatim below]\n";
       const suffix = `\n[Truncated from ${inputTokens} tokens]`;
       const truncated = truncateTextToEstimatedTokens(
         sourceText,
-        Math.max(0, FALLBACK_MAX_TOKENS - estimateTokens(suffix)),
+        Math.max(
+          0,
+          FALLBACK_MAX_TOKENS - estimateTokens(suffix) - estimateTokens(marker),
+        ),
       );
       return {
-        content: `${truncated}${suffix}`,
+        content: `${marker}${truncated}${suffix}`,
         level: "fallback",
       };
     };

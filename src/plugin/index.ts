@@ -10,6 +10,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "../openclaw-bridge.js";
 import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
 import type { LcmConfig } from "../db/config.js";
+import { applyResultBudgetConfig } from "./result-budget.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
@@ -20,7 +21,22 @@ import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
+import { createLcmGetEntityTool } from "../tools/lcm-get-entity-tool.js";
+import { createLcmSearchEntitiesTool } from "../tools/lcm-search-entities-tool.js";
+import { createLcmCompactTool } from "../tools/lcm-compact-tool.js";
+import {
+  recordLlmOutput,
+  inferTokenBudget,
+  getRuntimeContext as getTokenStateRuntimeContext,
+} from "./token-state.js";
+import { createLcmSynthesizeAroundTool } from "../tools/lcm-synthesize-around-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
+import {
+  tryStartBackfillAutostart,
+  type AutostartHandle,
+} from "../operator/backfill-autostart.js";
+import { tryStartExtractionAutostart } from "../operator/extraction-autostart.js";
+import { initSemanticInfraIfPossible } from "../operator/semantic-infra-init.js";
 import type {
   LcmDependencies,
   RuntimeLlmCompleteFn,
@@ -250,9 +266,18 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "2. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
   "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
   "",
+  "**Specialized tools beyond the 1/2/3 escalation** (use when the question type clearly matches):",
+  "- **Time-anchored** (\"what did we work on yesterday/last week?\"): `lcm_synthesize_around` with `window_kind=\"period\"` and a period shortcut (`yesterday`, `last-7-days`, `this-month`, `last-12h`, etc.) OR explicit `since`/`before`. No anchor lookup needed.",
+  "- **Topic-anchored / paraphrastic** (\"did we discuss X?\"): `lcm_grep mode=\"hybrid\"` (FTS + Voyage rerank — strongest recall) or `lcm_grep mode=\"semantic\"` (embedding-only, cheaper, with confidence band; supports `summaryKinds` filter for kind-scoped recall).",
+  "- **Verbatim citation** (\"quote exactly what was said\"): `lcm_grep mode=\"verbatim\"` returns FULL untruncated message rows with optional `role` filter (user/assistant/tool/system).",
+  "- **Entity / pattern** (\"who is this person?\", \"history of project X\"): `lcm_get_entity` (exact name) or `lcm_search_entities` (fuzzy). Entity catalog is populated by an async worker; if empty, the tools return a `catalogStatus` field.",
+  "- **Drilldown** (\"where did this come from?\"): `lcm_describe` with `expandChildren=true` or `expandMessages=true` for inline one-hop expansion (no sub-agent). For deeper traversal, `lcm_expand_query`.",
+  "",
   "**`lcm_grep` routing guidance:**",
-  '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for regular expressions and literal patterns that use regex syntax.',
+  '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for literal patterns.',
   '- Full-text queries are not regexes. Alternation (`A|B`), regex wildcards (`.*`), character classes (`[abc]`), and anchors (`^foo`, `foo$`) require `mode: "regex"`.',
+  '- For paraphrastic / topical recall ("did we discuss X?"), `mode: "hybrid"` (FTS + Voyage rerank — best recall) or `mode: "semantic"` (embedding only — cheaper).',
+  '- For citation / "exactly what was said", `mode: "verbatim"` returns full untruncated message rows. Combine with `role: "user"|"assistant"|"tool"|"system"` to filter.',
   '- Full-text queries use FTS5 semantics, and FTS5 defaults to AND matching, so extra terms make matching stricter rather than broader.',
   '- Prefer 1-3 distinctive full-text terms or one quoted phrase. Do not pad queries with synonyms or extra keywords.',
   '- Wrap exact multi-word phrases in quotes, for example `"error handling"`.',
@@ -988,6 +1013,11 @@ function createLcmDependencies(
   const log = createLcmLogger(api);
   const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
 
+  // Wave-12 retro A1: propagate `toolResultTokenBudget` plugin-config
+  // value to the result-budget module's live bindings. No-op when env
+  // is set (env wins, same precedence as every other LcmConfig field).
+  applyResultBudgetConfig(config.toolResultTokenBudget);
+
   if (diagnostics.ignoreSessionPatternsEnvOverridesPluginConfig) {
     logStartupBannerOnce({
       key: "ignore-session-patterns-env-override",
@@ -1363,6 +1393,20 @@ function wirePluginHandlers(
   deps: LcmDependencies,
   shared: SharedLcmInit,
 ): void {
+  // Wave-14: subscribe to llm_output to feed the per-session token-state
+  // cache. Tool factories then close over this cache via
+  // `getTokenStateRuntimeContext(sessionKey)` to learn live context state
+  // at execute() time. See src/plugin/token-state.ts for the contract.
+  api.on("llm_output", async (event, ctx) => {
+    const sessionKey = ctx.sessionKey ?? event.sessionId;
+    if (!sessionKey || !event.usage) return;
+    recordLlmOutput({
+      sessionKey,
+      usage: event.usage,
+      tokenBudget: inferTokenBudget(event.provider, event.model),
+    });
+  });
+
   api.on("before_reset", async (event, ctx) => {
     await (await shared.waitForEngine()).handleBeforeReset({
       reason: event.reason,
@@ -1387,11 +1431,28 @@ function wirePluginHandlers(
   api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
 
   api.registerTool(
-    (ctx) => createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) => createLcmGrepTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+      getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+    }),
     { name: "lcm_grep" },
   );
+  // Wave-12 consolidation SA: lcm_semantic_recall removed and folded
+  // into `lcm_grep mode='semantic'`. Reach-for analysis (Step 1.7 v2)
+  // showed semantic_recall remained gravitationally orphaned even with
+  // its tailor-made F5 scenario; the `summaryKinds` filter that was
+  // its main differentiator now lives on lcm_grep. See the methodology
+  // run at /tmp/decision-consolidation-final.md (and feat/lcm-v4.1-omnibus
+  // commit for context). Audit-mode telemetry should validate the merge.
   api.registerTool(
-    (ctx) => createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) => createLcmDescribeTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+      getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+    }),
     { name: "lcm_describe" },
   );
   api.registerTool(
@@ -1405,8 +1466,64 @@ function wirePluginHandlers(
         getLcm: shared.waitForEngine,
         sessionKey: ctx.sessionKey,
         requesterSessionKey: ctx.sessionKey,
+        getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
       }),
     { name: "lcm_expand_query" },
+  );
+  // Wave-12 audit (W2A1 P0 #2): pass getRuntimeContext so the
+  // wrapper's needsCompact gate + post-call tap fire correctly.
+  // Synthesize was previously off the token-accounting bus.
+  api.registerTool(
+    (ctx) =>
+      createLcmSynthesizeAroundTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+        getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+      }),
+    { name: "lcm_synthesize_around" },
+  );
+  // Final.review.3 — entity tool surface (Scenario 4 fix). Read tools over
+  // lcm_entities + lcm_entity_mentions, populated by the async coreference
+  // worker. Without these the entity worker writes records that no agent can
+  // query, which the doc audit (Slice 1 BLOCKER) flagged as vapor.
+  api.registerTool(
+    (ctx) => createLcmGetEntityTool({
+      deps,
+      getLcm: shared.waitForEngine,
+      sessionKey: ctx.sessionKey,
+      getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+    }),
+    { name: "lcm_get_entity" },
+  );
+  api.registerTool(
+    (ctx) =>
+      createLcmSearchEntitiesTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionKey: ctx.sessionKey,
+        getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+      }),
+    { name: "lcm_search_entities" },
+  );
+  // Wave-14: agent-triggered LCM compaction. Always REGISTERED (so agents
+  // learn it exists and can recommend operator-enable on disabled-state),
+  // but execution is gated on `agentCompactionToolEnabled` config flag
+  // (default false). See src/tools/lcm-compact-tool.ts for the tool's
+  // safety gates (50% reserve floor, cache-hot deferral, 2-calls-per-5-min cap).
+  api.registerTool(
+    (ctx) =>
+      createLcmCompactTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionId: ctx.sessionId,
+        sessionKey: ctx.sessionKey,
+        // Wave-14: wire the live token-state cache. Was previously vapor —
+        // factory declared the callback but registration never passed one.
+        // Now feeds real currentTokenCount + tokenBudget from llm_output hook.
+        getRuntimeContext: () => getTokenStateRuntimeContext(ctx.sessionKey),
+      }),
+    { name: "lcm_compact" },
   );
 
   api.registerCommand(
@@ -1749,6 +1866,17 @@ const lcmPlugin = {
     api.on("gateway_stop", async () => {
       stopped = true;
       shared.stopped = true;
+      // v4.1 Wire-2: stop the backfill autostart loop (if running) so
+      // we don't make a Voyage call after the DB connection closes.
+      if (shared.backfillAutostart) {
+        shared.backfillAutostart.stop();
+        shared.backfillAutostart = null;
+      }
+      // v4.1 cycle-2: stop the extraction autostart loop too.
+      if (shared.extractionAutostart) {
+        shared.extractionAutostart.stop();
+        shared.extractionAutostart = null;
+      }
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
@@ -1761,6 +1889,51 @@ const lcmPlugin = {
     });
 
     wirePluginHandlers(api, deps, shared);
+
+    // v4.1 Wire-2: try to start the embedding-backfill autostart loop.
+    // Best-effort + opt-in (gated on VOYAGE_API_KEY env var). If any
+    // pre-flight fails (no key / no vec0 / no active model), the helper
+    // logs once and returns a NO_OP_HANDLE — gateway boots normally.
+    //
+    // The autostart needs an OPEN db handle. waitForDatabase resolves
+    // either immediately (if eager init succeeded) or once the deferred
+    // init completes; we await it here in a fire-and-forget so plugin
+    // load isn't blocked.
+    void (async () => {
+      try {
+        const db = await shared.waitForDatabase();
+        if (shared.stopped) return; // gateway_stop fired during wait
+        // v4.1 Final.review P1 #1 fix: load sqlite-vec, register the
+        // active embedding profile, and ensure the per-model vec0 table
+        // exists. Without this, the backfill autostart's pre-flight
+        // checks fail and the entire v4.1 semantic feature is inert.
+        // Best-effort + graceful degrade — see semantic-infra-init.ts.
+        initSemanticInfraIfPossible(db, { log: deps.log });
+        const handle = tryStartBackfillAutostart(db, { log: deps.log });
+        shared.backfillAutostart = handle;
+      } catch (e) {
+        deps.log.warn(
+          `[lcm] backfill autostart: skipped — DB init failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    })();
+
+    // v4.1 cycle-2: extraction (entity coref) autostart. Default ON
+    // (opt-out via LCM_EXTRACTION_LLM_ENABLED=false); uses deps.complete
+    // for the LLM call (reuses existing model/auth resolution chain).
+    // Drains lcm_extraction_queue every 60s.
+    void (async () => {
+      try {
+        const db = await shared.waitForDatabase();
+        if (shared.stopped) return;
+        const handle = tryStartExtractionAutostart(db, { log: deps.log, deps });
+        shared.extractionAutostart = handle;
+      } catch (e) {
+        deps.log.warn(
+          `[lcm] extraction autostart: skipped — DB init failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    })();
 
     logStartupBannerOnce({
       key: "plugin-loaded",

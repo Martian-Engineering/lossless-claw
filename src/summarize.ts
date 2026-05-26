@@ -75,7 +75,14 @@ function buildSummarizerBreakerKey(candidate: ResolvedSummaryCandidate): string 
 
 type SummaryMode = "normal" | "aggressive";
 
-const DEFAULT_LEAF_TARGET_TOKENS = 2400;
+// v4.1 (A.10): raised from 2400 → 4000. The empirical-spike-agent found
+// 543 leaves on Eva's live DB pegged at exactly 2,415 tokens — the LLM
+// was hitting the old 2400 default and producing artificially-truncated
+// summaries. Voyage embedding (Group B) supports 32K input context, so
+// 4000-token leaves are well within budget. Average leaf on Eva's corpus
+// is 1,167 tokens (most leaves don't approach the cap); the change only
+// affects leaves where the source content is dense enough to need it.
+const DEFAULT_LEAF_TARGET_TOKENS = 4000;
 const DEFAULT_CONDENSED_TARGET_TOKENS = 2000;
 const LCM_SUMMARIZER_SYSTEM_PROMPT =
   "You are a context-compaction summarization engine. Follow user instructions exactly and return plain text summary content only.";
@@ -1122,12 +1129,26 @@ function buildDeterministicFallbackSummary(text: string, targetTokens: number): 
     return "";
   }
 
+  // Wave-4 Auditor #18 P0 fix: ALWAYS tag fallback output, even when the
+  // source text is short enough to fit within targetTokens. Previously
+  // the under-cap branch returned the raw `trimmed` source verbatim with
+  // no marker — downstream tiers in the pyramid would treat raw user/tool
+  // content as a compacted summary, hiding the fact that the LLM
+  // summarizer was unavailable. Operators reading /lcm health, doctor
+  // scans, or eval reports could not distinguish "LLM down, fallback
+  // shipped raw content" from "LLM ran cleanly, summary is the source".
+  // Now both branches carry an explicit marker.
+  const FALLBACK_MARKER =
+    "[LCM fallback summary — model unavailable; raw source preserved verbatim below]";
+  const FALLBACK_MARKER_TRUNC =
+    "[LCM fallback summary — model unavailable; raw source truncated for context management]";
+
   const maxChars = Math.max(256, targetTokens * 4);
   if (trimmed.length <= maxChars) {
-    return trimmed;
+    return `${FALLBACK_MARKER}\n${trimmed}`;
   }
 
-  return `${trimmed.slice(0, maxChars)}\n[LCM fallback summary; truncated for context management]`;
+  return `${FALLBACK_MARKER_TRUNC}\n${trimmed.slice(0, maxChars)}`;
 }
 
 /** Normalize model refs from string or `{ primary }` config shapes. */

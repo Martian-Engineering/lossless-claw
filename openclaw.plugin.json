@@ -12,7 +12,11 @@
       "lcm_grep",
       "lcm_describe",
       "lcm_expand",
-      "lcm_expand_query"
+      "lcm_expand_query",
+      "lcm_get_entity",
+      "lcm_search_entities",
+      "lcm_synthesize_around",
+      "lcm_compact"
     ]
   },
   "uiHints": {
@@ -110,11 +114,7 @@
     },
     "largeFilesDir": {
       "label": "Large Files Directory",
-      "help": "Directory for persisting large-file text payloads (default: <stateDir>/lcm-files). Uses OPENCLAW_STATE_DIR when set."
-    },
-    "largeFilesDir": {
-      "label": "Large Files Directory",
-      "help": "Directory for externalized large files and inline-image payloads (default: ~/.openclaw/lcm-files)"
+      "help": "Directory for externalized large-file text payloads + inline-image content (default: <OPENCLAW_STATE_DIR>/lcm-files; falls back to ~/.openclaw/lcm-files)"
     },
     "ignoreSessionPatterns": {
       "label": "Ignored Sessions",
@@ -154,11 +154,11 @@
     },
     "expansionModel": {
       "label": "Expansion Model",
-      "help": "Model override for lcm_expand_query sub-agent (e.g., 'anthropic/claude-haiku-4-5')"
+      "help": "Model override for lcm_expand_query sub-agent (e.g., 'openai-codex/gpt-5.4-mini' or 'anthropic/claude-haiku-4-5')"
     },
     "expansionProvider": {
       "label": "Expansion Provider",
-      "help": "Provider override for lcm_expand_query sub-agent (e.g., 'anthropic')"
+      "help": "Provider override for lcm_expand_query sub-agent (e.g., 'openai-codex' or 'anthropic')"
     },
     "delegationTimeoutMs": {
       "label": "Delegation Timeout (ms)",
@@ -171,6 +171,10 @@
     "maxAssemblyTokenBudget": {
       "label": "Max Assembly Token Budget",
       "help": "Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
+    },
+    "toolResultTokenBudget": {
+      "label": "Tool Result Token Budget",
+      "help": "Per-call token cap for any single LCM tool's emitted result. Default 10000 tokens (~40K chars). Floor 2000. Both per-tool truncation AND the needs-compact gate's projection ceiling read from this. Env override: LCM_TOOL_RESULT_TOKEN_BUDGET."
     },
     "summaryMaxOverageFactor": {
       "label": "Summary Max Overage Factor",
@@ -263,6 +267,10 @@
     "fallbackProviders": {
       "label": "Fallback Providers",
       "help": "Explicit runtime LLM fallback provider/model pairs for compaction summarization; entries require plugins.entries.lossless-claw.llm policy"
+    },
+    "agentCompactionToolEnabled": {
+      "label": "Agent Compaction Tool",
+      "help": "Operator opt-in for the agent-triggered lcm_compact tool. When false (default), agents see a structured 'operator-disabled' response. When true, agents may proactively compact context mid-turn (gated by 50% reserve floor, cache-hot deferral, 2-calls-per-5-min cap)."
     }
   },
   "configSchema": {
@@ -354,9 +362,6 @@
       "dbPath": {
         "type": "string"
       },
-      "largeFilesDir": {
-        "type": "string"
-      },
       "ignoreSessionPatterns": {
         "type": "array",
         "items": {
@@ -409,6 +414,10 @@
       "maxAssemblyTokenBudget": {
         "type": "integer",
         "minimum": 1000
+      },
+      "toolResultTokenBudget": {
+        "type": "integer",
+        "minimum": 2000
       },
       "summaryMaxOverageFactor": {
         "type": "number",
@@ -480,6 +489,9 @@
         "type": "boolean"
       },
       "transcriptGcEnabled": {
+        "type": "boolean"
+      },
+      "agentCompactionToolEnabled": {
         "type": "boolean"
       },
       "proactiveThresholdCompactionMode": {

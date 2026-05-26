@@ -22,7 +22,17 @@ When a conversation grows beyond the model's context window, OpenClaw (just like
 2. **Summarizes chunks** of older messages into summaries using your configured LLM
 3. **Condenses summaries** into higher-level nodes as they accumulate, forming a DAG (directed acyclic graph)
 4. **Assembles context** each turn by combining summaries + recent raw messages
-5. **Provides tools** (`lcm_grep`, `lcm_describe`, `lcm_expand`) so agents can search and recall details from compacted history
+5. **Provides 8 agent tools** so agents can search and recall details from compacted history:
+   - `lcm_grep` — search via regex / FTS5 / hybrid (FTS+semantic+rerank) / pure-semantic (absorbs the prior `lcm_semantic_recall` surface — Wave-12 consolidation) / verbatim modes; `summaryKinds` filter scopes hits to leaves vs condensed
+   - `lcm_synthesize_around` — fresh windowed synthesis. Three modes:
+     - `window_kind="period"` (the `lcm_recent` replacement) — direct date-range / period-shortcut (e.g. `period: "yesterday"`, `period: "last-7-days"`); no anchor lookup required
+     - `window_kind="time"` — ±N hours around an anchor leaf (`target: "sum_xxx"`)
+     - `window_kind="semantic"` — top-K most-similar leaves to a target leaf or free-text query
+   - `lcm_describe` — drill into a summary's lineage + one-hop expansion to children/messages
+   - `lcm_expand_query` — recursive expansion via bounded sub-agent (~120s; cited summaries validated against the DB)
+   - `lcm_expand` — sub-agent-only DAG walker, gated by an explicit grant ledger
+   - `lcm_get_entity` / `lcm_search_entities` — entity catalog lookup (populated by async coreference worker; `lcm_search_entities` supports browse-by-`entityType` with empty query)
+   - `lcm_compact` — agent-triggered LCM compaction escape valve (operator opt-in via `agentCompactionToolEnabled`; gated by reserve floor + per-window cap)
 
 Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.
 
@@ -30,15 +40,19 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 ## Commands And Skill
 
-The plugin now ships a bundled `lossless-claw` skill plus a small plugin command surface for supported OpenClaw chat/native command providers:
+The plugin ships **9 operator subcommands** (all reachable via `/lcm <subcommand>`; `/lossless` is an alias):
 
-- `/lcm` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
-- `/lcm backup` creates a timestamped backup of the current LCM SQLite database
-- `/lcm rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
-- `/lcm doctor` scans for broken or truncated summaries
-- `/lcm doctor clean` shows read-only high-confidence junk diagnostics for archived subagents, cron sessions, and NULL-key orphaned subagent runs
-- `/lcm status` shows plugin, conversation, and maintenance state including deferred compaction debt
-- `/lossless` is an alias for `/lcm` on supported native command surfaces
+- `/lcm status` — version, enablement/selection state, DB path/size, summary counts, summary-health, deferred compaction debt
+- `/lcm health` — v4.1 subsystem health (embeddings, workers, synthesis cache + audit GC, eval recall, suppression cascade)
+- `/lcm worker [status|tick embedding-backfill]` — inspect worker state or run a manual backfill tick
+- `/lcm reconcile-session-keys [--list-candidates | --apply --from k1,k2 --to k3 --reason "..."]` — merge legacy `legacy:conv_*` keys into a logical session
+- `/lcm eval [--baseline | --mode hybrid --query-set <name>]` — recall + drift eval harness
+- `/lcm purge --reason "..." [--session-key K | --summary-ids ids | --since ISO | --before ISO | --min-token-count N] [--apply] [--allow-main-session]` — soft-purge leaves matching criteria (defaults to dry-run preview)
+- `/lcm backup` — timestamped backup of the LCM SQLite database
+- `/lcm rotate` — rewrite the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
+- `/lcm doctor` — scan for broken or truncated summaries (`doctor clean` reports global high-confidence junk; `doctor clean apply` deletes after backup; `doctor apply` repairs)
+
+`/lcm` (no subcommand) is an alias for `/lcm status`.
 
 These are plugin slash/native commands, not root shell CLI subcommands. Supported examples:
 
