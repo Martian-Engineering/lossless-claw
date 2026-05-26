@@ -12,7 +12,10 @@
       "lcm_grep",
       "lcm_describe",
       "lcm_expand",
-      "lcm_expand_query"
+      "lcm_expand_query",
+      "lcm_get_entity",
+      "lcm_search_entities",
+      "lcm_synthesize_around"
     ]
   },
   "uiHints": {

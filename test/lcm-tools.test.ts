@@ -490,4 +490,140 @@ describe("LCM tools session scoping", () => {
     expect(JSON.stringify(cross.details)).not.toContain("foreign summary");
     expect(JSON.stringify(cross.details)).not.toContain("subtree");
   });
+
+  it("lcm_describe surfaces sessionKey and time range in text + structured details", async () => {
+    const timezone = "UTC";
+    const earliestAt = new Date("2026-04-01T00:00:00.000Z");
+    const latestAt = new Date("2026-04-02T00:00:00.000Z");
+    const createdAt = new Date("2026-04-03T00:00:00.000Z");
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "sum_with_session",
+        type: "summary",
+        summary: {
+          conversationId: 7,
+          sessionKey: "agent:main:abc123",
+          kind: "leaf",
+          content: "summary body",
+          depth: 0,
+          tokenCount: 9,
+          descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: 9,
+          fileIds: [],
+          parentIds: [],
+          childIds: [],
+          messageIds: [],
+          earliestAt,
+          latestAt,
+          timeRange: { earliestAt, latestAt, createdAt },
+          subtree: [
+            {
+              summaryId: "sum_with_session",
+              parentSummaryId: null,
+              depthFromRoot: 0,
+              kind: "leaf",
+              depth: 0,
+              tokenCount: 9,
+              descendantCount: 0,
+              descendantTokenCount: 0,
+              sourceMessageTokenCount: 9,
+              earliestAt,
+              latestAt,
+              childCount: 0,
+              path: "",
+            },
+          ],
+          createdAt,
+        },
+      })),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 7, timezone }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-session", { id: "sum_with_session" });
+
+    const text = (result.content[0] as { text: string }).text;
+    // Text output should expose session key and creation time so agents see them
+    expect(text).toContain("sessionKey=agent:main:abc123");
+    expect(text).toContain(`created=${formatTimestamp(createdAt, timezone)}`);
+    expect(text).toContain(
+      `range=${formatTimestamp(earliestAt, timezone)}..${formatTimestamp(latestAt, timezone)}`,
+    );
+
+    // Structured details should preserve the new fields too
+    const details = result.details as {
+      summary: {
+        sessionKey: string;
+        timeRange: { earliestAt: Date; latestAt: Date; createdAt: Date };
+      };
+    };
+    expect(details.summary.sessionKey).toBe("agent:main:abc123");
+    expect(details.summary.timeRange.earliestAt).toEqual(earliestAt);
+    expect(details.summary.timeRange.latestAt).toEqual(latestAt);
+    expect(details.summary.timeRange.createdAt).toEqual(createdAt);
+  });
+
+  it("lcm_describe renders sessionKey as '-' when retrieval returns an empty session_key", async () => {
+    const timezone = "UTC";
+    const createdAt = new Date("2026-04-03T00:00:00.000Z");
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "sum_no_session",
+        type: "summary",
+        summary: {
+          conversationId: 7,
+          sessionKey: "",
+          kind: "leaf",
+          content: "summary body",
+          depth: 0,
+          tokenCount: 9,
+          descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: 9,
+          fileIds: [],
+          parentIds: [],
+          childIds: [],
+          messageIds: [],
+          earliestAt: null,
+          latestAt: null,
+          timeRange: { earliestAt: null, latestAt: null, createdAt },
+          subtree: [
+            {
+              summaryId: "sum_no_session",
+              parentSummaryId: null,
+              depthFromRoot: 0,
+              kind: "leaf",
+              depth: 0,
+              tokenCount: 9,
+              descendantCount: 0,
+              descendantTokenCount: 0,
+              sourceMessageTokenCount: 9,
+              earliestAt: null,
+              latestAt: null,
+              childCount: 0,
+              path: "",
+            },
+          ],
+          createdAt,
+        },
+      })),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 7, timezone }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-no-session", { id: "sum_no_session" });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("sessionKey=-");
+  });
 });

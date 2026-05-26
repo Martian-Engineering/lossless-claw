@@ -615,7 +615,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(completeMock).toHaveBeenCalledTimes(2);
 
     expect(summary.length).toBeGreaterThan(0);
-    expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(summary).toContain("[LCM fallback summary — model unavailable; raw source truncated for context management]");
   });
 
   it("falls back deterministically when the initial summarizer call times out", async () => {
@@ -644,7 +644,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       const summary = await summaryPromise;
 
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
-      expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+      expect(summary).toContain("[LCM fallback summary — model unavailable; raw source truncated for context management]");
       expect(vi.getTimerCount()).toBe(0);
 
       const diagnostics = getDepsLogText(deps);
@@ -733,7 +733,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     });
 
     const summary = await summarize!("A".repeat(12_000));
-    expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(summary).toContain("[LCM fallback summary — model unavailable; raw source truncated for context management]");
 
     const diagnostics = getDepsLogText(deps);
     expect(diagnostics).toContain("provider=openai");
@@ -763,7 +763,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const summary = await summarize!("F".repeat(8_000), false);
 
-    expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(summary).toContain("[LCM fallback summary — model unavailable; raw source truncated for context management]");
     expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
 
     const diagnostics = getDepsLogText(deps);
@@ -866,7 +866,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const summary = await summarize!("Q".repeat(10_000), false);
 
-    expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(summary).toContain("[LCM fallback summary — model unavailable; raw source truncated for context management]");
     expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
 
     const diagnostics = getDepsLogText(deps);
@@ -1470,7 +1470,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       const summary = await summarize!(longInput, false);
 
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
-      expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+      expect(summary).toContain("[LCM fallback summary — model unavailable; raw source truncated for context management]");
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("empty normalized summary on first attempt");
@@ -1580,7 +1580,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       const longInput = "C".repeat(10_000);
       const summary = await summarize!(longInput, false);
 
-      expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+      expect(summary).toContain("[LCM fallback summary — model unavailable; raw source truncated for context management]");
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("retry failed");
@@ -1822,7 +1822,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       const summary = await summarize!(longInput, false);
 
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
-      expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+      expect(summary).toContain("[LCM fallback summary — model unavailable; raw source truncated for context management]");
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).not.toContain("source=envelope");
