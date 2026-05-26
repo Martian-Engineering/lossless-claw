@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { assertForeignKeysEnabled } from "../concurrency/model.js";
 
 type ConnectionKey = string;
 /**
@@ -51,6 +52,11 @@ function configureConnection(db: DatabaseSync): DatabaseSync {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
   db.exec("PRAGMA foreign_keys = ON");
+  // v4.1 B.fix — Gap 7: verify the PRAGMA actually took effect. Catches
+  // future regressions where a code path opens a connection that bypasses
+  // configureConnection and leaves FK enforcement off — making every
+  // ON DELETE CASCADE in the schema a silent no-op.
+  assertForeignKeysEnabled(db);
   // 64MB page cache (default 2MB is severely undersized for multi-GB databases
   // with concurrent agents). Memory is demand-allocated, released on close.
   db.exec("PRAGMA cache_size = -65536");
@@ -112,7 +118,11 @@ function closeDatabase(db: DatabaseSync | undefined): void {
  */
 export function createLcmDatabaseConnection(dbPath: string): DatabaseSync {
   ensureDbDirectory(dbPath);
-  const db = new DatabaseSync(dbPath);
+  // v4.1 Final.review P1 #1 fix: open with allowExtension=true so
+  // sqlite-vec can be loaded. Without this, db.loadExtension() throws
+  // and the entire v4.1 semantic feature is silently inert in
+  // production (autostart pre-flight returns NO_OP).
+  const db = new DatabaseSync(dbPath, { allowExtension: true });
   try {
     configureConnection(db);
   } catch (err) {
