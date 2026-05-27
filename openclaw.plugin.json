@@ -201,6 +201,14 @@
       "label": "Circuit Breaker Cooldown (ms)",
       "help": "Cooldown before the summarization circuit breaker auto-resets"
     },
+    "replayFloodThresholdExternal": {
+      "label": "Replay Flood Threshold (External)",
+      "help": "Max identical messages allowed in a single SQLite-second for third-party roles (role=user) before the anti-replay guard refuses the batch. Defaults to 3 to preserve replay defense for third-partyly-rebroadcastable input."
+    },
+    "replayFloodThresholdInternal": {
+      "label": "Replay Flood Threshold (Internal)",
+      "help": "Max identical messages allowed in a single SQLite-second for internal roles (role=tool/assistant/system) before the anti-replay guard refuses the batch. Defaults to 32 to absorb legitimate idempotent sub-agent bursts."
+    },
     "cacheAwareCompaction.enabled": {
       "label": "Cache-Aware Compaction (Deprecated)",
       "help": "Deprecated compatibility setting. Automatic compaction is now threshold-only and does not use prompt-cache hot/cold state."
@@ -451,6 +459,14 @@
         "minimum": 1
       },
       "circuitBreakerCooldownMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "replayFloodThresholdExternal": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "replayFloodThresholdInternal": {
         "type": "integer",
         "minimum": 1
       },

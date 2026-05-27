@@ -516,6 +516,29 @@ Why it matters:
 - useful when the runtime model window is smaller than the surrounding system assumes
 - can prevent oversized assembly on smaller-context models
 
+## Anti-replay flood guard
+
+The ingest path runs `assertNoReplayTimestampFlood` to refuse batches that look like webhook-style replay attacks (many identical messages at the same `created_at`). Because SQLite `datetime('now')` is second-granularity, legitimate idempotent bursts from sub-agents can also trip the guard if it is single-threshold. The role-aware thresholds below split the budget by message origin.
+
+### `replayFloodThresholdExternal`
+
+Max identical messages allowed in a single SQLite-second for `role=user` before the guard refuses the batch. Defaults to `3`.
+
+Why it matters:
+
+- preserves replay defense for third-partyly-rebroadcastable input
+- lower values are stricter but risk rejecting legitimate dedup retries from upstream channels
+
+### `replayFloodThresholdInternal`
+
+Max identical messages allowed in a single SQLite-second for `role=tool/assistant/system` before the guard refuses the batch. Defaults to `32`.
+
+Why it matters:
+
+- absorbs legitimate same-second idempotent tool returns (for example, sub-agents emitting many `{"status":"ok"}` results)
+- still bounded so a pathological loop cannot ingest unboundedly under the same timestamp
+- raise it if you operate cron sub-agents that emit very tight bursts; lower it if you want stricter sanity protection
+
 ## Nested objects
 
 ### `cacheAwareCompaction`
