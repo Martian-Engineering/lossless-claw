@@ -9,6 +9,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
   ContextEngine,
   ContextEngineInfo,
+  ContextEngineHostCapability,
   AssembleResult,
   BootstrapResult,
   CompactResult,
@@ -78,6 +79,15 @@ import {
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
+
+const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
+  "bootstrap",
+  "assemble-before-prompt",
+  "after-turn",
+  "maintain",
+  "compact",
+  "runtime-llm-complete",
+];
 type AssemblePrefixSnapshot = {
   serializedMessages: string[];
   messageSummaries: string[];
@@ -2896,6 +2906,15 @@ export class LcmContextEngine implements ContextEngine {
       version: "0.1.0",
       ownsCompaction: migrationOk,
       turnMaintenanceMode: "background",
+      hostRequirements: {
+        "agent-run": {
+          requiredCapabilities: LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
+          unsupportedMessage: [
+            "lossless-claw requires a native OpenClaw runtime with the full context-engine agent-run lifecycle.",
+            "Use the native Codex or Pi embedded runtime, or switch plugins.slots.contextEngine to legacy for CLI harness runs.",
+          ].join(" "),
+        },
+      },
     } as ContextEngineInfo;
 
     this.conversationStore = new ConversationStore(this.db, {

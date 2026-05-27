@@ -340,6 +340,21 @@ describe("LcmContextEngine metadata", () => {
     expect(engine.info.ownsCompaction).toBe(true);
   });
 
+  it("requires the full native host lifecycle for agent runs", () => {
+    const engine = createEngine();
+    expect(engine.info.hostRequirements?.["agent-run"]).toEqual({
+      requiredCapabilities: [
+        "bootstrap",
+        "assemble-before-prompt",
+        "after-turn",
+        "maintain",
+        "compact",
+        "runtime-llm-complete",
+      ],
+      unsupportedMessage: expect.stringContaining("native Codex or Pi embedded runtime"),
+    });
+  });
+
   it("configures file-backed sqlite connections with WAL and busy_timeout", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-db-"));
     tempDirs.push(tempDir);
