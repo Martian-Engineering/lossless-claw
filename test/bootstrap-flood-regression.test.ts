@@ -84,6 +84,8 @@ function createTestConfig(databasePath: string): LcmConfig {
       max: 40_000,
     },
     stripInjectedContextTags: [],
+    replayFloodThresholdExternal: 3,
+    replayFloodThresholdInternal: 32,
   };
 }
 
