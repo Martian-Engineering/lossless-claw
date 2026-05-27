@@ -1,5 +1,13 @@
 # @martian-engineering/lossless-claw
 
+## 0.11.3
+
+### Patch Changes
+
+- [#740](https://github.com/Martian-Engineering/lossless-claw/pull/740) [`6ecc595`](https://github.com/Martian-Engineering/lossless-claw/commit/6ecc595165c43d7639edabb22efd40297043d416) Thanks [@jalehman](https://github.com/jalehman)! - Declare the OpenClaw context-engine host capability requirement so unsupported CLI harnesses fail with a descriptive error.
+
+- [#750](https://github.com/Martian-Engineering/lossless-claw/pull/750) [`f517e95`](https://github.com/Martian-Engineering/lossless-claw/commit/f517e9544b57c0ce9bb5420a7a9bb95244149fae) Thanks [@jalehman](https://github.com/jalehman)! - Forward host runtime auth profile context through Lossless summary and doctor repair calls.
+
 ## 0.11.2
 
 ### Patch Changes
