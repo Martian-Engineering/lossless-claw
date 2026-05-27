@@ -825,29 +825,6 @@ describe("runLcmMigrations summary depth backfill", () => {
       },
     ]);
   });
-  it("creates conversation bootstrap state storage", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
-    tempDirs.push(tempDir);
-    const dbPath = join(tempDir, "bootstrap-state.db");
-    const db = getLcmConnection(dbPath);
-
-    runLcmMigrations(db, { fts5Available: false });
-
-    const columns = db.prepare(`PRAGMA table_info(conversation_bootstrap_state)`).all() as Array<{
-      name?: string;
-    }>;
-
-    expect(columns.map((column) => column.name)).toEqual([
-      "conversation_id",
-      "session_file_path",
-      "last_seen_size",
-      "last_seen_mtime_ms",
-      "last_processed_offset",
-      "last_processed_entry_hash",
-      "updated_at",
-    ]);
-  });
-
   it("creates message_parts when the bulk schema create did not", () => {
     const db = createTestDb("missing-message-parts.db");
     let skippedBulkMessagePartsCreate = false;

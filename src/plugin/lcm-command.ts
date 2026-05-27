@@ -1,9 +1,8 @@
-import { existsSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
-import type { RotateSessionStorageWithBackupResult } from "../engine.js";
 import { runDelegatedFocusBrief, runDelegatedRefocusBrief } from "../focus-briefs.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
@@ -36,7 +35,6 @@ import { FocusBriefStore, hashFocusSourceContext } from "../store/focus-brief-st
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
-const ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 
 type LcmStatusStats = {
   conversationCount: number;
@@ -75,7 +73,6 @@ type CurrentConversationResolution =
 type ParsedLcmCommand =
   | { kind: "status" }
   | { kind: "backup" }
-  | { kind: "rotate" }
   | { kind: "focus_status" }
   | { kind: "focus_generate"; prompt: string }
   | { kind: "refocus" }
@@ -84,20 +81,10 @@ type ParsedLcmCommand =
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "help"; error?: string };
 
-type RotateCommandEngine = {
-  rotateSessionStorageWithBackup(params: {
-    sessionId?: string;
-    sessionKey?: string;
-    sessionFile: string;
-    lockTimeoutMs: number;
-  }): Promise<RotateSessionStorageWithBackupResult>;
-};
-
 type FocusCompactionCommandEngine = {
   compact(params: {
     sessionId: string;
     sessionKey?: string;
-    sessionFile: string;
     tokenBudget?: number;
     currentTokenCount?: number;
     compactionTarget?: "budget" | "threshold";
@@ -106,7 +93,7 @@ type FocusCompactionCommandEngine = {
   }): Promise<CompactResult>;
 };
 
-type RuntimeCommandEngine = RotateCommandEngine & Partial<FocusCompactionCommandEngine>;
+type RuntimeCommandEngine = Partial<FocusCompactionCommandEngine>;
 
 const DOCTOR_CLEANER_IDS = new Set<DoctorCleanerId>(getDoctorCleanerFilterIds());
 
@@ -261,10 +248,6 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return rest.length === 0
         ? { kind: "backup" }
         : { kind: "help", error: "`/lcm backup` does not accept extra arguments." };
-    case "rotate":
-      return rest.length === 0
-        ? { kind: "rotate" }
-        : { kind: "help", error: "`/lcm rotate` does not accept extra arguments." };
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
@@ -296,7 +279,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, rotate, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -603,23 +586,11 @@ async function runFocusLifecycleCompaction(params: {
     };
   }
 
-  let sessionFile = "";
-  try {
-    sessionFile =
-      (await params.deps.resolveSessionTranscriptFile({
-        sessionId,
-        sessionKey,
-      })) ?? "";
-  } catch {
-    sessionFile = "";
-  }
-
   const tokenBudget = resolveLifecycleCompactionTokenBudget(params.config);
   try {
     const result = await engine.compact({
       sessionId,
       sessionKey,
-      sessionFile,
       tokenBudget,
       currentTokenCount: params.current.stats.contextTokenCount,
       compactionTarget: "threshold",
@@ -693,10 +664,6 @@ function buildHelpText(error?: string): string {
         "Create a timestamped backup of the current LCM database.",
       ),
       buildStatLine(
-        formatCommand(`${VISIBLE_COMMAND} rotate`),
-        "Compact the current session transcript while preserving the same LCM conversation and live session identity.",
-      ),
-      buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} focus <prompt>`),
         "Generate an active focus brief with a delegated recall sub-agent.",
       ),
@@ -728,8 +695,8 @@ function buildHelpText(error?: string): string {
       buildStatLine("subcommands", `Discover them with ${formatCommand(`${VISIBLE_COMMAND} help`)}.`),
       buildStatLine("alias", `${formatCommand(HIDDEN_ALIAS)} is accepted as a shorter alias.`),
       buildStatLine("current conversation", "Uses the active LCM session when the host exposes session identity."),
-      buildStatLine("`/new`", "Prunes context for the current LCM conversation. It does not split storage."),
-      buildStatLine("`/reset`", "Resets OpenClaw session flow. Use rotate when you only want transcript compaction."),
+      buildStatLine("`/new`", "Prunes context for the current LCM conversation."),
+      buildStatLine("`/reset`", "Resets OpenClaw session flow."),
     ]),
   ];
   return lines.join("\n");
@@ -1085,210 +1052,6 @@ async function buildBackupText(params: {
   );
   return lines.join("\n");
 }
-
-async function buildRotateText(params: {
-  ctx: PluginCommandContext;
-  db: DatabaseSync;
-  config: LcmConfig;
-  deps?: LcmDependencies;
-  getLcm?: () => Promise<RuntimeCommandEngine>;
-}): Promise<string> {
-  const lines = [
-    ...buildHeaderLines(),
-    "",
-    "🪓 Lossless Claw Rotate",
-    "",
-  ];
-
-  const sessionKey = normalizeIdentity(params.ctx.sessionKey);
-  if (!sessionKey) {
-    lines.push(
-      buildSection("📍 Current conversation", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine(
-          "reason",
-          "OpenClaw must expose the active session key for Lossless Claw to rotate storage safely.",
-        ),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  const current = await resolveCurrentConversation({
-    ctx: params.ctx,
-    db: params.db,
-  });
-  if (current.kind === "unavailable") {
-    lines.push(
-      buildSection("📍 Current conversation", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine("reason", current.reason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  if (!params.deps || !params.getLcm) {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine("reason", "Rotate requires the runtime-backed LCM engine to be available."),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  const sessionId = await resolveRuntimeSessionId({
-    ctx: params.ctx,
-    deps: params.deps,
-    current,
-  });
-  if (!sessionId) {
-    lines.push(
-      buildSection("📍 Current conversation", [
-        buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
-        buildStatLine("session key", formatCommand(truncateMiddle(sessionKey, 44))),
-        buildStatLine("messages", formatNumber(current.stats.messageCount)),
-      ]),
-      "",
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine(
-          "reason",
-          "Lossless Claw resolved the active conversation, but OpenClaw did not expose or resolve a runtime session id, so rotate cannot locate the live transcript safely.",
-        ),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  const transcriptPath = await params.deps.resolveSessionTranscriptFile({
-    sessionId,
-    sessionKey,
-  });
-  if (!transcriptPath || !existsSync(transcriptPath)) {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine(
-          "reason",
-          "Lossless Claw could not resolve the active session transcript path, so it cannot rotate the transcript safely.",
-        ),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  const unavailableReason = getLcmBackupUnavailableReason(params.config.databasePath);
-  if (unavailableReason) {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine("reason", unavailableReason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  let result: RotateSessionStorageWithBackupResult;
-  try {
-    result = await (await params.getLcm()).rotateSessionStorageWithBackup({
-      sessionId,
-      sessionKey,
-      sessionFile: transcriptPath,
-      lockTimeoutMs: ROTATE_DATABASE_LOCK_TIMEOUT_MS,
-    });
-  } catch (error) {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "failed"),
-        buildStatLine("reason", formatFailureReason(error)),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  lines.push(
-    buildSection("📍 Current conversation", [
-      buildStatLine(
-        "conversation id",
-        formatNumber(result.currentConversationId ?? current.stats.conversationId),
-      ),
-      buildStatLine("session key", formatCommand(truncateMiddle(sessionKey, 44))),
-      buildStatLine(
-        "messages",
-        formatNumber(result.currentMessageCount ?? current.stats.messageCount),
-      ),
-    ]),
-    "",
-  );
-
-  if (result.kind === "backup_failed") {
-    lines.push(
-      buildSection("💾 Backup", [
-        buildStatLine("status", "failed"),
-        buildStatLine("reason", result.reason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  if (result.kind === "unavailable" && !result.backupPath) {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine("reason", result.reason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  lines.push(
-    buildSection("💾 Backup", [
-      buildStatLine("status", "replaced latest"),
-      buildStatLine("backup path", result.backupPath!),
-    ]),
-    "",
-  );
-
-  if (result.kind === "rotate_failed") {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "failed"),
-        buildStatLine("reason", result.reason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  if (result.kind === "unavailable") {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine("reason", result.reason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  lines.push(
-    buildSection("🛠️ Rotate", [
-      buildStatLine("status", "rotated"),
-      buildStatLine("preserved tail messages", formatNumber(result.preservedTailMessageCount)),
-      buildStatLine("checkpoint bytes", formatNumber(result.checkpointSize)),
-      buildStatLine("bytes removed", formatNumber(result.bytesRemoved)),
-      buildStatLine("transcript", transcriptPath),
-      buildStatLine("mode", "preserved current conversation and rotated transcript tail"),
-    ]),
-    "",
-    buildSection("🧭 Notes", [
-      "Current LCM conversation, summaries, and context items remain in place.",
-      `${formatCommand("/new")} still prunes context only, and ${formatCommand("/reset")} still resets OpenClaw session flow.`,
-    ]),
-  );
-  return lines.join("\n");
-}
-
 function formatFocusPreview(content: string, maxChars = 1200): string {
   const trimmed = content.trim();
   if (trimmed.length <= maxChars) {
@@ -2248,16 +2011,6 @@ export function createLcmCommand(params: {
             text: await buildBackupText({
               db: await getDb(),
               config: params.config,
-            }),
-          };
-        case "rotate":
-          return {
-            text: await buildRotateText({
-              ctx,
-              db: await getDb(),
-              config: params.config,
-              deps: params.deps,
-              getLcm: params.getLcm,
             }),
           };
         case "focus_status":

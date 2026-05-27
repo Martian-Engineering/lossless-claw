@@ -1,15 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, statSync } from "node:fs";
-import { mkdir, open, stat, writeFile } from "node:fs/promises";
-import type { FileHandle } from "node:fs/promises";
-import { join, resolve as resolvePath } from "node:path";
+import { statSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { createInterface } from "node:readline";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
   ContextEngine,
   ContextEngineInfo,
   ContextEngineHostCapability,
+  ContextEngineRuntimeContext,
   AssembleResult,
   BootstrapResult,
   CompactResult,
@@ -69,13 +67,8 @@ import {
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
-import type { LcmDependencies, StartupSessionFileCandidate } from "./types.js";
+import type { LcmDependencies } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
-import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
-import {
-  DatabaseTransactionTimeoutError,
-  withExclusiveDatabaseLock,
-} from "./transaction-mutex.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
@@ -117,24 +110,6 @@ type PromptCacheSnapshot = {
   provider?: string;
   model?: string;
 };
-type TranscriptRewriteReplacement = {
-  entryId: string;
-  message: AgentMessage;
-};
-type TranscriptRewriteRequest = {
-  replacements: TranscriptRewriteReplacement[];
-};
-type BootstrapCheckpointFileState = {
-  lastProcessedOffset: number;
-  lastSeenSize: number;
-};
-type RotateTranscriptRewriteResult = {
-  checkpointSize: number;
-  bytesRemoved: number;
-  preservedTailMessageCount: number;
-};
-type AutoRotateSessionFilePhase = "startup" | "runtime";
-type AutoRotateSessionFileAction = "rotate" | "warn" | "skip" | "summary";
 type ContextEngineMaintenanceResult = {
   changed: boolean;
   bytesFreed: number;
@@ -145,7 +120,7 @@ type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
   sessionKey?: string;
-  tokenBudget: number;
+  tokenBudget?: number;
   currentTokenCount?: number;
   compactionTarget?: "budget" | "threshold";
   customInstructions?: string;
@@ -158,9 +133,6 @@ type CompactionExecutionParams = {
 };
 type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   allowDeferredCompactionExecution?: boolean;
-  rewriteTranscriptEntries?: (
-    request: TranscriptRewriteRequest,
-  ) => Promise<ContextEngineMaintenanceResult>;
 };
 type DeferredCompactionDebtDrainParams = {
   conversationId: number;
@@ -220,37 +192,6 @@ function buildFocusProjectionKey(brief?: FocusBriefRecord | null): string | null
   hash.update(brief.content);
   return hash.digest("hex").slice(0, 32);
 }
-
-function checkpointIsPastTranscriptEof(
-  checkpoint: BootstrapCheckpointFileState | null | undefined,
-  fileSize: number,
-): boolean {
-  if (!checkpoint) {
-    return false;
-  }
-  return checkpoint.lastProcessedOffset > fileSize || checkpoint.lastSeenSize > fileSize;
-}
-
-function getErrorCode(error: unknown): string | undefined {
-  if (!(error instanceof Error)) {
-    return undefined;
-  }
-  const { code } = error as NodeJS.ErrnoException;
-  return typeof code === "string" ? code : undefined;
-}
-
-function isMissingFileError(error: unknown): boolean {
-  const code = getErrorCode(error);
-  return code === "ENOENT" || code === "ENOTDIR";
-}
-
-function normalizeSessionFilePathForComparison(filePath: string): string {
-  const trimmed = filePath.trim();
-  return trimmed ? resolvePath(trimmed) : "";
-}
-
-const TRANSCRIPT_GC_BATCH_SIZE = 12;
-const AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -495,53 +436,6 @@ function extractTranscriptToolCallId(message: AgentMessage): string | undefined 
   }
 
   return undefined;
-}
-
-function listTranscriptToolResultEntryIdsByCallId(sessionFile: string): Map<string, string> {
-  const sessionManager = SessionManager.open(sessionFile);
-  const branch = sessionManager.getBranch();
-  const entryIdsByCallId = new Map<string, string>();
-  const duplicateCallIds = new Set<string>();
-
-  for (const entry of branch) {
-    if (entry.type !== "message" || entry.message.role !== "toolResult") {
-      continue;
-    }
-    const toolCallId = extractTranscriptToolCallId(entry.message as AgentMessage);
-    if (!toolCallId) {
-      continue;
-    }
-    if (entryIdsByCallId.has(toolCallId)) {
-      duplicateCallIds.add(toolCallId);
-      continue;
-    }
-    entryIdsByCallId.set(toolCallId, entry.id);
-  }
-
-  for (const duplicateCallId of duplicateCallIds) {
-    entryIdsByCallId.delete(duplicateCallId);
-  }
-
-  return entryIdsByCallId;
-}
-
-function isRotatePreservedEntryType(type: string): boolean {
-  return (
-    type === "message" ||
-    type === "model_change" ||
-    type === "thinking_level_change" ||
-    type === "session_info"
-  );
-}
-
-function normalizeRotateTailMessageCount(value: number, branchMessageCount: number): number {
-  if (branchMessageCount <= 0) {
-    return 0;
-  }
-  if (!Number.isFinite(value)) {
-    return 1;
-  }
-  return Math.max(1, Math.min(branchMessageCount, Math.floor(value)));
 }
 
 function appendTextValue(value: unknown, out: string[]): void {
@@ -1412,92 +1306,6 @@ function extractBootstrapMessageCandidate(value: unknown): AgentMessage | null {
   return extractCanonicalBootstrapMessage(value);
 }
 
-function parseBootstrapJsonl(raw: string, options?: {
-  strict?: boolean;
-}): { messages: AgentMessage[]; sawNonWhitespace: boolean; hadMalformedLine: boolean } {
-  const messages: AgentMessage[] = [];
-  const lines = raw.split(/\r?\n/);
-  let sawNonWhitespace = false;
-  let hadMalformedLine = false;
-  for (const line of lines) {
-    const item = line.trim();
-    if (!item) {
-      continue;
-    }
-    sawNonWhitespace = true;
-    try {
-      const parsed = JSON.parse(item);
-      const candidate = extractBootstrapMessageCandidate(parsed);
-      if (candidate) {
-        messages.push(candidate);
-        continue;
-      }
-    } catch {
-      if (options?.strict) {
-        hadMalformedLine = true;
-      }
-    }
-  }
-  return { messages, sawNonWhitespace, hadMalformedLine };
-}
-
-/** Load recoverable messages from a JSON/JSONL session file without full-file reads for JSONL. */
-async function readLeafPathMessages(sessionFile: string): Promise<AgentMessage[]> {
-  try {
-    let sawNonWhitespace = false;
-    let jsonArrayMode = false;
-    let jsonArrayBuffer = "";
-    const messages: AgentMessage[] = [];
-    const stream = createReadStream(sessionFile, { encoding: "utf8" });
-    const lines = createInterface({
-      input: stream,
-      crlfDelay: Infinity,
-    });
-
-    for await (const line of lines) {
-      if (!sawNonWhitespace) {
-        const trimmed = line.trim();
-        if (trimmed) {
-          sawNonWhitespace = true;
-          if (trimmed.startsWith("[")) {
-            jsonArrayMode = true;
-          }
-        }
-      }
-
-      if (jsonArrayMode) {
-        jsonArrayBuffer += `${line}\n`;
-        continue;
-      }
-
-      const parsed = parseBootstrapJsonl(line);
-      if (parsed.messages.length > 0) {
-        messages.push(...parsed.messages);
-      }
-    }
-
-    if (jsonArrayMode) {
-      const trimmed = jsonArrayBuffer.trim();
-      if (!trimmed) {
-        return [];
-      }
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (!Array.isArray(parsed)) {
-          return [];
-        }
-        return parsed.filter(isBootstrapMessage);
-      } catch {
-        return [];
-      }
-    }
-
-    return messages;
-  } catch {
-    return [];
-  }
-}
-
 /**
  * Resolve the first-time bootstrap token budget.
  *
@@ -1560,198 +1368,6 @@ function trimBootstrapMessagesToBudget(messages: AgentMessage[], maxTokens: numb
 
   kept.reverse();
   return kept;
-}
-
-async function readFileSegment(sessionFile: string, offset: number): Promise<string | null> {
-  let fh: FileHandle | null = null;
-  try {
-    fh = await open(sessionFile, "r");
-    const stats = await fh.stat();
-    const safeOffset = Math.max(0, Math.min(Math.floor(offset), stats.size));
-    const length = stats.size - safeOffset;
-    if (length <= 0) {
-      return "";
-    }
-    const buffer = Buffer.alloc(length);
-    await fh.read(buffer, 0, length, safeOffset);
-    return buffer.toString("utf8");
-  } catch {
-    return null;
-  } finally {
-    await fh?.close();
-  }
-}
-
-async function readLastJsonlEntryBeforeOffset(
-  sessionFile: string,
-  offset: number,
-  messageOnly = false,
-  matcher?: (message: AgentMessage) => boolean,
-): Promise<string | null> {
-  const chunkSize = 16_384;
-  const safeOffset = Math.max(0, Math.floor(offset));
-  if (safeOffset <= 0) {
-    return null;
-  }
-
-  let fh: FileHandle | null = null;
-  try {
-    fh = await open(sessionFile, "r");
-    let cursor = safeOffset;
-    let carry = "";
-    while (true) {
-      const trimmedEnd = carry.replace(/\s+$/u, "");
-      if (trimmedEnd) {
-        const newlineIndex = Math.max(trimmedEnd.lastIndexOf("\n"), trimmedEnd.lastIndexOf("\r"));
-        if (newlineIndex >= 0) {
-          const candidate = trimmedEnd.slice(newlineIndex + 1).trim();
-          if (candidate) {
-            if (messageOnly) {
-              let matchedMessage: AgentMessage | null = null;
-              try {
-                matchedMessage = extractBootstrapMessageCandidate(JSON.parse(candidate));
-              } catch { /* not valid JSON, skip */ }
-              if (!matchedMessage || (matcher && !matcher(matchedMessage))) {
-                carry = trimmedEnd.slice(0, newlineIndex);
-                continue;
-              }
-            }
-            return candidate;
-          }
-          carry = trimmedEnd.slice(0, newlineIndex);
-          continue;
-        }
-      }
-
-      // No more newlines in current carry — need more data from earlier in the file.
-      if (cursor <= 0) {
-        // Reached start-of-file: whatever is left is the first line.
-        const firstLine = trimmedEnd.trim() || null;
-        if (!firstLine) return null;
-        if (messageOnly) {
-          let matchedMessage: AgentMessage | null = null;
-          try {
-            matchedMessage = extractBootstrapMessageCandidate(JSON.parse(firstLine));
-          } catch { /* not valid JSON */ }
-          if (!matchedMessage || (matcher && !matcher(matchedMessage))) return null;
-        }
-        return firstLine;
-      }
-
-      const start = Math.max(0, cursor - chunkSize);
-      const length = cursor - start;
-      const buffer = Buffer.alloc(length);
-      await fh.read(buffer, 0, length, start);
-      carry = buffer.toString("utf8") + carry;
-      cursor = start;
-    }
-  } catch {
-    return null;
-  } finally {
-    await fh?.close();
-  }
-}
-
-async function readAppendedLeafPathMessages(params: {
-  sessionFile: string;
-  offset: number;
-}): Promise<{ messages: AgentMessage[]; canUseAppendOnly: boolean; sawNonWhitespace: boolean }> {
-  const raw = await readFileSegment(params.sessionFile, params.offset);
-  if (raw == null) {
-    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: false };
-  }
-
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return { messages: [], canUseAppendOnly: true, sawNonWhitespace: false };
-  }
-
-  if (trimmed.startsWith("[")) {
-    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: true };
-  }
-
-  const parsed = parseBootstrapJsonl(raw, { strict: true });
-  if (parsed.hadMalformedLine) {
-    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: parsed.sawNonWhitespace };
-  }
-
-  return {
-    messages: parsed.messages,
-    canUseAppendOnly: true,
-    sawNonWhitespace: parsed.sawNonWhitespace,
-  };
-}
-
-export type RotateSessionStorageResult =
-  | {
-      kind: "rotated";
-      conversationId: number;
-      preservedTailMessageCount: number;
-      checkpointSize: number;
-      bytesRemoved: number;
-    }
-  | {
-      kind: "unavailable";
-      reason: string;
-    };
-
-export type RotateSessionStorageWithBackupResult =
-  | {
-      kind: "rotated";
-      currentConversationId: number;
-      currentMessageCount: number;
-      backupPath: string;
-      preservedTailMessageCount: number;
-      checkpointSize: number;
-      bytesRemoved: number;
-    }
-  | {
-      kind: "backup_failed";
-      currentConversationId: number;
-      currentMessageCount: number;
-      reason: string;
-    }
-  | {
-      kind: "rotate_failed";
-      currentConversationId: number;
-      currentMessageCount: number;
-      backupPath: string;
-      reason: string;
-    }
-  | {
-      kind: "unavailable";
-      reason: string;
-      currentConversationId?: number;
-      currentMessageCount?: number;
-      backupPath?: string;
-    };
-
-type StartupAutoRotateCandidate = {
-  sessionId: string;
-  sessionKey: string;
-  sessionFile: string;
-  conversationId: number;
-  sizeBytes: number;
-  currentMessageCount: number;
-};
-
-type StartupAutoRotateBatchResult = {
-  rotated: number;
-  warned: number;
-  bytesRemoved: number;
-  backupPath?: string;
-  backupCreated: number;
-};
-
-function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | null {
-  if (!line) {
-    return null;
-  }
-  try {
-    return extractBootstrapMessageCandidate(JSON.parse(line));
-  } catch {
-    return null;
-  }
 }
 
 function messageIdentity(role: string, content: string): string {
@@ -2822,38 +2438,12 @@ export class LcmContextEngine implements ContextEngine {
   >();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
-  private oversizedAutoRotateCheckpointByQueueKey = new Map<string, number>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
 
-  /**
-   * Tracks file metadata from the last successful full bootstrap read per
-   * conversation. When the session JSONL file has not changed since the last
-   * full read and the conversation is already bootstrapped, the expensive
-   * readLeafPathMessages() call can be skipped entirely.
-   */
-  private lastFullReadFileState = new Map<number, { size: number; mtimeMs: number }>();
-
   // ── Circuit breaker for compaction auth failures ──
   private circuitBreakerStates = new Map<string, CircuitBreakerState>();
-
-  /** Last file state successfully covered by `reconcileTranscriptTailForAfterTurn`
-   *  slow-path full re-reads, keyed by `${sessionQueueKey}\u0000${sessionFile}`
-   *  (same NUL-escape separator pattern as `messageIdentity`). Long-running
-   *  sessions where the bootstrap checkpoint is missing or path-mismatched
-   *  would otherwise pay O(file-size) on every afterTurn; repeated attempts
-   *  for the same unchanged file state are skipped.
-   *
-   *  Bounded with FIFO eviction at `AFTER_TURN_RECONCILE_KEY_CAP` entries
-   *  so hosts churning through many sessions/files don't accumulate this
-   *  map indefinitely. When the cap is exceeded we drop the oldest entry
-   *  (Map iteration order is insertion order in JS); a session whose
-   *  entry eventually evicts may pay the slow path once again, which is
-   *  acceptable since the bound is well above realistic concurrent-session
-   *  counts. */
-  private afterTurnReconcileFullReadStates = new Map<string, { size: number; mtimeMs: number }>();
-  private static readonly AFTER_TURN_RECONCILE_KEY_CAP = 4096;
 
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
@@ -5024,8 +4614,8 @@ export class LcmContextEngine implements ContextEngine {
   // ── ContextEngine interface ─────────────────────────────────────────────
 
   /**
-   * Reconcile session-file history with persisted messages and append only the
-   * tail that is present in JSONL but missing from LCM.
+   * Reconcile a host-provided runtime history snapshot with persisted messages
+   * and append only the tail that is missing from LCM.
    */
   private async reconcileSessionTail(params: {
     sessionId: string;
@@ -5329,8 +4919,7 @@ export class LcmContextEngine implements ContextEngine {
     messages: AgentMessage[];
     sessionContext: string;
     source: string;
-    priorMessages?: AgentMessage[];
-    sessionFile?: string;
+    priorMessages: AgentMessage[];
   }): Promise<AgentMessage[]> {
     if (params.messages.length < 3) {
       return params.messages;
@@ -5347,10 +4936,8 @@ export class LcmContextEngine implements ContextEngine {
       return params.messages;
     }
 
-    const priorMessages =
-      params.priorMessages ??
-      (params.sessionFile ? await readLeafPathMessages(params.sessionFile) : undefined);
-    if (!priorMessages || priorMessages.length === 0) {
+    const priorMessages = params.priorMessages;
+    if (priorMessages.length === 0) {
       return params.messages;
     }
 
@@ -5402,335 +4989,10 @@ export class LcmContextEngine implements ContextEngine {
       : params.messages;
   }
 
-  private async reconcileTranscriptTailForAfterTurn(params: {
-    sessionId: string;
-    sessionKey?: string;
-    sessionFile: string;
-  }): Promise<TranscriptReconcileResult> {
-    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
-    return await this.withSessionQueue(
-      queueKey,
-      async () => {
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-        });
-        if (!conversation) {
-          // No persisted conversation exists yet; afterTurn's own ingest batch
-          // will create the initial frontier, so refreshing after that ingest is
-          // safe and preserves the normal first-turn checkpoint behavior.
-          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
-        }
-
-        // OpenClaw can submit the foreground prompt outside the mutable
-        // messages array passed to afterTurn. The transcript has the complete
-        // turn by this point, so reconcile it before accepting assistant-only
-        // deltas from the runtime snapshot.
-        const checkpoint = await this.summaryStore.getConversationBootstrapState(
-          conversation.conversationId,
-        );
-        let sessionFileState: { size: number; mtimeMs: number } | undefined;
-        try {
-          const sessionFileStats = await stat(params.sessionFile);
-          sessionFileState = {
-            size: sessionFileStats.size,
-            mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
-          };
-        } catch {
-          // Leave undefined: without stat proof, do not use append-only guards or slow-read caps.
-        }
-        const transcriptEpochShrank = checkpointIsPastTranscriptEof(
-          checkpoint,
-          sessionFileState?.size ?? Number.POSITIVE_INFINITY,
-        );
-        if (
-          checkpoint &&
-          checkpoint.sessionFilePath === params.sessionFile &&
-          checkpoint.lastProcessedOffset >= 0 &&
-          !transcriptEpochShrank
-        ) {
-          const appended = await readAppendedLeafPathMessages({
-            sessionFile: params.sessionFile,
-            offset: checkpoint.lastProcessedOffset,
-          });
-          if (appended.canUseAppendOnly) {
-            const placeholderCheckpoint =
-              checkpoint.lastSeenSize === 0 &&
-              checkpoint.lastSeenMtimeMs === 0 &&
-              checkpoint.lastProcessedOffset === 0 &&
-              checkpoint.lastProcessedEntryHash === null;
-            if (placeholderCheckpoint && appended.messages.length > 0) {
-              const reconcile = await this.reconcileSessionTail({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                conversationId: conversation.conversationId,
-                historicalMessages: appended.messages,
-                noAnchorImportReason: "placeholder-checkpoint-recovery",
-              });
-              if (reconcile.importedMessages > 0) {
-                this.recordRecentBootstrapImport(
-                  conversation.conversationId,
-                  reconcile.importedMessages,
-                  "reconciled missing session messages",
-                );
-                await this.refreshBootstrapState({
-                  conversationId: conversation.conversationId,
-                  sessionFile: params.sessionFile,
-                });
-              }
-              return reconcile;
-            }
-
-            const replayFilteredMessages = await this.filterBootstrapReplayMessages({
-              messages: appended.messages,
-              sessionContext: this.formatSessionLogContext({
-                conversationId: conversation.conversationId,
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-              }),
-              source: "afterTurn transcript reconcile append-only",
-              sessionFile: params.sessionFile,
-            });
-            let importedMessages = 0;
-            for (const message of replayFilteredMessages) {
-              const result = await this.ingestSingle({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                message,
-              });
-              if (result.ingested) {
-                importedMessages += 1;
-              }
-            }
-            if (importedMessages > 0) {
-              this.recordRecentBootstrapImport(
-                conversation.conversationId,
-                importedMessages,
-                "reconciled missing session messages",
-              );
-              await this.refreshBootstrapState({
-                conversationId: conversation.conversationId,
-                sessionFile: params.sessionFile,
-              });
-            }
-            return { importedMessages, blockedByImportCap: false, hasOverlap: true };
-          }
-        }
-
-        // Slow path: checkpoint missing, path mismatched, or non-append-only.
-        // Cap full re-reads only for unchanged file states. If the transcript
-        // changed since the last full read, reconcile again; if it did not,
-        // skip without advancing the checkpoint so stale state can be retried
-        // after a later file change, process restart, or cap eviction.
-        const fullReadKey = `${queueKey}\u0000${params.sessionFile}`;
-        const reason = !checkpoint
-          ? "checkpoint-missing"
-          : checkpoint.sessionFilePath !== params.sessionFile
-            ? "path-mismatch"
-            : transcriptEpochShrank
-              ? "same-path-shrink"
-              : "append-only-ineligible";
-        if (reason === "same-path-shrink") {
-          this.afterTurnReconcileFullReadStates.delete(fullReadKey);
-        }
-        const rememberedFileState = this.afterTurnReconcileFullReadStates.get(fullReadKey);
-        if (
-          rememberedFileState
-          && sessionFileState
-          && rememberedFileState.size === sessionFileState.size
-          && rememberedFileState.mtimeMs === sessionFileState.mtimeMs
-        ) {
-          this.deps.log.debug(
-            `[lcm] afterTurn: transcript reconcile slow path skipped (file state already read this process) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
-          );
-          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
-        }
-
-        const rememberSlowReadState = (): void => {
-          if (!sessionFileState) {
-            return;
-          }
-          if (
-            !this.afterTurnReconcileFullReadStates.has(fullReadKey)
-            && this.afterTurnReconcileFullReadStates.size
-              >= LcmContextEngine.AFTER_TURN_RECONCILE_KEY_CAP
-          ) {
-            const oldest = this.afterTurnReconcileFullReadStates.keys().next().value;
-            if (typeof oldest === "string") {
-              this.afterTurnReconcileFullReadStates.delete(oldest);
-            }
-          }
-          this.afterTurnReconcileFullReadStates.set(fullReadKey, sessionFileState);
-        };
-        const slowPathStartedAt = Date.now();
-
-        // Distinguish empty-file from read/parse error: stat the file and
-        // only treat it as "actually empty" when size is 0. A non-zero file
-        // returning empty `historicalMessages` indicates the parser hit an
-        // error (and `readLeafPathMessages` swallows those into `[]`); in
-        // that case we must NOT mark the bootstrap checkpoint as fully
-        // processed, otherwise future afterTurns will skip reconciliation
-        // and we lose messages.
-        const historicalMessages = await readLeafPathMessages(params.sessionFile);
-        if (historicalMessages.length === 0) {
-          if (!sessionFileState) {
-            // #649 added this permissive stat-fail fallback expecting the
-            // afterTurn-tail `refreshAfterTurnBootstrapState` hook to refresh
-            // the checkpoint. That hook delegates to refreshBootstrapState,
-            // which itself calls `stat(sessionFile)` and throws on failure;
-            // the hook's catch then logs a warn and leaves
-            // conversation_bootstrap_state NULL. Subsequent turns re-enter
-            // the slow path with reason="checkpoint-missing" (excluded from
-            // allowNoAnchorImport) and the conversation gets stuck in a
-            // transparent-passthrough state where compaction never runs.
-            //
-            // Seed a placeholder bootstrap_state row ONLY when no checkpoint
-            // already exists. If a valid checkpoint is present (with a
-            // non-zero offset), a transient stat/read failure must NOT reset
-            // it to zero — that would cause the next successful read to
-            // replay every message from offset=0, duplicating rows in the
-            // messages table (identity_hash is not a uniqueness guard).
-            if (!checkpoint) {
-              try {
-                await this.summaryStore.upsertConversationBootstrapState({
-                  conversationId: conversation.conversationId,
-                  sessionFilePath: params.sessionFile,
-                  lastSeenSize: 0,
-                  lastSeenMtimeMs: 0,
-                  lastProcessedOffset: 0,
-                  lastProcessedEntryHash: null,
-                });
-              } catch (seedError) {
-                this.deps.log.warn(
-                  `[lcm] afterTurn: transcript reconcile slow path failed to seed placeholder bootstrap_state conversation=${conversation.conversationId} sessionFile=${params.sessionFile} error=${seedError instanceof Error ? seedError.message : String(seedError)}`,
-                );
-              }
-              this.deps.log.warn(
-                `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; allowing live afterTurn persistence and seeding placeholder bootstrap_state at offset=0 to unblock next-turn recovery conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
-              );
-            } else {
-              // Checkpoint exists with a valid offset — a transient stat/read
-              // failure must NOT overwrite it. Leave the existing checkpoint
-              // intact so the next successful read resumes from the right offset.
-              this.deps.log.warn(
-                `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) instead of reseeding conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
-              );
-            }
-            return {
-              importedMessages: 0,
-              blockedByImportCap: false,
-              hasOverlap: true,
-            };
-          }
-          if (sessionFileState.size === 0) {
-            // File is genuinely empty — refresh the checkpoint so the next
-            // afterTurn takes the incremental path.
-            await this.refreshBootstrapState({
-              conversationId: conversation.conversationId,
-              sessionFile: params.sessionFile,
-            });
-            rememberSlowReadState();
-          } else {
-            this.deps.log.warn(
-              `[lcm] afterTurn: transcript reconcile slow path read empty messages from non-empty file (${sessionFileState?.size ?? "?"} bytes) — skipping checkpoint refresh to avoid dropping messages on parser failure conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
-            );
-          }
-          return {
-            importedMessages: 0,
-            blockedByImportCap: false,
-            hasOverlap: sessionFileState.size === 0,
-          };
-        }
-        const reconcile = await this.reconcileSessionTail({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          conversationId: conversation.conversationId,
-          historicalMessages,
-          skipContentAnchorScan: reason === "same-path-shrink",
-          allowNoAnchorImport: reason === "path-mismatch" || reason === "same-path-shrink",
-          noAnchorImportReason: reason,
-        });
-        if (reconcile.blockedByImportCap) {
-          return { importedMessages: 0, blockedByImportCap: true, hasOverlap: reconcile.hasOverlap };
-        }
-        if (reconcile.importedMessages > 0) {
-          this.recordRecentBootstrapImport(
-            conversation.conversationId,
-            reconcile.importedMessages,
-            "reconciled missing session messages",
-          );
-        }
-        if (!reconcile.hasOverlap && reconcile.importedMessages === 0) {
-          this.deps.log.warn(
-            `[lcm] afterTurn: transcript reconcile found no anchor and imported 0 messages; skipping checkpoint refresh conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length}`,
-          );
-          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: false };
-        }
-        // Refresh only after the slow-path read either found an overlap or
-        // imported the bounded no-anchor epoch. A no-overlap/no-import result
-        // leaves the checkpoint stale on purpose so future turns can retry.
-        await this.refreshBootstrapState({
-          conversationId: conversation.conversationId,
-          sessionFile: params.sessionFile,
-        });
-        rememberSlowReadState();
-        this.deps.log.warn(
-          `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${reconcile.importedMessages} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
-        );
-        return {
-          importedMessages: reconcile.importedMessages,
-          blockedByImportCap: false,
-          hasOverlap: reconcile.hasOverlap,
-        };
-      },
-      {
-        operationName: "afterTurnTranscriptReconcile",
-        context: [
-          `session=${params.sessionId}`,
-          ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
-        ].join(" "),
-      },
-    );
-  }
-
-  /**
-   * Persist bootstrap checkpoint metadata anchored to the current DB frontier.
-   *
-   * By default, the frontier hash follows the latest persisted DB message. The
-   * first-time bootstrap path can override it with the raw transcript hash so
-   * later reconciliation can anchor entries whose DB content was externalized.
-   */
-  private async refreshBootstrapState(params: {
-    conversationId: number;
-    sessionFile: string;
-    fileStats?: { size: number; mtimeMs: number };
-    lastProcessedEntryHash?: string | null;
-  }): Promise<void> {
-    const latestDbMessage = await this.conversationStore.getLastMessage(params.conversationId);
-    const fileStats = params.fileStats ?? (await stat(params.sessionFile));
-    await this.summaryStore.upsertConversationBootstrapState({
-      conversationId: params.conversationId,
-      sessionFilePath: params.sessionFile,
-      lastSeenSize: fileStats.size,
-      lastSeenMtimeMs: Math.trunc(fileStats.mtimeMs),
-      lastProcessedOffset: fileStats.size,
-      lastProcessedEntryHash:
-        params.lastProcessedEntryHash !== undefined
-          ? params.lastProcessedEntryHash
-          : latestDbMessage
-            ? createBootstrapEntryHash({
-                role: latestDbMessage.role,
-                content: latestDbMessage.content,
-                tokenCount: latestDbMessage.tokenCount,
-              })
-            : null,
-    });
-  }
-
   async bootstrap(params: {
     sessionId: string;
-    sessionFile: string;
     sessionKey?: string;
+    messages?: AgentMessage[];
   }): Promise<BootstrapResult> {
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       return {
@@ -5746,910 +5008,61 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
+
     this.ensureMigrated();
-    const startedAt = Date.now();
     const sessionLabel = [
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
-    const sessionFileStats = await stat(params.sessionFile);
-    const sessionFileSize = sessionFileStats.size;
-    const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
+    const bootstrapMessages = trimBootstrapMessagesToBudget(
+      filterPersistableMessages(params.messages ?? []),
+      resolveBootstrapMaxTokens(this.config),
+    );
 
-    const result = await this.withSessionQueue(
+    if (bootstrapMessages.length === 0) {
+      this.deps.log.debug(
+        `[lcm] bootstrap: skipped ${sessionLabel} reason=no_runtime_messages`,
+      );
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "runtime messages unavailable",
+      };
+    }
+
+    let importedMessages = 0;
+    await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () =>
-        this.conversationStore.withTransaction(async () => {
-          const persistBootstrapState = async (
-            conversationId: number,
-            lastProcessedEntryHash?: string | null,
-          ): Promise<void> => {
-            await this.refreshBootstrapState({
-              conversationId,
-              sessionFile: params.sessionFile,
-              fileStats: {
-                size: sessionFileSize,
-                mtimeMs: sessionFileMtimeMs,
-              },
-              lastProcessedEntryHash,
-            });
-            // Update the file-level cache so subsequent bootstraps against an
-            // unchanged file can skip the full read via the cache guard.
-            this.lastFullReadFileState.set(conversationId, {
-              size: sessionFileSize,
-              mtimeMs: sessionFileMtimeMs,
-            });
-          };
-
-          // Guard: when a sessionKey resumes on a new sessionId and the tracked
-          // transcript file has disappeared, treat it as a missed /reset and
-          // rotate the conversation before getOrCreate would re-attach to it.
-          const normalizedSessionKey = params.sessionKey?.trim();
-          if (normalizedSessionKey) {
-            const activeByKey = await this.conversationStore.getConversationBySessionKey(normalizedSessionKey);
-            if (activeByKey && activeByKey.sessionId !== params.sessionId) {
-              const activeBootstrapState = await this.summaryStore.getConversationBootstrapState(
-                activeByKey.conversationId,
-              );
-              const trackedSessionFile = activeBootstrapState?.sessionFilePath;
-              let trackedSessionFileMissing = false;
-              if (typeof trackedSessionFile === "string" && trackedSessionFile.length > 0) {
-                try {
-                  await stat(trackedSessionFile);
-                } catch (err) {
-                  const code = getErrorCode(err);
-                  if (code === "ENOENT" || code === "ENOTDIR") {
-                    trackedSessionFileMissing = true;
-                  } else {
-                    this.deps.log.warn(
-                      `[lcm] bootstrap: could not verify tracked transcript path conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
-                    );
-                  }
-                }
-              }
-              const transcriptRotated =
-                typeof trackedSessionFile === "string" &&
-                trackedSessionFile.length > 0 &&
-                trackedSessionFile !== params.sessionFile;
-
-              if (transcriptRotated && trackedSessionFileMissing) {
-                this.deps.log.warn(
-                  `[lcm] bootstrap: detected reset/rollover without prior lifecycle split; rotating conversation=${activeByKey.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} oldSessionId=${activeByKey.sessionId} oldFile=${trackedSessionFile} newFile=${params.sessionFile}`,
-                );
-                await this.applySessionReplacement({
-                  reason: "bootstrap session-file rollover fallback",
-                  sessionId: activeByKey.sessionId,
-                  sessionKey: normalizedSessionKey,
-                  nextSessionId: params.sessionId,
-                  nextSessionKey: normalizedSessionKey,
-                  createReplacement: true,
-                });
-              }
-            }
-          }
-
-          const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
-            sessionKey: params.sessionKey,
-          });
-          const conversationId = conversation.conversationId;
-          let existingCount = await this.conversationStore.getMessageCount(conversationId);
-          let bootstrapState = await this.summaryStore.getConversationBootstrapState(conversationId);
-          let transcriptEpochRotated = false;
-          let transcriptEpochReason: string | undefined;
-
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath !== params.sessionFile
-          ) {
-            transcriptEpochRotated = true;
-            transcriptEpochReason = "path-mismatch";
-            this.deps.log.warn(
-              `[lcm] bootstrap: session file rotated conversation=${conversationId} ${sessionLabel} oldFile=${bootstrapState.sessionFilePath} newFile=${params.sessionFile}`,
-            );
-            // A rotated session file invalidates every piece of cached state
-            // keyed to the old path: the on-disk bootstrap checkpoint row, the
-            // in-memory file-level guard, and any counters derived from the
-            // old file's messages. Clear them all in one place so subsequent
-            // reads treat this conversation as unbootstrapped.
-            this.lastFullReadFileState.delete(conversationId);
-            bootstrapState = null;
-          }
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath === params.sessionFile &&
-            checkpointIsPastTranscriptEof(bootstrapState, sessionFileSize)
-          ) {
-            transcriptEpochRotated = true;
-            transcriptEpochReason = "same-path-shrink";
-            this.deps.log.warn(
-              `[lcm] bootstrap: session file shrank past checkpoint conversation=${conversationId} ${sessionLabel} file=${params.sessionFile} checkpointOffset=${bootstrapState.lastProcessedOffset} checkpointSize=${bootstrapState.lastSeenSize} currentSize=${sessionFileSize}`,
-            );
-            this.lastFullReadFileState.delete(conversationId);
-            bootstrapState = null;
-          }
-
-          // If the transcript file is byte-for-byte unchanged from the last
-          // successful bootstrap checkpoint, skip reopening and reparsing it.
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath === params.sessionFile &&
-            bootstrapState.lastSeenSize === sessionFileSize &&
-            bootstrapState.lastSeenMtimeMs === sessionFileMtimeMs
-          ) {
-            if (!conversation.bootstrappedAt) {
-              await this.conversationStore.markConversationBootstrapped(conversationId);
-            }
-            this.deps.log.debug(
-              `[lcm] bootstrap: checkpoint hit conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} duration=${formatDurationMs(Date.now() - startedAt)}`,
-            );
-            return {
-              bootstrapped: false,
-              importedMessages: 0,
-              reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
-            };
-          }
-
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath === params.sessionFile &&
-            sessionFileSize > bootstrapState.lastSeenSize &&
-            sessionFileMtimeMs >= bootstrapState.lastSeenMtimeMs
-          ) {
-            const latestDbMessage = await this.conversationStore.getLastMessage(conversationId);
-            const latestDbHash = latestDbMessage
-              ? createBootstrapEntryHash({
-                  role: latestDbMessage.role,
-                  content: latestDbMessage.content,
-                  tokenCount: latestDbMessage.tokenCount,
-                })
-              : null;
-            const frontierHash = latestDbHash ?? bootstrapState.lastProcessedEntryHash;
-            // Short-circuit before the expensive backward scan: the fast-path can
-            // only succeed when the current frontier still matches the checkpoint.
-            // A freshly rotated row may have no DB messages yet, so in that case
-            // the stored checkpoint hash acts as the frontier anchor. When the
-            // frontier no longer matches, skip straight to the async full-read
-            // slow path below and avoid a backward scan that cannot succeed.
-            const canTryAppendOnlyFastPath =
-              frontierHash !== null && frontierHash === bootstrapState.lastProcessedEntryHash;
-
-            const tailEntryRaw = canTryAppendOnlyFastPath
-              ? await readLastJsonlEntryBeforeOffset(
-                  params.sessionFile,
-                  bootstrapState.lastProcessedOffset,
-                  true,
-                  (message) => createBootstrapEntryHash(toStoredMessage(message)) === frontierHash,
-                )
-              : null;
-            const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
-            const tailEntryHash = tailEntryMessage
-              ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
-              : null;
-
-            if (
-              canTryAppendOnlyFastPath &&
-              tailEntryHash &&
-              tailEntryHash === bootstrapState.lastProcessedEntryHash
-            ) {
-              const appended = await readAppendedLeafPathMessages({
-                sessionFile: params.sessionFile,
-                offset: bootstrapState.lastProcessedOffset,
-              });
-              if (appended.canUseAppendOnly) {
-                if (!conversation.bootstrappedAt) {
-                  await this.conversationStore.markConversationBootstrapped(conversationId);
-                }
-
-                const replayFilteredMessages = await this.filterBootstrapReplayMessages({
-                  messages: appended.messages,
-                  sessionContext: this.formatSessionLogContext({
-                    conversationId,
-                    sessionId: params.sessionId,
-                    sessionKey: params.sessionKey,
-                  }),
-                  source: "bootstrap append-only",
-                  sessionFile: params.sessionFile,
-                });
-
-                let importedMessages = 0;
-                for (const message of replayFilteredMessages) {
-                  const ingestResult = await this.ingestSingle({
-                    sessionId: params.sessionId,
-                    sessionKey: params.sessionKey,
-                    message,
-                  });
-                  if (ingestResult.ingested) {
-                    importedMessages += 1;
-                  }
-                }
-
-                await persistBootstrapState(conversationId);
-                this.deps.log.debug(
-                  `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} replayFilteredMessages=${replayFilteredMessages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
-                );
-
-                if (importedMessages > 0) {
-                  return {
-                    bootstrapped: true,
-                    importedMessages,
-                    reason: "reconciled missing session messages",
-                  };
-                }
-
-                return {
-                  bootstrapped: false,
-                  importedMessages: 0,
-                  reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
-                };
-              }
-            }
-          }
-
-          // File-level cache guard: if the conversation is already bootstrapped
-          // and the JSONL file has not changed since the last successful full read,
-          // skip the expensive readLeafPathMessages entirely.
-          if (conversation.bootstrappedAt && existingCount > 0) {
-            const cached = this.lastFullReadFileState.get(conversationId);
-            if (
-              cached &&
-              cached.size === sessionFileSize &&
-              cached.mtimeMs === sessionFileMtimeMs
-            ) {
-              await persistBootstrapState(conversationId);
-              this.deps.log.debug(
-                `[lcm] bootstrap: skipped full read (file unchanged) conversation=${conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
-              );
-              return {
-                bootstrapped: false,
-                importedMessages: 0,
-                reason: "already bootstrapped",
-              };
-            }
-          }
-
-          const historicalMessages = await readLeafPathMessages(params.sessionFile);
-          this.deps.log.debug(
-            `[lcm] bootstrap: full transcript read conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} historicalMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-
-          // First-time import path: no LCM rows yet, so seed directly from the
-          // active leaf context snapshot.
-          if (existingCount === 0) {
-            const bootstrapMessages = trimBootstrapMessagesToBudget(
-              historicalMessages,
-              resolveBootstrapMaxTokens(this.config),
-            );
-
-            if (bootstrapMessages.length === 0) {
-              await this.conversationStore.markConversationBootstrapped(conversationId);
-              await persistBootstrapState(conversationId);
-              return {
-                bootstrapped: false,
-                importedMessages: 0,
-                reason: "no leaf-path messages in session",
-              };
-            }
-
-            let importedMessages = 0;
-            for (const message of bootstrapMessages) {
-              const result = await this.ingestSingle({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                message,
-                skipReplayTimestampFloodGuard: true,
-              });
-              if (result.ingested) {
-                importedMessages += 1;
-              }
-            }
-            await this.conversationStore.markConversationBootstrapped(conversationId);
-
-            // Prune HEARTBEAT_OK turns from the freshly imported data
-            let prunedMessages = 0;
-            if (this.config.pruneHeartbeatOk) {
-              const pruned = await this.pruneHeartbeatOkTurns(conversationId);
-              prunedMessages = pruned;
-              if (pruned > 0) {
-                this.deps.log.info(
-                  `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
-                );
-              }
-            }
-
-            const lastImportedHash =
-              prunedMessages === 0 && bootstrapMessages.length > 0
-                ? createBootstrapEntryHash(
-                    toStoredMessage(bootstrapMessages[bootstrapMessages.length - 1]),
-                  )
-                : undefined;
-            await persistBootstrapState(conversationId, lastImportedHash);
-            this.deps.log.debug(
-              `[lcm] bootstrap: initial import conversation=${conversationId} ${sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-            );
-
-            return {
-              bootstrapped: true,
-              importedMessages,
-            };
-          }
-
-          // Existing conversation path: reconcile crash gaps by appending JSONL
-          // messages that were never persisted to LCM.
-          const reconcile = await this.reconcileSessionTail({
+      async () => {
+        const conversation = await this.conversationStore.getOrCreateConversation(
+          params.sessionId,
+          { sessionKey: params.sessionKey },
+        );
+        for (const message of bootstrapMessages) {
+          const result = await this.ingestSingle({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
-            conversationId,
-            historicalMessages,
-            checkpointEntryHash:
-              transcriptEpochReason === "same-path-shrink"
-                ? undefined
-                : bootstrapState?.lastProcessedEntryHash,
-            skipContentAnchorScan: transcriptEpochReason === "same-path-shrink",
-            allowNoAnchorImport: transcriptEpochRotated,
-            noAnchorImportReason: transcriptEpochReason,
+            message,
+            skipReplayTimestampFloodGuard: true,
           });
-          this.deps.log.debug(
-            `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-
-          if (reconcile.blockedByImportCap) {
-            return {
-              bootstrapped: false,
-              importedMessages: 0,
-              reason:
-                reconcile.blockedReason === "cross-conversation-raw-id"
-                  ? "reconcile duplicate raw ids"
-                  : "reconcile import capped",
-            };
+          if (result.ingested) {
+            importedMessages += 1;
           }
-
-          if (!conversation.bootstrappedAt) {
-            await this.conversationStore.markConversationBootstrapped(conversationId);
-          }
-
-          if (reconcile.importedMessages > 0) {
-            await persistBootstrapState(conversationId);
-            return {
-              bootstrapped: true,
-              importedMessages: reconcile.importedMessages,
-              reason: "reconciled missing session messages",
-            };
-          }
-
-          if (reconcile.hasOverlap) {
-            await persistBootstrapState(conversationId);
-          }
-
-          if (conversation.bootstrappedAt) {
-            return {
-              bootstrapped: false,
-              importedMessages: 0,
-              reason: "already bootstrapped",
-            };
-          }
-
-          return {
-            bootstrapped: false,
-            importedMessages: 0,
-            reason: reconcile.hasOverlap
-              ? "conversation already up to date"
-              : "conversation already has messages",
-          };
-        }),
+        }
+        if (!conversation.bootstrappedAt) {
+          await this.conversationStore.markConversationBootstrapped(conversation.conversationId);
+        }
+      },
       { operationName: "bootstrap", context: sessionLabel },
     );
 
-    // Post-bootstrap pruning: clean HEARTBEAT_OK turns that were already
-    // in the DB from prior bootstrap cycles (before pruning was enabled).
-    if (this.config.pruneHeartbeatOk && result.bootstrapped === false) {
-      try {
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-        });
-        if (conversation) {
-          const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
-          if (pruned > 0) {
-            await this.refreshBootstrapState({
-              conversationId: conversation.conversationId,
-              sessionFile: params.sessionFile,
-            });
-            this.deps.log.info(
-              `[lcm] bootstrap: retroactively pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversation.conversationId}`,
-            );
-          }
-        }
-      } catch (err) {
-        this.deps.log.warn(
-          `[lcm] bootstrap: heartbeat pruning failed: ${describeLogError(err)}`,
-        );
-      }
-    }
-
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-    });
-    if (conversation) {
-      this.recordRecentBootstrapImport(
-        conversation.conversationId,
-        result.importedMessages,
-        result.reason ?? null,
-      );
-    }
-
-    this.deps.log.debug(
-      `[lcm] bootstrap: done ${sessionLabel} bootstrapped=${result.bootstrapped} importedMessages=${result.importedMessages} reason=${result.reason ?? "none"} duration=${formatDurationMs(Date.now() - startedAt)}`,
-    );
-    return result;
-  }
-
-  /**
-   * Remove messages from the batch that already exist in the DB for this session.
-   * Conservative replay detection: only strip a prefix when the incoming
-   * batch begins with the entire stored transcript for the session.
-   *
-   * Fixes two issues from #246:
-   * 1. Replaced hasMessage() fast-path with aligned-tail check — the old
-   *    approach false-positives on legitimate repeated first messages
-   * 2. Dedup now runs on newMessages only, before autoCompactionSummary
-   *    is prepended — synthetic summaries can no longer interfere with
-   *    replay detection
-   */
-  private async deduplicateAfterTurnBatch(
-    sessionId: string,
-    sessionKey: string | undefined,
-    batch: AgentMessage[],
-    options?: { oversizedNoOverlap?: "ingest" | "skip" },
-  ): Promise<AgentMessage[]> {
-    if (batch.length === 0) return batch;
-
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId,
-      sessionKey,
-    });
-    if (!conversation) return batch;
-
-    const conversationId = conversation.conversationId;
-    const storedMessageCount = await this.conversationStore.getMessageCount(conversationId);
-    if (storedMessageCount === 0) return batch;
-
-    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
-    if (!lastDbMessage) return batch;
-
-    const storedBatch = batch.map((m) => toStoredMessage(m));
-
-    // When the DB already has more messages than the incoming batch,
-    // the batch may be a tail-only replay. Try tail-matching first,
-    // then fall back to suffix-matching.
-    if (storedMessageCount > batch.length) {
-      return this.deduplicateOversizedBatch(
-        conversationId,
-        batch,
-        storedBatch,
-        storedMessageCount,
-        lastDbMessage,
-        options,
-      );
-    }
-
-    // Aligned-tail check: DB's last message must match the message at the
-    // exact replay boundary in the incoming batch. This replaces the
-    // hasMessage() check which could false-positive on any repeated content.
-    const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
-    if (
-      messageIdentity(lastDbMessage.role, lastDbMessage.content) !==
-      messageIdentity(batchAtBoundary.role, batchAtBoundary.content)
-    ) {
-      // Prefix mismatch — attempt suffix fallback before giving up.
-      return this.deduplicateSuffixFallback(
-        conversationId,
-        batch,
-        storedBatch,
-        storedMessageCount,
-        "prefix-mismatch",
-      );
-    }
-
-    // Full proof: incoming batch must start with the entire stored transcript
-    // in exact order before we trim anything.
-    const storedMessages = await this.conversationStore.getMessages(conversationId, {
-      limit: storedMessageCount,
-    });
-    if (storedMessages.length !== storedMessageCount) {
-      return batch;
-    }
-    for (let i = 0; i < storedMessageCount; i += 1) {
-      const storedConversationMessage = storedMessages[i]!;
-      const incomingMessage = storedBatch[i]!;
-      if (
-        messageIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
-        messageIdentity(incomingMessage.role, incomingMessage.content)
-      ) {
-        return batch;
-      }
-    }
-
-    return batch.slice(storedMessageCount);
-  }
-
-  /**
-   * Handle the case where the DB has more messages than the incoming batch.
-   * The batch is likely a tail-only replay after compaction — try to match
-   * the entire batch against the tail of stored messages.
-   */
-  private async deduplicateOversizedBatch(
-    conversationId: number,
-    batch: AgentMessage[],
-    storedBatch: ReturnType<typeof toStoredMessage>[],
-    storedMessageCount: number,
-    lastDbMessage: { role: string; content: string },
-    options?: { oversizedNoOverlap?: "ingest" | "skip" },
-  ): Promise<AgentMessage[]> {
-    const lastBatchIdentity = messageIdentity(
-      storedBatch[storedBatch.length - 1]!.role,
-      storedBatch[storedBatch.length - 1]!.content,
-    );
-    const lastDbIdentity = messageIdentity(lastDbMessage.role, lastDbMessage.content);
-
-    // Quick check: if the last DB message matches the last batch message,
-    // verify that the entire batch matches the actual DB tail. Message seq
-    // can have gaps after maintenance deletes, so do not derive seq from count.
-    if (lastDbIdentity === lastBatchIdentity) {
-      const storedMessages = await this.conversationStore.getMessages(conversationId, {
-        limit: storedMessageCount,
-      });
-      const tailMessages = storedMessages.slice(-batch.length);
-      if (tailMessages.length === batch.length) {
-        let tailMatch = true;
-        for (let i = 0; i < batch.length; i++) {
-          if (
-            messageIdentity(tailMessages[i]!.role, tailMessages[i]!.content) !==
-            messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
-          ) {
-            tailMatch = false;
-            break;
-          }
-        }
-        if (tailMatch) {
-          this.deps.log.debug(
-            `[lcm] dedup: tail-match detected, batch already fully stored ` +
-              `(storedCount=${storedMessageCount} batchLen=${batch.length}), skipping entire batch`,
-          );
-          return [];
-        }
-      }
-    }
-
-    // Fall back to suffix matching. If the DB is already longer than the
-    // incoming afterTurn batch and no suffix overlap exists, fail closed:
-    // importing the whole short batch as new would duplicate/pollute LCM with
-    // stale runtime tail snapshots. The transcript reconcile path runs before
-    // this and is responsible for importing genuine missing JSONL tail turns.
-    return this.deduplicateSuffixFallback(
-      conversationId,
-      batch,
-      storedBatch,
-      storedMessageCount,
-      "oversized",
-      { onNoOverlap: options?.oversizedNoOverlap ?? "skip" },
-    );
-  }
-
-  /**
-   * Suffix-matching fallback: scan the batch from the end looking for a
-   * boundary where the stored transcript's tail aligns with a suffix of the
-   * batch. Returns only the genuinely new messages after that boundary.
-   */
-  private async deduplicateSuffixFallback(
-    conversationId: number,
-    batch: AgentMessage[],
-    storedBatch: ReturnType<typeof toStoredMessage>[],
-    storedMessageCount: number,
-    context: string,
-    options?: { onNoOverlap?: "ingest" | "skip" },
-  ): Promise<AgentMessage[]> {
-    const allStored = await this.conversationStore.getMessages(conversationId, {
-      limit: storedMessageCount,
-    });
-    if (allStored.length === 0) return batch;
-
-    const lastStoredIdentity = messageIdentity(
-      allStored[allStored.length - 1]!.role,
-      allStored[allStored.length - 1]!.content,
-    );
-
-    for (let k = batch.length - 1; k >= 0; k--) {
-      if (
-        messageIdentity(storedBatch[k]!.role, storedBatch[k]!.content) !== lastStoredIdentity
-      ) {
-        continue;
-      }
-      const matchLen = Math.min(k + 1, allStored.length);
-      const startDb = allStored.length - matchLen;
-      let suffixMatch = true;
-      for (let j = 0; j < matchLen; j++) {
-        if (
-          messageIdentity(
-            allStored[startDb + j]!.role,
-            allStored[startDb + j]!.content,
-          ) !==
-          messageIdentity(
-            storedBatch[k - matchLen + 1 + j]!.role,
-            storedBatch[k - matchLen + 1 + j]!.content,
-          )
-        ) {
-          suffixMatch = false;
-          break;
-        }
-      }
-      const newSlice = batch.slice(k + 1);
-      if (suffixMatch && (newSlice.length > 0 || matchLen > 1)) {
-        this.deps.log.debug(
-          `[lcm] dedup: ${context} suffix-match at batch[${k}], ` +
-            `returning ${newSlice.length} new messages ` +
-            `(storedCount=${storedMessageCount} batchLen=${batch.length})`,
-        );
-        return newSlice;
-      }
-    }
-
-    if (options?.onNoOverlap === "skip") {
-      this.deps.log.warn(
-        `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
-          `no overlap found — fail-closed skipping full batch`,
-      );
-      return [];
-    }
-
-    this.deps.log.warn(
-      `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
-        `no overlap found — ingesting full batch`,
-    );
-    return batch;
-  }
-  /**
-   * Rebuild a compact tool-result message from stored message parts.
-   *
-   * The first transcript-GC pass only rewrites tool results that were already
-   * externalized into large_files during ingest, so the stored placeholder is
-   * the canonical replacement content.
-   */
-  private async buildTranscriptGcReplacementMessage(
-    messageId: number,
-  ): Promise<AgentMessage | null> {
-    const message = await this.conversationStore.getMessageById(messageId);
-    if (!message) {
-      return null;
-    }
-
-    const parts = await this.conversationStore.getMessageParts(messageId);
-    const toolCallId = pickToolCallId(parts);
-    if (!toolCallId) {
-      return null;
-    }
-
-    const content = contentFromParts(parts, "toolResult", message.content);
-    const toolName = pickToolName(parts) ?? "unknown";
-    const isError = pickToolIsError(parts);
-
     return {
-      role: "toolResult",
-      toolCallId,
-      toolName,
-      content,
-      ...(isError !== undefined ? { isError } : {}),
-    } as AgentMessage;
-  }
-
-  /**
-   * Run transcript GC for summarized tool-result messages that already have a
-   * large_files-backed placeholder stored in LCM.
-   */
-  async maintain(params: {
-    sessionId: string;
-    sessionFile: string;
-    sessionKey?: string;
-    runtimeContext?: ContextEngineMaintenanceRuntimeContext;
-  }): Promise<ContextEngineMaintenanceResult> {
-    const runRuntimeAutoRotate = async (): Promise<void> => {
-      await this.maybeAutoRotateManagedSessionFile({
-        phase: "runtime",
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-      });
+      bootstrapped: importedMessages > 0,
+      importedMessages,
+      reason: importedMessages > 0 ? "bootstrapped from runtime messages" : "conversation already up to date",
     };
-    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      await runRuntimeAutoRotate();
-      return {
-        changed: false,
-        bytesFreed: 0,
-        rewrittenEntries: 0,
-        reason: "session excluded by pattern",
-      };
-    }
-    if (this.isStatelessSession(params.sessionKey)) {
-      await runRuntimeAutoRotate();
-      return {
-        changed: false,
-        bytesFreed: 0,
-        rewrittenEntries: 0,
-        reason: "stateless session",
-      };
-    }
-    const startedAt = Date.now();
-    const sessionLabel = [
-      `session=${params.sessionId}`,
-      ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
-    ].join(" ");
-    const result = await this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () => {
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-        });
-        if (!conversation) {
-          return {
-            changed: false,
-            bytesFreed: 0,
-            rewrittenEntries: 0,
-            reason: "conversation not found",
-          };
-        }
-
-        let deferredCompactionResult: ContextEngineMaintenanceResult | null = null;
-        const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
-          conversation.conversationId,
-        );
-        if (params.runtimeContext?.allowDeferredCompactionExecution === true) {
-          const runtimeTokenBudget = (() => {
-            const tokenBudget = asRecord(params.runtimeContext)?.tokenBudget;
-            if (
-              typeof tokenBudget === "number"
-              && Number.isFinite(tokenBudget)
-              && tokenBudget > 0
-            ) {
-              return Math.floor(tokenBudget);
-            }
-            return 128_000;
-          })();
-          const cappedTokenBudget = this.applyAssemblyBudgetCap(runtimeTokenBudget);
-          const maintainCurrentTokenCount =
-            typeof params.runtimeContext?.currentTokenCount === "number"
-              ? Math.floor(params.runtimeContext.currentTokenCount as number)
-              : undefined;
-          if (maintenance?.pending || maintenance?.running) {
-            deferredCompactionResult = await this.consumeDeferredCompactionDebt({
-              conversationId: conversation.conversationId,
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              tokenBudget: cappedTokenBudget,
-              currentTokenCount: maintainCurrentTokenCount,
-              runtimeContext: params.runtimeContext,
-              legacyParams: asRecord(params.runtimeContext),
-            });
-          }
-        } else if (maintenance?.pending || maintenance?.running) {
-          this.deps.log.debug(
-            `[lcm] maintain: deferred compaction debt pending conversation=${conversation.conversationId} ${sessionLabel} but host runtimeContext.allowDeferredCompactionExecution is disabled`,
-          );
-        }
-
-        if (!this.config.transcriptGcEnabled) {
-          return (
-            deferredCompactionResult ?? {
-              changed: false,
-              bytesFreed: 0,
-              rewrittenEntries: 0,
-              reason: "transcript GC disabled",
-            }
-          );
-        }
-
-        if (typeof params.runtimeContext?.rewriteTranscriptEntries !== "function") {
-          return (
-            deferredCompactionResult ?? {
-              changed: false,
-              bytesFreed: 0,
-              rewrittenEntries: 0,
-              reason: "runtime rewrite helper unavailable",
-            }
-          );
-        }
-
-        const rewriteTranscriptEntries = params.runtimeContext.rewriteTranscriptEntries;
-        const candidates = await this.summaryStore.listTranscriptGcCandidates(
-          conversation.conversationId,
-          { limit: TRANSCRIPT_GC_BATCH_SIZE },
-        );
-        if (candidates.length === 0) {
-          this.deps.log.debug(
-            `[lcm] maintain: no transcript GC candidates conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-          return deferredCompactionResult ?? {
-            changed: false,
-            bytesFreed: 0,
-            rewrittenEntries: 0,
-            reason: "no transcript GC candidates",
-          };
-        }
-
-        const transcriptEntryIdsByCallId = listTranscriptToolResultEntryIdsByCallId(
-          params.sessionFile,
-        );
-        const replacements: TranscriptRewriteReplacement[] = [];
-        const seenEntryIds = new Set<string>();
-
-        for (const candidate of candidates) {
-          const entryId = transcriptEntryIdsByCallId.get(candidate.toolCallId);
-          if (!entryId || seenEntryIds.has(entryId)) {
-            continue;
-          }
-
-          const replacementMessage = await this.buildTranscriptGcReplacementMessage(
-            candidate.messageId,
-          );
-          if (!replacementMessage) {
-            continue;
-          }
-
-          seenEntryIds.add(entryId);
-          replacements.push({
-            entryId,
-            message: replacementMessage,
-          });
-        }
-
-        if (replacements.length === 0) {
-          this.deps.log.debug(
-            `[lcm] maintain: no matching transcript entries conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-          return deferredCompactionResult ?? {
-            changed: false,
-            bytesFreed: 0,
-            rewrittenEntries: 0,
-            reason: "no matching transcript entries",
-          };
-        }
-
-        const result = await rewriteTranscriptEntries({
-          replacements,
-        });
-
-        if (result.changed) {
-          try {
-            await this.refreshBootstrapState({
-              conversationId: conversation.conversationId,
-              sessionFile: params.sessionFile,
-            });
-          } catch (e) {
-            this.deps.log.warn(
-              `[lcm] Failed to update bootstrap checkpoint after maintain: ${describeLogError(e)}`,
-            );
-          }
-        }
-
-        const combinedResult = deferredCompactionResult
-          ? {
-              changed: deferredCompactionResult.changed || result.changed,
-              bytesFreed: result.bytesFreed,
-              rewrittenEntries: result.rewrittenEntries,
-              reason: result.reason ?? deferredCompactionResult.reason,
-            }
-          : result;
-
-        this.deps.log.debug(
-          `[lcm] maintain: done conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} replacements=${replacements.length} changed=${combinedResult.changed} rewrittenEntries=${combinedResult.rewrittenEntries} bytesFreed=${combinedResult.bytesFreed} duration=${formatDurationMs(Date.now() - startedAt)}`,
-        );
-        return combinedResult;
-      },
-      { operationName: "maintain", context: sessionLabel },
-    );
-    await runRuntimeAutoRotate();
-    return result;
   }
+
   private async ingestSingle(params: {
     sessionId: string;
     sessionKey?: string;
@@ -6665,14 +5078,8 @@ export class LcmContextEngine implements ContextEngine {
       return { ingested: false };
     }
 
-    // Skip assistant messages that failed with an error and have no useful content.
-    // These occur when an API call returns a 500 or similar transient error.
-    // Ingesting them pollutes the LCM database: on retry, the error messages
-    // accumulate and get assembled into context, creating a positive feedback
-    // loop where each retry sends an increasingly large (and malformed) payload
-    // that continues to fail.
+    const topLevel = message as unknown as Record<string, unknown>;
     if (message.role === "assistant") {
-      const topLevel = message as unknown as Record<string, unknown>;
       const stopReason =
         typeof topLevel.stopReason === "string"
           ? topLevel.stopReason
@@ -6693,13 +5100,10 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     let stored = toStoredMessage(message);
-
-    // Get or create conversation for this session
     const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
       sessionKey,
     });
     const conversationId = conversation.conversationId;
-
     let messageForParts = message;
 
     const nativeImageIntercepted = await this.interceptNativeImageBlocks({
@@ -6776,11 +5180,7 @@ export class LcmContextEngine implements ContextEngine {
       stored = rawPayloadIntercepted.stored;
     }
 
-    // Determine next sequence number
-    const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
-    const seq = maxSeq + 1;
-
-    // Persist the message
+    const seq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
     const msgRecord = await this.conversationStore.createMessage({
       conversationId,
       seq,
@@ -6797,8 +5197,6 @@ export class LcmContextEngine implements ContextEngine {
         fallbackContent: stored.content,
       }),
     );
-
-    // Append to context items so assembler can see it
     await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
 
     return { ingested: true };
@@ -6876,36 +5274,217 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  private async deduplicateAfterTurnBatch(
+    sessionId: string,
+    sessionKey: string | undefined,
+    batch: AgentMessage[],
+    options?: { oversizedNoOverlap?: "ingest" | "skip" },
+  ): Promise<AgentMessage[]> {
+    if (batch.length === 0) {
+      return batch;
+    }
+
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    if (!conversation) {
+      return batch;
+    }
+
+    const conversationId = conversation.conversationId;
+    const storedMessageCount = await this.conversationStore.getMessageCount(conversationId);
+    if (storedMessageCount === 0) {
+      return batch;
+    }
+
+    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
+    if (!lastDbMessage) {
+      return batch;
+    }
+
+    const storedBatch = batch.map((message) => toStoredMessage(message));
+    if (storedMessageCount > batch.length) {
+      return this.deduplicateOversizedBatch(
+        conversationId,
+        batch,
+        storedBatch,
+        storedMessageCount,
+        lastDbMessage,
+        options,
+      );
+    }
+
+    const batchAtBoundary = storedBatch[storedMessageCount - 1];
+    if (!batchAtBoundary) {
+      return batch;
+    }
+    if (
+      messageIdentity(lastDbMessage.role, lastDbMessage.content) !==
+      messageIdentity(batchAtBoundary.role, batchAtBoundary.content)
+    ) {
+      return this.deduplicateSuffixFallback(
+        conversationId,
+        batch,
+        storedBatch,
+        storedMessageCount,
+        "prefix-mismatch",
+      );
+    }
+
+    const storedMessages = await this.conversationStore.getMessages(conversationId, {
+      limit: storedMessageCount,
+    });
+    if (storedMessages.length !== storedMessageCount) {
+      return batch;
+    }
+    for (let i = 0; i < storedMessageCount; i += 1) {
+      const storedConversationMessage = storedMessages[i];
+      const incomingMessage = storedBatch[i];
+      if (
+        !storedConversationMessage ||
+        !incomingMessage ||
+        messageIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
+          messageIdentity(incomingMessage.role, incomingMessage.content)
+      ) {
+        return batch;
+      }
+    }
+
+    return batch.slice(storedMessageCount);
+  }
+
+  private async deduplicateOversizedBatch(
+    conversationId: number,
+    batch: AgentMessage[],
+    storedBatch: ReturnType<typeof toStoredMessage>[],
+    storedMessageCount: number,
+    lastDbMessage: { role: string; content: string },
+    options?: { oversizedNoOverlap?: "ingest" | "skip" },
+  ): Promise<AgentMessage[]> {
+    const lastStoredBatch = storedBatch[storedBatch.length - 1];
+    if (!lastStoredBatch) {
+      return batch;
+    }
+    const lastBatchIdentity = messageIdentity(lastStoredBatch.role, lastStoredBatch.content);
+    const lastDbIdentity = messageIdentity(lastDbMessage.role, lastDbMessage.content);
+
+    if (lastDbIdentity === lastBatchIdentity) {
+      const storedMessages = await this.conversationStore.getMessages(conversationId, {
+        limit: storedMessageCount,
+      });
+      const tailMessages = storedMessages.slice(-batch.length);
+      if (tailMessages.length === batch.length) {
+        let tailMatch = true;
+        for (let i = 0; i < batch.length; i += 1) {
+          if (
+            messageIdentity(tailMessages[i]!.role, tailMessages[i]!.content) !==
+            messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
+          ) {
+            tailMatch = false;
+            break;
+          }
+        }
+        if (tailMatch) {
+          this.deps.log.debug(
+            `[lcm] dedup: tail-match detected, batch already fully stored ` +
+              `(storedCount=${storedMessageCount} batchLen=${batch.length}), skipping entire batch`,
+          );
+          return [];
+        }
+      }
+    }
+
+    return this.deduplicateSuffixFallback(
+      conversationId,
+      batch,
+      storedBatch,
+      storedMessageCount,
+      "oversized",
+      { onNoOverlap: options?.oversizedNoOverlap ?? "skip" },
+    );
+  }
+
+  private async deduplicateSuffixFallback(
+    conversationId: number,
+    batch: AgentMessage[],
+    storedBatch: ReturnType<typeof toStoredMessage>[],
+    storedMessageCount: number,
+    context: string,
+    options?: { onNoOverlap?: "ingest" | "skip" },
+  ): Promise<AgentMessage[]> {
+    const allStored = await this.conversationStore.getMessages(conversationId, {
+      limit: storedMessageCount,
+    });
+    if (allStored.length === 0) {
+      return batch;
+    }
+
+    const lastStoredIdentity = messageIdentity(
+      allStored[allStored.length - 1]!.role,
+      allStored[allStored.length - 1]!.content,
+    );
+
+    for (let k = batch.length - 1; k >= 0; k -= 1) {
+      if (messageIdentity(storedBatch[k]!.role, storedBatch[k]!.content) !== lastStoredIdentity) {
+        continue;
+      }
+      const matchLen = Math.min(k + 1, allStored.length);
+      const startDb = allStored.length - matchLen;
+      let suffixMatch = true;
+      for (let j = 0; j < matchLen; j += 1) {
+        if (
+          messageIdentity(allStored[startDb + j]!.role, allStored[startDb + j]!.content) !==
+          messageIdentity(storedBatch[k - matchLen + 1 + j]!.role, storedBatch[k - matchLen + 1 + j]!.content)
+        ) {
+          suffixMatch = false;
+          break;
+        }
+      }
+      const newSlice = batch.slice(k + 1);
+      if (suffixMatch && (newSlice.length > 0 || matchLen > 1)) {
+        this.deps.log.debug(
+          `[lcm] dedup: ${context} suffix-match at batch[${k}], ` +
+            `returning ${newSlice.length} new messages ` +
+            `(storedCount=${storedMessageCount} batchLen=${batch.length})`,
+        );
+        return newSlice;
+      }
+    }
+
+    if (options?.onNoOverlap === "skip") {
+      this.deps.log.warn(
+        `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
+          `no overlap found — fail-closed skipping full batch`,
+      );
+      return [];
+    }
+
+    this.deps.log.warn(
+      `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
+        `no overlap found — ingesting full batch`,
+    );
+    return batch;
+  }
+
   async afterTurn(params: {
     sessionId: string;
     sessionKey?: string;
-    sessionFile: string;
     messages: AgentMessage[];
     prePromptMessageCount: number;
     autoCompactionSummary?: string;
     isHeartbeat?: boolean;
     tokenBudget?: number;
-    /** OpenClaw runtime param name (preferred). */
-    runtimeContext?: Record<string, unknown>;
-    /** Back-compat param name. */
+    runtimeContext?: ContextEngineRuntimeContext;
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
-    const runRuntimeAutoRotate = async (): Promise<void> => {
-      await this.maybeAutoRotateManagedSessionFile({
-        phase: "runtime",
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-      });
-    };
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      await runRuntimeAutoRotate();
       return;
     }
     if (this.isStatelessSession(params.sessionKey)) {
-      await runRuntimeAutoRotate();
       return;
     }
+
     this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = [
@@ -6913,58 +5492,21 @@ export class LcmContextEngine implements ContextEngine {
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
 
-    // Dedup guard: prevent duplicate ingestion when gateway restart replays
-    // full history. Run on newMessages BEFORE prepending autoCompactionSummary
-    // so synthetic summaries cannot interfere with replay detection.
     const newMessages = filterPersistableMessages(
       params.messages.slice(params.prePromptMessageCount),
     );
-    let transcriptReconcileResult: TranscriptReconcileResult = {
-      importedMessages: 0,
-      blockedByImportCap: false,
-      hasOverlap: true,
-    };
-    try {
-      transcriptReconcileResult = await this.reconcileTranscriptTailForAfterTurn({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-      });
-    } catch (err) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
-      );
-    }
-    const transcriptReconcileUnsafeToAdvance =
-      transcriptReconcileResult.blockedByImportCap ||
-      (!transcriptReconcileResult.hasOverlap && transcriptReconcileResult.importedMessages === 0);
-    let dedupedNewMessages: AgentMessage[] = [];
-    if (transcriptReconcileUnsafeToAdvance) {
-      if (newMessages.length > 0 || params.autoCompactionSummary) {
-        this.deps.log.warn(
-          `[lcm] afterTurn: transcript reconcile did not cover the transcript frontier; skipping afterTurn persistence to avoid creating a future anchor past unreconciled transcript history ${sessionLabel}`,
-        );
-      }
-    } else {
-      dedupedNewMessages = await this.deduplicateAfterTurnBatch(
-        params.sessionId,
-        params.sessionKey,
-        newMessages,
-        {
-          oversizedNoOverlap: transcriptReconcileResult.importedMessages > 0 ? "ingest" : "skip",
-        },
-      );
-    }
+    const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
+      params.sessionId,
+      params.sessionKey,
+      newMessages,
+      { oversizedNoOverlap: "ingest" },
+    );
+
     const summaryCoveredMessages: AgentMessage[] = [];
     const summaryDedupedNewMessages: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
       for (const message of dedupedNewMessages) {
-        if (
-          messageContentCoveredBySummary({
-            message,
-            summary: params.autoCompactionSummary,
-          })
-        ) {
+        if (messageContentCoveredBySummary({ message, summary: params.autoCompactionSummary })) {
           summaryCoveredMessages.push(message);
         } else {
           summaryDedupedNewMessages.push(message);
@@ -6980,24 +5522,14 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const ingestBatch: AgentMessage[] = [];
-    if (!transcriptReconcileUnsafeToAdvance && params.autoCompactionSummary) {
-      ingestBatch.push({
-        role: "user",
-        content: params.autoCompactionSummary,
-      } as AgentMessage);
+    if (params.autoCompactionSummary) {
+      ingestBatch.push({ role: "user", content: params.autoCompactionSummary } as AgentMessage);
     }
-
     ingestBatch.push(...summaryDedupedNewMessages);
+
     if (ingestBatch.length === 0) {
-      // Nothing to ingest in *this* afterTurn call — but the conversation may
-      // still be over threshold from prior turns, especially when the host
-      // path (e.g. afterTurnTranscriptReconcile, or external `engine.ingest`
-      // calls during the turn) already imported the new messages before
-      // afterTurn's dedup ran. Log and fall through to compaction evaluation
-      // rather than early-returning, otherwise compaction would never fire
-      // once dedup begins consistently swallowing new turn deltas.
       this.deps.log.debug(
-        `[lcm] afterTurn: nothing to ingest ${sessionLabel} newMessages=${newMessages.length} (continuing to compaction evaluation; transcript reconcile may have already ingested) duration=${formatDurationMs(Date.now() - startedAt)}`,
+        `[lcm] afterTurn: nothing to ingest ${sessionLabel} newMessages=${newMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
     } else {
       try {
@@ -7008,22 +5540,9 @@ export class LcmContextEngine implements ContextEngine {
           isHeartbeat: params.isHeartbeat === true,
         });
       } catch (err) {
-        // Never compact a stale or partially ingested frontier.
         this.deps.log.error(
           `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(err)}`,
         );
-        this.logAutoRotateSessionFileDecision({
-          phase: "runtime",
-          action: "skip",
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          sessionFile: params.sessionFile,
-          thresholdBytes: this.config.autoRotateSessionFiles.sizeBytes,
-          durationMs: 0,
-          reason: "ingest-failed",
-          error: describeLogError(err),
-          level: "warn",
-        });
         return;
       }
     }
@@ -7042,27 +5561,14 @@ export class LcmContextEngine implements ContextEngine {
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
             });
-            try {
-              await this.refreshBootstrapState({
-                conversationId: conversation.conversationId,
-                sessionFile: params.sessionFile,
-              });
-            } catch (err) {
-              this.deps.log.warn(
-                `[lcm] afterTurn: heartbeat pruning checkpoint refresh failed for ${sessionContext}: ${describeLogError(err)}`,
-              );
-            }
             this.deps.log.info(
               `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
             );
-            await runRuntimeAutoRotate();
             return;
           }
         }
       } catch (err) {
-        this.deps.log.warn(
-          `[lcm] afterTurn: heartbeat pruning failed: ${describeLogError(err)}`,
-        );
+        this.deps.log.warn(`[lcm] afterTurn: heartbeat pruning failed: ${describeLogError(err)}`);
       }
     }
 
@@ -7083,19 +5589,15 @@ export class LcmContextEngine implements ContextEngine {
     const estimatedContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
     const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
     const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
-      (
-        (legacyParams ?? {}) as {
-          currentTokenCount?: unknown;
-        }
-      ).currentTokenCount,
+      ((legacyParams ?? {}) as { currentTokenCount?: unknown }).currentTokenCount,
     );
-    const observedCurrentTokenCount =
-      runtimePromptTokens ?? suppliedCurrentTokenCount ?? estimatedContextTokens;
+    const observedCurrentTokenCount = runtimePromptTokens ?? suppliedCurrentTokenCount ?? estimatedContextTokens;
     if (runtimePromptTokens !== undefined) {
       this.deps.log.debug(
         `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens} estimatedTokenCount=${estimatedContextTokens}`,
       );
     }
+
     const conversation = await this.conversationStore.getConversationForSession({
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
@@ -7104,21 +5606,9 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.debug(
         `[lcm] afterTurn: conversation lookup missed ${sessionLabel} ingestBatch=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
-      await runRuntimeAutoRotate();
       return;
     }
-    const refreshAfterTurnBootstrapState = async (): Promise<void> => {
-      try {
-        await this.refreshBootstrapState({
-          conversationId: conversation.conversationId,
-          sessionFile: params.sessionFile,
-        });
-      } catch (err) {
-        this.deps.log.warn(
-          `[lcm] afterTurn: bootstrap checkpoint refresh failed for ${sessionLabel}: ${describeLogError(err)}`,
-        );
-      }
-    };
+
     const recordAfterTurnCompactionRetry = async (reason: string): Promise<void> => {
       try {
         await this.recordDeferredCompactionDebt({
@@ -7133,17 +5623,8 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
     };
-    let shouldRefreshBootstrapState =
-      !transcriptReconcileResult.blockedByImportCap &&
-      (transcriptReconcileResult.hasOverlap || transcriptReconcileResult.importedMessages > 0);
-    let deferredCompactionDrain:
-      | {
-          reason: string;
-          tokenBudget: number;
-          currentTokenCount: number;
-        }
-      | null = null;
 
+    let deferredCompactionDrain: { reason: string; tokenBudget: number; currentTokenCount: number } | null = null;
     try {
       await this.updateCompactionTelemetry({
         conversationId: conversation.conversationId,
@@ -7151,9 +5632,7 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget,
       });
     } catch (err) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: compaction telemetry update failed: ${describeLogError(err)}`,
-      );
+      this.deps.log.warn(`[lcm] afterTurn: compaction telemetry update failed: ${describeLogError(err)}`);
     }
 
     try {
@@ -7167,14 +5646,13 @@ export class LcmContextEngine implements ContextEngine {
           const compactResult = await this.compact({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
-            sessionFile: params.sessionFile,
             tokenBudget,
             currentTokenCount: observedCurrentTokenCount,
             compactionTarget: "threshold",
+            runtimeContext: params.runtimeContext,
             legacyParams,
           });
           if (!compactResult.ok) {
-            shouldRefreshBootstrapState = false;
             await recordAfterTurnCompactionRetry("threshold");
           }
         }
@@ -7185,20 +5663,12 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
         });
-        deferredCompactionDrain = {
-          tokenBudget,
-          currentTokenCount: observedCurrentTokenCount,
-          reason: "threshold",
-        };
+        deferredCompactionDrain = { tokenBudget, currentTokenCount: observedCurrentTokenCount, reason: "threshold" };
       }
     } catch (err) {
       this.deps.log.warn(
         `[lcm] afterTurn: compaction policy check failed for ${sessionLabel}: ${describeLogError(err)}`,
       );
-    }
-
-    if (shouldRefreshBootstrapState) {
-      await refreshAfterTurnBootstrapState();
     }
 
     if (deferredCompactionDrain) {
@@ -7215,7 +5685,100 @@ export class LcmContextEngine implements ContextEngine {
     this.deps.log.debug(
       `[lcm] afterTurn: done conversation=${conversation.conversationId} ${sessionLabel} newMessages=${newMessages.length} dedupedMessages=${dedupedNewMessages.length} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
     );
-    await runRuntimeAutoRotate();
+  }
+
+  async maintain(params: {
+    sessionId: string;
+    sessionKey?: string;
+    runtimeContext?: ContextEngineMaintenanceRuntimeContext;
+  }): Promise<ContextEngineMaintenanceResult> {
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "session excluded by pattern",
+      };
+    }
+    if (this.isStatelessSession(params.sessionKey)) {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "stateless session",
+      };
+    }
+
+    const sessionLabel = [
+      `session=${params.sessionId}`,
+      ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
+    ].join(" ");
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () => {
+        const conversation = await this.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+        if (!conversation) {
+          return {
+            changed: false,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: "conversation not found",
+          };
+        }
+
+        const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+          conversation.conversationId,
+        );
+        if (params.runtimeContext?.allowDeferredCompactionExecution !== true) {
+          if (maintenance?.pending || maintenance?.running) {
+            this.deps.log.debug(
+              `[lcm] maintain: deferred compaction debt pending conversation=${conversation.conversationId} ${sessionLabel} but host runtimeContext.allowDeferredCompactionExecution is disabled`,
+            );
+          }
+          return {
+            changed: false,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: "no maintenance work",
+          };
+        }
+
+        const runtimeTokenBudget = (() => {
+          const tokenBudget = asRecord(params.runtimeContext)?.tokenBudget;
+          if (typeof tokenBudget === "number" && Number.isFinite(tokenBudget) && tokenBudget > 0) {
+            return Math.floor(tokenBudget);
+          }
+          return 128_000;
+        })();
+        const cappedTokenBudget = this.applyAssemblyBudgetCap(runtimeTokenBudget);
+        const maintainCurrentTokenCount =
+          typeof params.runtimeContext?.currentTokenCount === "number"
+            ? Math.floor(params.runtimeContext.currentTokenCount as number)
+            : undefined;
+        if (maintenance?.pending || maintenance?.running) {
+          return this.consumeDeferredCompactionDebt({
+            conversationId: conversation.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            tokenBudget: cappedTokenBudget,
+            currentTokenCount: maintainCurrentTokenCount,
+            runtimeContext: params.runtimeContext,
+            legacyParams: asRecord(params.runtimeContext),
+          });
+        }
+
+        return {
+          changed: false,
+          bytesFreed: 0,
+          rewrittenEntries: 0,
+          reason: "no maintenance work",
+        };
+      },
+      { operationName: "maintain", context: sessionLabel },
+    );
   }
 
   async assemble(params: {
@@ -7462,13 +6025,12 @@ export class LcmContextEngine implements ContextEngine {
   async compact(params: {
     sessionId: string;
     sessionKey?: string;
-    sessionFile: string;
     tokenBudget?: number;
     currentTokenCount?: number;
     compactionTarget?: "budget" | "threshold";
     customInstructions?: string;
     /** OpenClaw runtime param name (preferred). */
-    runtimeContext?: Record<string, unknown>;
+    runtimeContext?: ContextEngineRuntimeContext | Record<string, unknown>;
     /** Back-compat param name. */
     legacyParams?: Record<string, unknown>;
     /** Force compaction even if below threshold */
@@ -7793,1081 +6355,6 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
-  /** Return the configured auto-rotation mode for the current phase. */
-  private getAutoRotateSessionFileMode(
-    phase: AutoRotateSessionFilePhase,
-  ): "rotate" | "warn" | "off" {
-    return phase === "startup"
-      ? this.config.autoRotateSessionFiles.startup
-      : this.config.autoRotateSessionFiles.runtime;
-  }
-
-  /** Emit one structured, grep-friendly auto-rotation log line. */
-  private logAutoRotateSessionFileDecision(params: {
-    level?: "info" | "warn" | "error";
-    phase: AutoRotateSessionFilePhase;
-    action: AutoRotateSessionFileAction;
-    sessionId?: string;
-    sessionKey?: string;
-    conversationId?: number;
-    sessionFile?: string;
-    sizeBytes?: number;
-    thresholdBytes?: number;
-    durationMs: number;
-    backupPath?: string;
-    bytesRemoved?: number;
-    preservedTailMessageCount?: number;
-    checkpointSize?: number;
-    currentMessageCount?: number;
-    scanned?: number;
-    eligible?: number;
-    rotated?: number;
-    warned?: number;
-    skipped?: number;
-    backupCreated?: number;
-    reason?: string;
-    error?: string;
-  }): void {
-    const fields: Array<[string, string | number | undefined]> = [
-      ["phase", params.phase],
-      ["action", params.action],
-      ["sessionId", params.sessionId],
-      ["sessionKey", params.sessionKey],
-      ["conversationId", params.conversationId],
-      ["sessionFile", params.sessionFile],
-      ["sizeBytes", params.sizeBytes],
-      ["thresholdBytes", params.thresholdBytes],
-      ["durationMs", params.durationMs],
-      ["backupPath", params.backupPath],
-      ["bytesRemoved", params.bytesRemoved],
-      ["preservedTailMessageCount", params.preservedTailMessageCount],
-      ["checkpointSize", params.checkpointSize],
-      ["currentMessageCount", params.currentMessageCount],
-      ["scanned", params.scanned],
-      ["eligible", params.eligible],
-      ["rotated", params.rotated],
-      ["warned", params.warned],
-      ["skipped", params.skipped],
-      ["backupCreated", params.backupCreated],
-      ["reason", params.reason],
-      ["error", params.error],
-    ];
-    const rendered = fields
-      .filter((entry): entry is [string, string | number] => entry[1] !== undefined)
-      .map(([key, value]) => `${key}=${String(value).replace(/\s+/g, "_")}`)
-      .join(" ");
-    const level = params.level ?? "info";
-    this.deps.log[level](`[lcm] auto-rotate: ${rendered}`);
-  }
-
-  /** Check one LCM-managed transcript and rotate it when policy allows. */
-  private async maybeAutoRotateManagedSessionFile(params: {
-    phase: AutoRotateSessionFilePhase;
-    sessionId?: string;
-    sessionKey?: string;
-    sessionFile?: string;
-    conversationId?: number;
-  }): Promise<void> {
-    const startedAt = Date.now();
-    const thresholdBytes = this.config.autoRotateSessionFiles.sizeBytes;
-    const sessionId = params.sessionId?.trim();
-    const sessionKey = params.sessionKey?.trim();
-    const sessionFile = params.sessionFile?.trim();
-    const baseLog = {
-      phase: params.phase,
-      sessionId,
-      sessionKey,
-      conversationId: params.conversationId,
-      sessionFile,
-      thresholdBytes,
-    };
-
-    const skip = (reason: string, sizeBytes?: number): void => {
-      this.logAutoRotateSessionFileDecision({
-        ...baseLog,
-        action: "skip",
-        sizeBytes,
-        durationMs: Date.now() - startedAt,
-        reason,
-      });
-    };
-
-    // Cheap guards first: these must not stat or mutate transcripts for
-    // sessions that LCM does not actively and durably own.
-    if (!this.config.autoRotateSessionFiles.enabled) {
-      skip("disabled");
-      return;
-    }
-    const mode = this.getAutoRotateSessionFileMode(params.phase);
-    if (mode === "off") {
-      skip("mode-off");
-      return;
-    }
-    if (!this.info.ownsCompaction) {
-      skip("engine-unhealthy");
-      return;
-    }
-    if (!sessionId || !sessionKey) {
-      skip("missing-session-identity");
-      return;
-    }
-    if (!sessionFile) {
-      skip("missing-session-file");
-      return;
-    }
-    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
-      skip("session-excluded");
-      return;
-    }
-    if (this.isStatelessSession(sessionKey)) {
-      skip("stateless-session");
-      return;
-    }
-
-    // The file stat is the only runtime hot-path filesystem work before we
-    // know a rotation is needed.
-    let sizeBytes: number;
-    try {
-      sizeBytes = (await stat(sessionFile)).size;
-    } catch (error) {
-      this.logAutoRotateSessionFileDecision({
-        ...baseLog,
-        action: "warn",
-        durationMs: Date.now() - startedAt,
-        reason: "session-file-stat-failed",
-        error: describeLogError(error),
-        level: "warn",
-      });
-      return;
-    }
-
-    if (sizeBytes <= thresholdBytes) {
-      this.oversizedAutoRotateCheckpointByQueueKey.delete(
-        this.resolveSessionQueueKey(sessionId, sessionKey),
-      );
-      skip("below-threshold", sizeBytes);
-      return;
-    }
-
-    // Reconfirm active LCM ownership after the size check. Startup scans pass a
-    // conversation id; runtime checks resolve the current session identity.
-    let conversation: ConversationRecord | null;
-    try {
-      conversation = params.conversationId !== undefined
-        ? await this.conversationStore.getConversation(params.conversationId)
-        : await this.conversationStore.getConversationForSession({ sessionId, sessionKey });
-    } catch (error) {
-      this.logAutoRotateSessionFileDecision({
-        ...baseLog,
-        action: "warn",
-        sizeBytes,
-        durationMs: Date.now() - startedAt,
-        reason: "conversation-lookup-failed",
-        error: describeLogError(error),
-        level: "warn",
-      });
-      return;
-    }
-    if (!conversation?.active) {
-      skip("no-active-conversation", sizeBytes);
-      return;
-    }
-
-    // If one rotate could not shrink below the threshold, wait for at least one
-    // threshold worth of new growth before trying again. This avoids a turn-by-
-    // turn loop when the preserved tail is itself larger than the configured cap.
-    const queueKey = this.resolveSessionQueueKey(sessionId, sessionKey);
-    const previousOversizedCheckpoint = this.oversizedAutoRotateCheckpointByQueueKey.get(queueKey);
-    if (
-      previousOversizedCheckpoint !== undefined &&
-      sizeBytes < previousOversizedCheckpoint + thresholdBytes
-    ) {
-      skip("previous-rotate-left-file-over-threshold", sizeBytes);
-      return;
-    }
-
-    // Warn mode is operational telemetry only: it proves the policy would have
-    // fired without touching the live transcript.
-    if (mode === "warn") {
-      this.logAutoRotateSessionFileDecision({
-        ...baseLog,
-        action: "warn",
-        conversationId: conversation.conversationId,
-        sizeBytes,
-        durationMs: Date.now() - startedAt,
-        reason: "above-threshold",
-        level: "warn",
-      });
-      return;
-    }
-
-    let result: RotateSessionStorageResult | RotateSessionStorageWithBackupResult;
-    try {
-      result = this.config.autoRotateSessionFiles.createBackups
-        ? await this.rotateSessionStorageWithBackup({
-            sessionId,
-            sessionKey,
-            sessionFile,
-            lockTimeoutMs: AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS,
-          })
-        : await this.rotateSessionStorage({
-            sessionId,
-            sessionKey,
-            sessionFile,
-          });
-    } catch (error) {
-      this.logAutoRotateSessionFileDecision({
-        ...baseLog,
-        action: "warn",
-        conversationId: conversation.conversationId,
-        sizeBytes,
-        durationMs: Date.now() - startedAt,
-        reason: "rotate-threw",
-        error: describeLogError(error),
-        level: "warn",
-      });
-      return;
-    }
-
-    if (result.kind === "rotated") {
-      if (result.checkpointSize >= thresholdBytes) {
-        this.oversizedAutoRotateCheckpointByQueueKey.set(queueKey, result.checkpointSize);
-      } else {
-        this.oversizedAutoRotateCheckpointByQueueKey.delete(queueKey);
-      }
-      const conversationId = "currentConversationId" in result
-        ? result.currentConversationId
-        : result.conversationId;
-      this.logAutoRotateSessionFileDecision({
-        ...baseLog,
-        action: "rotate",
-        conversationId,
-        sizeBytes,
-        durationMs: Date.now() - startedAt,
-        backupPath: "backupPath" in result ? result.backupPath : undefined,
-        bytesRemoved: result.bytesRemoved,
-        preservedTailMessageCount: result.preservedTailMessageCount,
-        checkpointSize: result.checkpointSize,
-        currentMessageCount: "currentMessageCount" in result ? result.currentMessageCount : undefined,
-      });
-      return;
-    }
-
-    this.logAutoRotateSessionFileDecision({
-      ...baseLog,
-      action: "warn",
-      conversationId: "currentConversationId" in result
-        ? result.currentConversationId ?? conversation.conversationId
-        : conversation.conversationId,
-      sizeBytes,
-      durationMs: Date.now() - startedAt,
-      backupPath: "backupPath" in result ? result.backupPath : undefined,
-      currentMessageCount: "currentMessageCount" in result ? result.currentMessageCount : undefined,
-      reason: result.kind,
-      error: result.reason,
-      level: "warn",
-    });
-  }
-
-  /** Emit the compact startup auto-rotate summary line. */
-  private logStartupAutoRotateSummary(params: {
-    startedAt: number;
-    thresholdBytes: number;
-    scanned: number;
-    eligible: number;
-    rotated: number;
-    warned: number;
-    skipped: number;
-    bytesRemoved: number;
-    backupPath?: string;
-    backupCreated?: number;
-    reason?: string;
-  }): void {
-    this.logAutoRotateSessionFileDecision({
-      phase: "startup",
-      action: "summary",
-      thresholdBytes: params.thresholdBytes,
-      durationMs: Date.now() - params.startedAt,
-      scanned: params.scanned,
-      eligible: params.eligible,
-      rotated: params.rotated,
-      warned: params.warned,
-      skipped: params.skipped,
-      backupPath: params.backupPath,
-      bytesRemoved: params.bytesRemoved,
-      backupCreated: params.backupCreated,
-      reason: params.reason,
-    });
-  }
-
-  /** Quietly intersect one indexed startup candidate with active LCM ownership. */
-  private async prepareStartupAutoRotateCandidate(params: {
-    candidate: StartupSessionFileCandidate;
-    startedAt: number;
-    thresholdBytes: number;
-  }): Promise<
-    | { kind: "eligible"; candidate: StartupAutoRotateCandidate }
-    | { kind: "skipped" }
-    | { kind: "warned" }
-  > {
-    const sessionId = params.candidate.sessionId?.trim();
-    const sessionKey = params.candidate.sessionKey?.trim();
-    const sessionFile = params.candidate.sessionFile?.trim();
-    if (!sessionId || !sessionKey || !sessionFile) {
-      return { kind: "skipped" };
-    }
-    if (this.shouldIgnoreSession({ sessionId, sessionKey }) || this.isStatelessSession(sessionKey)) {
-      return { kind: "skipped" };
-    }
-
-    let conversation: ConversationRecord | null;
-    try {
-      conversation = await this.conversationStore.getConversationForSession({ sessionId, sessionKey });
-    } catch (error) {
-      this.logAutoRotateSessionFileDecision({
-        phase: "startup",
-        action: "warn",
-        sessionId,
-        sessionKey,
-        sessionFile,
-        thresholdBytes: params.thresholdBytes,
-        durationMs: Date.now() - params.startedAt,
-        reason: "conversation-lookup-failed",
-        error: describeLogError(error),
-        level: "warn",
-      });
-      return { kind: "warned" };
-    }
-    if (!conversation?.active) {
-      return { kind: "skipped" };
-    }
-
-    const bootstrapState = await this.summaryStore.getConversationBootstrapState(
-      conversation.conversationId,
-    );
-    const bootstrapPath = bootstrapState?.sessionFilePath?.trim();
-    if (
-      !bootstrapPath ||
-      normalizeSessionFilePathForComparison(bootstrapPath) !==
-        normalizeSessionFilePathForComparison(sessionFile)
-    ) {
-      return { kind: "skipped" };
-    }
-
-    let sizeBytes: number;
-    try {
-      sizeBytes = (await stat(sessionFile)).size;
-    } catch (error) {
-      if (isMissingFileError(error)) {
-        return { kind: "skipped" };
-      }
-      this.logAutoRotateSessionFileDecision({
-        phase: "startup",
-        action: "warn",
-        sessionId,
-        sessionKey,
-        conversationId: conversation.conversationId,
-        sessionFile,
-        thresholdBytes: params.thresholdBytes,
-        durationMs: Date.now() - params.startedAt,
-        reason: "session-file-stat-failed",
-        error: describeLogError(error),
-        level: "warn",
-      });
-      return { kind: "warned" };
-    }
-    if (sizeBytes <= params.thresholdBytes) {
-      this.oversizedAutoRotateCheckpointByQueueKey.delete(
-        this.resolveSessionQueueKey(sessionId, sessionKey),
-      );
-      return { kind: "skipped" };
-    }
-
-    return {
-      kind: "eligible",
-      candidate: {
-        sessionId,
-        sessionKey,
-        sessionFile,
-        conversationId: conversation.conversationId,
-        sizeBytes,
-        currentMessageCount: await this.conversationStore.getMessageCount(conversation.conversationId),
-      },
-    };
-  }
-
-  /** Enter all affected session queues before taking the startup batch DB backup. */
-  private async withStartupAutoRotateSessionQueues<T>(
-    candidates: StartupAutoRotateCandidate[],
-    operation: () => Promise<T>,
-  ): Promise<T> {
-    const queueKeys = Array.from(
-      new Set(candidates.map((candidate) => this.resolveSessionQueueKey(candidate.sessionId, candidate.sessionKey))),
-    ).sort();
-    const enter = async (index: number): Promise<T> => {
-      if (index >= queueKeys.length) {
-        return operation();
-      }
-      return this.withSessionQueue(queueKeys[index]!, () => enter(index + 1));
-    };
-    return enter(0);
-  }
-
-  /** Rotate startup candidates with one pre-mutation LCM database backup. */
-  private async rotateStartupAutoRotateBatch(params: {
-    candidates: StartupAutoRotateCandidate[];
-    startedAt: number;
-    thresholdBytes: number;
-  }): Promise<StartupAutoRotateBatchResult> {
-    const empty = (): StartupAutoRotateBatchResult => ({
-      rotated: 0,
-      warned: 0,
-      bytesRemoved: 0,
-      backupCreated: 0,
-    });
-    if (params.candidates.length === 0) {
-      return empty();
-    }
-
-    try {
-      return await this.withStartupAutoRotateSessionQueues(params.candidates, async () =>
-        withExclusiveDatabaseLock(
-          this.db,
-          { timeoutMs: AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS },
-          async () => {
-            if (this.db.isTransaction) {
-              this.logAutoRotateSessionFileDecision({
-                phase: "startup",
-                action: "warn",
-                thresholdBytes: params.thresholdBytes,
-                durationMs: Date.now() - params.startedAt,
-                reason: "database-transaction-active",
-                level: "warn",
-              });
-              return { ...empty(), warned: 1 };
-            }
-
-            let backupPath: string | undefined;
-            let backupCreated = 0;
-            if (this.config.autoRotateSessionFiles.createBackups) {
-              try {
-                backupPath = createLcmDatabaseBackup(this.db, {
-                  databasePath: this.config.databasePath,
-                  label: "rotate",
-                  replaceLatest: true,
-                }) ?? undefined;
-              } catch (error) {
-                this.logAutoRotateSessionFileDecision({
-                  phase: "startup",
-                  action: "warn",
-                  thresholdBytes: params.thresholdBytes,
-                  durationMs: Date.now() - params.startedAt,
-                  reason: "backup-failed",
-                  error: describeLogError(error),
-                  level: "warn",
-                });
-                return { ...empty(), warned: 1 };
-              }
-              if (!backupPath) {
-                this.logAutoRotateSessionFileDecision({
-                  phase: "startup",
-                  action: "warn",
-                  thresholdBytes: params.thresholdBytes,
-                  durationMs: Date.now() - params.startedAt,
-                  reason: "backup-unavailable",
-                  level: "warn",
-                });
-                return { ...empty(), warned: 1 };
-              }
-              backupCreated = 1;
-            }
-
-            const result: StartupAutoRotateBatchResult = {
-              rotated: 0,
-              warned: 0,
-              bytesRemoved: 0,
-              backupPath,
-              backupCreated,
-            };
-            for (const candidate of params.candidates) {
-              let rotateResult: RotateSessionStorageResult;
-              try {
-                rotateResult = await this.rotateSessionStorageWhileHoldingDatabaseLock({
-                  sessionId: candidate.sessionId,
-                  sessionKey: candidate.sessionKey,
-                  sessionFile: candidate.sessionFile,
-                });
-              } catch (error) {
-                result.warned += 1;
-                this.logAutoRotateSessionFileDecision({
-                  phase: "startup",
-                  action: "warn",
-                  sessionId: candidate.sessionId,
-                  sessionKey: candidate.sessionKey,
-                  conversationId: candidate.conversationId,
-                  sessionFile: candidate.sessionFile,
-                  sizeBytes: candidate.sizeBytes,
-                  thresholdBytes: params.thresholdBytes,
-                  durationMs: Date.now() - params.startedAt,
-                  backupPath,
-                  currentMessageCount: candidate.currentMessageCount,
-                  reason: "rotate-threw",
-                  error: describeLogError(error),
-                  level: "warn",
-                });
-                continue;
-              }
-
-              if (rotateResult.kind === "unavailable") {
-                result.warned += 1;
-                this.logAutoRotateSessionFileDecision({
-                  phase: "startup",
-                  action: "warn",
-                  sessionId: candidate.sessionId,
-                  sessionKey: candidate.sessionKey,
-                  conversationId: candidate.conversationId,
-                  sessionFile: candidate.sessionFile,
-                  sizeBytes: candidate.sizeBytes,
-                  thresholdBytes: params.thresholdBytes,
-                  durationMs: Date.now() - params.startedAt,
-                  backupPath,
-                  currentMessageCount: candidate.currentMessageCount,
-                  reason: "unavailable",
-                  error: rotateResult.reason,
-                  level: "warn",
-                });
-                continue;
-              }
-
-              result.rotated += 1;
-              result.bytesRemoved += rotateResult.bytesRemoved;
-              const queueKey = this.resolveSessionQueueKey(candidate.sessionId, candidate.sessionKey);
-              if (rotateResult.checkpointSize >= params.thresholdBytes) {
-                this.oversizedAutoRotateCheckpointByQueueKey.set(queueKey, rotateResult.checkpointSize);
-              } else {
-                this.oversizedAutoRotateCheckpointByQueueKey.delete(queueKey);
-              }
-              this.logAutoRotateSessionFileDecision({
-                phase: "startup",
-                action: "rotate",
-                sessionId: candidate.sessionId,
-                sessionKey: candidate.sessionKey,
-                conversationId: rotateResult.conversationId,
-                sessionFile: candidate.sessionFile,
-                sizeBytes: candidate.sizeBytes,
-                thresholdBytes: params.thresholdBytes,
-                durationMs: Date.now() - params.startedAt,
-                backupPath,
-                bytesRemoved: rotateResult.bytesRemoved,
-                preservedTailMessageCount: rotateResult.preservedTailMessageCount,
-                checkpointSize: rotateResult.checkpointSize,
-                currentMessageCount: candidate.currentMessageCount,
-              });
-            }
-            return result;
-          },
-        )
-      );
-    } catch (error) {
-      if (error instanceof DatabaseTransactionTimeoutError) {
-        this.logAutoRotateSessionFileDecision({
-          phase: "startup",
-          action: "warn",
-          thresholdBytes: params.thresholdBytes,
-          durationMs: Date.now() - params.startedAt,
-          reason: "database-lock-timeout",
-          error: describeLogError(error),
-          level: "warn",
-        });
-        return { ...empty(), warned: 1 };
-      }
-      throw error;
-    }
-  }
-
-  /** Scan OpenClaw-indexed startup transcripts and rotate oversized active LCM sessions. */
-  async autoRotateManagedSessionFilesAtStartup(): Promise<void> {
-    const startedAt = Date.now();
-    const thresholdBytes = this.config.autoRotateSessionFiles.sizeBytes;
-    const mode = this.getAutoRotateSessionFileMode("startup");
-    const summary = {
-      scanned: 0,
-      eligible: 0,
-      rotated: 0,
-      warned: 0,
-      skipped: 0,
-      bytesRemoved: 0,
-      backupPath: undefined as string | undefined,
-      backupCreated: 0,
-    };
-    const logSummary = (reason?: string): void =>
-      this.logStartupAutoRotateSummary({
-        startedAt,
-        thresholdBytes,
-        ...summary,
-        reason,
-      });
-
-    if (!this.config.autoRotateSessionFiles.enabled || mode === "off") {
-      logSummary(this.config.autoRotateSessionFiles.enabled ? "mode-off" : "disabled");
-      return;
-    }
-    if (!this.info.ownsCompaction) {
-      logSummary("engine-unhealthy");
-      return;
-    }
-    if (!this.deps.listStartupSessionFileCandidates) {
-      logSummary("no-indexed-session-provider");
-      return;
-    }
-
-    this.ensureMigrated();
-    let indexedCandidates: StartupSessionFileCandidate[];
-    try {
-      indexedCandidates = await this.deps.listStartupSessionFileCandidates();
-    } catch (error) {
-      summary.warned += 1;
-      this.logAutoRotateSessionFileDecision({
-        phase: "startup",
-        action: "warn",
-        thresholdBytes,
-        durationMs: Date.now() - startedAt,
-        reason: "candidate-scan-failed",
-        error: describeLogError(error),
-        level: "warn",
-      });
-      logSummary("candidate-scan-failed");
-      return;
-    }
-
-    const rotateCandidates: StartupAutoRotateCandidate[] = [];
-    for (const candidate of indexedCandidates) {
-      summary.scanned += 1;
-      const prepared = await this.prepareStartupAutoRotateCandidate({
-        candidate,
-        startedAt,
-        thresholdBytes,
-      });
-      if (prepared.kind === "eligible") {
-        summary.eligible += 1;
-        if (mode === "warn") {
-          summary.warned += 1;
-          this.logAutoRotateSessionFileDecision({
-            phase: "startup",
-            action: "warn",
-            sessionId: prepared.candidate.sessionId,
-            sessionKey: prepared.candidate.sessionKey,
-            conversationId: prepared.candidate.conversationId,
-            sessionFile: prepared.candidate.sessionFile,
-            sizeBytes: prepared.candidate.sizeBytes,
-            thresholdBytes,
-            durationMs: Date.now() - startedAt,
-            currentMessageCount: prepared.candidate.currentMessageCount,
-            reason: "above-threshold",
-            level: "warn",
-          });
-        } else {
-          rotateCandidates.push(prepared.candidate);
-        }
-      } else if (prepared.kind === "warned") {
-        summary.warned += 1;
-      } else {
-        summary.skipped += 1;
-      }
-    }
-
-    const batch = await this.rotateStartupAutoRotateBatch({
-      candidates: rotateCandidates,
-      startedAt,
-      thresholdBytes,
-    });
-    summary.rotated += batch.rotated;
-    summary.warned += batch.warned;
-    summary.bytesRemoved += batch.bytesRemoved;
-    summary.backupPath = batch.backupPath;
-    summary.backupCreated += batch.backupCreated;
-    logSummary("completed");
-  }
-
-  /**
-   * Rewrite the active transcript into a compact suffix-preserving form.
-   *
-   * Rotate is transcript maintenance, not conversation replacement. We keep the
-   * current conversation id and LCM context intact, then rebuild the transcript
-   * so only the latest raw tail plus current session settings remain on disk.
-   */
-  private async rewriteTranscriptForRotate(params: {
-    conversationId: number;
-    sessionFile: string;
-  }): Promise<RotateTranscriptRewriteResult> {
-    const sessionManager = SessionManager.open(params.sessionFile);
-    const header = sessionManager.getHeader();
-    const branch = sessionManager.getBranch();
-    const originalStats = await stat(params.sessionFile);
-
-    const messageIndices: number[] = [];
-    for (let index = 0; index < branch.length; index += 1) {
-      if (branch[index]?.type === "message") {
-        messageIndices.push(index);
-      }
-    }
-
-    const keepTailMessageCount = normalizeRotateTailMessageCount(
-      this.config.freshTailCount,
-      messageIndices.length,
-    );
-    const anchorIndex =
-      keepTailMessageCount > 0
-        ? (messageIndices[messageIndices.length - keepTailMessageCount] ?? branch.length)
-        : branch.length;
-
-    const latestPreludeEntries = new Map<string, (typeof branch)[number]>();
-    for (let index = 0; index < anchorIndex; index += 1) {
-      const entry = branch[index];
-      if (entry && isRotatePreservedEntryType(entry.type) && entry.type !== "message") {
-        latestPreludeEntries.set(entry.type, entry);
-      }
-    }
-
-    const entriesToKeep: Array<Record<string, unknown>> = [];
-    for (const type of ["session_info", "model_change", "thinking_level_change"] as const) {
-      const entry = latestPreludeEntries.get(type);
-      if (entry) {
-        entriesToKeep.push({ ...entry });
-      }
-    }
-
-    for (let index = anchorIndex; index < branch.length; index += 1) {
-      const entry = branch[index];
-      if (entry && isRotatePreservedEntryType(entry.type)) {
-        entriesToKeep.push({ ...entry });
-      }
-    }
-
-    while (entriesToKeep.length > 0 && entriesToKeep[entriesToKeep.length - 1]?.type !== "message") {
-      entriesToKeep.pop();
-    }
-
-    let previousEntryId: string | null = null;
-    const linearizedEntries = entriesToKeep.map((entry) => {
-      const nextEntry = {
-        ...entry,
-        parentId: previousEntryId,
-      };
-      previousEntryId = typeof nextEntry.id === "string" ? nextEntry.id : previousEntryId;
-      return nextEntry;
-    });
-
-    const serialized = [
-      JSON.stringify(header),
-      ...linearizedEntries.map((entry) => JSON.stringify(entry)),
-    ].join("\n") + "\n";
-    await writeFile(params.sessionFile, serialized, "utf8");
-
-    const rewrittenStats = await stat(params.sessionFile);
-    await this.refreshBootstrapState({
-      conversationId: params.conversationId,
-      sessionFile: params.sessionFile,
-      fileStats: {
-        size: rewrittenStats.size,
-        mtimeMs: rewrittenStats.mtimeMs,
-      },
-    });
-
-    return {
-      checkpointSize: rewrittenStats.size,
-      bytesRemoved: Math.max(0, originalStats.size - rewrittenStats.size),
-      preservedTailMessageCount: keepTailMessageCount,
-    };
-  }
-
-  /**
-   * Rotate the active session transcript while a write transaction is already open.
-   *
-   * This keeps the transcript rewrite and checkpoint update in one place so the
-   * command path can reuse it after taking a faithful backup on the shared
-   * connection.
-   */
-  private async rotateSessionStorageInActiveTransaction(params: {
-    sessionId: string;
-    sessionKey: string;
-    sessionFile: string;
-  }): Promise<RotateSessionStorageResult> {
-    const { sessionId, sessionKey } = params;
-    const current = await this.conversationStore.getConversationForSession({
-      sessionId,
-      sessionKey,
-    });
-    if (!current?.active) {
-      return {
-        kind: "unavailable",
-        reason: "No active Lossless Claw conversation is stored for the current session.",
-      };
-    }
-
-    try {
-      const rewriteResult = await this.rewriteTranscriptForRotate({
-        conversationId: current.conversationId,
-        sessionFile: params.sessionFile,
-      });
-      this.deps.log.info(
-        `[lcm] rotate: rewrote transcript for conversation=${current.conversationId} session=${sessionId} sessionKey=${sessionKey} preservedTailMessages=${rewriteResult.preservedTailMessageCount} checkpointSize=${rewriteResult.checkpointSize} bytesRemoved=${rewriteResult.bytesRemoved}`,
-      );
-      return {
-        kind: "rotated",
-        conversationId: current.conversationId,
-        preservedTailMessageCount: rewriteResult.preservedTailMessageCount,
-        checkpointSize: rewriteResult.checkpointSize,
-        bytesRemoved: rewriteResult.bytesRemoved,
-      };
-    } catch (error) {
-      return {
-        kind: "unavailable",
-        reason: `Lossless Claw could not rotate the current session transcript: ${describeLogError(error)}`,
-      };
-    }
-  }
-
-  async rotateSessionStorage(params: {
-    sessionId?: string;
-    sessionKey?: string;
-    sessionFile: string;
-  }): Promise<RotateSessionStorageResult> {
-    const sessionId = params.sessionId?.trim();
-    const sessionKey = params.sessionKey?.trim();
-    if (!sessionId || !sessionKey) {
-      return {
-        kind: "unavailable",
-        reason: "Lossless Claw needs both the current session id and session key to rotate storage safely.",
-      };
-    }
-    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
-      return {
-        kind: "unavailable",
-        reason: "The current session is excluded by ignoreSessionPatterns, so there is no active LCM conversation to rotate.",
-      };
-    }
-    if (this.isStatelessSession(sessionKey)) {
-      return {
-        kind: "unavailable",
-        reason: "The current session is stateless in Lossless Claw, so there is no writable active LCM conversation to rotate.",
-      };
-    }
-
-    this.ensureMigrated();
-    return this.withSessionQueue(
-      this.resolveSessionQueueKey(sessionId, sessionKey),
-      async () =>
-        this.conversationStore.withTransaction(() =>
-          this.rotateSessionStorageInActiveTransaction({
-            sessionId,
-            sessionKey,
-            sessionFile: params.sessionFile,
-          })
-        ),
-    );
-  }
-
-  /**
-   * Rotate session storage while the caller already holds exclusive DB access.
-   *
-   * The caller is responsible for ordering any higher-level queues before
-   * entering this helper. This method only manages the rotate write
-   * transaction on the shared connection.
-   */
-  async rotateSessionStorageWhileHoldingDatabaseLock(params: {
-    sessionId?: string;
-    sessionKey?: string;
-    sessionFile: string;
-  }): Promise<RotateSessionStorageResult> {
-    const sessionId = params.sessionId?.trim();
-    const sessionKey = params.sessionKey?.trim();
-    if (!sessionId || !sessionKey) {
-      return {
-        kind: "unavailable",
-        reason: "Lossless Claw needs both the current session id and session key to rotate storage safely.",
-      };
-    }
-    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
-      return {
-        kind: "unavailable",
-        reason: "The current session is excluded by ignoreSessionPatterns, so there is no active LCM conversation to rotate.",
-      };
-    }
-    if (this.isStatelessSession(sessionKey)) {
-      return {
-        kind: "unavailable",
-        reason: "The current session is stateless in Lossless Claw, so there is no writable active LCM conversation to rotate.",
-      };
-    }
-
-    this.ensureMigrated();
-    if (this.db.isTransaction) {
-      return {
-        kind: "unavailable",
-        reason:
-          "Lossless Claw obtained exclusive rotate access, but the shared database connection is still inside another transaction.",
-      };
-    }
-
-    let transactionActive = false;
-    try {
-      this.db.exec("BEGIN IMMEDIATE");
-      transactionActive = true;
-      const result = await this.rotateSessionStorageInActiveTransaction({
-        sessionId,
-        sessionKey,
-        sessionFile: params.sessionFile,
-      });
-      this.db.exec("COMMIT");
-      transactionActive = false;
-      return result;
-    } catch (error) {
-      if (transactionActive) {
-        this.db.exec("ROLLBACK");
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Wait for same-session work and DB transactions to drain, then back up and rotate.
-   *
-   * This is the safe command path: it preserves session ordering, waits for the
-   * shared connection to become idle, takes the pre-rotate backup on that live
-   * connection, and only then opens the rotate write transaction.
-   */
-  async rotateSessionStorageWithBackup(params: {
-    sessionId?: string;
-    sessionKey?: string;
-    sessionFile: string;
-    lockTimeoutMs: number;
-  }): Promise<RotateSessionStorageWithBackupResult> {
-    const sessionId = params.sessionId?.trim();
-    const sessionKey = params.sessionKey?.trim();
-    if (!sessionId || !sessionKey) {
-      return {
-        kind: "unavailable",
-        reason: "Lossless Claw needs both the current session id and session key to rotate storage safely.",
-      };
-    }
-    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
-      return {
-        kind: "unavailable",
-        reason: "The current session is excluded by ignoreSessionPatterns, so there is no active LCM conversation to rotate.",
-      };
-    }
-    if (this.isStatelessSession(sessionKey)) {
-      return {
-        kind: "unavailable",
-        reason: "The current session is stateless in Lossless Claw, so there is no writable active LCM conversation to rotate.",
-      };
-    }
-
-    this.ensureMigrated();
-    return this.withSessionQueue(
-      this.resolveSessionQueueKey(sessionId, sessionKey),
-      async () => {
-        try {
-          return await withExclusiveDatabaseLock(
-            this.db,
-            { timeoutMs: params.lockTimeoutMs },
-            async () => {
-              if (this.db.isTransaction) {
-                return {
-                  kind: "unavailable" as const,
-                  reason:
-                    "Lossless Claw obtained exclusive rotate access, but the shared database connection is still inside another transaction.",
-                };
-              }
-
-              const current = await this.conversationStore.getConversationForSession({
-                sessionId,
-                sessionKey,
-              });
-              if (!current?.active) {
-                return {
-                  kind: "unavailable" as const,
-                  reason: "No active Lossless Claw conversation is stored for the current session.",
-                };
-              }
-
-              const currentMessageCount = await this.conversationStore.getMessageCount(current.conversationId);
-              let backupPath: string | null = null;
-              try {
-                backupPath = createLcmDatabaseBackup(this.db, {
-                  databasePath: this.config.databasePath,
-                  label: "rotate",
-                  replaceLatest: true,
-                });
-              } catch (error) {
-                return {
-                  kind: "backup_failed" as const,
-                  currentConversationId: current.conversationId,
-                  currentMessageCount,
-                  reason: describeLogError(error),
-                };
-              }
-
-              if (!backupPath) {
-                return {
-                  kind: "unavailable" as const,
-                  currentConversationId: current.conversationId,
-                  currentMessageCount,
-                  reason: "Lossless Claw could not create the rotate backup.",
-                };
-              }
-
-              let rotateResult: RotateSessionStorageResult;
-              try {
-                rotateResult = await this.rotateSessionStorageWhileHoldingDatabaseLock({
-                  sessionId,
-                  sessionKey,
-                  sessionFile: params.sessionFile,
-                });
-              } catch (error) {
-                return {
-                  kind: "rotate_failed" as const,
-                  currentConversationId: current.conversationId,
-                  currentMessageCount,
-                  backupPath,
-                  reason: describeLogError(error),
-                };
-              }
-              if (rotateResult.kind === "unavailable") {
-                return {
-                  kind: "unavailable" as const,
-                  currentConversationId: current.conversationId,
-                  currentMessageCount,
-                  backupPath,
-                  reason: rotateResult.reason,
-                };
-              }
-
-              return {
-                kind: "rotated" as const,
-                currentConversationId: current.conversationId,
-                currentMessageCount,
-                backupPath,
-                preservedTailMessageCount: rotateResult.preservedTailMessageCount,
-                checkpointSize: rotateResult.checkpointSize,
-                bytesRemoved: rotateResult.bytesRemoved,
-              };
-            },
-          );
-        } catch (error) {
-          if (error instanceof DatabaseTransactionTimeoutError) {
-            return {
-              kind: "unavailable",
-              reason: `Lossless Claw waited ${Math.floor(params.lockTimeoutMs / 1000)}s for the database to become idle, but another transaction never finished.`,
-            };
-          }
-          throw error;
-        }
-      },
-    );
-  }
-
   // ── Public accessors for retrieval (used by subagent expansion) ─────────
 
   getRetrieval(): RetrievalEngine {
@@ -9023,6 +6510,3 @@ function createEmergencyFallbackSummarize(): (
     return text.slice(0, maxChars) + "\n[Truncated for context management]";
   };
 }
-
-/** @internal Exposed for unit tests only. */
-export const __testing = { readLastJsonlEntryBeforeOffset };

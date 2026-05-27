@@ -3,13 +3,14 @@
 Lossless-claw reads plugin configuration from `plugins.entries.lossless-claw.config`.
 
 Lossless-claw requires OpenClaw `2026.5.22` or newer so the host can enforce
-context-engine runtime capabilities before an agent run starts. Agent runs need
-a native host that provides the full context-engine lifecycle: session bootstrap,
-pre-prompt assembly, after-turn ingestion, maintenance, compaction, and runtime
-LLM completion. Native Codex and Pi embedded runs provide those capabilities;
-generic CLI harnesses such as `claude-cli` and `codex-cli` do not. If you must
-use a generic CLI harness, set `plugins.slots.contextEngine` to `legacy` for
-that run instead of `lossless-claw`.
+context-engine runtime capabilities and pass the SQLite transcript scope before
+an agent run starts. Agent runs need a native host that provides the full
+context-engine lifecycle: session bootstrap, pre-prompt assembly, after-turn
+ingestion, maintenance, compaction, and runtime LLM completion. Native Codex and
+Pi embedded runs provide those capabilities; generic CLI harnesses such as
+`claude-cli` and `codex-cli` do not. If you must use a generic CLI harness, set
+`plugins.slots.contextEngine` to `legacy` for that run instead of
+`lossless-claw`.
 
 Configuration precedence is:
 
@@ -60,7 +61,6 @@ Most installations only need to override a handful of keys. If you want a comple
   "summaryTimeoutMs": 60000,
   "timezone": "America/Los_Angeles",
   "pruneHeartbeatOk": false,
-  "transcriptGcEnabled": false,
   "maxAssemblyTokenBudget": 30000,
   "summaryMaxOverageFactor": 3,
   "customInstructions": "",
@@ -68,13 +68,6 @@ Most installations only need to override a handful of keys. If you want a comple
   "circuitBreakerCooldownMs": 1800000,
   "fallbackProviders": [],
   "proactiveThresholdCompactionMode": "deferred",
-  "autoRotateSessionFiles": {
-    "enabled": true,
-    "createBackups": false,
-    "sizeBytes": 2097152,
-    "startup": "rotate",
-    "runtime": "rotate"
-  },
   "cacheAwareCompaction": {
     "enabled": true,
     "cacheTTLSeconds": 300,
@@ -138,19 +131,10 @@ openclaw plugins install --link /path/to/lossless-claw
 | `newSessionRetainDepth` | `integer` | `2` | `LCM_NEW_SESSION_RETAIN_DEPTH` | Controls what survives `/new`. `-1` keeps all context, `0` keeps summaries only, higher values keep only deeper summaries. |
 | `timezone` | `string` | `TZ` or system timezone | `TZ` | IANA timezone used for timestamp rendering in summaries. |
 | `pruneHeartbeatOk` | `boolean` | `false` | `LCM_PRUNE_HEARTBEAT_OK` | Retroactively removes `HEARTBEAT_OK` turn cycles from persisted storage. |
-| `transcriptGcEnabled` | `boolean` | `false` | `LCM_TRANSCRIPT_GC_ENABLED` | Enables transcript rewrite GC during `maintain()`; disabled by default so transcript rewrites stay opt-in. |
 | `proactiveThresholdCompactionMode` | `"deferred" \| "inline"` | `"deferred"` | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | Controls whether proactive threshold compaction is deferred into maintenance debt by default or run inline for legacy behavior. |
-| `autoRotateSessionFiles.enabled` | `boolean` | `true` | `LCM_AUTO_ROTATE_SESSION_FILES_ENABLED` | Enables automatic rotation for oversized LCM-managed session JSONL files. |
-| `autoRotateSessionFiles.createBackups` | `boolean` | `false` | `LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS` | Creates or replaces the rolling `rotate-latest` SQLite backup before automatic session-file rotation. Manual `/lcm rotate` backups are always created. |
-| `autoRotateSessionFiles.sizeBytes` | `integer` | `2097152` | `LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES` | Byte threshold that triggers automatic session-file rotation. |
-| `autoRotateSessionFiles.startup` | `"rotate" \| "warn" \| "off"` | `"rotate"` | `LCM_AUTO_ROTATE_SESSION_FILES_STARTUP` | Startup behavior for oversized indexed OpenClaw session transcripts that also have active LCM bootstrap state. |
-| `autoRotateSessionFiles.runtime` | `"rotate" \| "warn" \| "off"` | `"rotate"` | `LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME` | Runtime behavior after `afterTurn()` and `maintain()` check the current transcript size. |
 
 > **Multi-profile note:** `OPENCLAW_STATE_DIR` (set by the host OpenClaw gateway) controls where state is stored. When two gateways run on the same host (e.g. separate bot personas), each gateway sets its own `OPENCLAW_STATE_DIR` and lossless-claw automatically uses that directory for the database, large-file payloads, auth-profile lookups, and legacy secrets — no per-profile plugin config is needed.
 
-Automatic session-file rotation rewrites only the live session transcript, keeps the active LCM conversation and durable history intact, and refreshes the bootstrap checkpoint. Startup rotation first scans OpenClaw's current indexed session stores for configured agents, then intersects those candidates with active LCM conversations and matching bootstrap file mappings. Automatic rotation does not create a SQLite backup by default; set `autoRotateSessionFiles.createBackups` to `true` to make runtime rotation replace the rolling `rotate-latest` backup and to make startup rotation create one pre-rotation LCM database backup for the batch before any transcript is rewritten. Manual `/lcm rotate` always keeps its backup-backed behavior regardless of this flag. Rotation never runs for ignored sessions, stateless sessions, or sessions without active LCM state. The preserved JSONL tail follows the existing rotate behavior, which is controlled by `freshTailCount`.
-
-Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rotate:`. Startup emits one compact summary line with `phase=startup`, `action=summary`, `scanned`, `eligible`, `rotated`, `warned`, `skipped`, `durationMs`, `bytesRemoved`, and backup fields when a batch backup was created; quiet skips such as missing files, missing bootstrap mappings, and below-threshold files are counted there instead of producing one line per candidate. Rotation detail lines include `phase`, `action`, `sessionId`, `sessionKey`, `sessionFile`, `sizeBytes`, `thresholdBytes`, `durationMs`, `backupPath`, `bytesRemoved`, `preservedTailMessageCount`, and `checkpointSize`; real warning lines include the same available context plus `reason` or `error`.
 
 ### Compaction thresholds and summary sizing
 
@@ -324,15 +308,6 @@ Lossless-claw now defaults `proactiveThresholdCompactionMode` to `deferred`.
 - status output also surfaces the latest API/cache telemetry as diagnostics, not as a deferral gate
 - set `proactiveThresholdCompactionMode` to `inline` only if you need the legacy inline proactive compaction behavior for compatibility
 
-### `/lcm rotate`
-
-`/lcm rotate` exists for a different use case than `/new` or `/reset`:
-
-- `/new` keeps the same active LCM conversation row and only prunes context.
-- `/reset` changes OpenClaw session flow, which is sometimes more disruptive than users want.
-- `/lcm rotate` keeps the live OpenClaw session identity and the same active LCM conversation row, but rewrites the backing transcript into a compact preserved-tail form.
-
-Before rotating, Lossless-claw replaces one rolling `rotate-latest` SQLite backup. It then rewrites the current session transcript and checkpoints the same conversation at the new transcript frontier so bootstrap does not replay the dropped transcript history. Existing summaries, context items, and conversation identity stay in place. If you want additional timestamped snapshots, run `/lcm backup` explicitly before `/lcm rotate`.
 
 ## Environment-only knobs outside plugin config
 

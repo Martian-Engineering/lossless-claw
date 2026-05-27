@@ -54,7 +54,7 @@ When compaction creates a summary from a range of messages (or summaries), the s
 
 When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
 
-1. **bootstrap** — On session start, reconciles the JSONL session file with the LCM database. Imports any messages that exist in the file but not in LCM (crash recovery).
+1. **bootstrap** — On session start, imports the runtime-provided message snapshot into the LCM database.
 2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
 3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether `contextThreshold` requires compaction.
 
@@ -199,18 +199,9 @@ Files embedded in user messages (typically via `<file>` blocks from tool output)
 
 This prevents a single large file paste from consuming the entire context window while keeping the content accessible.
 
-## Session reconciliation
+## Runtime message import
 
-LCM handles crash recovery through **bootstrap reconciliation**:
-
-1. On session start, read the JSONL session file (OpenClaw's ground truth).
-2. Compare against the LCM database.
-3. Find the most recent message that exists in both (the "anchor").
-4. Import any messages after the anchor that are in JSONL but not in LCM.
-5. If an existing session key moves to a different transcript file and no anchor exists, treat the new file as a bounded transcript epoch and import its recoverable messages. The same flood cap used for tail reconciliation prevents large unrelated transcripts from being appended automatically.
-6. Advance the bootstrap checkpoint only after an overlap is found or a bounded epoch import succeeds. No-anchor reads that import nothing leave the old checkpoint in place so a later turn can retry.
-
-This handles the case where OpenClaw wrote messages to the session file but crashed before LCM could persist them.
+LCM no longer reads OpenClaw session files. The host supplies the current runtime message snapshot to lifecycle hooks, and LCM persists those messages directly into SQLite. Replay guards operate on message identity and ordering inside the database rather than transcript-file checkpoints.
 
 ## Operation serialization
 

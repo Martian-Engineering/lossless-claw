@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -44,15 +44,7 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
-    transcriptGcEnabled: false,
     proactiveThresholdCompactionMode: "deferred",
-    autoRotateSessionFiles: {
-      enabled: true,
-      createBackups: false,
-      sizeBytes: 2 * 1024 * 1024,
-      startup: "rotate",
-      runtime: "rotate",
-    },
     summaryMaxOverageFactor: 3,
     delegationTimeoutMs: 120000,
     customInstructions: "",
@@ -103,28 +95,25 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
   } as unknown as LcmDependencies;
 }
 
-function seedSessionFile(dir: string, name: string = randomUUID()) {
+function seedRuntimeSession(name: string = randomUUID()) {
   const seededSessionId = randomUUID();
   const seededSessionKey = `agent:test:direct:${name}:${seededSessionId}`;
-  const seededSessionFile = join(dir, `${name}-${seededSessionId}.jsonl`);
-
-  const messages: string[] = [];
+  const messages = [];
   for (let i = 0; i < 20; i++) {
-    messages.push(JSON.stringify({
-      role: "user",
+    messages.push({
+      role: "user" as const,
       content: `Message ${i}: ${"x".repeat(500)}`,
-    }));
-    messages.push(JSON.stringify({
-      role: "assistant",
+    });
+    messages.push({
+      role: "assistant" as const,
       content: `Response ${i}: ${"y".repeat(500)}`,
-    }));
+    });
   }
-  writeFileSync(seededSessionFile, messages.join("\n") + "\n");
 
   return {
     sessionId: seededSessionId,
     sessionKey: seededSessionKey,
-    sessionFile: seededSessionFile,
+    messages,
   };
 }
 
@@ -132,13 +121,19 @@ describe("Circuit Breaker", () => {
   let tmpDir: string;
   let db: DatabaseSync;
   let engine: LcmContextEngine;
-  let sessionFile: string;
-  let sessionId: string;
+    let sessionId: string;
   let sessionKey: string;
+
+  function seedRuntimeSessionForCurrent() {
+    const seeded = seedRuntimeSession();
+    sessionId = seeded.sessionId;
+    sessionKey = seeded.sessionKey;
+    return seeded;
+  }
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "lcm-cb-test-"));
-    ({ sessionId, sessionKey, sessionFile } = seedSessionFile(tmpDir));
+    ({ sessionId, sessionKey } = seedRuntimeSession());
 
     const config = createTestConfig();
     const deps = createTestDeps(config);
@@ -153,13 +148,12 @@ describe("Circuit Breaker", () => {
 
   it("should allow compaction when circuit breaker is closed", async () => {
     // Bootstrap to seed data
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
+    await engine.bootstrap(seedRuntimeSessionForCurrent());
     
     // Compact with a working summarizer
     const result = await engine.compact({
       sessionId,
       sessionKey,
-      sessionFile,
       tokenBudget: 5000,
       force: true,
       legacyParams: {
@@ -172,7 +166,7 @@ describe("Circuit Breaker", () => {
   });
 
   it("should trip after N consecutive auth failures", async () => {
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
+    await engine.bootstrap(seedRuntimeSessionForCurrent());
     
     let callCount = 0;
     const failingSummarizer = async () => {
@@ -185,7 +179,6 @@ describe("Circuit Breaker", () => {
       await engine.compact({
         sessionId,
         sessionKey,
-        sessionFile,
         tokenBudget: 5000,
         force: true,
         legacyParams: { summarize: failingSummarizer },
@@ -196,7 +189,6 @@ describe("Circuit Breaker", () => {
     const blocked = await engine.compact({
       sessionId,
       sessionKey,
-      sessionFile,
       tokenBudget: 5000,
       force: true,
       legacyParams: { summarize: failingSummarizer },
@@ -207,7 +199,7 @@ describe("Circuit Breaker", () => {
   });
 
   it("should auto-reset after cooldown", async () => {
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
+    await engine.bootstrap(seedRuntimeSessionForCurrent());
     
     const failingSummarizer = async () => {
       throw makeAuthError();
@@ -218,7 +210,6 @@ describe("Circuit Breaker", () => {
       await engine.compact({
         sessionId,
         sessionKey,
-        sessionFile,
         tokenBudget: 5000,
         force: true,
         legacyParams: { summarize: failingSummarizer },
@@ -229,7 +220,6 @@ describe("Circuit Breaker", () => {
     let result = await engine.compact({
       sessionId,
       sessionKey,
-      sessionFile,
       tokenBudget: 5000,
       force: true,
       legacyParams: { summarize: failingSummarizer },
@@ -247,7 +237,6 @@ describe("Circuit Breaker", () => {
     result = await engine.compact({
       sessionId,
       sessionKey,
-      sessionFile,
       tokenBudget: 5000,
       force: true,
       legacyParams: {
@@ -260,7 +249,7 @@ describe("Circuit Breaker", () => {
   });
 
   it("should reset on successful compaction", async () => {
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
+    await engine.bootstrap(seedRuntimeSessionForCurrent());
     
     let shouldFail = true;
     const toggleSummarizer = async (text: string) => {
@@ -275,7 +264,6 @@ describe("Circuit Breaker", () => {
       await engine.compact({
         sessionId,
         sessionKey,
-        sessionFile,
         tokenBudget: 5000,
         force: true,
         legacyParams: { summarize: toggleSummarizer },
@@ -287,7 +275,6 @@ describe("Circuit Breaker", () => {
     await engine.compact({
       sessionId,
       sessionKey,
-      sessionFile,
       tokenBudget: 5000,
       force: true,
       legacyParams: { summarize: toggleSummarizer },
@@ -299,7 +286,6 @@ describe("Circuit Breaker", () => {
       await engine.compact({
         sessionId,
         sessionKey,
-        sessionFile,
         tokenBudget: 5000,
         force: true,
         legacyParams: { summarize: toggleSummarizer },
@@ -310,7 +296,6 @@ describe("Circuit Breaker", () => {
     const result = await engine.compact({
       sessionId,
       sessionKey,
-      sessionFile,
       tokenBudget: 5000,
       force: true,
       legacyParams: { summarize: toggleSummarizer },
@@ -340,8 +325,8 @@ describe("Circuit Breaker", () => {
 
     const scopedDb = new DatabaseSync(":memory:");
     const scopedEngine = new LcmContextEngine(providerDeps, scopedDb);
-    const brokenSession = seedSessionFile(tmpDir, "broken-provider");
-    const healthySession = seedSessionFile(tmpDir, "healthy-provider");
+    const brokenSession = seedRuntimeSession("broken-provider");
+    const healthySession = seedRuntimeSession("healthy-provider");
 
     try {
       await scopedEngine.bootstrap(brokenSession);
@@ -372,7 +357,7 @@ describe("Circuit Breaker", () => {
     const deps = createTestDeps(config);
     const sweepDb = new DatabaseSync(":memory:");
     const sweepEngine = new LcmContextEngine(deps, sweepDb);
-    const sweepSession = seedSessionFile(tmpDir, "full-sweep");
+    const sweepSession = seedRuntimeSession("full-sweep");
 
     try {
       await sweepEngine.bootstrap(sweepSession);

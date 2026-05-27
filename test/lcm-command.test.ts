@@ -17,7 +17,6 @@ function createCommandFixture(options?: {
   summarize?: LcmSummarizeFn;
   deps?: LcmDependencies;
   getLcm?: () => Promise<{
-    rotateSessionStorageWithBackup: (...args: unknown[]) => Promise<unknown>;
     compact?: (...args: unknown[]) => Promise<unknown>;
   }>;
 }) {
@@ -400,7 +399,6 @@ describe("lcm command", () => {
       },
       resolveAgentDir: () => fixture.tempDir,
       resolveSessionIdFromSessionKey: async () => undefined,
-      resolveSessionTranscriptFile: async () => undefined,
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -419,7 +417,6 @@ describe("lcm command", () => {
       deps,
       getLcm: async () => ({
         compact,
-        rotateSessionStorageWithBackup: vi.fn(),
       }),
     });
 
@@ -699,7 +696,6 @@ describe("lcm command", () => {
       },
       resolveAgentDir: () => fixture.tempDir,
       resolveSessionIdFromSessionKey: async () => undefined,
-      resolveSessionTranscriptFile: async () => undefined,
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -718,7 +714,6 @@ describe("lcm command", () => {
       deps,
       getLcm: async () => ({
         compact,
-        rotateSessionStorageWithBackup: vi.fn(),
       }),
     });
 
@@ -815,7 +810,6 @@ describe("lcm command", () => {
       readLatestAssistantReply: () => undefined,
       resolveAgentDir: () => fixture.tempDir,
       resolveSessionIdFromSessionKey: async () => undefined,
-      resolveSessionTranscriptFile: async () => undefined,
       agentLaneSubagent: "subagent",
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     } as unknown as LcmDependencies;
@@ -825,7 +819,6 @@ describe("lcm command", () => {
       deps,
       getLcm: async () => ({
         compact: vi.fn(async () => ({ ok: true, compacted: true, reason: "forced full sweep" })),
-        rotateSessionStorageWithBackup: vi.fn(),
       }),
     });
 
@@ -1653,7 +1646,6 @@ describe("lcm command", () => {
       readLatestAssistantReply: vi.fn(() => undefined) as LcmDependencies["readLatestAssistantReply"],
       resolveAgentDir: vi.fn(() => tmpdir()) as LcmDependencies["resolveAgentDir"],
       resolveSessionIdFromSessionKey: vi.fn(async () => undefined) as LcmDependencies["resolveSessionIdFromSessionKey"],
-      resolveSessionTranscriptFile: vi.fn(async () => undefined) as LcmDependencies["resolveSessionTranscriptFile"],
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -1765,460 +1757,6 @@ describe("lcm command", () => {
     expect(result.text).toContain("reason: disk full");
   });
 
-  it("rotates the current session and replaces the latest rotate backup", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    let mockedBackupPath = "";
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      backupPath: mockedBackupPath,
-      preservedTailMessageCount: 8,
-      checkpointSize: 1234,
-      bytesRemoved: 4567,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
-      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "rotate-session",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
-    writeFileSync(mockedBackupPath, "backup");
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-session",
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    const backupPath = result.text.match(/backup path: (.+)/)?.[1]?.trim();
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("status: replaced latest");
-    expect(result.text).toContain("status: rotated");
-    expect(result.text).toContain("preserved tail messages: 8");
-    expect(result.text).toContain("bytes removed: 4,567");
-    expect(result.text).toContain("mode: preserved current conversation and rotated transcript tail");
-    expect(backupPath).toBeTruthy();
-    expect(backupPath?.endsWith(".rotate-latest.bak")).toBe(true);
-    expect(existsSync(backupPath!)).toBe(true);
-
-    const second = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-session",
-        sessionKey: "agent:main:main",
-      }),
-    );
-    const secondBackupPath = second.text.match(/backup path: (.+)/)?.[1]?.trim();
-    expect(secondBackupPath).toBe(backupPath);
-    expect(existsSync(secondBackupPath!)).toBe(true);
-
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
-      sessionId: "rotate-session",
-      sessionKey: "agent:main:main",
-      sessionFile: transcriptPath,
-      lockTimeoutMs: 30_000,
-    });
-  });
-
-  it("renders engine-reported rotate stats after waiting for other DB work", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-backup-fail-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    let mockedBackupPath = "";
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId,
-      currentMessageCount: 2,
-      backupPath: mockedBackupPath,
-      preservedTailMessageCount: 6,
-      checkpointSize: 1234,
-      bytesRemoved: 789,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
-      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "rotate-backup-failure-session",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
-    writeFileSync(mockedBackupPath, "backup");
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-backup-failure-session",
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("messages: 2");
-    expect(result.text).toContain("status: replaced latest");
-    expect(result.text).toContain("status: rotated");
-    expect(result.text).toContain("preserved tail messages: 6");
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
-      sessionId: "rotate-backup-failure-session",
-      sessionKey: "agent:main:main",
-      sessionFile: transcriptPath,
-      lockTimeoutMs: 30_000,
-    });
-  });
-
-  it("resolves the runtime session id from the session key when rotate lacks ctx.sessionId", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-runtime-session-id-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    let mockedBackupPath = "";
-    const resolveSessionIdFromSessionKey = vi.fn(async () => "runtime-session-id");
-    const resolveSessionTranscriptFile = vi.fn(async () => transcriptPath);
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      backupPath: mockedBackupPath,
-      preservedTailMessageCount: 8,
-      checkpointSize: 1234,
-      bytesRemoved: 4567,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey,
-      resolveSessionTranscriptFile,
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "stored-session-id",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
-    writeFileSync(mockedBackupPath, "backup");
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("status: rotated");
-    expect(resolveSessionIdFromSessionKey).toHaveBeenCalledWith("agent:main:main");
-    expect(resolveSessionTranscriptFile).toHaveBeenCalledWith({
-      sessionId: "runtime-session-id",
-      sessionKey: "agent:main:main",
-    });
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
-      sessionId: "runtime-session-id",
-      sessionKey: "agent:main:main",
-      sessionFile: transcriptPath,
-      lockTimeoutMs: 30_000,
-    });
-  });
-
-  it("falls back to the stored conversation session id when runtime rotate resolution is unavailable", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-stored-session-id-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    let mockedBackupPath = "";
-    const resolveSessionIdFromSessionKey = vi.fn(async () => undefined);
-    const resolveSessionTranscriptFile = vi.fn(async () => transcriptPath);
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      backupPath: mockedBackupPath,
-      preservedTailMessageCount: 8,
-      checkpointSize: 1234,
-      bytesRemoved: 4567,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey,
-      resolveSessionTranscriptFile,
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "stored-session-id",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
-    writeFileSync(mockedBackupPath, "backup");
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("status: rotated");
-    expect(resolveSessionIdFromSessionKey).toHaveBeenCalledWith("agent:main:main");
-    expect(resolveSessionTranscriptFile).toHaveBeenCalledWith({
-      sessionId: "stored-session-id",
-      sessionKey: "agent:main:main",
-    });
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
-      sessionId: "stored-session-id",
-      sessionKey: "agent:main:main",
-      sessionFile: transcriptPath,
-      lockTimeoutMs: 30_000,
-    });
-  });
-
-  it("reports rotate as unavailable when no session id can be resolved for the live transcript", async () => {
-    const resolveSessionIdFromSessionKey = vi.fn(async () => undefined);
-    const resolveSessionTranscriptFile = vi.fn(async () => undefined);
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId: 0,
-      currentMessageCount: 0,
-      backupPath: "unused",
-      preservedTailMessageCount: 0,
-      checkpointSize: 0,
-      bytesRemoved: 0,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey,
-      resolveSessionTranscriptFile,
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    await fixture.conversationStore.createConversation({
-      sessionId: "",
-      sessionKey: "agent:main:main",
-    });
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("status: unavailable");
-    expect(result.text).toContain("did not expose or resolve a runtime session id");
-    expect(resolveSessionIdFromSessionKey).toHaveBeenCalledWith("agent:main:main");
-    expect(resolveSessionTranscriptFile).not.toHaveBeenCalled();
-    expect(rotateSessionStorageWithBackup).not.toHaveBeenCalled();
-  });
-
-  it("reports rotate failure when the engine reports a backup failure", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-backup-fail-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "backup_failed" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      reason: "SQLITE_BUSY",
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
-      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "rotate-backup-failure-session",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-backup-failure-session",
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("status: failed");
-    expect(result.text).toContain("reason: SQLITE_BUSY");
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalled();
-  });
-
-  it("reports rotate failure after the engine already created a backup", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-engine-fail-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    let mockedBackupPath = "";
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotate_failed" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      backupPath: mockedBackupPath,
-      reason: "rotate exploded",
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
-      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "rotate-engine-failure-session",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
-    writeFileSync(mockedBackupPath, "backup");
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-engine-failure-session",
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("status: replaced latest");
-    expect(result.text).toContain("status: failed");
-    expect(result.text).toContain("reason: rotate exploded");
-    expect(result.text).toContain("backup path:");
-  });
-
-  it("reports rotate as unavailable when OpenClaw does not expose a session key", async () => {
-    const fixture = createCommandFixture();
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-missing-session-key",
-      }),
-    );
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("status: unavailable");
-    expect(result.text).toContain("OpenClaw must expose the active session key");
-  });
 
   it("prefers the active conversation when multiple rows share the same session key", async () => {
     const fixture = createCommandFixture();
@@ -2283,7 +1821,6 @@ describe("lcm command", () => {
     const result = await fixture.command.handler(createCommandContext("rewrite"));
     expect(result.text).toContain("⚠️ Unknown subcommand `rewrite`.");
     expect(result.text).toContain("`/lossless backup`");
-    expect(result.text).toContain("`/lossless rotate`");
     expect(result.text).toContain("`/lossless help`");
     expect(result.text).toContain("`/lcm` is accepted as a shorter alias.");
   });

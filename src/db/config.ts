@@ -23,8 +23,6 @@ export function resolveOpenclawStateDir(env: NodeJS.ProcessEnv = process.env): s
  * plugin config and status surfaces.
  */
 export const DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO = 0.90;
-export const DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES = 2 * 1024 * 1024;
-
 export type CacheAwareCompactionConfig = {
   enabled: boolean;
   cacheTTLSeconds: number;
@@ -42,16 +40,6 @@ export type DynamicLeafChunkTokensConfig = {
 };
 
 export type ProactiveThresholdCompactionMode = "deferred" | "inline";
-export type AutoRotateSessionFileMode = "rotate" | "warn" | "off";
-
-export type AutoRotateSessionFilesConfig = {
-  enabled: boolean;
-  createBackups: boolean;
-  sizeBytes: number;
-  startup: AutoRotateSessionFileMode;
-  runtime: AutoRotateSessionFileMode;
-};
-
 export type LcmConfigSource = "env" | "plugin-config" | "default";
 
 export type LcmConfigDiagnostics = {
@@ -130,12 +118,8 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
-  /** When true, maintain() may rewrite transcript entries for transcript GC. */
-  transcriptGcEnabled: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
-  /** Automatically rotate LCM-managed session JSONL files that exceed a size ceiling. */
-  autoRotateSessionFiles: AutoRotateSessionFilesConfig;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
   maxAssemblyTokenBudget?: number;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
@@ -239,13 +223,6 @@ function toProactiveThresholdCompactionMode(
   return undefined;
 }
 
-function toAutoRotateSessionFileMode(value: unknown): AutoRotateSessionFileMode | undefined {
-  const normalized = toStr(value)?.toLowerCase();
-  if (normalized === "rotate" || normalized === "warn" || normalized === "off") {
-    return normalized;
-  }
-  return undefined;
-}
 
 /** Coerce a byte threshold to a positive integer. */
 function toPositiveInteger(value: number | undefined): number | undefined {
@@ -340,14 +317,9 @@ export function resolveLcmConfigWithDiagnostics(
   const pc = pluginConfig ?? {};
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
-  const autoRotateSessionFiles = toRecord(pc.autoRotateSessionFiles);
   const proactiveThresholdCompactionMode = toProactiveThresholdCompactionMode(
     env.LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE,
   ) ?? toProactiveThresholdCompactionMode(pc.proactiveThresholdCompactionMode) ?? "deferred";
-  const autoRotateSessionFileSizeBytes =
-    toPositiveInteger(parseFiniteInt(env.LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES))
-      ?? toPositiveInteger(toNumber(autoRotateSessionFiles?.sizeBytes))
-      ?? DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES;
   const resolvedLeafChunkTokens =
     parseFiniteInt(env.LCM_LEAF_CHUNK_TOKENS)
       ?? toNumber(pc.leafChunkTokens) ?? 20000;
@@ -531,30 +503,7 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_PRUNE_HEARTBEAT_OK !== undefined
           ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
           : toBool(pc.pruneHeartbeatOk) ?? false,
-      transcriptGcEnabled:
-        env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
-          ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"
-          : toBool(pc.transcriptGcEnabled) ?? false,
       proactiveThresholdCompactionMode,
-      autoRotateSessionFiles: {
-        enabled:
-          env.LCM_AUTO_ROTATE_SESSION_FILES_ENABLED !== undefined
-            ? env.LCM_AUTO_ROTATE_SESSION_FILES_ENABLED !== "false"
-            : toBool(autoRotateSessionFiles?.enabled) ?? true,
-        createBackups:
-          env.LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS !== undefined
-            ? env.LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS === "true"
-            : toBool(autoRotateSessionFiles?.createBackups) ?? false,
-        sizeBytes: autoRotateSessionFileSizeBytes,
-        startup:
-          toAutoRotateSessionFileMode(env.LCM_AUTO_ROTATE_SESSION_FILES_STARTUP)
-            ?? toAutoRotateSessionFileMode(autoRotateSessionFiles?.startup)
-            ?? "rotate",
-        runtime:
-          toAutoRotateSessionFileMode(env.LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME)
-            ?? toAutoRotateSessionFileMode(autoRotateSessionFiles?.runtime)
-            ?? "rotate",
-      },
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)
           ?? toNumber(pc.maxAssemblyTokenBudget) ?? undefined,

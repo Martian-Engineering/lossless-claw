@@ -41,15 +41,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileSummaryModel: "",
       timezone: "UTC",
       pruneHeartbeatOk: false,
-      transcriptGcEnabled: false,
       proactiveThresholdCompactionMode: "deferred",
-      autoRotateSessionFiles: {
-        enabled: true,
-        createBackups: false,
-        sizeBytes: 2 * 1024 * 1024,
-        startup: "rotate",
-        runtime: "rotate",
-      },
       summaryMaxOverageFactor: 3,
     },
     complete: vi.fn(async () => ({

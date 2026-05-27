@@ -149,19 +149,11 @@ function attachSessionStoreApi(api: OpenClawPluginApi, sessionStorePath: string)
       session: {
         resolveStorePath: (store?: string) => string;
         loadSessionStore: (storePath: string) => Record<string, unknown>;
-        resolveSessionFilePath: (
-          sessionId: string,
-          entry?: { sessionFile?: unknown },
-        ) => string;
       };
     };
   }).channel.session = {
     resolveStorePath: (store?: string) => (typeof store === "string" ? store : sessionStorePath),
     loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
-    resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-      typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-        ? entry.sessionFile
-        : join(tmpdir(), `${runtimeSessionId}.jsonl`),
   };
 }
 
@@ -260,7 +252,6 @@ describe("lcm plugin registration", () => {
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
-      transcriptGcEnabled: true,
       proactiveThresholdCompactionMode: "inline",
       largeFileThresholdTokens: 12345,
     });
@@ -296,7 +287,6 @@ describe("lcm plugin registration", () => {
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
-      transcriptGcEnabled: true,
       proactiveThresholdCompactionMode: "inline",
       largeFileTokenThreshold: 12345,
     });
@@ -307,7 +297,6 @@ describe("lcm plugin registration", () => {
     expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, proactiveThresholdCompactionMode=inline)`,
     );
-    expect(infoLog).toHaveBeenCalledWith("[lcm] Transcript GC enabled (default false)");
     expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Proactive threshold compaction mode: inline (default deferred)",
     );
@@ -746,68 +735,6 @@ describe("lcm plugin registration", () => {
     );
   });
 
-  it("preserves registration config fallback when live runtime config is unavailable for startup scans", async () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const sessionStorePath = join(
-      tmpdir(),
-      `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
-    );
-    const sessionId = `alpha-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const sessionKey = `agent:alpha:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFile = join(tmpdir(), `${sessionId}.jsonl`);
-
-    writeFileSync(
-      sessionStorePath,
-      `${JSON.stringify({
-        [sessionKey]: {
-          sessionId,
-          sessionFile,
-        },
-      }, null, 2)}\n`,
-      "utf8",
-    );
-
-    const { api, getFactory } = buildApi({ enabled: true, dbPath });
-    api.config = {
-      session: {
-        store: sessionStorePath,
-      },
-      agents: {
-        list: [{ id: "alpha", enabled: true }],
-      },
-    } as OpenClawPluginApi["config"];
-    attachSessionStoreApi(api, sessionStorePath);
-    delete (api.runtime as unknown as { config?: unknown }).config;
-
-    lcmPlugin.register(api);
-
-    const factory = getFactory();
-    expect(factory).toBeTypeOf("function");
-    const engine = factory!() as {
-      deps?: {
-        listStartupSessionFileCandidates: () => Promise<Array<{
-          sessionId: string;
-          sessionKey: string;
-          sessionFile: string;
-          agentId: string;
-          storePath: string;
-        }>>;
-      };
-    };
-
-    await expect(engine.deps?.listStartupSessionFileCandidates()).resolves.toEqual([
-      {
-        sessionId,
-        sessionKey,
-        sessionFile,
-        agentId: "alpha",
-        storePath: sessionStorePath,
-      },
-    ]);
-    rmSync(sessionStorePath, { force: true });
-  });
-
   it("uses runtime OpenClaw defaults when api.pluginConfig is ready before api.config", () => {
     const { api, getFactory, infoLog } = buildApi(
       {
@@ -908,7 +835,6 @@ describe("lcm plugin registration", () => {
     const startupBannerMessages = [...firstMessages, ...secondMessages].filter((message) =>
       [
         "[lcm] Plugin loaded (enabled=true, db=",
-        "[lcm] Transcript GC ",
         "[lcm] Proactive threshold compaction mode:",
         "[lcm] Compaction summarization model:",
         "[lcm] Ignoring sessions matching ",
@@ -918,7 +844,6 @@ describe("lcm plugin registration", () => {
 
     expect(startupBannerMessages.sort()).toEqual([
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, proactiveThresholdCompactionMode=deferred)`,
-      "[lcm] Transcript GC disabled (default false)",
       "[lcm] Proactive threshold compaction mode: deferred (default deferred)",
       "[lcm] Compaction summarization model: (unconfigured)",
       "[lcm] Ignoring sessions matching 2 pattern(s) from plugin config: agent:*:cron:**, agent:main:subagent:**",
@@ -933,8 +858,8 @@ describe("lcm plugin registration", () => {
       expect.not.arrayContaining([expect.stringContaining("[lcm] Migration successful")]),
     );
   });
-  it("registers with a clear warning when runtime.llm is unavailable", () => {
-    const { api, getFactory, warnLog } = buildApi(
+  it("registers with a debug note when plugin-wide runtime.llm is unavailable", () => {
+    const { api, getFactory, debugLog, warnLog } = buildApi(
       {
         enabled: true,
       },
@@ -944,7 +869,10 @@ describe("lcm plugin registration", () => {
 
     expect(() => lcmPlugin.register(api)).not.toThrow();
     expect(getFactory()).toBeTypeOf("function");
-    expect(warnLog).toHaveBeenCalledWith(
+    expect(debugLog).toHaveBeenCalledWith(
+      expect.stringContaining("Plugin-wide runtime.llm.complete is unavailable"),
+    );
+    expect(warnLog).not.toHaveBeenCalledWith(
       expect.stringContaining("runtime.llm.complete is unavailable"),
     );
   });
@@ -1018,14 +946,12 @@ describe("lcm plugin registration", () => {
     );
     const sessionId = `test-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const sessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFilePath = join(tmpdir(), `${sessionId}.jsonl`);
 
     writeFileSync(
       sessionStorePath,
       `${JSON.stringify({
         [sessionKey]: {
           sessionId,
-          sessionFile: sessionFilePath,
           totalTokens: null,
           totalTokensFresh: false,
           inputTokens: 1_200,
@@ -1051,19 +977,11 @@ describe("lcm plugin registration", () => {
         session: {
           resolveStorePath: (store?: string) => string;
           loadSessionStore: (storePath: string) => Record<string, unknown>;
-          resolveSessionFilePath: (
-            sessionId: string,
-            entry?: { sessionFile?: unknown },
-          ) => string;
         };
       };
     }).channel.session = {
       resolveStorePath: (store?: string) => (typeof store === "string" ? store : sessionStorePath),
       loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
-      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-          ? entry.sessionFile
-          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
     };
     lcmPlugin.register(first.api);
     const firstFactory = first.getFactory();
@@ -1115,19 +1033,11 @@ describe("lcm plugin registration", () => {
         session: {
           resolveStorePath: (store?: string) => string;
           loadSessionStore: (storePath: string) => Record<string, unknown>;
-          resolveSessionFilePath: (
-            sessionId: string,
-            entry?: { sessionFile?: unknown },
-          ) => string;
         };
       };
     }).channel.session = {
       resolveStorePath: (store?: string) => (typeof store === "string" ? store : sessionStorePath),
       loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
-      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-          ? entry.sessionFile
-          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
     };
     lcmPlugin.register(second.api);
     const secondFactory = second.getFactory();
@@ -1171,14 +1081,12 @@ describe("lcm plugin registration", () => {
     );
     const sessionId = `fresh-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const sessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFilePath = join(tmpdir(), `${sessionId}.jsonl`);
 
     writeFileSync(
       sessionStorePath,
       `${JSON.stringify({
         [sessionKey]: {
           sessionId,
-          sessionFile: sessionFilePath,
           totalTokens: 50_000,
           totalTokensFresh: true,
           inputTokens: 1_200,
@@ -1275,14 +1183,12 @@ describe("lcm plugin registration", () => {
     const sessionId = `stale-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const sessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
     const concurrentSessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFilePath = join(tmpdir(), `${sessionId}.jsonl`);
 
     writeFileSync(
       sessionStorePath,
       `${JSON.stringify({
         [sessionKey]: {
           sessionId,
-          sessionFile: sessionFilePath,
           totalTokens: null,
           totalTokensFresh: false,
           inputTokens: 1_200,
@@ -1354,10 +1260,6 @@ describe("lcm plugin registration", () => {
         session: {
           resolveStorePath: (store?: string) => string;
           loadSessionStore: (storePath: string) => Record<string, unknown>;
-          resolveSessionFilePath: (
-            sessionId: string,
-            entry?: { sessionFile?: unknown },
-          ) => string;
         };
       };
     }).channel.session = {
@@ -1372,7 +1274,6 @@ describe("lcm plugin registration", () => {
               ...loaded,
               [concurrentSessionKey]: {
                 sessionId: "concurrent-session",
-                sessionFile: join(tmpdir(), "concurrent-session.jsonl"),
                 totalTokens: 12_345,
                 totalTokensFresh: true,
               },
@@ -1382,10 +1283,6 @@ describe("lcm plugin registration", () => {
         }
         return loaded;
       },
-      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-          ? entry.sessionFile
-          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
     };
     lcmPlugin.register(second.api);
     const secondFactory = second.getFactory();
