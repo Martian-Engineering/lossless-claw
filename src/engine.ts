@@ -5411,6 +5411,15 @@ export class LcmContextEngine implements ContextEngine {
     return await this.withSessionQueue(
       queueKey,
       async () => {
+        await this.conversationStore.withTransaction(async () => {
+          await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+            phase: "afterTurn",
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            sessionFile: params.sessionFile,
+            createReplacement: false,
+          });
+        });
         const conversation = await this.conversationStore.getConversationForSession({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -5727,6 +5736,71 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
+  /**
+   * Recover lifecycle splits that the host missed when it pruned a transcript
+   * file before Lossless saw a reset/session_end hook. Without this, stable
+   * session keys can reattach a new runtime UUID to a stale active conversation
+   * and assemble old assistant tails as if they belonged to the new turn.
+   */
+  private async rotateStaleSessionKeyConversationIfTrackedTranscriptMissing(params: {
+    phase: "bootstrap" | "assemble" | "afterTurn";
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile?: string;
+    createReplacement?: boolean;
+  }): Promise<boolean> {
+    const normalizedSessionKey = params.sessionKey?.trim();
+    if (!normalizedSessionKey) {
+      return false;
+    }
+
+    const activeByKey = await this.conversationStore.getConversationBySessionKey(
+      normalizedSessionKey,
+    );
+    if (!activeByKey || activeByKey.sessionId === params.sessionId) {
+      return false;
+    }
+
+    const activeBootstrapState = await this.summaryStore.getConversationBootstrapState(
+      activeByKey.conversationId,
+    );
+    const trackedSessionFile = activeBootstrapState?.sessionFilePath;
+    if (typeof trackedSessionFile !== "string" || trackedSessionFile.length === 0) {
+      return false;
+    }
+
+    const transcriptRotated =
+      params.sessionFile === undefined || trackedSessionFile !== params.sessionFile;
+    if (!transcriptRotated) {
+      return false;
+    }
+
+    try {
+      await stat(trackedSessionFile);
+      return false;
+    } catch (err) {
+      if (!isMissingFileError(err)) {
+        this.deps.log.warn(
+          `[lcm] ${params.phase}: could not verify tracked transcript path conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
+        );
+        return false;
+      }
+    }
+
+    this.deps.log.warn(
+      `[lcm] ${params.phase}: detected reset/rollover without prior lifecycle split; rotating conversation=${activeByKey.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} oldSessionId=${activeByKey.sessionId} oldFile=${trackedSessionFile}${params.sessionFile ? ` newFile=${params.sessionFile}` : ""}`,
+    );
+    await this.applySessionReplacement({
+      reason: `${params.phase} session-file rollover fallback`,
+      sessionId: activeByKey.sessionId,
+      sessionKey: normalizedSessionKey,
+      nextSessionId: params.sessionId,
+      nextSessionKey: normalizedSessionKey,
+      createReplacement: params.createReplacement ?? true,
+    });
+    return true;
+  }
+
   async bootstrap(params: {
     sessionId: string;
     sessionFile: string;
@@ -5781,52 +5855,12 @@ export class LcmContextEngine implements ContextEngine {
             });
           };
 
-          // Guard: when a sessionKey resumes on a new sessionId and the tracked
-          // transcript file has disappeared, treat it as a missed /reset and
-          // rotate the conversation before getOrCreate would re-attach to it.
-          const normalizedSessionKey = params.sessionKey?.trim();
-          if (normalizedSessionKey) {
-            const activeByKey = await this.conversationStore.getConversationBySessionKey(normalizedSessionKey);
-            if (activeByKey && activeByKey.sessionId !== params.sessionId) {
-              const activeBootstrapState = await this.summaryStore.getConversationBootstrapState(
-                activeByKey.conversationId,
-              );
-              const trackedSessionFile = activeBootstrapState?.sessionFilePath;
-              let trackedSessionFileMissing = false;
-              if (typeof trackedSessionFile === "string" && trackedSessionFile.length > 0) {
-                try {
-                  await stat(trackedSessionFile);
-                } catch (err) {
-                  const code = getErrorCode(err);
-                  if (code === "ENOENT" || code === "ENOTDIR") {
-                    trackedSessionFileMissing = true;
-                  } else {
-                    this.deps.log.warn(
-                      `[lcm] bootstrap: could not verify tracked transcript path conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
-                    );
-                  }
-                }
-              }
-              const transcriptRotated =
-                typeof trackedSessionFile === "string" &&
-                trackedSessionFile.length > 0 &&
-                trackedSessionFile !== params.sessionFile;
-
-              if (transcriptRotated && trackedSessionFileMissing) {
-                this.deps.log.warn(
-                  `[lcm] bootstrap: detected reset/rollover without prior lifecycle split; rotating conversation=${activeByKey.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} oldSessionId=${activeByKey.sessionId} oldFile=${trackedSessionFile} newFile=${params.sessionFile}`,
-                );
-                await this.applySessionReplacement({
-                  reason: "bootstrap session-file rollover fallback",
-                  sessionId: activeByKey.sessionId,
-                  sessionKey: normalizedSessionKey,
-                  nextSessionId: params.sessionId,
-                  nextSessionKey: normalizedSessionKey,
-                  createReplacement: true,
-                });
-              }
-            }
-          }
+          await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+            phase: "bootstrap",
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            sessionFile: params.sessionFile,
+          });
 
           const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
             sessionKey: params.sessionKey,
@@ -7246,6 +7280,22 @@ export class LcmContextEngine implements ContextEngine {
         `session=${params.sessionId}`,
         ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
       ].join(" ");
+
+      await this.withSessionQueue(
+        this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+        async () =>
+          this.conversationStore.withTransaction(async () => {
+            await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+              phase: "assemble",
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+            });
+          }),
+        {
+          operationName: "assembleLifecycleGuard",
+          context: sessionLabel,
+        },
+      );
 
       const conversation = await this.conversationStore.getConversationForSession({
         sessionId: params.sessionId,

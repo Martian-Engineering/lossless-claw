@@ -3452,6 +3452,64 @@ describe("LcmContextEngine.bootstrap", () => {
     ]);
   });
 
+  it("rotates before assemble when a stable sessionKey points at a pruned transcript", async () => {
+    const engine = createEngine();
+    const firstSessionId = "assemble-missed-reset-fallback-1";
+    const secondSessionId = "assemble-missed-reset-fallback-2";
+    const sessionKey = "agent:main:test:assemble-missed-reset-fallback";
+    const firstSessionFile = createSessionFilePath("assemble-missed-reset-fallback-old");
+    writeLeafTranscript(firstSessionFile, [
+      { role: "user", content: "what model produced this response?" },
+      { role: "assistant", content: "openai-codex/gpt-5.5" },
+    ]);
+
+    const first = await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: firstSessionFile,
+    });
+    expect(first).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const originalConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(originalConversation).not.toBeNull();
+
+    rmSync(firstSessionFile, { force: true });
+
+    const liveMessages = [makeMessage({ role: "user", content: "new live prompt" })];
+    const assembled = await engine.assemble({
+      sessionId: secondSessionId,
+      sessionKey,
+      messages: liveMessages,
+      tokenBudget: 4_096,
+    });
+
+    expect(assembled.messages).toEqual(liveMessages);
+    expect(
+      assembled.messages.some((message) => message.content === "openai-codex/gpt-5.5"),
+    ).toBe(false);
+
+    const activeConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeConversation).not.toBeNull();
+    expect(activeConversation!.conversationId).not.toBe(originalConversation!.conversationId);
+    expect(activeConversation!.sessionId).toBe(secondSessionId);
+    expect(activeConversation!.active).toBe(true);
+
+    const archivedConversation = await engine.getConversationStore().getConversation(
+      originalConversation!.conversationId,
+    );
+    expect(archivedConversation?.active).toBe(false);
+    expect(archivedConversation?.archivedAt).not.toBeNull();
+  });
+
   it("preserves the active conversation when the tracked transcript stat fails for a non-missing reason", async () => {
     const engine = createEngine();
     const firstSessionId = "bootstrap-stat-failure-fallback-1";
@@ -8674,6 +8732,77 @@ describe("LcmContextEngine fidelity and token budget", () => {
       .getConversationBootstrapState(conversation!.conversationId);
     expect(checkpoint?.sessionFilePath).toBe(newSessionFile);
     expect(checkpoint?.lastProcessedOffset).toBe(statSync(newSessionFile).size);
+  });
+
+  it("afterTurn archives a stale active conversation when the prior keyed transcript was pruned", async () => {
+    const engine = createEngine();
+    const firstSessionId = "after-turn-missed-reset-fallback-1";
+    const secondSessionId = "after-turn-missed-reset-fallback-2";
+    const sessionKey = "agent:main:test:after-turn-missed-reset-fallback";
+    const oldSessionFile = createSessionFilePath("after-turn-missed-reset-fallback-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old turn user" },
+      { role: "assistant", content: "openai-codex/gpt-5.5" },
+    ]);
+
+    const first = await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+    expect(first).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const originalConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(originalConversation).not.toBeNull();
+
+    rmSync(oldSessionFile, { force: true });
+
+    const newSessionFile = createSessionFilePath("after-turn-missed-reset-fallback-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "new turn user" },
+      { role: "assistant", content: "new turn assistant" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "new turn user" }),
+        makeMessage({ role: "assistant", content: "new turn assistant" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const activeConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeConversation).not.toBeNull();
+    expect(activeConversation!.conversationId).not.toBe(originalConversation!.conversationId);
+    expect(activeConversation!.sessionId).toBe(secondSessionId);
+    expect(activeConversation!.active).toBe(true);
+
+    const archivedConversation = await engine.getConversationStore().getConversation(
+      originalConversation!.conversationId,
+    );
+    expect(archivedConversation?.active).toBe(false);
+    expect(archivedConversation?.archivedAt).not.toBeNull();
+
+    const activeMessages = await engine.getConversationStore().getMessages(
+      activeConversation!.conversationId,
+    );
+    expect(activeMessages.map((message) => message.content)).toEqual([
+      "new turn user",
+      "new turn assistant",
+    ]);
   });
 
   it("afterTurn skips persistence when full reread finds no anchor and imports nothing", async () => {
