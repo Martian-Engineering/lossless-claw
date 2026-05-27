@@ -56,6 +56,8 @@ function createTestConfig(databasePath: string): LcmConfig {
     pinnedFilesPerAgent: {},
     circuitBreakerThreshold: 5,
     circuitBreakerCooldownMs: 1_800_000,
+    replayFloodThresholdExternal: 3,
+    replayFloodThresholdInternal: 32,
   };
 }
 

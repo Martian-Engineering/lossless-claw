@@ -155,6 +155,21 @@ export type LcmConfig = {
   circuitBreakerThreshold: number;
   /** Cooldown in milliseconds before the circuit breaker auto-resets (default 30 min). */
   circuitBreakerCooldownMs: number;
+  /**
+   * Anti-replay flood threshold for EXTERNAL-input roles (currently `user`).
+   * Identical (conversation, role, content, created_at-in-seconds) tuples
+   * are rebroadcast-attack-shaped for inbound user inputs; default 3.
+   */
+  replayFloodThresholdExternal: number;
+  /**
+   * Anti-replay flood threshold for INTERNAL-runtime roles
+   * (`tool`, `assistant`, `system`). These messages are not subject to
+   * third-party rebroadcast and can legitimately repeat in fast sub-agent
+   * bursts (e.g. idempotent tool results). Default 32 absorbs typical bursts.
+   * Set to a finite value to retain a sanity ceiling; set to `Infinity` to
+   * disable the guard for internal roles entirely.
+   */
+  replayFloodThresholdInternal: number;
   /** Explicit fallback provider/model pairs for compaction summarization. */
   fallbackProviders: Array<{ provider: string; model: string }>;
   /** Legacy cache-sensitive policy. Accepted but not used for automatic compaction. */
@@ -633,6 +648,12 @@ export function resolveLcmConfigWithDiagnostics(
       circuitBreakerCooldownMs:
         parseFiniteInt(env.LCM_CIRCUIT_BREAKER_COOLDOWN_MS)
           ?? toNumber(pc.circuitBreakerCooldownMs) ?? 1_800_000,
+      replayFloodThresholdExternal:
+        parseFiniteInt(env.LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL)
+          ?? toNumber(pc.replayFloodThresholdExternal) ?? 3,
+      replayFloodThresholdInternal:
+        parseFiniteInt(env.LCM_REPLAY_FLOOD_THRESHOLD_INTERNAL)
+          ?? toNumber(pc.replayFloodThresholdInternal) ?? 32,
       fallbackProviders:
         parseFallbackProviders(env.LCM_FALLBACK_PROVIDERS)
           ?? toFallbackProviderArray(pc.fallbackProviders) ?? [],

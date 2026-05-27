@@ -57,7 +57,9 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     delegationTimeoutMs: 120000,
     customInstructions: "",
     circuitBreakerThreshold: 3, // Low threshold for testing
-    circuitBreakerCooldownMs: 5000, // 5 seconds for testing
+    circuitBreakerCooldownMs: 5000,
+    replayFloodThresholdExternal: 3,
+    replayFloodThresholdInternal: 32, // 5 seconds for testing
     fallbackProviders: [],
     cacheAwareCompaction: {
       enabled: true,

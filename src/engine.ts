@@ -3452,6 +3452,8 @@ export class LcmContextEngine implements ContextEngine {
 
     this.conversationStore = new ConversationStore(this.db, {
       fts5Available: this.fts5Available,
+      replayFloodThresholdExternal: this.config.replayFloodThresholdExternal,
+      replayFloodThresholdInternal: this.config.replayFloodThresholdInternal,
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.focusBriefStore = new FocusBriefStore(this.db);

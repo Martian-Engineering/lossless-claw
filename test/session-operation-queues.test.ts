@@ -64,6 +64,8 @@ function createTestConfig(databasePath: string): LcmConfig {
     customInstructions: "",
     circuitBreakerThreshold: 5,
     circuitBreakerCooldownMs: 1_800_000,
+    replayFloodThresholdExternal: 3,
+    replayFloodThresholdInternal: 32,
     fallbackProviders: [],
     cacheAwareCompaction: {
       enabled: true,
