@@ -7162,6 +7162,15 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget,
         observedCurrentTokenCount,
       );
+      // Preserve the decision's actual reason so leaf-trigger compaction is
+      // visible in the maintenance row and is correctly re-validated by the
+      // legacy-debt clear path in consumeDeferredCompactionDebt (which keys
+      // off `reason === "threshold"`). Reasons other than `"threshold"`
+      // re-evaluate before clearing, and our updated evaluate() now returns
+      // `shouldCompact:true` for leaf-trigger so the row will not be
+      // prematurely cleared while the trigger remains hot.
+      const decisionReason: string =
+        thresholdDecision.reason === "leaf-trigger" ? "leaf-trigger" : "threshold";
       if (this.config.proactiveThresholdCompactionMode === "inline") {
         if (thresholdDecision.shouldCompact) {
           const compactResult = await this.compact({
@@ -7175,20 +7184,20 @@ export class LcmContextEngine implements ContextEngine {
           });
           if (!compactResult.ok) {
             shouldRefreshBootstrapState = false;
-            await recordAfterTurnCompactionRetry("threshold");
+            await recordAfterTurnCompactionRetry(decisionReason);
           }
         }
       } else if (thresholdDecision.shouldCompact) {
         await this.recordDeferredCompactionDebt({
           conversationId: conversation.conversationId,
-          reason: "threshold",
+          reason: decisionReason,
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
         });
         deferredCompactionDrain = {
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
-          reason: "threshold",
+          reason: decisionReason,
         };
       }
     } catch (err) {

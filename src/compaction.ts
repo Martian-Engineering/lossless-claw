@@ -17,13 +17,22 @@ import { LcmProviderAuthError } from "./summarize.js";
 
 export interface CompactionDecision {
   shouldCompact: boolean;
-  reason: "threshold" | "manual" | "none";
+  reason: "threshold" | "leaf-trigger" | "manual" | "none";
   /** Persisted Lossless context tokens before runtime prompt overhead. */
   storedTokens: number;
   /** Runtime-observed prompt tokens, when supplied by the host. */
   observedTokens?: number;
   currentTokens: number;
   threshold: number;
+  /**
+   * Raw message tokens accumulated outside the protected fresh tail, when
+   * the leaf trigger was consulted. Populated when `reason === "leaf-trigger"`
+   * or when the threshold path also crossed the leaf trigger threshold; left
+   * unset otherwise so existing consumers see no behavioural change.
+   */
+  rawTokensOutsideTail?: number;
+  /** Leaf-trigger threshold (`leafChunkTokens`) used during evaluation. */
+  leafTriggerThreshold?: number;
 }
 
 export interface CompactionResult {
@@ -577,6 +586,10 @@ export class CompactionEngine {
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
 
     if (currentTokens > threshold) {
+      // Token-budget threshold path: also surface leaf-trigger telemetry so
+      // callers can see when both gates would fire on the same turn. Reason
+      // stays `"threshold"` to preserve the existing debt-routing contract.
+      const leafTrigger = await this.evaluateLeafTrigger(conversationId);
       return {
         shouldCompact: true,
         reason: "threshold",
@@ -584,6 +597,34 @@ export class CompactionEngine {
         ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
         currentTokens,
         threshold,
+        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
+        leafTriggerThreshold: leafTrigger.threshold,
+      };
+    }
+
+    // Threshold not crossed. Conversations that stay under the token-budget
+    // threshold can still accumulate raw messages indefinitely; without a
+    // leaf-trigger gate here, automatic compaction is never scheduled and
+    // the fresh-tail-protected raw tail grows unboundedly. Consult the leaf
+    // trigger so afterTurn can enqueue deferred debt before the threshold
+    // ever fires.
+    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    if (leafTrigger.shouldCompact) {
+      this.log.debug(
+        `[lcm] compaction.evaluate: leaf-trigger fired conversation=${conversationId} ` +
+          `rawTokensOutsideTail=${leafTrigger.rawTokensOutsideTail} ` +
+          `leafTriggerThreshold=${leafTrigger.threshold} ` +
+          `currentTokens=${currentTokens} threshold=${threshold}`,
+      );
+      return {
+        shouldCompact: true,
+        reason: "leaf-trigger",
+        storedTokens,
+        ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
+        currentTokens,
+        threshold,
+        rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
+        leafTriggerThreshold: leafTrigger.threshold,
       };
     }
 
@@ -594,6 +635,8 @@ export class CompactionEngine {
       ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
       currentTokens,
       threshold,
+      rawTokensOutsideTail: leafTrigger.rawTokensOutsideTail,
+      leafTriggerThreshold: leafTrigger.threshold,
     };
   }
 

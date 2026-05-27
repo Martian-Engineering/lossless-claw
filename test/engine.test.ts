@@ -10645,6 +10645,154 @@ describe("LcmContextEngine compaction telemetry", () => {
 
 });
 
+// ── Compaction.evaluate leaf-trigger gate (issue #639) ──────────────────────
+
+describe("LcmContextEngine.compact evaluate leaf-trigger gate", () => {
+  it("returns shouldCompact=true with reason=leaf-trigger when raw tokens exceed leafChunkTokens but stay under context threshold", async () => {
+    // Tiny leaf chunk so a single short turn pair already exceeds the leaf
+    // threshold, while a generous tokenBudget keeps `currentTokens <= contextThreshold * tokenBudget`.
+    const engine = createEngineWithConfig({
+      freshTailCount: 1,
+      leafChunkTokens: 1,
+      contextThreshold: 0.95,
+    });
+    const sessionId = "evaluate-leaf-trigger-under-threshold";
+
+    await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({ role: "user", content: "some accumulated raw history that is outside the fresh tail" }),
+        makeMessage({ role: "assistant", content: "more accumulated raw history that is outside the fresh tail" }),
+        makeMessage({ role: "user", content: "still in the fresh tail" }),
+      ],
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<{
+          shouldCompact: boolean;
+          reason: string;
+          rawTokensOutsideTail?: number;
+          leafTriggerThreshold?: number;
+          currentTokens: number;
+          threshold: number;
+        }>;
+      };
+    };
+
+    const decision = await privateEngine.compaction.evaluate(
+      conversation!.conversationId,
+      1_000_000,
+    );
+
+    expect(decision.shouldCompact).toBe(true);
+    expect(decision.reason).toBe("leaf-trigger");
+    expect(decision.rawTokensOutsideTail).toBeGreaterThan(0);
+    expect(decision.leafTriggerThreshold).toBe(1);
+    expect(decision.currentTokens).toBeLessThanOrEqual(decision.threshold);
+  });
+
+  it("returns shouldCompact=false with reason=none when neither threshold nor leaf trigger fires", async () => {
+    const engine = createEngineWithConfig({
+      freshTailCount: 4,
+      leafChunkTokens: 50_000,
+      contextThreshold: 0.95,
+    });
+    const sessionId = "evaluate-none";
+
+    await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({ role: "user", content: "hi" }),
+        makeMessage({ role: "assistant", content: "hello" }),
+      ],
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<{ shouldCompact: boolean; reason: string }>;
+      };
+    };
+
+    const decision = await privateEngine.compaction.evaluate(
+      conversation!.conversationId,
+      1_000_000,
+    );
+
+    expect(decision.shouldCompact).toBe(false);
+    expect(decision.reason).toBe("none");
+  });
+
+  it("afterTurn enqueues deferred compaction debt with reason=leaf-trigger when only the leaf gate fires", async () => {
+    const engine = createEngineWithConfig({
+      freshTailCount: 1,
+      leafChunkTokens: 1,
+      contextThreshold: 0.95,
+      proactiveThresholdCompactionMode: "deferred",
+    });
+    const sessionId = "after-turn-leaf-trigger-deferred";
+
+    // Seed enough raw history outside the fresh tail to trip the leaf trigger.
+    await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({ role: "user", content: "older raw turn that lives outside the fresh tail" }),
+        makeMessage({ role: "assistant", content: "older raw turn that lives outside the fresh tail" }),
+      ],
+    });
+
+    const privateEngine = engine as unknown as {
+      scheduleDeferredCompactionDebtDrain: (params: { reason: string }) => void;
+    };
+    const scheduleSpy = vi
+      .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+      .mockImplementation(() => {
+        // Don't actually drain; we just want to observe the queue handoff.
+      });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-leaf-trigger-deferred"),
+      messages: [makeMessage({ role: "user", content: "newest fresh-tail turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 1_000_000,
+      runtimeContext: { currentTokenCount: 100 },
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.reason).toBe("leaf-trigger");
+
+    expect(scheduleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "leaf-trigger" }),
+    );
+  });
+});
+
 // ── Compact token budget plumbing ───────────────────────────────────────────
 
 describe("LcmContextEngine.compact token budget plumbing", () => {
