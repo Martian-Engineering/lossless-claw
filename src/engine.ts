@@ -7254,9 +7254,16 @@ export class LcmContextEngine implements ContextEngine {
         conversation.conversationId,
       );
       if (maintenance?.pending || maintenance?.running) {
-        if (liveContextTokens > tokenBudget) {
+        const recordedContextTokens = this.normalizeObservedTokenCount(
+          maintenance.currentTokenCount ?? undefined,
+        );
+        const emergencyContextTokens = Math.max(
+          liveContextTokens,
+          recordedContextTokens ?? 0,
+        );
+        if (emergencyContextTokens > tokenBudget) {
           this.deps.log.warn(
-            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${liveContextTokens} tokenBudget=${tokenBudget} reason=over-budget`,
+            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${emergencyContextTokens} tokenBudget=${tokenBudget} reason=over-budget`,
           );
           try {
             await this.maybeConsumeDeferredCompactionDebtForAssemble({
@@ -7264,7 +7271,7 @@ export class LcmContextEngine implements ContextEngine {
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
               tokenBudget,
-              currentTokenCount: liveContextTokens,
+              currentTokenCount: emergencyContextTokens,
             });
           } catch (error) {
             this.deps.log.warn(
@@ -7273,7 +7280,7 @@ export class LcmContextEngine implements ContextEngine {
           }
         } else {
           this.deps.log.debug(
-            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${liveContextTokens} tokenBudget=${tokenBudget} reason=not-over-budget`,
+            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${emergencyContextTokens} tokenBudget=${tokenBudget} reason=not-over-budget`,
           );
         }
       }
