@@ -1,6 +1,6 @@
 # Agent tools
 
-LCM provides four tools for agents to search, inspect, and recall information from compacted conversation history.
+LCM provides tools for agents to search, inspect, and recall information from compacted conversation history.
 
 ## Usage patterns
 
@@ -13,6 +13,10 @@ Most recall tasks follow this escalation:
 3. **`lcm_expand_query`** — Deep recall: spawn a sub-agent to expand the DAG and answer a focused question
 
 Start with grep. If the snippet is enough, stop. If you need full summary content, use describe. If you need details that were compressed away, use expand_query.
+
+### Exact-key shortcut: recall_keys
+
+When the user asks for an exact all-caps identifier whose value is missing from active context, use `lcm_recall_keys` before broad grep/expand. It searches stored raw messages on demand and returns bounded evidence snippets with source message IDs. It does not mutate assembled context and refuses secret-shaped keys or snippets.
 
 ### When to expand
 
@@ -27,6 +31,36 @@ Summaries are lossy by design. The "Expand for details about:" footer at the end
 `lcm_expand_query` is bounded (~120s, scoped sub-agent) and relatively cheap. Don't ration it, but use `lcm_grep` first when you need broad discovery across many sessions.
 
 ## Tool reference
+
+### lcm_recall_keys
+
+Recover exact all-caps identifier facts from stored raw messages without injecting anything into assembled context.
+
+Use this for durable fact handles such as `CRABPOT_LCM_FACT`, `DEPLOYMENT_WINDOW_ID`, or `RELEASE_NOTE_TAG` when a prompt asks for the key and the active summary/tail does not show its value. Do not use it for secrets; keys like `API_KEY`, `TOKEN`, or `PRIVATE_KEY` are refused.
+
+**Parameters:**
+
+| Param | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `keys` | string[] | ✅ | — | Exact all-caps identifiers to recover, max 4 |
+| `conversationId` | number | | current session family | Specific physical conversation to search |
+| `allConversations` | boolean | | `false` | Search all conversations |
+| `limitPerKey` | number | | 2 | Max evidence snippets per key, 1–5 |
+
+**Returns:**
+- `matches` — Evidence snippets with `key`, `messageId`, `conversationId`, `role`, `createdAt`, and `snippet`
+- `skippedKeys` — Keys refused as duplicates, invalid exact-key shapes, or secret-shaped identifiers
+- `conversationScope` — Scope used for the lookup
+
+**Examples:**
+
+```
+# Recover a named fact from the current session family
+lcm_recall_keys(keys: ["CRABPOT_LCM_FACT"])
+
+# Recover up to three snippets for two exact keys
+lcm_recall_keys(keys: ["RELEASE_NOTE_TAG", "DEPLOYMENT_WINDOW_ID"], limitPerKey: 3)
+```
 
 ### lcm_grep
 
@@ -181,9 +215,10 @@ Add instructions to your agent's system prompt so it knows when to use LCM tools
 ## Memory & Context
 
 Use LCM tools for recall:
-1. `lcm_grep` — Search all conversations by keyword/regex. Prefer `mode: "full_text"` for short topic terms, use `mode: "regex"` for alternation or other regex syntax, quote exact phrases, use `sort: "relevance"` for older-topic lookups, and `sort: "hybrid"` when recency should still matter.
-2. `lcm_describe` — Inspect a specific summary (cheap, no sub-agent)
-3. `lcm_expand_query` — Deep recall with bounded sub-agent expansion
+1. `lcm_recall_keys` — Recover exact all-caps identifier facts from raw message evidence without changing assembled context.
+2. `lcm_grep` — Search all conversations by keyword/regex. Prefer `mode: "full_text"` for short topic terms, use `mode: "regex"` for alternation or other regex syntax, quote exact phrases, use `sort: "relevance"` for older-topic lookups, and `sort: "hybrid"` when recency should still matter.
+3. `lcm_describe` — Inspect a specific summary (cheap, no sub-agent)
+4. `lcm_expand_query` — Deep recall with bounded sub-agent expansion
 
 When summaries in context have an "Expand for details about:" footer
 listing something you need, use `lcm_expand_query` to get the full detail.

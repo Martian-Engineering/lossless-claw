@@ -20,6 +20,7 @@ import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
+import { createLcmRecallKeysTool } from "../tools/lcm-recall-keys-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type {
   LcmDependencies,
@@ -245,12 +246,16 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "**Contradictions/uncertainty:** If facts seem contradictory or uncertain, verify with lossless-claw recall tools before answering instead of trusting the summary at face value.",
   "",
   "**Tool escalation:**",
+  "For exact all-caps identifiers that look like durable fact handles (for example `PROJECT_FLAG`), call `lcm_recall_keys` first. It returns bounded raw-message evidence with source IDs without changing assembled context.",
+  "",
   "Recall order for compacted conversation history:",
-  "1. `lcm_grep` — search by regex or full-text across messages and summaries",
-  "2. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
-  "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
+  "1. `lcm_recall_keys` — recover exact all-caps identifier facts from raw message evidence",
+  "2. `lcm_grep` — search by regex or full-text across messages and summaries",
+  "3. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
+  "4. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
   "",
   "**`lcm_grep` routing guidance:**",
+  "- Use `lcm_recall_keys` instead of broad grep when the prompt asks for a specific all-caps identifier key whose value is missing from active context.",
   '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for regular expressions and literal patterns that use regex syntax.',
   '- Full-text queries are not regexes. Alternation (`A|B`), regex wildcards (`.*`), character classes (`[abc]`), and anchors (`^foo`, `foo$`) require `mode: "regex"`.',
   '- Full-text queries use FTS5 semantics, and FTS5 defaults to AND matching, so extra terms make matching stricter rather than broader.',
@@ -289,9 +294,10 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "State uncertainty instead of guessing from compacted summaries.",
   "",
   "**Precision flow:**",
-  "1. `lcm_grep` to find the relevant summaries or messages",
-  "2. `lcm_expand_query` when you need exact evidence before answering",
-  "3. Answer from the retrieved evidence instead of summary paraphrase",
+  "1. `lcm_recall_keys` for exact all-caps identifier keys.",
+  "2. `lcm_grep` to find the relevant summaries or messages.",
+  "3. `lcm_expand_query` when you need richer evidence before answering.",
+  "4. Answer from the retrieved evidence instead of summary paraphrase",
   "",
   "**Uncertainty checklist:**",
   "- Am I making an exact factual claim from compacted context?",
@@ -1391,6 +1397,10 @@ function wirePluginHandlers(
   api.registerTool(
     (ctx) => createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
     { name: "lcm_grep" },
+  );
+  api.registerTool(
+    (ctx) => createLcmRecallKeysTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    { name: "lcm_recall_keys" },
   );
   api.registerTool(
     (ctx) => createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),

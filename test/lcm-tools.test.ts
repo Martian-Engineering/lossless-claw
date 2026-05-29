@@ -1,12 +1,17 @@
+import { DatabaseSync } from "node:sqlite";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createDelegatedExpansionGrant,
   resetDelegatedExpansionGrantsForTests,
 } from "../src/expansion-auth.js";
 import { formatTimestamp } from "../src/compaction.js";
+import { getLcmDbFeatures } from "../src/db/features.js";
+import { runLcmMigrations } from "../src/db/migration.js";
+import { ConversationStore } from "../src/store/conversation-store.js";
 import { createLcmDescribeTool } from "../src/tools/lcm-describe-tool.js";
 import { createLcmExpandTool } from "../src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
+import { createLcmRecallKeysTool } from "../src/tools/lcm-recall-keys-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
@@ -80,6 +85,17 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
     },
     ...overrides,
   } as LcmDependencies;
+}
+
+function createTestDb(): { db: DatabaseSync; conversationStore: ConversationStore } {
+  const db = new DatabaseSync(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  const { fts5Available } = getLcmDbFeatures(db);
+  runLcmMigrations(db, { fts5Available });
+  return {
+    db,
+    conversationStore: new ConversationStore(db, { fts5Available }),
+  };
 }
 
 function buildLcmEngine(params: {
@@ -412,6 +428,314 @@ describe("LCM tools session scoping", () => {
     );
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("session family rooted at 42 (3 segments)");
+  });
+
+  it("lcm_recall_keys returns exact-key raw evidence with source message IDs", async () => {
+    const createdAt = new Date("2026-01-04T00:00:00.000Z");
+    const searchMessages = vi.fn(async () => [
+      {
+        messageId: 101,
+        conversationId: 42,
+        role: "user",
+        snippet: "CRABPOT_LCM_FACT",
+        createdAt,
+        rank: 0,
+      },
+    ]);
+    const getMessageById = vi.fn(async () => ({
+      messageId: 101,
+      conversationId: 42,
+      seq: 7,
+      role: "user",
+      content: "Remember blue-lantern-42 as CRABPOT_LCM_FACT.",
+      tokenCount: 8,
+      createdAt,
+      largeContent: null,
+    }));
+    const tool = createLcmRecallKeysTool({
+      deps: makeDeps(),
+      lcm: {
+        getConversationStore: () => ({
+          getConversationBySessionKey: vi.fn(async () => ({
+            conversationId: 42,
+            sessionId: "legacy-session",
+            sessionKey: "agent:main:main",
+            active: true,
+            archivedAt: null,
+            title: null,
+            bootstrappedAt: null,
+            createdAt,
+            updatedAt: createdAt,
+          })),
+          getConversationFamilyIds: vi.fn(async () => [42, 21]),
+          searchMessages,
+          getMessageById,
+        }),
+      } as never,
+      sessionKey: "agent:main:main",
+    });
+
+    const result = await tool.execute("call-recall-key", {
+      keys: ["CRABPOT_LCM_FACT"],
+    });
+
+    expect(searchMessages).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        conversationIds: [42, 21],
+        mode: "regex",
+        query: expect.stringContaining("CRABPOT_LCM_FACT"),
+      }),
+    );
+    expect(result.details).toMatchObject({
+      keys: ["CRABPOT_LCM_FACT"],
+      matchCount: 1,
+      matches: [
+        {
+          key: "CRABPOT_LCM_FACT",
+          messageId: 101,
+          conversationId: 42,
+          role: "user",
+          createdAt: createdAt.toISOString(),
+          snippet: "Remember blue-lantern-42 as CRABPOT_LCM_FACT.",
+        },
+      ],
+    });
+  });
+
+  it("lcm_recall_keys rejects secret-shaped keys and sensitive snippets", async () => {
+    const createdAt = new Date("2026-01-05T00:00:00.000Z");
+    const stripeLikeSecret = ["sk", "live", "1234567890abcdefghijklmnopqrstuvwxyz"].join("_");
+    const searchMessages = vi.fn(async () => [
+      {
+        messageId: 201,
+        conversationId: 42,
+        role: "user",
+        snippet: "PROJECT_ID",
+        createdAt,
+        rank: 0,
+      },
+    ]);
+    const getMessageById = vi.fn(async () => ({
+      messageId: 201,
+      conversationId: 42,
+      seq: 3,
+      role: "user",
+      content: `PROJECT_ID is launch-alpha; Stripe value ${stripeLikeSecret}.`,
+      tokenCount: 8,
+      createdAt,
+      largeContent: null,
+    }));
+    const tool = createLcmRecallKeysTool({
+      deps: makeDeps(),
+      lcm: {
+        getConversationStore: () => ({
+          getConversationBySessionId: vi.fn(async () => ({
+            conversationId: 42,
+            sessionId: "session-1",
+            sessionKey: null,
+            active: true,
+            archivedAt: null,
+            title: null,
+            bootstrappedAt: null,
+            createdAt,
+            updatedAt: createdAt,
+          })),
+          getConversationFamilyIds: vi.fn(async () => [42]),
+          searchMessages,
+          getMessageById,
+        }),
+      } as never,
+      sessionId: "session-1",
+    });
+
+    const result = await tool.execute("call-sensitive-recall", {
+      keys: ["API_KEY", "PROJECT_ID"],
+    });
+
+    expect(searchMessages).toHaveBeenCalledTimes(1);
+    expect(searchMessages).toHaveBeenCalledWith(
+      expect.objectContaining({ query: expect.stringContaining("PROJECT_ID") }),
+    );
+    expect(result.details).toMatchObject({
+      keys: ["PROJECT_ID"],
+      skippedKeys: [{ key: "API_KEY", reason: "sensitive_identifier" }],
+      matches: [],
+      matchCount: 0,
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).not.toContain(stripeLikeSecret);
+  });
+
+  it("lcm_recall_keys allows ordinary key wording in safe snippets", async () => {
+    const createdAt = new Date("2026-01-05T01:00:00.000Z");
+    const tool = createLcmRecallKeysTool({
+      deps: makeDeps(),
+      lcm: {
+        getConversationStore: () => ({
+          getConversationBySessionId: vi.fn(async () => ({
+            conversationId: 42,
+            sessionId: "session-1",
+            sessionKey: null,
+            active: true,
+            archivedAt: null,
+            title: null,
+            bootstrappedAt: null,
+            createdAt,
+            updatedAt: createdAt,
+          })),
+          getConversationFamilyIds: vi.fn(async () => [42]),
+          searchMessages: vi.fn(async () => [
+            {
+              messageId: 251,
+              conversationId: 42,
+              role: "user",
+              snippet: "CRABPOT_LCM_FACT",
+              createdAt,
+              rank: 0,
+            },
+          ]),
+          getMessageById: vi.fn(async () => ({
+            messageId: 251,
+            conversationId: 42,
+            seq: 4,
+            role: "user",
+            content: "The key CRABPOT_LCM_FACT is blue-lantern-42.",
+            tokenCount: 8,
+            createdAt,
+            largeContent: null,
+          })),
+        }),
+      } as never,
+      sessionId: "session-1",
+    });
+
+    const result = await tool.execute("call-key-wording-recall", {
+      keys: ["CRABPOT_LCM_FACT"],
+    });
+
+    expect(result.details).toMatchObject({
+      keys: ["CRABPOT_LCM_FACT"],
+      matchCount: 1,
+      matches: [
+        {
+          key: "CRABPOT_LCM_FACT",
+          snippet: "The key CRABPOT_LCM_FACT is blue-lantern-42.",
+        },
+      ],
+    });
+  });
+
+  it("lcm_recall_keys scans past recent ineligible candidates with the real store", async () => {
+    const { db, conversationStore } = createTestDb();
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "session-1",
+        sessionKey: "agent:main:main",
+      });
+      const [validMessage] = await conversationStore.createMessagesBulk([
+        {
+          conversationId: conversation.conversationId,
+          seq: 0,
+          role: "user",
+          content: "Remember blue-lantern-42 as CRABPOT_LCM_FACT.",
+          tokenCount: 8,
+        },
+        ...Array.from({ length: 6 }, (_, index) => ({
+          conversationId: conversation.conversationId,
+          seq: index + 1,
+          role: "tool" as const,
+          content: `Tool echo ${index}: CRABPOT_LCM_FACT should not be returned.`,
+          tokenCount: 9,
+        })),
+      ]);
+      db.prepare(
+        `UPDATE messages
+         SET created_at = datetime('2026-01-01 00:00:00', printf('+%d seconds', seq))
+         WHERE conversation_id = ?`,
+      ).run(conversation.conversationId);
+
+      const tool = createLcmRecallKeysTool({
+        deps: makeDeps(),
+        lcm: {
+          getConversationStore: () => conversationStore,
+        } as never,
+        sessionKey: "agent:main:main",
+      });
+
+      const result = await tool.execute("call-real-store-starvation", {
+        keys: ["CRABPOT_LCM_FACT"],
+      });
+
+      expect(result.details).toMatchObject({
+        keys: ["CRABPOT_LCM_FACT"],
+        matchCount: 1,
+        matches: [
+          {
+            key: "CRABPOT_LCM_FACT",
+            messageId: validMessage?.messageId,
+            role: "user",
+            snippet: "Remember blue-lantern-42 as CRABPOT_LCM_FACT.",
+          },
+        ],
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("lcm_recall_keys does not accept substring matches as evidence", async () => {
+    const createdAt = new Date("2026-01-06T00:00:00.000Z");
+    const tool = createLcmRecallKeysTool({
+      deps: makeDeps(),
+      lcm: {
+        getConversationStore: () => ({
+          getConversationBySessionId: vi.fn(async () => ({
+            conversationId: 42,
+            sessionId: "session-1",
+            sessionKey: null,
+            active: true,
+            archivedAt: null,
+            title: null,
+            bootstrappedAt: null,
+            createdAt,
+            updatedAt: createdAt,
+          })),
+          getConversationFamilyIds: vi.fn(async () => [42]),
+          searchMessages: vi.fn(async () => [
+            {
+              messageId: 301,
+              conversationId: 42,
+              role: "user",
+              snippet: "CRABPOT_LCM_FACT_BACKUP",
+              createdAt,
+              rank: 0,
+            },
+          ]),
+          getMessageById: vi.fn(async () => ({
+            messageId: 301,
+            conversationId: 42,
+            seq: 3,
+            role: "user",
+            content: "CRABPOT_LCM_FACT_BACKUP is red-lantern-99.",
+            tokenCount: 7,
+            createdAt,
+            largeContent: null,
+          })),
+        }),
+      } as never,
+      sessionId: "session-1",
+    });
+
+    const result = await tool.execute("call-boundary-recall", {
+      keys: ["CRABPOT_LCM_FACT"],
+    });
+
+    expect(result.details).toMatchObject({
+      keys: ["CRABPOT_LCM_FACT"],
+      matches: [],
+      matchCount: 0,
+    });
   });
 
   it("lcm_describe blocks cross-conversation lookup unless allConversations=true", async () => {
