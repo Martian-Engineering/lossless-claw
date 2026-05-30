@@ -262,7 +262,7 @@ const MEDIA_PATH_RE = /^MEDIA:\/.+$/;
 const EMBEDDED_DATA_URL_RE = /data:[^;\s"'`]+;base64,[A-Za-z0-9+/=\s]+/gi;
 const MEDIA_ATTACHMENT_PART_TYPES = new Set(["file", "snapshot"]);
 const MEDIA_ATTACHMENT_RAW_TYPES = new Set(["file", "image", "snapshot"]);
-const PROVIDER_REASONING_RAW_TYPES = new Set(["reasoning", "thinking"]);
+const PROVIDER_REASONING_RAW_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 const STRUCTURED_MEDIA_TEXT_KEYS = ["text", "caption", "alt", "title", "summary"] as const;
 const STRUCTURED_MEDIA_NESTED_KEYS = [
   "content",
@@ -466,6 +466,10 @@ function extractMeaningfulStructuredText(value: unknown): string {
 
 /** Extract a readable fallback from one structured message part. */
 function extractMessagePartSummaryText(part: MessagePartRecord): string {
+  if (part.partType === "reasoning") {
+    return "";
+  }
+
   const sections: string[] = [];
   const text = extractMeaningfulStructuredText(part.textContent);
   if (text) {

@@ -596,10 +596,14 @@ const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
   ...TOOL_CALL_RAW_TYPES,
   ...TOOL_RESULT_RAW_TYPES,
 ]);
+const REASONING_RAW_TYPES: ReadonlySet<string> = new Set([
+  "thinking",
+  "redacted_thinking",
+  "reasoning",
+]);
 const REPLAY_CRITICAL_RAW_TYPES: ReadonlySet<string> = new Set([
   ...TOOL_RAW_TYPES,
-  "thinking",
-  "reasoning",
+  ...REASONING_RAW_TYPES,
 ]);
 const RAW_PAYLOAD_EXTERNALIZATION_REASON = "large_raw_message";
 
@@ -648,6 +652,10 @@ function extractStructuredText(value: unknown, depth: number = 0): string | unde
   }
 
   const record = value as Record<string, unknown>;
+
+  if (typeof record.type === "string" && REASONING_RAW_TYPES.has(record.type)) {
+    return undefined;
+  }
 
   // Skip tool call/result objects — their structured data belongs in the parts table, not content
   if (typeof record.type === "string" && TOOL_RAW_TYPES.has(record.type)) {
@@ -795,6 +803,7 @@ function toPartType(type: string): MessagePartType {
     case "text":
       return "text";
     case "thinking":
+    case "redacted_thinking":
     case "reasoning":
       return "reasoning";
     case "tool_use":
@@ -851,12 +860,15 @@ function extractMessageContent(content: unknown): string {
   if (Array.isArray(content) && content.length === 0) {
     return "";
   }
-  // If content is an array of only tool call/result objects, store as empty
+  // If content is an array of only tool call/result/reasoning objects, store as empty
   // (structured data is preserved in the message parts table)
   if (Array.isArray(content) && content.length > 0 && content.every(
     (item) => typeof item === "object" && item !== null && !Array.isArray(item) &&
       typeof (item as Record<string, unknown>).type === "string" &&
-      TOOL_RAW_TYPES.has((item as Record<string, unknown>).type as string)
+      (
+        TOOL_RAW_TYPES.has((item as Record<string, unknown>).type as string) ||
+        REASONING_RAW_TYPES.has((item as Record<string, unknown>).type as string)
+      )
   )) {
     return "";
   }

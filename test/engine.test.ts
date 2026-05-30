@@ -1723,6 +1723,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
         .getMessages(conversation!.conversationId);
       expect(messages).toHaveLength(1);
       expect(messages[0].content).not.toContain("[LCM Raw Payload:");
+      expect(messages[0].content).not.toContain("protected reasoning");
 
       const largeFiles = await engine
         .getSummaryStore()
@@ -10768,6 +10769,115 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
 });
 
 describe("LcmContextEngine compaction telemetry", () => {
+  it("does not feed engine-ingested reasoning parts into compaction summarizer input", async () => {
+    const privateReasoning = "PRIVATE_STORED_REASONING_TRACE";
+    let summarizerInput = "";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 0,
+        leafMinFanout: 2,
+        leafChunkTokens: 1_000,
+        incrementalMaxDepth: 0,
+      },
+      {
+        complete: vi.fn(async (request) => {
+          const message = request.messages?.[0];
+          summarizerInput =
+            message && typeof message === "object" && "content" in message
+              ? String((message as { content?: unknown }).content ?? "")
+              : "";
+          return { content: [{ type: "text", text: "Safe compacted summary." }] };
+        }),
+        resolveModel: vi.fn(() => ({ provider: "vllm", model: "qwen3.5-122b" })),
+      },
+    );
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "reasoning", summary: [{ text: privateReasoning }] },
+          { type: "text", text: "Visible assistant answer." },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({
+        role: "user",
+        content: `Follow-up ${"x".repeat(400)}`,
+      }),
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("reasoning-parts-compact"),
+      tokenBudget: 10_000,
+      force: true,
+      legacyParams: { provider: "vllm", model: "qwen3.5-122b" },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(summarizerInput).toContain("Visible assistant answer.");
+    expect(summarizerInput).not.toContain(privateReasoning);
+  });
+
+  it("does not feed redacted-thinking-only ingested parts into compaction summarizer input", async () => {
+    const privateReasoning = "PRIVATE_REDACTED_THINKING_ONLY_TRACE";
+    let summarizerInput = "";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 0,
+        leafMinFanout: 2,
+        leafChunkTokens: 1_000,
+        incrementalMaxDepth: 0,
+      },
+      {
+        complete: vi.fn(async (request) => {
+          const message = request.messages?.[0];
+          summarizerInput =
+            message && typeof message === "object" && "content" in message
+              ? String((message as { content?: unknown }).content ?? "")
+              : "";
+          return { content: [{ type: "text", text: "Safe compacted summary." }] };
+        }),
+        resolveModel: vi.fn(() => ({ provider: "vllm", model: "qwen3.5-122b" })),
+      },
+    );
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "redacted_thinking", text: privateReasoning },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({
+        role: "user",
+        content: `Follow-up ${"x".repeat(400)}`,
+      }),
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("redacted-thinking-only-compact"),
+      tokenBudget: 10_000,
+      force: true,
+      legacyParams: { provider: "vllm", model: "qwen3.5-122b" },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(summarizerInput).toContain("Follow-up");
+    expect(summarizerInput).not.toContain(privateReasoning);
+  });
+
   it("does not append synthetic system messages for compaction passes", async () => {
     const infoLog = vi.fn();
     const debugLog = vi.fn();
