@@ -1,21 +1,120 @@
 {
   "id": "lossless-claw",
+  "kind": "context-engine",
+  "activation": {
+    "onStartup": true
+  },
+  "skills": [
+    "skills/lossless-claw"
+  ],
+  "contracts": {
+    "tools": [
+      "lcm_grep",
+      "lcm_describe",
+      "lcm_expand",
+      "lcm_expand_query"
+    ]
+  },
   "uiHints": {
+    "enabled": {
+      "label": "Enabled",
+      "help": "Enable or disable lossless-claw without uninstalling it"
+    },
     "contextThreshold": {
       "label": "Context Threshold",
       "help": "Fraction of context window that triggers compaction (0.0–1.0)"
     },
+    "sweepMaxDepth": {
+      "label": "Sweep Max Depth",
+      "help": "Preferred maximum condensation source depth during routine full sweeps (0 = leaf only, -1 = unlimited). Pressure sweeps may go deeper when summarized context remains above target."
+    },
     "incrementalMaxDepth": {
-      "label": "Incremental Max Depth",
-      "help": "How deep incremental compaction goes (0 = leaf only, -1 = unlimited)"
+      "label": "Incremental Max Depth (Deprecated)",
+      "help": "Deprecated alias for sweepMaxDepth. Kept for existing configs."
     },
     "freshTailCount": {
       "label": "Fresh Tail Count",
       "help": "Number of recent messages protected from compaction"
     },
+    "freshTailMaxTokens": {
+      "label": "Fresh Tail Max Tokens",
+      "help": "Optional token cap for the protected fresh tail; the newest message is always preserved"
+    },
+    "promptAwareEviction": {
+      "label": "Prompt-Aware Eviction",
+      "help": "When enabled, budget-constrained assembly keeps older context by prompt relevance instead of pure chronology. This can improve recall under tight budgets, but it can also reduce provider prompt-cache hit rates because the preserved prefix changes as prompts change."
+    },
+    "stubLargeToolPayloads": {
+      "label": "Stub Large Tool Payloads",
+      "help": "When enabled, evictable tool-result rows whose payload was externalized via lcm-blob-migrate are replaced with a [LCM Tool Output: file_xxx | …] reference at assemble time. Fresh tail is never stubbed. The agent recovers the original output via lcm_describe(id=file_xxx, expandFile=true). Default off; requires running scripts/lcm-blob-migrate.mjs first to populate messages.large_content."
+    },
+    "leafChunkTokens": {
+      "label": "Leaf Chunk Tokens",
+      "help": "Maximum source tokens per leaf compaction chunk before summarization (default 20000)"
+    },
+    "summaryPrefixTargetTokens": {
+      "label": "Summary Prefix Target Tokens",
+      "help": "Optional target for summarized-prefix tokens after a full sweep. When omitted, Lossless derives a pressure target from contextThreshold and leafChunkTokens."
+    },
+    "maxSweepIterations": {
+      "label": "Max Sweep Iterations",
+      "help": "Hard cap on summarizer passes within a single full compaction sweep (default 12). Bounds how long a sweep can run on the turn-critical path; on hitting the cap the sweep stops cleanly with a partial result."
+    },
+    "sweepDeadlineMs": {
+      "label": "Sweep Deadline (ms)",
+      "help": "Wall-clock budget for a single full compaction sweep, in milliseconds (default 120000). When exceeded the sweep stops before starting another pass, so a slow or rate-limited summarizer cannot hang the agent turn."
+    },
+    "compactUntilUnderDeadlineMs": {
+      "label": "Compact-Until-Under Deadline (ms)",
+      "help": "Wall-clock budget for a whole compact-until-under operation, in milliseconds (default 300000). A compact-until-under run executes several sweeps; this caps the total so it cannot run maxRounds times the per-sweep deadline (~20 minutes at defaults)."
+    },
+    "bootstrapMaxTokens": {
+      "label": "Bootstrap Max Tokens",
+      "help": "Maximum raw parent-history tokens imported into a brand-new conversation bootstrap; oldest turns are dropped first"
+    },
+    "newSessionRetainDepth": {
+      "label": "New Session Retain Depth",
+      "help": "Context retained after /new (-1 keeps all context, 2 keeps d2+)"
+    },
+    "leafTargetTokens": {
+      "label": "Leaf Target Tokens",
+      "help": "Target token count for leaf summaries"
+    },
+    "condensedTargetTokens": {
+      "label": "Condensed Target Tokens",
+      "help": "Target token count for condensed summaries"
+    },
+    "maxExpandTokens": {
+      "label": "Max Expand Tokens",
+      "help": "Token cap for lcm_expand_query expansion calls"
+    },
+    "leafMinFanout": {
+      "label": "Leaf Min Fanout",
+      "help": "Minimum number of raw messages required before a leaf compaction pass runs"
+    },
+    "condensedMinFanout": {
+      "label": "Condensed Min Fanout",
+      "help": "Number of same-depth summaries required before condensation is attempted"
+    },
+    "condensedMinFanoutHard": {
+      "label": "Condensed Min Fanout Hard",
+      "help": "Hard floor for condensation grouping during maintenance and repair flows"
+    },
     "dbPath": {
       "label": "Database Path",
-      "help": "Path to LCM SQLite database (default: ~/.openclaw/lcm.db)"
+      "help": "Path to LCM SQLite database (default: <OPENCLAW_STATE_DIR>/lcm.db; falls back to ~/.openclaw/lcm.db)"
+    },
+    "databasePath": {
+      "label": "Database Path",
+      "help": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)"
+    },
+    "largeFilesDir": {
+      "label": "Large Files Directory",
+      "help": "Directory for persisting large-file text payloads (default: <stateDir>/lcm-files). Uses OPENCLAW_STATE_DIR when set."
+    },
+    "largeFilesDir": {
+      "label": "Large Files Directory",
+      "help": "Directory for externalized large files and inline-image payloads (default: ~/.openclaw/lcm-files)"
     },
     "ignoreSessionPatterns": {
       "label": "Ignored Sessions",
@@ -29,13 +128,29 @@
       "label": "Skip Stateless Sessions",
       "help": "When enabled, matching stateless session keys skip LCM persistence and grant writes"
     },
+    "largeFileThresholdTokens": {
+      "label": "Large File Threshold Tokens",
+      "help": "Token threshold that routes text attachments into large-file summarization"
+    },
+    "largeFileTokenThreshold": {
+      "label": "Large File Threshold Tokens",
+      "help": "Legacy alias of largeFileThresholdTokens"
+    },
     "summaryModel": {
       "label": "Summary Model",
-      "help": "Model override for LCM summarization (e.g., 'gpt-5.4' to reuse the session provider, or 'openai-resp/gpt-5.4' for a full cross-provider ref)"
+      "help": "Runtime LLM model override for LCM summarization (e.g., 'gpt-5.4' with summaryProvider, or 'openai-resp/gpt-5.4'); explicit overrides require plugins.entries.lossless-claw.llm policy"
     },
     "summaryProvider": {
       "label": "Summary Provider",
       "help": "Provider override used only when summaryModel is a bare model name (e.g., 'openai-resp')"
+    },
+    "largeFileSummaryModel": {
+      "label": "Large File Summary Model",
+      "help": "Runtime LLM model override for large-file summarization; explicit overrides require plugins.entries.lossless-claw.llm policy"
+    },
+    "largeFileSummaryProvider": {
+      "label": "Large File Summary Provider",
+      "help": "Provider override for large-file summarization"
     },
     "expansionModel": {
       "label": "Expansion Model",
@@ -44,6 +159,110 @@
     "expansionProvider": {
       "label": "Expansion Provider",
       "help": "Provider override for lcm_expand_query sub-agent (e.g., 'anthropic')"
+    },
+    "delegationTimeoutMs": {
+      "label": "Delegation Timeout (ms)",
+      "help": "Maximum time to wait for delegated lcm_expand_query sub-agent completion before timing out"
+    },
+    "summaryTimeoutMs": {
+      "label": "Summary Timeout (ms)",
+      "help": "Maximum time to wait for a single model-backed LCM summarizer call before timing out"
+    },
+    "maxAssemblyTokenBudget": {
+      "label": "Max Assembly Token Budget",
+      "help": "Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
+    },
+    "summaryMaxOverageFactor": {
+      "label": "Summary Max Overage Factor",
+      "help": "Maximum allowed overage factor for summaries relative to target tokens (default 3). Summaries exceeding this are deterministically truncated."
+    },
+    "customInstructions": {
+      "label": "Custom Instructions",
+      "help": "Natural language instructions injected into all summarization prompts (e.g., formatting rules, tone control)"
+    },
+    "circuitBreakerThreshold": {
+      "label": "Circuit Breaker Threshold",
+      "help": "Consecutive auth failures before the summarization circuit breaker trips"
+    },
+    "circuitBreakerCooldownMs": {
+      "label": "Circuit Breaker Cooldown (ms)",
+      "help": "Cooldown before the summarization circuit breaker auto-resets"
+    },
+    "cacheAwareCompaction.enabled": {
+      "label": "Cache-Aware Compaction (Deprecated)",
+      "help": "Deprecated compatibility setting. Automatic compaction is now threshold-only and does not use prompt-cache hot/cold state."
+    },
+    "cacheAwareCompaction.cacheTTLSeconds": {
+      "label": "Short Cache TTL (Deprecated)",
+      "help": "Deprecated compatibility setting. Threshold debt no longer waits for cache TTL."
+    },
+    "cacheAwareCompaction.maxColdCacheCatchupPasses": {
+      "label": "Cold Cache Catch-Up (Deprecated)",
+      "help": "Deprecated compatibility setting. Automatic cold-cache catch-up passes were removed."
+    },
+    "cacheAwareCompaction.hotCachePressureFactor": {
+      "label": "Hot Cache Pressure (Deprecated)",
+      "help": "Deprecated compatibility setting. Hot-cache raw-history pressure no longer drives automatic compaction."
+    },
+    "cacheAwareCompaction.hotCacheBudgetHeadroomRatio": {
+      "label": "Hot Cache Headroom (Deprecated)",
+      "help": "Deprecated compatibility setting. Hot-cache budget headroom no longer defers threshold compaction."
+    },
+    "cacheAwareCompaction.coldCacheObservationThreshold": {
+      "label": "Cold Cache Observations (Deprecated)",
+      "help": "Deprecated compatibility setting. Cold-cache streaks are diagnostic only."
+    },
+    "cacheAwareCompaction.criticalBudgetPressureRatio": {
+      "label": "Critical Budget Pressure (Deprecated)",
+      "help": "Deprecated compatibility setting. contextThreshold is now the only automatic compaction threshold."
+    },
+    "dynamicLeafChunkTokens.enabled": {
+      "label": "Dynamic Leaf Chunks (Deprecated)",
+      "help": "Deprecated compatibility setting. Automatic compaction now uses leafChunkTokens directly."
+    },
+    "dynamicLeafChunkTokens.max": {
+      "label": "Dynamic Leaf Chunk Max (Deprecated)",
+      "help": "Deprecated compatibility setting. Automatic compaction now uses leafChunkTokens directly."
+    },
+    "timezone": {
+      "label": "Timezone",
+      "help": "IANA timezone used for summary timestamps"
+    },
+    "pruneHeartbeatOk": {
+      "label": "Prune HEARTBEAT_OK",
+      "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
+    },
+    "transcriptGcEnabled": {
+      "label": "Transcript GC",
+      "help": "Enable transcript rewrite GC during maintain(); disabled by default"
+    },
+    "proactiveThresholdCompactionMode": {
+      "label": "Proactive Threshold Compaction Mode",
+      "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
+    },
+    "autoRotateSessionFiles.enabled": {
+      "label": "Auto-Rotate Session Files",
+      "help": "Automatically rotate oversized LCM-managed session JSONL files after startup and runtime checks"
+    },
+    "autoRotateSessionFiles.createBackups": {
+      "label": "Auto-Rotate Backups",
+      "help": "Create the rolling rotate-latest SQLite backup before automatic session-file rotation; disabled by default"
+    },
+    "autoRotateSessionFiles.sizeBytes": {
+      "label": "Auto-Rotate Size Bytes",
+      "help": "Session JSONL byte threshold for automatic rotation (default: 2097152)"
+    },
+    "autoRotateSessionFiles.startup": {
+      "label": "Startup Auto-Rotate",
+      "help": "Startup behavior for oversized indexed OpenClaw session files with active LCM state: rotate, warn, or off"
+    },
+    "autoRotateSessionFiles.runtime": {
+      "label": "Runtime Auto-Rotate",
+      "help": "Runtime behavior for oversized current LCM session files: rotate, warn, or off"
+    },
+    "fallbackProviders": {
+      "label": "Fallback Providers",
+      "help": "Explicit runtime LLM fallback provider/model pairs for compaction summarization; entries require plugins.entries.lossless-claw.llm policy"
     }
   },
   "configSchema": {
@@ -58,11 +277,65 @@
         "minimum": 0,
         "maximum": 1
       },
+      "sweepMaxDepth": {
+        "type": "integer",
+        "minimum": -1
+      },
       "incrementalMaxDepth": {
         "type": "integer",
         "minimum": -1
       },
       "freshTailCount": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "freshTailMaxTokens": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "promptAwareEviction": {
+        "type": "boolean"
+      },
+      "stubLargeToolPayloads": {
+        "type": "boolean"
+      },
+      "leafChunkTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "summaryPrefixTargetTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "maxSweepIterations": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "sweepDeadlineMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "compactUntilUnderDeadlineMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "bootstrapMaxTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "newSessionRetainDepth": {
+        "type": "integer",
+        "minimum": -1
+      },
+      "leafTargetTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "condensedTargetTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "maxExpandTokens": {
         "type": "integer",
         "minimum": 1
       },
@@ -79,6 +352,9 @@
         "minimum": 2
       },
       "dbPath": {
+        "type": "string"
+      },
+      "largeFilesDir": {
         "type": "string"
       },
       "ignoreSessionPatterns": {
@@ -100,10 +376,20 @@
         "type": "integer",
         "minimum": 1000
       },
+      "largeFileTokenThreshold": {
+        "type": "integer",
+        "minimum": 1000
+      },
       "summaryModel": {
         "type": "string"
       },
       "summaryProvider": {
+        "type": "string"
+      },
+      "largeFileSummaryModel": {
+        "type": "string"
+      },
+      "largeFileSummaryProvider": {
         "type": "string"
       },
       "expansionModel": {
@@ -111,6 +397,149 @@
       },
       "expansionProvider": {
         "type": "string"
+      },
+      "delegationTimeoutMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "summaryTimeoutMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "maxAssemblyTokenBudget": {
+        "type": "integer",
+        "minimum": 1000
+      },
+      "summaryMaxOverageFactor": {
+        "type": "number",
+        "minimum": 1
+      },
+      "customInstructions": {
+        "type": "string"
+      },
+      "circuitBreakerThreshold": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "circuitBreakerCooldownMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "cacheAwareCompaction": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "cacheTTLSeconds": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "maxColdCacheCatchupPasses": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "hotCachePressureFactor": {
+            "type": "number",
+            "minimum": 1
+          },
+          "hotCacheBudgetHeadroomRatio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.95
+          },
+          "coldCacheObservationThreshold": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "criticalBudgetPressureRatio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        }
+      },
+      "dynamicLeafChunkTokens": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "max": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "timezone": {
+        "type": "string"
+      },
+      "pruneHeartbeatOk": {
+        "type": "boolean"
+      },
+      "transcriptGcEnabled": {
+        "type": "boolean"
+      },
+      "proactiveThresholdCompactionMode": {
+        "type": "string",
+        "enum": [
+          "deferred",
+          "inline"
+        ]
+      },
+      "autoRotateSessionFiles": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "createBackups": {
+            "type": "boolean"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "startup": {
+            "type": "string",
+            "enum": [
+              "rotate",
+              "warn",
+              "off"
+            ]
+          },
+          "runtime": {
+            "type": "string",
+            "enum": [
+              "rotate",
+              "warn",
+              "off"
+            ]
+          }
+        }
+      },
+      "databasePath": {
+        "description": "Path to LCM SQLite database (preferred key; alias of dbPath, default: <OPENCLAW_STATE_DIR>/lcm.db)",
+        "type": "string"
+      },
+      "largeFilesDir": {
+        "description": "Directory for persisting large-file text payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)",
+        "type": "string"
+      },
+      "fallbackProviders": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "provider": { "type": "string" },
+            "model": { "type": "string" }
+          },
+          "required": ["provider", "model"],
+          "additionalProperties": false
+        }
       }
     }
   }

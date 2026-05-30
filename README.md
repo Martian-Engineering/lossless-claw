@@ -7,6 +7,7 @@ Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/op
 - [What it does](#what-it-does)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
+- [Commands And Skill](#commands-and-skill)
 - [Documentation](#documentation)
 - [Development](#development)
 - [License](#license)
@@ -27,6 +28,35 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 **It feels like talking to an agent that never forgets. Because it doesn't. In normal operation, you'll never need to think about compaction again.**
 
+## Commands And Skill
+
+The plugin now ships a bundled `lossless-claw` skill plus a small plugin command surface for supported OpenClaw chat/native command providers:
+
+- `/lcm` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
+- `/lcm backup` creates a timestamped backup of the current LCM SQLite database
+- `/lcm rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
+- `/lcm doctor` scans for broken or truncated summaries
+- `/lcm doctor clean` shows read-only high-confidence junk diagnostics for archived subagents, cron sessions, and NULL-key orphaned subagent runs
+- `/lcm status` shows plugin, conversation, and maintenance state including deferred compaction debt
+- `/lossless` is an alias for `/lcm` on supported native command surfaces
+
+These are plugin slash/native commands, not root shell CLI subcommands. Supported examples:
+
+- `/lcm`
+- `/lcm backup`
+- `/lcm rotate`
+- `/lcm doctor`
+- `/lcm doctor clean`
+- `/lossless`
+
+Not currently supported as root CLI commands:
+
+- `openclaw lcm`
+- `openclaw lossless`
+- `openclaw /lcm`
+
+The bundled skill focuses on configuration, diagnostics, architecture, and recall-tool usage. Its reference set lives under `skills/lossless-claw/references/`.
+
 ## Quick start
 
 ### Prerequisites
@@ -34,6 +64,8 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 - OpenClaw with plugin context engine support
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
+
+> **Compatibility:** `lossless-claw@0.10.0` and newer require OpenClaw `2026.5.12` or newer. These releases call OpenClaw's `api.runtime.llm.complete` capability for summarization, which is unavailable in older OpenClaw builds. If you cannot upgrade OpenClaw yet, stay on `lossless-claw@0.9.4` and remove `0.10.x`-only config such as `sweepMaxDepth`.
 
 ### Install the plugin
 
@@ -49,15 +81,22 @@ If you're running from a local OpenClaw checkout, use:
 pnpm openclaw plugins install @martian-engineering/lossless-claw
 ```
 
-For local plugin development, link your working copy instead of copying files:
+For local plugin development, build your working copy first, then link it instead of copying files:
 
 ```bash
+cd /path/to/lossless-claw
+pnpm build
+
 openclaw plugins install --link /path/to/lossless-claw
 # or from a local OpenClaw checkout:
 # pnpm openclaw plugins install --link /path/to/lossless-claw
 ```
 
+Re-run `pnpm build` after local source changes so the linked plugin's `dist/` output stays current.
+
 The install command records the plugin, enables it, and applies compatible slot selection (including `contextEngine` when applicable).
+
+> **Note:** If your OpenClaw config uses `plugins.allow`, allowlist the plugin id `lossless-claw` plus any other active plugins you rely on. Do not add command tokens or aliases like `lossless` or `/lcm` to `plugins.allow`; that setting only accepts plugin ids. In some setups, narrowing the allowlist can prevent plugin-backed integrations from loading, even if `lossless-claw` itself is installed correctly. Restart the gateway after plugin config changes.
 
 ### Configure OpenClaw
 
@@ -91,15 +130,29 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
     "entries": {
       "lossless-claw": {
         "enabled": true,
+        "llm": {
+          "allowModelOverride": true,
+          "allowedModels": ["openai/gpt-5.4-mini"]
+        },
         "config": {
-          "freshTailCount": 32,
+          "freshTailCount": 64,
+          "leafChunkTokens": 80000,
+          "newSessionRetainDepth": 2,
           "contextThreshold": 0.75,
-          "incrementalMaxDepth": -1,
+          "incrementalMaxDepth": 1,
+          "cacheAwareCompaction": {
+            "enabled": true,
+            "cacheTTLSeconds": 300
+          },
           "ignoreSessionPatterns": [
             "agent:*:cron:**"
           ],
-          "summaryProvider": "anthropic",
-          "summaryModel": "claude-3-5-haiku"
+          "transcriptGcEnabled": false,
+          "proactiveThresholdCompactionMode": "deferred",
+          "summaryModel": "openai/gpt-5.4-mini",
+          "expansionModel": "openai/gpt-5.4-mini",
+          "delegationTimeoutMs": 300000,
+          "summaryTimeoutMs": 60000
         }
       }
     }
@@ -107,7 +160,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 }
 ```
 
-`summaryModel` and `summaryProvider` let you pin compaction summarization to a cheaper or faster model than your main OpenClaw session model. When unset, LCM uses OpenClaw's configured default model/provider.
+`leafChunkTokens` controls how many source tokens can accumulate in a leaf compaction chunk before summarization is triggered. The default is `20000`, but quota-limited summary providers may benefit from a larger value to reduce compaction frequency. `summaryModel` and `summaryProvider` let you request a cheaper or faster compaction model through OpenClaw's `api.runtime.llm.complete` capability; OpenClaw still owns provider dispatch and auth. Explicit summary model requests require `llm.allowModelOverride` and matching `llm.allowedModels` policy entries for `lossless-claw`. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). `delegationTimeoutMs` controls how long `lcm_expand_query` waits for that delegated sub-agent to finish before returning a timeout error; it defaults to `120000` (120s). `summaryTimeoutMs` controls the per-call timeout for model-backed LCM summarization; it defaults to `60000` (60s). When unset, the model settings still fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
 
 ### Environment variables
 
@@ -119,11 +172,12 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_STATELESS_SESSION_PATTERNS` | `""` | Comma-separated glob patterns for session keys that may read from LCM but never write to it |
 | `LCM_SKIP_STATELESS_SESSIONS` | `true` | Enable stateless-session write skipping for matching session keys |
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window that triggers compaction (0.0–1.0) |
-| `LCM_FRESH_TAIL_COUNT` | `32` | Number of recent messages protected from compaction |
+| `LCM_FRESH_TAIL_COUNT` | `64` | Number of recent messages protected from compaction |
+| `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | Context retained after `/new` (`-1` keeps all context, `2` keeps d2+) |
 | `LCM_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |
 | `LCM_CONDENSED_MIN_FANOUT` | `4` | Minimum summaries per condensed node |
 | `LCM_CONDENSED_MIN_FANOUT_HARD` | `2` | Relaxed fanout for forced compaction sweeps |
-| `LCM_INCREMENTAL_MAX_DEPTH` | `0` | How deep incremental compaction goes (0 = leaf only, -1 = unlimited) |
+| `LCM_INCREMENTAL_MAX_DEPTH` | `1` | How deep incremental compaction goes (0 = leaf only, 1 = one condensed pass, -1 = unlimited) |
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Max source tokens per leaf compaction chunk |
 | `LCM_LEAF_TARGET_TOKENS` | `1200` | Target token count for leaf summaries |
 | `LCM_CONDENSED_TARGET_TOKENS` | `2000` | Target token count for condensed summaries |
@@ -133,14 +187,24 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_LARGE_FILE_SUMMARY_MODEL` | `""` | Model override for large-file summarization |
 | `LCM_SUMMARY_MODEL` | `""` | Model override for compaction summarization; falls back to OpenClaw's default model when unset |
 | `LCM_SUMMARY_PROVIDER` | `""` | Provider override for compaction summarization; falls back to `OPENCLAW_PROVIDER` or the provider embedded in the model ref |
-| `LCM_EXPANSION_MODEL` | *(from OpenClaw)* | Model override for `lcm_expand_query` sub-agent (e.g. `anthropic/claude-haiku-4-5`) |
+| `LCM_SUMMARY_BASE_URL` | *(from OpenClaw / provider default)* | Base URL override for summarization API calls |
+| `LCM_EXPANSION_MODEL` | *(from OpenClaw)* | Model override for `lcm_expand_query` sub-agent (e.g. `openai/gpt-5.4-mini`) |
 | `LCM_EXPANSION_PROVIDER` | *(from OpenClaw)* | Provider override for `lcm_expand_query` sub-agent |
-| `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
+| `LCM_DELEGATION_TIMEOUT_MS` | `120000` | Max time to wait for delegated `lcm_expand_query` sub-agent completion |
+| `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Max time to wait for a single model-backed LCM summarizer call |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
+| `LCM_TRANSCRIPT_GC_ENABLED` | `false` | Enable transcript rewrite GC during `maintain()` |
+| `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | `deferred` | Choose whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior |
+| `LCM_CACHE_TTL_SECONDS` | `300` | Cache TTL used by cache-aware deferred compaction when provider/runtime telemetry does not supply a more specific retention window |
+
+Transcript GC rewrites are disabled by default. Set `transcriptGcEnabled` or `LCM_TRANSCRIPT_GC_ENABLED` to turn them on explicitly.
+Deferred proactive compaction is also the default. Set `proactiveThresholdCompactionMode` or `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` to `inline` only if you need legacy foreground compaction behavior. In deferred mode, lossless-claw records one coalesced prompt-mutating debt item after the turn, leaves background `maintain()` to process only non-prompt-mutating work while Anthropic cache is still hot, and then consumes that debt pre-assembly once the cache is cold or the prompt is approaching overflow.
 
 ### Expansion model override requirements
 
 If you want `lcm_expand_query` to run on a dedicated model via `expansionModel` or `LCM_EXPANSION_MODEL`, OpenClaw must explicitly trust the plugin to request sub-agent model overrides.
+
+For most setups, `openai/gpt-5.4-mini` is a better starting point than Anthropic Haiku because it is cheap, fast, and does not depend on Anthropic quota remaining.
 
 Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the canonical `provider/model` target you want the plugin to use:
 
@@ -170,14 +234,19 @@ Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the 
 - `subagent.allowedModels` is optional but recommended. Use `"*"` only if you intentionally want to trust any target model.
 - The chosen expansion target must also be available in OpenClaw's normal model catalog. If it is not already configured elsewhere, add it under the top-level `models` map as shown above.
 - If you prefer splitting provider and model, set `config.expansionProvider` and use a bare `config.expansionModel`.
+- `openclaw doctor --fix` can add the required `subagent` policy for a configured `expansionModel`. If a host still rejects a stale or unavailable override, `lcm_expand_query` retries once without the override so recall does not fail hard.
 
 Plugin config equivalents:
 
 - `ignoreSessionPatterns`
 - `statelessSessionPatterns`
 - `skipStatelessSessions`
+- `transcriptGcEnabled`
+- `newSessionRetainDepth`
 - `summaryModel`
 - `summaryProvider`
+- `delegationTimeoutMs`
+- `summaryTimeoutMs`
 
 Environment variables still win over plugin config when both are set.
 
@@ -188,23 +257,53 @@ For compaction summarization, lossless-claw resolves the model in this order:
 1. `LCM_SUMMARY_MODEL` / `LCM_SUMMARY_PROVIDER`
 2. Plugin config `summaryModel` / `summaryProvider`
 3. OpenClaw's default compaction model/provider
-4. Legacy per-call model/provider hints
+4. Runtime/session model/provider hints from OpenClaw
 
 If `summaryModel` already includes a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that choice. Otherwise, the provider falls back to the matching override, then `OPENCLAW_PROVIDER`, then the provider inferred by the caller.
+
+Summary calls are dispatched through OpenClaw's runtime LLM layer, so auth profiles, OAuth refresh, API keys, base URLs, and provider-specific request preparation remain host-owned. Run `openclaw doctor --fix` after adding explicit summary model overrides if you want OpenClaw to add the matching `plugins.entries.lossless-claw.llm` policy.
 
 ### Recommended starting configuration
 
 ```
-LCM_FRESH_TAIL_COUNT=32
-LCM_INCREMENTAL_MAX_DEPTH=-1
+LCM_FRESH_TAIL_COUNT=64
+LCM_LEAF_CHUNK_TOKENS=20000
+LCM_INCREMENTAL_MAX_DEPTH=1
 LCM_CONTEXT_THRESHOLD=0.75
+LCM_SUMMARY_MODEL=openai/gpt-5.4-mini
+LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
 ```
 
-- **freshTailCount=32** protects the last 32 messages from compaction, giving the model enough recent context for continuity.
-- **incrementalMaxDepth=-1** enables unlimited automatic condensation after each compaction pass — the DAG cascades as deep as needed. Set to `0` (default) for leaf-only, or a positive integer for a specific depth cap.
+- **freshTailCount=64** protects the last 64 messages from compaction, giving the model more recent context for continuity.
+- **leafChunkTokens=20000** limits how large each leaf compaction chunk can grow before LCM summarizes it. Increase this when your summary provider is quota-limited and frequent leaf compactions are exhausting that quota.
+- **incrementalMaxDepth=1** runs one condensed pass after each leaf compaction by default. Set to `0` for leaf-only behavior, a larger positive integer for a deeper cap, or `-1` for unlimited cascading.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
 
 ### Session exclusion patterns
+
+### Session reset semantics
+
+Lossless-claw distinguishes OpenClaw's two session-reset commands:
+
+- `/new` keeps the active conversation row and all stored summaries, but prunes `context_items` so the next turn rebuilds context from retained summaries instead of the fresh tail.
+- `/reset` archives the active conversation row and creates a new active row for the same stable `sessionKey`, giving the next turn a clean LCM conversation while preserving prior history.
+
+For large sessions, neither command is a perfect “keep my live agent context, but stop writing into this giant active LCM row” tool:
+
+- `/new` keeps writing into the same active LCM conversation row.
+- `/reset` changes OpenClaw session flow, which is heavier than users often want when their real problem is just LCM row size.
+
+`/lcm rotate` fills that gap. It replaces one rolling `rotate-latest` SQLite backup, rewrites the current session transcript down to the preserved live tail plus current session settings, and refreshes the bootstrap frontier on the same active LCM conversation so dropped transcript history is not replayed. Existing summaries, context items, and conversation identity stay in place; only the transcript backing is compacted. If you want additional timestamped snapshots instead, run `/lcm backup`.
+
+`newSessionRetainDepth` (or `LCM_NEW_SESSION_RETAIN_DEPTH`) controls how much summary structure survives `/new`:
+
+- `-1`: keep all existing context items
+- `0`: keep all summaries, drop only fresh-tail messages
+- `1`: keep d1+ summaries
+- `2`: keep d2+ summaries; recommended default
+- `3+`: keep only deeper, more abstract summaries
+
+Lossless-claw applies `/new` pruning through `before_reset` and uses `session_end` to catch transcript rollovers such as `/reset`, idle or daily session rotation, compaction session replacement, and deletions. User-facing confirmation text after `/new` or `/reset` must still be emitted by OpenClaw's command handlers.
 
 Use `ignoreSessionPatterns` or `LCM_IGNORE_SESSION_PATTERNS` to keep low-value sessions completely out of LCM. Matching sessions do not create conversations, do not store messages, and do not participate in compaction or delegated expansion grants.
 
@@ -338,6 +437,9 @@ For most long-lived LCM setups, a good starting point is:
 ## Development
 
 ```bash
+# Build (bundles TypeScript to dist/index.js)
+pnpm build
+
 # Run tests
 npx vitest
 

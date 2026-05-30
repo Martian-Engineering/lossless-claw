@@ -884,9 +884,9 @@ func nextConversationMessageSeq(ctx context.Context, q sqlQueryer, conversationI
 
 func insertCopiedMessage(ctx context.Context, q sqlQueryer, targetConversationID, seq int64, source transplantMessage) (int64, error) {
 	result, err := q.ExecContext(ctx, `
-		INSERT INTO messages (conversation_id, seq, role, content, token_count, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, targetConversationID, seq, source.role, source.content, source.tokenCount, source.createdAt)
+		INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, targetConversationID, seq, source.role, source.content, source.tokenCount, messageIdentityHash(source.role, source.content), source.createdAt)
 	if err != nil {
 		return 0, fmt.Errorf("insert copied message from %d: %w", source.messageID, err)
 	}
@@ -1136,7 +1136,7 @@ func mergeTransplantedContextItems(ctx context.Context, q sqlQueryer, targetConv
 		return fmt.Errorf("temporarily shift context ordinals for conversation %d: %w", targetConversationID, err)
 	}
 
-	// Step 2: Insert transplanted summaries with temporary high ordinals.
+	// Step 2: Insert transplanted summaries into the free low-ordinal range.
 	// They'll be reordered in step 3.
 	for i, source := range sourceContext {
 		newSummaryID, ok := oldToNew[source.summaryID]
@@ -1144,7 +1144,7 @@ func mergeTransplantedContextItems(ctx context.Context, q sqlQueryer, targetConv
 			return fmt.Errorf("missing remapped summary ID for context summary %s", source.summaryID)
 		}
 
-		tempOrd := tempShift + int64(i) + 1
+		tempOrd := int64(i)
 		if _, err := q.ExecContext(ctx, `
 			INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
 			VALUES (?, ?, 'summary', ?)
@@ -1153,7 +1153,23 @@ func mergeTransplantedContextItems(ctx context.Context, q sqlQueryer, targetConv
 		}
 	}
 
-	// Step 3: Reorder all summary context items by depth DESC, then created_at ASC.
+	// Step 3: Move all summaries out of the final low-ordinal range before
+	// reordering. Otherwise a summary that should move to ordinal 0 can collide
+	// with a newly inserted temporary summary already sitting at ordinal 0.
+	maxAfterInsert := int64(len(sourceContext) - 1)
+	if maxOrdinal.Valid {
+		maxAfterInsert = tempShift + maxOrdinal.Int64
+	}
+	reorderShift := maxAfterInsert + 1
+	if _, err := q.ExecContext(ctx, `
+		UPDATE context_items
+		SET ordinal = ordinal + ?
+		WHERE conversation_id = ? AND item_type = 'summary'
+	`, reorderShift, targetConversationID); err != nil {
+		return fmt.Errorf("temporarily shift summary context ordinals for conversation %d: %w", targetConversationID, err)
+	}
+
+	// Step 4: Reorder all summary context items by depth DESC, then created_at ASC.
 	// This merges transplanted and existing summaries into the correct order.
 	if _, err := q.ExecContext(ctx, `
 		WITH ranked_summaries AS (
@@ -1175,7 +1191,7 @@ func mergeTransplantedContextItems(ctx context.Context, q sqlQueryer, targetConv
 		return fmt.Errorf("reorder summary context items for conversation %d: %w", targetConversationID, err)
 	}
 
-	// Step 4: Reorder message context items to follow after all summaries.
+	// Step 5: Reorder message context items to follow after all summaries.
 	if _, err := q.ExecContext(ctx, `
 		WITH summary_count AS (
 			SELECT COUNT(*) AS cnt

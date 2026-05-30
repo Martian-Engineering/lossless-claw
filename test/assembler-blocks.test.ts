@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { toolCallBlockFromPart, toolResultBlockFromPart, blockFromPart } from "../src/assembler.js";
+import {
+  toolCallBlockFromPart,
+  toolResultBlockFromPart,
+  blockFromPart,
+  tokenizeText,
+  scoreRelevance,
+} from "../src/assembler.js";
 import type { MessagePartRecord } from "../src/store/conversation-store.js";
 
 /**
@@ -149,7 +155,7 @@ describe("toolCallBlockFromPart", () => {
     expect(block).not.toHaveProperty("input");
   });
 
-  it("omits id when toolCallId is empty string", () => {
+  it("generates synthetic id when toolCallId is empty string", () => {
     const part = makePart({
       toolCallId: "",
       toolName: "read",
@@ -157,8 +163,19 @@ describe("toolCallBlockFromPart", () => {
     });
     const block = toolCallBlockFromPart(part) as Record<string, unknown>;
 
-    expect(block).not.toHaveProperty("id");
+    expect(block.id).toBe("toolu_lcm_test-part-1");
     expect(block.name).toBe("read");
+  });
+
+  it("generates synthetic id when toolCallId is null", () => {
+    const part = makePart({
+      toolCallId: null,
+      toolName: "read",
+      toolInput: '{"path":"a.txt"}',
+    });
+    const block = toolCallBlockFromPart(part) as Record<string, unknown>;
+
+    expect(block.id).toBe("toolu_lcm_test-part-1");
   });
 });
 
@@ -234,6 +251,27 @@ describe("toolResultBlockFromPart", () => {
     expect(block.tool_use_id).toBe("toolu_content");
     expect(block.content).toEqual([{ type: "text", text: "command output" }]);
     expect(block).not.toHaveProperty("output");
+  });
+
+  it("restores externalized plain-text tool results as text blocks", () => {
+    const part = makePart({
+      partType: "tool",
+      toolCallId: "toolu_externalized",
+      toolName: "exec",
+      textContent: "[LCM Tool Output: file_deadbeef12345678 tool=exec]",
+      toolOutput: null,
+    });
+    const block = toolResultBlockFromPart(part, "tool_result", {
+      type: "tool_result",
+      text: "[LCM Tool Output: file_deadbeef12345678 tool=exec]",
+      externalizedFileId: "file_deadbeef12345678",
+      toolOutputExternalized: true,
+    }) as Record<string, unknown>;
+
+    expect(block).toEqual({
+      type: "text",
+      text: "[LCM Tool Output: file_deadbeef12345678 tool=exec]",
+    });
   });
 });
 
@@ -416,5 +454,197 @@ describe("blockFromPart", () => {
     const block = blockFromPart(part) as Record<string, unknown>;
 
     expect(block).toEqual({ type: "text", text: "" });
+  });
+
+  // ─── Regression: #158 — tool call id backfill from metadata.raw ──────────
+
+  it("backfills toolCallId from metadata.raw when DB column is NULL (regression #158)", () => {
+    // This is the exact scenario that crashes downstream providers:
+    // text-type rows with tool call data only in metadata.raw.
+    const part = makePart({
+      partType: "text",
+      toolCallId: null,
+      toolName: null,
+      toolInput: null,
+      metadata: JSON.stringify({
+        rawType: "toolCall",
+        originalRole: "assistant",
+        raw: {
+          type: "toolCall",
+          id: "toolu_01114sYtk4SBgj4gPvTmLrzX",
+          name: "exec",
+          arguments: { command: "ls" },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.type).toBe("toolCall");
+    expect(block.id).toBe("toolu_01114sYtk4SBgj4gPvTmLrzX");
+    expect(block.name).toBe("exec");
+    expect(block.arguments).toEqual({ command: "ls" });
+  });
+
+  it("backfills toolCallId from metadata.raw for tool_use type (regression #158)", () => {
+    const part = makePart({
+      partType: "text",
+      toolCallId: null,
+      toolName: null,
+      toolInput: null,
+      metadata: JSON.stringify({
+        rawType: "tool_use",
+        originalRole: "assistant",
+        raw: {
+          type: "tool_use",
+          id: "toolu_abc123",
+          name: "read",
+          input: { path: "USER.md" },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.type).toBe("tool_use");
+    expect(block.id).toBe("toolu_abc123");
+    expect(block.name).toBe("read");
+  });
+
+  it("backfills toolCallId from metadata.raw.call_id for function_call type", () => {
+    const part = makePart({
+      partType: "text",
+      toolCallId: null,
+      toolName: null,
+      toolInput: null,
+      metadata: JSON.stringify({
+        rawType: "function_call",
+        originalRole: "assistant",
+        raw: {
+          type: "function_call",
+          call_id: "fc_legacy_123",
+          name: "bash",
+          arguments: { cmd: "pwd" },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.type).toBe("function_call");
+    expect(block.call_id).toBe("fc_legacy_123");
+    expect(block.name).toBe("bash");
+    expect(block.arguments).toEqual({ cmd: "pwd" });
+  });
+
+  it("prefers DB column over metadata.raw when both are present", () => {
+    const part = makePart({
+      partType: "text",
+      toolCallId: "db-column-id",
+      toolName: "db-tool-name",
+      metadata: JSON.stringify({
+        rawType: "toolCall",
+        originalRole: "assistant",
+        raw: {
+          type: "toolCall",
+          id: "raw-id",
+          name: "raw-name",
+          arguments: { x: 1 },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.id).toBe("db-column-id");
+    expect(block.name).toBe("db-tool-name");
+  });
+
+  it("generates synthetic fallback id when neither DB nor raw has an id", () => {
+    const part = makePart({
+      partType: "text",
+      toolCallId: null,
+      metadata: JSON.stringify({
+        rawType: "toolCall",
+        originalRole: "assistant",
+        raw: {
+          type: "toolCall",
+          name: "exec",
+          arguments: { command: "ls" },
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block.id).toBe("toolu_lcm_test-part-1");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// tokenizeText
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("tokenizeText", () => {
+  it("splits on non-alphanumeric characters and lowercases", () => {
+    expect(tokenizeText("Hello World")).toEqual(["hello", "world"]);
+  });
+
+  it("filters out single-character tokens", () => {
+    expect(tokenizeText("I am a test")).toEqual(["am", "test"]);
+  });
+
+  it("returns empty array for empty string", () => {
+    expect(tokenizeText("")).toEqual([]);
+  });
+
+  it("returns empty array for whitespace-only input", () => {
+    expect(tokenizeText("   ")).toEqual([]);
+  });
+
+  it("handles mixed punctuation and numbers", () => {
+    expect(tokenizeText("auth2 login-flow v3.1")).toEqual(["auth2", "login", "flow", "v3"]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// scoreRelevance
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("scoreRelevance", () => {
+  it("returns 0 when prompt is empty", () => {
+    expect(scoreRelevance("some item text", "")).toBe(0);
+  });
+
+  it("returns 0 when item text is empty", () => {
+    expect(scoreRelevance("", "some prompt")).toBe(0);
+  });
+
+  it("returns 0 when there is no keyword overlap", () => {
+    expect(scoreRelevance("painting canvas watercolor", "authentication login")).toBe(0);
+  });
+
+  it("returns positive score when keywords overlap", () => {
+    const score = scoreRelevance("authentication login password security", "how does authentication work");
+    expect(score).toBeGreaterThan(0);
+  });
+
+  it("scores higher for more matching terms", () => {
+    const oneMatch = scoreRelevance("authentication painting canvas", "authentication login security");
+    const twoMatches = scoreRelevance("authentication login canvas", "authentication login security");
+    expect(twoMatches).toBeGreaterThan(oneMatch);
+  });
+
+  it("deduplicates prompt terms (repeated prompt words don't inflate score)", () => {
+    const single = scoreRelevance("authentication login", "authentication");
+    const repeated = scoreRelevance("authentication login", "authentication authentication authentication");
+    expect(repeated).toBe(single);
+  });
+
+  it("handles case-insensitive matching", () => {
+    const score = scoreRelevance("Authentication LOGIN", "authentication login");
+    expect(score).toBeGreaterThan(0);
+  });
+
+  it("ignores single-character terms from prompt", () => {
+    const score = scoreRelevance("login page handler", "I need a login");
+    const direct = scoreRelevance("login page handler", "login");
+    expect(score).toBeGreaterThan(0);
+    expect(direct).toBeGreaterThan(0);
   });
 });

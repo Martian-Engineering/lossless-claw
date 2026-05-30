@@ -37,6 +37,7 @@ type backfillOptions struct {
 	promptDir            string
 	provider             string
 	model                string
+	baseURL              string
 }
 
 type backfillMessage struct {
@@ -126,6 +127,11 @@ func runBackfillCommand(args []string) error {
 	}
 	defer db.Close()
 
+	settings := resolveTUISummaryRuntimeSettings(paths, opts.provider, opts.model, opts.baseURL, "", "")
+	opts.provider = settings.provider
+	opts.model = settings.model
+	opts.baseURL = settings.baseURL
+
 	ctx := context.Background()
 	input := backfillSessionInput{
 		agent:       opts.agent,
@@ -186,6 +192,7 @@ func runBackfillCommand(args []string) error {
 		apiKey:   apiKey,
 		http:     &http.Client{Timeout: defaultHTTPTimeout},
 		model:    opts.model,
+		baseURL:  opts.baseURL,
 	}
 
 	result, stats, err := runBackfillWorkflow(ctx, db, opts, input, client.summarize)
@@ -282,6 +289,7 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 	promptDir := fs.String("prompt-dir", "", "custom prompt template directory")
 	provider := fs.String("provider", "", "provider id (e.g. anthropic, openai)")
 	model := fs.String("model", "", "summary model id")
+	baseURL := fs.String("base-url", "", "custom API base URL")
 
 	normalized, err := normalizeBackfillArgs(args)
 	if err != nil {
@@ -314,6 +322,7 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 		promptDir:            strings.TrimSpace(*promptDir),
 		provider:             strings.TrimSpace(*provider),
 		model:                strings.TrimSpace(*model),
+		baseURL:              strings.TrimSpace(*baseURL),
 	}
 	if opts.apply {
 		opts.dryRun = false
@@ -351,7 +360,6 @@ func parseBackfillArgs(args []string) (backfillOptions, error) {
 	if opts.promptDir != "" {
 		opts.promptDir = expandHomePath(opts.promptDir)
 	}
-	opts.provider, opts.model = resolveSummaryProviderModel(opts.provider, opts.model)
 	return opts, nil
 }
 
@@ -372,6 +380,7 @@ func normalizeBackfillArgs(args []string) ([]string, error) {
 		"--prompt-dir":              true,
 		"--provider":                true,
 		"--model":                   true,
+		"--base-url":                true,
 	}
 
 	for i := 0; i < len(args); i++ {
@@ -419,6 +428,11 @@ Flags:
   --prompt-dir <path>          custom prompt template directory
   --provider <id>              API provider (inferred from model when omitted)
   --model <id>                 API model (default: provider-specific)
+  --base-url <url>             custom API base URL (overrides openclaw.json and env)
+
+Env:
+  LCM_TUI_SUMMARY_PROVIDER / LCM_TUI_SUMMARY_MODEL / LCM_TUI_SUMMARY_BASE_URL
+  fall back to LCM_SUMMARY_PROVIDER / LCM_SUMMARY_MODEL / LCM_SUMMARY_BASE_URL
 `)
 }
 
@@ -616,9 +630,9 @@ func applyBackfillImport(ctx context.Context, db *sql.DB, input backfillSessionI
 
 	for idx, msg := range input.messages {
 		result, err := tx.ExecContext(ctx, `
-			INSERT INTO messages (conversation_id, seq, role, content, token_count, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, conversationID, idx, msg.role, msg.content, estimateTokenCount(msg.content), msg.createdAt)
+			INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, conversationID, idx, msg.role, msg.content, estimateTokenCount(msg.content), messageIdentityHash(msg.role, msg.content), msg.createdAt)
 		if err != nil {
 			return backfillImportResult{}, fmt.Errorf("insert backfill message seq=%d: %w", idx, err)
 		}

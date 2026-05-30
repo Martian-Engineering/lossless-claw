@@ -34,6 +34,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       skipStatelessSessions: true,
       contextThreshold: 0.75,
       freshTailCount: 8,
+      newSessionRetainDepth: 2,
       leafMinFanout: 8,
       condensedMinFanout: 4,
       condensedMinFanoutHard: 2,
@@ -47,15 +48,22 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       summaryModel: "",
       largeFileSummaryProvider: "",
       largeFileSummaryModel: "",
-      autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
+      transcriptGcEnabled: false,
+      proactiveThresholdCompactionMode: "deferred",
+      autoRotateSessionFiles: {
+        enabled: true,
+        createBackups: false,
+        sizeBytes: 2 * 1024 * 1024,
+        startup: "rotate",
+        runtime: "rotate",
+      },
+      summaryMaxOverageFactor: 3,
     },
     complete: vi.fn(),
     callGateway: vi.fn(async () => ({})),
     resolveModel: () => ({ provider: "anthropic", model: "claude-opus-4-5" }),
-    getApiKey: async () => undefined,
-    requireApiKey: async () => "",
     parseAgentSessionKey,
     isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
     normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
@@ -82,6 +90,7 @@ function buildLcmEngine(params: {
   };
   conversationId?: number;
   conversationIdBySessionKey?: number;
+  conversationFamilyIds?: number[];
   timezone?: string;
 }) {
   return {
@@ -114,6 +123,18 @@ function buildLcmEngine(params: {
               updatedAt: new Date("2026-01-01T00:00:00.000Z"),
             },
       ),
+      getConversationFamilyIds: vi.fn(async () => {
+        if (params.conversationFamilyIds && params.conversationFamilyIds.length > 0) {
+          return params.conversationFamilyIds;
+        }
+        if (typeof params.conversationIdBySessionKey === "number") {
+          return [params.conversationIdBySessionKey];
+        }
+        if (typeof params.conversationId === "number") {
+          return [params.conversationId];
+        }
+        return [];
+      }),
     }),
   };
 }
@@ -121,6 +142,90 @@ function buildLcmEngine(params: {
 describe("LCM tools session scoping", () => {
   beforeEach(() => {
     resetDelegatedExpansionGrantsForTests();
+  });
+
+  it("lcm_grep metadata explains focused FTS5 query construction", () => {
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+    });
+
+    expect(tool.description).toContain("queries use FTS5 AND semantics by default");
+    const patternDescription = (
+      tool.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties.pattern?.description;
+    expect(patternDescription).toContain("FTS5 defaults to AND matching");
+    expect(patternDescription).toContain("prefer 1-3 distinctive terms or one quoted multi-word phrase");
+    expect(patternDescription).toContain("Regex syntax such as alternation (`A|B`) requires regex mode");
+  });
+
+  it("lcm_grep rejects regex alternation in full-text mode before searching", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-regex-syntax", {
+      pattern: "apple|banana|cherry",
+      mode: "full_text",
+    });
+
+    expect(retrieval.grep).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain(
+      "full_text mode does not support regex syntax",
+    );
+    expect((result.details as { error?: string }).error).toContain('mode: "regex"');
+  });
+
+  it("lcm_grep still forwards regex alternation in regex mode", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [
+          {
+            messageId: 101,
+            conversationId: 42,
+            role: "assistant",
+            snippet: "apple",
+            createdAt: new Date("2026-01-02T00:00:00.000Z"),
+            rank: 0,
+          },
+        ],
+        summaries: [],
+        totalMatches: 1,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-regex-mode", {
+      pattern: "apple|banana|cherry",
+      mode: "regex",
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        query: "apple|banana|cherry",
+        mode: "regex",
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("apple");
   });
 
   it("lcm_expand query mode infers conversationId from delegated grant", async () => {
@@ -214,6 +319,39 @@ describe("LCM tools session scoping", () => {
     expect(text).toContain("deployment timeline");
   });
 
+  it("lcm_grep forwards full-text sort mode and reports it in output", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-sort", {
+      pattern: '"error handling" retries',
+      mode: "full_text",
+      sort: "relevance",
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        mode: "full_text",
+        sort: "relevance",
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("**Mode:** full_text | **Scope:** both | **Sort:** relevance");
+  });
+
   it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
@@ -237,7 +375,190 @@ describe("LCM tools session scoping", () => {
     expect(retrieval.grep).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: 42,
+        conversationIds: [42],
       }),
+    );
+  });
+
+  it("lcm_grep searches across a resolved session family", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps({
+        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
+      }),
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationIdBySessionKey: 42,
+        conversationFamilyIds: [42, 21, 7],
+      }) as never,
+      sessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-family", { pattern: "deployment" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        conversationIds: [42, 21, 7],
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("session family rooted at 42 (3 segments)");
+  });
+
+  it("lcm_grep rejects allConversations from a sub-agent without a delegated grant", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval }) as never,
+      sessionKey: "agent:main:subagent:session-1",
+    });
+    const result = await tool.execute("call-subagent-all", {
+      pattern: "private",
+      allConversations: true,
+    });
+
+    expect(retrieval.grep).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain(
+      "Delegated LCM retrieval requires a valid grant",
+    );
+  });
+
+  it("lcm_grep rejects allConversations when a sub-agent key is passed as sessionId", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval }) as never,
+      sessionId: "agent:main:subagent:session-1",
+    });
+    const result = await tool.execute("call-subagent-session-id-all", {
+      pattern: "private",
+      allConversations: true,
+    });
+
+    expect(retrieval.grep).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain(
+      "Delegated LCM retrieval requires a valid grant",
+    );
+  });
+
+  it("lcm_grep scopes delegated allConversations to the granted conversation IDs", async () => {
+    const retrieval = {
+      grep: vi.fn(async (request: { conversationIds?: number[] }) => {
+        const scoped = request.conversationIds?.includes(42);
+        return {
+          messages: [],
+          summaries: scoped
+            ? [
+                {
+                  summaryId: "sum_allowed",
+                  conversationId: 42,
+                  kind: "leaf",
+                  snippet: "allowed summary",
+                  createdAt: new Date("2026-01-02T00:00:00.000Z"),
+                },
+              ]
+            : [
+                {
+                  summaryId: "sum_foreign",
+                  conversationId: 99,
+                  kind: "leaf",
+                  snippet: "foreign summary",
+                  createdAt: new Date("2026-01-02T00:00:00.000Z"),
+                },
+              ],
+          totalMatches: 1,
+        };
+      }),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: "agent:main:subagent:session-1",
+      issuerSessionId: "main",
+      allowedConversationIds: [42],
+      tokenCap: 120,
+    });
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval }) as never,
+      sessionKey: "agent:main:subagent:session-1",
+    });
+    const result = await tool.execute("call-subagent-granted-all", {
+      pattern: "summary",
+      allConversations: true,
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        conversationIds: [42],
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("allowed summary");
+    expect(text).not.toContain("foreign summary");
+  });
+
+  it("lcm_grep rejects explicit foreign conversationId outside a delegated grant", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: "agent:main:subagent:session-1",
+      issuerSessionId: "main",
+      allowedConversationIds: [42],
+      tokenCap: 120,
+    });
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval }) as never,
+      sessionKey: "agent:main:subagent:session-1",
+    });
+    const result = await tool.execute("call-subagent-foreign", {
+      pattern: "private",
+      conversationId: 99,
+    });
+
+    expect(retrieval.grep).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain(
+      "outside delegated conversation scope",
     );
   });
 
@@ -292,7 +613,7 @@ describe("LCM tools session scoping", () => {
       sessionId: "session-1",
     });
     const scoped = await tool.execute("call-3", { id: "sum_foreign" });
-    expect((scoped.details as { error?: string }).error).toContain("Not found in conversation 42");
+    expect((scoped.details as { error?: string }).error).toContain("Not found in this session scope");
 
     const cross = await tool.execute("call-4", {
       id: "sum_foreign",
@@ -303,5 +624,69 @@ describe("LCM tools session scoping", () => {
     expect((cross.content[0] as { text: string }).text).toContain(
       formatTimestamp(new Date("2026-01-01T00:00:00.000Z"), timezone),
     );
+    expect(cross.details).toMatchObject({
+      id: "sum_foreign",
+      type: "summary",
+      summary: {
+        conversationId: 99,
+        tokenCount: 12,
+      },
+      manifest: {
+        tokenCap: 120,
+      },
+    });
+    expect(JSON.stringify(cross.details)).not.toContain("foreign summary");
+    expect(JSON.stringify(cross.details)).not.toContain("subtree");
+  });
+
+  it("lcm_describe rejects allConversations results outside a delegated grant", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "sum_foreign",
+        type: "summary",
+        summary: {
+          conversationId: 99,
+          kind: "leaf",
+          content: "foreign summary",
+          depth: 0,
+          tokenCount: 12,
+          descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: 12,
+          fileIds: [],
+          parentIds: [],
+          childIds: [],
+          messageIds: [],
+          earliestAt: new Date("2026-01-01T00:00:00.000Z"),
+          latestAt: new Date("2026-01-01T00:00:00.000Z"),
+          subtree: [],
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      })),
+    };
+
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: "agent:main:subagent:session-1",
+      issuerSessionId: "main",
+      allowedConversationIds: [42],
+      tokenCap: 120,
+    });
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval }) as never,
+      sessionKey: "agent:main:subagent:session-1",
+    });
+    const result = await tool.execute("call-subagent-describe-foreign", {
+      id: "sum_foreign",
+      allConversations: true,
+    });
+
+    expect((result.details as { error?: string }).error).toContain(
+      "Not found in delegated conversation scope",
+    );
+    expect(JSON.stringify(result.details)).not.toContain("foreign summary");
   });
 });

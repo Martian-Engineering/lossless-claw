@@ -35,6 +35,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       skipStatelessSessions: true,
       contextThreshold: 0.75,
       freshTailCount: 8,
+      newSessionRetainDepth: 2,
       leafMinFanout: 8,
       condensedMinFanout: 4,
       condensedMinFanoutHard: 2,
@@ -48,16 +49,23 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       summaryModel: "",
       largeFileSummaryProvider: "",
       largeFileSummaryModel: "",
-      autocompactDisabled: false,
       timezone: "UTC",
       pruneHeartbeatOk: false,
+      transcriptGcEnabled: false,
+      proactiveThresholdCompactionMode: "deferred",
+      autoRotateSessionFiles: {
+        enabled: true,
+        createBackups: false,
+        sizeBytes: 2 * 1024 * 1024,
+        startup: "rotate",
+        runtime: "rotate",
+      },
+      summaryMaxOverageFactor: 3,
     },
     complete: vi.fn(),
     callGateway: (params: { method: string; params?: Record<string, unknown> }) =>
       callGatewayMock(params),
     resolveModel: () => ({ provider: "anthropic", model: "claude-opus-4-5" }),
-    getApiKey: async () => undefined,
-    requireApiKey: async () => "",
     parseAgentSessionKey,
     isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
     normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
@@ -351,6 +359,59 @@ describe("createLcmExpandTool expansion limits", () => {
     expect(result.details).toMatchObject({
       error: expect.stringMatching(/conversation 8/i),
     });
+    expect(mockRetrieval.expand).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for delegated explicit expansion with multiple allowed conversations", async () => {
+    const mockRetrieval = makeMockRetrieval();
+
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: "agent:main:subagent:multi-conversation",
+      issuerSessionId: "main",
+      allowedConversationIds: [7, 11],
+      tokenCap: 120,
+    });
+
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:multi-conversation",
+    });
+    const result = await tool.execute("call-multi-conversation", {
+      summaryIds: ["sum_a", "sum_b"],
+      allConversations: true,
+    });
+
+    expect(result.details).toMatchObject({
+      error: expect.stringContaining("requires a single delegated conversation scope"),
+    });
+    expect(mockRetrieval.expand).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for delegated query expansion with multiple allowed conversations", async () => {
+    const mockRetrieval = makeMockRetrieval();
+
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: "agent:main:subagent:multi-query",
+      issuerSessionId: "main",
+      allowedConversationIds: [7, 11],
+      tokenCap: 120,
+    });
+
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:multi-query",
+    });
+    const result = await tool.execute("call-multi-query", {
+      query: "private",
+      allConversations: true,
+    });
+
+    expect(result.details).toMatchObject({
+      error: expect.stringContaining("requires a single delegated conversation scope"),
+    });
+    expect(mockRetrieval.grep).not.toHaveBeenCalled();
     expect(mockRetrieval.expand).not.toHaveBeenCalled();
   });
 

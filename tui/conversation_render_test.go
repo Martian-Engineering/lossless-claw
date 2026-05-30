@@ -38,3 +38,38 @@ func TestConversationMessageDisplayTextKeepsLargeAssistantMessageBelowDefaultLim
 		t.Fatalf("expected assistant message below default cap to remain unchanged")
 	}
 }
+
+func TestRenderActiveFocusBannerShowsStaleDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	brief := &focusBriefEntry{
+		briefID:               "focus_active",
+		prompt:                "agent configuration",
+		status:                "active",
+		tokenCount:            7000,
+		targetTokens:          12000,
+		postFocusMessageCount: 2,
+		postFocusSummaryCount: 1,
+		postFocusTokenCount:   900,
+		stale:                 true,
+		sourceContextChanged:  true,
+	}
+
+	got := renderActiveFocusBanner(brief, 200)
+	for _, want := range []string{
+		"FOCUS active",
+		"focus_active",
+		"agent configuration",
+		"7000/12000t",
+		"delta:2 msgs,1 summaries,~900t",
+		"stale",
+		"source obsolete",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected focus banner to contain %q, got %q", want, got)
+		}
+	}
+	if inactive := renderActiveFocusBanner(&focusBriefEntry{status: "inactive"}, 120); inactive != "" {
+		t.Fatalf("inactive focus banner = %q, want empty", inactive)
+	}
+}

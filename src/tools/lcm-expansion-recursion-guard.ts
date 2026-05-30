@@ -3,6 +3,7 @@ import { resolveDelegatedExpansionGrantId } from "../expansion-auth.js";
 import type { LcmDependencies } from "../types.js";
 
 export const EXPANSION_RECURSION_ERROR_CODE = "EXPANSION_RECURSION_BLOCKED";
+export const EXPANSION_CONCURRENCY_ERROR_CODE = "EXPANSION_CONCURRENCY_BLOCKED";
 const EXPANSION_DELEGATION_DEPTH_CAP = 1;
 
 type TelemetryEvent = "start" | "block" | "timeout" | "success";
@@ -23,6 +24,7 @@ export type DelegatedExpansionContext = {
 };
 
 export type ExpansionRecursionBlockReason = "depth_cap" | "idempotent_reentry";
+export type ExpansionConcurrencyBlockReason = "origin_session_in_flight";
 
 export type ExpansionRecursionGuardDecision =
   | {
@@ -41,8 +43,24 @@ export type ExpansionRecursionGuardDecision =
       originSessionKey: string;
     };
 
+export type ExpansionConcurrencyGuardDecision =
+  | {
+      blocked: false;
+      requestId: string;
+      originSessionKey: string;
+    }
+  | {
+      blocked: true;
+      code: typeof EXPANSION_CONCURRENCY_ERROR_CODE;
+      reason: ExpansionConcurrencyBlockReason;
+      message: string;
+      requestId: string;
+      originSessionKey: string;
+    };
+
 const delegatedContextBySessionKey = new Map<string, DelegatedExpansionContext>();
 const blockedRequestIdsBySessionKey = new Map<string, Set<string>>();
+const activeRequestIdByOriginSessionKey = new Map<string, string>();
 
 function normalizeSessionKey(sessionKey?: string): string {
   return typeof sessionKey === "string" ? sessionKey.trim() : "";
@@ -87,6 +105,14 @@ function buildExpansionRecursionRecoveryGuidance(originSessionKey: string): stri
     "your answer from that result. Do NOT call `lcm_expand_query` from delegated context. " +
     `If deeper delegation is required, return to the origin session (${originSessionKey}) ` +
     "and call `lcm_expand_query` there."
+  );
+}
+
+function buildExpansionConcurrencyRecoveryGuidance(originSessionKey: string): string {
+  return (
+    "Recovery: Wait for the active expansion to finish before retrying. " +
+    `If you need an immediate fallback, stay in the origin session (${originSessionKey}) ` +
+    "and use `lcm_grep` or `lcm_describe` instead."
   );
 }
 
@@ -214,6 +240,66 @@ export function evaluateExpansionRecursionGuard(params: {
 }
 
 /**
+ * Acquire the single active delegated-expansion slot for an origin session.
+ * A second concurrent caller from the same origin session is blocked
+ * immediately so sub-agents do not deadlock on a shared lane.
+ */
+export function acquireExpansionConcurrencySlot(params: {
+  originSessionKey?: string;
+  requestId: string;
+}): ExpansionConcurrencyGuardDecision {
+  const originSessionKey = normalizeSessionKey(params.originSessionKey) || "main";
+  const requestId = params.requestId.trim();
+  const activeRequestId = activeRequestIdByOriginSessionKey.get(originSessionKey);
+
+  if (activeRequestId && activeRequestId !== requestId) {
+    return {
+      blocked: true,
+      code: EXPANSION_CONCURRENCY_ERROR_CODE,
+      reason: "origin_session_in_flight",
+      message:
+        `${EXPANSION_CONCURRENCY_ERROR_CODE}: Another lcm_expand_query delegation is already ` +
+        `in flight for origin session (${originSessionKey}; activeRequestId=${activeRequestId}). ` +
+        buildExpansionConcurrencyRecoveryGuidance(originSessionKey),
+      requestId,
+      originSessionKey,
+    };
+  }
+
+  if (!activeRequestId) {
+    activeRequestIdByOriginSessionKey.set(originSessionKey, requestId);
+  }
+
+  return {
+    blocked: false,
+    requestId,
+    originSessionKey,
+  };
+}
+
+/**
+ * Release the active delegated-expansion slot for an origin session.
+ */
+export function releaseExpansionConcurrencySlot(params: {
+  originSessionKey?: string;
+  requestId?: string;
+}): void {
+  const originSessionKey = normalizeSessionKey(params.originSessionKey);
+  if (!originSessionKey) {
+    return;
+  }
+  const activeRequestId = activeRequestIdByOriginSessionKey.get(originSessionKey);
+  if (!activeRequestId) {
+    return;
+  }
+  const requestId = params.requestId?.trim();
+  if (requestId && activeRequestId !== requestId) {
+    return;
+  }
+  activeRequestIdByOriginSessionKey.delete(originSessionKey);
+}
+
+/**
  * Emit structured delegated expansion telemetry with monotonic counters.
  */
 export function recordExpansionDelegationTelemetry(params: {
@@ -246,7 +332,7 @@ export function recordExpansionDelegationTelemetry(params: {
   };
   const line = `[lcm][expansion_delegation] ${JSON.stringify(payload)}`;
   if (params.event === "start" || params.event === "success") {
-    params.deps.log.info(line);
+    params.deps.log.debug(line);
     return;
   }
   params.deps.log.warn(line);
@@ -279,6 +365,7 @@ export function getExpansionDelegationTelemetrySnapshotForTests(): Record<Teleme
 export function resetExpansionDelegationGuardForTests(): void {
   delegatedContextBySessionKey.clear();
   blockedRequestIdsBySessionKey.clear();
+  activeRequestIdByOriginSessionKey.clear();
   telemetryCounters.start = 0;
   telemetryCounters.block = 0;
   telemetryCounters.timeout = 0;

@@ -56,7 +56,7 @@ When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
 
 1. **bootstrap** — On session start, reconciles the JSONL session file with the LCM database. Imports any messages that exist in the file but not in LCM (crash recovery).
 2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
-3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether compaction should run.
+3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether `contextThreshold` requires compaction.
 
 ### Leaf compaction
 
@@ -66,9 +66,9 @@ The **leaf pass** converts raw messages into leaf summaries:
 2. Cap the chunk at `leafChunkTokens` (default 20k tokens).
 3. Concatenate message content with timestamps.
 4. Resolve the most recent prior summary for continuity (passed as `previous_context` so the LLM avoids repeating known information).
-5. Send to the LLM with the leaf prompt.
-6. Normalize provider response blocks (Anthropic/OpenAI text, output_text, and nested content/summary shapes) into plain text.
-7. If normalization is empty, log provider/model/block-type diagnostics and fall back to deterministic truncation.
+5. Send to OpenClaw's host-owned `runtime.llm.complete` capability with the leaf prompt.
+6. Normalize runtime LLM response text into plain text while preserving provider/model diagnostics from the host result.
+7. If normalization is empty, log provider/model diagnostics and fall back to deterministic truncation.
 8. If the summary is larger than the input (LLM failure), retry with the aggressive prompt. If still too large, fall back to deterministic truncation.
 9. Persist the summary, link to source messages, and replace the message range in context_items.
 
@@ -84,15 +84,16 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 
 ### Compaction modes
 
-**Incremental (after each turn):**
-- Checks if raw tokens outside the fresh tail exceed `leafChunkTokens`
-- If so, runs one leaf pass
-- If `incrementalMaxDepth != 0`, follows with condensation passes up to that depth (`-1` for unlimited)
-- Best-effort: failures don't break the conversation
+**Automatic threshold sweep (after each turn):**
+- Checks if the assembled context crosses `contextThreshold`
+- Below threshold, does not compact and does not record leaf debt
+- In deferred mode, records one `"threshold"` maintenance row for background, `maintain()`, or pre-assembly execution
+- In inline mode, runs a full sweep before `afterTurn()` completes
 
-**Full sweep (manual `/compact` or overflow):**
+**Full sweep (threshold, manual `/compact`, or overflow):**
 - Phase 1: Repeatedly runs leaf passes until no more eligible chunks
-- Phase 2: Repeatedly runs condensation passes starting from the shallowest eligible depth
+- Phase 2: If the summarized prefix is above `summaryPrefixTargetTokens`, repeatedly runs condensation passes starting from the shallowest eligible depth, respecting the preferred `sweepMaxDepth` (`0` for leaf-only, `-1` for unlimited)
+- Pressure phase: If summarized-prefix pressure remains, condensation may go beyond `sweepMaxDepth` using the hard fanout floor
 - Each pass checks for progress; stops if no tokens were saved
 
 **Budget-targeted (`compactUntilUnder`):**
@@ -125,7 +126,7 @@ The assembler runs before each model turn and builds the message array:
 2. Resolve each item — summaries become user messages with XML wrappers; messages are reconstructed from parts.
 3. Split into evictable prefix and protected fresh tail (last `freshTailCount` raw messages).
 4. Compute fresh tail token cost (always included, even if over budget).
-5. Fill remaining budget from the evictable set, keeping newest items and dropping oldest.
+5. Fill remaining budget from the evictable set. By default this keeps newest older items and drops the oldest; when `promptAwareEviction` is enabled and a searchable prompt is present, the evictable prefix is ranked by prompt relevance first and then restored to chronological order.
 6. Normalize assistant content to array blocks (Anthropic API compatibility).
 7. Sanitize tool-use/result pairing (ensures every tool_result has a matching tool_use).
 
@@ -190,7 +191,7 @@ Files embedded in user messages (typically via `<file>` blocks from tool output)
 1. Parse file blocks from message content.
 2. For each block exceeding `largeFileTokenThreshold` (default 25k tokens):
    - Generate a unique file ID (`file_` prefix)
-   - Store the content to `~/.openclaw/lcm-files/<conversation_id>/<file_id>.<ext>`
+   - Store the content to `largeFilesDir/<conversation_id>/<file_id>.<ext>` (default `~/.openclaw/lcm-files/...`)
    - Generate a ~200 token exploration summary (structural analysis, key sections, etc.)
    - Insert a `large_files` record with metadata
    - Replace the file block in the message with a compact reference
@@ -206,6 +207,8 @@ LCM handles crash recovery through **bootstrap reconciliation**:
 2. Compare against the LCM database.
 3. Find the most recent message that exists in both (the "anchor").
 4. Import any messages after the anchor that are in JSONL but not in LCM.
+5. If an existing session key moves to a different transcript file and no anchor exists, treat the new file as a bounded transcript epoch and import its recoverable messages. The same flood cap used for tail reconciliation prevents large unrelated transcripts from being appended automatically.
+6. Advance the bootstrap checkpoint only after an overlap is found or a bounded epoch import succeeds. No-anchor reads that import nothing leave the old checkpoint in place so a later turn can retry.
 
 This handles the case where OpenClaw wrote messages to the session file but crashed before LCM could persist them.
 
@@ -213,12 +216,8 @@ This handles the case where OpenClaw wrote messages to the session file but cras
 
 All mutating operations (ingest, compact) are serialized per-session using a promise queue. This prevents races between concurrent afterTurn/compact calls for the same conversation without blocking operations on different conversations.
 
-## Authentication
+## Runtime LLM boundary
 
-LCM needs to call an LLM for summarization. It resolves credentials through a three-tier cascade:
+LCM needs model inference for summarization, but it does not resolve provider credentials, base URLs, or provider transport settings directly. Summarization calls go through OpenClaw's `runtime.llm.complete` capability, which owns model preparation, credential resolution, OAuth refresh, provider dispatch, and usage attribution.
 
-1. **Auth profiles** — OpenClaw's OAuth/token/API-key profile system (`auth-profiles.json`), checked in priority order
-2. **Environment variables** — Standard provider env vars (`ANTHROPIC_API_KEY`, etc.)
-3. **Custom provider key** — From models config (e.g., `models.json`)
-
-For OAuth providers (e.g., Anthropic via Claude Max), LCM handles token refresh and credential persistence automatically.
+Configured Lossless summary model overrides (`summaryModel`, `largeFileSummaryModel`, and `fallbackProviders`) are sent as runtime LLM model override requests. OpenClaw enforces those requests with `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`; denied overrides fail closed instead of silently falling back to a different model.

@@ -122,7 +122,8 @@ function buildOrchestrationObservability(input: {
  */
 export function createLcmExpandTool(input: {
   deps: LcmDependencies;
-  lcm: LcmContextEngine;
+  lcm?: LcmContextEngine;
+  getLcm?: () => Promise<LcmContextEngine>;
   /** Runtime session key (used for delegated expansion auth scoping). */
   sessionId?: string;
   sessionKey?: string;
@@ -136,10 +137,14 @@ export function createLcmExpandTool(input: {
       "Use this to drill into previously-compacted context when you need detail " +
       "that was summarised away. Provide either summaryIds (direct expansion) or " +
       "query (grep-first, then expand top matches). Returns a compact text payload " +
-      "with cited IDs for follow-up.",
+      "plus cited IDs in tool output for follow-up.",
     parameters: LcmExpandSchema,
     async execute(_toolCallId, params) {
-      const retrieval = input.lcm.getRetrieval();
+      const lcm = input.lcm ?? (await input.getLcm?.());
+      if (!lcm) {
+        throw new Error("LCM engine is unavailable.");
+      }
+      const retrieval = lcm.getRetrieval();
       const orchestrator = new ExpansionOrchestrator(retrieval);
       const runtimeAuthManager = getRuntimeExpansionAuthManager();
 
@@ -178,12 +183,21 @@ export function createLcmExpandTool(input: {
       }
 
       const conversationScope = await resolveLcmConversationScope({
-        lcm: input.lcm,
+        lcm,
         deps: input.deps,
         sessionId: input.sessionId,
         sessionKey: input.sessionKey,
         params: p,
       });
+      if (conversationScope.error) {
+        return jsonResult({ error: conversationScope.error });
+      }
+      if (isDelegatedSession && conversationScope.conversationId == null) {
+        return jsonResult({
+          error:
+            "lcm_expand requires a single delegated conversation scope. Provide conversationId within the delegated grant.",
+        });
+      }
 
       const runExpand = async (input: {
         summaryIds: string[];

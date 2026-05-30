@@ -31,7 +31,7 @@ const LcmDescribeSchema = Type.Object({
   conversationId: Type.Optional(
     Type.Number({
       description:
-        "Conversation ID to scope describe lookups to. If omitted, uses the current session conversation.",
+        "Physical conversation ID to scope describe lookups to. If omitted, uses the current session family.",
     }),
   ),
   allConversations: Type.Optional(
@@ -46,6 +46,25 @@ const LcmDescribeSchema = Type.Object({
       minimum: 1,
     }),
   ),
+  expandFile: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true (and target is a file_xxx), inline the file's content from disk. " +
+        "Combined with the file's exploration_summary, this is how an agent recovers " +
+        "the original output of an elided tool result that was replaced with a " +
+        "[LCM Tool Output: file_xxx | tool=… | N bytes] reference. Capped at " +
+        "expandFileMaxBytes (default 32768 = ~8K tokens). Returns content + " +
+        "contentTruncated boolean. Use lcm_grep to search across the full file when " +
+        "it exceeds the cap.",
+    }),
+  ),
+  expandFileMaxBytes: Type.Optional(
+    Type.Number({
+      description: "Max bytes of inlined file content when expandFile=true. Default 32768. Hard cap 512000.",
+      minimum: 1024,
+      maximum: 512_000,
+    }),
+  ),
 });
 
 function normalizeRequestedTokenCap(value: unknown): number | undefined {
@@ -55,9 +74,36 @@ function normalizeRequestedTokenCap(value: unknown): number | undefined {
   return Math.max(1, Math.trunc(value));
 }
 
+function compactDescribeDetails(result: Awaited<ReturnType<LcmContextEngine["getRetrieval"]>["describe"]>) {
+  if (!result) {
+    return result;
+  }
+  if (result.type === "summary" && result.summary) {
+    const { content: _content, subtree: _subtree, ...summary } = result.summary;
+    return {
+      id: result.id,
+      type: result.type,
+      summary,
+    };
+  }
+  if (result.type === "file" && result.file) {
+    const { explorationSummary: _explorationSummary, ...file } = result.file;
+    return {
+      id: result.id,
+      type: result.type,
+      file: {
+        ...file,
+        hasExplorationSummary: Boolean(result.file.explorationSummary),
+      },
+    };
+  }
+  return { id: result.id, type: result.type };
+}
+
 export function createLcmDescribeTool(input: {
   deps: LcmDependencies;
-  lcm: LcmContextEngine;
+  lcm?: LcmContextEngine;
+  getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
 }): AnyAgentTool {
@@ -68,28 +114,57 @@ export function createLcmDescribeTool(input: {
       "Look up metadata and content for an LCM item by ID. " +
       "Use this to inspect summaries (sum_xxx) or stored files (file_xxx) " +
       "from compacted conversation history. Returns summary content, lineage, " +
-      "token counts, and file exploration results.",
+      "token counts, and file exploration results. " +
+      "ALSO USE THIS when you see a `[LCM Tool Output: file_xxx | tool=… | N bytes]` " +
+      "reference in the conversation — that means an older tool result was elided " +
+      "for context efficiency. Call lcm_describe(id=file_xxx, expandFile=true) to " +
+      "fetch the original output content before answering questions that depend on " +
+      "its specifics.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
-      const retrieval = input.lcm.getRetrieval();
-      const timezone = input.lcm.timezone;
+      const lcm = input.lcm ?? (await input.getLcm?.());
+      if (!lcm) {
+        throw new Error("LCM engine is unavailable.");
+      }
+      const retrieval = lcm.getRetrieval();
+      const timezone = lcm.timezone;
       const p = params as Record<string, unknown>;
       const id = (p.id as string).trim();
       const conversationScope = await resolveLcmConversationScope({
-        lcm: input.lcm,
+        lcm,
         deps: input.deps,
         sessionId: input.sessionId,
         sessionKey: input.sessionKey,
         params: p,
       });
-      if (!conversationScope.allConversations && conversationScope.conversationId == null) {
+      if (conversationScope.error) {
+        return jsonResult({ error: conversationScope.error });
+      }
+      if (
+        !conversationScope.allConversations
+        && conversationScope.conversationId == null
+        && (conversationScope.conversationIds?.length ?? 0) === 0
+      ) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
         });
       }
 
-      const result = await retrieval.describe(id);
+      // v4.2 §B — pass expandFile + largeFilesDir through so file_xxx
+      // drilldowns can return on-disk content. Path validation in
+      // retrieval.describeFile rejects URIs outside largeFilesDir.
+      const expandFile = p.expandFile === true;
+      const expandFileMaxBytes =
+        typeof p.expandFileMaxBytes === "number" && Number.isFinite(p.expandFileMaxBytes)
+          ? p.expandFileMaxBytes
+          : undefined;
+      const result = await retrieval.describe(id, {
+        expandFile,
+        expandFileMaxBytes,
+        // Optional-chained for test mocks that may not expose configView.
+        largeFilesDir: lcm.configView?.largeFilesDir,
+      });
 
       if (!result) {
         return jsonResult({
@@ -97,12 +172,24 @@ export function createLcmDescribeTool(input: {
           hint: "Check the ID format (sum_xxx for summaries, file_xxx for files).",
         });
       }
-      if (conversationScope.conversationId != null) {
+      if (
+        conversationScope.conversationId != null
+        || (conversationScope.conversationIds?.length ?? 0) > 0
+      ) {
         const itemConversationId =
           result.type === "summary" ? result.summary?.conversationId : result.file?.conversationId;
-        if (itemConversationId != null && itemConversationId !== conversationScope.conversationId) {
+        const allowedConversationIds = new Set(
+          (conversationScope.conversationIds?.length ?? 0) > 0
+            ? conversationScope.conversationIds
+            : conversationScope.conversationId != null
+              ? [conversationScope.conversationId]
+              : [],
+        );
+        if (itemConversationId != null && !allowedConversationIds.has(itemConversationId)) {
           return jsonResult({
-            error: `Not found in conversation ${conversationScope.conversationId}: ${id}`,
+            error: conversationScope.delegated
+              ? `Not found in delegated conversation scope: ${id}`
+              : `Not found in this session scope: ${id}`,
             hint: "Use allConversations=true for cross-conversation lookup.",
           });
         }
@@ -191,7 +278,7 @@ export function createLcmDescribeTool(input: {
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: {
-            ...result,
+            ...compactDescribeDetails(result),
             manifest: {
               tokenCap: resolvedTokenCap,
               budgetSource:
@@ -227,10 +314,30 @@ export function createLcmDescribeTool(input: {
           lines.push("");
           lines.push("*No exploration summary available.*");
         }
+        // v4.2 §B — when expandFile=true, retrieval reads on-disk content
+        // and inlines it. Show it under a "Content" heading; flag truncation.
+        if (typeof f.content === "string") {
+          lines.push("");
+          lines.push("## Content");
+          lines.push("");
+          lines.push("```");
+          lines.push(f.content);
+          lines.push("```");
+          if (f.contentTruncated) {
+            lines.push("");
+            lines.push(
+              `*Output truncated to ${f.content.length.toLocaleString()} of ${f.byteSize?.toLocaleString() ?? "?"} bytes. ` +
+              `Use lcm_grep against the file id to search the full content.*`,
+            );
+          }
+        } else if (expandFile) {
+          lines.push("");
+          lines.push("*Content unavailable: file missing on disk or path failed validation.*");
+        }
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: result,
+          details: compactDescribeDetails(result),
         };
       }
 

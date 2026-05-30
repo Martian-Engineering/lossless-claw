@@ -96,6 +96,7 @@ export function detectBroadTimeRangeIndicator(query?: string): boolean {
   if (!query) {
     return false;
   }
+  if (typeof query !== "string") return false;
   const trimmed = query.trim();
   if (!trimmed) {
     return false;
@@ -138,6 +139,7 @@ export function detectMultiHopIndicator(input: {
     return false;
   }
 
+  if (typeof input.query !== "string") return false;
   const trimmed = input.query.trim();
   if (!trimmed) {
     return false;

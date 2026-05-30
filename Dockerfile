@@ -11,7 +11,7 @@ WORKDIR /plugin
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
-RUN npm run build || true # Just in case
+RUN npm run build
 
 # Set up openclaw workspace
 WORKDIR /root/.openclaw

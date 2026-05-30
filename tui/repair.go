@@ -30,13 +30,21 @@ const (
 	openAIResponsesModel   = "gpt-5.3-codex"
 	condensedTargetTokens  = 2000
 	defaultHTTPTimeout     = 180 * time.Second
+
+	defaultAnthropicBaseURL = "https://api.anthropic.com"
+	defaultOpenAIBaseURL    = "https://api.openai.com"
 )
 
 var (
 	lookupCLIPath       = exec.LookPath
 	execCLICommand      = exec.CommandContext
-	cliOutputTokenSlack = 64
+	cliOutputTokenSlack = 128
 )
+
+// cliSummarizationSystemPrompt is the system directive sent to CLI-delegated
+// summarizers (claude CLI, codex CLI). It constrains the CLI to output only
+// the requested summary, with no preamble, commentary, or protocol tokens.
+const cliSummarizationSystemPrompt = "You are a summarization engine. Output ONLY the requested summary. No preamble, no conversation, no questions, no commentary. Never output HEARTBEAT_OK or any protocol tokens."
 
 type repairOptions struct {
 	apply     bool
@@ -44,6 +52,9 @@ type repairOptions struct {
 	all       bool
 	summaryID string
 	verbose   bool
+	provider  string
+	model     string
+	baseURL   string
 }
 
 type repairSummary struct {
@@ -90,6 +101,7 @@ type anthropicClient struct {
 	apiKey   string
 	http     *http.Client
 	model    string
+	baseURL  string
 }
 
 type anthropicRequest struct {
@@ -174,15 +186,21 @@ func runRepairCommand(args []string) error {
 
 	var client *anthropicClient
 	if opts.apply {
-		apiKey, err := resolveAnthropicAPIKey(paths)
+		settings := resolveTUISummaryRuntimeSettings(paths, opts.provider, opts.model, opts.baseURL, "", "")
+		opts.provider = settings.provider
+		opts.model = settings.model
+		opts.baseURL = settings.baseURL
+
+		apiKey, err := resolveProviderAPIKey(paths, opts.provider)
 		if err != nil {
 			return err
 		}
 		client = &anthropicClient{
-			provider: defaultLLMProvider,
+			provider: opts.provider,
 			apiKey:   apiKey,
 			http:     &http.Client{Timeout: defaultHTTPTimeout},
-			model:    anthropicModel,
+			model:    opts.model,
+			baseURL:  opts.baseURL,
 		}
 	}
 
@@ -213,6 +231,9 @@ func parseRepairArgs(args []string) (repairOptions, int64, error) {
 	all := fs.Bool("all", false, "scan all conversations")
 	summaryID := fs.String("summary-id", "", "repair a specific summary ID")
 	verbose := fs.Bool("verbose", false, "include old content hash and preview")
+	provider := fs.String("provider", "", "provider id (e.g. anthropic, openai)")
+	model := fs.String("model", "", "summary model id")
+	baseURL := fs.String("base-url", "", "custom API base URL")
 
 	normalizedArgs, err := normalizeRepairArgs(args)
 	if err != nil {
@@ -231,6 +252,9 @@ func parseRepairArgs(args []string) (repairOptions, int64, error) {
 		all:       *all,
 		summaryID: strings.TrimSpace(*summaryID),
 		verbose:   *verbose,
+		provider:  strings.TrimSpace(*provider),
+		model:     strings.TrimSpace(*model),
+		baseURL:   strings.TrimSpace(*baseURL),
 	}
 	if opts.apply {
 		opts.dryRun = false
@@ -265,8 +289,16 @@ func normalizeRepairArgs(args []string) ([]string, error) {
 		switch {
 		case arg == "--apply" || arg == "--dry-run" || arg == "--all" || arg == "--verbose":
 			flags = append(flags, arg)
+		case strings.HasPrefix(arg, "--provider="), strings.HasPrefix(arg, "--model="), strings.HasPrefix(arg, "--base-url="):
+			flags = append(flags, arg)
 		case strings.HasPrefix(arg, "--summary-id="):
 			flags = append(flags, arg)
+		case arg == "--provider" || arg == "--model" || arg == "--base-url":
+			if i+1 >= len(args) {
+				return nil, errors.New("missing value for " + arg)
+			}
+			flags = append(flags, arg, args[i+1])
+			i++
 		case arg == "--summary-id":
 			if i+1 >= len(args) {
 				return nil, errors.New("missing value for --summary-id")
@@ -285,9 +317,13 @@ func normalizeRepairArgs(args []string) ([]string, error) {
 func repairUsageText() string {
 	return strings.TrimSpace(`
 Usage:
-  lcm-tui repair <conversation_id> [--dry-run] [--summary-id <id>]
-  lcm-tui repair <conversation_id> --apply [--summary-id <id>]
-  lcm-tui repair --all [--dry-run|--apply]
+  lcm-tui repair <conversation_id> [--dry-run] [--summary-id <id>] [--provider <id>] [--model <model>] [--base-url <url>]
+  lcm-tui repair <conversation_id> --apply [--summary-id <id>] [--provider <id>] [--model <model>] [--base-url <url>]
+  lcm-tui repair --all [--dry-run|--apply] [--provider <id>] [--model <model>] [--base-url <url>]
+
+Env:
+  LCM_TUI_SUMMARY_PROVIDER / LCM_TUI_SUMMARY_MODEL / LCM_TUI_SUMMARY_BASE_URL
+  fall back to LCM_SUMMARY_PROVIDER / LCM_SUMMARY_MODEL / LCM_SUMMARY_BASE_URL
 `)
 }
 
@@ -917,7 +953,10 @@ Files
 
 func (c *anthropicClient) summarize(ctx context.Context, prompt string, targetTokens int) (string, error) {
 	provider, model := resolveSummaryProviderModel(c.provider, c.model)
-	if strings.TrimSpace(c.apiKey) == "" {
+	// Codex OAuth path has no raw API key: the codex CLI reads ~/.codex/auth.json
+	// directly. Allow an empty apiKey to reach summarizeOpenAI, which routes to
+	// the CLI delegate when hasCodexOAuth() is true.
+	if strings.TrimSpace(c.apiKey) == "" && !(provider == "openai-codex" && hasCodexOAuth()) {
 		return "", fmt.Errorf("missing API key for provider %q", provider)
 	}
 	if c.http == nil {
@@ -959,8 +998,16 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 		return summarizeViaCLI(ctx, model, prompt, targetTokens)
 	}
 
-	endpoint := "https://api.anthropic.com/v1/messages"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	baseURL := c.baseURL
+	if baseURL == "" {
+		baseURL = defaultAnthropicBaseURL
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		resolveProviderEndpointURL(baseURL, "/v1/messages"),
+		bytes.NewReader(payload),
+	)
 	if err != nil {
 		return "", fmt.Errorf("build Anthropic request: %w", err)
 	}
@@ -1010,10 +1057,13 @@ func summarizeViaCLI(ctx context.Context, model, prompt string, targetTokens int
 	}
 	cmd := execCLICommand(ctx, claudePath,
 		"--print",
+		"--input-format", "text",
 		"--output-format", "text",
+		"--system-prompt", cliSummarizationSystemPrompt,
 		"--model", model,
-		"-p", prompt,
 	)
+	cmd.Dir = os.TempDir()
+	cmd.Stdin = strings.NewReader(prompt)
 	// Unset ANTHROPIC_API_KEY so the CLI uses its own stored OAuth credentials.
 	env := os.Environ()
 	filtered := env[:0]
@@ -1046,7 +1096,110 @@ func summarizeViaCLI(ctx context.Context, model, prompt string, targetTokens int
 	return result, nil
 }
 
+// filteredOpenAIChildEnv returns env with all OPENAI_* vars stripped, so a
+// CLI-delegated codex subprocess reads credentials and endpoint config from
+// ~/.codex/ alone. Filtering the whole prefix (not just OPENAI_API_KEY)
+// prevents a misconfigured OPENAI_BASE_URL or proxy var from re-routing
+// OAuth-authenticated traffic to an unintended endpoint.
+func filteredOpenAIChildEnv(env []string) []string {
+	filtered := env[:0]
+	for _, e := range env {
+		if strings.HasPrefix(e, "OPENAI_") {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	return filtered
+}
+
+// hasCodexOAuth reports whether ~/.codex/auth.json exists and is non-empty.
+// Presence of that file is how the user indicates they have logged in to the
+// Codex CLI; the binary itself handles OAuth refresh against ChatGPT Plus/Pro.
+func hasCodexOAuth() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(home, ".codex", "auth.json"))
+	if err != nil {
+		return false
+	}
+	return !info.IsDir() && info.Size() > 0
+}
+
+// summarizeViaCodexCLI delegates summarization to the `codex` CLI binary when
+// the user has a Codex OAuth session (~/.codex/auth.json) but no raw
+// OPENAI_API_KEY. Mirrors summarizeViaCLI's shape for Anthropic OAuth.
+//
+// The Codex CLI lacks a --system-prompt flag, so the system directive is
+// prepended to the stdin payload. The --output-last-message flag captures just
+// the model's final message, avoiding session/status preamble that `codex exec`
+// writes to stdout.
+func summarizeViaCodexCLI(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
+	codexPath, err := lookupCLIPath("codex")
+	if err != nil {
+		return "", fmt.Errorf("codex OAuth detected but `codex` CLI not found in PATH: install Codex CLI or set OPENAI_API_KEY")
+	}
+
+	outputFile, err := os.CreateTemp("", "lcm-codex-output-*.txt")
+	if err != nil {
+		return "", fmt.Errorf("create codex output file: %w", err)
+	}
+	outputPath := outputFile.Name()
+	_ = outputFile.Close()
+	defer os.Remove(outputPath)
+
+	cmd := execCLICommand(ctx, codexPath,
+		"exec",
+		"--skip-git-repo-check",
+		"--color", "never",
+		"--ephemeral",
+		"--sandbox", "read-only",
+		"--output-last-message", outputPath,
+		"-m", model,
+		"-",
+	)
+	cmd.Dir = os.TempDir()
+	cmd.Stdin = strings.NewReader(cliSummarizationSystemPrompt + "\n\n" + prompt)
+	cmd.Env = filteredOpenAIChildEnv(os.Environ())
+
+	if _, err := cmd.Output(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", fmt.Errorf("codex CLI exited %d: %s", exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return "", fmt.Errorf("codex CLI: %w", err)
+	}
+
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		return "", fmt.Errorf("read codex CLI output: %w", err)
+	}
+	result := strings.TrimSpace(string(data))
+	if result == "" {
+		return "", fmt.Errorf("codex CLI returned empty output")
+	}
+	estimatedTokens := estimateTokenCount(result)
+	if estimatedTokens > targetTokens+cliOutputTokenSlack {
+		return "", fmt.Errorf(
+			"codex CLI output exceeded target token budget: got %d tokens for target %d",
+			estimatedTokens,
+			targetTokens,
+		)
+	}
+	return result, nil
+}
+
 func (c *anthropicClient) summarizeOpenAI(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
+	// Codex ChatGPT Plus/Pro OAuth cannot authenticate against api.openai.com
+	// with a raw key because no key exists for that plan. When the openai-codex
+	// provider is selected with no OPENAI_API_KEY but a populated
+	// ~/.codex/auth.json is present, delegate to the `codex` CLI which already
+	// holds valid OAuth credentials and handles token refresh transparently.
+	if normalizeProviderID(c.provider) == "openai-codex" && strings.TrimSpace(c.apiKey) == "" && hasCodexOAuth() {
+		return summarizeViaCodexCLI(ctx, model, prompt, targetTokens)
+	}
+
 	reqBody := openAIResponsesRequest{
 		Model:           model,
 		MaxOutputTokens: targetTokens,
@@ -1067,7 +1220,16 @@ func (c *anthropicClient) summarizeOpenAI(ctx context.Context, model, prompt str
 		return "", fmt.Errorf("marshal OpenAI request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/responses", bytes.NewReader(payload))
+	baseURL := c.baseURL
+	if baseURL == "" {
+		baseURL = defaultOpenAIBaseURL
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		resolveProviderEndpointURL(baseURL, "/v1/responses"),
+		bytes.NewReader(payload),
+	)
 	if err != nil {
 		return "", fmt.Errorf("build OpenAI request: %w", err)
 	}
@@ -1328,6 +1490,15 @@ func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) 
 		}
 	}
 
+	// Codex OAuth fallback: when ~/.codex/auth.json exists the codex CLI
+	// can handle auth itself. Return an empty apiKey with nil error so the
+	// caller routes to summarizeViaCodexCLI. Placed before the OpenClaw
+	// auth-profile and credential-file lookups because those don't apply to
+	// ChatGPT Plus/Pro plans, which have no API-key equivalent.
+	if normalizedProvider == "openai-codex" && hasCodexOAuth() {
+		return "", nil
+	}
+
 	// Check CLAUDE_CODE_OAUTH_TOKEN env var (setup-token / OAuth support).
 	if normalizedProvider == "anthropic" {
 		if oauthToken := strings.TrimSpace(os.Getenv("CLAUDE_CODE_OAUTH_TOKEN")); oauthToken != "" {
@@ -1371,11 +1542,15 @@ func resolveProviderAPIKey(paths appDataPaths, provider string) (string, error) 
 		}
 	}
 
-	return "", fmt.Errorf(
+	msg := fmt.Sprintf(
 		"unable to resolve API key for provider %q; set one of: %s",
 		normalizedProvider,
 		strings.Join(envCandidates, ", "),
 	)
+	if normalizedProvider == "openai-codex" {
+		msg += " (or run `codex login` to populate ~/.codex/auth.json)"
+	}
+	return "", errors.New(msg)
 }
 
 // readSetupTokenFromSecrets reads an Anthropic setup-token from ~/.openclaw/secrets.json.
@@ -1503,6 +1678,68 @@ func readProviderProfileMode(configPath, provider string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+func resolveProviderBaseURL(paths appDataPaths, provider, flagOverride string) string {
+	if flagOverride != "" {
+		return strings.TrimRight(flagOverride, "/")
+	}
+
+	if envVal := strings.TrimSpace(os.Getenv("LCM_SUMMARY_BASE_URL")); envVal != "" {
+		return strings.TrimRight(envVal, "/")
+	}
+
+	normalizedProvider := normalizeProviderID(provider)
+	if normalizedProvider != "" && paths.openclawConfig != "" {
+		if baseURL := readProviderBaseURL(paths.openclawConfig, normalizedProvider); baseURL != "" {
+			return strings.TrimRight(baseURL, "/")
+		}
+	}
+
+	switch normalizedProvider {
+	case "openai", "openai-codex", "github-copilot":
+		return defaultOpenAIBaseURL
+	default:
+		return defaultAnthropicBaseURL
+	}
+}
+
+// resolveProviderEndpointURL accepts either API-root base URLs or versioned /v1 URLs.
+func resolveProviderEndpointURL(baseURL, endpointPath string) string {
+	trimmedBaseURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.HasSuffix(trimmedBaseURL, "/v1") && strings.HasPrefix(endpointPath, "/v1/") {
+		return trimmedBaseURL + strings.TrimPrefix(endpointPath, "/v1")
+	}
+	return trimmedBaseURL + endpointPath
+}
+
+func readProviderBaseURL(configPath, provider string) string {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+
+	var parsed struct {
+		Models struct {
+			Providers map[string]struct {
+				BaseURL string `json:"baseUrl"`
+			} `json:"providers"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return ""
+	}
+
+	normalizedProvider := normalizeProviderID(provider)
+	if p, ok := parsed.Models.Providers[normalizedProvider]; ok && p.BaseURL != "" {
+		return strings.TrimSpace(p.BaseURL)
+	}
+	for name, p := range parsed.Models.Providers {
+		if normalizeProviderID(name) == normalizedProvider && p.BaseURL != "" {
+			return strings.TrimSpace(p.BaseURL)
+		}
+	}
+	return ""
 }
 
 func readKeyFromEnvFileCandidates(path string, envCandidates []string) (string, error) {

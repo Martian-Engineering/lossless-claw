@@ -83,8 +83,8 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk";
 ```
 
 ### LLM Completion (summarize.ts)
-**From:** `@mariozechner/pi-ai` (completeSimple)
-**To:** Inject via `LcmDependencies.complete`
+**From:** direct provider SDK calls such as `@mariozechner/pi-ai` `completeSimple`
+**To:** inject `LcmDependencies.complete`, which delegates summarization to OpenClaw `runtime.llm.complete`
 ```typescript
 // Old:
 import { completeSimple } from "@mariozechner/pi-ai";
@@ -92,8 +92,8 @@ import { completeSimple } from "@mariozechner/pi-ai";
 ```
 
 ### Model Auth (summarize.ts)
-**From:** `../../agents/model-auth.js`
-**To:** Inject via `LcmDependencies.getApiKey` / `LcmDependencies.requireApiKey`
+**From:** direct credential lookup through OpenClaw internals
+**To:** no Lossless dependency. OpenClaw `runtime.llm.complete` owns credential resolution, OAuth refresh, provider dispatch, and usage attribution.
 
 ### Model Resolution (summarize.ts)
 **From:** `../../agents/pi-embedded-runner/model.js`
@@ -147,7 +147,7 @@ Files that only import types from core:
 
 ### Phase 3: Dependency Injection Threading
 Files that need `LcmDependencies` threaded through:
-- `src/summarize.ts` — needs complete, resolveModel, getApiKey, requireApiKey, resolveAgentDir
+- `src/summarize.ts` — needs complete and resolveModel; direct credential lookup stays out of Lossless
 - `src/assembler.ts` — needs sanitizeToolUseResultPairing
 - `src/engine.ts` — orchestrates everything, needs full deps
 - `src/compaction.ts` — needs summarize (which needs deps)

@@ -25,7 +25,7 @@ function formatDisplayTime(
 const LcmGrepSchema = Type.Object({
   pattern: Type.String({
     description:
-      "Search pattern. Interpreted as regex when mode is 'regex', or as a text query for 'full_text' mode.",
+      'Search pattern. Interpreted as regex when mode is "regex", or as an FTS5 text query when mode is "full_text". In full_text mode, FTS5 defaults to AND matching, so prefer 1-3 distinctive terms or one quoted multi-word phrase instead of padding with synonyms or extra keywords. Regex syntax such as alternation (`A|B`) requires regex mode.',
   }),
   mode: Type.Optional(
     Type.String({
@@ -44,7 +44,7 @@ const LcmGrepSchema = Type.Object({
   conversationId: Type.Optional(
     Type.Number({
       description:
-        "Conversation ID to search within. If omitted, defaults to the current session conversation.",
+        "Physical conversation ID to search within. If omitted, defaults to the current session family.",
     }),
   ),
   allConversations: Type.Optional(
@@ -70,6 +70,13 @@ const LcmGrepSchema = Type.Object({
       maximum: 200,
     }),
   ),
+  sort: Type.Optional(
+    Type.String({
+      description:
+        'Sort order: "recency" (newest first, default), "relevance" (best FTS5 match first, full_text mode only), or "hybrid" (full_text mode only; balances relevance with recency). Applied before limit is enforced.',
+      enum: ["recency", "relevance", "hybrid"],
+    }),
+  ),
 });
 
 function truncateSnippet(content: string, maxLen: number = 200): string {
@@ -80,9 +87,69 @@ function truncateSnippet(content: string, maxLen: number = 200): string {
   return singleLine.substring(0, maxLen - 3) + "...";
 }
 
+// Identify clear regex syntax that is likely to make an FTS5 query silently
+// miss. This intentionally stays conservative instead of becoming a parser.
+function findRegexSyntaxInFullTextQuery(pattern: string): string | null {
+  let inQuote = false;
+  let escaped = false;
+
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    const next = pattern[index + 1];
+
+    if (escaped) {
+      escaped = false;
+      if (!inQuote && char && /[bBdDsSwW]/.test(char)) {
+        return "regex character escape";
+      }
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (inQuote) {
+      continue;
+    }
+    if (char === "|") {
+      return "alternation";
+    }
+    if (char === "." && (next === "*" || next === "+" || next === "?")) {
+      return "wildcard";
+    }
+    if (char === "[") {
+      const closing = pattern.indexOf("]", index + 1);
+      if (closing > index + 1) {
+        return "character class";
+      }
+    }
+    if (char === "^" && (index === 0 || /\s/.test(pattern[index - 1] ?? ""))) {
+      return "anchor";
+    }
+    if (char === "$" && (index === pattern.length - 1 || /\s/.test(next ?? ""))) {
+      return "anchor";
+    }
+  }
+
+  return null;
+}
+
+function validateFullTextPattern(pattern: string): string | null {
+  const syntax = findRegexSyntaxInFullTextQuery(pattern);
+  if (!syntax) {
+    return null;
+  }
+  return `full_text mode does not support regex syntax (${syntax}). Use mode: "regex" for \`${pattern}\`, or rewrite the full_text query as 1-3 literal terms or one quoted phrase.`;
+}
+
 export function createLcmGrepTool(input: {
   deps: LcmDependencies;
-  lcm: LcmContextEngine;
+  lcm?: LcmContextEngine;
+  getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
 }): AnyAgentTool {
@@ -93,18 +160,30 @@ export function createLcmGrepTool(input: {
       "Search compacted conversation history using regex or full-text search. " +
       "Searches across messages and/or summaries stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
-      "active context. Returns matching snippets with their summary/message IDs " +
+      "active context. In full_text mode, queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. Returns matching snippets with their summary/message IDs " +
       "for follow-up with lcm_expand or lcm_describe.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
-      const retrieval = input.lcm.getRetrieval();
-      const timezone = input.lcm.timezone;
+      const lcm = input.lcm ?? (await input.getLcm?.());
+      if (!lcm) {
+        throw new Error("LCM engine is unavailable.");
+      }
+      const retrieval = lcm.getRetrieval();
+      const timezone = lcm.timezone;
 
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
       const mode = (p.mode as "regex" | "full_text") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
+      const requestedSort = (p.sort as "recency" | "relevance" | "hybrid") ?? "recency";
+      const effectiveSort = mode === "full_text" ? requestedSort : "recency";
+      if (mode === "full_text") {
+        const fullTextPatternError = validateFullTextPattern(pattern);
+        if (fullTextPatternError) {
+          return jsonResult({ error: fullTextPatternError });
+        }
+      }
       let since: Date | undefined;
       let before: Date | undefined;
       try {
@@ -121,37 +200,50 @@ export function createLcmGrepTool(input: {
         });
       }
       const conversationScope = await resolveLcmConversationScope({
-        lcm: input.lcm,
+        lcm,
         deps: input.deps,
         sessionId: input.sessionId,
         sessionKey: input.sessionKey,
         params: p,
       });
-      if (!conversationScope.allConversations && conversationScope.conversationId == null) {
+      if (conversationScope.error) {
+        return jsonResult({ error: conversationScope.error });
+      }
+      if (
+        !conversationScope.allConversations
+        && conversationScope.conversationId == null
+        && (conversationScope.conversationIds?.length ?? 0) === 0
+      ) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
         });
       }
-
       const result = await retrieval.grep({
         query: pattern,
         mode,
         scope,
         conversationId: conversationScope.conversationId,
+        conversationIds: conversationScope.conversationIds,
         limit,
         since,
         before,
+        sort: effectiveSort,
       });
 
       const lines: string[] = [];
       lines.push("## LCM Grep Results");
       lines.push(`**Pattern:** \`${pattern}\``);
-      lines.push(`**Mode:** ${mode} | **Scope:** ${scope}`);
+      lines.push(`**Mode:** ${mode} | **Scope:** ${scope} | **Sort:** ${effectiveSort}`);
       if (conversationScope.allConversations) {
         lines.push("**Conversation scope:** all conversations");
       } else if (conversationScope.conversationId != null) {
-        lines.push(`**Conversation scope:** ${conversationScope.conversationId}`);
+        const familyCount = conversationScope.conversationIds?.length ?? 0;
+        lines.push(
+          familyCount > 1
+            ? `**Conversation scope:** session family rooted at ${conversationScope.conversationId} (${familyCount} segments)`
+            : `**Conversation scope:** ${conversationScope.conversationId}`,
+        );
       }
       if (since || before) {
         lines.push(

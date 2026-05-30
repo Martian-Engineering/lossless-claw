@@ -512,6 +512,46 @@ export function formatFileReference(input: {
   ].join("\n");
 }
 
+export function formatToolOutputReference(input: {
+  fileId: string;
+  toolName?: string;
+  byteSize: number;
+  summary: string;
+}): string {
+  const toolName = input.toolName?.trim() || "unknown";
+  const byteSize = Math.max(0, input.byteSize);
+
+  return [
+    `[LCM Tool Output: ${input.fileId} | tool=${toolName} | ${byteSize.toLocaleString("en-US")} bytes]`,
+    "",
+    "Exploration Summary:",
+    input.summary.trim() || "(no summary available)",
+    "",
+    "Call lcm_describe(id=\"<file_id above>\", expandFile=true) to fetch the full output content from disk.",
+  ].join("\n");
+}
+
+export function formatRawPayloadReference(input: {
+  fileId: string;
+  role: string;
+  byteSize: number;
+  reason: string;
+  summary: string;
+}): string {
+  const role = input.role.trim() || "unknown";
+  const reason = input.reason.trim() || "large_raw_message";
+  const byteSize = Math.max(0, input.byteSize);
+
+  return [
+    `[LCM Raw Payload: ${input.fileId} | role=${role} | reason=${reason} | ${byteSize.toLocaleString("en-US")} bytes]`,
+    "",
+    "Exploration Summary:",
+    input.summary.trim() || "(no summary available)",
+    "",
+    "Call lcm_describe(id=\"<file_id above>\", expandFile=true) to fetch the full payload content from disk.",
+  ].join("\n");
+}
+
 export async function generateExplorationSummary(input: ExplorationSummaryInput): Promise<string> {
   const extension = extensionFromNameOrMime(input.fileName, input.mimeType);
 

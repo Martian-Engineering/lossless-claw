@@ -85,7 +85,17 @@ func setupConversationWindowTestDB(t *testing.T) string {
 			role TEXT,
 			content TEXT,
 			created_at TEXT
-		)
+		);
+		CREATE TABLE message_parts (
+			part_id TEXT PRIMARY KEY,
+			message_id INTEGER NOT NULL,
+			session_id TEXT NOT NULL,
+			part_type TEXT NOT NULL,
+			ordinal INTEGER NOT NULL,
+			text_content TEXT,
+			tool_input TEXT,
+			tool_output TEXT
+		);
 	`); err != nil {
 		t.Fatalf("create messages table: %v", err)
 	}

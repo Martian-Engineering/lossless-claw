@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,6 +41,309 @@ func TestLoadSessionBatchIncludesEstimatedTokens(t *testing.T) {
 	}
 }
 
+func TestLoadSessionBatchIncludesCodexBackendMetadata(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "main")
+	sessionsDir := filepath.Join(agentDir, "sessions")
+	backendDir := filepath.Join(agentDir, "agent", "codex-home", "sessions", "2026", "05", "12")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("create sessions dir: %v", err)
+	}
+	if err := os.MkdirAll(backendDir, 0o755); err != nil {
+		t.Fatalf("create codex sessions dir: %v", err)
+	}
+
+	const threadID = "019e1cac-cdb8-7801-acf8-efc11c77d024"
+	path := filepath.Join(sessionsDir, "session-1.jsonl")
+	content := `{"type":"message","id":"1","message":{"role":"user","content":"hello"}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+	binding := `{"threadId":"` + threadID + `","model":"gpt-5.5"}`
+	if err := os.WriteFile(path+".codex-app-server.json", []byte(binding), 0o644); err != nil {
+		t.Fatalf("write codex binding: %v", err)
+	}
+	backendContent := `{"timestamp":"2026-05-12T14:52:29Z","type":"event_msg","payload":{"type":"agent_message","message":"hello from codex"}}` + "\n" +
+		`{"timestamp":"2026-05-12T14:52:30Z","type":"event_msg","payload":{"type":"task_complete"}}` + "\n"
+	backendPath := filepath.Join(backendDir, "rollout-2026-05-12T07-52-27-"+threadID+".jsonl")
+	if err := os.WriteFile(backendPath, []byte(backendContent), 0o644); err != nil {
+		t.Fatalf("write codex backend session: %v", err)
+	}
+
+	files := []sessionFileEntry{
+		{
+			filename:  "session-1.jsonl",
+			path:      path,
+			updatedAt: time.Unix(1700000000, 0),
+			byteSize:  int64(len(content)),
+		},
+	}
+
+	sessions, _, err := loadSessionBatch(files, 0, 1, filepath.Join(dir, "missing.db"))
+	if err != nil {
+		t.Fatalf("load session batch: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(sessions))
+	}
+	if sessions[0].codexThreadID != threadID {
+		t.Fatalf("expected codex thread id %q, got %q", threadID, sessions[0].codexThreadID)
+	}
+	if sessions[0].codexBackendPath != backendPath {
+		t.Fatalf("expected backend path %q, got %q", backendPath, sessions[0].codexBackendPath)
+	}
+	if sessions[0].codexMessageCount != 2 {
+		t.Fatalf("expected codex row count 2, got %d", sessions[0].codexMessageCount)
+	}
+	if sessions[0].codexEstimatedTokens != len(backendContent)/4 {
+		t.Fatalf("expected codex estimated tokens %d, got %d", len(backendContent)/4, sessions[0].codexEstimatedTokens)
+	}
+	if !strings.Contains(formatCodexSessionMetric(sessions[0]), "codex:2") {
+		t.Fatalf("expected codex session metric, got %q", formatCodexSessionMetric(sessions[0]))
+	}
+}
+
+func TestParseCodexBackendMessagesNormalizesEvents(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	content := `{"timestamp":"2026-05-12T14:52:29Z","type":"session_meta","payload":{"id":"thread-1","cwd":"/tmp","originator":"openclaw","cli_version":"0.130.0","source":"vscode","model_provider":"openai"}}` + "\n" +
+		`{"timestamp":"2026-05-12T14:52:30Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}` + "\n" +
+		`{"timestamp":"2026-05-12T14:52:31Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call-1","input":{"cmd":"true"}}}` + "\n" +
+		`{"timestamp":"2026-05-12T14:52:32Z","type":"event_msg","payload":{"type":"agent_message","message":"visible update"}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write codex backend session: %v", err)
+	}
+
+	messages, err := parseCodexBackendMessages(path)
+	if err != nil {
+		t.Fatalf("parse codex backend messages: %v", err)
+	}
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages, got %d", len(messages))
+	}
+	if messages[0].role != "system" || !strings.Contains(messages[0].text, "thread-1") {
+		t.Fatalf("expected session meta system row, got %#v", messages[0])
+	}
+	if messages[1].role != "assistant" || messages[1].text != "done" {
+		t.Fatalf("expected assistant message, got %#v", messages[1])
+	}
+	if messages[2].role != "tool" || !strings.Contains(messages[2].text, "[toolCall] exec") {
+		t.Fatalf("expected tool call row, got %#v", messages[2])
+	}
+	if messages[3].role != "assistant" || messages[3].text != "visible update" {
+		t.Fatalf("expected agent message event, got %#v", messages[3])
+	}
+}
+
+func TestLoadSessionBatchIncludesConversationMetadata(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session-1.jsonl")
+	content := `{"type":"message","id":"1","message":{"role":"user","content":"hello"}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	dbPath := filepath.Join(dir, "lcm.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`
+		CREATE TABLE conversations (
+			conversation_id INTEGER PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			session_key TEXT
+		);
+		INSERT INTO conversations (conversation_id, session_id, session_key) VALUES
+			(1, 'session-1', 'agent:main:old'),
+			(2, 'session-1', 'agent:main:latest');
+	`); err != nil {
+		t.Fatalf("seed conversations: %v", err)
+	}
+
+	files := []sessionFileEntry{
+		{
+			filename:  "session-1.jsonl",
+			path:      path,
+			updatedAt: time.Unix(1700000000, 0),
+			byteSize:  int64(len(content)),
+		},
+	}
+
+	sessions, _, err := loadSessionBatch(files, 0, 1, dbPath)
+	if err != nil {
+		t.Fatalf("load session batch: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(sessions))
+	}
+	if sessions[0].conversationID != 2 {
+		t.Fatalf("expected latest conversation id 2, got %d", sessions[0].conversationID)
+	}
+	if sessions[0].sessionKey != "agent:main:latest" {
+		t.Fatalf("expected session key %q, got %q", "agent:main:latest", sessions[0].sessionKey)
+	}
+}
+
+func TestLoadSessionBatchResolvesTopicSessionFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "telegram-runtime-topic-8.jsonl")
+	content := `{"type":"message","id":"1","message":{"role":"user","content":"hello topic"}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	dbPath := filepath.Join(dir, "lcm.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`
+		CREATE TABLE conversations (
+			conversation_id INTEGER PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			session_key TEXT
+		);
+		CREATE TABLE summaries (
+			summary_id TEXT PRIMARY KEY,
+			conversation_id INTEGER NOT NULL
+		);
+		CREATE TABLE large_files (
+			file_id TEXT PRIMARY KEY,
+			conversation_id INTEGER NOT NULL
+		);
+		INSERT INTO conversations (conversation_id, session_id, session_key) VALUES
+			(11, 'telegram-runtime', 'telegram-runtime-topic-7'),
+			(12, 'telegram-runtime', 'telegram-runtime-topic-8');
+		INSERT INTO summaries (summary_id, conversation_id) VALUES
+			('sum-topic-7-a', 11),
+			('sum-topic-7-b', 11),
+			('sum-topic-8-a', 12);
+		INSERT INTO large_files (file_id, conversation_id) VALUES
+			('file-topic-7-a', 11),
+			('file-topic-8-a', 12),
+			('file-topic-8-b', 12);
+	`); err != nil {
+		t.Fatalf("seed topic conversations: %v", err)
+	}
+
+	files := []sessionFileEntry{
+		{
+			filename:  "telegram-runtime-topic-8.jsonl",
+			path:      path,
+			updatedAt: time.Unix(1700000000, 0),
+			byteSize:  int64(len(content)),
+		},
+	}
+
+	sessions, _, err := loadSessionBatch(files, 0, 1, dbPath)
+	if err != nil {
+		t.Fatalf("load session batch: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(sessions))
+	}
+	if sessions[0].conversationID != 12 {
+		t.Fatalf("expected topic conversation id 12, got %d", sessions[0].conversationID)
+	}
+	if sessions[0].sessionKey != "telegram-runtime-topic-8" {
+		t.Fatalf("expected session key %q, got %q", "telegram-runtime-topic-8", sessions[0].sessionKey)
+	}
+	if sessions[0].summaryCount != 1 {
+		t.Fatalf("expected summary count 1, got %d", sessions[0].summaryCount)
+	}
+	if sessions[0].fileCount != 2 {
+		t.Fatalf("expected file count 2, got %d", sessions[0].fileCount)
+	}
+}
+
+func TestDiscoverSessionFilesDedupesCanonicalSessionIDAndPrefersTopicTranscript(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "main")
+	sessionsDir := filepath.Join(agentDir, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("create sessions dir: %v", err)
+	}
+
+	const canonicalID = "fd9b66a7-ebbf-4a7b-8415-b5d366379cd2"
+	barePath := filepath.Join(sessionsDir, canonicalID+".jsonl")
+	topicPath := filepath.Join(sessionsDir, canonicalID+"-topic-47.jsonl")
+	bareContent := `{"type":"session","id":"` + canonicalID + `"}` + "\n" +
+		`{"type":"message","id":"1","message":{"role":"user","content":"bare"}}` + "\n"
+	topicContent := `{"type":"session","id":"` + canonicalID + `"}` + "\n" +
+		`{"type":"message","id":"1","message":{"role":"user","content":"topic"}}` + "\n"
+	if err := os.WriteFile(barePath, []byte(bareContent), 0o644); err != nil {
+		t.Fatalf("write bare session file: %v", err)
+	}
+	if err := os.WriteFile(topicPath, []byte(topicContent), 0o644); err != nil {
+		t.Fatalf("write topic session file: %v", err)
+	}
+	now := time.Now()
+	if err := os.Chtimes(barePath, now, now); err != nil {
+		t.Fatalf("set bare mtime: %v", err)
+	}
+	if err := os.Chtimes(topicPath, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatalf("set topic mtime: %v", err)
+	}
+
+	files, err := discoverSessionFiles(agentEntry{name: "main", path: agentDir})
+	if err != nil {
+		t.Fatalf("discover session files: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 deduped session file, got %d", len(files))
+	}
+	if files[0].filename != canonicalID+"-topic-47.jsonl" {
+		t.Fatalf("expected topic transcript to win, got %q", files[0].filename)
+	}
+}
+
+func TestLookupConversationIDResolvesTopicSessionFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "lcm.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`
+		CREATE TABLE conversations (
+			conversation_id INTEGER PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			session_key TEXT
+		);
+		INSERT INTO conversations (conversation_id, session_id, session_key) VALUES
+			(21, 'telegram-runtime', 'telegram-runtime-topic-7'),
+			(22, 'telegram-runtime', 'telegram-runtime-topic-8');
+	`); err != nil {
+		t.Fatalf("seed conversations: %v", err)
+	}
+
+	conversationID, err := lookupConversationID(db, "telegram-runtime-topic-8")
+	if err != nil {
+		t.Fatalf("lookup conversation id: %v", err)
+	}
+	if conversationID != 22 {
+		t.Fatalf("expected topic conversation id 22, got %d", conversationID)
+	}
+}
+
 func TestEstimateTokenCountFromBytes(t *testing.T) {
 	t.Parallel()
 
@@ -63,14 +367,17 @@ func TestEstimateTokenCountFromBytes(t *testing.T) {
 	}
 }
 
-func TestRenderSessionsShowsEstimatedTokens(t *testing.T) {
+func TestRenderSessionsShowsSessionKeyAndEstimatedTokens(t *testing.T) {
 	t.Parallel()
 
 	m := model{
+		width:         160,
 		height:        10,
 		sessionCursor: 0,
 		sessions: []sessionEntry{
 			{
+				id:              "session-1",
+				sessionKey:      "agent:main:main",
 				filename:        "session-1.jsonl",
 				updatedAt:       time.Unix(1700000000, 0),
 				messageCount:    2,
@@ -80,7 +387,95 @@ func TestRenderSessionsShowsEstimatedTokens(t *testing.T) {
 	}
 
 	rendered := m.renderSessions()
+	if !strings.Contains(rendered, "session-1") {
+		t.Fatalf("expected session id in rendered sessions, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, "key:agent:main:main") {
+		t.Fatalf("expected session key in rendered sessions, got: %q", rendered)
+	}
 	if !strings.Contains(rendered, "est:123t") {
 		t.Fatalf("expected estimated token label in rendered sessions, got: %q", rendered)
+	}
+}
+
+func TestRenderSessionsAlignsColumns(t *testing.T) {
+	t.Parallel()
+
+	m := model{
+		width:         180,
+		height:        10,
+		sessionCursor: -1,
+		sessions: []sessionEntry{
+			{
+				id:              "short",
+				sessionKey:      "agent:main:main",
+				updatedAt:       time.Unix(1700000000, 0),
+				messageCount:    2,
+				estimatedTokens: 123,
+				conversationID:  42,
+				summaryCount:    3,
+				fileCount:       1,
+			},
+			{
+				id:              "much-longer-session-id",
+				sessionKey:      "agent:main:subagent:abcdef1234567890",
+				updatedAt:       time.Unix(1700001000, 0),
+				messageCount:    25,
+				estimatedTokens: 4567,
+				conversationID:  314,
+				summaryCount:    12,
+				fileCount:       8,
+			},
+		},
+	}
+
+	lines := strings.Split(m.renderSessions(), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 rendered lines, got %d", len(lines))
+	}
+
+	msgs0 := strings.Index(lines[0], "msgs:")
+	msgs1 := strings.Index(lines[1], "msgs:")
+	if msgs0 <= 0 || msgs1 <= 0 || msgs0 != msgs1 {
+		t.Fatalf("expected msgs column to align, got %d and %d\n%s\n%s", msgs0, msgs1, lines[0], lines[1])
+	}
+
+	est0 := strings.Index(lines[0], "est:")
+	est1 := strings.Index(lines[1], "est:")
+	if est0 <= 0 || est1 <= 0 || est0 != est1 {
+		t.Fatalf("expected est column to align, got %d and %d\n%s\n%s", est0, est1, lines[0], lines[1])
+	}
+
+	conv0 := strings.Index(lines[0], "conv_id:")
+	conv1 := strings.Index(lines[1], "conv_id:")
+	if conv0 <= 0 || conv1 <= 0 || conv0 != conv1 {
+		t.Fatalf("expected conv_id column to align, got %d and %d\n%s\n%s", conv0, conv1, lines[0], lines[1])
+	}
+}
+
+func TestRenderHeaderShowsSessionKeyInConversationView(t *testing.T) {
+	t.Parallel()
+
+	m := model{
+		screen:        screenConversation,
+		sessionCursor: 0,
+		sessions: []sessionEntry{
+			{
+				id:             "session-1",
+				sessionKey:     "agent:main:main",
+				conversationID: 42,
+			},
+		},
+	}
+
+	rendered := m.renderHeader()
+	if !strings.Contains(rendered, "session:session-1") {
+		t.Fatalf("expected session id in conversation header, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, "key:agent:main:main") {
+		t.Fatalf("expected session key in conversation header, got: %q", rendered)
+	}
+	if !strings.Contains(rendered, "conv_id:42") {
+		t.Fatalf("expected conversation id in conversation header, got: %q", rendered)
 	}
 }

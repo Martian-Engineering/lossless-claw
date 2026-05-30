@@ -104,14 +104,9 @@ function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnaps
 }
 ```
 
-Then use the snapshot in `createLcmDependencies()`, `resolveModel`, `resolveAuthStorePaths`, and `resolveApiKey` instead of live `process.env` reads.
+Then use the snapshot in `createLcmDependencies()` and `resolveModel` instead of live `process.env` reads.
 
-**Note:** `resolveApiKey` does dynamic `process.env[key]` lookups for provider-specific API keys (e.g., `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`). These can't be statically snapshotted since the key names depend on the provider being resolved. Two options:
-
-- **Option A (pragmatic):** Pass `getEnv: (key: string) => string | undefined` as a closure captured at init time. The closure still reads `process.env`, but it lives in `index.ts` (which is the plugin entry point and doesn't trigger the scanner because it has no network I/O patterns).
-- **Option B (pure):** Pre-resolve all known provider keys at init time into a `Map<string, string>`. Less flexible but avoids any runtime env access.
-
-**Recommendation:** Option A. `index.ts` is the plugin shell — it's expected to do env/config wiring. The scanner only flags files with both env access AND network patterns, and `index.ts` has neither `fetch` nor `http.request` (nor false-positive "post" in comments). The goal is keeping `engine.ts` and other I/O-heavy files clean.
+**Historical note:** the old extraction plan included `resolveApiKey` and dynamic `process.env[key]` lookups for provider-specific API keys. Runtime summarization no longer uses that path; OpenClaw `runtime.llm.complete` owns provider credentials.
 
 ### 4. Verify scanner clear
 

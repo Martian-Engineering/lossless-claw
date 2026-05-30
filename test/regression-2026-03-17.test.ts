@@ -57,6 +57,57 @@ describe("Session key continuity", () => {
     expect(conv1.conversationId).not.toBe(conv2.conversationId);
   });
 
+  it("resolves the active conversation when archived rows share the same sessionKey", async () => {
+    const db = createTestDb();
+    const { convStore } = createStores(db);
+
+    const archived = await convStore.createConversation({
+      sessionId: "uuid-archived",
+      sessionKey: "agent:main:main",
+    });
+    db.prepare(
+      `UPDATE conversations
+       SET active = 0,
+           archived_at = datetime('now'),
+           updated_at = datetime('now')
+       WHERE conversation_id = ?`,
+    ).run(archived.conversationId);
+
+    const active = await convStore.createConversation({
+      sessionId: "uuid-active",
+      sessionKey: "agent:main:main",
+    });
+
+    const byKey = await convStore.getConversationBySessionKey("agent:main:main");
+    expect(byKey?.conversationId).toBe(active.conversationId);
+    expect(byKey?.active).toBe(true);
+  });
+
+  it("creates a fresh active conversation instead of reusing an archived row", async () => {
+    const db = createTestDb();
+    const { convStore } = createStores(db);
+
+    const archived = await convStore.createConversation({
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+    });
+    db.prepare(
+      `UPDATE conversations
+       SET active = 0,
+           archived_at = datetime('now'),
+           updated_at = datetime('now')
+       WHERE conversation_id = ?`,
+    ).run(archived.conversationId);
+
+    const fresh = await convStore.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+
+    expect(fresh.conversationId).not.toBe(archived.conversationId);
+    expect(fresh.active).toBe(true);
+    expect(fresh.archivedAt).toBeNull();
+  });
+
   it("backfills sessionKey when found by sessionId", async () => {
     const db = createTestDb();
     const { convStore } = createStores(db);
@@ -83,6 +134,45 @@ describe("Session key continuity", () => {
     const conv2 = await convStore.getOrCreateConversation("uuid-1");
 
     expect(conv1.conversationId).toBe(conv2.conversationId);
+  });
+
+  it("recovers when the sessionKey insert loses a unique-constraint race", async () => {
+    const db = createTestDb();
+    const { convStore } = createStores(db);
+
+    const winner = await convStore.createConversation({
+      sessionId: "uuid-winner",
+      sessionKey: "agent:main:main",
+    });
+
+    const getByKey = convStore.getConversationBySessionKey.bind(convStore);
+    const getBySessionId = convStore.getConversationBySessionId.bind(convStore);
+    let firstByKeyMiss = true;
+    let firstBySessionIdMiss = true;
+
+    vi.spyOn(convStore, "getConversationBySessionKey").mockImplementation(async (sessionKey) => {
+      if (firstByKeyMiss) {
+        firstByKeyMiss = false;
+        return null;
+      }
+      return getByKey(sessionKey);
+    });
+
+    vi.spyOn(convStore, "getConversationBySessionId").mockImplementation(async (sessionId) => {
+      if (firstBySessionIdMiss) {
+        firstBySessionIdMiss = false;
+        return null;
+      }
+      return getBySessionId(sessionId);
+    });
+
+    const recovered = await convStore.getOrCreateConversation("uuid-loser", {
+      sessionKey: "agent:main:main",
+    });
+
+    expect(recovered.conversationId).toBe(winner.conversationId);
+    expect(recovered.sessionKey).toBe("agent:main:main");
+    expect(await convStore.getConversationBySessionId("uuid-loser")).toBeNull();
   });
 });
 

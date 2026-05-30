@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -82,6 +84,7 @@ func TestSummarizeOpenAISucceedsWithOutputText(t *testing.T) {
 		provider: "openai",
 		apiKey:   "test-openai-key",
 		model:    "gpt-5.3-codex",
+		baseURL:  "https://api.openai.com",
 		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.URL.String() != "https://api.openai.com/v1/responses" {
 				t.Fatalf("unexpected URL: %s", req.URL.String())
@@ -199,7 +202,7 @@ func TestSummarizeAnthropicOAuthDelegatesToCLI(t *testing.T) {
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
 	t.Setenv("LCM_HELPER_STDOUT", "CLI summary")
 	t.Setenv("LCM_EXPECT_MODEL", anthropicModel)
-	t.Setenv("LCM_EXPECT_PROMPT", "say hello")
+	t.Setenv("LCM_EXPECT_PROMPT_SHA256", hashPrompt("say hello"))
 	t.Setenv("ANTHROPIC_API_KEY", "should-be-filtered")
 
 	httpCalled := false
@@ -230,7 +233,7 @@ func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
 	t.Setenv("LCM_HELPER_STDOUT", strings.Repeat("word ", 200))
 	t.Setenv("LCM_EXPECT_MODEL", anthropicModel)
-	t.Setenv("LCM_EXPECT_PROMPT", "oversized")
+	t.Setenv("LCM_EXPECT_PROMPT_SHA256", hashPrompt("oversized"))
 
 	client := &anthropicClient{
 		provider: "anthropic",
@@ -248,19 +251,46 @@ func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
 	}
 }
 
-func TestSummarizeAnthropicRegularKeyHitsDirectAPI(t *testing.T) {
-	var capturedURL string
+func TestSummarizeAnthropicOAuthStreamsLargePromptViaStdin(t *testing.T) {
+	stubClaudeCLI(t)
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("LCM_HELPER_STDOUT", "large prompt summary")
+	t.Setenv("LCM_EXPECT_MODEL", anthropicModel)
+
+	largePrompt := strings.Repeat("large prompt chunk ", 20000)
+	t.Setenv("LCM_EXPECT_PROMPT_SHA256", hashPrompt(largePrompt))
+	t.Setenv("ANTHROPIC_API_KEY", "should-be-filtered")
+
 	client := &anthropicClient{
 		provider: "anthropic",
-		apiKey:   "sk-ant-api03-regular-key",
+		apiKey:   "sk-ant-oat01-test-token",
 		model:    anthropicModel,
+		http:     &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) { return nil, nil })},
+	}
+
+	summary, err := client.summarize(context.Background(), largePrompt, 200)
+	if err != nil {
+		t.Fatalf("summarize returned error for large prompt: %v", err)
+	}
+	if summary != "large prompt summary" {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
+func TestSummarizeOpenAICustomBaseURL(t *testing.T) {
+	customBase := "https://proxy.example.com/openai"
+	client := &anthropicClient{
+		provider: "openai",
+		apiKey:   "test-openai-key",
+		model:    "gpt-5.3-codex",
+		baseURL:  customBase,
 		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			capturedURL = req.URL.String()
-			if got := req.Header.Get("x-api-key"); got != "sk-ant-api03-regular-key" {
-				t.Fatalf("expected x-api-key header, got %q", got)
+			expectedURL := customBase + "/v1/responses"
+			if req.URL.String() != expectedURL {
+				t.Fatalf("expected URL %s, got %s", expectedURL, req.URL.String())
 			}
 			return jsonResponse(200, `{
-				"content":[{"type":"text","text":"Direct API response."}]
+				"output":[{"type":"message","content":[{"type":"output_text","text":"proxied response"}]}]
 			}`), nil
 		})},
 	}
@@ -269,10 +299,34 @@ func TestSummarizeAnthropicRegularKeyHitsDirectAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("summarize returned error: %v", err)
 	}
-	if capturedURL != "https://api.anthropic.com/v1/messages" {
-		t.Fatalf("expected direct API URL, got %q", capturedURL)
+	if summary != "proxied response" {
+		t.Fatalf("unexpected summary: %q", summary)
 	}
-	if summary != "Direct API response." {
+}
+
+func TestSummarizeOpenAICustomBaseURLWithVersionPrefix(t *testing.T) {
+	customBase := "https://proxy.example.com/v1"
+	client := &anthropicClient{
+		provider: "openai",
+		apiKey:   "test-openai-key",
+		model:    "gpt-5.3-codex",
+		baseURL:  customBase,
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			expectedURL := customBase + "/responses"
+			if req.URL.String() != expectedURL {
+				t.Fatalf("expected URL %s, got %s", expectedURL, req.URL.String())
+			}
+			return jsonResponse(200, `{
+				"output":[{"type":"message","content":[{"type":"output_text","text":"versioned proxy response"}]}]
+			}`), nil
+		})},
+	}
+
+	summary, err := client.summarize(context.Background(), "prompt", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
+	if summary != "versioned proxy response" {
 		t.Fatalf("unexpected summary: %q", summary)
 	}
 }
@@ -319,7 +373,7 @@ func TestHelperProcessClaudeCLI(t *testing.T) {
 
 	cliArgs := args[separator+2:]
 	expectedModel := os.Getenv("LCM_EXPECT_MODEL")
-	expectedPrompt := os.Getenv("LCM_EXPECT_PROMPT")
+	expectedPromptHash := os.Getenv("LCM_EXPECT_PROMPT_SHA256")
 
 	if os.Getenv("ANTHROPIC_API_KEY") != "" {
 		_, _ = os.Stderr.WriteString("ANTHROPIC_API_KEY should be filtered")
@@ -333,13 +387,28 @@ func TestHelperProcessClaudeCLI(t *testing.T) {
 		_, _ = os.Stderr.WriteString("missing output format")
 		os.Exit(5)
 	}
+	if !containsArgPair(cliArgs, "--input-format", "text") {
+		_, _ = os.Stderr.WriteString("missing input format")
+		os.Exit(9)
+	}
 	if expectedModel != "" && !containsArgPair(cliArgs, "--model", expectedModel) {
 		_, _ = os.Stderr.WriteString("missing model")
 		os.Exit(6)
 	}
-	if expectedPrompt != "" && !containsArgPair(cliArgs, "-p", expectedPrompt) {
-		_, _ = os.Stderr.WriteString("missing prompt")
+	if containsArgs(cliArgs, "-p") || containsArgs(cliArgs, "--prompt") {
+		_, _ = os.Stderr.WriteString("prompt should arrive via stdin, not argv")
 		os.Exit(7)
+	}
+	if expectedPromptHash != "" {
+		prompt, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			_, _ = os.Stderr.WriteString("failed to read stdin")
+			os.Exit(10)
+		}
+		if hashPrompt(string(prompt)) != expectedPromptHash {
+			_, _ = os.Stderr.WriteString("stdin prompt hash mismatch")
+			os.Exit(11)
+		}
 	}
 
 	_, _ = os.Stdout.WriteString(os.Getenv("LCM_HELPER_STDOUT"))
@@ -352,6 +421,11 @@ func TestHelperProcessClaudeCLI(t *testing.T) {
 		os.Exit(code)
 	}
 	os.Exit(0)
+}
+
+func hashPrompt(prompt string) string {
+	sum := sha256.Sum256([]byte(prompt))
+	return fmt.Sprintf("%x", sum)
 }
 
 func containsArgs(args []string, want string) bool {
@@ -370,4 +444,87 @@ func containsArgPair(args []string, flag, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestSummarizeAnthropicCustomBaseURL(t *testing.T) {
+	customBase := "https://proxy.example.com/anthropic"
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "test-anthropic-key",
+		model:    "claude-sonnet-4-20250514",
+		baseURL:  customBase,
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			expectedURL := customBase + "/v1/messages"
+			if req.URL.String() != expectedURL {
+				t.Fatalf("expected URL %s, got %s", expectedURL, req.URL.String())
+			}
+			return jsonResponse(200, `{
+				"content":[{"type":"text","text":"proxied anthropic response"}]
+			}`), nil
+		})},
+	}
+
+	summary, err := client.summarize(context.Background(), "prompt", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
+	if summary != "proxied anthropic response" {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
+func TestSummarizeAnthropicCustomBaseURLWithVersionPrefix(t *testing.T) {
+	customBase := "https://proxy.example.com/v1"
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "test-anthropic-key",
+		model:    "claude-sonnet-4-20250514",
+		baseURL:  customBase,
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			expectedURL := customBase + "/messages"
+			if req.URL.String() != expectedURL {
+				t.Fatalf("expected URL %s, got %s", expectedURL, req.URL.String())
+			}
+			return jsonResponse(200, `{
+				"content":[{"type":"text","text":"versioned anthropic proxy response"}]
+			}`), nil
+		})},
+	}
+
+	summary, err := client.summarize(context.Background(), "prompt", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
+	if summary != "versioned anthropic proxy response" {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
+func TestSummarizeAnthropicRegularKeyHitsDirectAPI(t *testing.T) {
+	var capturedURL string
+	client := &anthropicClient{
+		provider: "anthropic",
+		apiKey:   "sk-ant-api03-regular-key",
+		model:    anthropicModel,
+		http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			capturedURL = req.URL.String()
+			if got := req.Header.Get("x-api-key"); got != "sk-ant-api03-regular-key" {
+				t.Fatalf("expected x-api-key header, got %q", got)
+			}
+			return jsonResponse(200, `{
+				"content":[{"type":"text","text":"Direct API response."}]
+			}`), nil
+		})},
+	}
+
+	summary, err := client.summarize(context.Background(), "prompt", 200)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
+	}
+	if capturedURL != "https://api.anthropic.com/v1/messages" {
+		t.Fatalf("expected direct API URL, got %q", capturedURL)
+	}
+	if summary != "Direct API response." {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
 }

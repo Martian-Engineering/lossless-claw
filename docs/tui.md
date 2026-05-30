@@ -49,7 +49,7 @@ Lists all agents discovered under `~/.openclaw/agents/`. Select an agent to see 
 
 ### Screen 2: Session List
 
-Shows JSONL session files for the selected agent, sorted by last modified time. Each entry shows the filename, last update time, message count, conversation ID (if LCM-tracked), summary count, and large file count.
+Shows JSONL session files for the selected agent, sorted by last modified time. Each entry shows the filename, last update time, message count, conversation ID (if LCM-tracked), summary count, and large file count. If an OpenClaw session has a Codex app-server binding, the row also shows a `codex:` marker with the local backend rollout row count when available.
 
 Sessions load in batches of 50. Scrolling near the bottom automatically loads more.
 
@@ -57,6 +57,8 @@ Sessions load in batches of 50. Scrolling near the bottom automatically loads mo
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | Move cursor |
 | `Enter` | Open conversation |
+| `x` | Open bound Codex backend rollout transcript, when available |
+| `v` | Compare bound Codex backend rollout against the LCM active context |
 | `b`/`Backspace` | Back to agents |
 | `r` | Reload sessions |
 | `q` | Quit |
@@ -84,10 +86,16 @@ For sessions with an LCM `conv_id`, the conversation view uses keyset-paged wind
 | `]` | Load newer message window |
 | `l` | Open **Summary DAG** view |
 | `c` | Open **Context** view |
+| `o` | Open **Focus Briefs** view |
 | `f` | Open **Large Files** view |
+| `v` | Open **Codex ↔ LCM** comparison view |
 | `b`/`Backspace` | Back to sessions |
 | `r` | Reload messages |
 | `q` | Quit |
+
+### Codex ↔ LCM Comparison
+
+For Codex app-server bound sessions, the comparison view renders native Codex backend rollout rows beside the Lossless-managed active context items for the same OpenClaw session. The panes are index-aligned for inspection rather than treated as a causal one-to-one mapping: Codex rows show what the backend session recorded, while LCM rows show summaries and fresh-tail messages that Lossless would assemble.
 
 ## Summary DAG View
 
@@ -158,6 +166,22 @@ The status bar shows totals: how many summaries, how many messages, total items,
 | `Shift+J` | Scroll detail panel down |
 | `Shift+K` | Scroll detail panel up |
 | `r` | Reload context |
+| `b`/`Backspace` | Back to conversation |
+| `q` | Quit |
+
+## Focus Briefs View
+
+Lists focus briefs generated for the selected LCM conversation. Each row shows status, creation time, brief ID, token count, and prompt preview. The detail panel shows generator metadata, source/citation counts, post-focus drift diagnostics, cited and expanded summary IDs, the original focus prompt, and the generated brief content.
+
+This view is read-only. When a focus brief is active, the conversation and active-context screens show a compact focus banner with the brief ID, prompt preview, token count, and stale/source-snapshot diagnostics.
+
+| Key | Action |
+|-----|--------|
+| `↑`/`↓` or `k`/`j` | Move cursor |
+| `g`/`G` | Jump to first/last |
+| `Shift+J` | Scroll detail panel down |
+| `Shift+K` | Scroll detail panel up |
+| `r` | Reload focus briefs |
 | `b`/`Backspace` | Back to conversation |
 | `q` | Quit |
 
@@ -237,6 +261,34 @@ The confirmation screen shows:
 
 Each interactive operation also has a standalone CLI equivalent for scripting and batch operations.
 
+### `lcm-tui doctor`
+
+Scans for genuinely truncated summaries and can rewrite them in place. This is narrower than `repair`: it looks for specific truncation marker shapes instead of the generic fallback-summary marker.
+
+```bash
+# Preview repairs for one conversation
+lcm-tui doctor 44 --show-diff
+
+# Apply repairs through Codex CLI OAuth after `codex login`
+lcm-tui doctor 44 --apply --provider openai-codex --model gpt-5.3-codex
+
+# Scan only across every conversation
+lcm-tui doctor --all
+```
+
+| Flag | Description |
+|------|-------------|
+| `--apply` | Write repaired summaries to the database |
+| `--summary` | Scan only and show counts |
+| `--all` | Scan all conversations (discovery mode only) |
+| `--provider <id>` | API provider (default: anthropic) |
+| `--model <model>` | API model (default: `claude-haiku-4-5`) |
+| `--base-url <url>` | Custom API base URL (overrides config and env) |
+| `--show-diff` | Show unified diff for each fix |
+| `--timestamps` | Inject timestamps into rewrite source text |
+
+Use `--provider openai-codex` when you want ChatGPT Plus/Pro OAuth from the Codex CLI. Keep `--provider openai` for direct OpenAI-compatible HTTP calls with a raw `OPENAI_API_KEY`, including custom `--base-url` proxies.
+
 ### `lcm-tui repair`
 
 Finds and fixes corrupted summaries (those containing the `[LCM fallback summary]` marker from failed summarization attempts).
@@ -253,6 +305,12 @@ lcm-tui repair 44 --apply
 
 # Repair a specific summary
 lcm-tui repair 44 --summary-id sum_abc123 --apply
+
+# Repair through Codex CLI OAuth after `codex login`
+lcm-tui repair 44 --apply --provider openai-codex --model gpt-5.3-codex
+
+# Repair through a custom OpenAI-compatible proxy with a raw API key
+lcm-tui repair 44 --apply --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai
 ```
 
 The repair process:
@@ -260,7 +318,7 @@ The repair process:
 2. Orders them bottom-up: leaves first (in context ordinal order), then condensed nodes by ascending depth
 3. Reconstructs source material from linked messages (leaves) or child summaries (condensed)
 4. Resolves `previous_context` for each node (for deduplication in the prompt)
-5. Sends to Anthropic API with the appropriate depth prompt
+5. Sends to the resolved provider API with the appropriate depth prompt
 6. Updates the database in a single transaction
 
 | Flag | Description |
@@ -268,6 +326,9 @@ The repair process:
 | `--apply` | Write repairs to database (default: dry run) |
 | `--all` | Scan all conversations |
 | `--summary-id <id>` | Target a specific summary |
+| `--provider <id>` | API provider (inferred from `--model` when omitted) |
+| `--model <model>` | API model (default depends on provider) |
+| `--base-url <url>` | Custom API base URL (overrides config and env) |
 | `--verbose` | Show content hashes and previews |
 
 ### `lcm-tui rewrite`
@@ -284,8 +345,11 @@ lcm-tui rewrite 44 --depth 0 --apply
 # Rewrite everything bottom-up
 lcm-tui rewrite 44 --all --apply --diff
 
-# Rewrite with OpenAI Responses API
-lcm-tui rewrite 44 --summary sum_abc123 --provider openai --model gpt-5.3-codex --apply
+# Rewrite with Codex CLI OAuth after `codex login`
+lcm-tui rewrite 44 --summary sum_abc123 --provider openai-codex --model gpt-5.3-codex --apply
+
+# Rewrite through a custom OpenAI-compatible proxy with a raw API key
+lcm-tui rewrite 44 --summary sum_abc123 --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai --apply
 
 # Use custom prompt templates
 lcm-tui rewrite 44 --all --apply --prompt-dir ~/.config/lcm-tui/prompts
@@ -301,6 +365,7 @@ lcm-tui rewrite 44 --all --apply --prompt-dir ~/.config/lcm-tui/prompts
 | `--diff` | Show unified diff |
 | `--provider <id>` | API provider (inferred from `--model` when omitted) |
 | `--model <model>` | API model (default depends on provider) |
+| `--base-url <url>` | Custom API base URL (overrides config and env) |
 | `--prompt-dir <path>` | Custom prompt template directory |
 | `--timestamps` | Inject timestamps into source text (default: true) |
 | `--tz <timezone>` | Timezone for timestamps (default: system local) |
@@ -376,8 +441,11 @@ lcm-tui backfill my-agent session_abc123 --apply --recompact --single-root
 # Import + compact + transplant into an active conversation
 lcm-tui backfill my-agent session_abc123 --apply --transplant-to 653
 
-# Backfill using OpenAI
-lcm-tui backfill my-agent session_abc123 --apply --provider openai --model gpt-5.3-codex
+# Backfill using Codex CLI OAuth after `codex login`
+lcm-tui backfill my-agent session_abc123 --apply --provider openai-codex --model gpt-5.3-codex
+
+# Backfill through a custom OpenAI-compatible proxy with a raw API key
+lcm-tui backfill my-agent session_abc123 --apply --provider openai --model gpt-5.3-codex --base-url https://proxy.example.com/openai
 ```
 
 All write paths are transactional:
@@ -404,6 +472,7 @@ An idempotency guard prevents duplicate imports for the same `session_id`.
 | `--fresh-tail <n>` | Preserve freshest N raw messages from leaf compaction |
 | `--provider <id>` | API provider (inferred from model when omitted) |
 | `--model <id>` | API model (default depends on provider) |
+| `--base-url <url>` | Custom API base URL (overrides config and env) |
 | `--prompt-dir <path>` | Custom depth-prompt directory |
 
 ### `lcm-tui prompts`
@@ -476,12 +545,14 @@ Resolution order:
 
 If the provider auth profile mode is `oauth` (not `api_key`), set the provider API key environment variable explicitly.
 
-Interactive rewrite (`w`/`W`) can be configured with:
+Summary-producing operations (`doctor`, `repair`, `rewrite`, `backfill`, and interactive rewrite `w`/`W`) can be configured with:
 - `LCM_TUI_SUMMARY_PROVIDER`
 - `LCM_TUI_SUMMARY_MODEL`
-- `LCM_TUI_CONVERSATION_WINDOW_SIZE` (default `200`)
+- `LCM_TUI_SUMMARY_BASE_URL`
 
-It also honors `LCM_SUMMARY_PROVIDER` / `LCM_SUMMARY_MODEL` as fallback.
+It also honors `LCM_SUMMARY_PROVIDER` / `LCM_SUMMARY_MODEL` / `LCM_SUMMARY_BASE_URL` as fallback.
+
+Separately, the conversation browser window size uses `LCM_TUI_CONVERSATION_WINDOW_SIZE` (default `200`).
 
 ## Database
 

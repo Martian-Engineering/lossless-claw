@@ -45,6 +45,7 @@ func TestApplyTransplantDeepCopiesMessages(t *testing.T) {
 			role TEXT NOT NULL,
 			content TEXT NOT NULL,
 			token_count INTEGER NOT NULL,
+			identity_hash TEXT,
 			created_at TEXT NOT NULL,
 			UNIQUE (conversation_id, seq)
 		);
@@ -60,7 +61,8 @@ func TestApplyTransplantDeepCopiesMessages(t *testing.T) {
 			item_type TEXT NOT NULL,
 			message_id INTEGER,
 			summary_id TEXT,
-			created_at TEXT
+			created_at TEXT,
+			UNIQUE (conversation_id, ordinal)
 		);
 		CREATE TABLE message_parts (
 			part_id TEXT PRIMARY KEY,
@@ -165,6 +167,14 @@ func TestApplyTransplantDeepCopiesMessages(t *testing.T) {
 	`, 2)
 	assertCount(t, db, `
 		SELECT COUNT(*)
+		FROM messages
+		WHERE conversation_id = 2
+		  AND content IN ('source one', 'source two')
+		  AND identity_hash IS NOT NULL
+		  AND identity_hash != ''
+	`, 2)
+	assertCount(t, db, `
+		SELECT COUNT(*)
 		FROM message_parts mp
 		JOIN messages m ON m.message_id = mp.message_id
 		WHERE m.conversation_id = 2
@@ -185,6 +195,88 @@ func TestApplyTransplantDeepCopiesMessages(t *testing.T) {
 		WHERE m.conversation_id = 2
 		  AND m.content IN ('source one', 'source two')
 	`, 2)
+}
+
+func TestMergeTransplantedContextItemsAvoidsShiftedOrdinalCollision(t *testing.T) {
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	mustExec(t, db, `
+		CREATE TABLE summaries (
+			summary_id TEXT PRIMARY KEY,
+			conversation_id INTEGER NOT NULL,
+			kind TEXT NOT NULL,
+			content TEXT NOT NULL,
+			token_count INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			file_ids TEXT,
+			depth INTEGER NOT NULL
+		);
+		CREATE TABLE context_items (
+			conversation_id INTEGER NOT NULL,
+			ordinal INTEGER NOT NULL,
+			item_type TEXT NOT NULL,
+			message_id INTEGER,
+			summary_id TEXT,
+			created_at TEXT,
+			UNIQUE (conversation_id, ordinal)
+		);
+	`)
+	mustExec(t, db, `
+		INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, created_at, file_ids, depth) VALUES
+		('sum_existing', 2, 'condensed', 'existing summary', 100, '2026-01-02T00:00:00Z', '', 1),
+		('sum_new_archive', 2, 'leaf', 'new archive summary', 120, '2026-01-01T00:00:00Z', '', 0);
+	`)
+	mustExec(t, db, `
+		INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id) VALUES
+		(2, 0, 'summary', 'sum_existing');
+	`)
+	for ordinal := 1; ordinal <= 32; ordinal++ {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO context_items (conversation_id, ordinal, item_type, message_id)
+			VALUES (2, ?, 'message', ?)
+		`, ordinal, int64(1000+ordinal)); err != nil {
+			t.Fatalf("insert target message context item %d: %v", ordinal, err)
+		}
+	}
+
+	err = mergeTransplantedContextItems(ctx, db, 2, []transplantContextSummary{{
+		summaryID: "sum_source_archive",
+	}}, map[string]string{
+		"sum_source_archive": "sum_new_archive",
+	})
+	if err != nil {
+		t.Fatalf("merge transplanted context items: %v", err)
+	}
+
+	assertCount(t, db, `
+		SELECT COUNT(*)
+		FROM context_items
+		WHERE conversation_id = 2
+		  AND item_type = 'summary'
+		  AND ordinal IN (0, 1)
+	`, 2)
+	assertCount(t, db, `
+		SELECT COUNT(*)
+		FROM context_items
+		WHERE conversation_id = 2
+		  AND item_type = 'message'
+		  AND ordinal BETWEEN 2 AND 33
+	`, 32)
+	assertCount(t, db, `
+		SELECT COUNT(*)
+		FROM (
+			SELECT ordinal
+			FROM context_items
+			WHERE conversation_id = 2
+			GROUP BY ordinal
+			HAVING COUNT(*) > 1
+		)
+	`, 0)
 }
 
 func mustExec(t *testing.T, db *sql.DB, query string) {

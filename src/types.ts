@@ -6,10 +6,14 @@
  */
 
 import type { LcmConfig } from "./db/config.js";
+import type { LcmConfigDiagnostics } from "./db/config.js";
 
 /**
  * Minimal LLM completion interface needed by LCM for summarization.
- * Matches the signature of completeSimple from @mariozechner/pi-ai.
+ *
+ * The production implementation delegates model prep, auth, and dispatch to
+ * OpenClaw's host-owned runtime LLM API. Provider/model fields are retained as
+ * summary-model selection hints and diagnostics, not as direct auth inputs.
  */
 export type CompletionContentBlock = {
   type: string;
@@ -17,24 +21,58 @@ export type CompletionContentBlock = {
   [key: string]: unknown;
 };
 
-export type CompletionResult = {
-  content: CompletionContentBlock[];
+export type CompletionErrorInfo = {
+  kind?: string;
+  message?: string;
+  code?: string;
+  statusCode?: number;
   [key: string]: unknown;
 };
+
+export type CompletionResult = {
+  content: CompletionContentBlock[];
+  error?: CompletionErrorInfo;
+  [key: string]: unknown;
+};
+
+export type RuntimeLlmModelOverride = {
+  configField: string;
+  configPath: string;
+  modelRef: string;
+};
+
+export type RuntimeLlmCompleteFn = (params: {
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+  model?: string;
+  maxTokens?: number;
+  temperature?: number;
+  systemPrompt?: string;
+  purpose?: string;
+  agentId?: string;
+  reasoning?: string;
+  authProfileId?: string;
+}) => Promise<{
+  text: string;
+  provider: string;
+  model: string;
+  agentId: string;
+  usage?: Record<string, unknown>;
+  audit?: Record<string, unknown>;
+}>;
 
 export type CompleteFn = (params: {
   provider?: string;
   model: string;
-  apiKey?: string;
-  providerApi?: string;
+  runtimeModelOverride?: RuntimeLlmModelOverride;
+  runtimeLlmComplete?: RuntimeLlmCompleteFn;
+  agentId?: string;
   authProfileId?: string;
-  agentDir?: string;
-  runtimeConfig?: unknown;
   messages: Array<{ role: string; content: unknown }>;
   system?: string;
   maxTokens: number;
   temperature?: number;
   reasoning?: string;
+  reasoningIfSupported?: string;
 }) => Promise<CompletionResult>;
 
 /**
@@ -56,28 +94,6 @@ export type ResolveModelFn = (modelRef?: string, providerHint?: string) => {
 };
 
 /**
- * API key resolution function.
- */
-export type ApiKeyLookupOptions = {
-  profileId?: string;
-  preferredProfile?: string;
-  agentDir?: string;
-  runtimeConfig?: unknown;
-};
-
-export type GetApiKeyFn = (
-  provider: string,
-  model: string,
-  options?: ApiKeyLookupOptions,
-) => Promise<string | undefined>;
-
-export type RequireApiKeyFn = (
-  provider: string,
-  model: string,
-  options?: ApiKeyLookupOptions,
-) => Promise<string>;
-
-/**
  * Session key utilities.
  */
 export type ParseAgentSessionKeyFn = (sessionKey: string) => {
@@ -87,6 +103,14 @@ export type ParseAgentSessionKeyFn = (sessionKey: string) => {
 
 export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 
+export type StartupSessionFileCandidate = {
+  sessionId: string;
+  sessionKey: string;
+  sessionFile: string;
+  agentId?: string;
+  storePath?: string;
+};
+
 /**
  * Dependencies injected into the LCM engine at registration time.
  * These replace all direct imports from OpenClaw core.
@@ -94,6 +118,9 @@ export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 export interface LcmDependencies {
   /** LCM configuration (from env vars + plugin config) */
   config: LcmConfig;
+
+  /** Optional config resolution metadata for startup diagnostics. */
+  configDiagnostics?: LcmConfigDiagnostics;
 
   /** LLM completion function for summarization */
   complete: CompleteFn;
@@ -103,12 +130,6 @@ export interface LcmDependencies {
 
   /** Resolve model alias to provider/model pair */
   resolveModel: ResolveModelFn;
-
-  /** Get API key for a provider/model pair */
-  getApiKey: GetApiKeyFn;
-
-  /** Require API key (throws if missing) */
-  requireApiKey: RequireApiKeyFn;
 
   /** Parse agent session key into components */
   parseAgentSessionKey: ParseAgentSessionKeyFn;
@@ -137,6 +158,15 @@ export interface LcmDependencies {
 
   /** Resolve runtime session id from an agent session key */
   resolveSessionIdFromSessionKey: (sessionKey: string) => Promise<string | undefined>;
+
+  /** Resolve the current transcript file path for a session identity */
+  resolveSessionTranscriptFile: (params: {
+    sessionId: string;
+    sessionKey?: string;
+  }) => Promise<string | undefined>;
+
+  /** List OpenClaw-indexed session files that startup recovery may enumerate. */
+  listStartupSessionFileCandidates?: () => Promise<StartupSessionFileCandidate[]>;
 
   /** Agent lane constant for subagents */
   agentLaneSubagent: string;

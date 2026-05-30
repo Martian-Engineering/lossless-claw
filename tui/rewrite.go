@@ -24,6 +24,7 @@ type rewriteOptions struct {
 	promptDir  string
 	provider   string
 	model      string
+	baseURL    string
 	showDiff   bool
 	timestamps bool
 	tz         *time.Location
@@ -72,6 +73,11 @@ func runRewriteCommand(args []string) error {
 	}
 	defer db.Close()
 
+	settings := resolveTUISummaryRuntimeSettings(paths, opts.provider, opts.model, opts.baseURL, "", "")
+	opts.provider = settings.provider
+	opts.model = settings.model
+	opts.baseURL = settings.baseURL
+
 	ctx := context.Background()
 	targets, err := loadRewriteTargets(ctx, db, conversationID, opts)
 	if err != nil {
@@ -100,6 +106,7 @@ func runRewriteCommand(args []string) error {
 			apiKey:   apiKey,
 			http:     &http.Client{Timeout: defaultHTTPTimeout},
 			model:    opts.model,
+			baseURL:  opts.baseURL,
 		}
 	} else {
 		apiKey, err := resolveProviderAPIKey(paths, opts.provider)
@@ -109,6 +116,7 @@ func runRewriteCommand(args []string) error {
 				apiKey:   apiKey,
 				http:     &http.Client{Timeout: defaultHTTPTimeout},
 				model:    opts.model,
+				baseURL:  opts.baseURL,
 			}
 		}
 		if client == nil {
@@ -194,6 +202,7 @@ func parseRewriteArgs(args []string) (rewriteOptions, int64, error) {
 	promptDir := fs.String("prompt-dir", "", "custom prompt template directory")
 	provider := fs.String("provider", "", "provider id (e.g. anthropic, openai)")
 	model := fs.String("model", "", "summary model id")
+	baseURL := fs.String("base-url", "", "custom API base URL")
 	showDiff := fs.Bool("diff", false, "show unified diff")
 	timestamps := fs.Bool("timestamps", true, "inject timestamps into source text")
 	tzName := fs.String("tz", "", "timezone for timestamps (e.g. America/Los_Angeles; default: system local)")
@@ -224,6 +233,7 @@ func parseRewriteArgs(args []string) (rewriteOptions, int64, error) {
 		promptDir:  strings.TrimSpace(*promptDir),
 		provider:   strings.TrimSpace(*provider),
 		model:      strings.TrimSpace(*model),
+		baseURL:    strings.TrimSpace(*baseURL),
 		showDiff:   *showDiff,
 		timestamps: *timestamps,
 		tz:         loc,
@@ -232,7 +242,6 @@ func parseRewriteArgs(args []string) (rewriteOptions, int64, error) {
 	if opts.promptDir != "" {
 		opts.promptDir = expandHomePath(opts.promptDir)
 	}
-	opts.provider, opts.model = resolveSummaryProviderModel(opts.provider, opts.model)
 	if opts.apply {
 		opts.dryRun = false
 	}
@@ -273,7 +282,7 @@ func normalizeRewriteArgs(args []string) ([]string, error) {
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		takesValue := arg == "--summary" || arg == "--depth" || arg == "--prompt-dir" || arg == "--provider" || arg == "--model" || arg == "--tz"
+		takesValue := arg == "--summary" || arg == "--depth" || arg == "--prompt-dir" || arg == "--provider" || arg == "--model" || arg == "--tz" || arg == "--base-url"
 		if takesValue {
 			if i+1 >= len(args) {
 				return nil, fmt.Errorf("missing value for %s", arg)
@@ -282,7 +291,7 @@ func normalizeRewriteArgs(args []string) ([]string, error) {
 			i++
 			continue
 		}
-		if strings.HasPrefix(arg, "--summary=") || strings.HasPrefix(arg, "--depth=") || strings.HasPrefix(arg, "--prompt-dir=") || strings.HasPrefix(arg, "--provider=") || strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "--tz=") {
+		if strings.HasPrefix(arg, "--summary=") || strings.HasPrefix(arg, "--depth=") || strings.HasPrefix(arg, "--prompt-dir=") || strings.HasPrefix(arg, "--provider=") || strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "--tz=") || strings.HasPrefix(arg, "--base-url=") {
 			flags = append(flags, arg)
 			continue
 		}
@@ -323,9 +332,14 @@ Flags:
   --prompt-dir <path> custom template directory
   --provider <id>     API provider (inferred from model when omitted)
   --model <model>     API model (default: provider-specific)
+  --base-url <url>    custom API base URL (overrides openclaw.json and env)
   --diff              show unified diff
   --timestamps        inject timestamps into source text (default true)
   --tz <timezone>     timezone for timestamps (e.g. America/Los_Angeles; default: system local)
+
+Env:
+  LCM_TUI_SUMMARY_PROVIDER / LCM_TUI_SUMMARY_MODEL / LCM_TUI_SUMMARY_BASE_URL
+  fall back to LCM_SUMMARY_PROVIDER / LCM_SUMMARY_MODEL / LCM_SUMMARY_BASE_URL
 `)
 }
 
@@ -413,13 +427,13 @@ func buildSummaryRewriteSource(ctx context.Context, q sqlQueryer, item rewriteSu
 }
 
 func buildLeafRewriteSource(ctx context.Context, q sqlQueryer, summaryID string, includeTimestamps bool, loc *time.Location) (rewriteSource, error) {
-	rows, err := q.QueryContext(ctx, `
-		SELECT m.role, COALESCE(m.content, ''), COALESCE(m.created_at, '')
+	rows, err := q.QueryContext(ctx, fmt.Sprintf(`
+		SELECT m.role, %s AS content, COALESCE(m.created_at, '')
 		FROM summary_messages sm
 		JOIN messages m ON m.message_id = sm.message_id
 		WHERE sm.summary_id = ?
 		ORDER BY sm.ordinal ASC
-	`, summaryID)
+	`, messageDisplayContentSQL("m")), summaryID)
 	if err != nil {
 		return rewriteSource{}, fmt.Errorf("query leaf source for %s: %w", summaryID, err)
 	}
