@@ -124,8 +124,14 @@ describe("lcm plugin prompt hook", () => {
     expect(result.prependSystemContext).toContain(
       "If facts seem contradictory or uncertain, verify with lossless-claw recall tools before answering",
     );
+    expect(result.prependSystemContext).toContain(
+      "call `lcm_recall_keys` first",
+    );
     expect(result.prependSystemContext).toContain("Recall order for compacted conversation history:");
-    expect(result.prependSystemContext).toContain("1. `lcm_grep` — search by regex or full-text");
+    expect(result.prependSystemContext).toContain(
+      "1. `lcm_recall_keys` — recover exact all-caps identifier facts from raw message evidence",
+    );
+    expect(result.prependSystemContext).toContain("2. `lcm_grep` — search by regex or full-text");
     expect(result.prependSystemContext).toContain("`lcm_grep` routing guidance");
     expect(result.prependSystemContext).toContain('Prefer `mode: "full_text"` for keyword or topical recall');
     expect(result.prependSystemContext).toContain("Full-text queries are not regexes");
@@ -135,9 +141,9 @@ describe("lcm plugin prompt hook", () => {
     expect(result.prependSystemContext).toContain('Wrap exact multi-word phrases in quotes');
     expect(result.prependSystemContext).toContain('Use `sort: "relevance"` when hunting for the best older match');
     expect(result.prependSystemContext).toContain('Use `sort: "hybrid"` when relevance matters but newer context should still get a boost');
-    expect(result.prependSystemContext).toContain("2. `lcm_describe` — inspect a specific summary");
+    expect(result.prependSystemContext).toContain("3. `lcm_describe` — inspect a specific summary");
     expect(result.prependSystemContext).toContain(
-      "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent",
+      "4. `lcm_expand_query` — deep recall: spawns bounded sub-agent",
     );
     expect(result.prependSystemContext).toContain(
       "`lcm_expand_query` usage",
@@ -165,8 +171,10 @@ describe("lcm plugin prompt hook", () => {
       "For exact commands, SHAs, paths, timestamps, config values, or causal chains, expand for details before answering.",
     );
     expect(result.prependSystemContext).toContain("**Precision flow:**");
-    expect(result.prependSystemContext).toContain("1. `lcm_grep` to find the relevant summaries or messages");
-    expect(result.prependSystemContext).toContain("2. `lcm_expand_query` when you need exact evidence before answering");
+    expect(result.prependSystemContext).toContain("1. `lcm_recall_keys` for exact all-caps identifier keys.");
+    expect(result.prependSystemContext).toContain("2. `lcm_grep` to find the relevant summaries or messages.");
+    expect(result.prependSystemContext).toContain("3. `lcm_expand_query` when you need richer evidence before answering.");
+    expect(result.prependSystemContext).toContain("4. Answer from the retrieved evidence instead of summary paraphrase");
     expect(result.prependSystemContext).toContain("**Uncertainty checklist:**");
     expect(result.prependSystemContext).toContain("Could compaction have omitted a crucial detail?");
     expect(result.prependSystemContext).toContain(

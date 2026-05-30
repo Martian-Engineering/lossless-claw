@@ -117,6 +117,15 @@ export type MessageSearchInput = {
   sort?: SearchSort;
 };
 
+export type LiteralMessageSearchInput = {
+  conversationId?: ConversationId;
+  conversationIds?: ConversationId[];
+  literal: string;
+  roles?: MessageRole[];
+  limit?: number;
+  offset?: number;
+};
+
 export type MessageSearchResult = {
   messageId: MessageId;
   conversationId: ConversationId;
@@ -929,6 +938,47 @@ export class ConversationStore {
     );
   }
 
+  async findMessagesContainingLiteral(input: LiteralMessageSearchInput): Promise<MessageRecord[]> {
+    const literal = input.literal.trim();
+    if (!literal) {
+      return [];
+    }
+
+    const limit = Math.max(1, Math.min(500, Math.trunc(input.limit ?? 50)));
+    const offset = Math.max(0, Math.trunc(input.offset ?? 0));
+    const where: string[] = [];
+    const args: Array<string | number> = [];
+    appendConversationScopeConstraint({
+      where,
+      args,
+      columnExpr: "conversation_id",
+      conversationId: input.conversationId,
+      conversationIds: input.conversationIds,
+    });
+
+    const roles = [...new Set(input.roles ?? [])];
+    if (roles.length > 0) {
+      where.push(`role IN (${roles.map(() => "?").join(", ")})`);
+      args.push(...roles);
+    }
+
+    where.push("instr(content, ?) > 0");
+    args.push(literal);
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+         FROM messages
+         ${whereClause}
+         ORDER BY created_at DESC, message_id DESC
+         LIMIT ? OFFSET ?`,
+      )
+      .all(...args, limit, offset) as unknown as MessageRow[];
+
+    return rows.map(toMessageRecord);
+  }
+
   private indexMessageForFullText(messageId: MessageId, content: string): void {
     if (!this.fts5Available) {
       return;
@@ -1128,7 +1178,7 @@ export class ConversationStore {
       .all(...args) as unknown as MessageRow[];
 
     return rows
-      .map((row) => {
+      .map((row): MessageSearchResult | null => {
         const normalizedContent = normalizeMessageContentForFullTextIndex(row.content) ?? row.content;
         const haystack = normalizedContent.toLowerCase();
         const matchesAllTerms = plan.terms.every((term) => haystack.includes(term));

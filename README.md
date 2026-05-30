@@ -22,7 +22,7 @@ When a conversation grows beyond the model's context window, OpenClaw (just like
 2. **Summarizes chunks** of older messages into summaries using your configured LLM
 3. **Condenses summaries** into higher-level nodes as they accumulate, forming a DAG (directed acyclic graph)
 4. **Assembles context** each turn by combining summaries + recent raw messages
-5. **Provides tools** (`lcm_grep`, `lcm_describe`, `lcm_expand`) so agents can search and recall details from compacted history
+5. **Provides tools** (`lcm_recall_keys`, `lcm_grep`, `lcm_describe`, `lcm_expand_query`, `lcm_expand`) so agents can search and recall details from compacted history
 
 Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.
 
@@ -478,6 +478,7 @@ src/
     fts5-sanitize.ts        # FTS5 query sanitization
   tools/
     lcm-grep-tool.ts        # lcm_grep tool implementation
+    lcm-recall-keys-tool.ts # lcm_recall_keys exact-identifier recall tool
     lcm-describe-tool.ts    # lcm_describe tool implementation
     lcm-expand-tool.ts      # lcm_expand tool (sub-agent only)
     lcm-expand-query-tool.ts # lcm_expand_query tool (main agent wrapper)

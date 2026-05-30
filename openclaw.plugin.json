@@ -10,6 +10,7 @@
   "contracts": {
     "tools": [
       "lcm_grep",
+      "lcm_recall_keys",
       "lcm_describe",
       "lcm_expand",
       "lcm_expand_query"
