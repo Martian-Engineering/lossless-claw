@@ -3481,6 +3481,11 @@ describe("LcmContextEngine.bootstrap", () => {
 
     rmSync(firstSessionFile, { force: true });
 
+    const newSessionFile = createSessionFilePath("assemble-missed-reset-fallback-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "new live prompt" },
+      { role: "assistant", content: "new assistant reply" },
+    ]);
     const liveMessages = [makeMessage({ role: "user", content: "new live prompt" })];
     const assembled = await engine.assemble({
       sessionId: secondSessionId,
@@ -3494,6 +3499,27 @@ describe("LcmContextEngine.bootstrap", () => {
       assembled.messages.some((message) => message.content === "openai-codex/gpt-5.5"),
     ).toBe(false);
 
+    const activeConversationBeforeAfterTurn = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeConversationBeforeAfterTurn).toBeNull();
+
+    const archivedConversation = await engine.getConversationStore().getConversation(
+      originalConversation!.conversationId,
+    );
+    expect(archivedConversation?.active).toBe(false);
+    expect(archivedConversation?.archivedAt).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "new assistant reply" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
     const activeConversation = await engine.getConversationStore().getConversationForSession({
       sessionId: secondSessionId,
       sessionKey,
@@ -3503,11 +3529,13 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(activeConversation!.sessionId).toBe(secondSessionId);
     expect(activeConversation!.active).toBe(true);
 
-    const archivedConversation = await engine.getConversationStore().getConversation(
-      originalConversation!.conversationId,
+    const storedActiveMessages = await engine.getConversationStore().getMessages(
+      activeConversation!.conversationId,
     );
-    expect(archivedConversation?.active).toBe(false);
-    expect(archivedConversation?.archivedAt).not.toBeNull();
+    expect(storedActiveMessages.map((message) => message.content)).toEqual([
+      "new live prompt",
+      "new assistant reply",
+    ]);
   });
 
   it("preserves the active conversation when the tracked transcript stat fails for a non-missing reason", async () => {
@@ -8773,10 +8801,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       sessionId: secondSessionId,
       sessionKey,
       sessionFile: newSessionFile,
-      messages: [
-        makeMessage({ role: "user", content: "new turn user" }),
-        makeMessage({ role: "assistant", content: "new turn assistant" }),
-      ],
+      messages: [makeMessage({ role: "assistant", content: "new turn assistant" })],
       prePromptMessageCount: 0,
       tokenBudget: 4_096,
     });

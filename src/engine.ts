@@ -5406,6 +5406,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     sessionKey?: string;
     sessionFile: string;
+    isHeartbeat?: boolean;
   }): Promise<TranscriptReconcileResult> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     return await this.withSessionQueue(
@@ -5425,10 +5426,43 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
         });
         if (!conversation) {
-          // No persisted conversation exists yet; afterTurn's own ingest batch
-          // will create the initial frontier, so refreshing after that ingest is
-          // safe and preserves the normal first-turn checkpoint behavior.
-          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+          if (params.isHeartbeat) {
+            return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+          }
+          // No persisted conversation exists yet. Prefer the transcript over
+          // the runtime delta so foreground prompts that are omitted from
+          // afterTurn's messages array are not lost.
+          const historicalMessages = await readLeafPathMessages(params.sessionFile);
+          let importedMessages = 0;
+          for (const message of historicalMessages) {
+            const result = await this.ingestSingle({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              message,
+              skipReplayTimestampFloodGuard: true,
+            });
+            if (result.ingested) {
+              importedMessages += 1;
+            }
+          }
+          if (importedMessages > 0) {
+            const activeConversation = await this.conversationStore.getConversationForSession({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+            });
+            if (activeConversation) {
+              this.recordRecentBootstrapImport(
+                activeConversation.conversationId,
+                importedMessages,
+                "imported initial afterTurn transcript",
+              );
+              await this.refreshBootstrapState({
+                conversationId: activeConversation.conversationId,
+                sessionFile: params.sessionFile,
+              });
+            }
+          }
+          return { importedMessages, blockedByImportCap: false, hasOverlap: true };
         }
 
         // OpenClaw can submit the foreground prompt outside the mutable
@@ -6963,6 +6997,7 @@ export class LcmContextEngine implements ContextEngine {
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         sessionFile: params.sessionFile,
+        isHeartbeat: params.isHeartbeat,
       });
     } catch (err) {
       this.deps.log.warn(
@@ -7289,6 +7324,7 @@ export class LcmContextEngine implements ContextEngine {
               phase: "assemble",
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
+              createReplacement: false,
             });
           }),
         {
