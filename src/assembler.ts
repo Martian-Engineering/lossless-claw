@@ -283,6 +283,9 @@ function getPartMetadata(part: MessagePartRecord): {
   originalRole?: string;
   rawType?: string;
   raw?: unknown;
+  topLevelReasoningField?: string;
+  topLevelReasoningContent?: string;
+  topLevelReasoningOnly?: boolean;
 } {
   const decoded = parseJson(part.metadata);
   if (!decoded || typeof decoded !== "object") {
@@ -293,6 +296,9 @@ function getPartMetadata(part: MessagePartRecord): {
     originalRole?: unknown;
     rawType?: unknown;
     raw?: unknown;
+    topLevelReasoningField?: unknown;
+    topLevelReasoningContent?: unknown;
+    topLevelReasoningOnly?: unknown;
   };
   return {
     originalRole:
@@ -304,6 +310,20 @@ function getPartMetadata(part: MessagePartRecord): {
         ? record.rawType
         : undefined,
     raw: record.raw,
+    topLevelReasoningField:
+      typeof record.topLevelReasoningField === "string" &&
+      record.topLevelReasoningField.length > 0
+        ? record.topLevelReasoningField
+        : undefined,
+    topLevelReasoningContent:
+      typeof record.topLevelReasoningContent === "string" &&
+      record.topLevelReasoningContent.length > 0
+        ? record.topLevelReasoningContent
+        : undefined,
+    topLevelReasoningOnly:
+      typeof record.topLevelReasoningOnly === "boolean"
+        ? record.topLevelReasoningOnly
+        : undefined,
   };
 }
 
@@ -618,7 +638,8 @@ export function contentFromParts(
   role: "user" | "assistant" | "toolResult",
   fallbackContent: string,
 ): unknown {
-  if (parts.length === 0) {
+  const contentParts = parts.filter((part) => !getPartMetadata(part).topLevelReasoningOnly);
+  if (contentParts.length === 0) {
     if (role === "assistant") {
       return fallbackContent ? [{ type: "text", text: fallbackContent }] : [];
     }
@@ -628,7 +649,7 @@ export function contentFromParts(
     return fallbackContent;
   }
 
-  const blocks = parts.map(blockFromPart);
+  const blocks = contentParts.map(blockFromPart);
   if (
     role === "user" &&
     blocks.length === 1 &&
@@ -640,6 +661,20 @@ export function contentFromParts(
     return (blocks[0] as { text: string }).text;
   }
   return blocks;
+}
+
+function pickTopLevelAssistantReasoning(parts: MessagePartRecord[]): Record<string, string> {
+  for (const part of parts) {
+    const metadata = getPartMetadata(part);
+    if (
+      metadata.topLevelReasoningField === "reasoning_content" &&
+      typeof metadata.topLevelReasoningContent === "string" &&
+      metadata.topLevelReasoningContent.length > 0
+    ) {
+      return { reasoning_content: metadata.topLevelReasoningContent };
+    }
+  }
+  return {};
 }
 
 /** @internal Exported for transcript-maintenance reconstruction. */
@@ -1689,9 +1724,14 @@ export class ContextAssembler {
     const role: "user" | "assistant" | "toolResult" =
       isToolResult && !toolCallId ? "assistant" : roleFromStore;
     const content = contentFromParts(parts, role, msg.content);
+    const topLevelAssistantReasoning =
+      role === "assistant" ? pickTopLevelAssistantReasoning(parts) : {};
     const contentText =
       typeof content === "string" ? content : (JSON.stringify(content) ?? msg.content);
-    const tokenCount = estimateTokens(contentText);
+    const topLevelReasoningText = Object.values(topLevelAssistantReasoning).join("\n");
+    const tokenCount = estimateTokens(
+      [contentText, topLevelReasoningText].filter(Boolean).join("\n"),
+    );
 
     // v4.2 §B (Option C) — `messages.large_content` now stores the
     // externalized `file_xxx` id, not a content copy. When present, look
@@ -1722,6 +1762,7 @@ export class ContextAssembler {
           ? ({
               role,
               content,
+              ...topLevelAssistantReasoning,
               usage: {
                 input: 0,
                 output: tokenCount,

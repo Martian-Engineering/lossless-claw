@@ -819,6 +819,33 @@ function normalizeUnknownBlock(value: unknown): {
   };
 }
 
+function extractTopLevelReasoningContent(
+  role: string,
+  topLevel: Record<string, unknown>,
+): { field: "reasoning_content"; content: string } | null {
+  if (role !== "assistant") {
+    return null;
+  }
+  const content = safeString(topLevel.reasoning_content);
+  return content && content.trim().length > 0
+    ? { field: "reasoning_content", content }
+    : null;
+}
+
+function topLevelReasoningMetadata(
+  reasoning: { field: "reasoning_content"; content: string } | null,
+  only = false,
+): Record<string, unknown> {
+  if (!reasoning) {
+    return {};
+  }
+  return {
+    topLevelReasoningField: reasoning.field,
+    topLevelReasoningContent: reasoning.content,
+    topLevelReasoningOnly: only || undefined,
+  };
+}
+
 function toPartType(type: string): MessagePartType {
   switch (type) {
     case "text":
@@ -1032,6 +1059,7 @@ function buildMessageParts(params: {
   const topLevelIsError =
     safeBoolean(topLevel.isError) ??
     safeBoolean(topLevel.is_error);
+  const topLevelReasoning = extractTopLevelReasoningContent(role, topLevel);
   const rawPayloadExternalized = safeBoolean(topLevel.rawPayloadExternalized);
   const externalizedFileId = safeString(topLevel.externalizedFileId);
   const originalByteSize =
@@ -1085,6 +1113,7 @@ function buildMessageParts(params: {
           toolCallId: topLevelToolCallId,
           toolName: topLevelToolName,
           isError: topLevelIsError,
+          ...topLevelReasoningMetadata(topLevelReasoning),
           rawPayloadExternalized: rawPayloadExternalized || undefined,
           externalizedFileId,
           originalByteSize,
@@ -1105,12 +1134,26 @@ function buildMessageParts(params: {
           originalRole: role,
           source: "non-array-content",
           raw: message.content,
+          ...topLevelReasoningMetadata(topLevelReasoning),
         }),
       },
     ];
   }
 
   const parts: CreateMessagePartInput[] = [];
+  if (message.content.length === 0 && topLevelReasoning) {
+    parts.push({
+      sessionId,
+      partType: "reasoning",
+      ordinal: 0,
+      textContent: null,
+      metadata: toJson({
+        originalRole: role,
+        rawType: topLevelReasoning.field,
+        ...topLevelReasoningMetadata(topLevelReasoning, true),
+      }),
+    });
+  }
   for (let ordinal = 0; ordinal < message.content.length; ordinal++) {
     const block = normalizeUnknownBlock(message.content[ordinal]);
     const metadataRecord = block.metadata.raw as Record<string, unknown> | undefined;
@@ -1162,6 +1205,7 @@ function buildMessageParts(params: {
         toolCallId: topLevelToolCallId,
         toolName: topLevelToolName,
         isError: topLevelIsError,
+        ...(ordinal === 0 ? topLevelReasoningMetadata(topLevelReasoning) : {}),
         externalizedFileId: safeString(metadataRecord?.externalizedFileId),
         originalByteSize:
           typeof metadataRecord?.originalByteSize === "number"
@@ -1267,11 +1311,15 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
           fallbackContent: content,
         })
       : estimateTokens(content);
+  const topLevelReasoning = extractTopLevelReasoningContent(
+    typeof message.role === "string" ? message.role : "",
+    message as unknown as Record<string, unknown>,
+  );
 
   return {
     role: toDbRole(message.role),
     content,
-    tokenCount,
+    tokenCount: tokenCount + (topLevelReasoning ? estimateTokens(topLevelReasoning.content) : 0),
   };
 }
 

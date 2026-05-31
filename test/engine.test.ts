@@ -9295,6 +9295,71 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(result.content).toEqual([{ type: "text", text: "/tmp/project" }]);
   });
 
+  it("preserves top-level reasoning_content for assistant tool-call replay", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const privateReasoning = "PRIVATE_KIMI_REASONING_CONTENT";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        reasoning_content: privateReasoning,
+        content: [
+          {
+            type: "function_call",
+            call_id: "fc_kimi_1",
+            name: "bash",
+            arguments: '{"cmd":"pwd"}',
+          },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "fc_kimi_1",
+        toolName: "bash",
+        content: [{ type: "function_call_output", call_id: "fc_kimi_1", output: "/tmp/project" }],
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const storedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const assistantParts = await engine
+      .getConversationStore()
+      .getMessageParts(storedMessages[0].messageId);
+    expect(storedMessages[0].tokenCount).toBeGreaterThanOrEqual(estimateTokens(privateReasoning));
+    expect(assistantParts.map((part) => part.partType)).toEqual(["tool"]);
+    expect(JSON.parse(assistantParts[0].metadata ?? "{}")).toMatchObject({
+      topLevelReasoningField: "reasoning_content",
+      topLevelReasoningContent: privateReasoning,
+    });
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+
+    const assistant = assembled.messages[0] as {
+      role: string;
+      reasoning_content?: string;
+      content?: Array<{ type?: string; call_id?: string; arguments?: unknown }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.reasoning_content).toBe(privateReasoning);
+    expect(JSON.stringify(assistant.content)).not.toContain(privateReasoning);
+    expect(assistant.content?.[0]?.type).toBe("function_call");
+    expect(assistant.content?.[0]?.call_id).toBe("fc_kimi_1");
+    expect(assistant.content?.[0]?.arguments).toBe('{"cmd":"pwd"}');
+  });
+
   it("reconstructs OpenAI reasoning and function call blocks when raw metadata is missing", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();
@@ -14171,6 +14236,59 @@ describe("LcmContextEngine compaction telemetry", () => {
     const result = await engine.compact({
       sessionId,
       sessionFile: createSessionFilePath("reasoning-parts-compact"),
+      tokenBudget: 10_000,
+      force: true,
+      legacyParams: { provider: "vllm", model: "qwen3.5-122b" },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(summarizerInput).toContain("Visible assistant answer.");
+    expect(summarizerInput).not.toContain(privateReasoning);
+  });
+
+  it("does not feed top-level reasoning_content into compaction summarizer input", async () => {
+    const privateReasoning = "PRIVATE_TOP_LEVEL_REASONING_CONTENT";
+    let summarizerInput = "";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 0,
+        leafMinFanout: 2,
+        leafChunkTokens: 1_000,
+        incrementalMaxDepth: 0,
+      },
+      {
+        complete: vi.fn(async (request) => {
+          const message = request.messages?.[0];
+          summarizerInput =
+            message && typeof message === "object" && "content" in message
+              ? String((message as { content?: unknown }).content ?? "")
+              : "";
+          return { content: [{ type: "text", text: "Safe compacted summary." }] };
+        }),
+        resolveModel: vi.fn(() => ({ provider: "vllm", model: "qwen3.5-122b" })),
+      },
+    );
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        reasoning_content: privateReasoning,
+        content: [{ type: "text", text: "Visible assistant answer." }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({
+        role: "user",
+        content: `Follow-up ${"x".repeat(400)}`,
+      }),
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("top-level-reasoning-content-compact"),
       tokenBudget: 10_000,
       force: true,
       legacyParams: { provider: "vllm", model: "qwen3.5-122b" },
