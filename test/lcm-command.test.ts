@@ -10,6 +10,7 @@ import { ConversationStore } from "../src/store/conversation-store.js";
 import { FocusBriefStore } from "../src/store/focus-brief-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
 import { createLcmCommand, __testing } from "../src/plugin/lcm-command.js";
+import { FALLBACK_DIRECTIVE_SUMMARY_MARKER } from "../src/summary-fallback.js";
 import type { LcmSummarizeFn } from "../src/summarize.js";
 import type { LcmDependencies } from "../src/types.js";
 
@@ -1157,6 +1158,14 @@ describe("lcm command", () => {
       tokenCount: 11,
     });
     await fixture.summaryStore.insertSummary({
+      summaryId: "sum_current_directive",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+      tokenCount: 9,
+    });
+    await fixture.summaryStore.insertSummary({
       summaryId: "sum_current_emergency",
       conversationId: currentConversation.conversationId,
       kind: "leaf",
@@ -1183,12 +1192,15 @@ describe("lcm command", () => {
     expect(result.text).toContain("🩺 Lossless Claw Doctor");
     expect(result.text).toContain(`conversation id: ${currentConversation.conversationId}`);
     expect(result.text).toContain("scope: this conversation only");
-    expect(result.text).toContain("detected summaries: 3");
+    expect(result.text).toContain("detected summaries: 4");
     expect(result.text).toContain("old-marker summaries: 1");
     expect(result.text).toContain("truncated-marker summaries: 1");
+    expect(result.text).toContain("fallback-marker summaries: 1");
     expect(result.text).toContain("emergency-fallback summaries: 1");
     expect(result.text).toContain("result: issues found");
-    expect(result.text).toContain("sum_current_emergency (emergency), sum_current_new (new), sum_current_old (old)");
+    expect(result.text).toContain(
+      "sum_current_directive (fallback), sum_current_emergency (emergency), sum_current_new (new), sum_current_old (old)",
+    );
     expect(result.text).toContain("**🛠️ Next step**");
     expect(result.text).toContain("`/lossless doctor apply` repairs these in place for the current conversation.");
     expect(result.text).not.toContain("sum_other_new");
@@ -1987,7 +1999,7 @@ describe("lcm command", () => {
       conversationId: currentConversation.conversationId,
       kind: "condensed",
       depth: 1,
-      content: `${"[LCM fallback summary; truncated for context management]"}\nold parent`,
+      content: `${FALLBACK_DIRECTIVE_SUMMARY_MARKER}\nold parent`,
       tokenCount: 9,
     });
     await fixture.summaryStore.linkSummaryToParents("sum_parent_fix", ["sum_leaf_fix"]);
@@ -2015,6 +2027,7 @@ describe("lcm command", () => {
     expect(repairedParent?.content).toContain("CONDENSED REPAIR");
     expect(repairedParent?.content).toContain("LEAF REPAIR");
     expect(repairedParent?.content).not.toContain("[LCM fallback summary");
+    expect(repairedParent?.content).not.toContain(FALLBACK_DIRECTIVE_SUMMARY_MARKER);
   });
 
   it("reports doctor apply as unavailable when the current conversation cannot be resolved and does not repair globally", async () => {

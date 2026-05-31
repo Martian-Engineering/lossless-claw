@@ -5,20 +5,25 @@ export const FALLBACK_DIRECTIVE_OMISSION =
 
 export const FALLBACK_SUMMARY_MARKER =
   "[LCM fallback summary; truncated for context management]";
-const DEFAULT_FALLBACK_DIRECTIVE_NOTE =
+export const FALLBACK_DIRECTIVE_SUMMARY_MARKER =
   "[LCM fallback summary; directive-shaped untrusted content omitted]";
-const OPTIONAL_DIRECTIVE_SCOPE_PREFIX = String.raw`(?:all\s+)?(?:(?:the|your|my|any|these|those)\s+)?`;
-const FALLBACK_DIRECTIVE_SHAPED_PATTERN = new RegExp(
-  [
-    String.raw`\b(ignore|disregard|forget|override)\s+${OPTIONAL_DIRECTIVE_SCOPE_PREFIX}(previous|prior|above|earlier|system|developer)\s+(instructions?|prompts?|rules?)\b`,
-    String.raw`\byou\s+are\s+now\b`,
-    String.raw`\bfrom\s+now\s+on\b`,
-    String.raw`\breply\s+only\s+with\b`,
-    String.raw`\b(reveal|print|show|dump|exfiltrate)\s+(?:(?:the|your|my|any)\s+)?(system|developer)\s+prompt\b`,
-    String.raw`\bjailbreak\b`,
-  ].join("|"),
-  "i",
-);
+const DEFAULT_FALLBACK_DIRECTIVE_NOTE = FALLBACK_DIRECTIVE_SUMMARY_MARKER;
+const OPTIONAL_DIRECTIVE_SCOPE_PREFIX = String.raw`(?:all\s+)?(?:of\s+)?(?:(?:the|your|my|any|these|those)\s+)?`;
+const DIRECTIVE_SCOPE = String.raw`(?:(?:previous|prior|above|earlier)(?:\s+(?:system|developer))?|(?:system|developer))`;
+const FALLBACK_DIRECTIVE_SHAPED_PATTERNS = [
+  new RegExp(
+    [
+      String.raw`\b(ignore|disregard|forget|override)\s+${OPTIONAL_DIRECTIVE_SCOPE_PREFIX}${DIRECTIVE_SCOPE}\s+(instructions?|prompts?|rules?)\b`,
+      String.raw`\byou\s+are\s+now\b`,
+      String.raw`\bfrom\s+now\s+on\b`,
+      String.raw`\breply\s+only\s+with\b`,
+      String.raw`\b(reveal|print|show|dump|exfiltrate)\s+(?:(?:the|your|my|any)\s+)?(system|developer)\s+prompt\b`,
+      String.raw`\bjailbreak\b`,
+    ].join("|"),
+    "i",
+  ),
+  /\b(?:DAN\s+mode|act\s+as\s+DAN|pretend\s+to\s+be\s+DAN|(?:[Aa]nswer|ANSWER)\b[^.!?\n]{0,80}\bas\s+DAN)\b/,
+];
 
 export function sanitizeDeterministicFallbackText(text: string): {
   sanitizedText: string;
@@ -35,7 +40,7 @@ export function sanitizeDeterministicFallbackText(text: string): {
       lastWasOmission = false;
       continue;
     }
-    if (FALLBACK_DIRECTIVE_SHAPED_PATTERN.test(unit)) {
+    if (FALLBACK_DIRECTIVE_SHAPED_PATTERNS.some((pattern) => pattern.test(unit))) {
       omittedDirectiveShapedContent = true;
       if (!lastWasOmission) {
         output.push(`${FALLBACK_DIRECTIVE_OMISSION} `);

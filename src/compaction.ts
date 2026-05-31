@@ -12,7 +12,10 @@ import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
 import { LcmProviderAuthError } from "./summarize.js";
-import { buildDeterministicFallbackSummary } from "./summary-fallback.js";
+import {
+  buildDeterministicFallbackSummary,
+  FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+} from "./summary-fallback.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -1810,7 +1813,7 @@ export class CompactionEngine {
     const buildDeterministicFallback = (): { content: string; level: CompactionLevel } => {
       const truncationNote = `[Truncated from ${inputTokens} tokens]`;
       const directiveOmissionNote = [
-        "[LCM fallback summary; directive-shaped untrusted content omitted]",
+        FALLBACK_DIRECTIVE_SUMMARY_MARKER,
         truncationNote,
       ].join("\n");
       const content = buildDeterministicFallbackSummary(sourceText, FALLBACK_MAX_TOKENS, {
