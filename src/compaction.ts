@@ -11,7 +11,7 @@ import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/sum
 import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
-import { LcmProviderAuthError } from "./summarize.js";
+import { isLcmDeterministicFallbackSummary, LcmProviderAuthError } from "./summarize.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -44,6 +44,8 @@ export interface CompactionResult {
   level?: CompactionLevel;
   /** Whether compaction was blocked by a provider auth failure */
   authFailure?: boolean;
+  /** Whether compaction was blocked by non-auth provider failure/degraded model fallback */
+  providerFailure?: boolean;
 }
 
 export interface CompactionConfig {
@@ -103,6 +105,7 @@ export interface CompactionConfig {
 }
 
 type CompactionLevel = "normal" | "aggressive" | "fallback" | "capped";
+type CompactionFailure = "auth" | "provider";
 type CompactionPass = "leaf" | "condensed";
 type CompactionSummarizeOptions = {
   previousSummary?: string;
@@ -122,6 +125,10 @@ type PassResult = {
   /** Token count of the newly created summary. */
   addedTokens: number;
 };
+type PassFailure = { failure: CompactionFailure };
+type SummaryEscalationResult =
+  | { content: string; level: CompactionLevel }
+  | PassFailure;
 type LeafChunkSelection = {
   items: ContextItemRecord[];
   rawTokensOutsideTail: number;
@@ -753,13 +760,13 @@ export class CompactionEngine {
       previousSummaryContent,
       input.summaryModel,
     );
-    if (!leafResult) {
+    if (!leafResult || "failure" in leafResult) {
       return {
         actionTaken: false,
         tokensBefore,
         tokensAfter: tokensBefore,
         condensed: false,
-        authFailure: true,
+        ...(leafResult?.failure === "provider" ? { providerFailure: true } : { authFailure: true }),
       };
     }
     // Delta tracking: compute token change from pass results instead of re-querying DB
@@ -798,7 +805,29 @@ export class CompactionEngine {
           summarize,
           input.summaryModel,
         );
-        if (!condenseResult) {
+        if (!condenseResult || "failure" in condenseResult) {
+          if (condenseResult?.failure === "provider") {
+            return {
+              actionTaken: true,
+              tokensBefore,
+              tokensAfter,
+              createdSummaryId,
+              condensed,
+              level,
+              providerFailure: true,
+            };
+          }
+          if (condenseResult?.failure === "auth") {
+            return {
+              actionTaken: true,
+              tokensBefore,
+              tokensAfter,
+              createdSummaryId,
+              condensed,
+              level,
+              authFailure: true,
+            };
+          }
           break;
         }
         const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
@@ -899,6 +928,7 @@ export class CompactionEngine {
     let previousSummaryContent: string | undefined;
     let previousTokens = tokensBefore;
     let hadAuthFailure = false;
+    let hadProviderFailure = false;
     let stoppedForNoProgress = false;
 
     // Sweep bounds: a single full sweep must not run an unbounded number of
@@ -979,8 +1009,12 @@ export class CompactionEngine {
         previousSummaryContent,
         input.summaryModel,
       );
-      if (!leafResult) {
-        hadAuthFailure = true;
+      if (!leafResult || "failure" in leafResult) {
+        if (leafResult?.failure === "provider") {
+          hadProviderFailure = true;
+        } else {
+          hadAuthFailure = true;
+        }
         break;
       }
       const passTokensAfter = passTokensBefore - leafResult.removedTokens + leafResult.addedTokens;
@@ -1022,7 +1056,13 @@ export class CompactionEngine {
       enforcePreferredDepth: boolean;
       useHardFanout: boolean;
     }): Promise<
-      "progress" | "no-candidate" | "depth-cap" | "budget" | "auth-failure" | "no-progress"
+      | "progress"
+      | "no-candidate"
+      | "depth-cap"
+      | "budget"
+      | "auth-failure"
+      | "provider-failure"
+      | "no-progress"
     > => {
       const candidate = await this.selectShallowestCondensationCandidate({
         conversationId,
@@ -1047,7 +1087,11 @@ export class CompactionEngine {
         summarize,
         input.summaryModel,
       );
-      if (!condenseResult) {
+      if (!condenseResult || "failure" in condenseResult) {
+        if (condenseResult?.failure === "provider") {
+          hadProviderFailure = true;
+          return "provider-failure";
+        }
         hadAuthFailure = true;
         return "auth-failure";
       }
@@ -1102,6 +1146,7 @@ export class CompactionEngine {
 
     while (
       !hadAuthFailure &&
+      !hadProviderFailure &&
       !stoppedForNoProgress &&
       !stoppedAtBudget &&
       await hasCondensationPressure()
@@ -1133,6 +1178,7 @@ export class CompactionEngine {
       condensed,
       level,
       ...(hadAuthFailure ? { authFailure: true } : {}),
+      ...(hadProviderFailure ? { providerFailure: true } : {}),
     };
   }
 
@@ -1146,7 +1192,13 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
-  }): Promise<{ success: boolean; rounds: number; finalTokens: number; authFailure?: boolean }> {
+  }): Promise<{
+    success: boolean;
+    rounds: number;
+    finalTokens: number;
+    authFailure?: boolean;
+    providerFailure?: boolean;
+  }> {
     return this.withContextCache(() => this._compactUntilUnderImpl(input));
   }
 
@@ -1157,7 +1209,13 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
-  }): Promise<{ success: boolean; rounds: number; finalTokens: number; authFailure?: boolean }> {
+  }): Promise<{
+    success: boolean;
+    rounds: number;
+    finalTokens: number;
+    authFailure?: boolean;
+    providerFailure?: boolean;
+  }> {
     const { conversationId, tokenBudget, summarize } = input;
     const targetTokens =
       typeof input.targetTokens === "number" &&
@@ -1224,6 +1282,14 @@ export class CompactionEngine {
           rounds: round,
           finalTokens: result.tokensAfter,
           authFailure: true,
+        };
+      }
+      if (result.providerFailure) {
+        return {
+          success: false,
+          rounds: round,
+          finalTokens: result.tokensAfter,
+          providerFailure: true,
         };
       }
 
@@ -1797,7 +1863,7 @@ export class CompactionEngine {
     options?: CompactionSummarizeOptions;
     /** Target token count for this summary kind (leaf or condensed). Used for hard-cap enforcement. */
     targetTokens: number;
-  }): Promise<{ content: string; level: CompactionLevel } | null> {
+  }): Promise<SummaryEscalationResult> {
     const sourceText = typeof params.sourceText === "string" ? params.sourceText.trim() : "";
     if (!sourceText) {
       return {
@@ -1818,10 +1884,11 @@ export class CompactionEngine {
       };
     };
     const authFailure = Symbol("authFailure");
+    const providerFailure = Symbol("providerFailure");
 
     const runSummarizer = async (
       aggressiveMode: boolean,
-    ): Promise<string | null | typeof authFailure> => {
+    ): Promise<string | null | typeof authFailure | typeof providerFailure> => {
       let output: string;
       try {
         output = await params.summarize(sourceText, aggressiveMode, params.options);
@@ -1832,12 +1899,18 @@ export class CompactionEngine {
         throw err;
       }
       const trimmed = output.trim();
+      if (isLcmDeterministicFallbackSummary(trimmed)) {
+        return providerFailure;
+      }
       return trimmed || null;
     };
 
     const initialSummary = await runSummarizer(false);
     if (initialSummary === authFailure) {
-      return null;
+      return { failure: "auth" };
+    }
+    if (initialSummary === providerFailure) {
+      return { failure: "provider" };
     }
     if (initialSummary === null) {
       // Empty provider output should still compact deterministically so a
@@ -1850,7 +1923,10 @@ export class CompactionEngine {
     if (estimateTokens(summaryText) >= inputTokens) {
       const aggressiveSummary = await runSummarizer(true);
       if (aggressiveSummary === authFailure) {
-        return null;
+        return { failure: "auth" };
+      }
+      if (aggressiveSummary === providerFailure) {
+        return { failure: "provider" };
       }
       if (aggressiveSummary === null) {
         return buildDeterministicFallback();
@@ -1977,7 +2053,11 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
     summaryModel?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
+  ): Promise<
+    | { summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number }
+    | PassFailure
+    | null
+  > {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
       [];
@@ -2020,11 +2100,11 @@ export class CompactionEngine {
       },
       targetTokens: this.config.leafTargetTokens,
     });
-    if (!summary) {
+    if ("failure" in summary) {
       this.log.warn(
-        `[lcm] leaf compaction skipped summary write; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
+        `[lcm] leaf compaction skipped summary write after ${summary.failure} failure; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
       );
-      return null;
+      return summary;
     }
 
     // Persist the leaf summary
@@ -2096,7 +2176,7 @@ export class CompactionEngine {
     targetDepth: number,
     summarize: CompactionSummarizeFn,
     summaryModel?: string,
-  ): Promise<PassResult | null> {
+  ): Promise<PassResult | PassFailure | null> {
     // Fetch full summary records
     const summaryRecords: SummaryRecord[] = [];
     for (const item of summaryItems) {
@@ -2138,11 +2218,11 @@ export class CompactionEngine {
       },
       targetTokens: this.config.condensedTargetTokens,
     });
-    if (!condensed) {
+    if ("failure" in condensed) {
       this.log.warn(
-        `[lcm] condensed compaction skipped summary write; conversationId=${conversationId}; depth=${targetDepth}; chunkSummaries=${summaryRecords.length}`,
+        `[lcm] condensed compaction skipped summary write after ${condensed.failure} failure; conversationId=${conversationId}; depth=${targetDepth}; chunkSummaries=${summaryRecords.length}`,
       );
-      return null;
+      return condensed;
     }
 
     // Persist the condensed summary

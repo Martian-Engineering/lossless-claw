@@ -4579,7 +4579,7 @@ export class LcmContextEngine implements ContextEngine {
 
       if (sweepResult.authFailure && breakerKey) {
         this.recordCompactionAuthFailure(breakerKey);
-      } else if (sweepResult.actionTaken && breakerKey) {
+      } else if (sweepResult.actionTaken && !sweepResult.providerFailure && breakerKey) {
         this.recordCompactionSuccess(breakerKey);
       }
       if (sweepResult.actionTaken) {
@@ -4605,11 +4605,16 @@ export class LcmContextEngine implements ContextEngine {
         isThresholdSweep && sweepResult.actionTaken && !isUnderTargetAfterSweep;
       const sweepOk =
         !sweepResult.authFailure &&
+        !sweepResult.providerFailure &&
         (isUnderTargetAfterSweep || (sweepResult.actionTaken && !isThresholdSweep));
       const sweepReason = sweepResult.authFailure
         ? (sweepResult.actionTaken
             ? "provider auth failure after partial compaction"
             : "provider auth failure")
+        : sweepResult.providerFailure
+          ? (sweepResult.actionTaken
+              ? "provider failure after partial compaction"
+              : "provider failure")
         : thresholdSweepStillOverTarget
           ? "compacted but still over target"
         : sweepResult.actionTaken
@@ -4619,7 +4624,10 @@ export class LcmContextEngine implements ContextEngine {
             : manualCompactionRequested
               ? "nothing to compact"
               : "live context still exceeds target";
-      if (thresholdSweepStillOverTarget && !sweepResult.authFailure) {
+      if (
+        (thresholdSweepStillOverTarget && !sweepResult.authFailure) ||
+        sweepResult.providerFailure
+      ) {
         this.openSummarySpendBackoff({
           scopeKey: summarySpendScopeKey,
           reason: sweepReason,
@@ -4699,7 +4707,7 @@ export class LcmContextEngine implements ContextEngine {
 
     if (compactResult.authFailure && breakerKey) {
       this.recordCompactionAuthFailure(breakerKey);
-    } else if (compactResult.rounds > 0 && breakerKey) {
+    } else if (compactResult.rounds > 0 && !compactResult.providerFailure && breakerKey) {
       this.recordCompactionSuccess(breakerKey);
     }
 
@@ -4712,6 +4720,10 @@ export class LcmContextEngine implements ContextEngine {
       ? (didCompact
           ? "provider auth failure after partial compaction"
           : "provider auth failure")
+      : compactResult.providerFailure
+        ? (didCompact
+            ? "provider failure after partial compaction"
+            : "provider failure")
       : compactResult.success
         ? didCompact
           ? "compacted"
@@ -10525,6 +10537,12 @@ export class LcmContextEngine implements ContextEngine {
           return {
             kind: "unavailable",
             reason: "Lossless Claw could not summarize raw context before rotate because the summary provider rejected authentication.",
+          };
+        }
+        if (result.providerFailure) {
+          return {
+            kind: "unavailable",
+            reason: "Lossless Claw could not summarize raw context before rotate because the summary provider failed.",
           };
         }
         if (leafPasses > 0) {

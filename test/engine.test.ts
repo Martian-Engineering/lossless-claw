@@ -15222,6 +15222,49 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(compactUntilUnderSpy).not.toHaveBeenCalled();
   });
 
+  it("keeps threshold debt failed when the sweep reports provider fallback failure", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 380,
+      threshold: 300,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: false,
+      tokensBefore: 380,
+      tokensAfter: 380,
+      condensed: false,
+      providerFailure: true,
+    });
+    const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
+
+    await engine.ingest({
+      sessionId: "threshold-provider-failure-session",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "threshold-provider-failure-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 400,
+      compactionTarget: "threshold",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toBe("provider failure");
+    expect(compactUntilUnderSpy).not.toHaveBeenCalled();
+  });
+
   it("passes currentTokenCount through to compaction evaluation and loop", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {

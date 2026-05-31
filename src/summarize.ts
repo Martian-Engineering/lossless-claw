@@ -1275,6 +1275,10 @@ function buildDeterministicFallbackSummary(text: string, targetTokens: number): 
   return `${summaryText}\n${fallbackNote}`;
 }
 
+export function isLcmDeterministicFallbackSummary(text: string): boolean {
+  return text.includes("[LCM fallback summary;");
+}
+
 /** Normalize model refs from string or `{ primary }` config shapes. */
 function readModelRef(value: unknown): string {
   if (typeof value === "string") {

@@ -1957,6 +1957,78 @@ describe("LCM integration: compaction", () => {
     expect(condensedSummaries).toHaveLength(0);
   });
 
+  it("compactLeaf preserves its leaf result when a follow-on condensed pass hits model-backed fallback", async () => {
+    const leafEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafMinFanout: 2,
+      condensedMinFanout: 2,
+      leafChunkTokens: 500,
+      condensedTargetTokens: 10,
+      incrementalMaxDepth: 1,
+    });
+
+    await convStore.createConversation({ sessionId: "incremental-depth-provider-failure" });
+
+    await sumStore.insertSummary({
+      summaryId: "sum_provider_failure_leaf_a",
+      conversationId: CONV_ID,
+      kind: "leaf",
+      depth: 0,
+      content: "Depth zero leaf A",
+      tokenCount: 60,
+    });
+    await sumStore.insertSummary({
+      summaryId: "sum_provider_failure_leaf_b",
+      conversationId: CONV_ID,
+      kind: "leaf",
+      depth: 0,
+      content: "Depth zero leaf B",
+      tokenCount: 60,
+    });
+    await sumStore.appendContextSummary(CONV_ID, "sum_provider_failure_leaf_a");
+    await sumStore.appendContextSummary(CONV_ID, "sum_provider_failure_leaf_b");
+
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => `Leaf source turn ${i}: ${"q".repeat(160)}`,
+      tokenCountFn: () => 120,
+    });
+
+    const summarize = vi.fn(
+      async (
+        _text: string,
+        _aggressive?: boolean,
+        options?: { isCondensed?: boolean; depth?: number },
+      ) => {
+        return options?.isCondensed
+          ? "[LCM fallback summary; truncated for context management]"
+          : "Leaf summary";
+      },
+    );
+
+    const result = await leafEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 1_200,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.providerFailure).toBe(true);
+    expect(result.condensed).toBe(false);
+    expect(result.level).toBe("normal");
+    expect(result.createdSummaryId).toBeDefined();
+    expect(Number.isNaN(result.tokensAfter)).toBe(false);
+
+    const condensedSummaries = sumStore._summaries.filter(
+      (summary) => summary.kind === "condensed",
+    );
+    expect(condensedSummaries).toHaveLength(0);
+    expect(
+      summarize.mock.calls.some((call) => call[2]?.isCondensed === true),
+    ).toBe(true);
+  });
+
   it("compactLeaf cascades to depth two when incrementalMaxDepth is two", async () => {
     const leafEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
@@ -3107,6 +3179,107 @@ describe("LCM integration: compaction", () => {
     expect(result.actionTaken).toBe(false);
     expect(result.level).toBeUndefined();
     expect(sumStore._summaries.find((s) => s.kind === "leaf")).toBeUndefined();
+  });
+
+  it("skips summary persistence when the model-backed summarizer exhausts providers into deterministic fallback", async () => {
+    await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) => `Content ${i}: ${"e".repeat(200)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const deps = makeSummarizeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "openai-codex",
+        model: "gpt-5.4",
+      })),
+      complete: vi.fn(async () => {
+        throw new Error("ChatGPT prolite plan, try again in 61 min");
+      }),
+    });
+    const summarizeResult = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "openai-codex",
+        model: "gpt-5.4",
+      },
+    });
+
+    const result = await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize: summarizeResult!.fn,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(false);
+    expect((result as { providerFailure?: boolean }).providerFailure).toBe(true);
+    expect(result.level).toBeUndefined();
+    expect(sumStore._summaries.find((s) => s.kind === "leaf")).toBeUndefined();
+
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    expect(contextItems.filter((item) => item.itemType === "summary")).toHaveLength(0);
+    expect(contextItems.filter((item) => item.itemType === "message")).toHaveLength(8);
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips condensed summary persistence when a model-backed summarizer falls back deterministically", async () => {
+    const sourceSummaries: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      await sumStore.insertSummary({
+        summaryId: `source_leaf_${i}`,
+        conversationId: CONV_ID,
+        kind: "leaf",
+        depth: 0,
+        content: `Leaf ${i}: ${"already summarized content ".repeat(80)}`,
+        tokenCount: 500,
+        descendantCount: 0,
+        descendantTokenCount: 0,
+        sourceMessageTokenCount: 500,
+      });
+      sourceSummaries.push(`source_leaf_${i}`);
+    }
+    for (const summaryId of sourceSummaries) {
+      await sumStore.appendContextSummary(CONV_ID, summaryId);
+    }
+
+    const deps = makeSummarizeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "openai-codex",
+        model: "gpt-5.4",
+      })),
+      complete: vi.fn(async () => {
+        throw new Error("ChatGPT prolite plan, try again in 61 min");
+      }),
+    });
+    const summarizeResult = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "openai-codex",
+        model: "gpt-5.4",
+      },
+    });
+    const pressureEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      contextThreshold: 0.1,
+      summaryPrefixTargetTokens: 100,
+      sweepMaxDepth: 1,
+    });
+
+    const result = await pressureEngine.compactFullSweep({
+      conversationId: CONV_ID,
+      tokenBudget: 1_000,
+      summarize: summarizeResult!.fn,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(false);
+    expect(result.providerFailure).toBe(true);
+    expect(result.condensed).toBe(false);
+    expect(sumStore._summaries.filter((summary) => summary.kind === "condensed")).toHaveLength(0);
+
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    expect(contextItems.filter((item) => item.itemType === "summary")).toHaveLength(4);
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
   });
 
   it("compactUntilUnder loops until under budget", async () => {
