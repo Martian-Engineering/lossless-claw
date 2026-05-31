@@ -1346,29 +1346,26 @@ function resolveSummaryCandidates(params: {
   };
   const nestedPluginConfig =
     runtimeConfig?.plugins?.entries?.["lossless-claw"]?.config ?? directPluginConfig;
+  const envSummaryProvider = process.env.LCM_SUMMARY_PROVIDER?.trim() ?? "";
+  const pluginSummaryProvider =
+    typeof nestedPluginConfig?.summaryProvider === "string"
+      ? nestedPluginConfig.summaryProvider.trim()
+      : "";
 
   const resolutionCandidates: SummaryResolutionCandidate[] = [
     {
       levelName: "environment variables",
       modelRef: process.env.LCM_SUMMARY_MODEL?.trim() ?? "",
-      providerHint:
-        process.env.LCM_SUMMARY_PROVIDER?.trim() ||
-        (providerHint || undefined),
-      hasExplicitProvider: Boolean(process.env.LCM_SUMMARY_PROVIDER?.trim()),
+      providerHint: envSummaryProvider || pluginSummaryProvider || (providerHint || undefined),
+      hasExplicitProvider: Boolean(envSummaryProvider || pluginSummaryProvider),
       runtimeModelOverrideField: "LCM_SUMMARY_MODEL",
       runtimeModelOverrideConfigPath: "LCM_SUMMARY_MODEL",
     },
     {
       levelName: "plugin config (lossless-claw)",
       modelRef: readModelRef(nestedPluginConfig?.summaryModel),
-      providerHint:
-        (typeof nestedPluginConfig?.summaryProvider === "string"
-          ? nestedPluginConfig.summaryProvider.trim()
-          : "") || (providerHint || undefined),
-      hasExplicitProvider: Boolean(
-        typeof nestedPluginConfig?.summaryProvider === "string" &&
-          nestedPluginConfig.summaryProvider.trim(),
-      ),
+      providerHint: pluginSummaryProvider || (providerHint || undefined),
+      hasExplicitProvider: Boolean(pluginSummaryProvider),
       runtimeModelOverrideField: "summaryModel",
       runtimeModelOverrideConfigPath: "plugins.entries.lossless-claw.config.summaryModel",
     },

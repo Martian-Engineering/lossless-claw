@@ -365,6 +365,39 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(vi.mocked(deps.log.warn)).toHaveBeenCalledWith(expect.stringContaining("gpt-4o-mini"));
   });
 
+  it("env summaryModel without summaryProvider inherits plugin summaryProvider before the legacy provider hint", async () => {
+    vi.stubEnv("LCM_SUMMARY_MODEL", "gpt-5.4-mini");
+    const deps = makeDeps();
+
+    await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {
+        provider: "openrouter",
+        model: "openrouter/z-ai/glm-5.1",
+        config: {
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                config: {
+                  summaryProvider: "openai-codex",
+                  summaryModel: "gpt-5.4-mini",
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    expect(vi.mocked(deps.resolveModel).mock.calls[0]).toEqual([
+      "gpt-5.4-mini",
+      "openai-codex",
+    ]);
+    expect(vi.mocked(deps.log.warn)).not.toHaveBeenCalledWith(
+      expect.stringContaining("gpt-5.4-mini"),
+    );
+  });
+
   it("falls back to legacy providerHint when no summary overrides exist", async () => {
     const deps = makeDeps();
 
