@@ -859,6 +859,14 @@ async function buildStatusText(params: {
           "observed token count",
           maintenance?.currentTokenCount != null ? formatNumber(maintenance.currentTokenCount) : "unknown",
         ),
+        buildStatLine(
+          "projected token count",
+          maintenance?.projectedTokenCount != null ? formatNumber(maintenance.projectedTokenCount) : "unknown",
+        ),
+        buildStatLine(
+          "raw tokens outside tail",
+          maintenance?.rawTokensOutsideTail != null ? formatNumber(maintenance.rawTokensOutsideTail) : "unknown",
+        ),
         buildStatLine("last api call", formatMaintenanceTime(telemetry?.lastApiCallAt ?? null)),
         buildStatLine("last cache touch", formatMaintenanceTime(telemetry?.lastCacheTouchAt ?? null)),
         buildStatLine("cache retention", telemetry?.retention ?? "unknown"),

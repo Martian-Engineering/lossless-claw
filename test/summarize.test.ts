@@ -713,6 +713,159 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(summary).not.toContain("Reasoning summary line.");
   });
 
+  it("uses chat-completion message content instead of vLLM reasoning fields", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "vllm",
+        model: "qwen3.5-122b",
+      })),
+      complete: vi.fn(async () => ({
+        content: [],
+        id: "chatcmpl_reasoning",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "User asked for weather; assistant answered sunny and 25C.",
+              reasoning: "Thinking Process: summarize the weather exchange verbatim.",
+              reasoning_content: "PRIVATE_QWEN_REASONING",
+            },
+            finish_reason: "stop",
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "vllm",
+        model: "qwen3.5-122b",
+      },
+    });
+
+    const summary = await summarize!("Weather conversation segment", false);
+
+    expect(summary).toBe("User asked for weather; assistant answered sunny and 25C.");
+    expect(summary).not.toContain("Thinking Process");
+    expect(summary).not.toContain("PRIVATE_QWEN_REASONING");
+    expect(getDepsLogText(deps)).toContain("source=envelope");
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses streaming delta content without reasoning_content", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "vllm",
+        model: "qwen3.5-122b",
+      })),
+      complete: vi.fn(async () => ({
+        content: [],
+        choices: [
+          {
+            delta: {
+              content: "Final streamed summary.",
+              reasoning_content: "PRIVATE_STREAM_REASONING",
+            },
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "vllm",
+        model: "qwen3.5-122b",
+      },
+    });
+
+    const summary = await summarize!("Streaming segment", false);
+
+    expect(summary).toBe("Final streamed summary.");
+    expect(summary).not.toContain("PRIVATE_STREAM_REASONING");
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries chat-completion summaries truncated by finish_reason length", async () => {
+    let callCount = 0;
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "vllm",
+        model: "qwen3.5-122b",
+      })),
+      complete: vi.fn(async () => {
+        callCount += 1;
+        if (callCount === 1) {
+          return {
+            content: [],
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: "Partial visible summary",
+                },
+                finish_reason: "length",
+              },
+            ],
+          };
+        }
+        return {
+          content: [{ type: "text", text: "Recovered complete summary." }],
+        };
+      }),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "vllm",
+        model: "qwen3.5-122b",
+      },
+    });
+
+    const summary = await summarize!("Long segment", false);
+
+    expect(summary).toBe("Recovered complete summary.");
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(deps.complete).mock.calls[1]?.[0]?.reasoning).toBe("low");
+
+    const diagnostics = getDepsLogText(deps);
+    expect(diagnostics).toContain("incomplete summary response on first attempt");
+    expect(diagnostics).toContain("response.choices[0].finish=length");
+  });
+
+  it("does not persist untyped provider error strings as summaries", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "vllm",
+        model: "qwen3.5-122b",
+      })),
+      complete: vi.fn(async () => ({
+        content: [],
+        message: "upstream timeout while acquiring provider connection",
+        response: "provider overloaded",
+        error: { code: "provider_timeout" },
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "vllm",
+        model: "qwen3.5-122b",
+      },
+    });
+
+    const summary = await summarize!("I".repeat(8_000), false);
+
+    expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(summary).not.toContain("upstream timeout");
+    expect(summary).not.toContain("provider overloaded");
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+  });
+
   it("logs provider/model/block diagnostics when normalized summary is empty", async () => {
     const deps = makeDeps({
       resolveModel: vi.fn(() => ({
@@ -740,6 +893,45 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(diagnostics).toContain("model=gpt-5.3-codex");
     expect(diagnostics).toContain("block_types=reasoning");
     expect(diagnostics).toContain("content_preview=");
+  });
+
+  it("redacts typed reasoning blocks from diagnostic previews", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "vllm",
+        model: "qwen3.5-122b",
+      })),
+      complete: vi.fn(async () => ({
+        content: [
+          {
+            type: "reasoning",
+            summary: [
+              {
+                type: "summary_text",
+                text: "PRIVATE_TYPED_REASONING_TRACE",
+              },
+            ],
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "vllm",
+        model: "qwen3.5-122b",
+      },
+    });
+
+    const summary = await summarize!("H".repeat(8_000), false);
+
+    expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+
+    const diagnostics = getDepsLogText(deps);
+    expect(diagnostics).toContain("block_types=reasoning");
+    expect(diagnostics).toContain("content_preview=");
+    expect(diagnostics).not.toContain("PRIVATE_TYPED_REASONING_TRACE");
   });
 
   it("does not treat thinking-only completions as summary content", async () => {
@@ -1641,6 +1833,44 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(diagnostics).toContain("error_preview=");
     });
 
+    it("redacts reasoning fields from provider error warning details", async () => {
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "vllm",
+          model: "qwen3.5-122b",
+        })),
+        complete: vi.fn(async () => ({
+          content: [],
+          stopReason: "error",
+          error: {
+            kind: "provider_error",
+            message: "provider failed before returning a summary",
+            reasoning_content: "PRIVATE_ERROR_REASONING",
+            details: [
+              {
+                type: "reasoning",
+                summary: [{ text: "PRIVATE_TYPED_ERROR_REASONING" }],
+              },
+            ],
+          },
+        })),
+      });
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: { provider: "vllm", model: "qwen3.5-122b" },
+      });
+
+      const summary = await summarize!("J".repeat(8_000), false);
+
+      expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+
+      const diagnostics = getDepsLogText(deps);
+      expect(diagnostics).toContain("provider failed before returning a summary");
+      expect(diagnostics).not.toContain("PRIVATE_ERROR_REASONING");
+      expect(diagnostics).not.toContain("PRIVATE_TYPED_ERROR_REASONING");
+    });
+
     it("redacts sensitive keys from diagnostic content previews", async () => {
       const deps = makeDeps({
         resolveModel: vi.fn(() => ({
@@ -1652,6 +1882,8 @@ describe("createLcmSummarizeFromLegacyParams", () => {
             {
               type: "tool_use",
               name: "http",
+              reasoning: "PRIVATE_DIAGNOSTIC_REASONING",
+              reasoning_content: "PRIVATE_DIAGNOSTIC_REASONING_CONTENT",
               input: { authorization: "Bearer super-secret-token", body: "x".repeat(1500) },
             },
           ],
@@ -1669,6 +1901,8 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(diagnostics).toContain("content_preview=");
       expect(diagnostics).toContain('"authorization":"[redacted]"');
       expect(diagnostics).not.toContain("super-secret-token");
+      expect(diagnostics).not.toContain("PRIVATE_DIAGNOSTIC_REASONING");
+      expect(diagnostics).not.toContain("PRIVATE_DIAGNOSTIC_REASONING_CONTENT");
       expect(diagnostics).toContain("[truncated:");
     });
 

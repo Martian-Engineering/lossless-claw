@@ -13,6 +13,8 @@ export type ConversationCompactionMaintenanceRecord = {
   lastFailureSummary: string | null;
   tokenBudget: number | null;
   currentTokenCount: number | null;
+  projectedTokenCount: number | null;
+  rawTokensOutsideTail: number | null;
   updatedAt: Date;
 };
 
@@ -27,6 +29,8 @@ type ConversationCompactionMaintenanceRow = {
   last_failure_summary: string | null;
   token_budget: number | null;
   current_token_count: number | null;
+  projected_token_count: number | null;
+  raw_tokens_outside_tail: number | null;
   updated_at: string;
 };
 
@@ -44,6 +48,8 @@ function toMaintenanceRecord(
     lastFailureSummary: row.last_failure_summary,
     tokenBudget: row.token_budget,
     currentTokenCount: row.current_token_count,
+    projectedTokenCount: row.projected_token_count,
+    rawTokensOutsideTail: row.raw_tokens_outside_tail,
     updatedAt: parseUtcTimestampOrNull(row.updated_at) ?? new Date(0),
   };
 }
@@ -70,6 +76,14 @@ function mergeMaintenanceRecord(
     tokenBudget: patch.tokenBudget !== undefined ? patch.tokenBudget : existing?.tokenBudget ?? null,
     currentTokenCount:
       patch.currentTokenCount !== undefined ? patch.currentTokenCount : existing?.currentTokenCount ?? null,
+    projectedTokenCount:
+      patch.projectedTokenCount !== undefined
+        ? patch.projectedTokenCount
+        : existing?.projectedTokenCount ?? null,
+    rawTokensOutsideTail:
+      patch.rawTokensOutsideTail !== undefined
+        ? patch.rawTokensOutsideTail
+        : existing?.rawTokensOutsideTail ?? null,
     updatedAt: new Date(),
   };
 }
@@ -106,6 +120,8 @@ export class CompactionMaintenanceStore {
            last_failure_summary,
            token_budget,
            current_token_count,
+           projected_token_count,
+           raw_tokens_outside_tail,
            updated_at
          FROM conversation_compaction_maintenance
          WHERE conversation_id = ?`,
@@ -130,8 +146,10 @@ export class CompactionMaintenanceStore {
          last_failure_summary,
          token_budget,
          current_token_count,
+         projected_token_count,
+         raw_tokens_outside_tail,
          updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(conversation_id) DO UPDATE SET
            pending = excluded.pending,
            requested_at = excluded.requested_at,
@@ -142,6 +160,8 @@ export class CompactionMaintenanceStore {
            last_failure_summary = excluded.last_failure_summary,
            token_budget = excluded.token_budget,
            current_token_count = excluded.current_token_count,
+           projected_token_count = excluded.projected_token_count,
+           raw_tokens_outside_tail = excluded.raw_tokens_outside_tail,
            updated_at = datetime('now')`,
       )
       .run(
@@ -155,6 +175,8 @@ export class CompactionMaintenanceStore {
         record.lastFailureSummary ?? null,
         record.tokenBudget ?? null,
         record.currentTokenCount ?? null,
+        record.projectedTokenCount ?? null,
+        record.rawTokensOutsideTail ?? null,
       );
   }
 
@@ -165,6 +187,8 @@ export class CompactionMaintenanceStore {
     requestedAt?: Date;
     tokenBudget?: number | null;
     currentTokenCount?: number | null;
+    projectedTokenCount?: number | null;
+    rawTokensOutsideTail?: number | null;
   }): Promise<void> {
     const existing = await this.getConversationCompactionMaintenance(input.conversationId);
     await this.saveConversationCompactionMaintenance(
@@ -175,6 +199,8 @@ export class CompactionMaintenanceStore {
         running: false,
         tokenBudget: input.tokenBudget ?? existing?.tokenBudget ?? null,
         currentTokenCount: input.currentTokenCount ?? existing?.currentTokenCount ?? null,
+        projectedTokenCount: input.projectedTokenCount ?? existing?.projectedTokenCount ?? null,
+        rawTokensOutsideTail: input.rawTokensOutsideTail ?? existing?.rawTokensOutsideTail ?? null,
       }),
     );
   }
