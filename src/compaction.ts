@@ -73,6 +73,8 @@ export interface CompactionConfig {
   timezone?: string;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
+  /** Injected context XML tags to strip before compaction summarization. */
+  stripInjectedContextTags?: string[];
 }
 
 type CompactionLevel = "normal" | "aggressive" | "fallback" | "capped";
