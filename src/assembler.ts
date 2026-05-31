@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ContextEngine } from "./openclaw-bridge.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
@@ -203,6 +205,12 @@ export interface AssembleContextInput {
    * Default: false (full v4.1 behavior).
    */
   stubLargeToolPayloads?: boolean;
+  /**
+   * Absolute path to the directory where large files (including externalized
+   * images) are stored. Required for image re-hydration. Matches the
+   * `largeFilesDir` plugin config value passed from the engine.
+   */
+  largeFilesDir?: string;
 }
 
 export interface AssembleContextResult {
@@ -1321,6 +1329,126 @@ function hasSearchablePrompt(prompt?: string): prompt is string {
   return typeof prompt === "string" && tokenizeText(prompt).length > 0;
 }
 
+
+// ── Image re-hydration ────────────────────────────────────────────────────────
+
+/**
+ * Regex matching LCM image placeholder text produced by large-files.ts
+ * during externalization. Two capture groups:
+ *   [1] MIME type  (e.g. "image/jpeg")
+ *   [2] LCM file ID (e.g. "file_abc123def456")
+ *
+ * Matches all role prefixes produced by the externalizer:
+ *   [User image: name.jpg (image/jpeg, 12345 bytes) | LCM file: file_xxx]
+ *   [System image: ...], [Tool image: ...], [Assistant image: ...], [Image: ...]
+ */
+const LCM_IMAGE_PLACEHOLDER_RE =
+  /\[(?:(?:User|System|Tool|Assistant) image|Image): [^(]+ \(([^,]+), [\d,]+ bytes\) \| LCM file: (file_[a-f0-9]{16})\]/g;
+
+/**
+ * Normalizes uncommon MIME subtypes to the file extension used on disk.
+ * `large-files.ts` stores files using this same mapping, so lookups must match.
+ */
+const MIME_SUBTYPE_TO_EXT: Record<string, string> = {
+  "svg+xml": "svg",
+  "x-icon": "ico",
+  "vnd.microsoft.icon": "ico",
+  jpeg: "jpg",
+};
+
+/**
+ * Re-hydrates externalized image placeholders in assembled messages.
+ *
+ * When lossless-claw externalizes a large image it replaces the image block
+ * with a text placeholder like:
+ *   `[User image: photo.jpg (image/jpeg, 45678 bytes) | LCM file: file_abc123]`
+ *
+ * This function scans every assembled message for those placeholders, reads
+ * the corresponding file from `largeFilesDir/<conversationId>/file_xxx.ext`,
+ * base64-encodes it, and injects a native `{type: "image", source: {...}}`
+ * block so the model receives the actual image data.
+ *
+ * Files that cannot be found or read are silently skipped — the placeholder
+ * text is left in place so the model at least knows an image was present.
+ *
+ * @param messages       - Assembled messages after sanitizeToolUseResultPairing.
+ * @param largeFilesDir  - Absolute path to the lcm-files directory.
+ * @param conversationId - Conversation ID used as the subdirectory name.
+ */
+function rehydrateExternalizedImages(
+  messages: AgentMessage[],
+  largeFilesDir: string | undefined,
+  conversationId: number,
+): AgentMessage[] {
+  if (!largeFilesDir) return messages;
+
+  const convDir = join(largeFilesDir, String(conversationId));
+
+  type ImageBlock = { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+
+  function extractImageBlocks(text: string): { remaining: string; blocks: ImageBlock[] } {
+    const blocks: ImageBlock[] = [];
+    let remaining = text;
+    const re = new RegExp(LCM_IMAGE_PLACEHOLDER_RE.source, "g");
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const mimeType = m[1];
+      const fileId = m[2];
+      const mimeSubtype = mimeType.split("/")[1] ?? "jpg";
+      const ext = MIME_SUBTYPE_TO_EXT[mimeSubtype] ?? mimeSubtype;
+      const filePath = join(convDir, `${fileId}.${ext}`);
+      try {
+        if (existsSync(filePath)) {
+          const data = readFileSync(filePath).toString("base64");
+          remaining = remaining.replace(m[0], "").trim();
+          blocks.push({ type: "image", source: { type: "base64", media_type: mimeType, data } });
+        }
+      } catch {
+        // File unreadable — leave placeholder in place.
+      }
+    }
+    return { remaining, blocks };
+  }
+
+  function rehydrateMessage(msg: AgentMessage): AgentMessage {
+    if (!msg || typeof msg !== "object" || !("content" in msg)) return msg;
+
+    if (typeof msg.content === "string") {
+      const { remaining, blocks } = extractImageBlocks(msg.content);
+      if (blocks.length === 0) return msg;
+      const parts: unknown[] = [];
+      if (remaining) parts.push({ type: "text", text: remaining });
+      parts.push(...blocks);
+      return { ...msg, content: parts } as AgentMessage;
+    }
+
+    if (Array.isArray(msg.content)) {
+      let changed = false;
+      const newContent: unknown[] = [];
+      for (const block of msg.content) {
+        const b = block as Record<string, unknown>;
+        if (b && b["type"] === "text" && typeof b["text"] === "string") {
+          const { remaining, blocks } = extractImageBlocks(b["text"] as string);
+          if (blocks.length === 0) {
+            newContent.push(block);
+          } else {
+            changed = true;
+            if (remaining) newContent.push({ type: "text", text: remaining });
+            newContent.push(...blocks);
+          }
+        } else {
+          newContent.push(block);
+        }
+      }
+      return changed ? ({ ...msg, content: newContent } as AgentMessage) : msg;
+    }
+
+    return msg;
+  }
+
+  return messages.map(rehydrateMessage);
+}
+
 // ── ContextAssembler ─────────────────────────────────────────────────────────
 
 export class ContextAssembler {
@@ -1555,8 +1683,9 @@ export class ContextAssembler {
       .filter((entry) => entry.segment === "freshTail")
       .map((entry) => entry.message);
     const repaired = sanitizeToolUseResultPairing(cleaned) as AgentMessage[];
+    const rehydrated = rehydrateExternalizedImages(repaired, input.largeFilesDir, input.conversationId);
     return {
-      messages: repaired,
+      messages: rehydrated,
       estimatedTokens,
       stats: {
         rawMessageCount,
@@ -1587,7 +1716,7 @@ export class ContextAssembler {
           preSanitizeFreshTailMessages,
         ),
         preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
-        finalMessagesHash: hashMessages(repaired),
+        finalMessagesHash: hashMessages(rehydrated),
         overflowDiagnostics,
         stubStats,
       },
@@ -1595,6 +1724,7 @@ export class ContextAssembler {
   }
 
   // ── Private helpers ──────────────────────────────────────────────────────
+
 
   private isSummaryCoveredByFocus(item: ResolvedItem, brief: FocusBriefRecord): boolean {
     if (!item.summary) {
