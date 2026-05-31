@@ -6553,7 +6553,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     });
     await engine.ingest({
       sessionId,
-      message: { role: "assistant", content: "ok" } as AgentMessage,
+      message: { role: "assistant", content: "ok" } as unknown as AgentMessage,
     });
 
     const conversation = await engine.getConversationStore().getConversationForSession({ sessionId });
@@ -6586,8 +6586,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
       createdAt: message.createdAt,
       rank: 0,
     }));
-    vi.spyOn(engine.getConversationStore(), "searchMessages").mockImplementation(async (input) =>
-      rankedMatches.slice(0, input.limit ?? rankedMatches.length),
+    const searchSpy = vi.spyOn(engine.getConversationStore(), "searchMessages").mockImplementation(async (input) =>
+      rankedMatches.slice(0, input.limit ?? 0),
     );
 
     const result = await engine.assemble({
@@ -6605,6 +6605,12 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(recallCue).toContain("STARVED_FACT is blue-lantern-42");
     expect(recallCue).not.toContain("API_KEY");
     expect(recallCue).not.toContain("redacted-test-value");
+    expect(searchSpy).toHaveBeenCalledWith(expect.objectContaining({
+      limit: 32,
+      mode: "full_text",
+      query: "STARVED_FACT",
+      sort: "recency",
+    }));
   });
 
   it("recalls multiple requested identifiers from the same historical message", async () => {
