@@ -392,6 +392,47 @@ describe("blockFromPart", () => {
     expect(block.id).toBe("rs_abc123");
   });
 
+  it("strips foreign thinkingSignature from DB-sourced thinking blocks", () => {
+    const part = makePart({
+      partType: "reasoning",
+      textContent: "provider-specific thinking text",
+      metadata: JSON.stringify({
+        raw: {
+          type: "thinking",
+          thinking: "provider-specific thinking text",
+          thinkingSignature: "dashscope-signature-for-a-different-provider",
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block).toEqual({
+      type: "thinking",
+      thinking: "provider-specific thinking text",
+    });
+    expect(block).not.toHaveProperty("thinkingSignature");
+  });
+
+  it("strips foreign thinkingSignature when only rawType identifies the thinking block", () => {
+    const part = makePart({
+      partType: "reasoning",
+      textContent: "legacy thinking text",
+      metadata: JSON.stringify({
+        rawType: "thinking",
+        raw: {
+          thinking: "legacy thinking text",
+          thinkingSignature: "legacy-provider-signature",
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block).toEqual({
+      thinking: "legacy thinking text",
+    });
+    expect(block).not.toHaveProperty("thinkingSignature");
+  });
+
   it("routes tool result parts correctly", () => {
     const part = makePart({
       partType: "tool",

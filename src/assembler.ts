@@ -500,7 +500,17 @@ export function blockFromPart(part: MessagePartRecord): unknown {
     // arguments (stringify if object) and format for the target provider.
     // Returning raw here causes arguments to be passed as a JS object instead
     // of a JSON string, which breaks xAI/OpenAI Chat Completions API (422).
-    const rawType = (metadata.raw as Record<string, unknown>).type as string | undefined;
+    const rawRecord = metadata.raw as Record<string, unknown>;
+    const rawType =
+      typeof rawRecord.type === "string" ? rawRecord.type : metadata.rawType;
+    if (
+      rawType === "thinking" &&
+      typeof rawRecord.thinkingSignature === "string"
+    ) {
+      const { thinkingSignature: _thinkingSignature, ...cleaned } = rawRecord;
+      return cleaned;
+    }
+
     const isToolBlock =
       rawType === "toolCall" ||
       rawType === "tool_use" ||
@@ -520,7 +530,6 @@ export function blockFromPart(part: MessagePartRecord): unknown {
     // from the DB columns.  For rows stored as part_type='text' those columns are
     // often NULL — the values only live inside metadata.raw.  Backfill them here
     // so the reconstructed block keeps the original id/name.
-    const rawRecord = metadata.raw as Record<string, unknown>;
     const rawToolCallId =
       typeof rawRecord.id === "string" && rawRecord.id.length > 0
         ? rawRecord.id
