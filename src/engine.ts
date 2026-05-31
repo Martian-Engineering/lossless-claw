@@ -71,7 +71,6 @@ import { buildMessageIdentityHash } from "./store/message-identity.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import {
-  buildDeterministicFallbackSummary,
   createLcmSummarizeFromLegacyParams,
   extractProviderAuthFailure,
   FALLBACK_SUMMARY_MARKER,
@@ -81,6 +80,7 @@ import {
 } from "./summarize.js";
 import type { CompleteFn, LcmDependencies, StartupSessionFileCandidate } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import { buildDeterministicFallbackSummary } from "./summary-fallback.js";
 import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
 import {
   DatabaseTransactionTimeoutError,
