@@ -1089,6 +1089,9 @@ export function createLcmExpandQueryTool(input: {
           sessionKey: input.sessionKey,
           params: p,
         });
+        if (conversationScope.error) {
+          return jsonResult({ error: conversationScope.error });
+        }
         const familyScopedConversationId =
           (conversationScope.conversationIds?.length ?? 0) > 1
             ? undefined

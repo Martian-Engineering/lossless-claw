@@ -362,6 +362,59 @@ describe("createLcmExpandTool expansion limits", () => {
     expect(mockRetrieval.expand).not.toHaveBeenCalled();
   });
 
+  it("fails closed for delegated explicit expansion with multiple allowed conversations", async () => {
+    const mockRetrieval = makeMockRetrieval();
+
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: "agent:main:subagent:multi-conversation",
+      issuerSessionId: "main",
+      allowedConversationIds: [7, 11],
+      tokenCap: 120,
+    });
+
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:multi-conversation",
+    });
+    const result = await tool.execute("call-multi-conversation", {
+      summaryIds: ["sum_a", "sum_b"],
+      allConversations: true,
+    });
+
+    expect(result.details).toMatchObject({
+      error: expect.stringContaining("requires a single delegated conversation scope"),
+    });
+    expect(mockRetrieval.expand).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for delegated query expansion with multiple allowed conversations", async () => {
+    const mockRetrieval = makeMockRetrieval();
+
+    createDelegatedExpansionGrant({
+      delegatedSessionKey: "agent:main:subagent:multi-query",
+      issuerSessionId: "main",
+      allowedConversationIds: [7, 11],
+      tokenCap: 120,
+    });
+
+    const tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval: mockRetrieval }),
+      sessionId: "agent:main:subagent:multi-query",
+    });
+    const result = await tool.execute("call-multi-query", {
+      query: "private",
+      allConversations: true,
+    });
+
+    expect(result.details).toMatchObject({
+      error: expect.stringContaining("requires a single delegated conversation scope"),
+    });
+    expect(mockRetrieval.grep).not.toHaveBeenCalled();
+    expect(mockRetrieval.expand).not.toHaveBeenCalled();
+  });
+
   it("clamps delegated expansion tokenCap to grant budget", async () => {
     const mockRetrieval = makeMockRetrieval();
     mockRetrieval.expand.mockResolvedValue({

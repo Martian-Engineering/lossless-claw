@@ -206,7 +206,14 @@ export function createLcmGrepTool(input: {
         sessionKey: input.sessionKey,
         params: p,
       });
-      if (!conversationScope.allConversations && conversationScope.conversationId == null) {
+      if (conversationScope.error) {
+        return jsonResult({ error: conversationScope.error });
+      }
+      if (
+        !conversationScope.allConversations
+        && conversationScope.conversationId == null
+        && (conversationScope.conversationIds?.length ?? 0) === 0
+      ) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
