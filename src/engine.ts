@@ -1221,6 +1221,8 @@ const PROMPT_RECALL_SEARCH_LIMIT = PROMPT_RECALL_MAX_MESSAGES * 2;
 const PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT = PROMPT_RECALL_SEARCH_LIMIT * 4;
 const DELIVERY_ONLY_TRANSCRIPT_MAX_MESSAGES = 4;
 const INJECTED_DELIVERY_TRANSCRIPT_PATTERN = /\b(?:delivery[-_\s]?mirror|config[-_\s]?audit)\b/i;
+const OPENCLAW_RUNTIME_CONTEXT_SENTINEL =
+  "OpenClaw runtime context for the immediately preceding user message. This context is runtime-generated, not user-author.";
 const PROMPT_RECALL_SENSITIVE_IDENTIFIER_PATTERN =
   /(?:^|[^A-Za-z0-9])(?:ACCESS_?KEY|API_?KEY|AUTH|CREDENTIALS?|DEPLOY_?KEY|KEY|PASS(?:WORD)?|PRIVATE_?KEY|SECRET|TOKEN)(?=$|[^A-Za-z0-9])/i;
 const PROMPT_RECALL_SENSITIVE_VALUE_PATTERN =
@@ -1263,6 +1265,13 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
 function isLikelyInjectedDeliveryMessage(message: AgentMessage): boolean {
   const stored = toStoredMessage(message);
   return stored.role === "system" && INJECTED_DELIVERY_TRANSCRIPT_PATTERN.test(stored.content);
+}
+
+function isOpenClawRuntimeContextLeak(stored: StoredMessage): boolean {
+  return (
+    stored.role === "assistant" &&
+    stored.content.trimStart().startsWith(OPENCLAW_RUNTIME_CONTEXT_SENTINEL)
+  );
 }
 
 function isLikelyInjectedDeliveryOnlyTranscript(messages: AgentMessage[]): boolean {
@@ -7541,6 +7550,9 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     let stored = toStoredMessage(message);
+    if (isOpenClawRuntimeContextLeak(stored)) {
+      return { ingested: false };
+    }
 
     // Get or create conversation for this session
     const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {

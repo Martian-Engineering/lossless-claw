@@ -686,6 +686,202 @@ describe("LcmContextEngine ignored sessions", () => {
   });
 });
 
+describe("LcmContextEngine OpenClaw runtime context leak filter", () => {
+  const leakedRuntimeContext =
+    "OpenClaw runtime context for the immediately preceding user message. This context is runtime-generated, not user-author. Keep internal details private.";
+
+  it("skips leaked assistant runtime context messages through direct ingest", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-leak-direct";
+
+    const result = await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "assistant", content: leakedRuntimeContext }),
+    });
+
+    expect(result.ingested).toBe(false);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).toBeNull();
+  });
+
+  it("skips leaked assistant runtime context messages without creating a conversation", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-leak-only";
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: [makeMessage({ role: "assistant", content: leakedRuntimeContext })],
+    });
+
+    expect(result.ingestedCount).toBe(0);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).toBeNull();
+  });
+
+  it("keeps real assistant replies after skipping leaked runtime context", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-leak-with-reply";
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({ role: "assistant", content: leakedRuntimeContext }),
+        makeMessage({ role: "assistant", content: "Real assistant reply." }),
+      ],
+    });
+
+    expect(result.ingestedCount).toBe(1);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["Real assistant reply."]);
+  });
+
+  it("skips leaked runtime context content blocks during afterTurn", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-leak-after-turn";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("runtime-context-leak-after-turn"),
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: [{ type: "text", text: leakedRuntimeContext }],
+        }),
+        makeMessage({ role: "assistant", content: "Visible answer." }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["Visible answer."]);
+  });
+
+  it("skips leaked runtime context imported from bootstrap transcripts", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-leak-bootstrap";
+    const sessionFile = createSessionFilePath("runtime-context-leak-bootstrap");
+    writeLeafTranscriptMessages(sessionFile, [
+      makeMessage({ role: "assistant", content: leakedRuntimeContext }),
+      makeMessage({ role: "assistant", content: "Bootstrapped answer." }),
+    ]);
+
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+
+    expect(result.importedMessages).toBe(1);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["Bootstrapped answer."]);
+  });
+
+  it("skips leaked runtime context in append-only bootstrap transcript recovery", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-leak-append-only-bootstrap";
+    const sessionFile = createSessionFilePath("runtime-context-leak-append-only-bootstrap");
+    writeLeafTranscriptMessages(sessionFile, [
+      makeMessage({ role: "user", content: "Initial question." }),
+      makeMessage({ role: "assistant", content: "Initial answer." }),
+    ]);
+
+    await engine.bootstrap({ sessionId, sessionFile });
+    writeLeafTranscriptMessages(sessionFile, [
+      makeMessage({ role: "user", content: "Initial question." }),
+      makeMessage({ role: "assistant", content: "Initial answer." }),
+      makeMessage({ role: "assistant", content: leakedRuntimeContext }),
+      makeMessage({ role: "assistant", content: "Recovered answer." }),
+    ]);
+
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+
+    expect(result.importedMessages).toBe(1);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "Initial question.",
+      "Initial answer.",
+      "Recovered answer.",
+    ]);
+  });
+
+  it("keeps user-authored messages even when they quote the runtime context prefix", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-user-quote";
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: leakedRuntimeContext })],
+    });
+
+    expect(result.ingestedCount).toBe(1);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([leakedRuntimeContext]);
+  });
+
+  it("keeps system and tool messages even when they contain the runtime context sentinel", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-non-assistant-roles";
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({ role: "system", content: leakedRuntimeContext }),
+        makeMessage({ role: "tool", content: leakedRuntimeContext }),
+      ],
+    });
+
+    expect(result.ingestedCount).toBe(2);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.role)).toEqual(["system", "tool"]);
+    expect(stored.map((m) => m.content)).toEqual([leakedRuntimeContext, leakedRuntimeContext]);
+  });
+
+  it("keeps ordinary assistant messages that mention the runtime context phrase later", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-assistant-explanation";
+    const content =
+      "I found the leak: OpenClaw runtime context for the immediately preceding user message was persisted even though it is runtime-generated, not user-author.";
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: [makeMessage({ role: "assistant", content })],
+    });
+
+    expect(result.ingestedCount).toBe(1);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([content]);
+  });
+
+  it("keeps assistant messages that start with runtime context wording without the full sentinel", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-generic-assistant";
+    const content =
+      "OpenClaw runtime context for the immediately preceding user message can refer to host-provided fields; this answer is not the private per-turn context block.";
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: [makeMessage({ role: "assistant", content })],
+    });
+
+    expect(result.ingestedCount).toBe(1);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([content]);
+  });
+});
+
 describe("LcmContextEngine stateless sessions", () => {
   const statelessSessionKey = "agent:main:subagent:worker-preview";
   const statefulSessionKey = "agent:main:main";
