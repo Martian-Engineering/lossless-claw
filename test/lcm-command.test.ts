@@ -1162,7 +1162,7 @@ describe("lcm command", () => {
       conversationId: currentConversation.conversationId,
       kind: "leaf",
       depth: 0,
-      content: FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+      content: `safe retained fallback text\n${FALLBACK_DIRECTIVE_SUMMARY_MARKER}\n[Truncated from 2706 tokens]`,
       tokenCount: 9,
     });
     await fixture.summaryStore.insertSummary({
@@ -1999,7 +1999,7 @@ describe("lcm command", () => {
       conversationId: currentConversation.conversationId,
       kind: "condensed",
       depth: 1,
-      content: `${FALLBACK_DIRECTIVE_SUMMARY_MARKER}\nold parent`,
+      content: `old parent\n${FALLBACK_DIRECTIVE_SUMMARY_MARKER}\n[Truncated from 2706 tokens]`,
       tokenCount: 9,
     });
     await fixture.summaryStore.linkSummaryToParents("sum_parent_fix", ["sum_leaf_fix"]);

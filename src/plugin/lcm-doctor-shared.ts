@@ -74,6 +74,11 @@ export function detectDoctorMarker(content: string): DoctorMarkerKind | null {
     return "old";
   }
 
+  const directiveFallbackIndex = content.indexOf(FALLBACK_DIRECTIVE_SUMMARY_MARKER);
+  if (directiveFallbackIndex >= 0) {
+    return "fallback";
+  }
+
   const truncatedIndex = content.indexOf(TRUNCATED_SUMMARY_PREFIX);
   if (truncatedIndex >= 0 && content.length - truncatedIndex < TRUNCATED_SUMMARY_WINDOW) {
     return "new";
@@ -81,14 +86,6 @@ export function detectDoctorMarker(content: string): DoctorMarkerKind | null {
 
   const fallbackIndex = content.indexOf(FALLBACK_SUMMARY_MARKER);
   if (fallbackIndex >= 0 && content.length - fallbackIndex < FALLBACK_SUMMARY_WINDOW) {
-    return "fallback";
-  }
-
-  const directiveFallbackIndex = content.indexOf(FALLBACK_DIRECTIVE_SUMMARY_MARKER);
-  if (
-    directiveFallbackIndex >= 0 &&
-    content.length - directiveFallbackIndex < FALLBACK_SUMMARY_WINDOW
-  ) {
     return "fallback";
   }
 
