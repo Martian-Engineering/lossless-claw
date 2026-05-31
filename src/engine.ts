@@ -103,6 +103,14 @@ type BootstrapImportObservation = {
 
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
+const MAX_STABLE_ORPHAN_STRIPPING_BOUNDARIES = 100;
+const MIN_OBSERVED_CACHE_READ_SHARE_FOR_HOT = 0.2;
+
+/** TTL for `recentBootstrapImportsByConversation` entries in overflow diagnostics. */
+const BOOTSTRAP_IMPORT_OBSERVATION_TTL_MS = 30 * 60_000;
+
+/** Yield every K bootstrap-ingest messages so the worker doesn't monopolise the loop. */
+const BOOTSTRAP_INGEST_CHUNK_SIZE = 100;
 type CircuitBreakerState = {
   failures: number;
   openSince: number | null;
@@ -408,12 +416,19 @@ function shouldLogOverflowDiagnostics(params: {
 function formatOverflowDiagnosticsForLog(params: {
   diagnostics: AssemblyOverflowDiagnostics;
   recentBootstrapImport?: BootstrapImportObservation;
+  now?: number;
 }): string {
+  // Drop stale observations: the LRU only evicts at 100 conversations, so
+  // without a TTL a "7 imports" tag could trail a conversation indefinitely.
   const recent = params.recentBootstrapImport;
+  const nowMs = params.now ?? Date.now();
+  const isFresh =
+    recent !== undefined &&
+    nowMs - recent.observedAt.getTime() <= BOOTSTRAP_IMPORT_OBSERVATION_TTL_MS;
   return JSON.stringify({
     ...params.diagnostics,
-    recentBootstrapImportCount: recent?.importedMessages ?? null,
-    recentBootstrapImportReason: recent?.reason ?? null,
+    recentBootstrapImportCount: isFresh ? recent!.importedMessages : null,
+    recentBootstrapImportReason: isFresh ? recent!.reason : null,
   });
 }
 
@@ -606,6 +621,7 @@ const REPLAY_CRITICAL_RAW_TYPES: ReadonlySet<string> = new Set([
   ...TOOL_RAW_TYPES,
   ...REASONING_RAW_TYPES,
 ]);
+const BASE64_IMAGE_MAGIC_PREFIXES = ["/9j/", "iVBOR", "R0lGOD", "UklGR", "PHN2Zy"] as const;
 const RAW_PAYLOAD_EXTERNALIZATION_REASON = "large_raw_message";
 
 function looksLikeJsonPayload(value: string): boolean {
@@ -618,6 +634,18 @@ function looksLikeJsonPayload(value: string): boolean {
     (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
     (trimmed.startsWith("[") && trimmed.endsWith("]"))
   );
+}
+
+function looksLikeBase64ImagePayload(value: string): boolean {
+  const trimmed = value.trim();
+  if (estimateTokens(trimmed) < 100) {
+    return false;
+  }
+  if (!BASE64_IMAGE_MAGIC_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) {
+    return false;
+  }
+  const base64Chars = trimmed.replace(/[^A-Za-z0-9+/=\s]/g, "");
+  return base64Chars.length / trimmed.length >= 0.8;
 }
 
 function extractStructuredText(value: unknown, depth: number = 0): string | undefined {
@@ -1216,6 +1244,153 @@ const PROMPT_RECALL_SENSITIVE_IDENTIFIER_PATTERN =
   /(?:^|[^A-Za-z0-9])(?:ACCESS_?KEY|API_?KEY|AUTH|CREDENTIALS?|DEPLOY_?KEY|KEY|PASS(?:WORD)?|PRIVATE_?KEY|SECRET|TOKEN)(?=$|[^A-Za-z0-9])/i;
 const PROMPT_RECALL_SENSITIVE_VALUE_PATTERN =
   /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{10,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b|\bxox[baprs]-[A-Za-z0-9-]{10,}\b|\b(?:sk|rk|pk)-[A-Za-z0-9_-]{10,}\b|\b(?:sk|rk|pk)_[A-Za-z0-9_]{10,}\b)/i;
+
+/**
+ * Block types that require structural persistence into the `message_parts`
+ * table. Keep this aligned with replay-critical raw types so bootstrap never
+ * bulk-inserts blocks that `ingestSingle` would preserve structurally.
+ */
+const STRUCTURAL_BLOCK_TYPES: ReadonlySet<string> = new Set([
+  ...REPLAY_CRITICAL_RAW_TYPES,
+  "tool-result",
+  "redacted_thinking",
+  "image",
+]);
+
+/** Return true when live ingest would reject this message before persistence. */
+function shouldSkipPersistedMessage(message: AgentMessage, isHeartbeat?: boolean): boolean {
+  if (isHeartbeat) {
+    return true;
+  }
+  if (!hasPersistableMessageRole(message)) {
+    return true;
+  }
+  if (message.role !== "assistant") {
+    return false;
+  }
+
+  const topLevel = message as unknown as Record<string, unknown>;
+  const stopReason =
+    typeof topLevel.stopReason === "string"
+      ? topLevel.stopReason
+      : typeof topLevel.stop_reason === "string"
+        ? topLevel.stop_reason
+        : undefined;
+  if (stopReason !== "error" && stopReason !== "aborted") {
+    return false;
+  }
+
+  const content = topLevel.content;
+  return (
+    content === undefined ||
+    content === null ||
+    content === "" ||
+    (Array.isArray(content) && content.length === 0)
+  );
+}
+
+/**
+ * Cheap pre-scan: should bootstrap take the bulk-insert fast path for this
+ * message, or fall through to the per-message `ingestSingle` path?
+ *
+ * Returns true (slower per-message path required) when:
+ *   - the message carries any structural block (tool/reasoning/image/etc.)
+ *     that needs `message_parts` rows
+ *   - the role is `tool` or `toolResult` (those go through a separate
+ *     interceptor/parts pipeline)
+ *   - any size-driven interceptor would fire (large file/raw-payload/tool-
+ *     result)
+ *   - the content shows the textual markers `interceptInlineImages` /
+ *     `interceptLargeFiles` look for
+ *
+ * False positives are acceptable (slower path); false negatives would skip
+ * externalization or drop `message_parts`, so the helper errs on the side of
+ * "use the safe per-message path".
+ */
+function bootstrapMessageWouldTriggerInterceptor(
+  message: AgentMessage,
+  largeFileTokenThreshold: number,
+): boolean {
+  const threshold = Math.max(1, largeFileTokenThreshold);
+  const role = (message as { role?: unknown }).role;
+  const content = "content" in message ? message.content : undefined;
+  const contentTextWouldTriggerInterceptor = (text: string): boolean => {
+    // interceptInlineImages: explicit media marker or a long base64 run.
+    if (text.startsWith("[media attached:")) return true;
+    if (looksLikeBase64ImagePayload(text)) return true;
+    // interceptLargeFiles: presence of a file block — match `<file>`,
+    // `<file ...>`, and `<file\n...>` forms. The interceptor decides on
+    // size; we only need a robust open-tag detector here.
+    return /<file(?:\s|>)/.test(text);
+  };
+
+  // Tool/toolResult roles need the per-message path regardless of payload —
+  // they go through `interceptInlineImagesInToolMessage` and have their own
+  // parts pipeline that the bulk-insert fast path does not reproduce.
+  if (role === "tool" || role === "toolResult") {
+    return true;
+  }
+
+  // Structural blocks (tool calls/results, reasoning, thinking, function
+  // calls, images) need `message_parts` rows for replay; bulk-insert only
+  // writes the `messages` row, so any such block forces per-message ingest.
+  if (Array.isArray(content)) {
+    if (content.length !== 1) {
+      return true;
+    }
+    for (const block of content) {
+      if (typeof block === "string") {
+        return true;
+      }
+
+      if (!block || typeof block !== "object") return true;
+      const blockRecord = block as Record<string, unknown> & { type?: unknown; rawType?: unknown };
+      const blockType = typeof blockRecord.type === "string" ? blockRecord.type : undefined;
+      const rawBlockType = typeof blockRecord.rawType === "string" ? blockRecord.rawType : undefined;
+      const isCanonicalTextBlock =
+        blockType === "text" &&
+        rawBlockType === undefined &&
+        typeof blockRecord.text === "string" &&
+        Object.keys(blockRecord).every((key) => key === "type" || key === "text");
+      if (!isCanonicalTextBlock) {
+        return true;
+      }
+      if (
+        (blockType && STRUCTURAL_BLOCK_TYPES.has(blockType)) ||
+        (rawBlockType && STRUCTURAL_BLOCK_TYPES.has(rawBlockType))
+      ) {
+        return true;
+      }
+      const extractedText = extractStructuredText(block);
+      if (typeof extractedText === "string" && contentTextWouldTriggerInterceptor(extractedText)) {
+        return true;
+      }
+    }
+  }
+
+  if (typeof content === "string") {
+    if (looksLikeJsonPayload(content)) {
+      return true;
+    }
+    const extractedText = extractStructuredText(content);
+    if (typeof extractedText === "string" && contentTextWouldTriggerInterceptor(extractedText)) {
+      return true;
+    }
+  }
+
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    const extractedText = extractStructuredText(content);
+    if (typeof extractedText === "string" && contentTextWouldTriggerInterceptor(extractedText)) {
+      return true;
+    }
+    return true;
+  }
+
+  // Size gate for interceptLargeRawPayload / interceptLargeToolResults. Match
+  // live ingest exactly: the interceptor compares the normalized stored message
+  // token count, not the raw string/block token count seen in the transcript.
+  return toStoredMessage(message).tokenCount >= threshold;
+}
 
 /**
  * Normalize AgentMessage variants into the storage shape used by LCM.
@@ -6529,16 +6704,60 @@ export class LcmContextEngine implements ContextEngine {
               };
             }
 
+            // Pre-scan: PR #510 moved bootstrap to N×ingestSingle so
+            // interceptors could fire on first import. Restore the v0.9.2
+            // bulk-insert fast path when no message would trigger any
+            // interceptor AND has no structural blocks (`message_parts` is
+            // not populated by the bulk path); otherwise stay on the
+            // per-message ingest path with periodic event-loop yields.
+            const threshold = this.config.largeFileTokenThreshold;
+            const requiresPerMessageIngest = bootstrapMessages.some((message) =>
+              bootstrapMessageWouldTriggerInterceptor(message, threshold),
+            );
+
             let importedMessages = 0;
-            for (const message of bootstrapMessages) {
-              const result = await this.ingestSingle({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                message,
-                skipReplayTimestampFloodGuard: true,
+            if (!requiresPerMessageIngest) {
+              const nextSeq =
+                (await this.conversationStore.getMaxSeq(conversationId)) + 1;
+              const persistableMessages = bootstrapMessages.filter((message) =>
+                !shouldSkipPersistedMessage(message),
+              );
+              const bulkInput = persistableMessages.map((message, index) => {
+                const stored = toStoredMessage(message);
+                return {
+                  conversationId,
+                  seq: nextSeq + index,
+                  role: stored.role,
+                  content: stored.content,
+                  tokenCount: stored.tokenCount,
+                };
               });
-              if (result.ingested) {
-                importedMessages += 1;
+              const inserted =
+                await this.conversationStore.createMessagesBulk(bulkInput);
+              await this.summaryStore.appendContextMessages(
+                conversationId,
+                inserted.map((record) => record.messageId),
+              );
+              importedMessages = inserted.length;
+            } else {
+              for (let i = 0; i < bootstrapMessages.length; i += 1) {
+                const result = await this.ingestSingle({
+                  sessionId: params.sessionId,
+                  sessionKey: params.sessionKey,
+                  message: bootstrapMessages[i],
+                  skipReplayTimestampFloodGuard: true,
+                });
+                if (result.ingested) {
+                  importedMessages += 1;
+                }
+                if ((i + 1) % BOOTSTRAP_INGEST_CHUNK_SIZE === 0) {
+                  // setImmediate yields a macrotask boundary so timer/IO
+                  // callbacks can run before the next ingest batch — a
+                  // bare `Promise.resolve()` only schedules a microtask,
+                  // which can still starve the event loop on long
+                  // bootstraps.
+                  await new Promise<void>((resolve) => setImmediate(resolve));
+                }
               }
             }
             await this.conversationStore.markConversationBootstrapped(conversationId);
@@ -7175,38 +7394,8 @@ export class LcmContextEngine implements ContextEngine {
     skipReplayTimestampFloodGuard?: boolean;
   }): Promise<IngestResult> {
     const { sessionId, sessionKey, message, isHeartbeat, skipReplayTimestampFloodGuard } = params;
-    if (isHeartbeat) {
+    if (shouldSkipPersistedMessage(message, isHeartbeat)) {
       return { ingested: false };
-    }
-    if (!hasPersistableMessageRole(message)) {
-      return { ingested: false };
-    }
-
-    // Skip assistant messages that failed with an error and have no useful content.
-    // These occur when an API call returns a 500 or similar transient error.
-    // Ingesting them pollutes the LCM database: on retry, the error messages
-    // accumulate and get assembled into context, creating a positive feedback
-    // loop where each retry sends an increasingly large (and malformed) payload
-    // that continues to fail.
-    if (message.role === "assistant") {
-      const topLevel = message as unknown as Record<string, unknown>;
-      const stopReason =
-        typeof topLevel.stopReason === "string"
-          ? topLevel.stopReason
-          : typeof topLevel.stop_reason === "string"
-            ? topLevel.stop_reason
-            : undefined;
-      if (stopReason === "error" || stopReason === "aborted") {
-        const content = topLevel.content;
-        const isEmpty =
-          content === undefined ||
-          content === null ||
-          content === "" ||
-          (Array.isArray(content) && content.length === 0);
-        if (isEmpty) {
-          return { ingested: false };
-        }
-      }
     }
 
     let stored = toStoredMessage(message);
