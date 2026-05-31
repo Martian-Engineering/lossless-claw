@@ -104,6 +104,91 @@ function seedLegacySummaryGraph(db: ReturnType<typeof getLcmConnection>): void {
 }
 
 describe("runLcmMigrations summary depth backfill", () => {
+  it("adds deferred compaction retry columns to legacy maintenance rows", () => {
+    const db = createTestDb("legacy-maintenance.db");
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE conversation_compaction_maintenance (
+        conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        pending INTEGER NOT NULL DEFAULT 0,
+        requested_at TEXT,
+        reason TEXT,
+        running INTEGER NOT NULL DEFAULT 0,
+        last_started_at TEXT,
+        last_finished_at TEXT,
+        last_failure_summary TEXT,
+        token_budget INTEGER,
+        current_token_count INTEGER,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      1,
+      "legacy-maintenance-session",
+    );
+    db.prepare(
+      `INSERT INTO conversation_compaction_maintenance (
+         conversation_id,
+         pending,
+         requested_at,
+         reason,
+         running,
+         last_failure_summary,
+         token_budget,
+         current_token_count
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      1,
+      1,
+      "2026-05-31T12:00:00.000Z",
+      "threshold",
+      0,
+      "provider timeout",
+      4096,
+      3500,
+    );
+
+    runLcmMigrations(db);
+
+    const columns = db
+      .prepare(`PRAGMA table_info(conversation_compaction_maintenance)`)
+      .all() as Array<{ name?: string }>;
+    expect(columns.some((column) => column.name === "projected_token_count")).toBe(true);
+    expect(columns.some((column) => column.name === "raw_tokens_outside_tail")).toBe(true);
+    expect(columns.some((column) => column.name === "retry_attempts")).toBe(true);
+    expect(columns.some((column) => column.name === "next_attempt_after")).toBe(true);
+
+    const row = db
+      .prepare(
+        `SELECT pending, reason, token_budget, current_token_count, retry_attempts, next_attempt_after
+         FROM conversation_compaction_maintenance
+         WHERE conversation_id = 1`,
+      )
+      .get() as {
+      pending: number;
+      reason: string;
+      token_budget: number;
+      current_token_count: number;
+      retry_attempts: number;
+      next_attempt_after: string | null;
+    };
+    expect(row).toEqual({
+      pending: 1,
+      reason: "threshold",
+      token_budget: 4096,
+      current_token_count: 3500,
+      retry_attempts: 0,
+      next_attempt_after: null,
+    });
+  });
+
   it("adds depth and metadata from summary lineage", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
     tempDirs.push(tempDir);

@@ -24,6 +24,9 @@ export function resolveOpenclawStateDir(env: NodeJS.ProcessEnv = process.env): s
  */
 export const DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO = 0.90;
 export const DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES = 2 * 1024 * 1024;
+export const DEFAULT_SUMMARY_CALL_WINDOW_MS = 10 * 60 * 1000;
+export const DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW = 24;
+export const DEFAULT_SUMMARY_SPEND_BACKOFF_MS = 30 * 60 * 1000;
 
 export type CacheAwareCompactionConfig = {
   enabled: boolean;
@@ -126,6 +129,12 @@ export type LcmConfig = {
   delegationTimeoutMs: number;
   /** Max time to wait for a single model-backed LCM summarizer call. */
   summaryTimeoutMs: number;
+  /** Rolling window for model-backed summarization call budgets. */
+  summaryCallWindowMs?: number;
+  /** Maximum model-backed summarization calls per session/window before backoff. */
+  summaryMaxCallsPerWindow?: number;
+  /** Cooldown after a summarization spend guard opens. */
+  summarySpendBackoffMs?: number;
   /** IANA timezone for timestamps in summaries (from TZ env or system default) */
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
@@ -417,6 +426,21 @@ export function resolveLcmConfigWithDiagnostics(
       parseFiniteInt(env.LCM_COMPACT_UNTIL_UNDER_DEADLINE_MS)
         ?? toNumber(pc.compactUntilUnderDeadlineMs),
     ) ?? 300_000;
+  const resolvedSummaryCallWindowMs =
+    toPositiveInteger(
+      parseFiniteInt(env.LCM_SUMMARY_CALL_WINDOW_MS)
+        ?? toNumber(pc.summaryCallWindowMs),
+    ) ?? DEFAULT_SUMMARY_CALL_WINDOW_MS;
+  const resolvedSummaryMaxCallsPerWindow =
+    toPositiveInteger(
+      parseFiniteInt(env.LCM_SUMMARY_MAX_CALLS_PER_WINDOW)
+        ?? toNumber(pc.summaryMaxCallsPerWindow),
+    ) ?? DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW;
+  const resolvedSummarySpendBackoffMs =
+    toPositiveInteger(
+      parseFiniteInt(env.LCM_SUMMARY_SPEND_BACKOFF_MS)
+        ?? toNumber(pc.summarySpendBackoffMs),
+    ) ?? DEFAULT_SUMMARY_SPEND_BACKOFF_MS;
   const envDelegationTimeoutMs =
     env.LCM_DELEGATION_TIMEOUT_MS !== undefined
       ? toNumber(env.LCM_DELEGATION_TIMEOUT_MS)
@@ -563,6 +587,9 @@ export function resolveLcmConfigWithDiagnostics(
       summaryTimeoutMs:
         parseFiniteInt(env.LCM_SUMMARY_TIMEOUT_MS)
           ?? toNumber(pc.summaryTimeoutMs) ?? 60000,
+      summaryCallWindowMs: resolvedSummaryCallWindowMs,
+      summaryMaxCallsPerWindow: resolvedSummaryMaxCallsPerWindow,
+      summarySpendBackoffMs: resolvedSummarySpendBackoffMs,
       timezone: env.TZ ?? toStr(pc.timezone) ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
       pruneHeartbeatOk:
         env.LCM_PRUNE_HEARTBEAT_OK !== undefined

@@ -199,6 +199,26 @@ export class LcmRuntimeLlmUnavailableError extends Error {
   }
 }
 
+/** Signals that Lossless has opened its non-auth summarization spend guard. */
+export class LcmSummarySpendLimitError extends Error {
+  readonly scopeKey: string;
+  readonly backoffUntil: Date;
+
+  constructor(params: {
+    scopeKey: string;
+    backoffUntil: Date;
+    message?: string;
+  }) {
+    super(
+      params.message ??
+        `summary spend backoff open for ${params.scopeKey} until ${params.backoffUntil.toISOString()}`,
+    );
+    this.name = "LcmSummarySpendLimitError";
+    this.scopeKey = params.scopeKey;
+    this.backoffUntil = params.backoffUntil;
+  }
+}
+
 /** Signals that a provider returned an explicit non-auth error response. */
 class LcmProviderResponseError extends Error {
   readonly provider: string;
@@ -1578,6 +1598,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           if (
             err instanceof LcmRuntimeLlmPolicyError ||
             err instanceof LcmRuntimeLlmUnavailableError ||
+            err instanceof LcmSummarySpendLimitError ||
             err instanceof LcmProviderAuthError ||
             err instanceof LcmProviderResponseError
           ) {
@@ -1601,6 +1622,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         }
         if (err instanceof LcmRuntimeLlmUnavailableError) {
           params.deps.log.error(err.message);
+          throw err;
+        }
+        if (err instanceof LcmSummarySpendLimitError) {
+          params.deps.log.warn(err.message);
           throw err;
         }
         if (err instanceof LcmProviderAuthError) {
@@ -1739,6 +1764,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           }
           if (retryErr instanceof LcmRuntimeLlmUnavailableError) {
             params.deps.log.error(retryErr.message);
+            throw retryErr;
+          }
+          if (retryErr instanceof LcmSummarySpendLimitError) {
+            params.deps.log.warn(retryErr.message);
             throw retryErr;
           }
           if (retryErr instanceof LcmProviderAuthError) {

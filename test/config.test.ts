@@ -5,6 +5,9 @@ import manifest from "../openclaw.plugin.json" with { type: "json" };
 import {
   DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES,
   DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
+  DEFAULT_SUMMARY_CALL_WINDOW_MS,
+  DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW,
+  DEFAULT_SUMMARY_SPEND_BACKOFF_MS,
   resolveLcmConfig,
   resolveLcmConfigWithDiagnostics,
   resolveOpenclawStateDir,
@@ -45,6 +48,9 @@ describe("resolveLcmConfig", () => {
     expect(config.leafTargetTokens).toBe(2400);
     expect(config.summaryProvider).toBe("");
     expect(config.summaryModel).toBe("");
+    expect(config.summaryCallWindowMs).toBe(DEFAULT_SUMMARY_CALL_WINDOW_MS);
+    expect(config.summaryMaxCallsPerWindow).toBe(DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW);
+    expect(config.summarySpendBackoffMs).toBe(DEFAULT_SUMMARY_SPEND_BACKOFF_MS);
     expect(config.pruneHeartbeatOk).toBe(false);
     expect(config.transcriptGcEnabled).toBe(false);
     expect(config.proactiveThresholdCompactionMode).toBe("deferred");
@@ -84,6 +90,9 @@ describe("resolveLcmConfig", () => {
       maxSweepIterations: 6,
       sweepDeadlineMs: 45000,
       compactUntilUnderDeadlineMs: 90000,
+      summaryCallWindowMs: 120000,
+      summaryMaxCallsPerWindow: 7,
+      summarySpendBackoffMs: 240000,
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:ephemeral:**"],
       skipStatelessSessions: false,
@@ -132,6 +141,9 @@ describe("resolveLcmConfig", () => {
     expect(config.maxSweepIterations).toBe(6);
     expect(config.sweepDeadlineMs).toBe(45000);
     expect(config.compactUntilUnderDeadlineMs).toBe(90000);
+    expect(config.summaryCallWindowMs).toBe(120000);
+    expect(config.summaryMaxCallsPerWindow).toBe(7);
+    expect(config.summarySpendBackoffMs).toBe(240000);
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
     expect(config.pruneHeartbeatOk).toBe(true);
@@ -191,6 +203,9 @@ describe("resolveLcmConfig", () => {
       LCM_MAX_SWEEP_ITERATIONS: "8",
       LCM_SWEEP_DEADLINE_MS: "90000",
       LCM_COMPACT_UNTIL_UNDER_DEADLINE_MS: "150000",
+      LCM_SUMMARY_CALL_WINDOW_MS: "180000",
+      LCM_SUMMARY_MAX_CALLS_PER_WINDOW: "9",
+      LCM_SUMMARY_SPEND_BACKOFF_MS: "360000",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
@@ -203,6 +218,9 @@ describe("resolveLcmConfig", () => {
       maxSweepIterations: 4,
       sweepDeadlineMs: 30000,
       compactUntilUnderDeadlineMs: 60000,
+      summaryCallWindowMs: 120000,
+      summaryMaxCallsPerWindow: 7,
+      summarySpendBackoffMs: 240000,
       ignoreSessionPatterns: ["agent:*:test:*"],
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
@@ -260,6 +278,9 @@ describe("resolveLcmConfig", () => {
     expect(config.maxSweepIterations).toBe(8); // env wins
     expect(config.sweepDeadlineMs).toBe(90000); // env wins
     expect(config.compactUntilUnderDeadlineMs).toBe(150000); // env wins
+    expect(config.summaryCallWindowMs).toBe(180000); // env wins
+    expect(config.summaryMaxCallsPerWindow).toBe(9); // env wins
+    expect(config.summarySpendBackoffMs).toBe(360000); // env wins
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
       cacheTTLSeconds: 600,
@@ -786,6 +807,18 @@ describe("resolveLcmConfig", () => {
   it("ships a manifest with schema entries for runtime-only toggles and model overrides", () => {
     expect(manifest.configSchema.properties.largeFileSummaryModel).toEqual({ type: "string" });
     expect(manifest.configSchema.properties.largeFileSummaryProvider).toEqual({ type: "string" });
+    expect(manifest.configSchema.properties.summaryCallWindowMs).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
+    expect(manifest.configSchema.properties.summaryMaxCallsPerWindow).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
+    expect(manifest.configSchema.properties.summarySpendBackoffMs).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
     expect(manifest.configSchema.properties.timezone).toEqual({ type: "string" });
     expect(manifest.configSchema.properties.pruneHeartbeatOk).toEqual({ type: "boolean" });
   });

@@ -10,7 +10,7 @@ import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { estimateTokens } from "../src/estimate-tokens.js";
-import { LcmProviderAuthError } from "../src/summarize.js";
+import { LcmProviderAuthError, LcmSummarySpendLimitError } from "../src/summarize.js";
 import {
   createDelegatedExpansionGrant,
   getRuntimeExpansionAuthManager,
@@ -4308,6 +4308,91 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(secondRotate.kind).toBe("unavailable");
     expect(secondRotate.reason).toContain("summary provider circuit breaker is open");
     expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("scopes rotate summarization spend guards per session", async () => {
+    const complete = vi.fn(async () => ({
+      content: [{ type: "text", text: "rotate summary" }],
+    }));
+    const engine = createEngineWithDeps(
+      {
+        summaryProvider: "test-provider",
+        summaryModel: "test-model",
+        freshTailCount: 2,
+        leafChunkTokens: 1,
+        leafMinFanout: 1,
+        summaryMaxCallsPerWindow: 1,
+        summaryCallWindowMs: 10 * 60 * 1000,
+        summarySpendBackoffMs: 30 * 60 * 1000,
+      },
+      { complete },
+    );
+
+    for (const suffix of ["one", "two"]) {
+      const sessionFile = createSessionFilePath(`lcm-rotate-spend-scope-${suffix}`);
+      const sessionKey = `agent:main:rotate-spend-scope-${suffix}`;
+      const sessionId = `rotate-spend-scope-${suffix}-session`;
+      const sm = SessionManager.open(sessionFile);
+      for (const message of [
+        { role: "user", content: [{ type: "text", text: `older detail ${suffix}` }] },
+        { role: "assistant", content: [{ type: "text", text: `tail assistant ${suffix}` }] },
+        { role: "user", content: [{ type: "text", text: `tail user ${suffix}` }] },
+      ] as AgentMessage[]) {
+        sm.appendMessage(message);
+      }
+
+      await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+
+      const rotate = await engine.rotateSessionStorage({
+        sessionId,
+        sessionKey,
+        sessionFile,
+      });
+      expect(rotate).toMatchObject({ kind: "rotated" });
+    }
+
+    expect(complete).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns rotate unavailable when summarization spend backoff opens", async () => {
+    const sessionFile = createSessionFilePath("lcm-rotate-storage-spend-backoff");
+    const sessionKey = "agent:main:rotate-spend-backoff";
+    const sessionId = "rotate-spend-backoff-session";
+    const sm = SessionManager.open(sessionFile);
+    for (const message of [
+      { role: "user", content: [{ type: "text", text: "older detail before rotate" }] },
+      { role: "assistant", content: [{ type: "text", text: "tail assistant" }] },
+      { role: "user", content: [{ type: "text", text: "tail user" }] },
+    ] as AgentMessage[]) {
+      sm.appendMessage(message);
+    }
+
+    const engine = createEngineWithConfig({
+      freshTailCount: 2,
+      leafChunkTokens: 1,
+      leafMinFanout: 1,
+    });
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactLeaf: (input: unknown) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "compactLeaf").mockRejectedValue(
+      new LcmSummarySpendLimitError({
+        scopeKey: "compaction:rotate-spend-backoff-session",
+        backoffUntil: new Date("2026-05-31T13:00:00.000Z"),
+      }),
+    );
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+
+    const rotate = await engine.rotateSessionStorage({
+      sessionId,
+      sessionKey,
+      sessionFile,
+    });
+    expect(rotate.kind).toBe("unavailable");
+    expect(rotate.reason).toContain("summary spend backoff is open");
   });
 
   it("reconciles unimported transcript messages before rotate summary coverage", async () => {
@@ -12264,8 +12349,127 @@ describe("LcmContextEngine fidelity and token budget", () => {
       .getConversationCompactionMaintenance(conversation.conversationId);
     expect(maintenance?.pending).toBe(true);
     expect(maintenance?.running).toBe(false);
+    expect(maintenance?.retryAttempts).toBe(0);
+    expect(maintenance?.nextAttemptAfter).toBeNull();
     expect(result.changed).toBe(false);
     expect(result.reason).toBe("provider auth failure");
+  });
+
+  it("maintain() keeps threshold debt pending when the auth circuit breaker is open", async () => {
+    const engine = createEngine();
+    const sessionId = "maintain-deferred-compaction-circuit-open";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+    });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    vi.spyOn(privateEngine, "executeCompactionCore").mockResolvedValue({
+      ok: true,
+      compacted: false,
+      reason: "circuit breaker open",
+    });
+
+    const result = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-circuit-open"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 4_096,
+        currentTokenCount: 3_500,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenance?.lastFailureSummary).toBe("summary provider circuit breaker is open");
+    expect(maintenance?.retryAttempts).toBe(0);
+    expect(maintenance?.nextAttemptAfter).toBeNull();
+    expect(result.changed).toBe(false);
+    expect(result.reason).toBe("circuit breaker open");
+  });
+
+  it("maintain() backs off deferred threshold debt after non-auth compaction failures", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-31T12:00:00.000Z"));
+    try {
+      const engine = createEngine();
+      const sessionId = "maintain-deferred-compaction-provider-timeout-backoff";
+      const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+        sessionKey: undefined,
+      });
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+        tokenBudget: 4_096,
+        currentTokenCount: 3_500,
+      });
+      const privateEngine = engine as unknown as {
+        executeCompactionCore: (params: unknown) => Promise<unknown>;
+      };
+      const executeSpy = vi.spyOn(privateEngine, "executeCompactionCore");
+      executeSpy.mockResolvedValueOnce({
+        ok: false,
+        compacted: false,
+        reason: "provider timeout",
+      });
+      executeSpy.mockResolvedValueOnce({
+        ok: true,
+        compacted: true,
+        reason: "compacted",
+      });
+
+      const first = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-deferred-provider-timeout-backoff"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+          currentTokenCount: 3_500,
+        },
+      });
+      expect(first.changed).toBe(false);
+      expect(first.reason).toBe("provider timeout");
+      expect(executeSpy).toHaveBeenCalledTimes(1);
+
+      const second = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-deferred-provider-timeout-backoff-retry"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+          currentTokenCount: 3_500,
+        },
+      });
+      expect(second.changed).toBe(false);
+      expect(second.reason).toBe("deferred compaction backoff active");
+      expect(executeSpy).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+      const third = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-deferred-provider-timeout-after-backoff"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+          currentTokenCount: 3_500,
+        },
+      });
+      expect(third.changed).toBe(true);
+      expect(third.reason).toBe("compacted");
+      expect(executeSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("maintain() keeps threshold debt pending when partial compaction remains over target", async () => {
@@ -12321,6 +12525,304 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenance?.lastFailureSummary).toBe("compacted but still over target");
     expect(result.changed).toBe(true);
     expect(result.reason).toBe("compacted but still over target");
+  });
+
+  it("maintain() backs off after partial deferred compaction still exceeds target", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-31T12:10:00.000Z"));
+    try {
+      const engine = createEngine();
+      const sessionId = "maintain-deferred-partial-still-over-backoff";
+      const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+        sessionKey: undefined,
+      });
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+        tokenBudget: 4_096,
+        currentTokenCount: 3_500,
+      });
+      const privateEngine = engine as unknown as {
+        compaction: {
+          compactFullSweep: (input: unknown) => Promise<unknown>;
+        };
+      };
+      const compactFullSweepSpy = vi
+        .spyOn(privateEngine.compaction, "compactFullSweep")
+        .mockResolvedValue({
+          actionTaken: true,
+          tokensBefore: 3_500,
+          tokensAfter: 3_200,
+          condensed: false,
+        });
+
+      const first = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-deferred-partial-over-backoff"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+          currentTokenCount: 3_500,
+        },
+      });
+      expect(first.changed).toBe(true);
+      expect(first.reason).toBe("compacted but still over target");
+      expect(compactFullSweepSpy).toHaveBeenCalledTimes(1);
+
+      const second = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-deferred-partial-over-backoff-retry"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+          currentTokenCount: 3_500,
+        },
+      });
+      expect(second.changed).toBe(false);
+      expect(second.reason).toBe("deferred compaction backoff active");
+      expect(compactFullSweepSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("maintain() stops model-backed deferred compaction at the summary call cap", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-31T12:20:00.000Z"));
+    try {
+      const complete = vi.fn(async () => ({
+        content: [{ type: "text", text: "short summary" }],
+      }));
+      const engine = createEngineWithDeps(
+        {
+          summaryProvider: "anthropic",
+          summaryModel: "claude-opus-4-5",
+          summaryMaxCallsPerWindow: 1,
+          summaryCallWindowMs: 10 * 60 * 1000,
+          summarySpendBackoffMs: 20 * 60 * 1000,
+        },
+        { complete },
+      );
+      const sessionId = "maintain-summary-spend-call-cap";
+      const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+        sessionKey: undefined,
+      });
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+        tokenBudget: 4_096,
+        currentTokenCount: 3_500,
+      });
+      const privateEngine = engine as unknown as {
+        compaction: {
+          compactFullSweep: (input: {
+            summarize: (text: string, aggressive?: boolean) => Promise<string>;
+          }) => Promise<unknown>;
+        };
+      };
+      vi.spyOn(privateEngine.compaction, "compactFullSweep").mockImplementation(async (input) => {
+        await input.summarize("first chunk ".repeat(200));
+        await input.summarize("second chunk ".repeat(200));
+        return {
+          actionTaken: true,
+          tokensBefore: 3_500,
+          tokensAfter: 2_000,
+          condensed: false,
+        };
+      });
+
+      const first = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-summary-spend-call-cap"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+          currentTokenCount: 3_500,
+        },
+      });
+      expect(first.changed).toBe(false);
+      expect(first.reason).toBe("summary spend backoff open");
+      expect(complete).toHaveBeenCalledTimes(1);
+
+      const maintenance = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation.conversationId);
+      expect(maintenance?.pending).toBe(true);
+      expect(maintenance?.retryAttempts).toBe(1);
+      expect(maintenance?.nextAttemptAfter?.toISOString()).toBe("2026-05-31T12:40:00.000Z");
+
+      const second = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-summary-spend-call-cap-retry"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+          currentTokenCount: 3_500,
+        },
+      });
+      expect(second.changed).toBe(false);
+      expect(second.reason).toBe("deferred compaction backoff active");
+      expect(complete).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("compact() is not blocked by deferred-maintenance retry backoff", async () => {
+    const engine = createEngine();
+    const sessionId = "manual-compact-ignores-maintenance-backoff";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+    });
+    await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+      conversationId: conversation.conversationId,
+    });
+    await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+      failureSummary: "provider timeout",
+      keepPending: true,
+    });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeSpy = vi.spyOn(privateEngine, "executeCompactionCore").mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("manual-compact-ignores-maintenance-backoff"),
+      tokenBudget: 4_096,
+      force: true,
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("poor-reduction spend backoff blocks custom summarizers in the same compaction scope", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-31T12:35:00.000Z"));
+    try {
+      const engine = createEngineWithConfig({
+        summarySpendBackoffMs: 10 * 60 * 1000,
+      });
+      const sessionId = "custom-summarizer-poor-reduction-backoff";
+      await engine.ingest({
+        sessionId,
+        message: { role: "user", content: "custom summarize poor reduction" } as AgentMessage,
+      });
+      const summarize = vi.fn(async () => "custom summary");
+      const privateEngine = engine as unknown as {
+        compaction: {
+          compactUntilUnder: (input: {
+            summarize: (text: string, aggressive?: boolean) => Promise<string>;
+          }) => Promise<unknown>;
+        };
+      };
+      vi.spyOn(privateEngine.compaction, "compactUntilUnder").mockImplementation(async (input) => {
+        await input.summarize("source text for custom summarizer");
+        return {
+          success: false,
+          rounds: 1,
+          finalTokens: 3_500,
+        };
+      });
+
+      const first = await engine.compact({
+        sessionId,
+        sessionFile: createSessionFilePath("custom-summarizer-poor-reduction-backoff"),
+        tokenBudget: 4_096,
+        currentTokenCount: 4_096,
+        force: true,
+        legacyParams: { summarize },
+      });
+      expect(first.reason).toBe("could not reach target");
+      expect(summarize).toHaveBeenCalledTimes(1);
+
+      const second = await engine.compact({
+        sessionId,
+        sessionFile: createSessionFilePath("custom-summarizer-poor-reduction-backoff-retry"),
+        tokenBudget: 4_096,
+        currentTokenCount: 4_096,
+        force: true,
+        legacyParams: { summarize },
+      });
+      expect(second.reason).toBe("summary spend backoff open");
+      expect(summarize).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("afterTurn refreshes threshold debt while retry backoff is active without compacting", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-31T12:30:00.000Z"));
+    try {
+      const engine = createEngineWithConfig({ freshTailCount: 1 });
+      const sessionId = "after-turn-records-debt-during-backoff";
+      await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation!.conversationId,
+        reason: "threshold",
+        tokenBudget: 600,
+        currentTokenCount: 300,
+      });
+      await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+        conversationId: conversation!.conversationId,
+      });
+      await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
+        conversationId: conversation!.conversationId,
+        failureSummary: "provider timeout",
+        keepPending: true,
+      });
+      const before = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation!.conversationId);
+      const privateEngine = engine as unknown as {
+        scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+      };
+      const scheduleSpy = vi
+        .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+        .mockImplementation(() => undefined);
+      const compactSpy = vi.spyOn(engine, "compact");
+
+      await engine.afterTurn({
+        sessionId,
+        sessionFile: createSessionFilePath("after-turn-records-debt-during-backoff"),
+        messages: [makeMessage({ role: "assistant", content: "fresh projected turn" })],
+        prePromptMessageCount: 0,
+        tokenBudget: 600,
+        runtimeContext: { currentTokenCount: 300 },
+      });
+
+      const after = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation!.conversationId);
+      expect(compactSpy).not.toHaveBeenCalled();
+      expect(scheduleSpy).toHaveBeenCalled();
+      expect(after?.pending).toBe(true);
+      expect(after?.running).toBe(false);
+      expect(after?.nextAttemptAfter?.toISOString()).toBe(
+        before?.nextAttemptAfter?.toISOString(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("assemble() leaves pending threshold debt for post-turn maintenance while under budget", async () => {
@@ -12780,6 +13282,45 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
     expect(consumeSpy).toHaveBeenCalledTimes(1);
     expect(assembleResult.messages).toHaveLength(1);
+  });
+
+  it("assemble() degrades instead of spending during active deferred retry backoff", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-deferred-compaction-backoff-degrades";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+    });
+    await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+      conversationId: conversation.conversationId,
+    });
+    await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+      failureSummary: "provider timeout",
+      keepPending: true,
+    });
+    const executeSpy = vi.spyOn(privateEngine, "executeCompactionCore");
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "hello ".repeat(200) })],
+      tokenBudget: 10,
+    });
+
+    expect(executeSpy).not.toHaveBeenCalled();
+    expect(assembleResult.messages).toHaveLength(1);
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(true);
   });
 
   it("maintain() uses the stricter current token budget for deferred threshold debt", async () => {
@@ -13880,6 +14421,52 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
         },
       }),
     );
+  });
+
+  it("caps model-backed large-file summarization calls per spend window", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-31T12:40:00.000Z"));
+    try {
+      const completeSpy = vi.fn(async () => ({
+        content: [{ type: "text", text: "large-file summary" }],
+      }));
+      const engine = createEngineWithDeps(
+        {
+          largeFileSummaryProvider: "openai-codex",
+          largeFileSummaryModel: "gpt-5.4",
+          summaryMaxCallsPerWindow: 1,
+          summaryCallWindowMs: 1_000,
+          summarySpendBackoffMs: 30 * 60 * 1000,
+        },
+        {
+          complete: completeSpy,
+          resolveModel: vi.fn((modelRef?: string, providerHint?: string) => ({
+            provider: providerHint ?? "openai-codex",
+            model: modelRef ?? "gpt-5.4",
+          })),
+        },
+      );
+      const privateEngine = engine as unknown as {
+        resolveLargeFileTextSummarizer: (params?: {
+          conversationId?: number;
+        }) => Promise<((prompt: string) => Promise<string | null>) | undefined>;
+      };
+
+      const summarizeText = await privateEngine.resolveLargeFileTextSummarizer({
+        conversationId: 123,
+      });
+      expect(summarizeText).toBeTypeOf("function");
+
+      await expect(summarizeText!("Large file prompt 1")).resolves.toBe("large-file summary");
+      await expect(summarizeText!("Large file prompt 2")).resolves.toBeNull();
+      vi.advanceTimersByTime(1_001);
+      await expect(summarizeText!("Large file prompt 3")).resolves.toBeNull();
+      vi.advanceTimersByTime(30 * 60 * 1000);
+      await expect(summarizeText!("Large file prompt 4")).resolves.toBe("large-file summary");
+      expect(completeSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("passes context-engine runtime llm and session identity to compaction summaries", async () => {

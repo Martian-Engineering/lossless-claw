@@ -206,6 +206,68 @@ describe("Circuit Breaker", () => {
     expect(blocked.compacted).toBe(false);
   });
 
+  it("does not reclassify repeated auth failures as summary spend failures", async () => {
+    const authConfig = createTestConfig({
+      circuitBreakerThreshold: 3,
+      summaryMaxCallsPerWindow: 1,
+      summaryCallWindowMs: 10 * 60 * 1000,
+      summarySpendBackoffMs: 30 * 60 * 1000,
+    });
+    const authDb = new DatabaseSync(":memory:");
+    const authEngine = new LcmContextEngine(createTestDeps(authConfig), authDb);
+    const authSessionFile = join(tmpDir, `auth-spend-${randomUUID()}.jsonl`);
+    writeFileSync(
+      authSessionFile,
+      Array.from({ length: 8 }, (_, index) =>
+        JSON.stringify({
+          message: {
+            role: index % 2 === 0 ? "user" : "assistant",
+            content: [{ type: "text", text: `auth spend message ${index} ${"x".repeat(200)}` }],
+          },
+        }),
+      ).join("\n") + "\n",
+    );
+    await authEngine.bootstrap({
+      sessionId: "auth-spend-session",
+      sessionKey: "agent:main:auth-spend",
+      sessionFile: authSessionFile,
+    });
+
+    let callCount = 0;
+    const failingSummarizer = async () => {
+      callCount++;
+      throw makeAuthError();
+    };
+
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        const result = await authEngine.compact({
+          sessionId: "auth-spend-session",
+          sessionKey: "agent:main:auth-spend",
+          sessionFile: authSessionFile,
+          tokenBudget: 5000,
+          force: true,
+          legacyParams: { summarize: failingSummarizer },
+        });
+        expect(result.reason).toContain("provider auth failure");
+      }
+
+      const blocked = await authEngine.compact({
+        sessionId: "auth-spend-session",
+        sessionKey: "agent:main:auth-spend",
+        sessionFile: authSessionFile,
+        tokenBudget: 5000,
+        force: true,
+        legacyParams: { summarize: failingSummarizer },
+      });
+
+      expect(callCount).toBe(3);
+      expect(blocked.reason).toBe("circuit breaker open");
+    } finally {
+      try { authDb.close(); } catch {}
+    }
+  });
+
   it("should auto-reset after cooldown", async () => {
     await engine.bootstrap({ sessionId, sessionFile, sessionKey });
     

@@ -178,12 +178,26 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   const hasRawTokensOutsideTail = maintenanceColumns.some(
     (col) => col.name === "raw_tokens_outside_tail",
   );
+  const hasRetryAttempts = maintenanceColumns.some(
+    (col) => col.name === "retry_attempts",
+  );
+  const hasNextAttemptAfter = maintenanceColumns.some(
+    (col) => col.name === "next_attempt_after",
+  );
 
   if (!hasProjectedTokenCount) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN projected_token_count INTEGER`);
   }
   if (!hasRawTokensOutsideTail) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN raw_tokens_outside_tail INTEGER`);
+  }
+  if (!hasRetryAttempts) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_maintenance ADD COLUMN retry_attempts INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+  if (!hasNextAttemptAfter) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN next_attempt_after TEXT`);
   }
 }
 
@@ -1082,6 +1096,8 @@ export function runLcmMigrations(
       current_token_count INTEGER,
       projected_token_count INTEGER,
       raw_tokens_outside_tail INTEGER,
+      retry_attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_after TEXT,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 

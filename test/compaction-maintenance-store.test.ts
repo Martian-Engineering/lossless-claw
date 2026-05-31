@@ -92,4 +92,110 @@ describe("CompactionMaintenanceStore", () => {
       rawTokensOutsideTail: 320,
     });
   });
+
+  it("records retry backoff after failures and clears it after success", async () => {
+    const db = createTestDb();
+    const { fts5Available } = getLcmDbFeatures(db);
+    const conversationStore = new ConversationStore(db, { fts5Available });
+    const conversation = await conversationStore.createConversation({
+      sessionId: "maintenance-store-retry-session",
+      sessionKey: "agent:main:maintenance-store:3",
+    });
+    const store = new CompactionMaintenanceStore(db);
+    const firstFinishedAt = new Date("2026-05-31T12:00:00.000Z");
+    const secondFinishedAt = new Date("2026-05-31T12:05:00.000Z");
+
+    await store.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+    });
+    await store.markProactiveCompactionRunning({
+      conversationId: conversation.conversationId,
+    });
+    await store.markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+      failureSummary: "provider timeout",
+      finishedAt: firstFinishedAt,
+    });
+
+    const failed = await store.getConversationCompactionMaintenance(conversation.conversationId);
+    expect(failed?.pending).toBe(true);
+    expect(failed?.running).toBe(false);
+    expect(failed?.retryAttempts).toBe(1);
+    expect(failed?.nextAttemptAfter?.toISOString()).toBe("2026-05-31T12:05:00.000Z");
+
+    await store.markProactiveCompactionRunning({
+      conversationId: conversation.conversationId,
+    });
+    await store.markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+      failureSummary: "provider timeout",
+      finishedAt: secondFinishedAt,
+    });
+
+    const failedAgain = await store.getConversationCompactionMaintenance(conversation.conversationId);
+    expect(failedAgain?.retryAttempts).toBe(2);
+    expect(failedAgain?.nextAttemptAfter?.toISOString()).toBe("2026-05-31T12:15:00.000Z");
+
+    for (let attempt = 3; attempt <= 8; attempt += 1) {
+      await store.markProactiveCompactionRunning({
+        conversationId: conversation.conversationId,
+      });
+      await store.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "provider timeout",
+        finishedAt: new Date(`2026-05-31T12:${String(10 + attempt).padStart(2, "0")}:00.000Z`),
+      });
+    }
+
+    const capped = await store.getConversationCompactionMaintenance(conversation.conversationId);
+    expect(capped?.retryAttempts).toBe(8);
+    expect(capped?.nextAttemptAfter?.getTime()).toBe(
+      new Date("2026-05-31T12:18:00.000Z").getTime() + 30 * 60 * 1000,
+    );
+
+    await store.markProactiveCompactionRunning({
+      conversationId: conversation.conversationId,
+    });
+    await store.markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+      failureSummary: null,
+      keepPending: false,
+    });
+
+    const recovered = await store.getConversationCompactionMaintenance(conversation.conversationId);
+    expect(recovered?.pending).toBe(false);
+    expect(recovered?.running).toBe(false);
+    expect(recovered?.retryAttempts).toBe(0);
+    expect(recovered?.nextAttemptAfter).toBeNull();
+  });
+
+  it("does not add deferred retry backoff for provider auth failures", async () => {
+    const db = createTestDb();
+    const { fts5Available } = getLcmDbFeatures(db);
+    const conversationStore = new ConversationStore(db, { fts5Available });
+    const conversation = await conversationStore.createConversation({
+      sessionId: "maintenance-store-auth-session",
+      sessionKey: "agent:main:maintenance-store:4",
+    });
+    const store = new CompactionMaintenanceStore(db);
+
+    await store.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+    });
+    await store.markProactiveCompactionRunning({
+      conversationId: conversation.conversationId,
+    });
+    await store.markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+      failureSummary: "provider auth failure",
+    });
+
+    const record = await store.getConversationCompactionMaintenance(conversation.conversationId);
+    expect(record?.pending).toBe(true);
+    expect(record?.running).toBe(false);
+    expect(record?.retryAttempts).toBe(0);
+    expect(record?.nextAttemptAfter).toBeNull();
+  });
 });

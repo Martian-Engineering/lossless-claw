@@ -168,6 +168,18 @@
       "label": "Summary Timeout (ms)",
       "help": "Maximum time to wait for a single model-backed LCM summarizer call before timing out"
     },
+    "summaryCallWindowMs": {
+      "label": "Summary Call Window (ms)",
+      "help": "Rolling window used by the summarization spend guard"
+    },
+    "summaryMaxCallsPerWindow": {
+      "label": "Summary Max Calls Per Window",
+      "help": "Maximum model-backed summarization calls per session/window before Lossless opens a non-auth spend backoff"
+    },
+    "summarySpendBackoffMs": {
+      "label": "Summary Spend Backoff (ms)",
+      "help": "Cooldown after the summarization spend guard opens"
+    },
     "maxAssemblyTokenBudget": {
       "label": "Max Assembly Token Budget",
       "help": "Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. Set for smaller context-window models (e.g., 30000 for 32k models)"
@@ -407,6 +419,18 @@
         "minimum": 1
       },
       "summaryTimeoutMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "summaryCallWindowMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "summaryMaxCallsPerWindow": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "summarySpendBackoffMs": {
         "type": "integer",
         "minimum": 1
       },

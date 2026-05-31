@@ -15,6 +15,8 @@ export type ConversationCompactionMaintenanceRecord = {
   currentTokenCount: number | null;
   projectedTokenCount: number | null;
   rawTokensOutsideTail: number | null;
+  retryAttempts: number;
+  nextAttemptAfter: Date | null;
   updatedAt: Date;
 };
 
@@ -31,8 +33,28 @@ type ConversationCompactionMaintenanceRow = {
   current_token_count: number | null;
   projected_token_count: number | null;
   raw_tokens_outside_tail: number | null;
+  retry_attempts: number;
+  next_attempt_after: string | null;
   updated_at: string;
 };
+
+const DEFERRED_COMPACTION_RETRY_BASE_MS = 5 * 60 * 1000;
+const DEFERRED_COMPACTION_RETRY_MAX_MS = 30 * 60 * 1000;
+
+function computeDeferredCompactionRetryDelayMs(attempts: number): number {
+  const safeAttempts = Number.isFinite(attempts) ? Math.max(1, Math.floor(attempts)) : 1;
+  const multiplier = Math.min(2 ** (safeAttempts - 1), 64);
+  return Math.min(DEFERRED_COMPACTION_RETRY_BASE_MS * multiplier, DEFERRED_COMPACTION_RETRY_MAX_MS);
+}
+
+function shouldBackOffDeferredCompactionFailure(failureSummary: string | null | undefined): boolean {
+  if (failureSummary == null) {
+    return false;
+  }
+  return !/\b(provider auth failure|summary provider circuit breaker is open)\b/i.test(
+    failureSummary,
+  );
+}
 
 function toMaintenanceRecord(
   row: ConversationCompactionMaintenanceRow,
@@ -50,6 +72,11 @@ function toMaintenanceRecord(
     currentTokenCount: row.current_token_count,
     projectedTokenCount: row.projected_token_count,
     rawTokensOutsideTail: row.raw_tokens_outside_tail,
+    retryAttempts:
+      typeof row.retry_attempts === "number" && Number.isFinite(row.retry_attempts)
+        ? Math.max(0, Math.floor(row.retry_attempts))
+        : 0,
+    nextAttemptAfter: parseUtcTimestampOrNull(row.next_attempt_after),
     updatedAt: parseUtcTimestampOrNull(row.updated_at) ?? new Date(0),
   };
 }
@@ -84,6 +111,14 @@ function mergeMaintenanceRecord(
       patch.rawTokensOutsideTail !== undefined
         ? patch.rawTokensOutsideTail
         : existing?.rawTokensOutsideTail ?? null,
+    retryAttempts:
+      patch.retryAttempts !== undefined
+        ? Math.max(0, Math.floor(patch.retryAttempts))
+        : existing?.retryAttempts ?? 0,
+    nextAttemptAfter:
+      patch.nextAttemptAfter !== undefined
+        ? patch.nextAttemptAfter
+        : existing?.nextAttemptAfter ?? null,
     updatedAt: new Date(),
   };
 }
@@ -122,6 +157,8 @@ export class CompactionMaintenanceStore {
            current_token_count,
            projected_token_count,
            raw_tokens_outside_tail,
+           retry_attempts,
+           next_attempt_after,
            updated_at
          FROM conversation_compaction_maintenance
          WHERE conversation_id = ?`,
@@ -139,17 +176,19 @@ export class CompactionMaintenanceStore {
            conversation_id,
            pending,
            requested_at,
-         reason,
-         running,
-         last_started_at,
-         last_finished_at,
-         last_failure_summary,
-         token_budget,
-         current_token_count,
-         projected_token_count,
-         raw_tokens_outside_tail,
-         updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+           reason,
+           running,
+           last_started_at,
+           last_finished_at,
+           last_failure_summary,
+           token_budget,
+           current_token_count,
+           projected_token_count,
+           raw_tokens_outside_tail,
+           retry_attempts,
+           next_attempt_after,
+           updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(conversation_id) DO UPDATE SET
            pending = excluded.pending,
            requested_at = excluded.requested_at,
@@ -162,6 +201,8 @@ export class CompactionMaintenanceStore {
            current_token_count = excluded.current_token_count,
            projected_token_count = excluded.projected_token_count,
            raw_tokens_outside_tail = excluded.raw_tokens_outside_tail,
+           retry_attempts = excluded.retry_attempts,
+           next_attempt_after = excluded.next_attempt_after,
            updated_at = datetime('now')`,
       )
       .run(
@@ -177,6 +218,8 @@ export class CompactionMaintenanceStore {
         record.currentTokenCount ?? null,
         record.projectedTokenCount ?? null,
         record.rawTokensOutsideTail ?? null,
+        record.retryAttempts,
+        record.nextAttemptAfter?.toISOString() ?? null,
       );
   }
 
@@ -226,10 +269,19 @@ export class CompactionMaintenanceStore {
     finishedAt?: Date;
     failureSummary?: string | null;
     keepPending?: boolean;
+    nextAttemptAfter?: Date | null;
   }): Promise<void> {
     const existing = await this.getConversationCompactionMaintenance(input.conversationId);
     const finishedAt = input.finishedAt ?? new Date();
     const isFailure = input.failureSummary != null;
+    const shouldBackOff = shouldBackOffDeferredCompactionFailure(input.failureSummary);
+    const retryAttempts = shouldBackOff ? (existing?.retryAttempts ?? 0) + 1 : 0;
+    const nextAttemptAfter =
+      input.nextAttemptAfter !== undefined
+        ? input.nextAttemptAfter
+        : shouldBackOff
+          ? new Date(finishedAt.getTime() + computeDeferredCompactionRetryDelayMs(retryAttempts))
+          : null;
     await this.saveConversationCompactionMaintenance(
       mergeMaintenanceRecord(input.conversationId, existing, {
         pending: input.keepPending ?? isFailure,
@@ -239,6 +291,8 @@ export class CompactionMaintenanceStore {
           input.failureSummary === undefined
             ? existing?.lastFailureSummary ?? null
             : input.failureSummary,
+        retryAttempts,
+        nextAttemptAfter,
       }),
     );
   }

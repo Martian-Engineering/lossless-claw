@@ -58,6 +58,9 @@ Most installations only need to override a handful of keys. If you want a comple
   "expansionModel": "",
   "delegationTimeoutMs": 120000,
   "summaryTimeoutMs": 60000,
+  "summaryCallWindowMs": 600000,
+  "summaryMaxCallsPerWindow": 24,
+  "summarySpendBackoffMs": 1800000,
   "timezone": "America/Los_Angeles",
   "pruneHeartbeatOk": false,
   "transcriptGcEnabled": false,
@@ -205,6 +208,9 @@ the raw copied transcript.
 | `expansionProvider` | `string` | `""` | `LCM_EXPANSION_PROVIDER` | `lcm_expand_query` sub-agent provider hint for bare model names. |
 | `delegationTimeoutMs` | `integer` | `120000` | `LCM_DELEGATION_TIMEOUT_MS` | Maximum time to wait for delegated expansion work. `lcm_expand_query` advertises a dynamic tool `timeoutMs` default with 30 seconds of extra RPC headroom so OpenClaw's tool watchdog does not fire before this wait completes. |
 | `summaryTimeoutMs` | `integer` | `60000` | `LCM_SUMMARY_TIMEOUT_MS` | Maximum time to wait for one model-backed summarizer call. |
+| `summaryCallWindowMs` | `integer` | `600000` | `LCM_SUMMARY_CALL_WINDOW_MS` | Rolling window for the per-session summarization spend guard. |
+| `summaryMaxCallsPerWindow` | `integer` | `24` | `LCM_SUMMARY_MAX_CALLS_PER_WINDOW` | Maximum model-backed summarization calls per session/window before Lossless opens a non-auth spend backoff. |
+| `summarySpendBackoffMs` | `integer` | `1800000` | `LCM_SUMMARY_SPEND_BACKOFF_MS` | Cooldown after the summarization spend guard opens. |
 | `customInstructions` | `string` | `""` | `LCM_CUSTOM_INSTRUCTIONS` | Extra natural-language instructions injected into every summarization prompt. |
 
 Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capability. If you configure an explicit Lossless summary model (`summaryModel`, `largeFileSummaryModel`, or `fallbackProviders`), OpenClaw must allow that runtime LLM override under `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`. `openclaw doctor --fix` can add the minimal policy entries for configured Lossless summary models. Delegated expansion calls use OpenClaw's runtime sub-agent layer; explicit `expansionModel` values require `plugins.entries.lossless-claw.subagent.allowModelOverride` and a matching `subagent.allowedModels` entry, or `"*"` if you intentionally trust any expansion target. `openclaw doctor --fix` can add the minimal subagent policy, and `lcm_expand_query` retries once without the override if the host rejects it.
