@@ -5432,9 +5432,39 @@ export class LcmContextEngine implements ContextEngine {
           // No persisted conversation exists yet. Prefer the transcript over
           // the runtime delta so foreground prompts that are omitted from
           // afterTurn's messages array are not lost.
+          let sessionFileState: { size: number } | undefined;
+          try {
+            const sessionFileStats = await stat(params.sessionFile);
+            sessionFileState = { size: sessionFileStats.size };
+          } catch {
+            // Missing files are common for brand-new live sessions; allow the
+            // runtime batch to seed the conversation in that case.
+          }
           const historicalMessages = await readLeafPathMessages(params.sessionFile);
+          if (historicalMessages.length === 0) {
+            if ((sessionFileState?.size ?? 0) > 0) {
+              this.deps.log.warn(
+                `[lcm] afterTurn: initial transcript read returned no messages from non-empty file; skipping live afterTurn persistence to avoid anchoring past unreadable history session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} sessionFile=${params.sessionFile}`,
+              );
+              return { importedMessages: 0, blockedByImportCap: false, hasOverlap: false };
+            }
+            return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+          }
+          if (batchLooksLikeHeartbeatAckTurn(historicalMessages)) {
+            return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+          }
+          const bootstrapMessages = trimBootstrapMessagesToBudget(
+            historicalMessages,
+            resolveBootstrapMaxTokens(this.config),
+          );
+          if (bootstrapMessages.length === 0) {
+            this.deps.log.warn(
+              `[lcm] afterTurn: initial transcript import exceeded bootstrap budget; skipping live afterTurn persistence to avoid anchoring past unreconciled history session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} sessionFile=${params.sessionFile} sourceMessages=${historicalMessages.length}`,
+            );
+            return { importedMessages: 0, blockedByImportCap: true, hasOverlap: false };
+          }
           let importedMessages = 0;
-          for (const message of historicalMessages) {
+          for (const message of bootstrapMessages) {
             const result = await this.ingestSingle({
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
@@ -5462,7 +5492,11 @@ export class LcmContextEngine implements ContextEngine {
               });
             }
           }
-          return { importedMessages, blockedByImportCap: false, hasOverlap: true };
+          return {
+            importedMessages,
+            blockedByImportCap: bootstrapMessages.length < historicalMessages.length,
+            hasOverlap: true,
+          };
         }
 
         // OpenClaw can submit the foreground prompt outside the mutable

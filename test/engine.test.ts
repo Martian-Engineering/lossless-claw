@@ -8830,6 +8830,92 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ]);
   });
 
+  it("afterTurn skips assistant-only rollover when the replacement transcript is unreadable", async () => {
+    const engine = createEngine();
+    const firstSessionId = "after-turn-missed-reset-unreadable-1";
+    const secondSessionId = "after-turn-missed-reset-unreadable-2";
+    const sessionKey = "agent:main:test:after-turn-missed-reset-unreadable";
+    const oldSessionFile = createSessionFilePath("after-turn-missed-reset-unreadable-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old unreadable user" },
+      { role: "assistant", content: "old unreadable assistant" },
+    ]);
+
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+    const originalConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(originalConversation).not.toBeNull();
+
+    rmSync(oldSessionFile, { force: true });
+    const unreadableSessionFile = createSessionFilePath("after-turn-missed-reset-unreadable-new");
+    writeFileSync(unreadableSessionFile, '{"message":', "utf8");
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: unreadableSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "new unreadable assistant delta" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const archivedConversation = await engine.getConversationStore().getConversation(
+      originalConversation!.conversationId,
+    );
+    expect(archivedConversation?.active).toBe(false);
+    expect(archivedConversation?.archivedAt).not.toBeNull();
+
+    const activeConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeConversation).toBeNull();
+  });
+
+  it("afterTurn bounds initial transcript imports to the bootstrap budget", async () => {
+    const engine = createEngineWithConfig({ bootstrapMaxTokens: 120 });
+    const sessionId = "after-turn-initial-transcript-budget";
+    const sessionKey = "agent:main:test:after-turn-initial-transcript-budget";
+    const sessionFile = createSessionFilePath("after-turn-initial-transcript-budget");
+    const transcriptMessages = Array.from({ length: 60 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `initial afterTurn bulk transcript ${index} ${"x".repeat(200)}`,
+    })) as Array<{ role: AgentMessage["role"]; content: string }>;
+    writeLeafTranscript(sessionFile, transcriptMessages);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: transcriptMessages[transcriptMessages.length - 1]!.content,
+        }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.length).toBeGreaterThan(0);
+    expect(stored.length).toBeLessThan(10);
+    expect(stored.map((message) => message.content)).toContain(
+      transcriptMessages[transcriptMessages.length - 1]!.content,
+    );
+  });
+
   it("afterTurn skips persistence when full reread finds no anchor and imports nothing", async () => {
     const engine = createEngineWithDeps({}, {
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -10189,29 +10275,32 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
     const sessionId = "after-turn-heartbeat-prune";
     const sessionKey = "agent:main:test:after-turn-heartbeat-prune";
+    const heartbeatMessages = [
+      makeMessage({
+        role: "user",
+        content:
+          "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+      }),
+      makeMessage({
+        role: "tool",
+        content: "# HEARTBEAT.md\n\n## Worker heartbeat (minimal)",
+      }),
+      makeMessage({
+        role: "tool",
+        content: '{\n  "active_session_ids": []\n}',
+      }),
+      makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+    ];
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-prune");
+    writeLeafTranscriptMessages(sessionFile, heartbeatMessages);
 
     const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
     const compactSpy = vi.spyOn(engine, "compact");
     await engine.afterTurn({
       sessionId,
       sessionKey,
-      sessionFile: createSessionFilePath("after-turn-heartbeat-prune"),
-      messages: [
-        makeMessage({
-          role: "user",
-          content:
-            "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
-        }),
-        makeMessage({
-          role: "tool",
-          content: "# HEARTBEAT.md\n\n## Worker heartbeat (minimal)",
-        }),
-        makeMessage({
-          role: "tool",
-          content: '{\n  "active_session_ids": []\n}',
-        }),
-        makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
-      ],
+      sessionFile,
+      messages: heartbeatMessages,
       prePromptMessageCount: 0,
       tokenBudget: 4096,
     });
@@ -10228,6 +10317,33 @@ describe("LcmContextEngine fidelity and token budget", () => {
         `heartbeat ack messages for conversation=${conversation!.conversationId} session=${sessionId} sessionKey=${sessionKey}`,
       ),
     );
+  });
+
+  it("afterTurn heartbeat flag skips non-empty transcript imports", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-flag-transcript-skip";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-flag-transcript-skip";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-flag-transcript-skip");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "heartbeat transcript user" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).toBeNull();
   });
 });
 
