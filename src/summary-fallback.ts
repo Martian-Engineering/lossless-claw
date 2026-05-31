@@ -22,7 +22,9 @@ const FALLBACK_DIRECTIVE_SHAPED_PATTERNS = [
     ].join("|"),
     "i",
   ),
-  /\b(?:dan\s+mode|act\s+as\s+dan|pretend\s+to\s+be\s+dan|answer\b[^.!?\n]{0,80}\bas\s+dan)\b/i,
+  /\bdan\s+mode\b/i,
+  /\banswer\s+(?:(?:every|all)\s+)?(?:future\s+)?(?:users?|requests?|questions?|prompts?|messages?)\s+as\s+dan\b/i,
+  /\b(?:act\s+as|pretend\s+to\s+be)\s+DAN\b/,
 ];
 
 export function sanitizeDeterministicFallbackText(text: string): {

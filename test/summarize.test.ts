@@ -2133,13 +2133,16 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     });
 
     it("shared deterministic fallback keeps ordinary Dan mentions", () => {
-      const summary = buildDeterministicFallbackSummary(
+      for (const text of [
         "Dan fixed the cache key regression and the final build passed locally.",
-        900,
-      );
+        "The correct answer was saved as Dan for the fixture.",
+        "The actor should act as Dan in the staging example.",
+      ]) {
+        const summary = buildDeterministicFallbackSummary(text, 900);
 
-      expect(summary).toBe("Dan fixed the cache key regression and the final build passed locally.");
-      expect(summary).not.toContain("directive-shaped untrusted content omitted");
+        expect(summary).toBe(text);
+        expect(summary).not.toContain("directive-shaped untrusted content omitted");
+      }
     });
 
     it("shared deterministic fallback catches contextual all-caps DAN jailbreak markers", () => {
