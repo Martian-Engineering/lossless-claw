@@ -7358,22 +7358,24 @@ export class LcmContextEngine implements ContextEngine {
         ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
       ].join(" ");
 
-      await this.withSessionQueue(
-        this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-        async () =>
-          this.conversationStore.withTransaction(async () => {
-            await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
-              phase: "assemble",
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              createReplacement: false,
-            });
-          }),
-        {
-          operationName: "assembleLifecycleGuard",
-          context: sessionLabel,
-        },
-      );
+      if (params.sessionKey?.trim()) {
+        await this.withSessionQueue(
+          this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+          async () =>
+            this.conversationStore.withTransaction(async () => {
+              await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+                phase: "assemble",
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                createReplacement: false,
+              });
+            }),
+          {
+            operationName: "assembleLifecycleGuard",
+            context: sessionLabel,
+          },
+        );
+      }
 
       const conversation = await this.conversationStore.getConversationForSession({
         sessionId: params.sessionId,
