@@ -58,6 +58,23 @@ export type ContextEngineInfo = {
   version: string;
   ownsCompaction?: boolean;
   turnMaintenanceMode?: "background" | "inline" | string;
+  hostRequirements?: Partial<Record<ContextEngineOperation, ContextEngineHostRequirements>>;
+};
+
+export type ContextEngineOperation = "agent-run" | "manual-compact" | "subagent-spawn";
+
+export type ContextEngineHostCapability =
+  | "bootstrap"
+  | "assemble-before-prompt"
+  | "after-turn"
+  | "maintain"
+  | "compact"
+  | "runtime-llm-complete"
+  | "thread-bootstrap-projection";
+
+export type ContextEngineHostRequirements = {
+  requiredCapabilities: ContextEngineHostCapability[];
+  unsupportedMessage?: string;
 };
 
 export type PluginCommandContext = {

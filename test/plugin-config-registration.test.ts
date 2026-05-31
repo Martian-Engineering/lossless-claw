@@ -652,6 +652,39 @@ describe("lcm plugin registration", () => {
     );
   });
 
+  it("does not combine summaryProvider with a provider-prefixed summaryModel for runtime LLM policy", () => {
+    const { api, warnLog } = buildApi({
+      enabled: true,
+      summaryProvider: "openai",
+      summaryModel: "openai/gpt-5.5",
+    });
+    api.config = {
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              summaryProvider: "openai",
+              summaryModel: "openai/gpt-5.5",
+            },
+            llm: {
+              allowModelOverride: true,
+              allowedModels: ["openai/gpt-5.5"],
+            },
+          },
+        },
+      },
+    } as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("openai/openai/gpt-5.5"),
+    );
+    expect(warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("Runtime LLM model override policy"),
+    );
+  });
+
   it("falls back to runtime plugin config for the startup banner when register runs before api.pluginConfig is populated", () => {
     const { api, infoLog } = buildApi(
       {},

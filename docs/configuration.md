@@ -2,6 +2,15 @@
 
 Lossless-claw reads plugin configuration from `plugins.entries.lossless-claw.config`.
 
+Lossless-claw requires OpenClaw `2026.5.22` or newer so the host can enforce
+context-engine runtime capabilities before an agent run starts. Agent runs need
+a native host that provides the full context-engine lifecycle: session bootstrap,
+pre-prompt assembly, after-turn ingestion, maintenance, compaction, and runtime
+LLM completion. Native Codex and Pi embedded runs provide those capabilities;
+generic CLI harnesses such as `claude-cli` and `codex-cli` do not. If you must
+use a generic CLI harness, set `plugins.slots.contextEngine` to `legacy` for
+that run instead of `lossless-claw`.
+
 Configuration precedence is:
 
 1. Environment variables
@@ -33,6 +42,9 @@ Most installations only need to override a handful of keys. If you want a comple
   "incrementalMaxDepth": 1,
   "leafChunkTokens": 20000,
   "summaryPrefixTargetTokens": 20000,
+  "maxSweepIterations": 12,
+  "sweepDeadlineMs": 120000,
+  "compactUntilUnderDeadlineMs": 300000,
   "bootstrapMaxTokens": 6000,
   "leafTargetTokens": 2400,
   "condensedTargetTokens": 2000,
@@ -138,11 +150,11 @@ openclaw plugins install --link /path/to/lossless-claw
 | `autoRotateSessionFiles.createBackups` | `boolean` | `false` | `LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS` | Creates or replaces the rolling `rotate-latest` SQLite backup before automatic session-file rotation. Manual `/lcm rotate` backups are always created. |
 | `autoRotateSessionFiles.sizeBytes` | `integer` | `2097152` | `LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES` | Byte threshold that triggers automatic session-file rotation. |
 | `autoRotateSessionFiles.startup` | `"rotate" \| "warn" \| "off"` | `"rotate"` | `LCM_AUTO_ROTATE_SESSION_FILES_STARTUP` | Startup behavior for oversized indexed OpenClaw session transcripts that also have active LCM bootstrap state. |
-| `autoRotateSessionFiles.runtime` | `"rotate" \| "warn" \| "off"` | `"rotate"` | `LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME` | Runtime behavior after `afterTurn()` and `maintain()` check the current transcript size. |
+| `autoRotateSessionFiles.runtime` | `"rotate" \| "warn" \| "off"` | `"rotate"` | `LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME` | Runtime behavior after post-turn checks. Runtime `rotate` logs deferral for active session JSONL rewrites and leaves direct rotation to startup or manual `/lcm rotate`. |
 
 > **Multi-profile note:** `OPENCLAW_STATE_DIR` (set by the host OpenClaw gateway) controls where state is stored. When two gateways run on the same host (e.g. separate bot personas), each gateway sets its own `OPENCLAW_STATE_DIR` and lossless-claw automatically uses that directory for the database, large-file payloads, auth-profile lookups, and legacy secrets — no per-profile plugin config is needed.
 
-Automatic session-file rotation rewrites only the live session transcript, keeps the active LCM conversation and durable history intact, and refreshes the bootstrap checkpoint. Startup rotation first scans OpenClaw's current indexed session stores for configured agents, then intersects those candidates with active LCM conversations and matching bootstrap file mappings. Automatic rotation does not create a SQLite backup by default; set `autoRotateSessionFiles.createBackups` to `true` to make runtime rotation replace the rolling `rotate-latest` backup and to make startup rotation create one pre-rotation LCM database backup for the batch before any transcript is rewritten. Manual `/lcm rotate` always keeps its backup-backed behavior regardless of this flag. Rotation never runs for ignored sessions, stateless sessions, or sessions without active LCM state. The preserved JSONL tail follows the existing rotate behavior, which is controlled by `freshTailCount`.
+Automatic session-file rotation rewrites only the live session transcript, keeps the active LCM conversation and durable history intact, and refreshes the bootstrap checkpoint. Startup rotation first scans OpenClaw's current indexed session stores for configured agents, then intersects those candidates with active LCM conversations and matching bootstrap file mappings. Runtime rotation checks from `afterTurn()` and `maintain()` intentionally do not directly rewrite active session JSONL because embedded prompt-lock fences can still be open while tool-call loops and host background maintenance overlap; runtime `rotate` logs a deferral until startup, manual `/lcm rotate`, or a future host-owned full-transcript rewrite primitive is available. Automatic rotation does not create a SQLite backup by default; set `autoRotateSessionFiles.createBackups` to `true` to make startup rotation create one pre-rotation LCM database backup for the batch before any transcript is rewritten. Manual `/lcm rotate` always keeps its backup-backed behavior regardless of this flag. Rotation never runs for ignored sessions, stateless sessions, or sessions without active LCM state. The preserved JSONL tail follows the existing rotate behavior, which is controlled by `freshTailCount`. Transcript GC uses the host-provided `rewriteTranscriptEntries` primitive and defers until host-approved background maintenance when `transcriptGcEnabled` is enabled.
 
 Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rotate:`. Startup emits one compact summary line with `phase=startup`, `action=summary`, `scanned`, `eligible`, `rotated`, `warned`, `skipped`, `durationMs`, `bytesRemoved`, and backup fields when a batch backup was created; quiet skips such as missing files, missing bootstrap mappings, and below-threshold files are counted there instead of producing one line per candidate. Rotation detail lines include `phase`, `action`, `sessionId`, `sessionKey`, `sessionFile`, `sizeBytes`, `thresholdBytes`, `durationMs`, `backupPath`, `bytesRemoved`, `preservedTailMessageCount`, and `checkpointSize`; real warning lines include the same available context plus `reason` or `error`.
 
@@ -162,6 +174,9 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `incrementalMaxDepth` | `integer` | alias of `sweepMaxDepth` | `LCM_INCREMENTAL_MAX_DEPTH` | Deprecated alias for `sweepMaxDepth`. Kept so existing configs continue to load. |
 | `leafChunkTokens` | `integer` | `20000` | `LCM_LEAF_CHUNK_TOKENS` | Maximum source-token budget for a leaf compaction chunk. Larger chunks reduce sweep frequency at the cost of slower individual summary calls. |
 | `summaryPrefixTargetTokens` | `integer` | derived | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | Optional target for summarized-prefix tokens after a full sweep. If unset, Lossless derives `max(condensedTargetTokens, min(leafChunkTokens, floor(contextThreshold * tokenBudget * 0.5)))`. |
+| `maxSweepIterations` | `integer` | `12` | `LCM_MAX_SWEEP_ITERATIONS` | Hard cap on summarizer passes within a single full sweep. On hitting the cap the sweep stops cleanly and returns the partial result; bounds how long a sweep can run on the turn-critical path. |
+| `sweepDeadlineMs` | `integer` | `120000` | `LCM_SWEEP_DEADLINE_MS` | Wall-clock budget for a single full sweep, in milliseconds. When exceeded the sweep stops before starting another pass, so a slow or rate-limited summarizer cannot hang the agent turn. |
+| `compactUntilUnderDeadlineMs` | `integer` | `300000` | `LCM_COMPACT_UNTIL_UNDER_DEADLINE_MS` | Wall-clock budget for a whole `compactUntilUnder` operation, in milliseconds. `compactUntilUnder` runs up to `maxRounds` sweeps; without this the worst case is `maxRounds × sweepDeadlineMs` (~20 min at the defaults). The deadline is shared into each round's sweep and checked before the next round. |
 | `bootstrapMaxTokens` | `integer` | `max(6000, floor(leafChunkTokens * 0.3))` | `LCM_BOOTSTRAP_MAX_TOKENS` | Maximum parent-history tokens imported when a new LCM conversation bootstraps. |
 | `leafTargetTokens` | `integer` | `2400` | `LCM_LEAF_TARGET_TOKENS` | Prompt target for leaf summary size. |
 | `condensedTargetTokens` | `integer` | `2000` | `LCM_CONDENSED_TARGET_TOKENS` | Prompt target for condensed summary size. |
@@ -181,11 +196,11 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `largeFileSummaryProvider` | `string` | `""` | `LCM_LARGE_FILE_SUMMARY_PROVIDER` | Large-file summarizer provider hint for bare model names. |
 | `expansionModel` | `string` | `""` | `LCM_EXPANSION_MODEL` | `lcm_expand_query` sub-agent model override. |
 | `expansionProvider` | `string` | `""` | `LCM_EXPANSION_PROVIDER` | `lcm_expand_query` sub-agent provider hint for bare model names. |
-| `delegationTimeoutMs` | `integer` | `120000` | `LCM_DELEGATION_TIMEOUT_MS` | Maximum time to wait for delegated expansion work. |
+| `delegationTimeoutMs` | `integer` | `120000` | `LCM_DELEGATION_TIMEOUT_MS` | Maximum time to wait for delegated expansion work. `lcm_expand_query` advertises a dynamic tool `timeoutMs` default with 30 seconds of extra RPC headroom so OpenClaw's tool watchdog does not fire before this wait completes. |
 | `summaryTimeoutMs` | `integer` | `60000` | `LCM_SUMMARY_TIMEOUT_MS` | Maximum time to wait for one model-backed summarizer call. |
 | `customInstructions` | `string` | `""` | `LCM_CUSTOM_INSTRUCTIONS` | Extra natural-language instructions injected into every summarization prompt. |
 
-Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capability. If you configure an explicit Lossless summary model (`summaryModel`, `largeFileSummaryModel`, or `fallbackProviders`), OpenClaw must allow that runtime LLM override under `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`. `openclaw doctor --fix` can add the minimal policy entries for configured Lossless summary models.
+Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capability. If you configure an explicit Lossless summary model (`summaryModel`, `largeFileSummaryModel`, or `fallbackProviders`), OpenClaw must allow that runtime LLM override under `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`. `openclaw doctor --fix` can add the minimal policy entries for configured Lossless summary models. Delegated expansion calls use OpenClaw's runtime sub-agent layer; explicit `expansionModel` values require `plugins.entries.lossless-claw.subagent.allowModelOverride` and a matching `subagent.allowedModels` entry, or `"*"` if you intentionally trust any expansion target. `openclaw doctor --fix` can add the minimal subagent policy, and `lcm_expand_query` retries once without the override if the host rejects it.
 
 ### Fallbacks, circuit breaking, and safety rails
 
@@ -224,11 +239,16 @@ Automatic compaction is threshold-only:
 - `afterTurn()` evaluates `contextThreshold` against the active token budget
 - below threshold, no automatic compaction runs and no leaf debt is recorded
 - at or above threshold, inline mode runs a threshold full sweep immediately
-- deferred mode records one coalesced `"threshold"` maintenance row and drains it in the background, `maintain()`, or pre-assembly
+- deferred mode records one coalesced `"threshold"` maintenance row and normally drains it in the background or host-approved `maintain()`
+- pre-assembly drain is reserved as an emergency safeguard when the live prompt is already over the active token budget
 
 Lossless still records prompt-cache telemetry for status and diagnostics, but cache hotness no longer delays threshold debt. Legacy `cacheAwareCompaction.*` and `dynamicLeafChunkTokens.*` settings remain accepted so existing OpenClaw config continues to load, but they do not change automatic compaction behavior.
 
 Full sweeps first run leaf passes until there are no more eligible raw-message chunks outside the fresh tail. Condensation is then driven by summarized-prefix pressure: the routine condensation phase obeys `sweepMaxDepth`, and if the summarized prefix still exceeds `summaryPrefixTargetTokens`, a pressure phase may use `condensedMinFanoutHard` and condense deeper. Total context pressure starts the sweep, but does not by itself force deeper condensation once the raw prefix has been summarized.
+
+A single sweep is bounded by both `maxSweepIterations` (a hard cap on summarizer passes) and `sweepDeadlineMs` (a wall-clock budget). When either limit is reached the sweep stops before starting another pass and returns the consistent partial result built so far, logging a `compactFullSweep stopped at …` warning. This keeps a slow or rate-limited summarizer from hanging the agent turn — remaining context pressure is picked up by the next sweep.
+
+Overflow recovery (`compactUntilUnder`) runs up to `maxRounds` sweeps to drive context under a target. Because every sweep re-arms its own `sweepDeadlineMs`, the whole operation is separately bounded by `compactUntilUnderDeadlineMs` (default 300000): the operation deadline is shared into each round's sweep — a sweep stops at whichever deadline is sooner — and is also checked before starting the next round. On hitting it, `compactUntilUnder` returns the consistent partial result and logs a `compactUntilUnder stopped at …` warning, so the worst case is the operation budget rather than `maxRounds × sweepDeadlineMs`.
 
 ### Prompt-aware eviction
 
@@ -306,7 +326,8 @@ Lossless-claw now defaults `proactiveThresholdCompactionMode` to `deferred`.
 - deferred mode records a single coalesced maintenance debt row per conversation
 - new deferred compaction debt is only created for `contextThreshold` pressure and uses reason `"threshold"`
 - `maintain()` consumes threshold debt when the host explicitly opts in to deferred execution
-- `assemble()` consumes pending threshold debt before building the next prompt
+- `assemble()` leaves pending threshold debt for after-turn background drain or host-approved `maintain()` while the live prompt is still within budget
+- `assemble()` only consumes pending threshold debt synchronously as an emergency safeguard when the live prompt estimate is already over the active token budget
 - old non-threshold debt from earlier builds is revalidated; if the conversation is no longer over threshold, it is cleared as a no-op
 - `/lcm status` / `/lossless status` shows the current maintenance state, including pending/running/last-failure details
 - status output also surfaces the latest API/cache telemetry as diagnostics, not as a deferral gate

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -118,16 +119,53 @@ type summarySource struct {
 
 // contextItemEntry represents one item in the active LCM context window.
 type contextItemEntry struct {
-	ordinal    int
-	itemType   string // "summary" or "message"
-	summaryID  string // set when itemType == "summary"
-	messageID  int64  // set when itemType == "message"
-	kind       string // "leaf", "condensed", or role for messages
-	depth      int    // summary depth (0 for leaves, 1+ for condensed)
-	tokenCount int
-	content    string // full sanitized content
-	preview    string // single-line preview for list
-	createdAt  string
+	ordinal                int
+	itemType               string // "summary", "message", or "focus_brief"
+	summaryID              string // set when itemType == "summary"
+	messageID              int64  // set when itemType == "message"
+	focusBriefID           string // set when itemType == "focus_brief"
+	kind                   string // "leaf", "condensed", role for messages, or "active"
+	depth                  int    // summary depth (0 for leaves, 1+ for condensed)
+	tokenCount             int
+	content                string // full sanitized content
+	preview                string // single-line preview for list
+	createdAt              string
+	summaryLatestAt        string
+	summaryMaxSourceSeq    int64
+	hasSummaryMaxSourceSeq bool
+}
+
+// focusBriefEntry represents a generated focus brief for a conversation.
+type focusBriefEntry struct {
+	briefID               string
+	conversationID        int64
+	prompt                string
+	content               string
+	status                string
+	tokenCount            int
+	targetTokens          int
+	createdAt             string
+	updatedAt             string
+	generatorRunID        string
+	generatorSessionKey   string
+	errorText             string
+	coveredLatestAt       string
+	coveredMessageSeq     int64
+	hasCoveredMessageSeq  bool
+	sourceContextHash     string
+	truncated             bool
+	postFocusMessageCount int
+	postFocusSummaryCount int
+	postFocusTokenCount   int
+	sourceContextChanged  bool
+	stale                 bool
+	sourceCount           int
+	citedCount            int
+	expandedCount         int
+	irrelevantCount       int
+	citedSummaryIDs       []string
+	expandedSummaryIDs    []string
+	preview               string
 }
 
 // summaryGraph is the in-memory DAG used by the summary drill-down view.
@@ -1312,6 +1350,12 @@ func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {
 	if err != nil {
 		return nil, err
 	}
+	summaryLatestAtExpr := "''"
+	if hasLatestAt, err := sqliteColumnExists(db, "summaries", "latest_at"); err != nil {
+		return nil, fmt.Errorf("check summaries.latest_at schema: %w", err)
+	} else if hasLatestAt {
+		summaryLatestAtExpr = "COALESCE(s.latest_at, '')"
+	}
 
 	rows, err := db.Query(fmt.Sprintf(`
 		SELECT
@@ -1338,13 +1382,17 @@ func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {
 			CASE
 				WHEN ci.item_type = 'summary' THEN COALESCE(s.created_at, '')
 				ELSE COALESCE(m.created_at, '')
-			END AS created_at
+			END AS created_at,
+			CASE
+				WHEN ci.item_type = 'summary' THEN %s
+				ELSE ''
+			END AS latest_at
 		FROM context_items ci
 		LEFT JOIN summaries s ON ci.summary_id = s.summary_id
 		LEFT JOIN messages m ON ci.message_id = m.message_id
 		WHERE ci.conversation_id = ?
 		ORDER BY ci.ordinal
-	`, messageDisplayContentSQL("m")), conversationID)
+	`, messageDisplayContentSQL("m"), summaryLatestAtExpr), conversationID)
 	if err != nil {
 		return nil, fmt.Errorf("query context items for conversation %d: %w", conversationID, err)
 	}
@@ -1366,11 +1414,15 @@ func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {
 			&item.tokenCount,
 			&content,
 			&item.createdAt,
+			&item.summaryLatestAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan context item: %w", err)
 		}
 		if summaryID.Valid {
 			item.summaryID = summaryID.String
+			if err := populateContextSummarySourceSeq(db, &item); err != nil {
+				return nil, err
+			}
 		}
 		if messageID.Valid {
 			item.messageID = messageID.Int64
@@ -1383,7 +1435,591 @@ func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate context items: %w", err)
 	}
-	return items, nil
+	brief, err := loadActiveFocusBriefForConversation(db, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	return applyFocusOverlayToContextItems(items, brief), nil
+}
+
+// populateContextSummarySourceSeq mirrors the runtime focus coverage lookup.
+func populateContextSummarySourceSeq(db *sql.DB, item *contextItemEntry) error {
+	if item.summaryID == "" {
+		return nil
+	}
+	exists, err := sqliteTableExists(db, "summary_parents")
+	if err != nil {
+		return fmt.Errorf("check summary_parents schema for context item %s: %w", item.summaryID, err)
+	}
+	if !exists {
+		return nil
+	}
+	exists, err = sqliteTableExists(db, "summary_messages")
+	if err != nil {
+		return fmt.Errorf("check summary_messages schema for context item %s: %w", item.summaryID, err)
+	}
+	if !exists {
+		return nil
+	}
+	exists, err = sqliteTableExists(db, "messages")
+	if err != nil {
+		return fmt.Errorf("check messages schema for context item %s: %w", item.summaryID, err)
+	}
+	if !exists {
+		return nil
+	}
+	var maxSeq sql.NullInt64
+	if err := db.QueryRow(`
+		WITH RECURSIVE source_summaries(summary_id) AS (
+			SELECT ?
+			UNION
+			SELECT sp.parent_summary_id
+			FROM summary_parents sp
+			JOIN source_summaries source ON source.summary_id = sp.summary_id
+		)
+		SELECT MAX(m.seq) AS max_seq
+		FROM source_summaries source
+		JOIN summary_messages sm ON sm.summary_id = source.summary_id
+		JOIN messages m ON m.message_id = sm.message_id
+	`, item.summaryID).Scan(&maxSeq); err != nil {
+		return fmt.Errorf("query context summary source seq for %s: %w", item.summaryID, err)
+	}
+	if maxSeq.Valid {
+		item.summaryMaxSourceSeq = maxSeq.Int64
+		item.hasSummaryMaxSourceSeq = true
+	}
+	return nil
+}
+
+// loadActiveFocusBriefForConversation returns the active focus overlay metadata.
+func loadActiveFocusBriefForConversation(db *sql.DB, conversationID int64) (*focusBriefEntry, error) {
+	exists, err := sqliteTableExists(db, "focus_briefs")
+	if err != nil {
+		return nil, fmt.Errorf("check focus brief schema: %w", err)
+	}
+	if !exists {
+		return nil, nil
+	}
+	var brief focusBriefEntry
+	var coveredLatestAt sql.NullString
+	var coveredMessageSeq sql.NullInt64
+	err = db.QueryRow(`
+		SELECT
+			brief_id,
+			conversation_id,
+			COALESCE(prompt, ''),
+			COALESCE(content, ''),
+			COALESCE(status, ''),
+			COALESCE(token_count, 0),
+			COALESCE(target_tokens, 0),
+			covered_latest_at,
+			covered_message_seq,
+			COALESCE(created_at, '')
+		FROM focus_briefs
+		WHERE conversation_id = ?
+		  AND status = 'active'
+		  AND TRIM(COALESCE(content, '')) != ''
+		ORDER BY created_at DESC, rowid DESC
+		LIMIT 1
+	`, conversationID).Scan(
+		&brief.briefID,
+		&brief.conversationID,
+		&brief.prompt,
+		&brief.content,
+		&brief.status,
+		&brief.tokenCount,
+		&brief.targetTokens,
+		&coveredLatestAt,
+		&coveredMessageSeq,
+		&brief.createdAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query active focus brief for conversation %d: %w", conversationID, err)
+	}
+	brief.content = sanitizeForTerminal(brief.content)
+	brief.prompt = sanitizeForTerminal(brief.prompt)
+	if coveredLatestAt.Valid {
+		brief.coveredLatestAt = coveredLatestAt.String
+	}
+	if coveredMessageSeq.Valid {
+		brief.coveredMessageSeq = coveredMessageSeq.Int64
+		brief.hasCoveredMessageSeq = true
+	}
+	return &brief, nil
+}
+
+// applyFocusOverlayToContextItems mirrors ContextAssembler.applyFocusOverlay.
+func applyFocusOverlayToContextItems(items []contextItemEntry, brief *focusBriefEntry) []contextItemEntry {
+	if brief == nil || strings.TrimSpace(brief.content) == "" {
+		return items
+	}
+
+	covered := make([]bool, len(items))
+	firstCoveredOrdinal := 0
+	foundCovered := false
+	for idx := range items {
+		if !contextSummaryCoveredByFocus(items[idx], brief) {
+			continue
+		}
+		covered[idx] = true
+		if !foundCovered || items[idx].ordinal < firstCoveredOrdinal {
+			firstCoveredOrdinal = items[idx].ordinal
+		}
+		foundCovered = true
+	}
+	if !foundCovered {
+		return items
+	}
+
+	focusContent := formatFocusBriefContextContent(brief)
+	focusItem := contextItemEntry{
+		ordinal:      firstCoveredOrdinal,
+		itemType:     "focus_brief",
+		focusBriefID: brief.briefID,
+		kind:         "active",
+		tokenCount:   estimateTokenCount(focusContent),
+		content:      sanitizeForTerminal(focusContent),
+		createdAt:    brief.createdAt,
+	}
+	focusItem.preview = oneLine(focusItem.content)
+
+	output := make([]contextItemEntry, 0, len(items)-countCoveredContextItems(covered)+1)
+	inserted := false
+	for idx, item := range items {
+		if covered[idx] {
+			continue
+		}
+		if !inserted && item.ordinal > firstCoveredOrdinal {
+			output = append(output, focusItem)
+			inserted = true
+		}
+		output = append(output, item)
+	}
+	if !inserted {
+		output = append(output, focusItem)
+	}
+	return output
+}
+
+func contextSummaryCoveredByFocus(item contextItemEntry, brief *focusBriefEntry) bool {
+	if item.itemType != "summary" {
+		return false
+	}
+	if brief.hasCoveredMessageSeq && item.hasSummaryMaxSourceSeq {
+		return item.summaryMaxSourceSeq <= brief.coveredMessageSeq
+	}
+	if strings.TrimSpace(brief.coveredLatestAt) == "" || strings.TrimSpace(item.summaryLatestAt) == "" {
+		return false
+	}
+	return compareSQLiteTimes(item.summaryLatestAt, brief.coveredLatestAt) <= 0
+}
+
+func compareSQLiteTimes(left, right string) int {
+	leftTime, leftOK := parseContextItemTime(left)
+	rightTime, rightOK := parseContextItemTime(right)
+	if leftOK && rightOK {
+		if leftTime.Before(rightTime) {
+			return -1
+		}
+		if leftTime.After(rightTime) {
+			return 1
+		}
+		return 0
+	}
+	return strings.Compare(strings.TrimSpace(left), strings.TrimSpace(right))
+}
+
+func parseContextItemTime(value string) (time.Time, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return time.Time{}, false
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+		return parsed, true
+	}
+	if parsed, err := time.Parse("2006-01-02 15:04:05", trimmed); err == nil {
+		return parsed, true
+	}
+	return time.Time{}, false
+}
+
+func formatFocusBriefContextContent(brief *focusBriefEntry) string {
+	attrs := []string{
+		fmt.Sprintf(`id="%s"`, escapeXMLAttribute(brief.briefID)),
+		fmt.Sprintf(`prompt="%s"`, escapeXMLAttribute(brief.prompt)),
+		fmt.Sprintf(`token_count="%d"`, brief.tokenCount),
+		fmt.Sprintf(`target_tokens="%d"`, brief.targetTokens),
+		fmt.Sprintf(`created_at="%s"`, escapeXMLAttribute(brief.createdAt)),
+	}
+	if strings.TrimSpace(brief.coveredLatestAt) != "" {
+		attrs = append(attrs, fmt.Sprintf(`covered_latest_at="%s"`, escapeXMLAttribute(brief.coveredLatestAt)))
+	}
+	if brief.hasCoveredMessageSeq {
+		attrs = append(attrs, fmt.Sprintf(`covered_message_seq="%d"`, brief.coveredMessageSeq))
+	}
+	return strings.Join([]string{
+		fmt.Sprintf("<focus_brief %s>", strings.Join(attrs, " ")),
+		"  <content>",
+		brief.content,
+		"  </content>",
+		"</focus_brief>",
+	}, "\n")
+}
+
+func escapeXMLAttribute(value string) string {
+	replacer := strings.NewReplacer(
+		"&", "&amp;",
+		`"`, "&quot;",
+		"<", "&lt;",
+		">", "&gt;",
+	)
+	return replacer.Replace(value)
+}
+
+func countCoveredContextItems(covered []bool) int {
+	count := 0
+	for _, value := range covered {
+		if value {
+			count++
+		}
+	}
+	return count
+}
+
+// sqliteTableExists checks optional feature tables without treating older DBs as broken.
+func sqliteTableExists(db *sql.DB, tableName string) (bool, error) {
+	var count int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = ?
+	`, tableName).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// sqliteColumnExists checks optional columns across historical LCM schemas.
+func sqliteColumnExists(db *sql.DB, tableName, columnName string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, tableName))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var columnType string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == columnName {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// loadFocusBriefs returns persisted focus briefs for the selected LCM conversation.
+func loadFocusBriefs(dbPath, sessionID string) ([]focusBriefEntry, error) {
+	db, err := openLCMDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	conversationID, err := lookupConversationID(db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	exists, err := sqliteTableExists(db, "focus_briefs")
+	if err != nil {
+		return nil, fmt.Errorf("check focus brief schema: %w", err)
+	}
+	if !exists {
+		return nil, nil
+	}
+
+	rows, err := db.Query(`
+		SELECT
+			brief_id,
+			conversation_id,
+			COALESCE(prompt, ''),
+			COALESCE(content, ''),
+			COALESCE(status, ''),
+			COALESCE(token_count, 0),
+			COALESCE(target_tokens, 0),
+			covered_latest_at,
+			covered_message_seq,
+			COALESCE(source_context_hash, ''),
+			COALESCE(raw_result_json, ''),
+			COALESCE(created_at, ''),
+			COALESCE(updated_at, ''),
+			COALESCE(generator_run_id, ''),
+			COALESCE(generator_session_key, ''),
+			COALESCE(error, '')
+		FROM focus_briefs
+		WHERE conversation_id = ?
+		ORDER BY created_at DESC, rowid DESC
+	`, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("query focus briefs for conversation %d: %w", conversationID, err)
+	}
+	defer rows.Close()
+
+	briefs := make([]focusBriefEntry, 0)
+	for rows.Next() {
+		var brief focusBriefEntry
+		var coveredLatestAt sql.NullString
+		var coveredMessageSeq sql.NullInt64
+		var rawResultJSON string
+		if err := rows.Scan(
+			&brief.briefID,
+			&brief.conversationID,
+			&brief.prompt,
+			&brief.content,
+			&brief.status,
+			&brief.tokenCount,
+			&brief.targetTokens,
+			&coveredLatestAt,
+			&coveredMessageSeq,
+			&brief.sourceContextHash,
+			&rawResultJSON,
+			&brief.createdAt,
+			&brief.updatedAt,
+			&brief.generatorRunID,
+			&brief.generatorSessionKey,
+			&brief.errorText,
+		); err != nil {
+			return nil, fmt.Errorf("scan focus brief: %w", err)
+		}
+		brief.content = sanitizeForTerminal(brief.content)
+		brief.prompt = sanitizeForTerminal(brief.prompt)
+		brief.errorText = sanitizeForTerminal(brief.errorText)
+		if coveredLatestAt.Valid {
+			brief.coveredLatestAt = coveredLatestAt.String
+		}
+		if coveredMessageSeq.Valid {
+			brief.coveredMessageSeq = coveredMessageSeq.Int64
+			brief.hasCoveredMessageSeq = true
+		}
+		brief.truncated = focusBriefRawTruncated(rawResultJSON)
+		brief.preview = oneLine(brief.content)
+		if err := populateFocusBriefSourceStats(db, &brief); err != nil {
+			return nil, err
+		}
+		if err := populateFocusBriefDiagnostics(db, &brief); err != nil {
+			return nil, err
+		}
+		briefs = append(briefs, brief)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate focus briefs: %w", err)
+	}
+	return briefs, nil
+}
+
+// loadActiveFocusBrief returns the active focus overlay for a session, if any.
+func loadActiveFocusBrief(dbPath, sessionID string) (*focusBriefEntry, error) {
+	briefs, err := loadFocusBriefs(dbPath, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	for idx := range briefs {
+		if briefs[idx].status == "active" {
+			brief := briefs[idx]
+			return &brief, nil
+		}
+	}
+	return nil, nil
+}
+
+// focusBriefRawTruncated reads the generator's truncation marker from raw JSON.
+func focusBriefRawTruncated(raw string) bool {
+	var parsed struct {
+		Truncated bool `json:"truncated"`
+	}
+	if strings.TrimSpace(raw) == "" {
+		return false
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return false
+	}
+	return parsed.Truncated
+}
+
+// populateFocusBriefDiagnostics adds post-focus drift and source freshness state.
+func populateFocusBriefDiagnostics(db *sql.DB, brief *focusBriefEntry) error {
+	if brief.hasCoveredMessageSeq {
+		exists, err := sqliteTableExists(db, "messages")
+		if err != nil {
+			return fmt.Errorf("check messages schema for focus diagnostics: %w", err)
+		}
+		if exists {
+			if err := db.QueryRow(`
+				SELECT COUNT(*), COALESCE(SUM(token_count), 0)
+				FROM messages
+				WHERE conversation_id = ?
+				  AND seq > ?
+			`, brief.conversationID, brief.coveredMessageSeq).Scan(
+				&brief.postFocusMessageCount,
+				&brief.postFocusTokenCount,
+			); err != nil {
+				return fmt.Errorf("query post-focus messages for %s: %w", brief.briefID, err)
+			}
+		}
+	}
+
+	summaryWatermark := strings.TrimSpace(brief.coveredLatestAt)
+	summaryPredicate := "datetime(created_at) > datetime(?)"
+	if summaryWatermark == "" {
+		summaryWatermark = strings.TrimSpace(brief.createdAt)
+	} else {
+		summaryPredicate = "latest_at IS NOT NULL AND datetime(latest_at) > datetime(?)"
+	}
+	if summaryWatermark != "" {
+		exists, err := sqliteTableExists(db, "summaries")
+		if err != nil {
+			return fmt.Errorf("check summaries schema for focus diagnostics: %w", err)
+		}
+		if exists {
+			var summaryTokens int
+			query := fmt.Sprintf(`
+				SELECT COUNT(*), COALESCE(SUM(token_count), 0)
+				FROM summaries
+				WHERE conversation_id = ?
+				  AND %s
+			`, summaryPredicate)
+			if err := db.QueryRow(query, brief.conversationID, summaryWatermark).Scan(
+				&brief.postFocusSummaryCount,
+				&summaryTokens,
+			); err != nil {
+				return fmt.Errorf("query post-focus summaries for %s: %w", brief.briefID, err)
+			}
+			brief.postFocusTokenCount += summaryTokens
+		}
+	}
+
+	activeHash, err := activeFocusSourceContextHash(db, brief.conversationID)
+	if err != nil {
+		return err
+	}
+	brief.sourceContextChanged = strings.TrimSpace(brief.sourceContextHash) != "" &&
+		activeHash != "" &&
+		activeHash != brief.sourceContextHash
+	brief.stale = brief.postFocusMessageCount > 0 ||
+		brief.postFocusSummaryCount > 0 ||
+		brief.sourceContextChanged
+	return nil
+}
+
+// activeFocusSourceContextHash mirrors the runtime focus source fingerprint.
+func activeFocusSourceContextHash(db *sql.DB, conversationID int64) (string, error) {
+	contextExists, err := sqliteTableExists(db, "context_items")
+	if err != nil {
+		return "", fmt.Errorf("check context schema for focus diagnostics: %w", err)
+	}
+	summaryExists, err := sqliteTableExists(db, "summaries")
+	if err != nil {
+		return "", fmt.Errorf("check summary schema for focus diagnostics: %w", err)
+	}
+	if !contextExists || !summaryExists {
+		return "", nil
+	}
+
+	rows, err := db.Query(`
+		SELECT
+			ci.ordinal,
+			s.summary_id,
+			COALESCE(s.token_count, 0),
+			COALESCE(s.latest_at, '')
+		FROM context_items ci
+		JOIN summaries s ON s.summary_id = ci.summary_id
+		WHERE ci.conversation_id = ?
+		  AND ci.item_type = 'summary'
+		ORDER BY ci.ordinal
+	`, conversationID)
+	if err != nil {
+		return "", fmt.Errorf("query active focus source hash: %w", err)
+	}
+	defer rows.Close()
+
+	hasher := sha256.New()
+	count := 0
+	for rows.Next() {
+		var ordinal int
+		var summaryID string
+		var tokenCount int
+		var latestAt string
+		if err := rows.Scan(&ordinal, &summaryID, &tokenCount, &latestAt); err != nil {
+			return "", fmt.Errorf("scan active focus source hash: %w", err)
+		}
+		fmt.Fprintf(hasher, "%d\x00%s\x00%d\x00%s\n", ordinal, summaryID, tokenCount, latestAt)
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate active focus source hash: %w", err)
+	}
+	if count == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+// populateFocusBriefSourceStats adds source/citation counts and IDs to one brief.
+func populateFocusBriefSourceStats(db *sql.DB, brief *focusBriefEntry) error {
+	exists, err := sqliteTableExists(db, "focus_brief_sources")
+	if err != nil {
+		return fmt.Errorf("check focus brief source schema: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+
+	rows, err := db.Query(`
+		SELECT role, summary_id
+		FROM focus_brief_sources
+		WHERE brief_id = ?
+		ORDER BY role, ordinal, summary_id
+	`, brief.briefID)
+	if err != nil {
+		return fmt.Errorf("query focus brief sources for %s: %w", brief.briefID, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var role string
+		var summaryID string
+		if err := rows.Scan(&role, &summaryID); err != nil {
+			return fmt.Errorf("scan focus brief source: %w", err)
+		}
+		switch role {
+		case "active_input":
+			brief.sourceCount++
+		case "cited":
+			brief.citedCount++
+			brief.citedSummaryIDs = append(brief.citedSummaryIDs, summaryID)
+		case "expanded":
+			brief.expandedCount++
+			brief.expandedSummaryIDs = append(brief.expandedSummaryIDs, summaryID)
+		case "irrelevant":
+			brief.irrelevantCount++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate focus brief sources: %w", err)
+	}
+	return nil
 }
 
 func formatTimeForList(ts time.Time) string {

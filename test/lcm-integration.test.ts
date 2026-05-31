@@ -9,7 +9,8 @@ import type {
 import { ContextAssembler } from "../src/assembler.js";
 import { CompactionEngine, type CompactionConfig } from "../src/compaction.js";
 import { RetrievalEngine } from "../src/retrieval.js";
-import { LcmProviderAuthError } from "../src/summarize.js";
+import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "../src/summarize.js";
+import type { LcmDependencies } from "../src/types.js";
 
 // ── Mock Store Factories ─────────────────────────────────────────────────────
 
@@ -369,6 +370,7 @@ function createMockSummaryStore() {
         descendantCount?: number;
         descendantTokenCount?: number;
         sourceMessageTokenCount?: number;
+        model?: string;
       }): Promise<SummaryRecord> => {
         const summary: SummaryRecord = {
           summaryId: input.summaryId,
@@ -383,6 +385,7 @@ function createMockSummaryStore() {
           descendantCount: input.descendantCount ?? 0,
           descendantTokenCount: input.descendantTokenCount ?? 0,
           sourceMessageTokenCount: input.sourceMessageTokenCount ?? 0,
+          model: input.model ?? "",
           createdAt: new Date(),
         };
         summaries.push(summary);
@@ -691,6 +694,69 @@ const defaultCompactionConfig: CompactionConfig = {
   summaryMaxOverageFactor: 3,
 };
 
+function makeSummarizeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
+  return {
+    config: {
+      enabled: true,
+      databasePath: ":memory:",
+      ignoreSessionPatterns: [],
+      statelessSessionPatterns: [],
+      skipStatelessSessions: true,
+      contextThreshold: 0.75,
+      freshTailCount: 8,
+      newSessionRetainDepth: 2,
+      leafMinFanout: 8,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      incrementalMaxDepth: 0,
+      leafChunkTokens: 20_000,
+      leafTargetTokens: 600,
+      condensedTargetTokens: 900,
+      maxExpandTokens: 120,
+      largeFileTokenThreshold: 25_000,
+      summaryProvider: "",
+      summaryModel: "",
+      largeFileSummaryProvider: "",
+      largeFileSummaryModel: "",
+      timezone: "UTC",
+      pruneHeartbeatOk: false,
+      transcriptGcEnabled: false,
+      proactiveThresholdCompactionMode: "deferred",
+      autoRotateSessionFiles: {
+        enabled: true,
+        createBackups: false,
+        sizeBytes: 2 * 1024 * 1024,
+        startup: "rotate",
+        runtime: "rotate",
+      },
+      summaryMaxOverageFactor: 3,
+    },
+    complete: vi.fn(async () => ({
+      content: [{ type: "text", text: "summary output" }],
+    })),
+    callGateway: vi.fn(async () => ({})),
+    resolveModel: vi.fn(() => ({
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+    })),
+    parseAgentSessionKey: vi.fn(() => null),
+    isSubagentSessionKey: vi.fn(() => false),
+    normalizeAgentId: vi.fn(() => "main"),
+    buildSubagentSystemPrompt: vi.fn(() => ""),
+    readLatestAssistantReply: vi.fn(() => undefined),
+    resolveAgentDir: vi.fn(() => "/tmp/openclaw-agent"),
+    resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
+    agentLaneSubagent: "subagent",
+    log: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
+    ...overrides,
+  } as LcmDependencies;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Test Suite: Ingest -> Assemble
 // ═════════════════════════════════════════════════════════════════════════════
@@ -798,6 +864,11 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(summaryMsg).toBeDefined();
     expect(summaryMsg!.role).toBe("user");
     expect(summaryMsg!.content).toContain("This is a leaf summary");
+    // Injection persistence mitigation (issue #71): assembled summaries carry an
+    // untrusted taint label on the <summary> tag so downstream models treat them
+    // as historical reference, not current instructions. The semantics of the
+    // label are defined once in the runtime recall system prompt.
+    expect(summaryMsg!.content).toContain('trust="untrusted"');
   });
 
   it("emits depersonalized overflow diagnostics with top contributors", async () => {
@@ -1356,6 +1427,10 @@ describe("LCM integration: compaction", () => {
       { type: "reasoning", text: "PRIVATE_REASONING_TEXT" },
       { type: "text", text: "Visible reply after reasoning text." },
     ]);
+    const redactedThinkingTextContent = JSON.stringify([
+      { type: "redacted_thinking", text: "PRIVATE_REDACTED_THINKING_TEXT" },
+      { type: "text", text: "Visible reply after redacted thinking text." },
+    ]);
     const thinkingSummaryContent = JSON.stringify([
       { type: "thinking", summary: "PRIVATE_THINKING_SUMMARY" },
       { type: "text", text: "Visible reply after thinking summary." },
@@ -1379,6 +1454,11 @@ describe("LCM integration: compaction", () => {
     });
     await ingestMessages(convStore, sumStore, 1, {
       contentFn: () => reasoningTextContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => redactedThinkingTextContent,
       roleFn: () => "assistant",
       tokenCountFn: (_i, c) => estimateTokens(c),
     });
@@ -1415,15 +1495,130 @@ describe("LCM integration: compaction", () => {
     expect(capturedSourceText).not.toContain("ANOTHER_ENCRYPTED");
     expect(capturedSourceText).not.toContain('"type":"thinking"');
     expect(capturedSourceText).not.toContain("PRIVATE_REASONING_TEXT");
+    expect(capturedSourceText).not.toContain("PRIVATE_REDACTED_THINKING_TEXT");
     expect(capturedSourceText).not.toContain("PRIVATE_THINKING_SUMMARY");
 
     // The visible text from the mixed-content message must still be present
     expect(capturedSourceText).toContain("Visible assistant reply.");
     expect(capturedSourceText).toContain("Visible reply after reasoning text.");
+    expect(capturedSourceText).toContain("Visible reply after redacted thinking text.");
     expect(capturedSourceText).toContain("Visible reply after thinking summary.");
 
     // The plain user message must still be present
     expect(capturedSourceText).toContain("A plain user message.");
+  });
+
+  it("leaf compaction strips redacted_thinking blocks from structured message parts", async () => {
+    const structuredPartEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafChunkTokens: 1_000,
+    });
+    await convStore.createConversation({ sessionId: "redacted-thinking-session" });
+
+    const assistant = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 1,
+      role: "assistant",
+      content: "",
+      tokenCount: 120,
+    });
+    await convStore.createMessageParts(assistant.messageId, [
+      {
+        sessionId: "redacted-thinking-session",
+        partType: "reasoning",
+        ordinal: 0,
+        textContent: JSON.stringify({
+          type: "redacted_thinking",
+          text: "PRIVATE_PART_REDACTED_THINKING",
+          summary: [{ text: "PRIVATE_PART_SUMMARY" }],
+        }),
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "redacted_thinking",
+        }),
+      },
+      {
+        sessionId: "redacted-thinking-session",
+        partType: "text",
+        ordinal: 1,
+        textContent: "Visible answer after redacted thinking.",
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "text",
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, assistant.messageId);
+
+    let capturedSourceText = "";
+    const summarize = vi.fn(async (text: string) => {
+      capturedSourceText = text;
+      return "Structured redacted thinking summary.";
+    });
+
+    const result = await structuredPartEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(capturedSourceText).toContain("Visible answer after redacted thinking.");
+    expect(capturedSourceText).not.toContain("PRIVATE_PART_REDACTED_THINKING");
+    expect(capturedSourceText).not.toContain("PRIVATE_PART_SUMMARY");
+  });
+
+  it("persists vLLM message content rather than reasoning as a leaf summary", async () => {
+    const qwenCompactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafMinFanout: 2,
+      leafChunkTokens: 1_000,
+    });
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Conversation turn ${i}: weather and follow-up details ${"x".repeat(200)}`,
+      roleFn: (i) => (i % 2 === 0 ? "user" : "assistant"),
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarizeResult = await createLcmSummarizeFromLegacyParams({
+      deps: makeSummarizeDeps({
+        resolveModel: vi.fn(() => ({ provider: "vllm", model: "qwen3.5-122b" })),
+        complete: vi.fn(async () => ({
+          content: [],
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: "User asked for weather; assistant answered sunny and 25C.",
+                reasoning: "Thinking Process: PRIVATE_QWEN_REASONING",
+                reasoning_content: "PRIVATE_QWEN_REASONING_CONTENT",
+              },
+            },
+          ],
+        })),
+      }),
+      legacyParams: { provider: "vllm", model: "qwen3.5-122b" },
+    });
+
+    expect(summarizeResult).toBeDefined();
+
+    await qwenCompactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize: summarizeResult!.fn,
+      summaryModel: "qwen3.5-122b",
+      force: true,
+    });
+
+    const leaf = sumStore._summaries.find((summary) => summary.kind === "leaf");
+    expect(leaf?.content).toBe("User asked for weather; assistant answered sunny and 25C.");
+    expect(leaf?.content).not.toContain("Thinking Process");
+    expect(leaf?.content).not.toContain("PRIVATE_QWEN_REASONING");
+    expect(leaf?.content).not.toContain("PRIVATE_QWEN_REASONING_CONTENT");
+    expect(leaf?.model).toBe("qwen3.5-122b");
   });
 
   it("leaf compaction summarizes structured message parts when stored content is empty", async () => {
@@ -3004,6 +3199,75 @@ describe("LCM integration: compaction", () => {
     expect(decision.threshold).toBe(450);
   });
 
+  it("evaluate compacts when observed tokens plus raw backlog exceed the threshold", async () => {
+    const backlogEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 1,
+    });
+    await ingestMessages(convStore, sumStore, 3, {
+      contentFn: (i) => `Backlog ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    const decision = await backlogEngine.evaluate(CONV_ID, 600, 300);
+    expect(decision).toMatchObject({
+      shouldCompact: true,
+      reason: "threshold",
+      storedTokens: 300,
+      observedTokens: 300,
+      rawTokensOutsideTail: 200,
+      projectedTokens: 500,
+      currentTokens: 500,
+      threshold: 450,
+    });
+  });
+
+  it("evaluate stays below threshold when projected raw backlog still fits", async () => {
+    const backlogEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 1,
+    });
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => `Small backlog ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    const decision = await backlogEngine.evaluate(CONV_ID, 600, 250);
+    expect(decision).toMatchObject({
+      shouldCompact: false,
+      reason: "none",
+      storedTokens: 200,
+      observedTokens: 250,
+      rawTokensOutsideTail: 100,
+      projectedTokens: 350,
+      currentTokens: 350,
+      threshold: 450,
+    });
+  });
+
+  it("evaluate does not count fresh-tail raw messages as backlog pressure", async () => {
+    const freshTailEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 3,
+    });
+    await ingestMessages(convStore, sumStore, 3, {
+      contentFn: (i) => `Fresh tail ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    const decision = await freshTailEngine.evaluate(CONV_ID, 600, 300);
+    expect(decision).toMatchObject({
+      shouldCompact: false,
+      reason: "none",
+      storedTokens: 300,
+      observedTokens: 300,
+      rawTokensOutsideTail: 0,
+      projectedTokens: 300,
+      currentTokens: 300,
+      threshold: 450,
+    });
+  });
+
   it("compactUntilUnder uses currentTokens when stored tokens are stale", async () => {
     await ingestMessages(convStore, sumStore, 10, {
       contentFn: (i) => `Turn ${i}: ${"x".repeat(200)}`,
@@ -3064,6 +3328,382 @@ describe("LCM integration: compaction", () => {
 
     expect(result.actionTaken).toBe(false);
     expect(summarize).not.toHaveBeenCalled();
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Test Suite: Full-sweep bounds (iteration cap + wall-clock deadline)
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("LCM integration: compactFullSweep bounds", () => {
+  let convStore: ReturnType<typeof createMockConversationStore>;
+  let sumStore: ReturnType<typeof createMockSummaryStore>;
+
+  beforeEach(() => {
+    convStore = createMockConversationStore();
+    sumStore = createMockSummaryStore();
+    wireStores(convStore, sumStore);
+  });
+
+  // Config that produces many leaf passes: a small leaf chunk size means each
+  // pass only consumes a few raw messages, so a long conversation drives one
+  // leaf pass per chunk. Without a bound this loop is effectively unbounded.
+  const manyPassConfig = (overrides: Partial<CompactionConfig>): CompactionConfig => ({
+    ...defaultCompactionConfig,
+    freshTailCount: 2,
+    leafChunkTokens: 60,
+    leafMinFanout: 1,
+    ...overrides,
+  });
+
+  // ~12 tokens each; 60 messages outside a 2-message fresh tail, ~3 messages
+  // per 60-token chunk => an unbounded sweep would run well over a dozen
+  // passes.
+  const seedManyMessages = async (): Promise<void> => {
+    await ingestMessages(convStore, sumStore, 60, {
+      contentFn: (i) => `Turn ${i}: ${"w".repeat(40)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+  };
+
+  it("stops cleanly at the iteration cap with a consistent partial result", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      manyPassConfig({ maxSweepIterations: 3 }),
+    );
+    await seedManyMessages();
+
+    const summarize = vi.fn(async (text: string) => `S(${text.length})`);
+
+    const result = await engine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    // The cap is a hard ceiling on summarizer passes within the sweep.
+    expect(summarize).toHaveBeenCalledTimes(3);
+    // A capped sweep still returns the consistent partial result built so far.
+    expect(result.actionTaken).toBe(true);
+    expect(result.createdSummaryId).toBeDefined();
+    expect(result.tokensAfter).toBeLessThan(result.tokensBefore);
+    // Context still contains the un-swept remainder as raw messages.
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    expect(contextItems.some((ci) => ci.itemType === "message")).toBe(true);
+    expect(contextItems.some((ci) => ci.itemType === "summary")).toBe(true);
+  });
+
+  it("runs more passes when the iteration cap is raised (cap is the limiting factor)", async () => {
+    const lowCapEngine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      manyPassConfig({ maxSweepIterations: 2 }),
+    );
+    await seedManyMessages();
+    const lowCapSummarize = vi.fn(async (text: string) => `S(${text.length})`);
+    await lowCapEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize: lowCapSummarize,
+      force: true,
+    });
+
+    // Fresh stores for the high-cap run so the two are independent.
+    const convStore2 = createMockConversationStore();
+    const sumStore2 = createMockSummaryStore();
+    wireStores(convStore2, sumStore2);
+    await ingestMessages(convStore2, sumStore2, 60, {
+      contentFn: (i) => `Turn ${i}: ${"w".repeat(40)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+    const highCapEngine = new CompactionEngine(
+      convStore2 as any,
+      sumStore2 as any,
+      manyPassConfig({ maxSweepIterations: 50 }),
+    );
+    const highCapSummarize = vi.fn(async (text: string) => `S(${text.length})`);
+    await highCapEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize: highCapSummarize,
+      force: true,
+    });
+
+    // The low cap genuinely limits the sweep: it stops at exactly the cap,
+    // while the high-cap run is free to make more passes.
+    expect(lowCapSummarize).toHaveBeenCalledTimes(2);
+    expect(highCapSummarize.mock.calls.length).toBeGreaterThan(2);
+  });
+
+  it("stops cleanly when the wall-clock deadline is exceeded", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      // Large iteration cap so the deadline — not the cap — is what stops it.
+      manyPassConfig({ maxSweepIterations: 1000, sweepDeadlineMs: 40 }),
+    );
+    await seedManyMessages();
+
+    // Each summarizer call sleeps ~25ms; after ~2 passes the 40ms budget is
+    // spent and the sweep must stop before starting another pass.
+    const summarize = vi.fn(async (text: string) => {
+      await new Promise((r) => setTimeout(r, 25));
+      return `S(${text.length})`;
+    });
+
+    const result = await engine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    // Far fewer passes than the iteration cap or an unbounded sweep would do.
+    expect(summarize.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(summarize.mock.calls.length).toBeLessThan(10);
+    expect(result.actionTaken).toBe(true);
+    expect(result.tokensAfter).toBeLessThanOrEqual(result.tokensBefore);
+  });
+
+  it("does not start a leaf summarizer pass when selection consumes the deadline", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      manyPassConfig({ maxSweepIterations: 1000, sweepDeadlineMs: 1 }),
+    );
+    await seedManyMessages();
+
+    const selectOldestLeafChunk = (engine as any).selectOldestLeafChunk.bind(engine);
+    vi.spyOn(engine as any, "selectOldestLeafChunk").mockImplementation(async (...args: unknown[]) => {
+      await new Promise((r) => setTimeout(r, 10));
+      return selectOldestLeafChunk(...args);
+    });
+    const summarize = vi.fn(async (text: string) => `S(${text.length})`);
+
+    const result = await engine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(summarize).not.toHaveBeenCalled();
+    expect(result.actionTaken).toBe(false);
+    expect(result.tokensAfter).toBe(result.tokensBefore);
+  });
+
+  it("does not start a condensed summarizer pass when candidate selection consumes the deadline", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      manyPassConfig({
+        maxSweepIterations: 1000,
+        sweepDeadlineMs: 1,
+        summaryPrefixTargetTokens: 1,
+      }),
+    );
+    await convStore.createConversation({ sessionId: "deadline-condensed-selection" });
+    for (const [summaryId, content] of [
+      ["sum_deadline_a", "Depth zero summary A"],
+      ["sum_deadline_b", "Depth zero summary B"],
+      ["sum_deadline_c", "Depth zero summary C"],
+    ] as const) {
+      await sumStore.insertSummary({
+        summaryId,
+        conversationId: CONV_ID,
+        kind: "leaf",
+        depth: 0,
+        content,
+        tokenCount: 80,
+      });
+      await sumStore.appendContextSummary(CONV_ID, summaryId);
+    }
+
+    const selectCandidate = (engine as any).selectShallowestCondensationCandidate.bind(engine);
+    vi.spyOn(engine as any, "selectShallowestCondensationCandidate").mockImplementation(
+      async (...args: unknown[]) => {
+        await new Promise((r) => setTimeout(r, 10));
+        return selectCandidate(...args);
+      },
+    );
+    const summarize = vi.fn(async (text: string) => `S(${text.length})`);
+
+    const result = await engine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(summarize).not.toHaveBeenCalled();
+    expect(result.actionTaken).toBe(false);
+    expect(result.tokensAfter).toBe(result.tokensBefore);
+  });
+
+  it("a bounded sweep returns within a small multiple of the deadline", async () => {
+    const sweepDeadlineMs = 60;
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      manyPassConfig({ maxSweepIterations: 1000, sweepDeadlineMs }),
+    );
+    await seedManyMessages();
+
+    const summarize = vi.fn(async (text: string) => {
+      await new Promise((r) => setTimeout(r, 20));
+      return `S(${text.length})`;
+    });
+
+    const startedAt = Date.now();
+    await engine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+    const elapsed = Date.now() - startedAt;
+
+    // The deadline bounds total sweep time: it may overrun by at most one
+    // in-flight pass, never the tens of minutes an unbounded sweep could take.
+    expect(elapsed).toBeLessThan(sweepDeadlineMs * 6);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Test Suite: compactUntilUnder bounds
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("LCM integration: compactUntilUnder bounds", () => {
+  let convStore: ReturnType<typeof createMockConversationStore>;
+  let sumStore: ReturnType<typeof createMockSummaryStore>;
+
+  beforeEach(() => {
+    convStore = createMockConversationStore();
+    sumStore = createMockSummaryStore();
+    wireStores(convStore, sumStore);
+  });
+
+  // Config that drives many sweep rounds: a small leaf chunk plus a low
+  // per-sweep iteration cap means each compactFullSweep makes only partial
+  // progress, so compactUntilUnder keeps issuing rounds. `sweepDeadlineMs` is
+  // left large on purpose so the *operation* deadline — not the per-sweep
+  // deadline — is what must stop the loop.
+  const multiRoundConfig = (overrides: Partial<CompactionConfig>): CompactionConfig => ({
+    ...defaultCompactionConfig,
+    freshTailCount: 2,
+    leafChunkTokens: 60,
+    leafMinFanout: 1,
+    maxSweepIterations: 2,
+    sweepDeadlineMs: 100_000,
+    ...overrides,
+  });
+
+  // ~60 messages of ~12 tokens each outside a 2-message fresh tail: far more
+  // raw chunks than a single 2-iteration sweep can summarize, so reaching a
+  // tight target needs many rounds.
+  const seedManyMessages = async (): Promise<void> => {
+    await ingestMessages(convStore, sumStore, 60, {
+      contentFn: (i) => `Turn ${i}: ${"w".repeat(40)}`,
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+  };
+
+  it("stops at the operation deadline instead of running maxRounds x sweepDeadlineMs", async () => {
+    const compactUntilUnderDeadlineMs = 80;
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      // maxRounds 10 x sweepDeadlineMs 100000 => a 1000s worst case absent an
+      // operation-wide bound. The operation deadline must cap it far below that.
+      multiRoundConfig({ maxRounds: 10, compactUntilUnderDeadlineMs }),
+    );
+    await seedManyMessages();
+
+    // Each summarizer call sleeps ~20ms; a few passes spend the 80ms budget.
+    const summarize = vi.fn(async (text: string) => {
+      await new Promise((r) => setTimeout(r, 20));
+      return `S(${text.length})`;
+    });
+
+    const startedAt = Date.now();
+    const result = await engine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      // Target far below the seeded ~720 tokens so a single sweep cannot reach it.
+      targetTokens: 50,
+      summarize,
+    });
+    const elapsed = Date.now() - startedAt;
+
+    // The operation deadline is shared into each round's sweep and checked
+    // before the next round: total time may overrun by at most one clamped
+    // sweep, never maxRounds x sweepDeadlineMs.
+    expect(elapsed).toBeLessThan(compactUntilUnderDeadlineMs * 8);
+    expect(elapsed).toBeLessThan(5_000);
+    // It stopped on the deadline, not by reaching the (unreachable) target.
+    expect(result.success).toBe(false);
+    expect(result.rounds).toBeGreaterThanOrEqual(1);
+    expect(result.rounds).toBeLessThan(10);
+  });
+
+  it("returns a consistent partial result when the operation deadline is hit", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      multiRoundConfig({ maxRounds: 10, compactUntilUnderDeadlineMs: 80 }),
+    );
+    await seedManyMessages();
+
+    const summarize = vi.fn(async (text: string) => {
+      await new Promise((r) => setTimeout(r, 20));
+      return `S(${text.length})`;
+    });
+
+    const result = await engine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      targetTokens: 50,
+      summarize,
+    });
+
+    // finalTokens is the real post-compaction context size: progress was made
+    // (below the seeded total) but the target was not reached.
+    const liveTokens = await sumStore.getContextTokenCount(CONV_ID);
+    expect(result.finalTokens).toBe(liveTokens);
+    expect(result.finalTokens).toBeGreaterThan(50);
+    // Context is internally consistent: the swept prefix is now summaries and
+    // the un-swept remainder is still raw messages.
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    expect(contextItems.some((ci) => ci.itemType === "summary")).toBe(true);
+    expect(contextItems.some((ci) => ci.itemType === "message")).toBe(true);
+  });
+
+  it("a generous operation deadline does not cut a legitimate multi-round run short", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      // Deadline comfortably above what a fast multi-round compaction needs.
+      multiRoundConfig({ maxRounds: 10, compactUntilUnderDeadlineMs: 60_000 }),
+    );
+    await seedManyMessages();
+
+    // Fast summarizer: rounds complete well within the operation deadline.
+    const summarize = vi.fn(async (text: string) => `S(${text.length})`);
+
+    const result = await engine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      targetTokens: 300,
+      summarize,
+    });
+
+    // The deadline did not interfere: multiple rounds ran and drove context
+    // under the target.
+    expect(result.rounds).toBeGreaterThan(1);
+    expect(result.success).toBe(true);
+    expect(result.finalTokens).toBeLessThanOrEqual(300);
   });
 });
 

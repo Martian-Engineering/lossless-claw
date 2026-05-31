@@ -163,6 +163,36 @@ Why it matters:
 - When unset, Lossless derives a target from `contextThreshold`, the active token budget, and `leafChunkTokens`.
 - Sweeps first exhaust eligible raw-message leaf chunks, then honor `sweepMaxDepth`; pressure condensation can go deeper only when summary-prefix pressure remains.
 
+### `maxSweepIterations`
+
+Hard cap on summarizer passes within a single full sweep. Default `12`.
+
+Why it matters:
+
+- A large conversation can otherwise drive an unbounded number of leaf/condensed passes in one sweep.
+- On hitting the cap the sweep stops cleanly and returns the partial result; the next sweep resumes the remaining work.
+- Bounds how long a sweep can run on the turn-critical path (the `assemble()` deferred-debt drain).
+
+### `sweepDeadlineMs`
+
+Wall-clock budget for a single full sweep, in milliseconds. Default `120000`.
+
+Why it matters:
+
+- A slow or rate-limited summarizer can burn a full `summaryTimeoutMs` per pass; without a deadline, many passes compound into tens of minutes.
+- When the deadline is exceeded the sweep stops before starting another pass and returns the partial result.
+- Pairs with `maxSweepIterations`: whichever limit is reached first stops the sweep.
+
+### `compactUntilUnderDeadlineMs`
+
+Wall-clock budget for a whole `compactUntilUnder` (overflow recovery) operation, in milliseconds. Default `300000`.
+
+Why it matters:
+
+- `compactUntilUnder` runs up to `maxRounds` sweeps, and each sweep re-arms its own `sweepDeadlineMs`; without an operation-wide budget the worst case is `maxRounds × sweepDeadlineMs` (~20 minutes at the defaults).
+- The deadline is shared into each round's sweep — a sweep stops at whichever deadline is sooner — and is also checked before starting the next round.
+- On hitting it, `compactUntilUnder` returns the consistent partial result; the default leaves room for a few full-deadline sweeps while capping the worst case well below 20 minutes.
+
 ### `incrementalMaxDepth`
 
 Deprecated alias for `sweepMaxDepth`.
@@ -266,7 +296,7 @@ Why it matters:
 - `deferred` also stores provider/model/cache telemetry so Anthropic-family sessions can avoid rewriting a still-hot prompt cache
 - `inline` preserves the legacy foreground compaction path for hosts that do not yet support deferred execution
 - `/lossless status` and `/lcm status` surface pending/running/last-failure maintenance state so operators can see when compaction is queued
-- background `maintain()` can still do non-prompt-mutating work, but prompt-mutating debt is consumed pre-assembly once cache is cold or the next turn is already approaching overflow
+- after-turn background drain and host-approved `maintain()` consume routine threshold debt; `assemble()` only drains pending threshold debt synchronously as an emergency safeguard when the live prompt estimate is already over budget
 
 ### `autoRotateSessionFiles`
 
@@ -284,6 +314,7 @@ Why it matters:
 
 - prevents very large OpenClaw session JSONL files from choking fallback/gateway startup while LCM owns the durable context
 - runtime rotation only creates or replaces the rolling `rotate-latest` DB backup when `createBackups` is `true`; manual `/lossless rotate` / `/lcm rotate` always keeps its backup-backed behavior
+- runtime JSONL rewrites run from `afterTurn()` after the host turn completes; `maintain()` skips rotation and leaves it to `afterTurn()` or startup because background maintenance can overlap an embedded model call
 - startup scans OpenClaw's current indexed session stores for configured agents, intersects those candidates with active LCM bootstrap state, and creates one pre-rotation DB backup for the startup batch only when `createBackups` is `true`
 - only runs for active, writable LCM conversations; ignored sessions, stateless sessions, sessions outside the indexed startup candidate set, and sessions without active LCM state are skipped
 - the preserved transcript tail follows the normal rotate behavior controlled by `freshTailCount`
@@ -385,6 +416,30 @@ See high-impact settings above.
 Env override:
 
 - `LCM_SUMMARY_PREFIX_TARGET_TOKENS`
+
+### `maxSweepIterations`
+
+See high-impact settings above.
+
+Env override:
+
+- `LCM_MAX_SWEEP_ITERATIONS`
+
+### `sweepDeadlineMs`
+
+See high-impact settings above.
+
+Env override:
+
+- `LCM_SWEEP_DEADLINE_MS`
+
+### `compactUntilUnderDeadlineMs`
+
+See high-impact settings above.
+
+Env override:
+
+- `LCM_COMPACT_UNTIL_UNDER_DEADLINE_MS`
 
 ### `incrementalMaxDepth`
 

@@ -168,6 +168,64 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   }
 }
 
+function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
+  const maintenanceColumns = db
+    .prepare(`PRAGMA table_info(conversation_compaction_maintenance)`)
+    .all() as SummaryColumnInfo[];
+  const hasProjectedTokenCount = maintenanceColumns.some(
+    (col) => col.name === "projected_token_count",
+  );
+  const hasRawTokensOutsideTail = maintenanceColumns.some(
+    (col) => col.name === "raw_tokens_outside_tail",
+  );
+
+  if (!hasProjectedTokenCount) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN projected_token_count INTEGER`);
+  }
+  if (!hasRawTokensOutsideTail) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN raw_tokens_outside_tail INTEGER`);
+  }
+}
+
+function ensureFocusBriefTables(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS focus_briefs (
+      brief_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      session_key TEXT,
+      prompt TEXT NOT NULL,
+      content TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('draft', 'active', 'superseded', 'failed', 'inactive')),
+      token_count INTEGER NOT NULL DEFAULT 0,
+      target_tokens INTEGER NOT NULL DEFAULT 0,
+      covered_latest_at TEXT,
+      covered_message_seq INTEGER,
+      source_context_hash TEXT NOT NULL DEFAULT '',
+      generator_run_id TEXT,
+      generator_session_key TEXT,
+      raw_result_json TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      superseded_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS focus_brief_sources (
+      brief_id TEXT NOT NULL REFERENCES focus_briefs(brief_id) ON DELETE CASCADE,
+      summary_id TEXT NOT NULL,
+      ordinal INTEGER,
+      role TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (brief_id, summary_id, role)
+    );
+
+    CREATE INDEX IF NOT EXISTS focus_briefs_conversation_status_idx
+      ON focus_briefs (conversation_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS focus_brief_sources_summary_idx
+      ON focus_brief_sources (summary_id);
+  `);
+}
+
 /**
  * Belt-and-suspenders guard: create `message_parts` if it does not yet exist.
  *
@@ -1001,7 +1059,39 @@ export function runLcmMigrations(
       last_failure_summary TEXT,
       token_budget INTEGER,
       current_token_count INTEGER,
+      projected_token_count INTEGER,
+      raw_tokens_outside_tail INTEGER,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS focus_briefs (
+      brief_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      session_key TEXT,
+      prompt TEXT NOT NULL,
+      content TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('draft', 'active', 'superseded', 'failed', 'inactive')),
+      token_count INTEGER NOT NULL DEFAULT 0,
+      target_tokens INTEGER NOT NULL DEFAULT 0,
+      covered_latest_at TEXT,
+      covered_message_seq INTEGER,
+      source_context_hash TEXT NOT NULL DEFAULT '',
+      generator_run_id TEXT,
+      generator_session_key TEXT,
+      raw_result_json TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      superseded_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS focus_brief_sources (
+      brief_id TEXT NOT NULL REFERENCES focus_briefs(brief_id) ON DELETE CASCADE,
+      summary_id TEXT NOT NULL,
+      ordinal INTEGER,
+      role TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (brief_id, summary_id, role)
     );
 
     CREATE TABLE IF NOT EXISTS lcm_migration_state (
@@ -1024,6 +1114,10 @@ export function runLcmMigrations(
       ON conversation_bootstrap_state (session_file_path, updated_at);
     CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
       ON conversation_compaction_telemetry (cache_state, updated_at);
+    CREATE INDEX IF NOT EXISTS focus_briefs_conversation_status_idx
+      ON focus_briefs (conversation_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS focus_brief_sources_summary_idx
+      ON focus_brief_sources (summary_id);
 
     -- Speed up summary_messages lookups by message_id (PK is summary_id,message_id)
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
@@ -1095,6 +1189,10 @@ export function runLcmMigrations(
     runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
       ensureCompactionTelemetryColumns(db),
     );
+    runMigrationStep("ensureCompactionMaintenanceColumns", log, () =>
+      ensureCompactionMaintenanceColumns(db),
+    );
+    runMigrationStep("ensureFocusBriefTables", log, () => ensureFocusBriefTables(db));
     runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));
     // Index on depth — created AFTER backfillSummaryDepths to avoid index
     // maintenance overhead during bulk depth updates on large existing DBs.

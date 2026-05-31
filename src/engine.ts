@@ -9,6 +9,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
   ContextEngine,
   ContextEngineInfo,
+  ContextEngineHostCapability,
   AssembleResult,
   BootstrapResult,
   CompactResult,
@@ -65,6 +66,7 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
+import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
 import type { LcmDependencies, StartupSessionFileCandidate } from "./types.js";
@@ -74,8 +76,18 @@ import {
   DatabaseTransactionTimeoutError,
   withExclusiveDatabaseLock,
 } from "./transaction-mutex.js";
+import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
+
+const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
+  "bootstrap",
+  "assemble-before-prompt",
+  "after-turn",
+  "maintain",
+  "compact",
+  "runtime-llm-complete",
+];
 type AssemblePrefixSnapshot = {
   serializedMessages: string[];
   messageSummaries: string[];
@@ -123,6 +135,7 @@ type RotateTranscriptRewriteResult = {
 };
 type AutoRotateSessionFilePhase = "startup" | "runtime";
 type AutoRotateSessionFileAction = "rotate" | "warn" | "skip" | "summary";
+type AutoRotateSessionFileCaller = "after-turn" | "maintain";
 type ContextEngineMaintenanceResult = {
   changed: boolean;
   bytesFreed: number;
@@ -162,6 +175,7 @@ type DeferredCompactionDebtDrainParams = {
 function buildContextEngineProjectionEpoch(
   conversationId: number,
   contextItems: ContextItemRecord[],
+  activeFocusBrief?: FocusBriefRecord | null,
 ): string {
   const hash = createHash("sha256");
   hash.update(CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION);
@@ -180,12 +194,32 @@ function buildContextEngineProjectionEpoch(
     hash.update(":");
     hash.update(item.summaryId);
   }
+  const focusProjectionKey = buildFocusProjectionKey(activeFocusBrief);
+  if (focusProjectionKey) {
+    hash.update("\0focus:");
+    hash.update(focusProjectionKey);
+  }
 
   return [
     CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION,
     conversationId,
     hash.digest("hex").slice(0, 32),
   ].join(":");
+}
+
+function buildFocusProjectionKey(brief?: FocusBriefRecord | null): string | null {
+  if (!brief) {
+    return null;
+  }
+  const hash = createHash("sha256");
+  hash.update(brief.briefId);
+  hash.update("\0");
+  hash.update(brief.updatedAt.toISOString());
+  hash.update("\0");
+  hash.update(brief.prompt);
+  hash.update("\0");
+  hash.update(brief.content);
+  return hash.digest("hex").slice(0, 32);
 }
 
 function checkpointIsPastTranscriptEof(
@@ -386,6 +420,33 @@ function safeString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function extractRawIdsFromPartMetadata(metadata: string | null | undefined): string[] {
+  if (!metadata) {
+    return [];
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(metadata);
+  } catch {
+    return [];
+  }
+
+  const raw = asRecord(asRecord(parsed)?.raw);
+  if (!raw) {
+    return [];
+  }
+
+  return [
+    safeString(raw.id),
+    safeString(raw.call_id),
+    safeString(raw.toolCallId),
+    safeString(raw.tool_call_id),
+    safeString(raw.toolUseId),
+    safeString(raw.tool_use_id),
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
 function formatDurationMs(durationMs: number): string {
   return `${durationMs}ms`;
 }
@@ -516,7 +577,7 @@ const STRUCTURED_ARRAY_FIELD_KEYS = [
 ];
 const STRUCTURED_NESTED_FIELD_KEYS = ["content", "output", "result", "payload", "data", "value"];
 const MAX_STRUCTURED_TEXT_DEPTH = 6;
-const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
+const TOOL_CALL_RAW_TYPES: ReadonlySet<string> = new Set([
   "tool_use",
   "toolUse",
   "tool-use",
@@ -524,15 +585,25 @@ const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
   "tool_call",
   "functionCall",
   "function_call",
+]);
+const TOOL_RESULT_RAW_TYPES: ReadonlySet<string> = new Set([
   "function_call_output",
   "tool_result",
   "toolResult",
   "tool_use_result",
 ]);
+const TOOL_RAW_TYPES: ReadonlySet<string> = new Set([
+  ...TOOL_CALL_RAW_TYPES,
+  ...TOOL_RESULT_RAW_TYPES,
+]);
+const REASONING_RAW_TYPES: ReadonlySet<string> = new Set([
+  "thinking",
+  "redacted_thinking",
+  "reasoning",
+]);
 const REPLAY_CRITICAL_RAW_TYPES: ReadonlySet<string> = new Set([
   ...TOOL_RAW_TYPES,
-  "thinking",
-  "reasoning",
+  ...REASONING_RAW_TYPES,
 ]);
 const RAW_PAYLOAD_EXTERNALIZATION_REASON = "large_raw_message";
 
@@ -581,6 +652,10 @@ function extractStructuredText(value: unknown, depth: number = 0): string | unde
   }
 
   const record = value as Record<string, unknown>;
+
+  if (typeof record.type === "string" && REASONING_RAW_TYPES.has(record.type)) {
+    return undefined;
+  }
 
   // Skip tool call/result objects — their structured data belongs in the parts table, not content
   if (typeof record.type === "string" && TOOL_RAW_TYPES.has(record.type)) {
@@ -728,6 +803,7 @@ function toPartType(type: string): MessagePartType {
     case "text":
       return "text";
     case "thinking":
+    case "redacted_thinking":
     case "reasoning":
       return "reasoning";
     case "tool_use":
@@ -784,12 +860,15 @@ function extractMessageContent(content: unknown): string {
   if (Array.isArray(content) && content.length === 0) {
     return "";
   }
-  // If content is an array of only tool call/result objects, store as empty
+  // If content is an array of only tool call/result/reasoning objects, store as empty
   // (structured data is preserved in the message parts table)
   if (Array.isArray(content) && content.length > 0 && content.every(
     (item) => typeof item === "object" && item !== null && !Array.isArray(item) &&
       typeof (item as Record<string, unknown>).type === "string" &&
-      TOOL_RAW_TYPES.has((item as Record<string, unknown>).type as string)
+      (
+        TOOL_RAW_TYPES.has((item as Record<string, unknown>).type as string) ||
+        REASONING_RAW_TYPES.has((item as Record<string, unknown>).type as string)
+      )
   )) {
     return "";
   }
@@ -1697,10 +1776,10 @@ function isBootstrapReplayCandidateMessage(message: AgentMessage): boolean {
   return role === "assistant" || role === "tool";
 }
 
-function createBootstrapReplaySignature(message: AgentMessage): string {
+function createLosslessMessageSignature(message: AgentMessage): string {
   const stored = toStoredMessage(message);
   const parts = buildMessageParts({
-    sessionId: "bootstrap-replay-signature",
+    sessionId: "lossless-message-signature",
     message,
     fallbackContent: stored.content,
   });
@@ -1719,6 +1798,10 @@ function createBootstrapReplaySignature(message: AgentMessage): string {
       metadata: part.metadata ?? null,
     })),
   });
+}
+
+function createBootstrapReplaySignature(message: AgentMessage): string {
+  return createLosslessMessageSignature(message);
 }
 
 function normalizeSummaryOverlapText(value: string): string {
@@ -1774,10 +1857,939 @@ function messageContentCoveredBySummary(params: {
   return false;
 }
 
+const INTER_SESSION_MESSAGE_MARKER = "[Inter-session message]";
+const INTERNAL_CONTEXT_BEGIN_MARKER = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
+const INTERNAL_CONTEXT_END_MARKER = "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+const INTERNAL_TASK_COMPLETION_EVENT_MARKER = "[Internal task completion event]";
+const FALLBACK_RETRY_PROMPT_MARKER =
+  "[Retry after the previous model attempt failed or timed out]";
+const NORMALIZED_INTER_SESSION_MESSAGE_MARKER = normalizeSummaryOverlapText(INTER_SESSION_MESSAGE_MARKER);
+const NORMALIZED_INTERNAL_TASK_COMPLETION_EVENT_MARKER = normalizeSummaryOverlapText(
+  INTERNAL_TASK_COMPLETION_EVENT_MARKER,
+);
+
+function hasFallbackRetryPromptMarker(content: string): boolean {
+  return content.split(/\r?\n/).some((line) => line.trim() === FALLBACK_RETRY_PROMPT_MARKER);
+}
+
+function hasCompleteInternalContextBlock(content: string): boolean {
+  const beginIndex = content.indexOf(INTERNAL_CONTEXT_BEGIN_MARKER);
+  if (beginIndex < 0) {
+    return false;
+  }
+  return (
+    content.indexOf(
+      INTERNAL_CONTEXT_END_MARKER,
+      beginIndex + INTERNAL_CONTEXT_BEGIN_MARKER.length,
+    ) >= 0
+  );
+}
+
+function isVolatileLiveInputContent(content: string): boolean {
+  const trimmed = content.trimStart();
+  if (hasFallbackRetryPromptMarker(trimmed)) {
+    return true;
+  }
+  if (!hasCompleteInternalContextBlock(trimmed)) {
+    return false;
+  }
+  const normalized = normalizeSummaryOverlapText(trimmed);
+  if (normalized.startsWith(NORMALIZED_INTER_SESSION_MESSAGE_MARKER)) {
+    return true;
+  }
+  return (
+    trimmed.startsWith(INTERNAL_CONTEXT_BEGIN_MARKER) &&
+    normalized.includes(NORMALIZED_INTERNAL_TASK_COMPLETION_EVENT_MARKER)
+  );
+}
+
+function estimateAgentMessageTokens(messages: AgentMessage[]): number {
+  return messages.reduce((total, message) => total + toStoredMessage(message).tokenCount, 0);
+}
+
+function isVolatileLiveInputMessage(message: AgentMessage): boolean {
+  const stored = toStoredMessage(message);
+  if (stored.role !== "user" && stored.role !== "system") {
+    return false;
+  }
+  if (!stored.content.trim()) {
+    return false;
+  }
+  return isVolatileLiveInputContent(stored.content);
+}
+
+function extractToolPairingIdFromRecord(record: Record<string, unknown>): string | undefined {
+  return (
+    safeString(record.toolCallId) ??
+    safeString(record.tool_call_id) ??
+    safeString(record.toolUseId) ??
+    safeString(record.tool_use_id) ??
+    safeString(record.call_id) ??
+    safeString(record.id)
+  );
+}
+
+function extractAssistantToolCallIdsForPairing(message: AgentMessage): string[] {
+  if (message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content)) {
+    return [];
+  }
+  const ids: string[] = [];
+  for (const block of message.content) {
+    const record = asRecord(block);
+    if (!record || typeof record.type !== "string" || !TOOL_CALL_RAW_TYPES.has(record.type)) {
+      continue;
+    }
+    const id = extractToolPairingIdFromRecord(record);
+    if (id) {
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
+function extractToolResultIdForPairing(message: AgentMessage): string | undefined {
+  if (message.role !== "tool" && message.role !== "toolResult") {
+    return undefined;
+  }
+  const topLevel = asRecord(message);
+  if (topLevel) {
+    const direct = extractToolPairingIdFromRecord(topLevel);
+    if (direct) {
+      return direct;
+    }
+  }
+  if (!("content" in message) || !Array.isArray(message.content)) {
+    return undefined;
+  }
+  for (const block of message.content) {
+    const record = asRecord(block);
+    if (!record || typeof record.type !== "string" || !TOOL_RESULT_RAW_TYPES.has(record.type)) {
+      continue;
+    }
+    const id = extractToolPairingIdFromRecord(record);
+    if (id) {
+      return id;
+    }
+  }
+  return undefined;
+}
+
+function expandProtectedToolPairIndexes(params: {
+  assembledMessages: AgentMessage[];
+  protectedAssembledIndexes: Set<number>;
+}): Set<number> {
+  const protectedIndexes = new Set(params.protectedAssembledIndexes);
+  const assistantIndexesByToolCallId = new Map<string, number[]>();
+  const toolResultIndexesByToolCallId = new Map<string, number[]>();
+
+  for (let index = 0; index < params.assembledMessages.length; index++) {
+    const message = params.assembledMessages[index] as AgentMessage;
+    for (const toolCallId of extractAssistantToolCallIdsForPairing(message)) {
+      const indexes = assistantIndexesByToolCallId.get(toolCallId);
+      if (indexes) {
+        indexes.push(index);
+      } else {
+        assistantIndexesByToolCallId.set(toolCallId, [index]);
+      }
+    }
+    const toolResultId = extractToolResultIdForPairing(message);
+    if (toolResultId) {
+      const indexes = toolResultIndexesByToolCallId.get(toolResultId);
+      if (indexes) {
+        indexes.push(index);
+      } else {
+        toolResultIndexesByToolCallId.set(toolResultId, [index]);
+      }
+    }
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let index = 0; index < params.assembledMessages.length; index++) {
+      if (!protectedIndexes.has(index)) {
+        continue;
+      }
+      const message = params.assembledMessages[index] as AgentMessage;
+      const relatedIndexes: number[] = [];
+      for (const toolCallId of extractAssistantToolCallIdsForPairing(message)) {
+        relatedIndexes.push(...(toolResultIndexesByToolCallId.get(toolCallId) ?? []));
+      }
+      const toolResultId = extractToolResultIdForPairing(message);
+      if (toolResultId) {
+        relatedIndexes.push(...(assistantIndexesByToolCallId.get(toolResultId) ?? []));
+      }
+      for (const relatedIndex of relatedIndexes) {
+        if (!protectedIndexes.has(relatedIndex)) {
+          protectedIndexes.add(relatedIndex);
+          changed = true;
+        }
+      }
+    }
+  }
+
+  return protectedIndexes;
+}
+
+function expandToolPairLiveSortIndexes(params: {
+  assembledMessages: AgentMessage[];
+  liveSortIndexes: Map<number, number>;
+}): Map<number, number> {
+  const liveSortIndexes = new Map(params.liveSortIndexes);
+  const assistantIndexesByToolCallId = new Map<string, number[]>();
+  const toolResultIndexesByToolCallId = new Map<string, number[]>();
+
+  for (let index = 0; index < params.assembledMessages.length; index++) {
+    const message = params.assembledMessages[index] as AgentMessage;
+    for (const toolCallId of extractAssistantToolCallIdsForPairing(message)) {
+      const indexes = assistantIndexesByToolCallId.get(toolCallId);
+      if (indexes) {
+        indexes.push(index);
+      } else {
+        assistantIndexesByToolCallId.set(toolCallId, [index]);
+      }
+    }
+    const toolResultId = extractToolResultIdForPairing(message);
+    if (toolResultId) {
+      const indexes = toolResultIndexesByToolCallId.get(toolResultId);
+      if (indexes) {
+        indexes.push(index);
+      } else {
+        toolResultIndexesByToolCallId.set(toolResultId, [index]);
+      }
+    }
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let index = 0; index < params.assembledMessages.length; index++) {
+      const liveIndex = liveSortIndexes.get(index);
+      if (liveIndex === undefined) {
+        continue;
+      }
+      const message = params.assembledMessages[index] as AgentMessage;
+      const relatedIndexes: number[] = [];
+      for (const toolCallId of extractAssistantToolCallIdsForPairing(message)) {
+        relatedIndexes.push(...(toolResultIndexesByToolCallId.get(toolCallId) ?? []));
+      }
+      const toolResultId = extractToolResultIdForPairing(message);
+      if (toolResultId) {
+        relatedIndexes.push(...(assistantIndexesByToolCallId.get(toolResultId) ?? []));
+      }
+      for (const relatedIndex of relatedIndexes) {
+        const existing = liveSortIndexes.get(relatedIndex);
+        if (existing === undefined || liveIndex < existing) {
+          liveSortIndexes.set(relatedIndex, liveIndex);
+          changed = true;
+        }
+      }
+    }
+  }
+
+  return liveSortIndexes;
+}
+
+function buildToolPairIndexesByAssembledIndex(
+  assembledMessages: AgentMessage[],
+): Map<number, Set<number>> {
+  const assistantIndexesByToolCallId = new Map<string, number[]>();
+  const toolResultIndexesByToolCallId = new Map<string, number[]>();
+
+  // First index both sides by tool call id so matching assistant/result turns
+  // can be treated as one eviction unit.
+  for (let index = 0; index < assembledMessages.length; index++) {
+    const message = assembledMessages[index] as AgentMessage;
+    for (const toolCallId of extractAssistantToolCallIdsForPairing(message)) {
+      const indexes = assistantIndexesByToolCallId.get(toolCallId);
+      if (indexes) {
+        indexes.push(index);
+      } else {
+        assistantIndexesByToolCallId.set(toolCallId, [index]);
+      }
+    }
+    const toolResultId = extractToolResultIdForPairing(message);
+    if (toolResultId) {
+      const indexes = toolResultIndexesByToolCallId.get(toolResultId);
+      if (indexes) {
+        indexes.push(index);
+      } else {
+        toolResultIndexesByToolCallId.set(toolResultId, [index]);
+      }
+    }
+  }
+
+  const neighborsByIndex = new Map<number, Set<number>>();
+  // Link matched pairs as an undirected graph; the final groups are connected
+  // components, which handles multi-tool assistant turns and duplicate ids.
+  const linkIndexes = (left: number, right: number) => {
+    const leftNeighbors = neighborsByIndex.get(left) ?? new Set<number>([left]);
+    leftNeighbors.add(right);
+    neighborsByIndex.set(left, leftNeighbors);
+
+    const rightNeighbors = neighborsByIndex.get(right) ?? new Set<number>([right]);
+    rightNeighbors.add(left);
+    neighborsByIndex.set(right, rightNeighbors);
+  };
+
+  for (const [toolCallId, assistantIndexes] of assistantIndexesByToolCallId.entries()) {
+    const toolResultIndexes = toolResultIndexesByToolCallId.get(toolCallId) ?? [];
+    for (const assistantIndex of assistantIndexes) {
+      for (const toolResultIndex of toolResultIndexes) {
+        linkIndexes(assistantIndex, toolResultIndex);
+      }
+    }
+  }
+
+  const groupsByIndex = new Map<number, Set<number>>();
+  // Materialize every index's component so budget trimming can cheaply ask
+  // "what else must be evicted with this message?"
+  for (let index = 0; index < assembledMessages.length; index++) {
+    const group = new Set<number>();
+    const pending = [index];
+    while (pending.length > 0) {
+      const current = pending.pop() as number;
+      if (group.has(current)) {
+        continue;
+      }
+      group.add(current);
+      for (const neighbor of neighborsByIndex.get(current) ?? [current]) {
+        if (!group.has(neighbor)) {
+          pending.push(neighbor);
+        }
+      }
+    }
+    groupsByIndex.set(index, group);
+  }
+  return groupsByIndex;
+}
+
+function normalizeLiveMessageForAssemblyReconciliation(message: AgentMessage): AgentMessage {
+  const stored = toStoredMessage(message);
+  if (stored.role !== "system" && stored.role !== "tool") {
+    return message;
+  }
+  const runtimeRole = stored.role === "system" ? "user" : "toolResult";
+  const parts =
+    "content" in message
+      ? buildMessageParts({
+          sessionId: "live-reconciliation",
+          message,
+          fallbackContent: stored.content,
+        }).map((part) => toSyntheticMessagePartRecord(part, 0))
+      : [];
+  const content = contentFromParts(parts, runtimeRole, stored.content);
+  return {
+    ...message,
+    role: runtimeRole,
+    content,
+  } as AgentMessage;
+}
+
+function countNonOverlappingOccurrences(params: {
+  haystack: string;
+  needle: string;
+}): number {
+  if (!params.needle) {
+    return 0;
+  }
+  let count = 0;
+  let cursor = 0;
+  while (cursor <= params.haystack.length) {
+    const found = params.haystack.indexOf(params.needle, cursor);
+    if (found < 0) {
+      break;
+    }
+    count++;
+    cursor = found + params.needle.length;
+  }
+  return count;
+}
+
+function liveInputCoverageCapacity(params: {
+  assembledMessage: AgentMessage;
+  liveMessage: AgentMessage;
+  /**
+   * When true, the live message is a volatile input that was never persisted to
+   * DB. Summary substring coverage is insufficient for such messages because a
+   * summary that contains similar text is summarizing a *past* turn — it does
+   * not prove the current turn's volatile input is already represented.
+   */
+  isVolatileLiveInput?: boolean;
+}): number {
+  const assembled = toStoredMessage(params.assembledMessage);
+  const live = toStoredMessage(params.liveMessage);
+  if (messagesHaveSameLiveCoverageSignature(params.assembledMessage, params.liveMessage)) {
+    return 1;
+  }
+
+  // Volatile live inputs are never persisted to DB. A summary containing
+  // similar text covers a *past* occurrence, not the current live input.
+  // Only exact assembled message matches (handled above) can cover a
+  // volatile input — a historical summary paraphrase is insufficient.
+  if (params.isVolatileLiveInput) {
+    return 0;
+  }
+
+  // Substring coverage is only safe for LCM summary wrappers. Raw assembled
+  // turns must match exactly, otherwise normalized near-matches can hide a
+  // distinct volatile live input.
+  if (!assembled.content.includes("<summary ") || !assembled.content.includes("</summary>")) {
+    return 0;
+  }
+
+  const liveText = normalizeSummaryOverlapText(live.content);
+  if (liveText.length < 24) {
+    return 0;
+  }
+  const assembledText = normalizeSummaryOverlapText(assembled.content);
+  return countNonOverlappingOccurrences({ haystack: assembledText, needle: liveText });
+}
+
+function isSummaryWrapperContent(content: string): boolean {
+  return content.includes("<summary ") && content.includes("</summary>");
+}
+
+type VolatileLiveInputEntry = {
+  message: AgentMessage;
+  liveIndex: number;
+};
+
+type VolatileLiveInputCandidate = VolatileLiveInputEntry & {
+  liveText: string;
+};
+
+type VolatileLiveInputCoverageSlot = {
+  assembledIndex: number;
+};
+
+type RetainedAssembledEntry = {
+  message: AgentMessage;
+  index: number;
+};
+
+function materializeVolatileLiveInputEntries(entries: VolatileLiveInputEntry[]): AgentMessage[] {
+  return entries
+    .slice()
+    .sort((a, b) => a.liveIndex - b.liveIndex)
+    .map((entry) => entry.message);
+}
+
+function hashAgentMessageForAssemblyProtection(message: AgentMessage): string {
+  return createHash("sha256").update(JSON.stringify([message])).digest("hex").slice(0, 16);
+}
+
+function resolveProtectedFreshTailAssembledIndexes(params: {
+  assembledMessages: AgentMessage[];
+  freshTailMessageHashes?: string[];
+}): Set<number> {
+  const protectedIndexes = new Set<number>();
+  const usedIndexes = new Set<number>();
+  for (const hash of params.freshTailMessageHashes ?? []) {
+    for (let index = params.assembledMessages.length - 1; index >= 0; index--) {
+      if (usedIndexes.has(index)) {
+        continue;
+      }
+      const message = params.assembledMessages[index] as AgentMessage;
+      if (hashAgentMessageForAssemblyProtection(message) === hash) {
+        protectedIndexes.add(index);
+        usedIndexes.add(index);
+        break;
+      }
+    }
+  }
+  return protectedIndexes;
+}
+
+function messagesHaveSameLosslessSignature(left: AgentMessage, right: AgentMessage): boolean {
+  return createLosslessMessageSignature(left) === createLosslessMessageSignature(right);
+}
+
+function createLiveCoverageSignature(message: AgentMessage): string {
+  const stored = toStoredMessage(message);
+  if (
+    (stored.role === "user" || stored.role === "system" || stored.role === "assistant") &&
+    stored.content.length > 0 &&
+    isCanonicalTextOnlyMessage(message, stored.content)
+  ) {
+    return JSON.stringify({
+      kind: "canonical-text",
+      role: stored.role,
+      content: stored.content,
+    });
+  }
+  const canonicalToolTextSignature = createCanonicalToolTextCoverageSignature(
+    message,
+    stored.content,
+  );
+  if (canonicalToolTextSignature) {
+    return canonicalToolTextSignature;
+  }
+  return createLosslessMessageSignature(message);
+}
+
+function normalizeToolNameForCoverage(toolName: string | null | undefined): string | null {
+  // The assembler fills missing tool names with "unknown" on rehydration.
+  // Treat null/undefined/""/"unknown" as equivalent for coverage matching
+  // so live and assembled tool-result signatures still match.
+  if (!toolName || toolName === "unknown") {
+    return null;
+  }
+  return toolName;
+}
+
+function createCanonicalToolTextCoverageSignature(
+  message: AgentMessage,
+  fallbackContent: string,
+): string | undefined {
+  const stored = toStoredMessage(message);
+  if (stored.role !== "tool" || fallbackContent.length === 0) {
+    return undefined;
+  }
+  const parts = buildMessageParts({
+    sessionId: "live-tool-coverage-signature",
+    message,
+    fallbackContent,
+  });
+  if (parts.length !== 1) {
+    return undefined;
+  }
+  const part = parts[0] as CreateMessagePartInput;
+  if (
+    part.partType !== "text" ||
+    (part.textContent ?? "") !== fallbackContent ||
+    part.toolInput != null ||
+    part.toolOutput != null
+  ) {
+    return undefined;
+  }
+  return JSON.stringify({
+    kind: "canonical-tool-text",
+    role: stored.role,
+    content: fallbackContent,
+    toolCallId: part.toolCallId ?? extractToolResultIdForPairing(message) ?? null,
+    toolName: normalizeToolNameForCoverage(part.toolName),
+  });
+}
+
+function isCanonicalTextOnlyMessage(message: AgentMessage, fallbackContent: string): boolean {
+  const parts = buildMessageParts({
+    sessionId: "live-coverage-signature",
+    message,
+    fallbackContent,
+  });
+  if (parts.length !== 1) {
+    return false;
+  }
+  const part = parts[0] as CreateMessagePartInput;
+  return (
+    part.partType === "text" &&
+    (part.textContent ?? "") === fallbackContent &&
+    part.toolCallId == null &&
+    part.toolName == null &&
+    part.toolInput == null &&
+    part.toolOutput == null
+  );
+}
+
+function messagesHaveSameLiveCoverageSignature(left: AgentMessage, right: AgentMessage): boolean {
+  return createLiveCoverageSignature(left) === createLiveCoverageSignature(right);
+}
+
+function resolveExactAssembledLiveSortIndexes(params: {
+  assembledMessages: AgentMessage[];
+  liveMessages: AgentMessage[];
+}): Map<number, number> {
+  const liveSortIndexes = new Map<number, number>();
+  const usedAssembledIndexes = new Set<number>();
+  for (let liveIndex = params.liveMessages.length - 1; liveIndex >= 0; liveIndex--) {
+    const liveMessage = params.liveMessages[liveIndex] as AgentMessage;
+    for (
+      let assembledIndex = params.assembledMessages.length - 1;
+      assembledIndex >= 0;
+      assembledIndex--
+    ) {
+      if (usedAssembledIndexes.has(assembledIndex)) {
+        continue;
+      }
+      const assembledMessage = params.assembledMessages[assembledIndex] as AgentMessage;
+      if (messagesHaveSameLiveCoverageSignature(assembledMessage, liveMessage)) {
+        liveSortIndexes.set(assembledIndex, liveIndex);
+        usedAssembledIndexes.add(assembledIndex);
+        break;
+      }
+    }
+  }
+  return liveSortIndexes;
+}
+
+function mergeCoveredVolatileLiveSortIndexes(params: {
+  exactLiveSortIndexes: Map<number, number>;
+  coveredEntriesByAssembledIndex: Map<number, VolatileLiveInputEntry[]>;
+}): Map<number, number> {
+  const liveSortIndexes = new Map(params.exactLiveSortIndexes);
+  for (const [assembledIndex, entries] of params.coveredEntriesByAssembledIndex.entries()) {
+    const coveredLiveIndex = Math.min(...entries.map((entry) => entry.liveIndex));
+    const existingLiveIndex = liveSortIndexes.get(assembledIndex);
+    if (existingLiveIndex === undefined || coveredLiveIndex < existingLiveIndex) {
+      liveSortIndexes.set(assembledIndex, coveredLiveIndex);
+    }
+  }
+  return liveSortIndexes;
+}
+
+function buildVolatileLiveInputMergedOutput(params: {
+  retained: RetainedAssembledEntry[];
+  appendedEntries: VolatileLiveInputEntry[];
+  liveSortIndexes: Map<number, number>;
+}): AgentMessage[] {
+  const output: AgentMessage[] = [];
+  const appendedEntries = params.appendedEntries
+    .slice()
+    .sort((left, right) => left.liveIndex - right.liveIndex);
+  let appendedCursor = 0;
+  for (const retainedEntry of params.retained) {
+    const retainedLiveIndex = params.liveSortIndexes.get(retainedEntry.index);
+    if (retainedLiveIndex !== undefined) {
+      while (
+        appendedCursor < appendedEntries.length &&
+        (appendedEntries[appendedCursor] as VolatileLiveInputEntry).liveIndex < retainedLiveIndex
+      ) {
+        output.push((appendedEntries[appendedCursor] as VolatileLiveInputEntry).message);
+        appendedCursor++;
+      }
+    }
+    output.push(retainedEntry.message);
+  }
+  while (appendedCursor < appendedEntries.length) {
+    output.push((appendedEntries[appendedCursor] as VolatileLiveInputEntry).message);
+    appendedCursor++;
+  }
+  return sanitizeToolUseResultPairing(output) as AgentMessage[];
+}
+
+function matchVolatileLiveInputsToCoverageSlots(params: {
+  assembledMessages: AgentMessage[];
+  volatileLiveInputs: VolatileLiveInputCandidate[];
+}): Map<number, number> {
+  const entryIndexesByLiveText = new Map<string, number[]>();
+  for (let entryIndex = 0; entryIndex < params.volatileLiveInputs.length; entryIndex++) {
+    const entry = params.volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate;
+    const entryIndexes = entryIndexesByLiveText.get(entry.liveText);
+    if (entryIndexes) {
+      entryIndexes.push(entryIndex);
+    } else {
+      entryIndexesByLiveText.set(entry.liveText, [entryIndex]);
+    }
+  }
+
+  const slots: VolatileLiveInputCoverageSlot[] = [];
+  const candidateSlotIndexesByEntryIndex = params.volatileLiveInputs.map(() => [] as number[]);
+  const addCandidateSlots = (entryIndexes: number[], assembledIndex: number, slotCount: number) => {
+    const slotIndexes: number[] = [];
+    for (let slotOffset = 0; slotOffset < slotCount; slotOffset++) {
+      slotIndexes.push(slots.length);
+      slots.push({ assembledIndex });
+    }
+    for (const entryIndex of entryIndexes) {
+      candidateSlotIndexesByEntryIndex[entryIndex]?.push(...slotIndexes);
+    }
+  };
+
+  for (const [liveText, entryIndexes] of entryIndexesByLiveText.entries()) {
+    for (let assembledIndex = 0; assembledIndex < params.assembledMessages.length; assembledIndex++) {
+      const assembledMessage = params.assembledMessages[assembledIndex] as AgentMessage;
+      const assembled = toStoredMessage(assembledMessage);
+      if (!isSummaryWrapperContent(assembled.content)) {
+        const exactEntryIndexes = entryIndexes.filter((entryIndex) =>
+          messagesHaveSameLiveCoverageSignature(
+            assembledMessage,
+            (params.volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate).message,
+          )
+        );
+        if (exactEntryIndexes.length > 0) {
+          addCandidateSlots(exactEntryIndexes, assembledIndex, 1);
+        }
+        continue;
+      }
+
+      const representativeEntry = params.volatileLiveInputs[entryIndexes[0] as number] as VolatileLiveInputCandidate;
+      const capacity = liveInputCoverageCapacity({
+        assembledMessage,
+        liveMessage: representativeEntry.message,
+        isVolatileLiveInput: true,
+      });
+      if (capacity <= 0) {
+        continue;
+      }
+
+      const entryIndexesBySignature = new Map<string, number[]>();
+      for (const entryIndex of entryIndexes) {
+        const entry = params.volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate;
+        const signature = createLiveCoverageSignature(entry.message);
+        const signatureEntryIndexes = entryIndexesBySignature.get(signature);
+        if (signatureEntryIndexes) {
+          signatureEntryIndexes.push(entryIndex);
+        } else {
+          entryIndexesBySignature.set(signature, [entryIndex]);
+        }
+      }
+
+      let exactSlotCount = 0;
+      for (const signatureEntryIndexes of entryIndexesBySignature.values()) {
+        const firstEntry = params.volatileLiveInputs[signatureEntryIndexes[0] as number] as VolatileLiveInputCandidate;
+        const liveContent = toStoredMessage(firstEntry.message).content;
+        const exactCapacity = liveContent
+          ? countNonOverlappingOccurrences({ haystack: assembled.content, needle: liveContent })
+          : 0;
+        const slotCount = Math.min(exactCapacity, signatureEntryIndexes.length);
+        if (slotCount > 0) {
+          addCandidateSlots(signatureEntryIndexes, assembledIndex, slotCount);
+          exactSlotCount += slotCount;
+        }
+      }
+
+      const genericSlotCount = Math.min(
+        Math.max(0, capacity - exactSlotCount),
+        Math.max(0, entryIndexes.length - exactSlotCount),
+      );
+      if (genericSlotCount > 0) {
+        addCandidateSlots(entryIndexes, assembledIndex, genericSlotCount);
+      }
+    }
+  }
+
+  const slotToEntryIndex = new Map<number, number>();
+  const tryAssignEntry = (entryIndex: number, visitedSlots: Set<number>): boolean => {
+    const candidateSlotIndexes = candidateSlotIndexesByEntryIndex[entryIndex] ?? [];
+    for (const slotIndex of candidateSlotIndexes) {
+      if (visitedSlots.has(slotIndex)) {
+        continue;
+      }
+      visitedSlots.add(slotIndex);
+      const currentEntryIndex = slotToEntryIndex.get(slotIndex);
+      if (
+        currentEntryIndex === undefined ||
+        tryAssignEntry(currentEntryIndex, visitedSlots)
+      ) {
+        slotToEntryIndex.set(slotIndex, entryIndex);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (let entryIndex = 0; entryIndex < params.volatileLiveInputs.length; entryIndex++) {
+    tryAssignEntry(entryIndex, new Set<number>());
+  }
+
+  const entryToAssembledIndex = new Map<number, number>();
+  for (const [slotIndex, entryIndex] of slotToEntryIndex.entries()) {
+    const slot = slots[slotIndex] as VolatileLiveInputCoverageSlot;
+    entryToAssembledIndex.set(entryIndex, slot.assembledIndex);
+  }
+  return entryToAssembledIndex;
+}
+
+function collectUncoveredVolatileLiveInputs(params: {
+  assembledMessages: AgentMessage[];
+  liveMessages: AgentMessage[];
+}): {
+  entries: VolatileLiveInputEntry[];
+  estimatedTokens: number;
+  coveredEntriesByAssembledIndex: Map<number, VolatileLiveInputEntry[]>;
+} {
+  const volatileLiveInputs = params.liveMessages
+    .map((message, liveIndex) => ({ message, liveIndex }))
+    .filter((entry) => isVolatileLiveInputMessage(entry.message))
+    .map((entry) => ({
+      ...entry,
+      liveText: normalizeSummaryOverlapText(toStoredMessage(entry.message).content),
+    }));
+  const uncovered: VolatileLiveInputEntry[] = [];
+  const coveredEntriesByAssembledIndex = new Map<number, VolatileLiveInputEntry[]>();
+  const entryToAssembledIndex = matchVolatileLiveInputsToCoverageSlots({
+    assembledMessages: params.assembledMessages,
+    volatileLiveInputs,
+  });
+
+  for (let entryIndex = 0; entryIndex < volatileLiveInputs.length; entryIndex++) {
+    const entry = volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate;
+    const assembledIndex = entryToAssembledIndex.get(entryIndex);
+    if (assembledIndex !== undefined) {
+      const coveredEntries = coveredEntriesByAssembledIndex.get(assembledIndex);
+      if (coveredEntries) {
+        coveredEntries.push(entry);
+      } else {
+        coveredEntriesByAssembledIndex.set(assembledIndex, [entry]);
+      }
+    } else {
+      uncovered.push(entry);
+    }
+  }
+
+  return {
+    entries: uncovered,
+    estimatedTokens: estimateAgentMessageTokens(materializeVolatileLiveInputEntries(uncovered)),
+    coveredEntriesByAssembledIndex,
+  };
+}
+
+function appendUncoveredVolatileLiveInputsWithinBudget(params: {
+  assembledMessages: AgentMessage[];
+  assembledEstimatedTokens: number;
+  liveMessages: AgentMessage[];
+  protectedAssembledIndexes?: Set<number>;
+  tokenBudget: number;
+}): {
+  messages: AgentMessage[];
+  estimatedTokens: number;
+  appendedMessages: number;
+  appendedTokens: number;
+  evictedMessages: number;
+  evictedTokens: number;
+  overBudget: boolean;
+} {
+  const liveMessages = params.liveMessages.map(normalizeLiveMessageForAssemblyReconciliation);
+  const protectedAssembledIndexes = expandProtectedToolPairIndexes({
+    assembledMessages: params.assembledMessages,
+    protectedAssembledIndexes: params.protectedAssembledIndexes ?? new Set<number>(),
+  });
+  const uncovered = collectUncoveredVolatileLiveInputs({
+    assembledMessages: params.assembledMessages,
+    liveMessages,
+  });
+  if (uncovered.entries.length === 0) {
+    return {
+      messages: params.assembledMessages,
+      estimatedTokens: params.assembledEstimatedTokens,
+      appendedMessages: 0,
+      appendedTokens: 0,
+      evictedMessages: 0,
+      evictedTokens: 0,
+      overBudget: params.assembledEstimatedTokens > params.tokenBudget,
+    };
+  }
+
+  let retained = params.assembledMessages.map((message, index) => ({ message, index }));
+  let appendedEntries = uncovered.entries.slice();
+  const toolPairIndexesByIndex = buildToolPairIndexesByAssembledIndex(params.assembledMessages);
+  const exactLiveSortIndexes = resolveExactAssembledLiveSortIndexes({
+    assembledMessages: params.assembledMessages,
+    liveMessages,
+  });
+  const exactLiveProtectedIndexes = expandProtectedToolPairIndexes({
+    assembledMessages: params.assembledMessages,
+    protectedAssembledIndexes: new Set(exactLiveSortIndexes.keys()),
+  });
+  const liveSortIndexes = expandToolPairLiveSortIndexes({
+    assembledMessages: params.assembledMessages,
+    liveSortIndexes: mergeCoveredVolatileLiveSortIndexes({
+      exactLiveSortIndexes,
+      coveredEntriesByAssembledIndex: uncovered.coveredEntriesByAssembledIndex,
+    }),
+  });
+  let evictedMessages = 0;
+  let evictedTokens = 0;
+  let output = buildVolatileLiveInputMergedOutput({
+    retained,
+    appendedEntries,
+    liveSortIndexes,
+  });
+  let estimatedTokens = estimateAgentMessageTokens(output);
+
+  while (retained.length > 0 && estimatedTokens > params.tokenBudget) {
+    let bestCandidate:
+      | {
+          evictAssembledIndexes: Set<number>;
+          output: AgentMessage[];
+          estimatedTokens: number;
+          appendedEntries: VolatileLiveInputEntry[];
+        }
+      | undefined;
+    for (let evictIndex = 0; evictIndex < retained.length; evictIndex++) {
+      const entry = retained[evictIndex] as RetainedAssembledEntry;
+      const evictAssembledIndexes = toolPairIndexesByIndex.get(entry.index) ?? new Set([entry.index]);
+      const candidateEvictsExactLiveTurn = Array.from(evictAssembledIndexes).some((index) =>
+        exactLiveProtectedIndexes.has(index)
+      );
+      const candidateEvictsProtectedTurn = Array.from(evictAssembledIndexes).some((index) =>
+        protectedAssembledIndexes.has(index)
+      );
+      if (candidateEvictsExactLiveTurn || candidateEvictsProtectedTurn) {
+        continue;
+      }
+      const restoredCoveredEntries = Array.from(evictAssembledIndexes).flatMap(
+        (index) => uncovered.coveredEntriesByAssembledIndex.get(index) ?? [],
+      );
+      const candidateRetained = retained.filter(
+        (retainedEntry) => !evictAssembledIndexes.has(retainedEntry.index),
+      );
+      const candidateAppendedEntries =
+        restoredCoveredEntries.length > 0
+          ? [...appendedEntries, ...restoredCoveredEntries]
+          : appendedEntries;
+      const candidateOutput = buildVolatileLiveInputMergedOutput({
+        retained: candidateRetained,
+        appendedEntries: candidateAppendedEntries,
+        liveSortIndexes,
+      });
+      const candidateEstimatedTokens = estimateAgentMessageTokens(candidateOutput);
+      const candidateFits = candidateEstimatedTokens <= params.tokenBudget;
+      const bestFits =
+        bestCandidate !== undefined && bestCandidate.estimatedTokens <= params.tokenBudget;
+      if (
+        bestCandidate === undefined ||
+        (candidateFits && !bestFits) ||
+        (candidateFits &&
+          bestFits &&
+          candidateEstimatedTokens > bestCandidate.estimatedTokens) ||
+        (!candidateFits &&
+          !bestFits &&
+          candidateEstimatedTokens < bestCandidate.estimatedTokens)
+      ) {
+        bestCandidate = {
+          evictAssembledIndexes,
+          output: candidateOutput,
+          estimatedTokens: candidateEstimatedTokens,
+          appendedEntries: candidateAppendedEntries,
+        };
+      }
+    }
+    if (!bestCandidate) {
+      break;
+    }
+    const removedEntries = retained.filter((entry) =>
+      bestCandidate.evictAssembledIndexes.has(entry.index),
+    );
+    retained = retained.filter((entry) => !bestCandidate.evictAssembledIndexes.has(entry.index));
+    appendedEntries = bestCandidate.appendedEntries;
+    for (const removed of removedEntries) {
+      uncovered.coveredEntriesByAssembledIndex.delete(removed.index);
+      evictedTokens += toStoredMessage(removed.message).tokenCount;
+    }
+    evictedMessages += removedEntries.length;
+    output = bestCandidate.output;
+    estimatedTokens = bestCandidate.estimatedTokens;
+  }
+  const appendedMessages = materializeVolatileLiveInputEntries(appendedEntries);
+
+  return {
+    messages: output,
+    estimatedTokens,
+    appendedMessages: appendedMessages.length,
+    appendedTokens: estimateAgentMessageTokens(appendedMessages),
+    evictedMessages,
+    evictedTokens,
+    overBudget: estimatedTokens > params.tokenBudget,
+  };
+}
+
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
 type TranscriptReconcileResult = {
   blockedByImportCap: boolean;
+  blockedReason?: "import-cap" | "cross-conversation-raw-id";
   importedMessages: number;
   hasOverlap: boolean;
 };
@@ -1806,6 +2818,7 @@ export class LcmContextEngine implements ContextEngine {
 
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
+  private focusBriefStore: FocusBriefStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
   private assembler: ContextAssembler;
@@ -1906,12 +2919,22 @@ export class LcmContextEngine implements ContextEngine {
       version: "0.1.0",
       ownsCompaction: migrationOk,
       turnMaintenanceMode: "background",
+      hostRequirements: {
+        "agent-run": {
+          requiredCapabilities: LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
+          unsupportedMessage: [
+            "lossless-claw requires a native OpenClaw runtime with the full context-engine agent-run lifecycle.",
+            "Use the native Codex or Pi embedded runtime, or switch plugins.slots.contextEngine to legacy for CLI harness runs.",
+          ].join(" "),
+        },
+      },
     } as ContextEngineInfo;
 
     this.conversationStore = new ConversationStore(this.db, {
       fts5Available: this.fts5Available,
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    this.focusBriefStore = new FocusBriefStore(this.db);
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
 
@@ -1945,6 +2968,7 @@ export class LcmContextEngine implements ContextEngine {
       this.conversationStore,
       this.summaryStore,
       this.config.timezone,
+      this.focusBriefStore,
     );
 
     const compactionConfig: CompactionConfig = {
@@ -1958,6 +2982,9 @@ export class LcmContextEngine implements ContextEngine {
       incrementalMaxDepth: this.config.incrementalMaxDepth,
       leafChunkTokens: this.config.leafChunkTokens,
       summaryPrefixTargetTokens: this.config.summaryPrefixTargetTokens,
+      maxSweepIterations: this.config.maxSweepIterations,
+      sweepDeadlineMs: this.config.sweepDeadlineMs,
+      compactUntilUnderDeadlineMs: this.config.compactUntilUnderDeadlineMs,
       leafTargetTokens: this.config.leafTargetTokens,
       condensedTargetTokens: this.config.condensedTargetTokens,
       maxRounds: 10,
@@ -2352,15 +3379,19 @@ export class LcmContextEngine implements ContextEngine {
     reason: string;
     tokenBudget: number;
     currentTokenCount?: number;
+    projectedTokenCount?: number;
+    rawTokensOutsideTail?: number;
   }): Promise<void> {
     await this.compactionMaintenanceStore.requestProactiveCompactionDebt({
       conversationId: params.conversationId,
       reason: params.reason,
       tokenBudget: params.tokenBudget,
       currentTokenCount: params.currentTokenCount ?? null,
+      projectedTokenCount: params.projectedTokenCount ?? null,
+      rawTokensOutsideTail: params.rawTokensOutsideTail ?? null,
     });
     this.deps.log.debug(
-      `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"}`,
+      `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"} projectedTokenCount=${params.projectedTokenCount ?? "null"} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"}`,
     );
   }
 
@@ -2382,8 +3413,9 @@ export class LcmContextEngine implements ContextEngine {
   /**
    * Consume durable threshold debt only when the session queue is idle.
    *
-   * Any skipped busy-queue attempt leaves the maintenance row pending for
-   * assemble() or a later host-approved maintain() pass.
+   * Any skipped busy-queue attempt leaves the maintenance row pending for a
+   * later idle drain, host-approved maintain() pass, or emergency assemble()
+   * fallback if the live prompt is already over budget.
    */
   private async drainDeferredCompactionDebtIfIdle(
     params: DeferredCompactionDebtDrainParams & { queueKey: string },
@@ -2489,6 +3521,9 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedCurrentTokenCount = this.normalizeObservedTokenCount(
         params.currentTokenCount ?? maintenance.currentTokenCount ?? undefined,
       );
+      const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
+        maintenance.projectedTokenCount ?? undefined,
+      );
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
@@ -2538,7 +3573,7 @@ export class LcmContextEngine implements ContextEngine {
         keepPending: !result.ok,
       });
       this.deps.log.debug(
-        `[lcm] maintain: deferred compaction ${result.compacted ? "completed" : "skipped"} conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} ok=${result.ok} reason=${result.reason ?? "none"}`,
+        `[lcm] maintain: deferred compaction ${result.compacted ? "completed" : "skipped"} conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} ok=${result.ok} reason=${result.reason ?? "none"} currentTokenCount=${resolvedCurrentTokenCount ?? "null"} projectedTokenCount=${resolvedProjectedTokenCount ?? "null"} rawTokensOutsideTail=${maintenance.rawTokensOutsideTail ?? "null"}`,
       );
       return {
         changed: result.compacted,
@@ -2566,8 +3601,12 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
-   * Re-check and consume deferred debt for assemble() while holding the
-   * session queue so pre-assembly writes cannot race queued maintenance.
+   * Consume deferred debt for assemble() only after the caller has established
+   * that the live prompt is already over budget. Routine threshold debt is
+   * drained after turns or by host-approved maintain() calls so the next user
+   * turn is not held hostage by proactive compaction work. Hitting this path
+   * means idle/background maintenance did not catch up before the prompt became
+   * unusable, so callers should treat it as an emergency safeguard.
    */
   private async maybeConsumeDeferredCompactionDebtForAssemble(params: {
     conversationId: number;
@@ -2686,29 +3725,56 @@ export class LcmContextEngine implements ContextEngine {
         : await this.compaction.evaluate(conversationId, tokenBudget);
     const targetTokens =
       params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
-    const liveContextStillExceedsTarget =
-      observedTokens !== undefined && observedTokens >= targetTokens;
     // Codex can report a live prompt count that includes runtime framing,
-    // tool schemas, and other overhead not present in Lossless's stored count.
-    // If that live count crosses the threshold, compact stored context far
-    // enough that stored tokens plus the observed overhead should fit.
+    // tool schemas, and other overhead not present in Lossless's compactable
+    // stored count. Raw backlog is different: it can force a sweep, but once
+    // swept it should not be carried forward as permanent runtime overhead.
     const decisionStoredTokens =
       typeof decision.storedTokens === "number"
       && Number.isFinite(decision.storedTokens)
       && decision.storedTokens >= 0
         ? Math.floor(decision.storedTokens)
         : decision.currentTokens;
+    const decisionProjectedTokens =
+      typeof decision.projectedTokens === "number" &&
+      Number.isFinite(decision.projectedTokens) &&
+      decision.projectedTokens >= 0
+        ? Math.floor(decision.projectedTokens)
+        : undefined;
+    const decisionRawTokensOutsideTail =
+      typeof decision.rawTokensOutsideTail === "number" &&
+      Number.isFinite(decision.rawTokensOutsideTail) &&
+      decision.rawTokensOutsideTail >= 0
+        ? Math.floor(decision.rawTokensOutsideTail)
+        : undefined;
     const observedRuntimeOverhead =
       params.compactionTarget === "threshold" && observedTokens !== undefined
         ? Math.max(0, observedTokens - decisionStoredTokens)
         : 0;
     const runtimeAdjustedSweepTargetTokens =
-      observedRuntimeOverhead > 0 && observedTokens !== undefined && observedTokens > targetTokens
+      observedRuntimeOverhead > 0 &&
+      observedTokens !== undefined &&
+      observedTokens > targetTokens
         ? Math.max(1, targetTokens - observedRuntimeOverhead)
         : undefined;
+    const projectedRawBacklogPressure =
+      params.compactionTarget === "threshold" &&
+      decisionProjectedTokens !== undefined &&
+      decisionProjectedTokens > targetTokens &&
+      (decisionRawTokensOutsideTail ?? 0) > 0;
+    const thresholdPressureTokens =
+      params.compactionTarget === "threshold"
+        ? Math.max(
+            decision.currentTokens,
+            observedTokens ?? 0,
+            decisionProjectedTokens ?? 0,
+          )
+        : observedTokens;
+    const liveContextStillExceedsTarget =
+      thresholdPressureTokens !== undefined && thresholdPressureTokens >= targetTokens;
 
     this.deps.log.info(
-      `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} shouldCompact=${decision.shouldCompact}`,
+      `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} projectedTokens=${decisionProjectedTokens ?? "none"} rawTokensOutsideTail=${decisionRawTokensOutsideTail ?? "none"} thresholdPressureTokens=${thresholdPressureTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} shouldCompact=${decision.shouldCompact}`,
     );
 
     if (!forceCompaction && !decision.shouldCompact) {
@@ -2729,11 +3795,15 @@ export class LcmContextEngine implements ContextEngine {
     // overflow counts can drive recovery even when persisted context is already small.
     const useSweep = manualCompactionRequested || params.compactionTarget === "threshold";
     if (useSweep) {
+      const forceThresholdSweep =
+        forceCompaction ||
+        runtimeAdjustedSweepTargetTokens !== undefined ||
+        projectedRawBacklogPressure;
       const sweepResult = await this.compaction.compact({
         conversationId,
         tokenBudget,
         summarize,
-        force: forceCompaction || runtimeAdjustedSweepTargetTokens !== undefined,
+        force: forceThresholdSweep,
         hardTrigger: false,
         summaryModel,
         ...(runtimeAdjustedSweepTargetTokens !== undefined
@@ -2754,7 +3824,8 @@ export class LcmContextEngine implements ContextEngine {
           ? sweepResult.tokensAfter
           : undefined;
       const projectedTokensAfterSweep =
-        sweepTokensAfter !== undefined && runtimeAdjustedSweepTargetTokens !== undefined
+        sweepTokensAfter !== undefined &&
+        (runtimeAdjustedSweepTargetTokens !== undefined || projectedRawBacklogPressure)
           ? sweepTokensAfter + observedRuntimeOverhead
           : sweepTokensAfter;
       const isThresholdSweep = params.compactionTarget === "threshold";
@@ -2796,10 +3867,16 @@ export class LcmContextEngine implements ContextEngine {
           details: {
             rounds: sweepResult.actionTaken ? 1 : 0,
             targetTokens: runtimeAdjustedSweepTargetTokens ?? targetTokens,
-            ...(runtimeAdjustedSweepTargetTokens !== undefined
+            ...(runtimeAdjustedSweepTargetTokens !== undefined || projectedRawBacklogPressure
               ? {
                   observedOverheadTokens: observedRuntimeOverhead,
                   projectedTokensAfter: projectedTokensAfterSweep,
+                  ...(decisionProjectedTokens !== undefined
+                    ? { projectedTokensBefore: decisionProjectedTokens }
+                    : {}),
+                  ...(decisionRawTokensOutsideTail !== undefined
+                    ? { rawTokensOutsideTail: decisionRawTokensOutsideTail }
+                    : {}),
                 }
               : {}),
           },
@@ -3074,6 +4151,12 @@ export class LcmContextEngine implements ContextEngine {
         return "webp";
       case "image/svg+xml":
         return "svg";
+      case "image/heic":
+        return "heic";
+      case "image/avif":
+        return "avif";
+      case "image/bmp":
+        return "bmp";
       default:
         return null;
     }
@@ -3128,6 +4211,7 @@ export class LcmContextEngine implements ContextEngine {
     content: unknown[];
     imageIndex: number;
     extension: string;
+    role?: string;
   }): string {
     for (let index = params.imageIndex - 1; index >= 0; index -= 1) {
       const entry = asRecord(params.content[index]);
@@ -3145,14 +4229,20 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    return `user-image.${params.extension}`;
+    const rolePrefix =
+      params.role === "assistant"
+        ? "assistant"
+        : params.role === "system"
+          ? "system"
+          : params.role === "tool" || params.role === "toolResult"
+            ? "tool"
+            : "user";
+    return `${rolePrefix}-image.${params.extension}`;
   }
 
   private static isExternalizedImageReference(value: string): boolean {
     if (typeof value !== "string") return false;
-    return /^\[(?:User|Tool|Assistant|Image) image: .*LCM file: file_[a-f0-9]{16}\]$/.test(
-      value.trim(),
-    );
+    return LcmContextEngine.IMAGE_REFERENCE_REGEX.test(value.trim());
   }
 
   private static isExternalizedReferenceContent(value: string): boolean {
@@ -3161,10 +4251,41 @@ export class LcmContextEngine implements ContextEngine {
       trimmed.startsWith("[LCM File:") ||
       trimmed.startsWith("[LCM Tool Output:") ||
       trimmed.includes("LCM file: file_") ||
-      /\[(?:User|Tool|Assistant|Image) image: [^\]]*LCM file: file_[a-f0-9]{16}\]/.test(
-        trimmed,
-      )
+      LcmContextEngine.IMAGE_REFERENCE_REGEX_GLOBAL.test(trimmed)
     );
+  }
+
+  /** Image references emitted by `externalizeImage` can use either role-specific
+   *  labels (`User image`, `Assistant image`, `System image`, `Tool image`) or
+   *  the generic `Image` label used by pure-base64 user/system content. */
+  private static readonly IMAGE_REFERENCE_REGEX =
+    /^\[(?:(?:User|System|Tool|Assistant) image|Image): [^\]]*LCM file: file_[a-f0-9]{16}\]$/;
+  private static readonly IMAGE_REFERENCE_REGEX_GLOBAL =
+    /\[(?:(?:User|System|Tool|Assistant) image|Image): [^\]]*LCM file: file_[a-f0-9]{16}\]/;
+
+  /** Stricter form of `isExternalizedReferenceContent` used by the
+   *  raw-payload externalizer's skip gate. Returns true when the message's
+   *  stored content was produced by a *wholesale-replacement* externalizer
+   *  (large-file / tool-output / raw-payload — each emits content that
+   *  starts with the canonical reference header, optionally followed by an
+   *  exploration-summary preamble), or when the whole trimmed content is a
+   *  single image-only reference (rare).
+   *
+   *  Mixed content like `"...intro... [User image: file_xyz] ... long body
+   *  text..."` is NOT considered wholly externalized — those messages must
+   *  remain eligible for raw-payload externalization when they exceed the
+   *  size threshold. */
+  private static isWhollyExternalizedReferenceContent(value: string): boolean {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return false;
+    if (
+      trimmed.startsWith("[LCM File:") ||
+      trimmed.startsWith("[LCM Tool Output:") ||
+      trimmed.startsWith("[LCM Raw Payload:")
+    ) {
+      return true;
+    }
+    return LcmContextEngine.IMAGE_REFERENCE_REGEX.test(trimmed);
   }
 
   /** Resolve the configured externalized-payload directory for one conversation. */
@@ -3220,16 +4341,40 @@ export class LcmContextEngine implements ContextEngine {
     return { fileId, byteSize, summary, reference };
   }
 
-  private async interceptNativeUserImageBlocks(params: {
+  private async interceptNativeImageBlocks(params: {
     conversationId: number;
     message: AgentMessage;
   }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
-    if (params.message.role !== "user" || !("content" in params.message)) {
+    if (!("content" in params.message)) {
+      return null;
+    }
+    const role = (params.message as { role?: unknown }).role;
+    // Cover every persistable role — `hasPersistableMessageRole` accepts
+    // user/assistant/system/tool/toolResult, so this gate must too. A system
+    // message carrying native `{type:"image"}` blocks would otherwise fall
+    // through to the generic raw-payload externalizer and be stored as a
+    // `raw-system-payload.json` blob with embedded base64.
+    if (
+      role !== "user" &&
+      role !== "assistant" &&
+      role !== "system" &&
+      role !== "tool" &&
+      role !== "toolResult"
+    ) {
       return null;
     }
     if (!Array.isArray(params.message.content)) {
       return null;
     }
+
+    const label =
+      role === "assistant"
+        ? "Assistant image"
+        : role === "system"
+          ? "System image"
+          : role === "tool" || role === "toolResult"
+            ? "Tool image"
+            : "User image";
 
     const rewrittenContent: unknown[] = [];
     const fileIds: string[] = [];
@@ -3250,10 +4395,11 @@ export class LcmContextEngine implements ContextEngine {
           content: params.message.content,
           imageIndex: index,
           extension: image.extension,
+          role: typeof role === "string" ? role : undefined,
         }),
         extension: image.extension,
         mimeType: image.mimeType,
-        label: "User image",
+        label,
       });
 
       rewrittenContent.push({ type: "text", text: externalized.reference });
@@ -3882,7 +5028,17 @@ export class LcmContextEngine implements ContextEngine {
     if (params.stored.role === "tool") {
       return null;
     }
-    if (LcmContextEngine.isExternalizedReferenceContent(params.stored.content)) {
+    // Skip when this message has already been raw-payload-externalized, or
+    // when its whole stored content is just an externalized reference.
+    // Mixed content that embeds an image reference alongside other oversized
+    // content remains eligible for raw-payload externalization.
+    const externalizedFlag = (
+      params.message as { rawPayloadExternalized?: unknown }
+    ).rawPayloadExternalized;
+    if (externalizedFlag === true) {
+      return null;
+    }
+    if (LcmContextEngine.isWhollyExternalizedReferenceContent(params.stored.content)) {
       return null;
     }
     if ("content" in params.message && hasReplayCriticalRawBlock(params.message.content)) {
@@ -4068,7 +5224,34 @@ export class LcmContextEngine implements ContextEngine {
             this.deps.log.debug(
               `[lcm] reconcileSessionTail: blocked no-anchor import for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} existingDbCount=${existingDbCount} cap=${importCap} overlap=false`,
             );
-            return { blockedByImportCap: true, importedMessages: 0, hasOverlap: false };
+            return {
+              blockedByImportCap: true,
+              blockedReason: "import-cap",
+              importedMessages: 0,
+              hasOverlap: false,
+            };
+          }
+
+          if (params.noAnchorImportReason === "same-path-shrink") {
+            const rawIdMatches = this.countActiveCrossConversationRawIdMatches({
+              conversationId,
+              sessionId,
+              messages: historicalMessages,
+            });
+            if (rawIdMatches.matchedRawIds > 0) {
+              this.deps.log.warn(
+                `[lcm] reconcileSessionTail: blocked same-path-shrink no-anchor import for ${sessionContext} because ${rawIdMatches.matchedRawIds}/${rawIdMatches.candidateRawIds} candidate raw ids already exist in other active conversations`,
+              );
+              this.deps.log.debug(
+                `[lcm] reconcileSessionTail: blocked cross-conversation raw-id duplicate for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateRawIds=${rawIdMatches.candidateRawIds} matchedRawIds=${rawIdMatches.matchedRawIds} overlap=false`,
+              );
+              return {
+                blockedByImportCap: true,
+                blockedReason: "cross-conversation-raw-id",
+                importedMessages: 0,
+                hasOverlap: false,
+              };
+            }
           }
 
           let importedMessages = 0;
@@ -4101,12 +5284,13 @@ export class LcmContextEngine implements ContextEngine {
       return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
     }
 
-    const missingTail = await this.filterBootstrapReplayMessages({
+    const missingTailFiltered = await this.filterBootstrapReplayMessages({
       messages: historicalMessages.slice(anchorIndex + 1),
       sessionContext,
       source: "reconcileSessionTail",
       priorMessages: historicalMessages.slice(0, anchorIndex + 1),
     });
+    const missingTail = missingTailFiltered.messages;
 
     if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
       this.deps.log.warn(
@@ -4115,12 +5299,23 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.debug(
         `[lcm] reconcileSessionTail: blocked for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} missingTail=${missingTail.length} existingDbCount=${existingDbCount}`,
       );
-      return { blockedByImportCap: true, importedMessages: 0, hasOverlap: true };
+      return {
+        blockedByImportCap: true,
+        blockedReason: "import-cap",
+        importedMessages: 0,
+        hasOverlap: true,
+      };
     }
 
     let importedMessages = 0;
-    for (const message of missingTail) {
-      const result = await this.ingestSingle({ sessionId, sessionKey: params.sessionKey, message });
+    for (const [index, message] of missingTail.entries()) {
+      const result = await this.ingestSingle({
+        sessionId,
+        sessionKey: params.sessionKey,
+        message,
+        skipReplayTimestampFloodGuard:
+          index < missingTailFiltered.replayGuardExemptPrefixLength,
+      });
       if (result.ingested) {
         importedMessages += 1;
       }
@@ -4130,6 +5325,70 @@ export class LcmContextEngine implements ContextEngine {
       `[lcm] reconcileSessionTail: slow path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages}`,
     );
     return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+  }
+
+  /** Count candidate raw event IDs that already belong to another active conversation. */
+  private countActiveCrossConversationRawIdMatches(params: {
+    conversationId: number;
+    sessionId: string;
+    messages: AgentMessage[];
+  }): { candidateRawIds: number; matchedRawIds: number } {
+    const candidateRawIds = new Set<string>();
+    for (const message of params.messages) {
+      const stored = toStoredMessage(message);
+      const parts = buildMessageParts({
+        sessionId: params.sessionId,
+        message,
+        fallbackContent: stored.content,
+      });
+      for (const part of parts) {
+        for (const rawId of extractRawIdsFromPartMetadata(part.metadata)) {
+          candidateRawIds.add(rawId);
+        }
+      }
+    }
+
+    if (candidateRawIds.size === 0) {
+      return { candidateRawIds: 0, matchedRawIds: 0 };
+    }
+
+    const matchStmt = this.db.prepare(
+      `SELECT 1 AS found
+       FROM message_parts mp
+       JOIN messages m ON m.message_id = mp.message_id
+       JOIN conversations c ON c.conversation_id = m.conversation_id
+       WHERE c.active = 1
+         AND m.conversation_id <> ?
+         AND mp.metadata IS NOT NULL
+         AND json_valid(mp.metadata)
+         AND (
+           json_extract(mp.metadata, '$.raw.id') = ?
+           OR json_extract(mp.metadata, '$.raw.call_id') = ?
+           OR json_extract(mp.metadata, '$.raw.toolCallId') = ?
+           OR json_extract(mp.metadata, '$.raw.tool_call_id') = ?
+           OR json_extract(mp.metadata, '$.raw.toolUseId') = ?
+           OR json_extract(mp.metadata, '$.raw.tool_use_id') = ?
+         )
+       LIMIT 1`,
+    );
+
+    let matchedRawIds = 0;
+    for (const rawId of candidateRawIds) {
+      const row = matchStmt.get(
+        params.conversationId,
+        rawId,
+        rawId,
+        rawId,
+        rawId,
+        rawId,
+        rawId,
+      ) as { found: number } | undefined;
+      if (row?.found === 1) {
+        matchedRawIds += 1;
+      }
+    }
+
+    return { candidateRawIds: candidateRawIds.size, matchedRawIds };
   }
 
   /**
@@ -4143,9 +5402,9 @@ export class LcmContextEngine implements ContextEngine {
     source: string;
     priorMessages?: AgentMessage[];
     sessionFile?: string;
-  }): Promise<AgentMessage[]> {
+  }): Promise<{ messages: AgentMessage[]; replayGuardExemptPrefixLength: number }> {
     if (params.messages.length < 3) {
-      return params.messages;
+      return { messages: params.messages, replayGuardExemptPrefixLength: 0 };
     }
 
     let replayCandidateLength = 0;
@@ -4156,14 +5415,14 @@ export class LcmContextEngine implements ContextEngine {
       replayCandidateLength += 1;
     }
     if (replayCandidateLength < 3) {
-      return params.messages;
+      return { messages: params.messages, replayGuardExemptPrefixLength: 0 };
     }
 
     const priorMessages =
       params.priorMessages ??
       (params.sessionFile ? await readLeafPathMessages(params.sessionFile) : undefined);
     if (!priorMessages || priorMessages.length === 0) {
-      return params.messages;
+      return { messages: params.messages, replayGuardExemptPrefixLength: 0 };
     }
 
     const replayCandidates = params.messages.slice(0, replayCandidateLength);
@@ -4171,7 +5430,7 @@ export class LcmContextEngine implements ContextEngine {
       params.priorMessages ? priorMessages : priorMessages.slice(0, Math.max(0, priorMessages.length - params.messages.length))
     ).filter(isBootstrapReplayCandidateMessage);
     if (earlierReplayCandidates.length < 3) {
-      return params.messages;
+      return { messages: params.messages, replayGuardExemptPrefixLength: 0 };
     }
 
     const incomingSignatures = replayCandidates.map(createBootstrapReplaySignature);
@@ -4209,29 +5468,114 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
 
-    return replayPrefixLength > 0
-      ? params.messages.slice(replayPrefixLength)
-      : params.messages;
+    if (replayPrefixLength > 0) {
+      return {
+        messages: params.messages.slice(replayPrefixLength),
+        replayGuardExemptPrefixLength: Math.max(0, replayCandidateLength - replayPrefixLength),
+      };
+    }
+
+    return {
+      messages: params.messages,
+      replayGuardExemptPrefixLength: replayCandidateLength,
+    };
   }
 
   private async reconcileTranscriptTailForAfterTurn(params: {
     sessionId: string;
     sessionKey?: string;
     sessionFile: string;
+    isHeartbeat?: boolean;
   }): Promise<TranscriptReconcileResult> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     return await this.withSessionQueue(
       queueKey,
       async () => {
+        await this.conversationStore.withTransaction(async () => {
+          await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+            phase: "afterTurn",
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            sessionFile: params.sessionFile,
+            createReplacement: false,
+          });
+        });
         const conversation = await this.conversationStore.getConversationForSession({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
         });
         if (!conversation) {
-          // No persisted conversation exists yet; afterTurn's own ingest batch
-          // will create the initial frontier, so refreshing after that ingest is
-          // safe and preserves the normal first-turn checkpoint behavior.
-          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+          if (params.isHeartbeat) {
+            return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+          }
+          // No persisted conversation exists yet. Prefer the transcript over
+          // the runtime delta so foreground prompts that are omitted from
+          // afterTurn's messages array are not lost.
+          let sessionFileState: { size: number } | undefined;
+          try {
+            const sessionFileStats = await stat(params.sessionFile);
+            sessionFileState = { size: sessionFileStats.size };
+          } catch {
+            // Missing files are common for brand-new live sessions; allow the
+            // runtime batch to seed the conversation in that case.
+          }
+          const historicalMessages = await readLeafPathMessages(params.sessionFile);
+          if (historicalMessages.length === 0) {
+            if ((sessionFileState?.size ?? 0) > 0) {
+              this.deps.log.warn(
+                `[lcm] afterTurn: initial transcript read returned no messages from non-empty file; skipping live afterTurn persistence to avoid anchoring past unreadable history session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} sessionFile=${params.sessionFile}`,
+              );
+              return { importedMessages: 0, blockedByImportCap: false, hasOverlap: false };
+            }
+            return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+          }
+          if (batchLooksLikeHeartbeatAckTurn(historicalMessages)) {
+            return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+          }
+          const bootstrapMessages = trimBootstrapMessagesToBudget(
+            historicalMessages,
+            resolveBootstrapMaxTokens(this.config),
+          );
+          if (bootstrapMessages.length === 0) {
+            this.deps.log.warn(
+              `[lcm] afterTurn: initial transcript import exceeded bootstrap budget; skipping live afterTurn persistence to avoid anchoring past unreconciled history session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} sessionFile=${params.sessionFile} sourceMessages=${historicalMessages.length}`,
+            );
+            return { importedMessages: 0, blockedByImportCap: true, hasOverlap: false };
+          }
+          let importedMessages = 0;
+          for (const message of bootstrapMessages) {
+            const result = await this.ingestSingle({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              message,
+              skipReplayTimestampFloodGuard: true,
+            });
+            if (result.ingested) {
+              importedMessages += 1;
+            }
+          }
+          if (importedMessages > 0) {
+            const activeConversation = await this.conversationStore.getConversationForSession({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+            });
+            if (activeConversation) {
+              this.recordRecentBootstrapImport(
+                activeConversation.conversationId,
+                importedMessages,
+                "imported initial afterTurn transcript",
+              );
+              await this.refreshBootstrapState({
+                conversationId: activeConversation.conversationId,
+                sessionFile: params.sessionFile,
+              });
+            }
+          }
+          return {
+            importedMessages,
+            blockedByImportCap: bootstrapMessages.length < historicalMessages.length,
+            hasOverlap: true,
+          };
         }
 
         // OpenClaw can submit the foreground prompt outside the mutable
@@ -4242,13 +5586,15 @@ export class LcmContextEngine implements ContextEngine {
           conversation.conversationId,
         );
         let sessionFileState: { size: number; mtimeMs: number } | undefined;
+        let sessionFileStatError: unknown;
         try {
           const sessionFileStats = await stat(params.sessionFile);
           sessionFileState = {
             size: sessionFileStats.size,
             mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
           };
-        } catch {
+        } catch (error) {
+          sessionFileStatError = error;
           // Leave undefined: without stat proof, do not use append-only guards or slow-read caps.
         }
         const transcriptEpochShrank = checkpointIsPastTranscriptEof(
@@ -4266,7 +5612,34 @@ export class LcmContextEngine implements ContextEngine {
             offset: checkpoint.lastProcessedOffset,
           });
           if (appended.canUseAppendOnly) {
-            const replayFilteredMessages = await this.filterBootstrapReplayMessages({
+            const placeholderCheckpoint =
+              checkpoint.lastSeenSize === 0 &&
+              checkpoint.lastSeenMtimeMs === 0 &&
+              checkpoint.lastProcessedOffset === 0 &&
+              checkpoint.lastProcessedEntryHash === null;
+            if (placeholderCheckpoint && appended.messages.length > 0) {
+              const reconcile = await this.reconcileSessionTail({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                conversationId: conversation.conversationId,
+                historicalMessages: appended.messages,
+                noAnchorImportReason: "placeholder-checkpoint-recovery",
+              });
+              if (reconcile.importedMessages > 0) {
+                this.recordRecentBootstrapImport(
+                  conversation.conversationId,
+                  reconcile.importedMessages,
+                  "reconciled missing session messages",
+                );
+                await this.refreshBootstrapState({
+                  conversationId: conversation.conversationId,
+                  sessionFile: params.sessionFile,
+                });
+              }
+              return reconcile;
+            }
+
+            const replayFiltered = await this.filterBootstrapReplayMessages({
               messages: appended.messages,
               sessionContext: this.formatSessionLogContext({
                 conversationId: conversation.conversationId,
@@ -4276,12 +5649,15 @@ export class LcmContextEngine implements ContextEngine {
               source: "afterTurn transcript reconcile append-only",
               sessionFile: params.sessionFile,
             });
+            const replayFilteredMessages = replayFiltered.messages;
             let importedMessages = 0;
-            for (const message of replayFilteredMessages) {
+            for (const [index, message] of replayFilteredMessages.entries()) {
               const result = await this.ingestSingle({
                 sessionId: params.sessionId,
                 sessionKey: params.sessionKey,
                 message,
+                skipReplayTimestampFloodGuard:
+                  index < replayFiltered.replayGuardExemptPrefixLength,
               });
               if (result.ingested) {
                 importedMessages += 1;
@@ -4349,6 +5725,37 @@ export class LcmContextEngine implements ContextEngine {
         };
         const slowPathStartedAt = Date.now();
 
+        if (isMissingFileError(sessionFileStatError)) {
+          if (!checkpoint) {
+            try {
+              await this.summaryStore.upsertConversationBootstrapState({
+                conversationId: conversation.conversationId,
+                sessionFilePath: params.sessionFile,
+                lastSeenSize: 0,
+                lastSeenMtimeMs: 0,
+                lastProcessedOffset: 0,
+                lastProcessedEntryHash: null,
+              });
+            } catch (seedError) {
+              this.deps.log.warn(
+                `[lcm] afterTurn: transcript reconcile slow path failed to seed placeholder bootstrap_state conversation=${conversation.conversationId} sessionFile=${params.sessionFile} error=${seedError instanceof Error ? seedError.message : String(seedError)}`,
+              );
+            }
+            this.deps.log.warn(
+              `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; could not stat/read transcript; allowing live afterTurn persistence and seeding placeholder bootstrap_state at offset=0 to unblock next-turn recovery conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+            );
+          } else {
+            this.deps.log.warn(
+              `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+            );
+          }
+          return {
+            importedMessages: 0,
+            blockedByImportCap: false,
+            hasOverlap: true,
+          };
+        }
+
         // Distinguish empty-file from read/parse error: stat the file and
         // only treat it as "actually empty" when size is 0. A non-zero file
         // returning empty `historicalMessages` indicates the parser hit an
@@ -4359,9 +5766,48 @@ export class LcmContextEngine implements ContextEngine {
         const historicalMessages = await readLeafPathMessages(params.sessionFile);
         if (historicalMessages.length === 0) {
           if (!sessionFileState) {
-            this.deps.log.warn(
-              `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; allowing live afterTurn persistence without checkpoint refresh conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
-            );
+            // #649 added this permissive stat-fail fallback expecting the
+            // afterTurn-tail `refreshAfterTurnBootstrapState` hook to refresh
+            // the checkpoint. That hook delegates to refreshBootstrapState,
+            // which itself calls `stat(sessionFile)` and throws on failure;
+            // the hook's catch then logs a warn and leaves
+            // conversation_bootstrap_state NULL. Subsequent turns re-enter
+            // the slow path with reason="checkpoint-missing" (excluded from
+            // allowNoAnchorImport) and the conversation gets stuck in a
+            // transparent-passthrough state where compaction never runs.
+            //
+            // Seed a placeholder bootstrap_state row ONLY when no checkpoint
+            // already exists. If a valid checkpoint is present (with a
+            // non-zero offset), a transient stat/read failure must NOT reset
+            // it to zero — that would cause the next successful read to
+            // replay every message from offset=0, duplicating rows in the
+            // messages table (identity_hash is not a uniqueness guard).
+            if (!checkpoint) {
+              try {
+                await this.summaryStore.upsertConversationBootstrapState({
+                  conversationId: conversation.conversationId,
+                  sessionFilePath: params.sessionFile,
+                  lastSeenSize: 0,
+                  lastSeenMtimeMs: 0,
+                  lastProcessedOffset: 0,
+                  lastProcessedEntryHash: null,
+                });
+              } catch (seedError) {
+                this.deps.log.warn(
+                  `[lcm] afterTurn: transcript reconcile slow path failed to seed placeholder bootstrap_state conversation=${conversation.conversationId} sessionFile=${params.sessionFile} error=${seedError instanceof Error ? seedError.message : String(seedError)}`,
+                );
+              }
+              this.deps.log.warn(
+                `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; allowing live afterTurn persistence and seeding placeholder bootstrap_state at offset=0 to unblock next-turn recovery conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+              );
+            } else {
+              // Checkpoint exists with a valid offset — a transient stat/read
+              // failure must NOT overwrite it. Leave the existing checkpoint
+              // intact so the next successful read resumes from the right offset.
+              this.deps.log.warn(
+                `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) instead of reseeding conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+              );
+            }
             return {
               importedMessages: 0,
               blockedByImportCap: false,
@@ -4473,6 +5919,71 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
+  /**
+   * Recover lifecycle splits that the host missed when it pruned a transcript
+   * file before Lossless saw a reset/session_end hook. Without this, stable
+   * session keys can reattach a new runtime UUID to a stale active conversation
+   * and assemble old assistant tails as if they belonged to the new turn.
+   */
+  private async rotateStaleSessionKeyConversationIfTrackedTranscriptMissing(params: {
+    phase: "bootstrap" | "assemble" | "afterTurn";
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile?: string;
+    createReplacement?: boolean;
+  }): Promise<boolean> {
+    const normalizedSessionKey = params.sessionKey?.trim();
+    if (!normalizedSessionKey) {
+      return false;
+    }
+
+    const activeByKey = await this.conversationStore.getConversationBySessionKey(
+      normalizedSessionKey,
+    );
+    if (!activeByKey || activeByKey.sessionId === params.sessionId) {
+      return false;
+    }
+
+    const activeBootstrapState = await this.summaryStore.getConversationBootstrapState(
+      activeByKey.conversationId,
+    );
+    const trackedSessionFile = activeBootstrapState?.sessionFilePath;
+    if (typeof trackedSessionFile !== "string" || trackedSessionFile.length === 0) {
+      return false;
+    }
+
+    const transcriptRotated =
+      params.sessionFile === undefined || trackedSessionFile !== params.sessionFile;
+    if (!transcriptRotated) {
+      return false;
+    }
+
+    try {
+      await stat(trackedSessionFile);
+      return false;
+    } catch (err) {
+      if (!isMissingFileError(err)) {
+        this.deps.log.warn(
+          `[lcm] ${params.phase}: could not verify tracked transcript path conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
+        );
+        return false;
+      }
+    }
+
+    this.deps.log.warn(
+      `[lcm] ${params.phase}: detected reset/rollover without prior lifecycle split; rotating conversation=${activeByKey.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} oldSessionId=${activeByKey.sessionId} oldFile=${trackedSessionFile}${params.sessionFile ? ` newFile=${params.sessionFile}` : ""}`,
+    );
+    await this.applySessionReplacement({
+      reason: `${params.phase} session-file rollover fallback`,
+      sessionId: activeByKey.sessionId,
+      sessionKey: normalizedSessionKey,
+      nextSessionId: params.sessionId,
+      nextSessionKey: normalizedSessionKey,
+      createReplacement: params.createReplacement ?? true,
+    });
+    return true;
+  }
+
   async bootstrap(params: {
     sessionId: string;
     sessionFile: string;
@@ -4527,52 +6038,12 @@ export class LcmContextEngine implements ContextEngine {
             });
           };
 
-          // Guard: when a sessionKey resumes on a new sessionId and the tracked
-          // transcript file has disappeared, treat it as a missed /reset and
-          // rotate the conversation before getOrCreate would re-attach to it.
-          const normalizedSessionKey = params.sessionKey?.trim();
-          if (normalizedSessionKey) {
-            const activeByKey = await this.conversationStore.getConversationBySessionKey(normalizedSessionKey);
-            if (activeByKey && activeByKey.sessionId !== params.sessionId) {
-              const activeBootstrapState = await this.summaryStore.getConversationBootstrapState(
-                activeByKey.conversationId,
-              );
-              const trackedSessionFile = activeBootstrapState?.sessionFilePath;
-              let trackedSessionFileMissing = false;
-              if (typeof trackedSessionFile === "string" && trackedSessionFile.length > 0) {
-                try {
-                  await stat(trackedSessionFile);
-                } catch (err) {
-                  const code = getErrorCode(err);
-                  if (code === "ENOENT" || code === "ENOTDIR") {
-                    trackedSessionFileMissing = true;
-                  } else {
-                    this.deps.log.warn(
-                      `[lcm] bootstrap: could not verify tracked transcript path conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
-                    );
-                  }
-                }
-              }
-              const transcriptRotated =
-                typeof trackedSessionFile === "string" &&
-                trackedSessionFile.length > 0 &&
-                trackedSessionFile !== params.sessionFile;
-
-              if (transcriptRotated && trackedSessionFileMissing) {
-                this.deps.log.warn(
-                  `[lcm] bootstrap: detected reset/rollover without prior lifecycle split; rotating conversation=${activeByKey.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} oldSessionId=${activeByKey.sessionId} oldFile=${trackedSessionFile} newFile=${params.sessionFile}`,
-                );
-                await this.applySessionReplacement({
-                  reason: "bootstrap session-file rollover fallback",
-                  sessionId: activeByKey.sessionId,
-                  sessionKey: normalizedSessionKey,
-                  nextSessionId: params.sessionId,
-                  nextSessionKey: normalizedSessionKey,
-                  createReplacement: true,
-                });
-              }
-            }
-          }
+          await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+            phase: "bootstrap",
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            sessionFile: params.sessionFile,
+          });
 
           const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
             sessionKey: params.sessionKey,
@@ -4686,7 +6157,7 @@ export class LcmContextEngine implements ContextEngine {
                   await this.conversationStore.markConversationBootstrapped(conversationId);
                 }
 
-                const replayFilteredMessages = await this.filterBootstrapReplayMessages({
+                const replayFiltered = await this.filterBootstrapReplayMessages({
                   messages: appended.messages,
                   sessionContext: this.formatSessionLogContext({
                     conversationId,
@@ -4696,13 +6167,16 @@ export class LcmContextEngine implements ContextEngine {
                   source: "bootstrap append-only",
                   sessionFile: params.sessionFile,
                 });
+                const replayFilteredMessages = replayFiltered.messages;
 
                 let importedMessages = 0;
-                for (const message of replayFilteredMessages) {
+                for (const [index, message] of replayFilteredMessages.entries()) {
                   const ingestResult = await this.ingestSingle({
                     sessionId: params.sessionId,
                     sessionKey: params.sessionKey,
                     message,
+                    skipReplayTimestampFloodGuard:
+                      index < replayFiltered.replayGuardExemptPrefixLength,
                   });
                   if (ingestResult.ingested) {
                     importedMessages += 1;
@@ -4842,7 +6316,10 @@ export class LcmContextEngine implements ContextEngine {
             return {
               bootstrapped: false,
               importedMessages: 0,
-              reason: "reconcile import capped",
+              reason:
+                reconcile.blockedReason === "cross-conversation-raw-id"
+                  ? "reconcile duplicate raw ids"
+                  : "reconcile import capped",
             };
           }
 
@@ -5195,12 +6672,17 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
   }): Promise<ContextEngineMaintenanceResult> {
+    const hostApprovedRuntimeMaintenance =
+      params.runtimeContext?.allowDeferredCompactionExecution === true;
     const runRuntimeAutoRotate = async (): Promise<void> => {
       await this.maybeAutoRotateManagedSessionFile({
         phase: "runtime",
+        caller: "maintain",
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         sessionFile: params.sessionFile,
+        allowSessionFileRewrite: false,
+        rewriteDeferralReason: "runtime-session-file-rewrite-deferred-to-startup-or-manual-rotate",
       });
     };
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
@@ -5246,7 +6728,7 @@ export class LcmContextEngine implements ContextEngine {
         const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
           conversation.conversationId,
         );
-        if (params.runtimeContext?.allowDeferredCompactionExecution === true) {
+        if (hostApprovedRuntimeMaintenance) {
           const runtimeTokenBudget = (() => {
             const tokenBudget = asRecord(params.runtimeContext)?.tokenBudget;
             if (
@@ -5287,6 +6769,17 @@ export class LcmContextEngine implements ContextEngine {
               bytesFreed: 0,
               rewrittenEntries: 0,
               reason: "transcript GC disabled",
+            }
+          );
+        }
+
+        if (!hostApprovedRuntimeMaintenance) {
+          return (
+            deferredCompactionResult ?? {
+              changed: false,
+              bytesFreed: 0,
+              rewrittenEntries: 0,
+              reason: "transcript GC deferred until host-approved background maintenance",
             }
           );
         }
@@ -5445,6 +6938,15 @@ export class LcmContextEngine implements ContextEngine {
 
     let messageForParts = message;
 
+    const nativeImageIntercepted = await this.interceptNativeImageBlocks({
+      conversationId,
+      message: messageForParts,
+    });
+    if (nativeImageIntercepted) {
+      messageForParts = nativeImageIntercepted.rewrittenMessage;
+      stored = toStoredMessage(messageForParts);
+    }
+
     if (stored.role === "tool") {
       const imageIntercepted = await this.interceptInlineImagesInToolMessage({
         conversationId,
@@ -5455,15 +6957,6 @@ export class LcmContextEngine implements ContextEngine {
         stored = toStoredMessage(messageForParts);
       }
     } else {
-      const nativeImageIntercepted = await this.interceptNativeUserImageBlocks({
-        conversationId,
-        message: messageForParts,
-      });
-      if (nativeImageIntercepted) {
-        messageForParts = nativeImageIntercepted.rewrittenMessage;
-        stored = toStoredMessage(messageForParts);
-      }
-
       const imageIntercepted = await this.interceptInlineImages({
         conversationId,
         content: stored.content,
@@ -5636,9 +7129,12 @@ export class LcmContextEngine implements ContextEngine {
     const runRuntimeAutoRotate = async (): Promise<void> => {
       await this.maybeAutoRotateManagedSessionFile({
         phase: "runtime",
+        caller: "after-turn",
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         sessionFile: params.sessionFile,
+        allowSessionFileRewrite: false,
+        rewriteDeferralReason: "after-turn-session-file-rewrite-deferred-to-startup-or-manual-rotate",
       });
     };
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
@@ -5672,6 +7168,7 @@ export class LcmContextEngine implements ContextEngine {
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         sessionFile: params.sessionFile,
+        isHeartbeat: params.isHeartbeat,
       });
     } catch (err) {
       this.deps.log.warn(
@@ -5862,13 +7359,18 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
     };
-    const recordAfterTurnCompactionRetry = async (reason: string): Promise<void> => {
+    const recordAfterTurnCompactionRetry = async (
+      reason: string,
+      diagnostics?: { projectedTokenCount?: number; rawTokensOutsideTail?: number },
+    ): Promise<void> => {
       try {
         await this.recordDeferredCompactionDebt({
           conversationId: conversation.conversationId,
           reason,
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
+          projectedTokenCount: diagnostics?.projectedTokenCount,
+          rawTokensOutsideTail: diagnostics?.rawTokensOutsideTail,
         });
       } catch (err) {
         this.deps.log.warn(
@@ -5905,6 +7407,10 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget,
         observedCurrentTokenCount,
       );
+      const thresholdDiagnostics = {
+        projectedTokenCount: thresholdDecision.projectedTokens,
+        rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
+      };
       if (this.config.proactiveThresholdCompactionMode === "inline") {
         if (thresholdDecision.shouldCompact) {
           const compactResult = await this.compact({
@@ -5918,7 +7424,7 @@ export class LcmContextEngine implements ContextEngine {
           });
           if (!compactResult.ok) {
             shouldRefreshBootstrapState = false;
-            await recordAfterTurnCompactionRetry("threshold");
+            await recordAfterTurnCompactionRetry("threshold", thresholdDiagnostics);
           }
         }
       } else if (thresholdDecision.shouldCompact) {
@@ -5927,6 +7433,8 @@ export class LcmContextEngine implements ContextEngine {
           reason: "threshold",
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
+          projectedTokenCount: thresholdDecision.projectedTokens,
+          rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
         });
         deferredCompactionDrain = {
           tokenBudget,
@@ -5990,6 +7498,25 @@ export class LcmContextEngine implements ContextEngine {
         ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
       ].join(" ");
 
+      if (params.sessionKey?.trim()) {
+        await this.withSessionQueue(
+          this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+          async () =>
+            this.conversationStore.withTransaction(async () => {
+              await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+                phase: "assemble",
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                createReplacement: false,
+              });
+            }),
+          {
+            operationName: "assembleLifecycleGuard",
+            context: sessionLabel,
+          },
+        );
+      }
+
       const conversation = await this.conversationStore.getConversationForSession({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
@@ -6013,17 +7540,40 @@ export class LcmContextEngine implements ContextEngine {
         conversation.conversationId,
       );
       if (maintenance?.pending || maintenance?.running) {
-        try {
-          await this.maybeConsumeDeferredCompactionDebtForAssemble({
-            conversationId: conversation.conversationId,
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            tokenBudget,
-            currentTokenCount: liveContextTokens,
-          });
-        } catch (error) {
+        const recordedContextTokens = this.normalizeObservedTokenCount(
+          maintenance.currentTokenCount ?? undefined,
+        );
+        const recordedProjectedTokens = this.normalizeObservedTokenCount(
+          maintenance.projectedTokenCount ?? undefined,
+        );
+        const observedEmergencyContextTokens = Math.max(
+          liveContextTokens,
+          recordedContextTokens ?? 0,
+        );
+        const emergencyContextTokens = Math.max(
+          observedEmergencyContextTokens,
+          recordedProjectedTokens ?? 0,
+        );
+        if (emergencyContextTokens > tokenBudget) {
           this.deps.log.warn(
-            `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
+            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${observedEmergencyContextTokens} projectedTokenCount=${recordedProjectedTokens ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
+          );
+          try {
+            await this.maybeConsumeDeferredCompactionDebtForAssemble({
+              conversationId: conversation.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              tokenBudget,
+              currentTokenCount: observedEmergencyContextTokens,
+            });
+          } catch (error) {
+            this.deps.log.warn(
+              `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
+            );
+          }
+        } else {
+          this.deps.log.debug(
+            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${observedEmergencyContextTokens} projectedTokenCount=${recordedProjectedTokens ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
           );
         }
       }
@@ -6087,23 +7637,49 @@ export class LcmContextEngine implements ContextEngine {
         return safeFallback();
       }
 
+      const volatileLiveInputAppend = appendUncoveredVolatileLiveInputsWithinBudget({
+        assembledMessages: assembled.messages,
+        assembledEstimatedTokens: assembled.estimatedTokens,
+        liveMessages: params.messages,
+        protectedAssembledIndexes: resolveProtectedFreshTailAssembledIndexes({
+          assembledMessages: assembled.messages,
+          freshTailMessageHashes:
+            assembled.debug?.freshTailProtectionMessageHashes ??
+            assembled.debug?.preSanitizeFreshTailMessageHashes,
+        }),
+        tokenBudget,
+      });
+      if (volatileLiveInputAppend.appendedMessages > 0) {
+        this.deps.log.warn(
+          `[lcm] assemble: appended unpersisted volatile live input conversation=${conversation.conversationId} ${sessionLabel} appendedMessages=${volatileLiveInputAppend.appendedMessages} appendedTokens=${volatileLiveInputAppend.appendedTokens} evictedMessages=${volatileLiveInputAppend.evictedMessages} evictedTokens=${volatileLiveInputAppend.evictedTokens} overBudget=${volatileLiveInputAppend.overBudget}`,
+        );
+      }
+
       // v4.2 §B — surface stub telemetry on the standard "assemble: done" line
       // so live watchers can grep stubbedCount/tokensSaved without needing the
       // full assemble-debug bag.
       const stubStatsLog = assembled.debug?.stubStats
         ? ` stubbed=${assembled.debug.stubStats.stubbedCount} tokensSaved=${assembled.debug.stubStats.tokensSaved}`
         : "";
+      const activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
+        conversation.conversationId,
+      );
       const contextProjectionEpoch = buildContextEngineProjectionEpoch(
         conversation.conversationId,
         contextItems,
+        activeFocusBrief,
       );
       const summaryContextItems = contextItems.filter((item) => item.itemType === "summary").length;
+      const volatileLiveInputLog = volatileLiveInputAppend.appendedMessages > 0
+        ? ` volatileLiveInputsAppended=${volatileLiveInputAppend.appendedMessages} volatileLiveInputEvicted=${volatileLiveInputAppend.evictedMessages} volatileLiveInputOverBudget=${volatileLiveInputAppend.overBudget}`
+        : "";
       this.deps.log.info(
-        `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} summaryContextItems=${summaryContextItems} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${assembled.messages.length} tokenBudget=${tokenBudget} estimatedTokens=${assembled.estimatedTokens} contextProjectionMode=thread_bootstrap contextProjectionEpoch=${contextProjectionEpoch}${stubStatsLog} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} summaryContextItems=${summaryContextItems} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${volatileLiveInputAppend.messages.length} tokenBudget=${tokenBudget} estimatedTokens=${volatileLiveInputAppend.estimatedTokens} contextProjectionMode=thread_bootstrap contextProjectionEpoch=${contextProjectionEpoch}${stubStatsLog}${volatileLiveInputLog} duration=${formatDurationMs(Date.now() - startedAt)}`,
+
       );
       const prefixChange = describeAssembledPrefixChange(
         this.getPreviousAssembledSnapshot(conversation.conversationId),
-        assembled.messages,
+        volatileLiveInputAppend.messages,
       );
       this.setPreviousAssembledSnapshot(
         conversation.conversationId,
@@ -6132,12 +7708,13 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const result: AssembleResult = {
-        messages: assembled.messages,
-        estimatedTokens: assembled.estimatedTokens,
+        messages: volatileLiveInputAppend.messages,
+        estimatedTokens: volatileLiveInputAppend.estimatedTokens,
         contextProjection: {
           mode: "thread_bootstrap",
           epoch: contextProjectionEpoch,
         },
+
       };
       return result;
     } catch (err) {
@@ -6579,10 +8156,13 @@ export class LcmContextEngine implements ContextEngine {
   /** Check one LCM-managed transcript and rotate it when policy allows. */
   private async maybeAutoRotateManagedSessionFile(params: {
     phase: AutoRotateSessionFilePhase;
+    caller?: AutoRotateSessionFileCaller;
     sessionId?: string;
     sessionKey?: string;
     sessionFile?: string;
     conversationId?: number;
+    allowSessionFileRewrite?: boolean;
+    rewriteDeferralReason?: string;
   }): Promise<void> {
     const startedAt = Date.now();
     const thresholdBytes = this.config.autoRotateSessionFiles.sizeBytes;
@@ -6714,6 +8294,10 @@ export class LcmContextEngine implements ContextEngine {
         reason: "above-threshold",
         level: "warn",
       });
+      return;
+    }
+    if (params.allowSessionFileRewrite === false) {
+      skip(params.rewriteDeferralReason ?? "session-file-rewrite-deferred", sizeBytes);
       return;
     }
 
@@ -7596,6 +9180,10 @@ export class LcmContextEngine implements ContextEngine {
 
   getSummaryStore(): SummaryStore {
     return this.summaryStore;
+  }
+
+  getFocusBriefStore(): FocusBriefStore {
+    return this.focusBriefStore;
   }
 
   getCompactionTelemetryStore(): CompactionTelemetryStore {

@@ -21,6 +21,23 @@
 
 - Follow [RELEASING.md](./RELEASING.md) for the repo's full Changesets and publish workflow.
 
+## OpenClaw Host Compatibility
+
+- When a change introduces or depends on a newer OpenClaw plugin API, runtime capability, config policy, manifest field, command behavior, or host integration contract, verify the first stable OpenClaw release that supports it before coding or publishing. Distinguish beta tags from stable releases.
+- Update every compatibility declaration in the same change:
+  - `package.json` `peerDependencies.openclaw`
+  - `package.json` `openclaw.compat.pluginApi`
+  - `package.json` `openclaw.compat.minGatewayVersion`
+  - `package.json` `openclaw.compat.tested`
+  - `package.json` `openclaw.build.openclawVersion`
+  - `package-lock.json`
+- Do not add an OpenClaw upper bound such as `<2026.x.0` unless a specific known incompatibility requires it.
+- Preserve `peerDependenciesMeta.openclaw.optional` when it exists; tightening the supported host version does not mean the package must install OpenClaw directly.
+- Refresh `package-lock.json` with `npm install --package-lock-only` after changing OpenClaw peer or compatibility metadata, then verify `npm ci --package-lock-only --ignore-scripts` so CI will not fail on stale lock metadata.
+- Add or update a regression test that asserts the required OpenClaw version metadata and, when relevant, the runtime capability gate or error path.
+- Update user-facing documentation in the same change. At minimum, document the minimum OpenClaw version, why it is required, and the fallback path for users who cannot upgrade yet.
+- Add a Changeset for any package compatibility change. Use `patch` for compatibility metadata fixes unless the change is breaking for currently supported users in a way that warrants a larger bump.
+
 ## Config Schema Sync
 
 - Whenever you add, rename, or remove a plugin config option in the runtime config loader or docs, update [`openclaw.plugin.json`](./openclaw.plugin.json) in the same change.

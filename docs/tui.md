@@ -86,6 +86,7 @@ For sessions with an LCM `conv_id`, the conversation view uses keyset-paged wind
 | `]` | Load newer message window |
 | `l` | Open **Summary DAG** view |
 | `c` | Open **Context** view |
+| `o` | Open **Focus Briefs** view |
 | `f` | Open **Large Files** view |
 | `v` | Open **Codex ↔ LCM** comparison view |
 | `b`/`Backspace` | Back to sessions |
@@ -165,6 +166,22 @@ The status bar shows totals: how many summaries, how many messages, total items,
 | `Shift+J` | Scroll detail panel down |
 | `Shift+K` | Scroll detail panel up |
 | `r` | Reload context |
+| `b`/`Backspace` | Back to conversation |
+| `q` | Quit |
+
+## Focus Briefs View
+
+Lists focus briefs generated for the selected LCM conversation. Each row shows status, creation time, brief ID, token count, and prompt preview. The detail panel shows generator metadata, source/citation counts, post-focus drift diagnostics, cited and expanded summary IDs, the original focus prompt, and the generated brief content.
+
+This view is read-only. When a focus brief is active, the conversation and active-context screens show a compact focus banner with the brief ID, prompt preview, token count, and stale/source-snapshot diagnostics.
+
+| Key | Action |
+|-----|--------|
+| `↑`/`↓` or `k`/`j` | Move cursor |
+| `g`/`G` | Jump to first/last |
+| `Shift+J` | Scroll detail panel down |
+| `Shift+K` | Scroll detail panel up |
+| `r` | Reload focus briefs |
 | `b`/`Backspace` | Back to conversation |
 | `q` | Quit |
 

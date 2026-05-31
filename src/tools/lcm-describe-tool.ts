@@ -137,7 +137,14 @@ export function createLcmDescribeTool(input: {
         sessionKey: input.sessionKey,
         params: p,
       });
-      if (!conversationScope.allConversations && conversationScope.conversationId == null) {
+      if (conversationScope.error) {
+        return jsonResult({ error: conversationScope.error });
+      }
+      if (
+        !conversationScope.allConversations
+        && conversationScope.conversationId == null
+        && (conversationScope.conversationIds?.length ?? 0) === 0
+      ) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
@@ -165,7 +172,10 @@ export function createLcmDescribeTool(input: {
           hint: "Check the ID format (sum_xxx for summaries, file_xxx for files).",
         });
       }
-      if (conversationScope.conversationId != null) {
+      if (
+        conversationScope.conversationId != null
+        || (conversationScope.conversationIds?.length ?? 0) > 0
+      ) {
         const itemConversationId =
           result.type === "summary" ? result.summary?.conversationId : result.file?.conversationId;
         const allowedConversationIds = new Set(
@@ -177,7 +187,9 @@ export function createLcmDescribeTool(input: {
         );
         if (itemConversationId != null && !allowedConversationIds.has(itemConversationId)) {
           return jsonResult({
-            error: `Not found in this session scope: ${id}`,
+            error: conversationScope.delegated
+              ? `Not found in delegated conversation scope: ${id}`
+              : `Not found in this session scope: ${id}`,
             hint: "Use allConversations=true for cross-conversation lookup.",
           });
         }

@@ -7,6 +7,7 @@ import { getLcmDbFeatures } from "../src/db/features.js";
 import { createLcmDatabaseConnection, closeLcmConnection } from "../src/db/connection.js";
 import { resolveLcmConfig } from "../src/db/config.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
+import { FocusBriefStore } from "../src/store/focus-brief-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
 import { createLcmCommand, __testing } from "../src/plugin/lcm-command.js";
 import type { LcmSummarizeFn } from "../src/summarize.js";
@@ -17,6 +18,7 @@ function createCommandFixture(options?: {
   deps?: LcmDependencies;
   getLcm?: () => Promise<{
     rotateSessionStorageWithBackup: (...args: unknown[]) => Promise<unknown>;
+    compact?: (...args: unknown[]) => Promise<unknown>;
   }>;
 }) {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-command-"));
@@ -34,7 +36,7 @@ function createCommandFixture(options?: {
     deps: options?.deps,
     getLcm: options?.getLcm,
   });
-  return { tempDir, dbPath, db, command, conversationStore, summaryStore };
+  return { tempDir, dbPath, db, config, command, conversationStore, summaryStore };
 }
 
 function createCommandContext(
@@ -226,6 +228,617 @@ describe("lcm command", () => {
     expect(result.text).toContain("tokens in context: 5");
     expect(result.text).toContain("compression ratio: 1:6");
     expect(result.text).toContain("doctor: 1 issue(s) in this conversation");
+  });
+
+  it("reports focus usage when no brief exists for the current conversation", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    await fixture.conversationStore.createConversation({
+      sessionId: "focus-empty-session",
+      sessionKey: "agent:main:telegram:direct:focus-empty",
+      title: "Focus empty fixture",
+    });
+
+    const result = await fixture.command.handler(
+      createCommandContext("focus", {
+        sessionKey: "agent:main:telegram:direct:focus-empty",
+      }),
+    );
+
+    expect(result.text).toContain("Lossless Claw Focus");
+    expect(result.text).toContain("status: none");
+    expect(result.text).toContain("usage: `/lossless focus <prompt>`");
+  });
+
+  it("generates and persists an active focus brief through a delegated subagent", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const sessionKey = "agent:main:telegram:direct:focus-generate";
+    const lifecycleEvents: string[] = [];
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "focus-generate-session",
+      sessionKey,
+      title: "Focus generation fixture",
+    });
+    const [firstMessage, secondMessage] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "Alpha auth work started.",
+        tokenCount: 6,
+      },
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "Alpha auth work reached the review stage.",
+        tokenCount: 8,
+      },
+    ]);
+    fixture.db
+      .prepare(`UPDATE messages SET created_at = ? WHERE conversation_id = ?`)
+      .run("2026-05-15 00:00:00", currentConversation.conversationId);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "focus_leaf",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Alpha auth implementation details.",
+      tokenCount: 50,
+      sourceMessageTokenCount: 14,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("focus_leaf", [
+      firstMessage.messageId,
+      secondMessage.messageId,
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "focus_parent",
+      conversationId: currentConversation.conversationId,
+      kind: "condensed",
+      depth: 1,
+      content: "Alpha auth current state and review notes.",
+      tokenCount: 20,
+      descendantTokenCount: 50,
+      sourceMessageTokenCount: 14,
+    });
+    await fixture.summaryStore.linkSummaryToParents("focus_parent", ["focus_leaf"]);
+    fixture.db
+      .prepare(`UPDATE summaries SET latest_at = ? WHERE summary_id = ?`)
+      .run("2026-05-15 00:00:00", "focus_parent");
+    await fixture.summaryStore.replaceContextRangeWithSummary({
+      conversationId: currentConversation.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 1,
+      summaryId: "focus_parent",
+    });
+
+    let agentRuns = 0;
+    let sessionReads = 0;
+    const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
+      if (request.method === "agent") {
+        agentRuns += 1;
+        lifecycleEvents.push(`agent-${agentRuns}`);
+        if (agentRuns === 1) {
+          expect(String(request.params?.message)).toContain("Gather Lossless focus evidence.");
+          expect(String(request.params?.message)).toContain("lcm_grep");
+          expect(String(request.params?.message)).toContain("do NOT call lcm_expand_query");
+        } else {
+          expect(String(request.params?.message)).toContain("Synthesize the final Lossless focus context brief.");
+          expect(String(request.params?.message)).toContain("Evidence dossier");
+        }
+        return { runId: `focus-run-${agentRuns}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionReads += 1;
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content:
+                sessionReads === 1
+                  ? JSON.stringify({
+                      evidenceMarkdown:
+                        "## Evidence Dossier\n- focus_parent cites alpha auth review state.\n- focus_leaf expands implementation details.",
+                      citedSummaryIds: ["focus_parent"],
+                      expandedSummaryIds: ["focus_leaf"],
+                      irrelevantSummaryIds: ["unrelated_summary"],
+                      expansionPrompts: [
+                        {
+                          prompt: "Expand the alpha auth implementation details.",
+                          summaryIds: ["focus_leaf"],
+                        },
+                      ],
+                      confidenceNotes: ["focus_parent was in active context"],
+                      truncated: false,
+                    })
+                  : JSON.stringify({
+                      briefMarkdown: `## Focused Narrative\n${"Alpha auth is ready for review. ".repeat(8_000)}`,
+                      citedSummaryIds: ["focus_parent"],
+                      expandedSummaryIds: ["focus_leaf"],
+                      irrelevantSummaryIds: ["unrelated_summary"],
+                      expansionPrompts: [
+                        {
+                          prompt: "Expand the alpha auth implementation details.",
+                          summaryIds: ["focus_leaf"],
+                        },
+                      ],
+                      confidenceNotes: ["focus_parent was in active context"],
+                      truncated: false,
+                    }),
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      throw new Error(`unexpected gateway method ${request.method}`);
+    });
+    const deps = {
+      config: fixture.config,
+      complete: vi.fn(),
+      callGateway,
+      resolveModel: () => ({ provider: "test", model: "test-model" }),
+      parseAgentSessionKey: (key: string) => {
+        const match = /^agent:([^:]+):(.*)$/.exec(key);
+        return match ? { agentId: match[1] ?? "main", suffix: match[2] ?? "" } : null;
+      },
+      isSubagentSessionKey: (key: string) => key.includes(":subagent:"),
+      normalizeAgentId: (id?: string) => id?.trim() || "main",
+      buildSubagentSystemPrompt: () => "subagent system prompt",
+      readLatestAssistantReply: (messages: unknown[]) => {
+        const latest = messages.at(-1) as { content?: unknown } | undefined;
+        return typeof latest?.content === "string" ? latest.content : undefined;
+      },
+      resolveAgentDir: () => fixture.tempDir,
+      resolveSessionIdFromSessionKey: async () => undefined,
+      resolveSessionTranscriptFile: async () => undefined,
+      agentLaneSubagent: "subagent",
+      log: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    } as unknown as LcmDependencies;
+    const compact = vi.fn(async () => {
+      lifecycleEvents.push("compact");
+      return { ok: true, compacted: true, reason: "forced full sweep" };
+    });
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      deps,
+      getLcm: async () => ({
+        compact,
+        rotateSessionStorageWithBackup: vi.fn(),
+      }),
+    });
+
+    const result = await command.handler(
+      createCommandContext("focus alpha auth review state", {
+        sessionKey,
+      }),
+    );
+
+    expect(result.text).toContain("Focus brief");
+    expect(result.text).toContain("Pre-focus compaction");
+    expect(result.text).toContain("compacted: yes");
+    expect(result.text).toContain("status: active");
+    expect(result.text).toContain("Alpha auth is ready for review.");
+    expect(lifecycleEvents.slice(0, 3)).toEqual(["compact", "agent-1", "agent-2"]);
+    expect(compact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "focus-generate-session",
+        sessionKey,
+        compactionTarget: "threshold",
+        force: true,
+      }),
+    );
+    expect(callGateway.mock.calls.map((call) => call[0].method)).toEqual([
+      "agent",
+      "agent.wait",
+      "sessions.get",
+      "agent",
+      "agent.wait",
+      "sessions.get",
+      "sessions.delete",
+    ]);
+    const brief = fixture.db
+      .prepare(`SELECT brief_id, prompt, status, content, generator_run_id FROM focus_briefs`)
+      .get() as {
+      brief_id: string;
+      prompt: string;
+      status: string;
+      content: string;
+      generator_run_id: string;
+    };
+    expect(brief.prompt).toBe("alpha auth review state");
+    expect(brief.status).toBe("active");
+    expect(brief.content).toContain("Alpha auth is ready for review.");
+    expect(brief.generator_run_id).toBe("focus-run-2");
+    const sources = fixture.db
+      .prepare(`SELECT summary_id, role FROM focus_brief_sources ORDER BY role, summary_id`)
+      .all() as Array<{ summary_id: string; role: string }>;
+    expect(sources).toEqual([
+      { summary_id: "focus_parent", role: "active_input" },
+      { summary_id: "focus_parent", role: "cited" },
+      { summary_id: "focus_leaf", role: "expanded" },
+      { summary_id: "unrelated_summary", role: "irrelevant" },
+    ]);
+
+    const [postFocusMessage] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 2,
+        role: "user",
+        content: "Alpha auth post-focus review note.",
+        tokenCount: 9,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "focus_delta",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Alpha auth post-focus context.",
+      tokenCount: 11,
+      sourceMessageTokenCount: 9,
+      latestAt: new Date("2026-05-16T00:00:00Z"),
+    });
+    await fixture.summaryStore.linkSummaryToMessages("focus_delta", [postFocusMessage.messageId]);
+    await fixture.summaryStore.replaceContextRangeWithSummary({
+      conversationId: currentConversation.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 0,
+      summaryId: "focus_delta",
+    });
+    const focusStore = new FocusBriefStore(fixture.db);
+    await focusStore.createFocusBrief({
+      conversationId: currentConversation.conversationId,
+      prompt: "failed refocus",
+      content: "",
+      status: "failed",
+      error: "generation timed out",
+      supersedeCurrentDrafts: false,
+    });
+
+    const status = await command.handler(
+      createCommandContext("focus", {
+        sessionKey,
+      }),
+    );
+    expect(status.text).toContain(`brief id: \`${brief.brief_id}\``);
+    expect(status.text).toContain("status: active");
+    expect(status.text).toContain("source summaries: 1");
+    expect(status.text).toContain("cited summaries: focus_parent");
+    expect(status.text).toContain("delta since focus: 1 messages, 1 summaries, ~20 tokens");
+    expect(status.text).toContain("stale: yes");
+    expect(status.text).toContain("source snapshot: obsolete");
+    expect(status.text).toContain("latest generation: failed");
+    expect(status.text).toContain("generation timed out");
+
+    const generalStatus = await command.handler(
+      createCommandContext("status", {
+        sessionKey,
+      }),
+    );
+    expect(generalStatus.text).toContain("**🎯 Focus**");
+    expect(generalStatus.text).toContain("status: active");
+    expect(generalStatus.text).toContain("delta since focus: 1 messages, 1 summaries, ~20 tokens");
+
+    const unfocus = await command.handler(
+      createCommandContext("unfocus", {
+        sessionKey,
+      }),
+    );
+    expect(unfocus.text).toContain("status: inactive");
+    expect(unfocus.text).toContain("deactivated briefs: 1");
+    expect(unfocus.text).toContain("Post-unfocus compaction");
+    expect(compact).toHaveBeenCalledTimes(2);
+    expect(
+      fixture.db
+        .prepare(`SELECT status FROM focus_briefs WHERE brief_id = ?`)
+        .get(brief.brief_id),
+    ).toEqual({ status: "inactive" });
+  });
+
+  it("refocuses an active focus brief from post-focus delta summaries", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const sessionKey = "agent:main:telegram:direct:refocus-generate";
+    const lifecycleEvents: string[] = [];
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "refocus-generate-session",
+      sessionKey,
+      title: "Refocus generation fixture",
+    });
+    const [oldMessage, deltaMessage] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "Original focus setup.",
+        tokenCount: 5,
+      },
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "New delta after focus.",
+        tokenCount: 6,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "refocus_old",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Original focus source.",
+      tokenCount: 20,
+      sourceMessageTokenCount: 5,
+      latestAt: new Date("2026-05-15T00:00:00Z"),
+    });
+    await fixture.summaryStore.linkSummaryToMessages("refocus_old", [oldMessage.messageId]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "refocus_delta",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "New relevant delta for the original prompt.",
+      tokenCount: 30,
+      sourceMessageTokenCount: 6,
+      latestAt: new Date("2026-05-16T00:00:00Z"),
+    });
+    await fixture.summaryStore.linkSummaryToMessages("refocus_delta", [deltaMessage.messageId]);
+    await fixture.summaryStore.appendContextSummary(
+      currentConversation.conversationId,
+      "refocus_old",
+    );
+    await fixture.summaryStore.appendContextSummary(
+      currentConversation.conversationId,
+      "refocus_delta",
+    );
+    const focusStore = new FocusBriefStore(fixture.db);
+    const oldBrief = await focusStore.createFocusBrief({
+      conversationId: currentConversation.conversationId,
+      sessionKey,
+      prompt: "agent configuration",
+      content: "Existing focus brief baseline.",
+      status: "active",
+      tokenCount: 40,
+      targetTokens: 12_000,
+      coveredLatestAt: "2026-05-15T00:00:00.000Z",
+      coveredMessageSeq: 0,
+      sourceContextHash: "old-hash",
+      sources: [{ summaryId: "refocus_old", ordinal: 0, role: "active_input" }],
+      supersedeCurrentDrafts: true,
+    });
+
+    let agentRuns = 0;
+    let sessionReads = 0;
+    const callGateway = vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
+      if (request.method === "agent") {
+        agentRuns += 1;
+        lifecycleEvents.push(`agent-${agentRuns}`);
+        const message = String(request.params?.message);
+        if (agentRuns === 1) {
+          expect(message).toContain("Gather Lossless refocus delta evidence.");
+          expect(message).toContain("Existing focus brief baseline.");
+          expect(message).toContain("refocus_delta");
+          expect(message).not.toContain("refocus_old");
+        } else {
+          expect(message).toContain("Synthesize the refreshed Lossless focus context brief.");
+          expect(message).toContain("Existing focus brief baseline.");
+        }
+        return { runId: `refocus-run-${agentRuns}` };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        sessionReads += 1;
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content:
+                sessionReads === 1
+                  ? JSON.stringify({
+                      evidenceMarkdown: "## Delta Evidence\n- refocus_delta updates agent configuration.",
+                      citedSummaryIds: ["refocus_delta"],
+                      expandedSummaryIds: ["refocus_delta"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["Delta only."],
+                      truncated: false,
+                    })
+                  : JSON.stringify({
+                      briefMarkdown: `Existing baseline plus refocus_delta update. ${"Merged relevant delta. ".repeat(8_000)}`,
+                      citedSummaryIds: ["refocus_delta"],
+                      expandedSummaryIds: ["refocus_delta"],
+                      irrelevantSummaryIds: [],
+                      expansionPrompts: [],
+                      confidenceNotes: ["Merged relevant delta."],
+                      truncated: false,
+                    }),
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      throw new Error(`unexpected gateway method ${request.method}`);
+    });
+    const deps = {
+      config: fixture.config,
+      complete: vi.fn(),
+      callGateway,
+      resolveModel: () => ({ provider: "test", model: "test-model" }),
+      parseAgentSessionKey: (key: string) => {
+        const match = /^agent:([^:]+):(.*)$/.exec(key);
+        return match ? { agentId: match[1] ?? "main", suffix: match[2] ?? "" } : null;
+      },
+      isSubagentSessionKey: (key: string) => key.includes(":subagent:"),
+      normalizeAgentId: (id?: string) => id?.trim() || "main",
+      buildSubagentSystemPrompt: () => "subagent system prompt",
+      readLatestAssistantReply: (messages: unknown[]) => {
+        const latest = messages.at(-1) as { content?: unknown } | undefined;
+        return typeof latest?.content === "string" ? latest.content : undefined;
+      },
+      resolveAgentDir: () => fixture.tempDir,
+      resolveSessionIdFromSessionKey: async () => undefined,
+      resolveSessionTranscriptFile: async () => undefined,
+      agentLaneSubagent: "subagent",
+      log: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    } as unknown as LcmDependencies;
+    const compact = vi.fn(async () => {
+      lifecycleEvents.push("compact");
+      return { ok: true, compacted: true, reason: "forced full sweep" };
+    });
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      deps,
+      getLcm: async () => ({
+        compact,
+        rotateSessionStorageWithBackup: vi.fn(),
+      }),
+    });
+
+    const result = await command.handler(
+      createCommandContext("refocus", {
+        sessionKey,
+      }),
+    );
+
+    expect(result.text).toContain("Focus brief");
+    expect(result.text).toContain("status: active");
+    expect(result.text).toContain("delta summaries: 1");
+    expect(result.text).toContain("Existing baseline plus refocus_delta update.");
+    expect(lifecycleEvents.slice(0, 3)).toEqual(["compact", "agent-1", "agent-2"]);
+    const rows = fixture.db
+      .prepare(`SELECT brief_id, prompt, status, content FROM focus_briefs ORDER BY rowid`)
+      .all() as Array<{ brief_id: string; prompt: string; status: string; content: string }>;
+    expect(rows).toEqual([
+      expect.objectContaining({
+        brief_id: oldBrief.briefId,
+        prompt: "agent configuration",
+        status: "superseded",
+      }),
+      expect.objectContaining({
+        prompt: "agent configuration",
+        status: "active",
+        content: expect.stringContaining("Existing baseline plus refocus_delta update."),
+      }),
+    ]);
+    const sources = fixture.db
+      .prepare(`SELECT summary_id, role FROM focus_brief_sources ORDER BY role, summary_id`)
+      .all() as Array<{ summary_id: string; role: string }>;
+    expect(sources).toContainEqual({ summary_id: "refocus_delta", role: "active_input" });
+    expect(sources).toContainEqual({ summary_id: "refocus_delta", role: "cited" });
+  });
+
+  it("keeps the active focus brief when refocus generation fails", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const sessionKey = "agent:main:telegram:direct:refocus-fails";
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "refocus-fails-session",
+      sessionKey,
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "Delta message.",
+        tokenCount: 4,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "refocus_failed_delta",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Delta content.",
+      tokenCount: 10,
+      latestAt: new Date("2026-05-16T00:00:00Z"),
+    });
+    await fixture.summaryStore.linkSummaryToMessages("refocus_failed_delta", [message.messageId]);
+    await fixture.summaryStore.appendContextSummary(
+      currentConversation.conversationId,
+      "refocus_failed_delta",
+    );
+    const focusStore = new FocusBriefStore(fixture.db);
+    const active = await focusStore.createFocusBrief({
+      conversationId: currentConversation.conversationId,
+      sessionKey,
+      prompt: "agent configuration",
+      content: "Still active baseline.",
+      status: "active",
+      coveredLatestAt: "2026-05-15T00:00:00.000Z",
+      coveredMessageSeq: 0,
+      supersedeCurrentDrafts: true,
+    });
+    const deps = {
+      config: fixture.config,
+      complete: vi.fn(),
+      callGateway: vi.fn(async (request: { method: string }) => {
+        if (request.method === "agent") return { runId: "refocus-failed-run" };
+        if (request.method === "agent.wait") return { status: "timeout" };
+        if (request.method === "sessions.delete") return { ok: true };
+        throw new Error(`unexpected gateway method ${request.method}`);
+      }),
+      resolveModel: () => ({ provider: "test", model: "test-model" }),
+      parseAgentSessionKey: () => ({ agentId: "main", suffix: "test" }),
+      isSubagentSessionKey: (key: string) => key.includes(":subagent:"),
+      normalizeAgentId: (id?: string) => id?.trim() || "main",
+      buildSubagentSystemPrompt: () => "subagent system prompt",
+      readLatestAssistantReply: () => undefined,
+      resolveAgentDir: () => fixture.tempDir,
+      resolveSessionIdFromSessionKey: async () => undefined,
+      resolveSessionTranscriptFile: async () => undefined,
+      agentLaneSubagent: "subagent",
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as LcmDependencies;
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      deps,
+      getLcm: async () => ({
+        compact: vi.fn(async () => ({ ok: true, compacted: true, reason: "forced full sweep" })),
+        rotateSessionStorageWithBackup: vi.fn(),
+      }),
+    });
+
+    const result = await command.handler(
+      createCommandContext("refocus", {
+        sessionKey,
+      }),
+    );
+
+    expect(result.text).toContain("Generation failed");
+    expect(
+      fixture.db.prepare(`SELECT status FROM focus_briefs WHERE brief_id = ?`).get(active.briefId),
+    ).toEqual({ status: "active" });
   });
 
   it("reports deferred compaction maintenance state in status output", async () => {
@@ -1018,6 +1631,9 @@ describe("lcm command", () => {
   });
 
   it("uses the normal runtime model chain for doctor apply when no explicit summary model is set", async () => {
+    const hostBoundComplete = vi.fn(async () => ({
+      text: "HOST BOUND REPAIR",
+    }));
     const runtimeComplete = vi.fn(async () => ({
       content: [{ type: "text", text: "RUNTIME REPAIR" }],
     }));
@@ -1078,6 +1694,12 @@ describe("lcm command", () => {
     const result = await fixture.command.handler(
       createCommandContext("doctor apply", {
         sessionKey: "agent:main:telegram:direct:doctor-apply-runtime-config",
+        runtimeContext: {
+          authProfileId: "openai-codex:work",
+          llm: {
+            complete: hostBoundComplete,
+          },
+        },
         config: {
           agents: {
             defaults: {
@@ -1103,6 +1725,12 @@ describe("lcm command", () => {
     expect(result.text).toContain("repaired summaries: 1");
     expect(result.text).not.toContain("could not resolve a summarizer");
     expect(runtimeComplete).toHaveBeenCalled();
+    expect(runtimeComplete.mock.calls[0]?.[0]).toMatchObject({
+      agentId: "main",
+      authProfileId: "openai-codex:work",
+      runtimeLlmComplete: hostBoundComplete,
+    });
+    expect(hostBoundComplete).not.toHaveBeenCalled();
     expect(repaired?.content).toContain("RUNTIME REPAIR");
     expect(repaired?.content).not.toContain("[Truncated from 111 tokens]");
   });
@@ -1716,6 +2344,16 @@ describe("lcm command", () => {
 });
 
 describe("lcm command helpers", () => {
+  it("parses focus command forms without flag syntax", () => {
+    expect(__testing.parseLcmCommand("focus alpha auth review")).toEqual({
+      kind: "focus_generate",
+      prompt: "alpha auth review",
+    });
+    expect(__testing.parseLcmCommand("focus")).toEqual({ kind: "focus_status" });
+    expect(__testing.parseLcmCommand("refocus")).toEqual({ kind: "refocus" });
+    expect(__testing.parseLcmCommand("unfocus")).toEqual({ kind: "unfocus" });
+  });
+
   it("treats only the canonical engine id and empty slot state as selected", () => {
     expect(__testing.resolvePluginSelected({})).toBe(true);
     expect(

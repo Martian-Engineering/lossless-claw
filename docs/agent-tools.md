@@ -124,6 +124,7 @@ When `allConversations: true` is set, `lcm_expand_query` can now synthesize one 
 | `query` | string | ✅* | — | Text query to find summaries (if no `summaryIds`) |
 | `summaryIds` | string[] | ✅* | — | Specific summary IDs to expand (if no `query`) |
 | `maxTokens` | number | | 2000 | Answer length cap |
+| `timeoutMs` | number | ✅ | `delegationTimeoutMs + 30000` | Total OpenClaw dynamic tool RPC timeout; use the schema default so delegated recall can finish before the host watchdog fires |
 | `conversationId` | number | | current session family | Scope to a specific physical conversation |
 | `allConversations` | boolean | | `false` | Search across all conversations |
 
@@ -144,20 +145,23 @@ When `allConversations: true` is set, `lcm_expand_query` can now synthesize one 
 # Find and expand summaries about a topic
 lcm_expand_query(
   query: "OAuth authentication fix",
-  prompt: "What was the root cause and what commits fixed it?"
+  prompt: "What was the root cause and what commits fixed it?",
+  timeoutMs: 150000
 )
 
 # Expand specific summaries you already have
 lcm_expand_query(
   summaryIds: ["sum_abc123", "sum_def456"],
-  prompt: "What were the exact file changes?"
+  prompt: "What were the exact file changes?",
+  timeoutMs: 150000
 )
 
 # Cross-conversation synthesis
 lcm_expand_query(
   query: "deployment procedure",
   prompt: "What's the current deployment process?",
-  allConversations: true
+  allConversations: true,
+  timeoutMs: 150000
 )
 ```
 
@@ -193,6 +197,6 @@ By default, tools operate on the current session family: the active conversation
 
 - `lcm_grep` and `lcm_describe` are fast (direct database queries)
 - `lcm_expand_query` spawns a sub-agent and takes ~30–120 seconds
-- The sub-agent has a 120-second timeout with cleanup guarantees
+- The sub-agent has a 120-second timeout with cleanup guarantees by default, and the tool schema advertises a 150-second OpenClaw dynamic RPC timeout so the host watchdog stays open long enough for delegated recall plus result cleanup
 - Token caps (`LCM_MAX_EXPAND_TOKENS`) prevent runaway expansion
 - Cross-conversation `lcm_expand_query` expands only a bounded set of top-ranked conversations

@@ -189,6 +189,15 @@ export function createLcmExpandTool(input: {
         sessionKey: input.sessionKey,
         params: p,
       });
+      if (conversationScope.error) {
+        return jsonResult({ error: conversationScope.error });
+      }
+      if (isDelegatedSession && conversationScope.conversationId == null) {
+        return jsonResult({
+          error:
+            "lcm_expand requires a single delegated conversation scope. Provide conversationId within the delegated grant.",
+        });
+      }
 
       const runExpand = async (input: {
         summaryIds: string[];

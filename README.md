@@ -65,6 +65,8 @@ The bundled skill focuses on configuration, diagnostics, architecture, and recal
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
 
+> **Compatibility:** `lossless-claw@0.10.0` and newer require OpenClaw `2026.5.12` or newer. These releases call OpenClaw's `api.runtime.llm.complete` capability for summarization, which is unavailable in older OpenClaw builds. If you cannot upgrade OpenClaw yet, stay on `lossless-claw@0.9.4` and remove `0.10.x`-only config such as `sweepMaxDepth`.
+
 ### Install the plugin
 
 Use OpenClaw's plugin installer (recommended):
@@ -232,6 +234,7 @@ Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the 
 - `subagent.allowedModels` is optional but recommended. Use `"*"` only if you intentionally want to trust any target model.
 - The chosen expansion target must also be available in OpenClaw's normal model catalog. If it is not already configured elsewhere, add it under the top-level `models` map as shown above.
 - If you prefer splitting provider and model, set `config.expansionProvider` and use a bare `config.expansionModel`.
+- `openclaw doctor --fix` can add the required `subagent` policy for a configured `expansionModel`. If a host still rejects a stale or unavailable override, `lcm_expand_query` retries once without the override so recall does not fail hard.
 
 Plugin config equivalents:
 

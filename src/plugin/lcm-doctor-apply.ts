@@ -53,6 +53,8 @@ export async function applyScopedDoctorRepair(params: {
   deps?: LcmDependencies;
   summarize?: LcmSummarizeFn;
   runtimeConfig?: unknown;
+  runtimeContext?: Record<string, unknown>;
+  sessionKey?: string;
 }): Promise<DoctorApplyResult> {
   const targets = loadDoctorTargets(params.db, params.conversationId);
   if (targets.length === 0) {
@@ -174,6 +176,8 @@ async function resolveDoctorApplySummarize(params: {
   deps?: LcmDependencies;
   summarize?: LcmSummarizeFn;
   runtimeConfig?: unknown;
+  runtimeContext?: Record<string, unknown>;
+  sessionKey?: string;
 }): Promise<LcmSummarizeFn | undefined> {
   if (typeof params.summarize === "function") {
     return params.summarize;
@@ -186,6 +190,8 @@ async function resolveDoctorApplySummarize(params: {
     deps: params.deps,
     legacyParams: {
       config: params.runtimeConfig,
+      ...(params.runtimeContext ?? {}),
+      ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
     },
     customInstructions: params.config.customInstructions || undefined,
   });
