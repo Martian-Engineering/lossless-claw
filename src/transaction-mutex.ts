@@ -146,7 +146,9 @@ export async function withExclusiveDatabaseLock<T>(
 ): Promise<T> {
   const release = await acquireTransactionLockWithTimeout(db, options.timeoutMs);
   try {
-    return await operation();
+    const heldLocks = new Map(heldLockContext.getStore() ?? []);
+    heldLocks.set(db, (heldLocks.get(db) ?? 0) + 1);
+    return await heldLockContext.run(heldLocks, async () => operation());
   } finally {
     release();
   }

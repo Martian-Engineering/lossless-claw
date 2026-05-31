@@ -21,7 +21,7 @@ import { getLcmDbFeatures } from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
-import { acquireTransactionLock } from "../src/transaction-mutex.js";
+import { acquireTransactionLock, withExclusiveDatabaseLock } from "../src/transaction-mutex.js";
 
 const tempDirs: string[] = [];
 const dbs: ReturnType<typeof createLcmDatabaseConnection>[] = [];
@@ -100,6 +100,30 @@ describe("transaction-mutex", () => {
   });
 
   describe("ConversationStore.withTransaction concurrent safety", () => {
+    it("reuses an exclusive database lock for nested store transactions", async () => {
+      const { db, fts5Available } = createTestDb();
+      const store = new ConversationStore(db, { fts5Available });
+      const conv = await store.createConversation({
+        sessionId: "sess-exclusive-nested",
+        sessionKey: "key-exclusive-nested",
+      });
+
+      await withExclusiveDatabaseLock(db, { timeoutMs: 100 }, async () => {
+        await store.withTransaction(async () => {
+          await store.createMessage({
+            conversationId: conv.conversationId,
+            seq: 1,
+            role: "user",
+            content: "nested under exclusive lock",
+            tokenCount: 5,
+          });
+        });
+      });
+
+      const messages = await store.getMessages(conv.conversationId);
+      expect(messages.map((message) => message.content)).toEqual(["nested under exclusive lock"]);
+    });
+
     it("does not throw nested-transaction errors with concurrent withTransaction calls", async () => {
       const { db, fts5Available } = createTestDb();
       const store = new ConversationStore(db, { fts5Available });
