@@ -274,6 +274,15 @@ function isReasoningLikeType(type: unknown): boolean {
   return normalized.includes("reasoning") || normalized.includes("thinking");
 }
 
+function isReasoningLikeKey(key: string): boolean {
+  const normalized = key.trim().toLowerCase();
+  return normalized.includes("reasoning") || normalized.includes("thinking");
+}
+
+function shouldAppendDirectTextField(key: string): boolean {
+  return key === "content" || key === "summary";
+}
+
 /** Collect text payloads from common provider response shapes. */
 function collectTextLikeFields(value: unknown, out: string[]): void {
   if (Array.isArray(value)) {
@@ -293,9 +302,19 @@ function collectTextLikeFields(value: unknown, out: string[]): void {
   for (const key of ["text", "output_text"]) {
     appendTextValue(value[key], out);
   }
-  for (const key of ["content", "summary", "output", "message", "response"]) {
+  for (const key of ["content", "summary", "output", "message", "response", "choices", "delta"]) {
     if (key in value) {
-      collectTextLikeFields(value[key], out);
+      if (isReasoningLikeKey(key)) {
+        continue;
+      }
+      const nested = value[key];
+      if (typeof nested === "string") {
+        if (shouldAppendDirectTextField(key)) {
+          out.push(nested);
+        }
+        continue;
+      }
+      collectTextLikeFields(nested, out);
     }
   }
 }
@@ -393,10 +412,17 @@ function sanitizeForDiagnostics(value: unknown, depth = 0): unknown {
     return String(value);
   }
 
+  if (isReasoningLikeType(value.type) || isReasoningLikeType(value.rawType)) {
+    return {
+      type: typeof value.type === "string" ? value.type : typeof value.rawType === "string" ? value.rawType : "reasoning",
+      content: "[redacted]",
+    };
+  }
+
   const out: Record<string, unknown> = {};
   const entries = Object.entries(value);
   for (const [key, entry] of entries.slice(0, DIAGNOSTIC_MAX_OBJECT_KEYS)) {
-    out[key] = DIAGNOSTIC_SENSITIVE_KEY_PATTERN.test(key)
+    out[key] = DIAGNOSTIC_SENSITIVE_KEY_PATTERN.test(key) || isReasoningLikeKey(key)
       ? "[redacted]"
       : sanitizeForDiagnostics(entry, depth + 1);
   }
@@ -440,7 +466,14 @@ function collectAuthFailureText(value: unknown, out: string[], depth = 0): void 
     return;
   }
 
-  for (const entry of Object.values(value).slice(0, DIAGNOSTIC_MAX_OBJECT_KEYS)) {
+  if (isReasoningLikeType(value.type) || isReasoningLikeType(value.rawType)) {
+    return;
+  }
+
+  for (const [key, entry] of Object.entries(value).slice(0, DIAGNOSTIC_MAX_OBJECT_KEYS)) {
+    if (isReasoningLikeKey(key)) {
+      continue;
+    }
     collectAuthFailureText(entry, out, depth + 1);
   }
 }
@@ -599,6 +632,17 @@ function getProviderResponseFinishReason(value: Record<string, unknown>): string
     }
   }
   return undefined;
+}
+
+function isIncompleteFinishReason(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === "length" ||
+    normalized === "max_tokens" ||
+    normalized === "max_output_tokens" ||
+    normalized === "model_length" ||
+    normalized === "incomplete"
+  );
 }
 
 function getProviderResponseErrorCode(value: Record<string, unknown>): string | undefined {
@@ -877,8 +921,12 @@ function collectIncompleteResponseSignals(
       out.add(`${label}.reason=${reason}`);
     }
   }
+  const finishReason = getProviderResponseFinishReason(value);
+  if (finishReason && isIncompleteFinishReason(finishReason)) {
+    out.add(`${label}.finish=${finishReason}`);
+  }
 
-  for (const key of ["content", "output", "message", "response", "items"] as const) {
+  for (const key of ["content", "output", "message", "response", "items", "choices"] as const) {
     if (key in value) {
       collectIncompleteResponseSignals(value[key], out, `${label}.${key}`, depth + 1);
     }
