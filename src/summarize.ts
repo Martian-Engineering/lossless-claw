@@ -110,6 +110,12 @@ const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
 const DIAGNOSTIC_MAX_CHARS = 1200;
 const DIAGNOSTIC_SENSITIVE_KEY_PATTERN =
   /(api[-_]?key|authorization|token|secret|password|cookie|set-cookie|private[-_]?key|bearer)/i;
+const CLOSED_REASONING_SUMMARY_BLOCK_RE =
+  /<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\1\s*>/gi;
+const REASONING_SUMMARY_START_RE =
+  /^(?:<\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\]|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:)/i;
+const REASONING_DIAGNOSTIC_MARKER_RE =
+  /(?:<\s*\/?\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\]|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:)/i;
 const AUTH_ERROR_TEXT_PATTERN =
   /\b401\b|unauthorized|unauthorised|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|authentication failed|authorization failed|missing scope|insufficient scope|model\.request\b/i;
 const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
@@ -403,55 +409,58 @@ function normalizeCompletionSummary(content: unknown): { summary: string; blockT
 }
 
 /**
- * Detect summary text that is actually a provider reasoning/thinking payload
- * leaking through as the summary body.
+ * Remove provider reasoning/thinking payloads leaking through as summary text.
  *
  * Some reasoning-capable summary models (vLLM+Qwen3 per #471, Kimi K2.6 per
  * #542) sometimes return reasoning text shaped so it slips past the
  * type-tagged filtering in `collectTextLikeFields` — e.g. the entire
  * summary body is wrapped in `<think>...</think>` tags, or starts with
- * `<think>` and never closes.  Treat those as empty so the empty-summary
- * hardening (envelope → retry → deterministic fallback) kicks in instead
- * of silently persisting reasoning text as the summary.  See #564.
+ * `<think>` and never closes.  Some providers also leak the same payload
+ * behind high-signal prose headers such as `Thinking Process:`.  Strip closed
+ * reasoning blocks when a visible summary follows, or treat reasoning-only
+ * output as empty so the empty-summary hardening (envelope → retry →
+ * deterministic fallback) kicks in instead of silently persisting reasoning
+ * text as the summary.  See #564.
  */
-function looksLikeReasoningOnlySummary(value: string): boolean {
-  if (typeof value !== "string") return false;
+function sanitizeReasoningSummaryText(value: string): {
+  summary: string;
+  droppedReasoning: boolean;
+  reasoningOnly: boolean;
+} {
+  if (typeof value !== "string") {
+    return { summary: "", droppedReasoning: false, reasoningOnly: false };
+  }
   const trimmed = value.trim();
-  if (!trimmed) return false;
+  if (!trimmed) {
+    return { summary: "", droppedReasoning: false, reasoningOnly: false };
+  }
 
   // Strip every CLOSED `<think>...</think>` / `<thinking>...</thinking>` /
   // `<reasoning>...</reasoning>` block.  A closed reasoning block followed
   // by a non-empty summary body (the common pattern when the provider
   // emits a reasoning trace and then a normal answer, e.g.
-  // `<think>...</think>Actual summary text`) is NOT reasoning-only —
-  // returning true here would force an unnecessary retry/fallback.
-  const withoutClosedThink = trimmed.replace(
-    /<\s*(think|thinking|reasoning)\s*>[\s\S]*?<\s*\/\s*\1\s*>/gi,
-    "",
-  );
+  // `<think>...</think>Actual summary text`) is kept, but the reasoning
+  // prefix itself must not be persisted.
+  const withoutClosedThink = trimmed.replace(CLOSED_REASONING_SUMMARY_BLOCK_RE, "");
   const remainder = withoutClosedThink.trim();
   if (!remainder) {
     // Either the entire body was a closed reasoning block (no summary
     // text after) or the input was empty — both are reasoning-only.
-    return true;
+    return { summary: "", droppedReasoning: true, reasoningOnly: true };
   }
 
   // Remainder still starts with an UNCLOSED reasoning marker — the
   // provider opened a `<think>`-style block but never closed it (often a
   // truncated stream / max_tokens cutoff before the answer began).
-  if (/^<\s*(think|thinking|reasoning)(\s[^>]*)?>/i.test(remainder)) {
-    return true;
-  }
-  if (/^<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>/i.test(remainder)) {
-    return true;
-  }
-  // Bracketed labels at the very start (`[thinking]…` with no obvious
-  // body separation) — same shape as the unclosed-tag case.
-  if (/^\[\s*(think|thinking|reasoning)\s*\]/i.test(remainder)) {
-    return true;
+  if (REASONING_SUMMARY_START_RE.test(remainder)) {
+    return { summary: "", droppedReasoning: true, reasoningOnly: true };
   }
 
-  return false;
+  return {
+    summary: remainder,
+    droppedReasoning: remainder !== trimmed,
+    reasoningOnly: false,
+  };
 }
 
 /** Format normalized block types for concise diagnostics. */
@@ -476,6 +485,9 @@ function sanitizeForDiagnostics(value: unknown, depth = 0): unknown {
     return "[max-depth]";
   }
   if (typeof value === "string") {
+    if (REASONING_DIAGNOSTIC_MARKER_RE.test(value)) {
+      return `[reasoning-like text redacted:${value.length} chars]`;
+    }
     return truncateDiagnosticText(value);
   }
   if (
@@ -1750,27 +1762,33 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       }
 
       // Reasoning-leak guardrail (#564, refs #471, #542): if the extracted
-      // summary text is itself a provider reasoning/thinking payload (wrapped
-      // in <think>…</think>, opened with `[thinking]`, etc.), treat it as
-      // empty so the retry/fallback chain runs instead of persisting the
-      // reasoning text verbatim as the summary body.
-      if (summary && looksLikeReasoningOnlySummary(summary)) {
-        // Log the block_types from the source normalization that actually
-        // produced this summary text — `normalized` is content-path, but
-        // when the summary came from `envelopeNormalized` the relevant
-        // shape is the envelope's, not the content's.
-        const droppedBlockTypes =
-          summarySource === "envelope" && envelopeNormalized
-            ? envelopeNormalized.blockTypes
-            : normalized.blockTypes;
-        params.deps.log.warn(
-          `[lcm] dropped reasoning-shaped summary on first attempt; provider=${provider}; ` +
-            `model=${model}; source=${summarySource}; ` +
-            `block_types=${formatBlockTypes(droppedBlockTypes)}; ` +
-            `summary_preview=${formatDiagnosticPayload(summary.slice(0, 160))}`,
-        );
-        summary = "";
-        summarySource = "content";
+      // summary text contains provider reasoning/thinking payloads, strip
+      // closed reasoning blocks when a visible summary follows.  Reasoning-only
+      // output is treated as empty so the retry/fallback chain runs.
+      if (summary) {
+        const rawSummaryChars = summary.length;
+        const sanitizedSummary = sanitizeReasoningSummaryText(summary);
+        if (sanitizedSummary.droppedReasoning) {
+          summary = sanitizedSummary.summary;
+        }
+        if (sanitizedSummary.reasoningOnly) {
+          // Log the block_types from the source normalization that actually
+          // produced this summary text — `normalized` is content-path, but
+          // when the summary came from `envelopeNormalized` the relevant
+          // shape is the envelope's, not the content's.
+          const droppedBlockTypes =
+            summarySource === "envelope" && envelopeNormalized
+              ? envelopeNormalized.blockTypes
+              : normalized.blockTypes;
+          params.deps.log.warn(
+            `[lcm] dropped reasoning-shaped summary on first attempt; provider=${provider}; ` +
+              `model=${model}; source=${summarySource}; ` +
+              `block_types=${formatBlockTypes(droppedBlockTypes)}; ` +
+              `summary_shape=reasoning-only; summary_chars=${rawSummaryChars}`,
+          );
+          summary = "";
+          summarySource = "content";
+        }
       }
 
       const incompleteSignals = extractIncompleteResponseSignals(result);
@@ -1808,15 +1826,22 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           summary = retryEnvelopeNormalized.summary;
 
           // Re-apply the reasoning-leak guardrail to the retry result so a
-          // reasoning-shaped retry response also drops to deterministic
-          // fallback rather than persisting as the summary body.  See #564.
-          if (summary && looksLikeReasoningOnlySummary(summary)) {
-            params.deps.log.warn(
-              `[lcm] dropped reasoning-shaped summary on retry; provider=${provider}; ` +
-                `model=${model}; block_types=${formatBlockTypes(retryEnvelopeNormalized.blockTypes)}; ` +
-                `summary_preview=${formatDiagnosticPayload(summary.slice(0, 160))}`,
-            );
-            summary = "";
+          // mixed reasoning+summary retry is stripped before persistence, and
+          // reasoning-only retry output drops to deterministic fallback.
+          if (summary) {
+            const rawRetrySummaryChars = summary.length;
+            const sanitizedRetrySummary = sanitizeReasoningSummaryText(summary);
+            if (sanitizedRetrySummary.droppedReasoning) {
+              summary = sanitizedRetrySummary.summary;
+            }
+            if (sanitizedRetrySummary.reasoningOnly) {
+              params.deps.log.warn(
+                `[lcm] dropped reasoning-shaped summary on retry; provider=${provider}; ` +
+                  `model=${model}; block_types=${formatBlockTypes(retryEnvelopeNormalized.blockTypes)}; ` +
+                  `summary_shape=reasoning-only; summary_chars=${rawRetrySummaryChars}`,
+              );
+              summary = "";
+            }
           }
 
           if (summary) {

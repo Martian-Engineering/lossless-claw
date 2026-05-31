@@ -285,6 +285,10 @@ const STRUCTURED_MEDIA_NESTED_KEYS = [
   "query",
   "command",
 ] as const;
+const CLOSED_REASONING_TEXT_BLOCK_RE =
+  /<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\1\s*>/gi;
+const REASONING_TEXT_START_RE =
+  /^(?:<\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\]|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:)/i;
 
 const CONDENSED_MIN_INPUT_RATIO = 0.1;
 
@@ -391,13 +395,25 @@ export function stripInjectedContextBlocks(content: string, tags: string[] | und
   return result.trim();
 }
 
+function stripPlainTextReasoningPayloads(content: string): string {
+  const strippedClosedBlocks = content.replace(CLOSED_REASONING_TEXT_BLOCK_RE, "");
+  const trimmed = strippedClosedBlocks.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (REASONING_TEXT_START_RE.test(trimmed)) {
+    return "";
+  }
+  return trimmed;
+}
+
 /** Extract human-readable text from structured content while ignoring attachment payload fields. */
 function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
   if (depth >= 4 || value == null) {
     return [];
   }
   if (typeof value === "string") {
-    const sanitized = stripEmbeddedMediaPayloads(value);
+    const sanitized = stripPlainTextReasoningPayloads(stripEmbeddedMediaPayloads(value));
     return sanitized ? [sanitized] : [];
   }
   if (Array.isArray(value)) {
@@ -419,7 +435,7 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
     if (typeof candidate !== "string") {
       continue;
     }
-    const sanitized = stripEmbeddedMediaPayloads(candidate);
+    const sanitized = stripPlainTextReasoningPayloads(stripEmbeddedMediaPayloads(candidate));
     if (sanitized) {
       textFragments.push(sanitized);
     }
@@ -465,7 +481,7 @@ export function extractMeaningfulMessageText(content: string): string {
       // Fall back to plain-text sanitation below.
     }
   }
-  return stripEmbeddedMediaPayloads(content);
+  return stripPlainTextReasoningPayloads(stripEmbeddedMediaPayloads(content));
 }
 
 /** Map stored message roles back to runtime roles for structured reconstruction. */
@@ -1928,7 +1944,7 @@ export class CompactionEngine {
     const partText = parts
       .filter((part) => !isMediaAttachmentPart(part))
       .map((part) => (typeof part.textContent === "string" ? part.textContent : ""))
-      .map((text) => stripEmbeddedMediaPayloads(text))
+      .map((text) => stripPlainTextReasoningPayloads(stripEmbeddedMediaPayloads(text)))
       .map((text) => text.trim())
       .filter(Boolean)
       .join("\n")

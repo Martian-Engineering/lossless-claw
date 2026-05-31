@@ -14,7 +14,7 @@ import type { LcmDependencies } from "../src/types.js";
 //   B2 — `extractMeaningfulMessageText` is now applied at every summarizer
 //        entry point (leaf, condensed, prior-summary context).  The unit
 //        suite below confirms it strips the structured reasoning shapes
-//        observed in the wild from #471 / #542 / #547.
+//        observed in the wild from #471 / #493 / #542.
 //   B1 — When a provider returns reasoning-shaped text as the summary body,
 //        the summarize path now detects the leak, drops the summary, and
 //        defers to the existing retry → deterministic-fallback chain
@@ -91,6 +91,25 @@ describe("extractMeaningfulMessageText (B2: shared sanitizer)", () => {
     expect(
       extractMeaningfulMessageText("Just a plain log line about reasoning."),
     ).toBe("Just a plain log line about reasoning.");
+  });
+
+  it("strips raw closed reasoning tags from legacy plain-text summaries", () => {
+    expect(
+      extractMeaningfulMessageText(
+        "<think>PRIVATE_LEGACY_REASONING</think>Visible legacy summary.",
+      ),
+    ).toBe("Visible legacy summary.");
+  });
+
+  it("drops raw reasoning-only legacy plain-text summaries", () => {
+    expect(
+      extractMeaningfulMessageText("<thinking>PRIVATE_LEGACY_REASONING</thinking>"),
+    ).toBe("");
+    expect(
+      extractMeaningfulMessageText(
+        "Thinking Process: PRIVATE_LEGACY_REASONING before the answer.",
+      ),
+    ).toBe("");
   });
 });
 
@@ -249,6 +268,10 @@ describe("createLcmSummarizeFromLegacyParams (B1: reasoning-leak guardrail)", ()
     const diagnostics = getDepsLogText(deps);
     expect(diagnostics).toContain("dropped reasoning-shaped summary on first attempt");
     expect(diagnostics).toContain("dropped reasoning-shaped summary on retry");
+    expect(diagnostics).not.toContain("plan first");
+    expect(diagnostics).not.toContain("retry plan");
+    expect(diagnostics).not.toContain("<think>");
+    expect(diagnostics).not.toContain("<thinking>");
   });
 
   it("treats a [thinking]-prefixed summary as a reasoning leak", async () => {
@@ -274,6 +297,37 @@ describe("createLcmSummarizeFromLegacyParams (B1: reasoning-leak guardrail)", ()
     const summary = await summarize!("Source text.", false);
 
     expect(summary).toBe("Clean summary on retry.");
+    expect(callCount).toBe(2);
+  });
+
+  it("treats a Thinking Process-prefixed summary as a reasoning leak", async () => {
+    let callCount = 0;
+    const deps = makeDeps({
+      complete: vi.fn(async () => {
+        callCount += 1;
+        if (callCount === 1) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Thinking Process: The user wants a digest before I answer.",
+              },
+            ],
+          };
+        }
+        return {
+          content: [{ type: "text", text: "Clean summary after header leak." }],
+        };
+      }),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: { provider: "openrouter", model: "qwen/qwen3-235b" },
+    });
+    const summary = await summarize!("Source text.", false);
+
+    expect(summary).toBe("Clean summary after header leak.");
     expect(callCount).toBe(2);
   });
 
@@ -309,8 +363,9 @@ describe("createLcmSummarizeFromLegacyParams (B1: reasoning-leak guardrail)", ()
 
     // Only one provider call — guardrail must NOT have rejected this.
     expect(callCount).toBe(1);
-    // The follow-on summary text must survive.
-    expect(summary).toContain("Recovered clean summary follow-on.");
+    expect(summary).toBe("Recovered clean summary follow-on.");
+    expect(summary).not.toContain("<think>");
+    expect(summary).not.toContain("The user wants a digest.");
   });
 
   it("does not drop a clean summary that merely mentions the word 'reasoning'", async () => {

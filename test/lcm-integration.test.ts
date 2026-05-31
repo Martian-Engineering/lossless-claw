@@ -2735,6 +2735,7 @@ describe("LCM integration: compaction", () => {
     );
 
     const summarizeCalls: Array<{
+      text: string;
       options?: {
         previousSummary?: string;
         isCondensed?: boolean;
@@ -2743,11 +2744,11 @@ describe("LCM integration: compaction", () => {
     }> = [];
     const summarize = vi.fn(
       async (
-        _text: string,
+        text: string,
         _aggressive?: boolean,
         options?: { previousSummary?: string; isCondensed?: boolean; depth?: number },
       ) => {
-        summarizeCalls.push({ options });
+        summarizeCalls.push({ text, options });
         return "Condensed output";
       },
     );
@@ -2777,7 +2778,7 @@ describe("LCM integration: compaction", () => {
       conversationId: depthZeroConversation.conversationId,
       kind: "leaf",
       depth: 0,
-      content: "Depth zero prior context",
+      content: "<think>PRIVATE_PRIOR_REASONING</think>Depth zero prior context",
       tokenCount: 60,
     });
     await sumStore.insertSummary({
@@ -2785,7 +2786,7 @@ describe("LCM integration: compaction", () => {
       conversationId: depthZeroConversation.conversationId,
       kind: "leaf",
       depth: 0,
-      content: "Depth zero focus A",
+      content: "<thinking>PRIVATE_FOCUS_REASONING</thinking>Depth zero focus A",
       tokenCount: 60,
     });
     await sumStore.insertSummary({
@@ -2826,6 +2827,12 @@ describe("LCM integration: compaction", () => {
     const depthZeroCall = summarizeCalls[summarizeCalls.length - 1];
     expect(depthZeroCall?.options?.depth).toBe(1);
     expect(depthZeroCall?.options?.previousSummary).toContain("Depth zero prior context");
+    expect(depthZeroCall?.options?.previousSummary).not.toContain("PRIVATE_PRIOR_REASONING");
+    expect(depthZeroCall?.options?.previousSummary).not.toContain("<think>");
+    expect(depthZeroCall?.text).toContain("Depth zero focus A");
+    expect(depthZeroCall?.text).toContain("Depth zero focus B");
+    expect(depthZeroCall?.text).not.toContain("PRIVATE_FOCUS_REASONING");
+    expect(depthZeroCall?.text).not.toContain("<thinking>");
   });
 
   it("relaxes fanout thresholds only under summarized-prefix pressure", async () => {
