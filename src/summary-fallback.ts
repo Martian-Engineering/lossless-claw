@@ -7,15 +7,15 @@ export const FALLBACK_SUMMARY_MARKER =
   "[LCM fallback summary; truncated for context management]";
 const DEFAULT_FALLBACK_DIRECTIVE_NOTE =
   "[LCM fallback summary; directive-shaped untrusted content omitted]";
+const OPTIONAL_DIRECTIVE_SCOPE_PREFIX = String.raw`(?:all\s+)?(?:(?:the|your|my|any|these|those)\s+)?`;
 const FALLBACK_DIRECTIVE_SHAPED_PATTERN = new RegExp(
   [
-    String.raw`\b(ignore|disregard|forget|override)\s+(all\s+)?(previous|prior|above|earlier|system|developer)\s+(instructions?|prompts?|rules?)\b`,
+    String.raw`\b(ignore|disregard|forget|override)\s+${OPTIONAL_DIRECTIVE_SCOPE_PREFIX}(previous|prior|above|earlier|system|developer)\s+(instructions?|prompts?|rules?)\b`,
     String.raw`\byou\s+are\s+now\b`,
     String.raw`\bfrom\s+now\s+on\b`,
     String.raw`\breply\s+only\s+with\b`,
-    String.raw`\b(reveal|print|show|dump|exfiltrate)\s+(the\s+)?(system|developer)\s+prompt\b`,
+    String.raw`\b(reveal|print|show|dump|exfiltrate)\s+(?:(?:the|your|my|any)\s+)?(system|developer)\s+prompt\b`,
     String.raw`\bjailbreak\b`,
-    String.raw`\bDAN\b`,
   ].join("|"),
   "i",
 );
@@ -74,7 +74,10 @@ export function buildDeterministicFallbackSummary(
   const fallbackNote = omittedDirectiveShapedContent
     ? (options?.directiveOmissionNote ?? DEFAULT_FALLBACK_DIRECTIVE_NOTE)
     : (options?.truncationNote ?? FALLBACK_SUMMARY_MARKER);
-  if (!sanitizedText) {
+  const sanitizedTextWithoutOmissionMarkers = omittedDirectiveShapedContent
+    ? sanitizedText.split(FALLBACK_DIRECTIVE_OMISSION).join("").trim()
+    : sanitizedText;
+  if (!sanitizedText || !sanitizedTextWithoutOmissionMarkers) {
     return fallbackNote;
   }
 
