@@ -60,7 +60,20 @@ function configureConnection(db: DatabaseSync): DatabaseSync {
   db.exec("PRAGMA synchronous = NORMAL");
   // Keep temp tables/indexes in RAM (helps ordinal resequencing).
   db.exec("PRAGMA temp_store = MEMORY");
+  // Keep extension loading disabled by default, while still allowing explicit
+  // enablement later on handles created with allowExtension: true.
+  if (typeof db.enableLoadExtension === "function") {
+    db.enableLoadExtension(false);
+  }
   return db;
+}
+
+function createDatabaseSync(dbPath: string): DatabaseSync {
+  const supportsExtensionLoading =
+    typeof DatabaseSync.prototype.enableLoadExtension === "function";
+  return supportsExtensionLoading
+    ? new DatabaseSync(dbPath, { allowExtension: true })
+    : new DatabaseSync(dbPath);
 }
 
 function trackConnection(dbPath: string, db: DatabaseSync): void {
@@ -112,7 +125,7 @@ function closeDatabase(db: DatabaseSync | undefined): void {
  */
 export function createLcmDatabaseConnection(dbPath: string): DatabaseSync {
   ensureDbDirectory(dbPath);
-  const db = new DatabaseSync(dbPath);
+  const db = createDatabaseSync(dbPath);
   try {
     configureConnection(db);
   } catch (err) {
