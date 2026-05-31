@@ -1746,6 +1746,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
         .getMessages(conversation!.conversationId);
       expect(messages).toHaveLength(1);
       expect(messages[0].content).not.toContain("[LCM Raw Payload:");
+      expect(messages[0].content).not.toContain("protected reasoning");
 
       const largeFiles = await engine
         .getSummaryStore()
@@ -3472,6 +3473,92 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(activeMessages.map((message) => message.content)).toEqual([
       "new user",
       "new assistant",
+    ]);
+  });
+
+  it("rotates before assemble when a stable sessionKey points at a pruned transcript", async () => {
+    const engine = createEngine();
+    const firstSessionId = "assemble-missed-reset-fallback-1";
+    const secondSessionId = "assemble-missed-reset-fallback-2";
+    const sessionKey = "agent:main:test:assemble-missed-reset-fallback";
+    const firstSessionFile = createSessionFilePath("assemble-missed-reset-fallback-old");
+    writeLeafTranscript(firstSessionFile, [
+      { role: "user", content: "what model produced this response?" },
+      { role: "assistant", content: "openai-codex/gpt-5.5" },
+    ]);
+
+    const first = await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: firstSessionFile,
+    });
+    expect(first).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const originalConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(originalConversation).not.toBeNull();
+
+    rmSync(firstSessionFile, { force: true });
+
+    const newSessionFile = createSessionFilePath("assemble-missed-reset-fallback-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "new live prompt" },
+      { role: "assistant", content: "new assistant reply" },
+    ]);
+    const liveMessages = [makeMessage({ role: "user", content: "new live prompt" })];
+    const assembled = await engine.assemble({
+      sessionId: secondSessionId,
+      sessionKey,
+      messages: liveMessages,
+      tokenBudget: 4_096,
+    });
+
+    expect(assembled.messages).toEqual(liveMessages);
+    expect(
+      assembled.messages.some((message) => message.content === "openai-codex/gpt-5.5"),
+    ).toBe(false);
+
+    const activeConversationBeforeAfterTurn = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeConversationBeforeAfterTurn).toBeNull();
+
+    const archivedConversation = await engine.getConversationStore().getConversation(
+      originalConversation!.conversationId,
+    );
+    expect(archivedConversation?.active).toBe(false);
+    expect(archivedConversation?.archivedAt).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "new assistant reply" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const activeConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeConversation).not.toBeNull();
+    expect(activeConversation!.conversationId).not.toBe(originalConversation!.conversationId);
+    expect(activeConversation!.sessionId).toBe(secondSessionId);
+    expect(activeConversation!.active).toBe(true);
+
+    const storedActiveMessages = await engine.getConversationStore().getMessages(
+      activeConversation!.conversationId,
+    );
+    expect(storedActiveMessages.map((message) => message.content)).toEqual([
+      "new live prompt",
+      "new assistant reply",
     ]);
   });
 
@@ -8542,6 +8629,85 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(secondSlowPathWarns.length).toBe(0);
   });
 
+  it("afterTurn treats missing tracked transcripts as a cheap degraded path without full reread", async () => {
+    const warnLog = vi.fn();
+    const debugLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: debugLog },
+      },
+    );
+    const sessionId = "after-turn-missing-transcript-cheap-skip";
+    const sessionKey = "agent:main:test:missing-transcript-cheap-skip";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey,
+    });
+    const bulkMessages = await engine.getConversationStore().createMessagesBulk(
+      Array.from({ length: 120 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index,
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `persisted historical message ${index}`,
+        tokenCount: 5,
+        skipReplayTimestampFloodGuard: true,
+      })),
+    );
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(
+        conversation.conversationId,
+        bulkMessages.map((message) => message.messageId),
+      );
+    const missingSessionFile = createSessionFilePath("after-turn-missing-transcript-cheap-skip");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: missingSessionFile,
+      lastSeenSize: 24_000,
+      lastSeenMtimeMs: 1_700_000_000_000,
+      lastProcessedOffset: 24_000,
+      lastProcessedEntryHash: "checkpoint-hash",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: missingSessionFile,
+      messages: [
+        makeMessage({ role: "assistant", content: "persisted historical message 119" }),
+        makeMessage({ role: "user", content: "live user after missing transcript" }),
+        makeMessage({ role: "assistant", content: "live assistant after missing transcript" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
+    expect(stored.slice(-2).map((message) => message.content)).toEqual([
+      "live user after missing transcript",
+      "live assistant after missing transcript",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation.conversationId);
+    expect(checkpoint).toMatchObject({
+      sessionFilePath: missingSessionFile,
+      lastSeenSize: 24_000,
+      lastProcessedOffset: 24_000,
+      lastProcessedEntryHash: "checkpoint-hash",
+    });
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("session file missing; skipping transcript reconcile full reread")),
+    ).toBe(true);
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("transcript reconcile slow path (full re-read)")),
+    ).toBe(false);
+  });
+
   it("seeds placeholder bootstrap_state when afterTurn stat-fail fallback runs (#649 follow-up)", async () => {
     // #649 added a permissive stat-fail fallback in the slow path that
     // returns hasOverlap:true to allow live afterTurn ingest even when the
@@ -8840,6 +9006,160 @@ describe("LcmContextEngine fidelity and token budget", () => {
       .getConversationBootstrapState(conversation!.conversationId);
     expect(checkpoint?.sessionFilePath).toBe(newSessionFile);
     expect(checkpoint?.lastProcessedOffset).toBe(statSync(newSessionFile).size);
+  });
+
+  it("afterTurn archives a stale active conversation when the prior keyed transcript was pruned", async () => {
+    const engine = createEngine();
+    const firstSessionId = "after-turn-missed-reset-fallback-1";
+    const secondSessionId = "after-turn-missed-reset-fallback-2";
+    const sessionKey = "agent:main:test:after-turn-missed-reset-fallback";
+    const oldSessionFile = createSessionFilePath("after-turn-missed-reset-fallback-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old turn user" },
+      { role: "assistant", content: "openai-codex/gpt-5.5" },
+    ]);
+
+    const first = await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+    expect(first).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const originalConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(originalConversation).not.toBeNull();
+
+    rmSync(oldSessionFile, { force: true });
+
+    const newSessionFile = createSessionFilePath("after-turn-missed-reset-fallback-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "new turn user" },
+      { role: "assistant", content: "new turn assistant" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "new turn assistant" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const activeConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeConversation).not.toBeNull();
+    expect(activeConversation!.conversationId).not.toBe(originalConversation!.conversationId);
+    expect(activeConversation!.sessionId).toBe(secondSessionId);
+    expect(activeConversation!.active).toBe(true);
+
+    const archivedConversation = await engine.getConversationStore().getConversation(
+      originalConversation!.conversationId,
+    );
+    expect(archivedConversation?.active).toBe(false);
+    expect(archivedConversation?.archivedAt).not.toBeNull();
+
+    const activeMessages = await engine.getConversationStore().getMessages(
+      activeConversation!.conversationId,
+    );
+    expect(activeMessages.map((message) => message.content)).toEqual([
+      "new turn user",
+      "new turn assistant",
+    ]);
+  });
+
+  it("afterTurn skips assistant-only rollover when the replacement transcript is unreadable", async () => {
+    const engine = createEngine();
+    const firstSessionId = "after-turn-missed-reset-unreadable-1";
+    const secondSessionId = "after-turn-missed-reset-unreadable-2";
+    const sessionKey = "agent:main:test:after-turn-missed-reset-unreadable";
+    const oldSessionFile = createSessionFilePath("after-turn-missed-reset-unreadable-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old unreadable user" },
+      { role: "assistant", content: "old unreadable assistant" },
+    ]);
+
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+    const originalConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(originalConversation).not.toBeNull();
+
+    rmSync(oldSessionFile, { force: true });
+    const unreadableSessionFile = createSessionFilePath("after-turn-missed-reset-unreadable-new");
+    writeFileSync(unreadableSessionFile, '{"message":', "utf8");
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: unreadableSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "new unreadable assistant delta" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const archivedConversation = await engine.getConversationStore().getConversation(
+      originalConversation!.conversationId,
+    );
+    expect(archivedConversation?.active).toBe(false);
+    expect(archivedConversation?.archivedAt).not.toBeNull();
+
+    const activeConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeConversation).toBeNull();
+  });
+
+  it("afterTurn bounds initial transcript imports to the bootstrap budget", async () => {
+    const engine = createEngineWithConfig({ bootstrapMaxTokens: 120 });
+    const sessionId = "after-turn-initial-transcript-budget";
+    const sessionKey = "agent:main:test:after-turn-initial-transcript-budget";
+    const sessionFile = createSessionFilePath("after-turn-initial-transcript-budget");
+    const transcriptMessages = Array.from({ length: 60 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `initial afterTurn bulk transcript ${index} ${"x".repeat(200)}`,
+    })) as Array<{ role: AgentMessage["role"]; content: string }>;
+    writeLeafTranscript(sessionFile, transcriptMessages);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: transcriptMessages[transcriptMessages.length - 1]!.content,
+        }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.length).toBeGreaterThan(0);
+    expect(stored.length).toBeLessThan(10);
+    expect(stored.map((message) => message.content)).toContain(
+      transcriptMessages[transcriptMessages.length - 1]!.content,
+    );
   });
 
   it("afterTurn skips persistence when full reread finds no anchor and imports nothing", async () => {
@@ -10396,29 +10716,32 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
     const sessionId = "after-turn-heartbeat-prune";
     const sessionKey = "agent:main:test:after-turn-heartbeat-prune";
+    const heartbeatMessages = [
+      makeMessage({
+        role: "user",
+        content:
+          "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+      }),
+      makeMessage({
+        role: "tool",
+        content: "# HEARTBEAT.md\n\n## Worker heartbeat (minimal)",
+      }),
+      makeMessage({
+        role: "tool",
+        content: '{\n  "active_session_ids": []\n}',
+      }),
+      makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+    ];
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-prune");
+    writeLeafTranscriptMessages(sessionFile, heartbeatMessages);
 
     const evaluateLeafTriggerSpy = vi.spyOn(engine, "evaluateLeafTrigger");
     const compactSpy = vi.spyOn(engine, "compact");
     await engine.afterTurn({
       sessionId,
       sessionKey,
-      sessionFile: createSessionFilePath("after-turn-heartbeat-prune"),
-      messages: [
-        makeMessage({
-          role: "user",
-          content:
-            "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
-        }),
-        makeMessage({
-          role: "tool",
-          content: "# HEARTBEAT.md\n\n## Worker heartbeat (minimal)",
-        }),
-        makeMessage({
-          role: "tool",
-          content: '{\n  "active_session_ids": []\n}',
-        }),
-        makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
-      ],
+      sessionFile,
+      messages: heartbeatMessages,
       prePromptMessageCount: 0,
       tokenBudget: 4096,
     });
@@ -10435,6 +10758,33 @@ describe("LcmContextEngine fidelity and token budget", () => {
         `heartbeat ack messages for conversation=${conversation!.conversationId} session=${sessionId} sessionKey=${sessionKey}`,
       ),
     );
+  });
+
+  it("afterTurn heartbeat flag skips non-empty transcript imports", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-flag-transcript-skip";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-flag-transcript-skip";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-flag-transcript-skip");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "heartbeat transcript user" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).toBeNull();
   });
 });
 
@@ -10939,6 +11289,115 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
 });
 
 describe("LcmContextEngine compaction telemetry", () => {
+  it("does not feed engine-ingested reasoning parts into compaction summarizer input", async () => {
+    const privateReasoning = "PRIVATE_STORED_REASONING_TRACE";
+    let summarizerInput = "";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 0,
+        leafMinFanout: 2,
+        leafChunkTokens: 1_000,
+        incrementalMaxDepth: 0,
+      },
+      {
+        complete: vi.fn(async (request) => {
+          const message = request.messages?.[0];
+          summarizerInput =
+            message && typeof message === "object" && "content" in message
+              ? String((message as { content?: unknown }).content ?? "")
+              : "";
+          return { content: [{ type: "text", text: "Safe compacted summary." }] };
+        }),
+        resolveModel: vi.fn(() => ({ provider: "vllm", model: "qwen3.5-122b" })),
+      },
+    );
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "reasoning", summary: [{ text: privateReasoning }] },
+          { type: "text", text: "Visible assistant answer." },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({
+        role: "user",
+        content: `Follow-up ${"x".repeat(400)}`,
+      }),
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("reasoning-parts-compact"),
+      tokenBudget: 10_000,
+      force: true,
+      legacyParams: { provider: "vllm", model: "qwen3.5-122b" },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(summarizerInput).toContain("Visible assistant answer.");
+    expect(summarizerInput).not.toContain(privateReasoning);
+  });
+
+  it("does not feed redacted-thinking-only ingested parts into compaction summarizer input", async () => {
+    const privateReasoning = "PRIVATE_REDACTED_THINKING_ONLY_TRACE";
+    let summarizerInput = "";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 0,
+        leafMinFanout: 2,
+        leafChunkTokens: 1_000,
+        incrementalMaxDepth: 0,
+      },
+      {
+        complete: vi.fn(async (request) => {
+          const message = request.messages?.[0];
+          summarizerInput =
+            message && typeof message === "object" && "content" in message
+              ? String((message as { content?: unknown }).content ?? "")
+              : "";
+          return { content: [{ type: "text", text: "Safe compacted summary." }] };
+        }),
+        resolveModel: vi.fn(() => ({ provider: "vllm", model: "qwen3.5-122b" })),
+      },
+    );
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "redacted_thinking", text: privateReasoning },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({
+        role: "user",
+        content: `Follow-up ${"x".repeat(400)}`,
+      }),
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("redacted-thinking-only-compact"),
+      tokenBudget: 10_000,
+      force: true,
+      legacyParams: { provider: "vllm", model: "qwen3.5-122b" },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(summarizerInput).toContain("Follow-up");
+    expect(summarizerInput).not.toContain(privateReasoning);
+  });
+
   it("does not append synthetic system messages for compaction passes", async () => {
     const infoLog = vi.fn();
     const debugLog = vi.fn();

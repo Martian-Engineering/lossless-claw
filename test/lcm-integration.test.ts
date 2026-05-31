@@ -9,7 +9,8 @@ import type {
 import { ContextAssembler } from "../src/assembler.js";
 import { CompactionEngine, type CompactionConfig } from "../src/compaction.js";
 import { RetrievalEngine } from "../src/retrieval.js";
-import { LcmProviderAuthError } from "../src/summarize.js";
+import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "../src/summarize.js";
+import type { LcmDependencies } from "../src/types.js";
 
 // ── Mock Store Factories ─────────────────────────────────────────────────────
 
@@ -369,6 +370,7 @@ function createMockSummaryStore() {
         descendantCount?: number;
         descendantTokenCount?: number;
         sourceMessageTokenCount?: number;
+        model?: string;
       }): Promise<SummaryRecord> => {
         const summary: SummaryRecord = {
           summaryId: input.summaryId,
@@ -383,6 +385,7 @@ function createMockSummaryStore() {
           descendantCount: input.descendantCount ?? 0,
           descendantTokenCount: input.descendantTokenCount ?? 0,
           sourceMessageTokenCount: input.sourceMessageTokenCount ?? 0,
+          model: input.model ?? "",
           createdAt: new Date(),
         };
         summaries.push(summary);
@@ -690,6 +693,69 @@ const defaultCompactionConfig: CompactionConfig = {
   maxRounds: 10,
   summaryMaxOverageFactor: 3,
 };
+
+function makeSummarizeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
+  return {
+    config: {
+      enabled: true,
+      databasePath: ":memory:",
+      ignoreSessionPatterns: [],
+      statelessSessionPatterns: [],
+      skipStatelessSessions: true,
+      contextThreshold: 0.75,
+      freshTailCount: 8,
+      newSessionRetainDepth: 2,
+      leafMinFanout: 8,
+      condensedMinFanout: 4,
+      condensedMinFanoutHard: 2,
+      incrementalMaxDepth: 0,
+      leafChunkTokens: 20_000,
+      leafTargetTokens: 600,
+      condensedTargetTokens: 900,
+      maxExpandTokens: 120,
+      largeFileTokenThreshold: 25_000,
+      summaryProvider: "",
+      summaryModel: "",
+      largeFileSummaryProvider: "",
+      largeFileSummaryModel: "",
+      timezone: "UTC",
+      pruneHeartbeatOk: false,
+      transcriptGcEnabled: false,
+      proactiveThresholdCompactionMode: "deferred",
+      autoRotateSessionFiles: {
+        enabled: true,
+        createBackups: false,
+        sizeBytes: 2 * 1024 * 1024,
+        startup: "rotate",
+        runtime: "rotate",
+      },
+      summaryMaxOverageFactor: 3,
+    },
+    complete: vi.fn(async () => ({
+      content: [{ type: "text", text: "summary output" }],
+    })),
+    callGateway: vi.fn(async () => ({})),
+    resolveModel: vi.fn(() => ({
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+    })),
+    parseAgentSessionKey: vi.fn(() => null),
+    isSubagentSessionKey: vi.fn(() => false),
+    normalizeAgentId: vi.fn(() => "main"),
+    buildSubagentSystemPrompt: vi.fn(() => ""),
+    readLatestAssistantReply: vi.fn(() => undefined),
+    resolveAgentDir: vi.fn(() => "/tmp/openclaw-agent"),
+    resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
+    agentLaneSubagent: "subagent",
+    log: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    },
+    ...overrides,
+  } as LcmDependencies;
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Test Suite: Ingest -> Assemble
@@ -1356,6 +1422,10 @@ describe("LCM integration: compaction", () => {
       { type: "reasoning", text: "PRIVATE_REASONING_TEXT" },
       { type: "text", text: "Visible reply after reasoning text." },
     ]);
+    const redactedThinkingTextContent = JSON.stringify([
+      { type: "redacted_thinking", text: "PRIVATE_REDACTED_THINKING_TEXT" },
+      { type: "text", text: "Visible reply after redacted thinking text." },
+    ]);
     const thinkingSummaryContent = JSON.stringify([
       { type: "thinking", summary: "PRIVATE_THINKING_SUMMARY" },
       { type: "text", text: "Visible reply after thinking summary." },
@@ -1379,6 +1449,11 @@ describe("LCM integration: compaction", () => {
     });
     await ingestMessages(convStore, sumStore, 1, {
       contentFn: () => reasoningTextContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => redactedThinkingTextContent,
       roleFn: () => "assistant",
       tokenCountFn: (_i, c) => estimateTokens(c),
     });
@@ -1415,15 +1490,130 @@ describe("LCM integration: compaction", () => {
     expect(capturedSourceText).not.toContain("ANOTHER_ENCRYPTED");
     expect(capturedSourceText).not.toContain('"type":"thinking"');
     expect(capturedSourceText).not.toContain("PRIVATE_REASONING_TEXT");
+    expect(capturedSourceText).not.toContain("PRIVATE_REDACTED_THINKING_TEXT");
     expect(capturedSourceText).not.toContain("PRIVATE_THINKING_SUMMARY");
 
     // The visible text from the mixed-content message must still be present
     expect(capturedSourceText).toContain("Visible assistant reply.");
     expect(capturedSourceText).toContain("Visible reply after reasoning text.");
+    expect(capturedSourceText).toContain("Visible reply after redacted thinking text.");
     expect(capturedSourceText).toContain("Visible reply after thinking summary.");
 
     // The plain user message must still be present
     expect(capturedSourceText).toContain("A plain user message.");
+  });
+
+  it("leaf compaction strips redacted_thinking blocks from structured message parts", async () => {
+    const structuredPartEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafChunkTokens: 1_000,
+    });
+    await convStore.createConversation({ sessionId: "redacted-thinking-session" });
+
+    const assistant = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 1,
+      role: "assistant",
+      content: "",
+      tokenCount: 120,
+    });
+    await convStore.createMessageParts(assistant.messageId, [
+      {
+        sessionId: "redacted-thinking-session",
+        partType: "reasoning",
+        ordinal: 0,
+        textContent: JSON.stringify({
+          type: "redacted_thinking",
+          text: "PRIVATE_PART_REDACTED_THINKING",
+          summary: [{ text: "PRIVATE_PART_SUMMARY" }],
+        }),
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "redacted_thinking",
+        }),
+      },
+      {
+        sessionId: "redacted-thinking-session",
+        partType: "text",
+        ordinal: 1,
+        textContent: "Visible answer after redacted thinking.",
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          rawType: "text",
+        }),
+      },
+    ]);
+    await sumStore.appendContextMessage(CONV_ID, assistant.messageId);
+
+    let capturedSourceText = "";
+    const summarize = vi.fn(async (text: string) => {
+      capturedSourceText = text;
+      return "Structured redacted thinking summary.";
+    });
+
+    const result = await structuredPartEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(capturedSourceText).toContain("Visible answer after redacted thinking.");
+    expect(capturedSourceText).not.toContain("PRIVATE_PART_REDACTED_THINKING");
+    expect(capturedSourceText).not.toContain("PRIVATE_PART_SUMMARY");
+  });
+
+  it("persists vLLM message content rather than reasoning as a leaf summary", async () => {
+    const qwenCompactionEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafMinFanout: 2,
+      leafChunkTokens: 1_000,
+    });
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Conversation turn ${i}: weather and follow-up details ${"x".repeat(200)}`,
+      roleFn: (i) => (i % 2 === 0 ? "user" : "assistant"),
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+
+    const summarizeResult = await createLcmSummarizeFromLegacyParams({
+      deps: makeSummarizeDeps({
+        resolveModel: vi.fn(() => ({ provider: "vllm", model: "qwen3.5-122b" })),
+        complete: vi.fn(async () => ({
+          content: [],
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: "User asked for weather; assistant answered sunny and 25C.",
+                reasoning: "Thinking Process: PRIVATE_QWEN_REASONING",
+                reasoning_content: "PRIVATE_QWEN_REASONING_CONTENT",
+              },
+            },
+          ],
+        })),
+      }),
+      legacyParams: { provider: "vllm", model: "qwen3.5-122b" },
+    });
+
+    expect(summarizeResult).toBeDefined();
+
+    await qwenCompactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize: summarizeResult!.fn,
+      summaryModel: "qwen3.5-122b",
+      force: true,
+    });
+
+    const leaf = sumStore._summaries.find((summary) => summary.kind === "leaf");
+    expect(leaf?.content).toBe("User asked for weather; assistant answered sunny and 25C.");
+    expect(leaf?.content).not.toContain("Thinking Process");
+    expect(leaf?.content).not.toContain("PRIVATE_QWEN_REASONING");
+    expect(leaf?.content).not.toContain("PRIVATE_QWEN_REASONING_CONTENT");
+    expect(leaf?.model).toBe("qwen3.5-122b");
   });
 
   it("leaf compaction summarizes structured message parts when stored content is empty", async () => {
