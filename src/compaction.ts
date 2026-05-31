@@ -22,6 +22,10 @@ export interface CompactionDecision {
   storedTokens: number;
   /** Runtime-observed prompt tokens, when supplied by the host. */
   observedTokens?: number;
+  /** Raw message tokens outside the protected fresh tail, when live prompt pressure is known. */
+  rawTokensOutsideTail?: number;
+  /** Projected prompt pressure after adding unsummarized raw backlog to observed tokens. */
+  projectedTokens?: number;
   currentTokens: number;
   threshold: number;
 }
@@ -573,7 +577,11 @@ export class CompactionEngine {
       observedTokenCount > 0
         ? Math.floor(observedTokenCount)
         : 0;
-    const currentTokens = Math.max(storedTokens, liveTokens);
+    const rawTokensOutsideTail =
+      liveTokens > 0 ? await this.countRawTokensOutsideFreshTail(conversationId) : undefined;
+    const projectedTokens =
+      liveTokens > 0 ? liveTokens + (rawTokensOutsideTail ?? 0) : undefined;
+    const currentTokens = Math.max(storedTokens, projectedTokens ?? liveTokens);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
 
     if (currentTokens > threshold) {
@@ -582,6 +590,8 @@ export class CompactionEngine {
         reason: "threshold",
         storedTokens,
         ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
+        ...(rawTokensOutsideTail !== undefined ? { rawTokensOutsideTail } : {}),
+        ...(projectedTokens !== undefined ? { projectedTokens } : {}),
         currentTokens,
         threshold,
       };
@@ -592,6 +602,8 @@ export class CompactionEngine {
       reason: "none",
       storedTokens,
       ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
+      ...(rawTokensOutsideTail !== undefined ? { rawTokensOutsideTail } : {}),
+      ...(projectedTokens !== undefined ? { projectedTokens } : {}),
       currentTokens,
       threshold,
     };

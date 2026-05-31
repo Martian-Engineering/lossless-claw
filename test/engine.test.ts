@@ -250,6 +250,29 @@ function makeMessage(params: { role?: string; content: unknown }): AgentMessage 
   } as AgentMessage;
 }
 
+async function seedBacklogContext(
+  engine: LcmContextEngine,
+  sessionId: string,
+  tokenCounts: number[],
+): Promise<void> {
+  const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+    sessionKey: undefined,
+  });
+  const messages = await engine.getConversationStore().createMessagesBulk(
+    tokenCounts.map((tokenCount, index) => ({
+      conversationId: conversation.conversationId,
+      seq: index,
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `backlog turn ${index}`,
+      tokenCount,
+      skipReplayTimestampFloodGuard: true,
+    })),
+  );
+  await engine
+    .getSummaryStore()
+    .appendContextMessages(conversation.conversationId, messages.map((message) => message.messageId));
+}
+
 function readSessionMessages(sessionFile: string): AgentMessage[] {
   return SessionManager.open(sessionFile)
     .getBranch()
@@ -7645,6 +7668,105 @@ describe("LcmContextEngine fidelity and token budget", () => {
     );
   });
 
+  it("afterTurn runs inline threshold compaction when projected raw backlog crosses threshold", async () => {
+    const engine = createEngineWithConfig({
+      proactiveThresholdCompactionMode: "inline",
+      freshTailCount: 1,
+    });
+    const sessionId = "after-turn-inline-projected-raw-backlog-threshold";
+    await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-inline-projected-raw-backlog-threshold"),
+      messages: [makeMessage({ role: "assistant", content: "fresh projected turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 600,
+      runtimeContext: { currentTokenCount: 300 },
+    });
+
+    expect(compactSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        tokenBudget: 600,
+        currentTokenCount: 300,
+        compactionTarget: "threshold",
+      }),
+    );
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    await expect(
+      engine.getSummaryStore().getContextTokenCount(conversation!.conversationId),
+    ).resolves.toBeLessThan(450);
+  });
+
+  it("afterTurn records deferred threshold debt when projected raw backlog crosses threshold", async () => {
+    const debugLog = vi.fn();
+    const engine = createEngineWithDeps(
+      { freshTailCount: 1 },
+      {
+        log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: debugLog },
+      },
+    );
+    const sessionId = "after-turn-deferred-projected-raw-backlog-threshold";
+    const privateEngine = engine as unknown as {
+      scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+    };
+    await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+    const scheduleSpy = vi
+      .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+      .mockImplementation(() => undefined);
+    const compactSpy = vi.spyOn(engine, "compact");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-deferred-projected-raw-backlog-threshold"),
+      messages: [makeMessage({ role: "assistant", content: "fresh projected turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 600,
+      runtimeContext: { currentTokenCount: 300 },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(compactSpy).not.toHaveBeenCalled();
+    expect(scheduleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        tokenBudget: 600,
+        currentTokenCount: 300,
+        reason: "threshold",
+      }),
+    );
+    expect(maintenance).toMatchObject({
+      pending: true,
+      running: false,
+      reason: "threshold",
+      tokenBudget: 600,
+      currentTokenCount: 300,
+      projectedTokenCount: expect.any(Number),
+      rawTokensOutsideTail: expect.any(Number),
+    });
+    await expect(
+      engine.getSummaryStore().getContextTokenCount(conversation!.conversationId),
+    ).resolves.toBeLessThan(450);
+    const deferredDebtLog = debugLog.mock.calls
+      .map((call) => String(call[0]))
+      .find((message) => message.includes("deferred compaction debt recorded"));
+    expect(deferredDebtLog).toContain("projectedTokenCount=");
+    expect(deferredDebtLog).not.toContain("projectedTokenCount=null");
+    expect(deferredDebtLog).toContain("rawTokensOutsideTail=");
+    expect(deferredDebtLog).not.toContain("rawTokensOutsideTail=null");
+  });
+
   it("afterTurn ignores raw leaf pressure below the context threshold", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-below-threshold-ignores-leaf-pressure";
@@ -9899,6 +10021,55 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(assembleResult.messages).toHaveLength(1);
   });
 
+  it("assemble() uses projected deferred pressure for emergency drain without passing it as observed tokens", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-threshold-debt-projected-over-budget-drains";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 300,
+      projectedTokenCount: 5_000,
+      rawTokensOutsideTail: 4_700,
+    });
+    const executeCompactionCoreSpy = vi.spyOn(
+      privateEngine,
+      "executeCompactionCore",
+    ).mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "hello" })],
+      tokenBudget: 4_096,
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: conversation.conversationId,
+        sessionId,
+        tokenBudget: 4_096,
+        currentTokenCount: 300,
+        compactionTarget: "threshold",
+      }),
+    );
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+    expect(assembleResult.messages).toHaveLength(1);
+  });
+
   it("assemble() does not wait for the session queue when deferred threshold debt is not urgent", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
@@ -11428,6 +11599,90 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
         projectedTokensAfter: 8_200,
       }),
     );
+  });
+
+  it("forces threshold sweeps to account for projected raw backlog pressure", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: infoLog, warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      storedTokens: 300,
+      observedTokens: 300,
+      rawTokensOutsideTail: 200,
+      projectedTokens: 500,
+      currentTokens: 500,
+      threshold: 450,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 300,
+        tokensAfter: 240,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "threshold-projected-raw-backlog-session",
+      message: { role: "user", content: "trigger projected threshold compact" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "threshold-projected-raw-backlog-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 600,
+      currentTokenCount: 300,
+      compactionTarget: "threshold",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 600,
+        summarize: expect.any(Function),
+        force: true,
+        hardTrigger: false,
+      }),
+    );
+    expect(result.result?.tokensBefore).toBe(500);
+    expect(result.result?.details).toEqual(
+      expect.objectContaining({
+        targetTokens: 450,
+        observedOverheadTokens: 0,
+        projectedTokensBefore: 500,
+        projectedTokensAfter: 240,
+        rawTokensOutsideTail: 200,
+      }),
+    );
+    expect(
+      infoLog.mock.calls
+        .map((call) => String(call[0]))
+        .some(
+          (message) =>
+            message.includes("projectedTokens=500") &&
+            message.includes("rawTokensOutsideTail=200") &&
+            message.includes("thresholdPressureTokens=500"),
+        ),
+    ).toBe(true);
   });
 
   it("does not clear threshold pressure when persisted tokens are under target but runtime tokens remain over", async () => {

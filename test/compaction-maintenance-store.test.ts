@@ -62,4 +62,34 @@ describe("CompactionMaintenanceStore", () => {
     expect(record?.pending).toBe(false);
     expect(record?.running).toBe(false);
   });
+
+  it("persists projected token diagnostics for deferred threshold debt", async () => {
+    const db = createTestDb();
+    const { fts5Available } = getLcmDbFeatures(db);
+    const conversationStore = new ConversationStore(db, { fts5Available });
+    const conversation = await conversationStore.createConversation({
+      sessionId: "maintenance-store-projected-session",
+      sessionKey: "agent:main:maintenance-store:2",
+    });
+    const store = new CompactionMaintenanceStore(db);
+
+    await store.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 600,
+      currentTokenCount: 300,
+      projectedTokenCount: 620,
+      rawTokensOutsideTail: 320,
+    });
+
+    const record = await store.getConversationCompactionMaintenance(conversation.conversationId);
+    expect(record).toMatchObject({
+      pending: true,
+      reason: "threshold",
+      tokenBudget: 600,
+      currentTokenCount: 300,
+      projectedTokenCount: 620,
+      rawTokensOutsideTail: 320,
+    });
+  });
 });

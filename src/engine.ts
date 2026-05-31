@@ -3366,15 +3366,19 @@ export class LcmContextEngine implements ContextEngine {
     reason: string;
     tokenBudget: number;
     currentTokenCount?: number;
+    projectedTokenCount?: number;
+    rawTokensOutsideTail?: number;
   }): Promise<void> {
     await this.compactionMaintenanceStore.requestProactiveCompactionDebt({
       conversationId: params.conversationId,
       reason: params.reason,
       tokenBudget: params.tokenBudget,
       currentTokenCount: params.currentTokenCount ?? null,
+      projectedTokenCount: params.projectedTokenCount ?? null,
+      rawTokensOutsideTail: params.rawTokensOutsideTail ?? null,
     });
     this.deps.log.debug(
-      `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"}`,
+      `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"} projectedTokenCount=${params.projectedTokenCount ?? "null"} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"}`,
     );
   }
 
@@ -3504,6 +3508,9 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedCurrentTokenCount = this.normalizeObservedTokenCount(
         params.currentTokenCount ?? maintenance.currentTokenCount ?? undefined,
       );
+      const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
+        maintenance.projectedTokenCount ?? undefined,
+      );
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
@@ -3553,7 +3560,7 @@ export class LcmContextEngine implements ContextEngine {
         keepPending: !result.ok,
       });
       this.deps.log.debug(
-        `[lcm] maintain: deferred compaction ${result.compacted ? "completed" : "skipped"} conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} ok=${result.ok} reason=${result.reason ?? "none"}`,
+        `[lcm] maintain: deferred compaction ${result.compacted ? "completed" : "skipped"} conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} ok=${result.ok} reason=${result.reason ?? "none"} currentTokenCount=${resolvedCurrentTokenCount ?? "null"} projectedTokenCount=${resolvedProjectedTokenCount ?? "null"} rawTokensOutsideTail=${maintenance.rawTokensOutsideTail ?? "null"}`,
       );
       return {
         changed: result.compacted,
@@ -3705,29 +3712,56 @@ export class LcmContextEngine implements ContextEngine {
         : await this.compaction.evaluate(conversationId, tokenBudget);
     const targetTokens =
       params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
-    const liveContextStillExceedsTarget =
-      observedTokens !== undefined && observedTokens >= targetTokens;
     // Codex can report a live prompt count that includes runtime framing,
-    // tool schemas, and other overhead not present in Lossless's stored count.
-    // If that live count crosses the threshold, compact stored context far
-    // enough that stored tokens plus the observed overhead should fit.
+    // tool schemas, and other overhead not present in Lossless's compactable
+    // stored count. Raw backlog is different: it can force a sweep, but once
+    // swept it should not be carried forward as permanent runtime overhead.
     const decisionStoredTokens =
       typeof decision.storedTokens === "number"
       && Number.isFinite(decision.storedTokens)
       && decision.storedTokens >= 0
         ? Math.floor(decision.storedTokens)
         : decision.currentTokens;
+    const decisionProjectedTokens =
+      typeof decision.projectedTokens === "number" &&
+      Number.isFinite(decision.projectedTokens) &&
+      decision.projectedTokens >= 0
+        ? Math.floor(decision.projectedTokens)
+        : undefined;
+    const decisionRawTokensOutsideTail =
+      typeof decision.rawTokensOutsideTail === "number" &&
+      Number.isFinite(decision.rawTokensOutsideTail) &&
+      decision.rawTokensOutsideTail >= 0
+        ? Math.floor(decision.rawTokensOutsideTail)
+        : undefined;
     const observedRuntimeOverhead =
       params.compactionTarget === "threshold" && observedTokens !== undefined
         ? Math.max(0, observedTokens - decisionStoredTokens)
         : 0;
     const runtimeAdjustedSweepTargetTokens =
-      observedRuntimeOverhead > 0 && observedTokens !== undefined && observedTokens > targetTokens
+      observedRuntimeOverhead > 0 &&
+      observedTokens !== undefined &&
+      observedTokens > targetTokens
         ? Math.max(1, targetTokens - observedRuntimeOverhead)
         : undefined;
+    const projectedRawBacklogPressure =
+      params.compactionTarget === "threshold" &&
+      decisionProjectedTokens !== undefined &&
+      decisionProjectedTokens > targetTokens &&
+      (decisionRawTokensOutsideTail ?? 0) > 0;
+    const thresholdPressureTokens =
+      params.compactionTarget === "threshold"
+        ? Math.max(
+            decision.currentTokens,
+            observedTokens ?? 0,
+            decisionProjectedTokens ?? 0,
+          )
+        : observedTokens;
+    const liveContextStillExceedsTarget =
+      thresholdPressureTokens !== undefined && thresholdPressureTokens >= targetTokens;
 
     this.deps.log.info(
-      `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} shouldCompact=${decision.shouldCompact}`,
+      `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} projectedTokens=${decisionProjectedTokens ?? "none"} rawTokensOutsideTail=${decisionRawTokensOutsideTail ?? "none"} thresholdPressureTokens=${thresholdPressureTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} shouldCompact=${decision.shouldCompact}`,
     );
 
     if (!forceCompaction && !decision.shouldCompact) {
@@ -3748,11 +3782,15 @@ export class LcmContextEngine implements ContextEngine {
     // overflow counts can drive recovery even when persisted context is already small.
     const useSweep = manualCompactionRequested || params.compactionTarget === "threshold";
     if (useSweep) {
+      const forceThresholdSweep =
+        forceCompaction ||
+        runtimeAdjustedSweepTargetTokens !== undefined ||
+        projectedRawBacklogPressure;
       const sweepResult = await this.compaction.compact({
         conversationId,
         tokenBudget,
         summarize,
-        force: forceCompaction || runtimeAdjustedSweepTargetTokens !== undefined,
+        force: forceThresholdSweep,
         hardTrigger: false,
         summaryModel,
         ...(runtimeAdjustedSweepTargetTokens !== undefined
@@ -3773,7 +3811,8 @@ export class LcmContextEngine implements ContextEngine {
           ? sweepResult.tokensAfter
           : undefined;
       const projectedTokensAfterSweep =
-        sweepTokensAfter !== undefined && runtimeAdjustedSweepTargetTokens !== undefined
+        sweepTokensAfter !== undefined &&
+        (runtimeAdjustedSweepTargetTokens !== undefined || projectedRawBacklogPressure)
           ? sweepTokensAfter + observedRuntimeOverhead
           : sweepTokensAfter;
       const isThresholdSweep = params.compactionTarget === "threshold";
@@ -3815,10 +3854,16 @@ export class LcmContextEngine implements ContextEngine {
           details: {
             rounds: sweepResult.actionTaken ? 1 : 0,
             targetTokens: runtimeAdjustedSweepTargetTokens ?? targetTokens,
-            ...(runtimeAdjustedSweepTargetTokens !== undefined
+            ...(runtimeAdjustedSweepTargetTokens !== undefined || projectedRawBacklogPressure
               ? {
                   observedOverheadTokens: observedRuntimeOverhead,
                   projectedTokensAfter: projectedTokensAfterSweep,
+                  ...(decisionProjectedTokens !== undefined
+                    ? { projectedTokensBefore: decisionProjectedTokens }
+                    : {}),
+                  ...(decisionRawTokensOutsideTail !== undefined
+                    ? { rawTokensOutsideTail: decisionRawTokensOutsideTail }
+                    : {}),
                 }
               : {}),
           },
@@ -7127,13 +7172,18 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
     };
-    const recordAfterTurnCompactionRetry = async (reason: string): Promise<void> => {
+    const recordAfterTurnCompactionRetry = async (
+      reason: string,
+      diagnostics?: { projectedTokenCount?: number; rawTokensOutsideTail?: number },
+    ): Promise<void> => {
       try {
         await this.recordDeferredCompactionDebt({
           conversationId: conversation.conversationId,
           reason,
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
+          projectedTokenCount: diagnostics?.projectedTokenCount,
+          rawTokensOutsideTail: diagnostics?.rawTokensOutsideTail,
         });
       } catch (err) {
         this.deps.log.warn(
@@ -7170,6 +7220,10 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget,
         observedCurrentTokenCount,
       );
+      const thresholdDiagnostics = {
+        projectedTokenCount: thresholdDecision.projectedTokens,
+        rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
+      };
       if (this.config.proactiveThresholdCompactionMode === "inline") {
         if (thresholdDecision.shouldCompact) {
           const compactResult = await this.compact({
@@ -7183,7 +7237,7 @@ export class LcmContextEngine implements ContextEngine {
           });
           if (!compactResult.ok) {
             shouldRefreshBootstrapState = false;
-            await recordAfterTurnCompactionRetry("threshold");
+            await recordAfterTurnCompactionRetry("threshold", thresholdDiagnostics);
           }
         }
       } else if (thresholdDecision.shouldCompact) {
@@ -7192,6 +7246,8 @@ export class LcmContextEngine implements ContextEngine {
           reason: "threshold",
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
+          projectedTokenCount: thresholdDecision.projectedTokens,
+          rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
         });
         deferredCompactionDrain = {
           tokenBudget,
@@ -7281,13 +7337,20 @@ export class LcmContextEngine implements ContextEngine {
         const recordedContextTokens = this.normalizeObservedTokenCount(
           maintenance.currentTokenCount ?? undefined,
         );
-        const emergencyContextTokens = Math.max(
+        const recordedProjectedTokens = this.normalizeObservedTokenCount(
+          maintenance.projectedTokenCount ?? undefined,
+        );
+        const observedEmergencyContextTokens = Math.max(
           liveContextTokens,
           recordedContextTokens ?? 0,
         );
+        const emergencyContextTokens = Math.max(
+          observedEmergencyContextTokens,
+          recordedProjectedTokens ?? 0,
+        );
         if (emergencyContextTokens > tokenBudget) {
           this.deps.log.warn(
-            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${emergencyContextTokens} tokenBudget=${tokenBudget} reason=over-budget`,
+            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${observedEmergencyContextTokens} projectedTokenCount=${recordedProjectedTokens ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
           );
           try {
             await this.maybeConsumeDeferredCompactionDebtForAssemble({
@@ -7295,7 +7358,7 @@ export class LcmContextEngine implements ContextEngine {
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
               tokenBudget,
-              currentTokenCount: emergencyContextTokens,
+              currentTokenCount: observedEmergencyContextTokens,
             });
           } catch (error) {
             this.deps.log.warn(
@@ -7304,7 +7367,7 @@ export class LcmContextEngine implements ContextEngine {
           }
         } else {
           this.deps.log.debug(
-            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${emergencyContextTokens} tokenBudget=${tokenBudget} reason=not-over-budget`,
+            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${observedEmergencyContextTokens} projectedTokenCount=${recordedProjectedTokens ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
           );
         }
       }

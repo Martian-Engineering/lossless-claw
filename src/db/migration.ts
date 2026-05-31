@@ -168,6 +168,25 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   }
 }
 
+function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
+  const maintenanceColumns = db
+    .prepare(`PRAGMA table_info(conversation_compaction_maintenance)`)
+    .all() as SummaryColumnInfo[];
+  const hasProjectedTokenCount = maintenanceColumns.some(
+    (col) => col.name === "projected_token_count",
+  );
+  const hasRawTokensOutsideTail = maintenanceColumns.some(
+    (col) => col.name === "raw_tokens_outside_tail",
+  );
+
+  if (!hasProjectedTokenCount) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN projected_token_count INTEGER`);
+  }
+  if (!hasRawTokensOutsideTail) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN raw_tokens_outside_tail INTEGER`);
+  }
+}
+
 function ensureFocusBriefTables(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS focus_briefs (
@@ -1040,6 +1059,8 @@ export function runLcmMigrations(
       last_failure_summary TEXT,
       token_budget INTEGER,
       current_token_count INTEGER,
+      projected_token_count INTEGER,
+      raw_tokens_outside_tail INTEGER,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -1167,6 +1188,9 @@ export function runLcmMigrations(
     );
     runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
       ensureCompactionTelemetryColumns(db),
+    );
+    runMigrationStep("ensureCompactionMaintenanceColumns", log, () =>
+      ensureCompactionMaintenanceColumns(db),
     );
     runMigrationStep("ensureFocusBriefTables", log, () => ensureFocusBriefTables(db));
     runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));

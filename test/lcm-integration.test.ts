@@ -3004,6 +3004,75 @@ describe("LCM integration: compaction", () => {
     expect(decision.threshold).toBe(450);
   });
 
+  it("evaluate compacts when observed tokens plus raw backlog exceed the threshold", async () => {
+    const backlogEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 1,
+    });
+    await ingestMessages(convStore, sumStore, 3, {
+      contentFn: (i) => `Backlog ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    const decision = await backlogEngine.evaluate(CONV_ID, 600, 300);
+    expect(decision).toMatchObject({
+      shouldCompact: true,
+      reason: "threshold",
+      storedTokens: 300,
+      observedTokens: 300,
+      rawTokensOutsideTail: 200,
+      projectedTokens: 500,
+      currentTokens: 500,
+      threshold: 450,
+    });
+  });
+
+  it("evaluate stays below threshold when projected raw backlog still fits", async () => {
+    const backlogEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 1,
+    });
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => `Small backlog ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    const decision = await backlogEngine.evaluate(CONV_ID, 600, 250);
+    expect(decision).toMatchObject({
+      shouldCompact: false,
+      reason: "none",
+      storedTokens: 200,
+      observedTokens: 250,
+      rawTokensOutsideTail: 100,
+      projectedTokens: 350,
+      currentTokens: 350,
+      threshold: 450,
+    });
+  });
+
+  it("evaluate does not count fresh-tail raw messages as backlog pressure", async () => {
+    const freshTailEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 3,
+    });
+    await ingestMessages(convStore, sumStore, 3, {
+      contentFn: (i) => `Fresh tail ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    const decision = await freshTailEngine.evaluate(CONV_ID, 600, 300);
+    expect(decision).toMatchObject({
+      shouldCompact: false,
+      reason: "none",
+      storedTokens: 300,
+      observedTokens: 300,
+      rawTokensOutsideTail: 0,
+      projectedTokens: 300,
+      currentTokens: 300,
+      threshold: 450,
+    });
+  });
+
   it("compactUntilUnder uses currentTokens when stored tokens are stale", async () => {
     await ingestMessages(convStore, sumStore, 10, {
       contentFn: (i) => `Turn ${i}: ${"x".repeat(200)}`,
