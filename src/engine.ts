@@ -114,6 +114,8 @@ type BootstrapImportObservation = {
 
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
+const AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON =
+  "ambiguous session-key runtime rollover";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
 type CircuitBreakerState = {
@@ -3288,9 +3290,20 @@ function appendForkBoundedLiveSuffixWithinBudget(params: {
 
 type TranscriptReconcileResult = {
   blockedByImportCap: boolean;
-  blockedReason?: "import-cap" | "cross-conversation-raw-id" | "duplicate-transcript-replay";
+  blockedReason?:
+    | "import-cap"
+    | "cross-conversation-raw-id"
+    | "duplicate-transcript-replay"
+    | "ambiguous-session-key-runtime-rollover";
   importedMessages: number;
   hasOverlap: boolean;
+};
+
+type AmbiguousSessionKeyRuntimeRollover = {
+  conversationId: number;
+  activeSessionId: string;
+  sessionKey: string;
+  trackedSessionFile: string;
 };
 
 export class LcmContextEngine implements ContextEngine {
@@ -6677,6 +6690,41 @@ export class LcmContextEngine implements ContextEngine {
         // processed, otherwise future afterTurns will skip reconciliation
         // and we lose messages.
         const historicalMessages = await readLeafPathMessages(params.sessionFile);
+        if (reason === "path-mismatch") {
+          const ambiguousRollover =
+            await this.findAmbiguousSessionKeyRuntimeRollover({
+              phase: "afterTurn",
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              sessionFile: params.sessionFile,
+            });
+          if (ambiguousRollover) {
+            const activeBootstrapState =
+              await this.summaryStore.getConversationBootstrapState(
+                ambiguousRollover.conversationId,
+              );
+            const hasFrontierAnchor =
+              await this.transcriptContainsCurrentConversationTailAnchor({
+                conversationId: ambiguousRollover.conversationId,
+                historicalMessages,
+                checkpointEntryHash: activeBootstrapState?.lastProcessedEntryHash,
+              });
+            if (!hasFrontierAnchor) {
+              this.logAmbiguousSessionKeyRuntimeRollover({
+                phase: "afterTurn",
+                rollover: ambiguousRollover,
+                sessionId: params.sessionId,
+                sessionFile: params.sessionFile,
+              });
+              return {
+                importedMessages: 0,
+                blockedByImportCap: false,
+                blockedReason: "ambiguous-session-key-runtime-rollover",
+                hasOverlap: false,
+              };
+            }
+          }
+        }
         if (historicalMessages.length === 0) {
           if (!sessionFileState) {
             // #649 added this permissive stat-fail fallback expecting the
@@ -6919,6 +6967,111 @@ export class LcmContextEngine implements ContextEngine {
     return true;
   }
 
+  private async findAmbiguousSessionKeyRuntimeRollover(params: {
+    phase: "bootstrap" | "assemble" | "afterTurn";
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile?: string;
+  }): Promise<AmbiguousSessionKeyRuntimeRollover | null> {
+    const normalizedSessionKey = params.sessionKey?.trim();
+    if (!normalizedSessionKey) {
+      return null;
+    }
+
+    const activeByKey = await this.conversationStore.getConversationBySessionKey(
+      normalizedSessionKey,
+    );
+    if (!activeByKey || activeByKey.sessionId === params.sessionId) {
+      return null;
+    }
+
+    const activeBootstrapState = await this.summaryStore.getConversationBootstrapState(
+      activeByKey.conversationId,
+    );
+    const trackedSessionFile = activeBootstrapState?.sessionFilePath;
+    if (typeof trackedSessionFile !== "string" || trackedSessionFile.length === 0) {
+      return null;
+    }
+
+    if (params.sessionFile !== undefined && trackedSessionFile === params.sessionFile) {
+      return null;
+    }
+
+    try {
+      await stat(trackedSessionFile);
+    } catch (err) {
+      if (!isMissingFileError(err)) {
+        this.deps.log.warn(
+          `[lcm] ${params.phase}: could not verify tracked transcript path for ambiguous runtime rollover guard conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
+        );
+      }
+      return null;
+    }
+
+    return {
+      conversationId: activeByKey.conversationId,
+      activeSessionId: activeByKey.sessionId,
+      sessionKey: normalizedSessionKey,
+      trackedSessionFile,
+    };
+  }
+
+  private logAmbiguousSessionKeyRuntimeRollover(params: {
+    phase: "bootstrap" | "assemble" | "afterTurn";
+    rollover: AmbiguousSessionKeyRuntimeRollover;
+    sessionId: string;
+    sessionFile?: string;
+  }): void {
+    this.deps.log.warn(
+      `[lcm] ${params.phase}: ${AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON}; preserving conversation=${params.rollover.conversationId} session=${params.sessionId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} oldFile=${params.rollover.trackedSessionFile}${params.sessionFile ? ` newFile=${params.sessionFile}` : ""}`,
+    );
+  }
+
+  private async transcriptContainsCurrentConversationTailAnchor(params: {
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+    checkpointEntryHash?: string | null;
+  }): Promise<boolean> {
+    if (params.historicalMessages.length === 0) {
+      return false;
+    }
+
+    const persistedMessages = await this.conversationStore.getMessages(params.conversationId);
+    if (persistedMessages.length < 2 || !params.checkpointEntryHash) {
+      return false;
+    }
+
+    const storedHistoricalMessages = params.historicalMessages.map((message) =>
+      toStoredMessage(message),
+    );
+    const tailLength = Math.min(3, persistedMessages.length);
+    const persistedTail = persistedMessages.slice(-tailLength);
+    for (let index = tailLength - 1; index < storedHistoricalMessages.length; index += 1) {
+      if (
+        createBootstrapEntryHash(storedHistoricalMessages[index]!) !==
+        params.checkpointEntryHash
+      ) {
+        continue;
+      }
+      const historicalTail = storedHistoricalMessages.slice(index - tailLength + 1, index + 1);
+      // A single common tail like "Done" is not enough to bind a new runtime to
+      // an existing keyed conversation. Require a contiguous persisted suffix.
+      const tailsMatch = persistedTail.every((persistedMessage, tailIndex) => {
+        const historical = historicalTail[tailIndex];
+        return (
+          historical !== undefined &&
+          messageIdentity(persistedMessage.role, persistedMessage.content) ===
+            messageIdentity(historical.role, historical.content)
+        );
+      });
+      if (tailsMatch) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   async bootstrap(params: {
     sessionId: string;
     sessionFile: string;
@@ -6979,6 +7132,7 @@ export class LcmContextEngine implements ContextEngine {
               mtimeMs: sessionFileMtimeMs,
             });
           };
+          let preloadedHistoricalMessages: AgentMessage[] | undefined;
 
           await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
             phase: "bootstrap",
@@ -6986,6 +7140,39 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             sessionFile: params.sessionFile,
           });
+          const ambiguousRollover =
+            await this.findAmbiguousSessionKeyRuntimeRollover({
+              phase: "bootstrap",
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              sessionFile: params.sessionFile,
+            });
+          if (ambiguousRollover) {
+            preloadedHistoricalMessages = await readLeafPathMessages(params.sessionFile);
+            const activeBootstrapState =
+              await this.summaryStore.getConversationBootstrapState(
+                ambiguousRollover.conversationId,
+              );
+            const hasFrontierAnchor =
+              await this.transcriptContainsCurrentConversationTailAnchor({
+                conversationId: ambiguousRollover.conversationId,
+                historicalMessages: preloadedHistoricalMessages,
+                checkpointEntryHash: activeBootstrapState?.lastProcessedEntryHash,
+              });
+            if (!hasFrontierAnchor) {
+              this.logAmbiguousSessionKeyRuntimeRollover({
+                phase: "bootstrap",
+                rollover: ambiguousRollover,
+                sessionId: params.sessionId,
+                sessionFile: params.sessionFile,
+              });
+              return {
+                bootstrapped: false,
+                importedMessages: 0,
+                reason: AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON,
+              };
+            }
+          }
 
           const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
             sessionKey: params.sessionKey,
@@ -7039,7 +7226,8 @@ export class LcmContextEngine implements ContextEngine {
               await this.conversationStore.markConversationBootstrapped(conversationId);
             }
             if (parentSessionReference !== null && !bootstrapState.forkBounded) {
-              const historicalMessages = await readLeafPathMessages(params.sessionFile);
+              const historicalMessages =
+                preloadedHistoricalMessages ?? (await readLeafPathMessages(params.sessionFile));
               await persistBootstrapState(conversationId, bootstrapState.lastProcessedEntryHash, {
                 forkBounded: true,
                 forkSourceMessageCount: historicalMessages.length,
@@ -7187,7 +7375,8 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
 
-          const historicalMessages = await readLeafPathMessages(params.sessionFile);
+          const historicalMessages =
+            preloadedHistoricalMessages ?? (await readLeafPathMessages(params.sessionFile));
           this.deps.log.debug(
             `[lcm] bootstrap: full transcript read conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} historicalMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
@@ -8154,12 +8343,18 @@ export class LcmContextEngine implements ContextEngine {
     const transcriptReconcileUnsafeToAdvance =
       transcriptReconcileResult.blockedByImportCap ||
       (!transcriptReconcileResult.hasOverlap && transcriptReconcileResult.importedMessages === 0);
+    const transcriptReconcileBlockedByAmbiguousRollover =
+      transcriptReconcileResult.blockedReason === "ambiguous-session-key-runtime-rollover";
     let dedupedNewMessages: AgentMessage[] = [];
     if (transcriptReconcileUnsafeToAdvance) {
       if (newMessages.length > 0 || params.autoCompactionSummary) {
         this.deps.log.warn(
           `[lcm] afterTurn: transcript reconcile did not cover the transcript frontier; skipping afterTurn persistence to avoid creating a future anchor past unreconciled transcript history ${sessionLabel}`,
         );
+      }
+      if (transcriptReconcileBlockedByAmbiguousRollover) {
+        await runRuntimeAutoRotate();
+        return;
       }
     } else {
       dedupedNewMessages = await this.deduplicateAfterTurnBatch(
@@ -8588,6 +8783,20 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.debug(
           `[lcm] assemble: conversation lookup missed ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
+        return safeFallback();
+      }
+      const ambiguousRollover =
+        await this.findAmbiguousSessionKeyRuntimeRollover({
+          phase: "assemble",
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+      if (ambiguousRollover) {
+        this.logAmbiguousSessionKeyRuntimeRollover({
+          phase: "assemble",
+          rollover: ambiguousRollover,
+          sessionId: params.sessionId,
+        });
         return safeFallback();
       }
 

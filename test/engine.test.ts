@@ -11106,6 +11106,242 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(checkpoint?.lastProcessedOffset).toBe(statSync(newSessionFile).size);
   });
 
+  it("bootstrap fails closed on ambiguous runtime rollover while the old transcript still exists", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const firstSessionId = "bootstrap-ambiguous-rollover-old-runtime";
+    const secondSessionId = "bootstrap-ambiguous-rollover-new-runtime";
+    const sessionKey = "agent:main:test:ambiguous-runtime-rollover";
+
+    const oldSessionFile = createSessionFilePath("bootstrap-ambiguous-rollover-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old long-lived question" },
+      { role: "assistant", content: "Done" },
+    ]);
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(oldCheckpoint?.sessionFilePath).toBe(oldSessionFile);
+
+    const newSessionFile = createSessionFilePath("bootstrap-ambiguous-rollover-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "new unrelated first turn" },
+      { role: "assistant", content: "Done" },
+    ]);
+
+    const result = await engine.bootstrap({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+    });
+
+    expect(result).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "ambiguous session-key runtime rollover",
+    });
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("ambiguous session-key runtime rollover")),
+    ).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old long-lived question",
+      "Done",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint).toEqual(oldCheckpoint);
+    const active = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(active?.conversationId).toBe(conversation!.conversationId);
+    expect(active?.sessionId).toBe(firstSessionId);
+    await expect(
+      engine.getConversationStore().getConversationBySessionId(secondSessionId),
+    ).resolves.toBeNull();
+  });
+
+  it("afterTurn fails closed on ambiguous runtime rollover while the old transcript still exists", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    const evaluateLeafTriggerSpy = vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    } as unknown as Record<string, unknown>);
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "above threshold",
+      currentTokens: 10_000,
+      threshold: 3_072,
+      projectedTokens: 10_000,
+      rawTokensOutsideTail: 6_000,
+    });
+    const firstSessionId = "after-turn-ambiguous-rollover-old-runtime";
+    const secondSessionId = "after-turn-ambiguous-rollover-new-runtime";
+    const sessionKey = "agent:main:test:after-turn-ambiguous-runtime-rollover";
+
+    const oldSessionFile = createSessionFilePath("after-turn-ambiguous-rollover-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old afterTurn long-lived question" },
+      { role: "assistant", content: "Done" },
+    ]);
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const oldCheckpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(oldCheckpoint?.sessionFilePath).toBe(oldSessionFile);
+
+    const newSessionFile = createSessionFilePath("after-turn-ambiguous-rollover-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "new afterTurn unrelated first turn" },
+      { role: "assistant", content: "Done" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "Done" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("ambiguous session-key runtime rollover")),
+    ).toBe(true);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old afterTurn long-lived question",
+      "Done",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint).toEqual(oldCheckpoint);
+    const activeByKey = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeByKey?.conversationId).toBe(conversation!.conversationId);
+    expect(activeByKey?.sessionId).toBe(firstSessionId);
+    await expect(
+      engine.getConversationStore().getConversationBySessionId(secondSessionId),
+    ).resolves.toBeNull();
+    await expect(
+      engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation!.conversationId),
+    ).resolves.toBeNull();
+    expect(evaluateLeafTriggerSpy).not.toHaveBeenCalled();
+    expect(evaluateSpy).not.toHaveBeenCalled();
+  });
+
+  it("assemble falls back to live messages on ambiguous runtime rollover while the old transcript still exists", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const firstSessionId = "assemble-ambiguous-rollover-old-runtime";
+    const secondSessionId = "assemble-ambiguous-rollover-new-runtime";
+    const sessionKey = "agent:main:test:assemble-ambiguous-runtime-rollover";
+
+    const oldSessionFile = createSessionFilePath("assemble-ambiguous-rollover-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "what model produced the stale answer?" },
+      { role: "assistant", content: "openai-codex/gpt-5.5" },
+    ]);
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+
+    const originalConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(originalConversation).not.toBeNull();
+
+    const liveMessages = [makeMessage({ role: "user", content: "new live user prompt" })];
+    const assembled = await engine.assemble({
+      sessionId: secondSessionId,
+      sessionKey,
+      messages: liveMessages,
+      tokenBudget: 4_096,
+    });
+
+    expect(assembled.messages).toEqual(liveMessages);
+    expect(
+      assembled.messages.some((message) => message.content === "openai-codex/gpt-5.5"),
+    ).toBe(false);
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("ambiguous session-key runtime rollover")),
+    ).toBe(true);
+    const activeByKey = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeByKey?.conversationId).toBe(originalConversation!.conversationId);
+    expect(activeByKey?.sessionId).toBe(firstSessionId);
+    await expect(
+      engine.getConversationStore().getConversationBySessionId(secondSessionId),
+    ).resolves.toBeNull();
+  });
+
   it("afterTurn reconciles a path-mismatched no-anchor transcript before oversized delta dedup", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-transcript-epoch-no-anchor";
