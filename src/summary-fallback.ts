@@ -11,6 +11,7 @@ const DEFAULT_FALLBACK_DIRECTIVE_NOTE = FALLBACK_DIRECTIVE_SUMMARY_MARKER;
 const OPTIONAL_DIRECTIVE_SCOPE_PREFIX = String.raw`(?:all\s+)?(?:of\s+)?(?:(?:the|your|my|any|these|those)\s+)?`;
 const DIRECTIVE_SCOPE = String.raw`(?:(?:previous|prior|above|earlier)(?:\s+(?:system|developer))?|(?:system|developer))`;
 const ANSWER_DAN_OBJECT = String.raw`(?:(?:me|us)|(?:(?:(?:the|this|that|your|my|any|these|those|all|every)\s+)?(?:future\s+)?(?:users?|requests?|questions?|prompts?|messages?)))`;
+const DAN_PERSONA_DIRECTIVE_PREFIX = String.raw`(?:^\s*|^\s*[A-Za-z][A-Za-z0-9 _/-]{0,40}:\s*)`;
 const FALLBACK_DIRECTIVE_SHAPED_PATTERNS = [
   new RegExp(
     [
@@ -24,9 +25,13 @@ const FALLBACK_DIRECTIVE_SHAPED_PATTERNS = [
     "i",
   ),
   /\bdan\s+mode\b/i,
+  /\byou\s+are\s+dan\b/i,
   new RegExp(String.raw`\banswer\s+${ANSWER_DAN_OBJECT}\s+as\s+dan\b`, "i"),
-  // Preserve embedded human-name "Dan" while catching imperative DAN persona directives.
-  /^\s*(?:act\s+as|pretend\s+to\s+be)\s+dan\b/i,
+  // Preserve embedded human-name "Dan" while catching imperative or labeled DAN persona directives.
+  new RegExp(
+    String.raw`${DAN_PERSONA_DIRECTIVE_PREFIX}(?:act\s+as|pretend\s+to\s+be)\s+dan\b`,
+    "i",
+  ),
   /\b(?:[Aa][Cc][Tt]\s+[Aa][Ss]|[Pp][Rr][Ee][Tt][Ee][Nn][Dd]\s+[Tt][Oo]\s+[Bb][Ee])\s+(?!Dan\b)[Dd][Aa][Nn]\b/,
 ];
 
