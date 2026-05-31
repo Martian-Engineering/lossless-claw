@@ -5436,13 +5436,15 @@ export class LcmContextEngine implements ContextEngine {
           conversation.conversationId,
         );
         let sessionFileState: { size: number; mtimeMs: number } | undefined;
+        let sessionFileStatError: unknown;
         try {
           const sessionFileStats = await stat(params.sessionFile);
           sessionFileState = {
             size: sessionFileStats.size,
             mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
           };
-        } catch {
+        } catch (error) {
+          sessionFileStatError = error;
           // Leave undefined: without stat proof, do not use append-only guards or slow-read caps.
         }
         const transcriptEpochShrank = checkpointIsPastTranscriptEof(
@@ -5569,6 +5571,37 @@ export class LcmContextEngine implements ContextEngine {
           this.afterTurnReconcileFullReadStates.set(fullReadKey, sessionFileState);
         };
         const slowPathStartedAt = Date.now();
+
+        if (isMissingFileError(sessionFileStatError)) {
+          if (!checkpoint) {
+            try {
+              await this.summaryStore.upsertConversationBootstrapState({
+                conversationId: conversation.conversationId,
+                sessionFilePath: params.sessionFile,
+                lastSeenSize: 0,
+                lastSeenMtimeMs: 0,
+                lastProcessedOffset: 0,
+                lastProcessedEntryHash: null,
+              });
+            } catch (seedError) {
+              this.deps.log.warn(
+                `[lcm] afterTurn: transcript reconcile slow path failed to seed placeholder bootstrap_state conversation=${conversation.conversationId} sessionFile=${params.sessionFile} error=${seedError instanceof Error ? seedError.message : String(seedError)}`,
+              );
+            }
+            this.deps.log.warn(
+              `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; could not stat/read transcript; allowing live afterTurn persistence and seeding placeholder bootstrap_state at offset=0 to unblock next-turn recovery conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+            );
+          } else {
+            this.deps.log.warn(
+              `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+            );
+          }
+          return {
+            importedMessages: 0,
+            blockedByImportCap: false,
+            hasOverlap: true,
+          };
+        }
 
         // Distinguish empty-file from read/parse error: stat the file and
         // only treat it as "actually empty" when size is 0. A non-zero file

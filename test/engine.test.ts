@@ -8420,6 +8420,85 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(secondSlowPathWarns.length).toBe(0);
   });
 
+  it("afterTurn treats missing tracked transcripts as a cheap degraded path without full reread", async () => {
+    const warnLog = vi.fn();
+    const debugLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: debugLog },
+      },
+    );
+    const sessionId = "after-turn-missing-transcript-cheap-skip";
+    const sessionKey = "agent:main:test:missing-transcript-cheap-skip";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey,
+    });
+    const bulkMessages = await engine.getConversationStore().createMessagesBulk(
+      Array.from({ length: 120 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index,
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `persisted historical message ${index}`,
+        tokenCount: 5,
+        skipReplayTimestampFloodGuard: true,
+      })),
+    );
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(
+        conversation.conversationId,
+        bulkMessages.map((message) => message.messageId),
+      );
+    const missingSessionFile = createSessionFilePath("after-turn-missing-transcript-cheap-skip");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: missingSessionFile,
+      lastSeenSize: 24_000,
+      lastSeenMtimeMs: 1_700_000_000_000,
+      lastProcessedOffset: 24_000,
+      lastProcessedEntryHash: "checkpoint-hash",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: missingSessionFile,
+      messages: [
+        makeMessage({ role: "assistant", content: "persisted historical message 119" }),
+        makeMessage({ role: "user", content: "live user after missing transcript" }),
+        makeMessage({ role: "assistant", content: "live assistant after missing transcript" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
+    expect(stored.slice(-2).map((message) => message.content)).toEqual([
+      "live user after missing transcript",
+      "live assistant after missing transcript",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation.conversationId);
+    expect(checkpoint).toMatchObject({
+      sessionFilePath: missingSessionFile,
+      lastSeenSize: 24_000,
+      lastProcessedOffset: 24_000,
+      lastProcessedEntryHash: "checkpoint-hash",
+    });
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("session file missing; skipping transcript reconcile full reread")),
+    ).toBe(true);
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("transcript reconcile slow path (full re-read)")),
+    ).toBe(false);
+  });
+
   it("seeds placeholder bootstrap_state when afterTurn stat-fail fallback runs (#649 follow-up)", async () => {
     // #649 added a permissive stat-fail fallback in the slow path that
     // returns hasOverlap:true to allow live afterTurn ingest even when the
