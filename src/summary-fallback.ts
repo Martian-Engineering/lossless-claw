@@ -10,6 +10,7 @@ export const FALLBACK_DIRECTIVE_SUMMARY_MARKER =
 const DEFAULT_FALLBACK_DIRECTIVE_NOTE = FALLBACK_DIRECTIVE_SUMMARY_MARKER;
 const OPTIONAL_DIRECTIVE_SCOPE_PREFIX = String.raw`(?:all\s+)?(?:of\s+)?(?:(?:the|your|my|any|these|those)\s+)?`;
 const DIRECTIVE_SCOPE = String.raw`(?:(?:previous|prior|above|earlier)(?:\s+(?:system|developer))?|(?:system|developer))`;
+const ANSWER_DAN_OBJECT = String.raw`(?:(?:me|us)|(?:(?:(?:the|this|that|your|my|any|these|those|all|every)\s+)?(?:future\s+)?(?:users?|requests?|questions?|prompts?|messages?)))`;
 const FALLBACK_DIRECTIVE_SHAPED_PATTERNS = [
   new RegExp(
     [
@@ -23,8 +24,10 @@ const FALLBACK_DIRECTIVE_SHAPED_PATTERNS = [
     "i",
   ),
   /\bdan\s+mode\b/i,
-  /\banswer\s+(?:(?:every|all)\s+)?(?:future\s+)?(?:users?|requests?|questions?|prompts?|messages?)\s+as\s+dan\b/i,
-  /\b(?:act\s+as|pretend\s+to\s+be)\s+DAN\b/,
+  new RegExp(String.raw`\banswer\s+${ANSWER_DAN_OBJECT}\s+as\s+dan\b`, "i"),
+  // Preserve embedded human-name "Dan" while catching imperative DAN persona directives.
+  /^\s*(?:act\s+as|pretend\s+to\s+be)\s+dan\b/i,
+  /\b(?:[Aa][Cc][Tt]\s+[Aa][Ss]|[Pp][Rr][Ee][Tt][Ee][Nn][Dd]\s+[Tt][Oo]\s+[Bb][Ee])\s+(?!Dan\b)[Dd][Aa][Nn]\b/,
 ];
 
 export function sanitizeDeterministicFallbackText(text: string): {
