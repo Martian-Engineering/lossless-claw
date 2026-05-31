@@ -11601,6 +11601,52 @@ describe("LcmContextEngine compaction telemetry", () => {
     );
   });
 
+  it("passes injected-context strip tags into production compaction", async () => {
+    const engine = createEngineWithConfig({
+      freshTailCount: 1,
+      leafMinFanout: 2,
+      leafChunkTokens: 20_000,
+      incrementalMaxDepth: 0,
+      stripInjectedContextTags: ["hindsight_memories"],
+    });
+    const sessionId = "compact-strip-injected-context";
+    const summarize = vi.fn(async () => "safe compacted summary");
+
+    await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({
+          role: "user",
+          content: [
+            "<hindsight_memories>",
+            "Injected memory that should not become durable summary content.",
+            "</hindsight_memories>",
+            "",
+            "Actual user request that should compact.",
+          ].join("\n"),
+        }),
+        makeMessage({ role: "assistant", content: "Actual assistant answer." }),
+        makeMessage({ role: "user", content: "Fresh tail question." }),
+        makeMessage({ role: "assistant", content: "Fresh tail answer." }),
+      ],
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("compact-strip-injected-context"),
+      tokenBudget: 4096,
+      force: true,
+      legacyParams: { summarize },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(summarize).toHaveBeenCalled();
+    const summarizedText = String(summarize.mock.calls[0]?.[0] ?? "");
+    expect(summarizedText).toContain("Actual user request that should compact.");
+    expect(summarizedText).not.toContain("Injected memory that should not become durable");
+    expect(summarizedText).not.toContain("hindsight_memories");
+  });
+
 
 });
 

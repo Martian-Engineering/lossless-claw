@@ -263,6 +263,10 @@
     "fallbackProviders": {
       "label": "Fallback Providers",
       "help": "Explicit runtime LLM fallback provider/model pairs for compaction summarization; entries require plugins.entries.lossless-claw.llm policy"
+    },
+    "stripInjectedContextTags": {
+      "label": "Strip Injected Context Tags",
+      "help": "XML tag names whose blocks are stripped from messages before summarization. Covers memory/context plugin prepended blocks (active-memory, memory-lancedb, hindsight-openclaw). Set to [] to disable."
     }
   },
   "configSchema": {
@@ -539,6 +543,13 @@
           },
           "required": ["provider", "model"],
           "additionalProperties": false
+        }
+      },
+      "stripInjectedContextTags": {
+        "description": "XML tag names whose blocks are stripped from messages before summarization. Memory/context plugins prepend tagged blocks via prependContext that should not leak into compacted summaries.",
+        "type": "array",
+        "items": {
+          "type": "string"
         }
       }
     }
