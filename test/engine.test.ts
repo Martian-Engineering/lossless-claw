@@ -6157,6 +6157,843 @@ describe("LcmContextEngine.assemble canonical path", () => {
     });
   });
 
+  async function seedPromptRecallFixture(params: {
+    engine: LcmContextEngine;
+    sessionId: string;
+    summaryId: string;
+    summaryContent: string;
+    memoryUserContent?: string;
+    memoryAssistantContent?: string;
+    tailUserContent?: string;
+    tailAssistantContent?: string;
+    prompt?: string;
+  }): Promise<{ liveMessages: AgentMessage[]; prompt: string }> {
+    const memoryUserContent =
+      params.memoryUserContent ??
+      "Reply with this exact memory marker: CRABPOT_LCM_FACT is blue-lantern-42.";
+    const memoryAssistantContent =
+      params.memoryAssistantContent ?? "CRABPOT_LCM_FACT is blue-lantern-42.";
+    const prompt =
+      params.prompt ?? "What is CRABPOT_LCM_FACT? Answer with only the remembered value.";
+
+    await params.engine.ingest({
+      sessionId: params.sessionId,
+      message: {
+        role: "user",
+        content: memoryUserContent,
+      } as AgentMessage,
+    });
+    await params.engine.ingest({
+      sessionId: params.sessionId,
+      message: { role: "assistant", content: memoryAssistantContent } as AgentMessage,
+    });
+    await params.engine.ingest({
+      sessionId: params.sessionId,
+      message: {
+        role: "user",
+        content: params.tailUserContent ?? "Say one neutral filler response.",
+      } as AgentMessage,
+    });
+    await params.engine.ingest({
+      sessionId: params.sessionId,
+      message: { role: "assistant", content: params.tailAssistantContent ?? "ok" } as AgentMessage,
+    });
+
+    const conversation = await params.engine.getConversationStore().getConversationForSession({
+      sessionId: params.sessionId,
+    });
+    expect(conversation).toBeTruthy();
+    const messages = await params.engine.getConversationStore().getMessages(conversation!.conversationId);
+    const summaryStore = params.engine.getSummaryStore();
+    await summaryStore.insertSummary({
+      summaryId: params.summaryId,
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: params.summaryContent,
+      tokenCount: estimateTokens(params.summaryContent),
+    });
+    await summaryStore.linkSummaryToMessages(
+      params.summaryId,
+      messages.slice(0, 2).map((message) => message.messageId),
+    );
+    await summaryStore.replaceContextRangeWithSummary({
+      conversationId: conversation!.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 1,
+      summaryId: params.summaryId,
+    });
+
+    return {
+      liveMessages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ] as AgentMessage[],
+      prompt,
+    };
+  }
+
+  it("adds raw prompt-recall matches when summary-covered history omits an exact memory key", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-after-rotate";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: "Reply with this exact memory marker: CRABPOT_LCM_FACT is blue-lantern-42.",
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "CRABPOT_LCM_FACT is blue-lantern-42." } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "Say one neutral filler response." } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "ok" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({ sessionId });
+    expect(conversation).toBeTruthy();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const summaryStore = engine.getSummaryStore();
+    await summaryStore.insertSummary({
+      summaryId: "sum_prompt_recall_omits_exact_key",
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Older setup turn established a recall fact, but this summary omits the exact key.",
+      tokenCount: estimateTokens("Older setup turn established a recall fact."),
+    });
+    await summaryStore.linkSummaryToMessages(
+      "sum_prompt_recall_omits_exact_key",
+      messages.slice(0, 2).map((message) => message.messageId),
+    );
+    await summaryStore.replaceContextRangeWithSummary({
+      conversationId: conversation!.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 1,
+      summaryId: "sum_prompt_recall_omits_exact_key",
+    });
+
+    const searchSpy = vi.spyOn(engine.getConversationStore(), "searchMessages");
+    const result = await engine.assemble({
+      sessionId,
+      messages: [
+        {
+          role: "user",
+          content: "What is CRABPOT_LCM_FACT? Answer with only the remembered value.",
+        },
+      ] as AgentMessage[],
+      prompt: "What is CRABPOT_LCM_FACT? Answer with only the remembered value.",
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(
+      rendered.some(
+        (content) =>
+          content.includes("<lossless_claw_prompt_recall>") &&
+          content.includes("CRABPOT_LCM_FACT is blue-lantern-42"),
+      ),
+    ).toBe(true);
+    expect(searchSpy).toHaveBeenCalledWith(expect.objectContaining({
+      mode: "full_text",
+      query: "CRABPOT_LCM_FACT",
+    }));
+    expect(result.contextProjection?.fingerprint).toMatch(/^prompt-recall-v1:[a-f0-9]{32}$/);
+  });
+
+  it("adds prompt-recall sentence context before a requested key", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-value-before-key";
+    const prompt = "What is CRABPOT_LCM_FACT?";
+    const { liveMessages } = await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_value_before_key",
+      summaryContent: "Older setup turn established a recall fact, but this summary omits the exact key.",
+      memoryUserContent: "Remember blue-lantern-42 as CRABPOT_LCM_FACT.",
+      memoryAssistantContent: "ok",
+      prompt,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    const recallCue = rendered.find((content) => content.includes("<lossless_claw_prompt_recall>"));
+    expect(recallCue).toEqual(expect.any(String));
+    expect(recallCue).toContain("Remember blue-lantern-42 as CRABPOT_LCM_FACT.");
+  });
+
+  it("skips prompt-recall matches when the cue would exceed the assembly budget", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-budget";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: "Reply with this exact memory marker: CRABPOT_LCM_FACT is blue-lantern-42.",
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "CRABPOT_LCM_FACT is blue-lantern-42." } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "Say one neutral filler response." } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "ok" } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({ sessionId });
+    expect(conversation).toBeTruthy();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const summaryStore = engine.getSummaryStore();
+    await summaryStore.insertSummary({
+      summaryId: "sum_prompt_recall_budget",
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Older setup turn established a recall fact, but this summary omits the exact key.",
+      tokenCount: estimateTokens("Older setup turn established a recall fact."),
+    });
+    await summaryStore.linkSummaryToMessages(
+      "sum_prompt_recall_budget",
+      messages.slice(0, 2).map((message) => message.messageId),
+    );
+    await summaryStore.replaceContextRangeWithSummary({
+      conversationId: conversation!.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 1,
+      summaryId: "sum_prompt_recall_budget",
+    });
+
+    const liveMessages = [
+      {
+        role: "user",
+        content: "What is CRABPOT_LCM_FACT? Answer with only the remembered value.",
+      },
+    ] as AgentMessage[];
+    const baseline = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 10_000,
+    });
+
+    const constrained = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt: "What is CRABPOT_LCM_FACT? Answer with only the remembered value.",
+      tokenBudget: baseline.estimatedTokens,
+    });
+
+    const rendered = constrained.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    expect(constrained.estimatedTokens).toBeLessThanOrEqual(baseline.estimatedTokens);
+  });
+
+  it("drops prompt-recall when volatile live input needs the remaining budget", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-live-budget";
+    const prompt = "What is CRABPOT_LCM_FACT?";
+    await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_live_budget",
+      summaryContent: "Fact omitted.",
+      prompt,
+    });
+    const volatileEvent =
+      "[Inter-session message] sourceSession=agent:main:subagent:prompt-recall-budget sourceTool=subagent_announce\n" +
+      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n" +
+      "[Internal task completion event]\n" +
+      "Keep the current volatile live input intact. ".repeat(160) +
+      "\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+    const liveMessages = [{ role: "user", content: volatileEvent }] as AgentMessage[];
+
+    const baseline = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 10_000,
+    });
+
+    const constrained = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: baseline.estimatedTokens,
+    });
+
+    const rendered = constrained.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    expect(rendered.some((content) => content.includes("Keep the current volatile live input intact."))).toBe(true);
+    expect(constrained.estimatedTokens).toBeLessThanOrEqual(baseline.estimatedTokens);
+  });
+
+  it("does not add prompt-recall when volatile live input already mentions the requested key", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-volatile-correction";
+    const prompt = "What is CRABPOT_LCM_FACT?";
+    await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_volatile_correction",
+      summaryContent: "Older setup turn established a recall fact, but this summary omits the exact key.",
+      memoryUserContent: "CRABPOT_LCM_FACT is stale-blue-lantern-42.",
+      memoryAssistantContent: "ok",
+      prompt,
+    });
+    const volatileEvent =
+      "[Inter-session message] sourceSession=agent:main:subagent:prompt-recall-correction sourceTool=subagent_announce\n" +
+      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n" +
+      "[Internal task completion event]\n" +
+      "Correction: CRABPOT_LCM_FACT is green-lantern-88.\n" +
+      "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+    const liveMessages = [{ role: "user", content: volatileEvent }] as AgentMessage[];
+    const searchSpy = vi.spyOn(engine.getConversationStore(), "searchMessages");
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    expect(rendered.some((content) => content.includes("CRABPOT_LCM_FACT is green-lantern-88"))).toBe(true);
+    expect(searchSpy).not.toHaveBeenCalled();
+  });
+
+  it("drops prompt-recall before evicting assembled context for volatile live input", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-preserve-summary";
+    const prompt = "What is CRABPOT_LCM_FACT?";
+    await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_preserve_summary",
+      summaryContent: "Long unrelated summary. ".repeat(100),
+      prompt,
+    });
+    const volatileEvent =
+      "[Inter-session message] sourceSession=agent:main:subagent:prompt-recall-preserve sourceTool=subagent_announce\n" +
+      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n" +
+      "[Internal task completion event]\n" +
+      "Small live note.\n" +
+      "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+    const liveMessages = [{ role: "user", content: volatileEvent }] as AgentMessage[];
+    const baseline = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 10_000,
+    });
+
+    const constrained = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: baseline.estimatedTokens + 20,
+    });
+
+    const rendered = constrained.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    expect(rendered.some((content) => content.includes("<summary id=\"sum_prompt_recall_preserve_summary\""))).toBe(
+      true,
+    );
+    expect(rendered.some((content) => content.includes("Small live note."))).toBe(true);
+    expect(constrained.estimatedTokens).toBeLessThanOrEqual(baseline.estimatedTokens + 20);
+  });
+
+  it("does not add prompt-recall when the active summary already carries the exact fact", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: infoLog,
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "session-prompt-recall-duplicate-fact";
+    const { liveMessages, prompt } = await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_exact_fact",
+      summaryContent:
+        "Older setup turn established CRABPOT_LCM_FACT is blue-lantern-42 but omits the full raw prompt.",
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    const assembleDoneLog = infoLog.mock.calls
+      .map((call: unknown[]) => call[0])
+      .find((entry: unknown) => typeof entry === "string" && entry.includes("[lcm] assemble: done"));
+    expect(assembleDoneLog).toEqual(expect.any(String));
+    expect(assembleDoneLog).not.toContain("promptRecallMatches=");
+  });
+
+  it("does not add prompt-recall when an active summary already mentions the requested key", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-summary-correction";
+    const { liveMessages, prompt } = await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_summary_correction",
+      summaryContent: "Correction: CRABPOT_LCM_FACT is green-lantern-88.",
+      memoryUserContent: "CRABPOT_LCM_FACT is stale-blue-lantern-42.",
+      memoryAssistantContent: "ok",
+    });
+    const searchSpy = vi.spyOn(engine.getConversationStore(), "searchMessages");
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    expect(searchSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not add prompt-recall when a newer raw tail already mentions the requested key", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-tail-correction";
+    const { liveMessages, prompt } = await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_tail_correction",
+      summaryContent: "Older setup turn established a recall fact, but this summary omits the exact key.",
+      memoryUserContent: "CRABPOT_LCM_FACT is stale-blue-lantern-42.",
+      memoryAssistantContent: "ok",
+      tailUserContent: "Correction: CRABPOT_LCM_FACT is green-lantern-88.",
+      tailAssistantContent: "noted",
+    });
+    const searchSpy = vi.spyOn(engine.getConversationStore(), "searchMessages");
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    expect(searchSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not recall substring or secret-shaped identifiers", async () => {
+    const boundaryEngine = createEngine();
+    const boundary = await seedPromptRecallFixture({
+      engine: boundaryEngine,
+      sessionId: "session-prompt-recall-boundary",
+      summaryId: "sum_prompt_recall_boundary",
+      summaryContent: "Older setup turn had a related backup key, but not the requested exact key.",
+      memoryUserContent: "CRABPOT_LCM_FACT_BACKUP is red-lantern-99.",
+      memoryAssistantContent: "ok",
+      prompt: "What is CRABPOT_LCM_FACT?",
+    });
+    const boundaryResult = await boundaryEngine.assemble({
+      sessionId: "session-prompt-recall-boundary",
+      messages: boundary.liveMessages,
+      prompt: boundary.prompt,
+      tokenBudget: 10_000,
+    });
+    const boundaryRendered = boundaryResult.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(boundaryRendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+
+    const mixedCaseBoundaryEngine = createEngine();
+    const mixedCaseBoundary = await seedPromptRecallFixture({
+      engine: mixedCaseBoundaryEngine,
+      sessionId: "session-prompt-recall-mixed-case-boundary",
+      summaryId: "sum_prompt_recall_mixed_case_boundary",
+      summaryContent: "Older setup turn had a similar mixed-case key, but not the requested exact key.",
+      memoryUserContent: "CRABPOT_LCM_FACTv2 is green-lantern-88.",
+      memoryAssistantContent: "ok",
+      prompt: "What is CRABPOT_LCM_FACT?",
+    });
+    const mixedCaseBoundaryResult = await mixedCaseBoundaryEngine.assemble({
+      sessionId: "session-prompt-recall-mixed-case-boundary",
+      messages: mixedCaseBoundary.liveMessages,
+      prompt: mixedCaseBoundary.prompt,
+      tokenBudget: 10_000,
+    });
+    const mixedCaseBoundaryRendered = mixedCaseBoundaryResult.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(
+      mixedCaseBoundaryRendered.some((content) => content.includes("<lossless_claw_prompt_recall>")),
+    ).toBe(false);
+
+    const secretEngine = createEngine();
+    const secret = await seedPromptRecallFixture({
+      engine: secretEngine,
+      sessionId: "session-prompt-recall-secret",
+      summaryId: "sum_prompt_recall_secret",
+      summaryContent: "Older setup turn had a secret-like key that should not be auto-surfaced.",
+      memoryUserContent: "API_KEY is redacted-test-value.",
+      memoryAssistantContent: "ok",
+      prompt: "What is API_KEY?",
+    });
+    const searchSpy = vi.spyOn(secretEngine.getConversationStore(), "searchMessages");
+    const secretResult = await secretEngine.assemble({
+      sessionId: "session-prompt-recall-secret",
+      messages: secret.liveMessages,
+      prompt: secret.prompt,
+      tokenBudget: 10_000,
+    });
+    const secretRendered = secretResult.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(secretRendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    expect(searchSpy).not.toHaveBeenCalled();
+
+    const contiguousSecretEngine = createEngine();
+    const contiguousSecret = await seedPromptRecallFixture({
+      engine: contiguousSecretEngine,
+      sessionId: "session-prompt-recall-contiguous-secret",
+      summaryId: "sum_prompt_recall_contiguous_secret",
+      summaryContent: "Older setup turn had a secret-like key that should not be auto-surfaced.",
+      memoryUserContent: "OPENAI_APIKEY is redacted-test-value.",
+      memoryAssistantContent: "ok",
+      prompt: "What is OPENAI_APIKEY?",
+    });
+    const contiguousSearchSpy = vi.spyOn(contiguousSecretEngine.getConversationStore(), "searchMessages");
+    const contiguousSecretResult = await contiguousSecretEngine.assemble({
+      sessionId: "session-prompt-recall-contiguous-secret",
+      messages: contiguousSecret.liveMessages,
+      prompt: contiguousSecret.prompt,
+      tokenBudget: 10_000,
+    });
+    const contiguousSecretRendered = contiguousSecretResult.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(
+      contiguousSecretRendered.some((content) => content.includes("<lossless_claw_prompt_recall>")),
+    ).toBe(false);
+    expect(contiguousSearchSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not add prompt-recall snippets that include unrelated sensitive material", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-sensitive-snippet";
+    const prompt = "What is PROJECT_ID?";
+    const { liveMessages } = await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_sensitive_snippet",
+      summaryContent: "Older setup turn established a project fact, but this summary omits the exact key.",
+      memoryUserContent: "PROJECT_ID is launch-alpha; api_key is redacted-test-value.",
+      memoryAssistantContent: "ok",
+      prompt,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    expect(rendered.some((content) => content.includes("api_key"))).toBe(false);
+    expect(rendered.some((content) => content.includes("redacted-test-value"))).toBe(false);
+  });
+
+  it("does not add prompt-recall snippets that include underscore provider tokens", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-underscore-provider-token";
+    const prompt = "What is PROJECT_ID?";
+    const fakeLiveKey = ["sk", "live", "a".repeat(24)].join("_");
+    const { liveMessages } = await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_underscore_provider_token",
+      summaryContent: "Older setup turn established a project fact, but this summary omits the exact key.",
+      memoryUserContent: `PROJECT_ID is launch-alpha; ${fakeLiveKey}.`,
+      memoryAssistantContent: "ok",
+      prompt,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    expect(rendered.some((content) => content.includes(fakeLiveKey))).toBe(false);
+  });
+
+  it("continues prompt-recall search past filtered newer matches", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-filtered-starvation";
+    const prompt = "What is STARVED_FACT?";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "STARVED_FACT is blue-lantern-42." } as AgentMessage,
+    });
+    for (let index = 0; index < 8; index += 1) {
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "user",
+          content: `STARVED_FACT candidate ${index}; API_KEY is redacted-test-value-${index}.`,
+        } as AgentMessage,
+      });
+    }
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "Say one neutral filler response." } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "ok" } as unknown as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({ sessionId });
+    expect(conversation).toBeTruthy();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const summaryStore = engine.getSummaryStore();
+    await summaryStore.insertSummary({
+      summaryId: "sum_prompt_recall_filtered_starvation",
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Older setup turns established a recall fact, but this summary omits the exact key.",
+      tokenCount: estimateTokens("Older setup turns established a recall fact."),
+    });
+    await summaryStore.linkSummaryToMessages(
+      "sum_prompt_recall_filtered_starvation",
+      messages.slice(0, 9).map((message) => message.messageId),
+    );
+    await summaryStore.replaceContextRangeWithSummary({
+      conversationId: conversation!.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 8,
+      summaryId: "sum_prompt_recall_filtered_starvation",
+    });
+    const rankedMatches = [...messages.slice(1, 9).reverse(), messages[0]].map((message) => ({
+      messageId: message.messageId,
+      conversationId: conversation!.conversationId,
+      role: message.role,
+      snippet: message.content,
+      createdAt: message.createdAt,
+      rank: 0,
+    }));
+    const searchSpy = vi.spyOn(engine.getConversationStore(), "searchMessages").mockImplementation(async (input) =>
+      rankedMatches.slice(0, input.limit ?? 0),
+    );
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [{ role: "user", content: prompt }] as AgentMessage[],
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    const recallCue = rendered.find((content) => content.includes("<lossless_claw_prompt_recall>"));
+    expect(recallCue).toEqual(expect.any(String));
+    expect(recallCue).toContain("STARVED_FACT is blue-lantern-42");
+    expect(recallCue).not.toContain("API_KEY");
+    expect(recallCue).not.toContain("redacted-test-value");
+    expect(searchSpy).toHaveBeenCalledWith(expect.objectContaining({
+      limit: 32,
+      mode: "full_text",
+      query: "STARVED_FACT",
+      sort: "recency",
+    }));
+  });
+
+  it("recalls multiple requested identifiers from the same historical message", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-same-message-identifiers";
+    const prompt = "Recall ALPHA_FACT and BETA_FACT.";
+    const { liveMessages } = await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_same_message_identifiers",
+      summaryContent: "Older setup turn established two named facts, but this summary omits the exact keys.",
+      memoryUserContent: "ALPHA_FACT is blue-lantern-42. BETA_FACT is green-lantern-88.",
+      memoryAssistantContent: "ok",
+      prompt,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    const recallCue = rendered.find((content) => content.includes("<lossless_claw_prompt_recall>"));
+    expect(recallCue).toEqual(expect.any(String));
+    expect(recallCue).toContain("ALPHA_FACT is blue-lantern-42");
+    expect(recallCue).toContain("BETA_FACT is green-lantern-88");
+  });
+
+  it("changes the projection fingerprint when prompt-recall cue content changes", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-projection-fingerprint";
+    await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_projection_fingerprint",
+      summaryContent: "Older setup turn established two named facts, but this summary omits the exact keys.",
+      memoryUserContent: "ALPHA_FACT is blue-lantern-42. BETA_FACT is green-lantern-88.",
+      memoryAssistantContent: "ok",
+      prompt: "Recall ALPHA_FACT.",
+    });
+
+    const alphaResult = await engine.assemble({
+      sessionId,
+      messages: [{ role: "user", content: "Recall ALPHA_FACT." }] as AgentMessage[],
+      prompt: "Recall ALPHA_FACT.",
+      tokenBudget: 10_000,
+    });
+    const betaResult = await engine.assemble({
+      sessionId,
+      messages: [{ role: "user", content: "Recall BETA_FACT." }] as AgentMessage[],
+      prompt: "Recall BETA_FACT.",
+      tokenBudget: 10_000,
+    });
+
+    expect(alphaResult.contextProjection?.epoch).toBe(betaResult.contextProjection?.epoch);
+    expect(alphaResult.contextProjection?.fingerprint).toMatch(/^prompt-recall-v1:[a-f0-9]{32}$/);
+    expect(betaResult.contextProjection?.fingerprint).toMatch(/^prompt-recall-v1:[a-f0-9]{32}$/);
+    expect(alphaResult.contextProjection?.fingerprint).not.toBe(
+      betaResult.contextProjection?.fingerprint,
+    );
+  });
+
+  it("bounds prompt-recall searches to four full-text identifier lookups", async () => {
+    const engine = createEngine();
+    const sessionId = "session-prompt-recall-search-bound";
+    const prompt = "Recall ALPHA_FACT, BETA_FACT, GAMMA_FACT, DELTA_FACT, and EPSILON_FACT.";
+    const { liveMessages } = await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_search_bound",
+      summaryContent: "Older setup turn established a recall fact, but this summary omits the exact key.",
+      memoryUserContent: "ALPHA_FACT is blue-lantern-42.",
+      memoryAssistantContent: "ok",
+      prompt,
+    });
+    const searchSpy = vi.spyOn(engine.getConversationStore(), "searchMessages");
+
+    await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    expect(searchSpy).toHaveBeenCalledTimes(4);
+    expect(searchSpy.mock.calls.map((call) => call[0])).toEqual([
+      expect.objectContaining({ mode: "full_text", query: "ALPHA_FACT" }),
+      expect.objectContaining({ mode: "full_text", query: "BETA_FACT" }),
+      expect.objectContaining({ mode: "full_text", query: "GAMMA_FACT" }),
+      expect.objectContaining({ mode: "full_text", query: "DELTA_FACT" }),
+    ]);
+  });
+
+  it("continues with assembled DB context when optional prompt recall lookup fails", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "session-prompt-recall-lookup-failure";
+    const { liveMessages, prompt } = await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_lookup_failure",
+      summaryContent: "Older setup turn established a recall fact, but this summary omits the exact key.",
+    });
+    vi.spyOn(engine.getConversationStore(), "searchMessages").mockRejectedValueOnce(
+      new Error("simulated prompt recall failure"),
+    );
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    expect(result.contextProjection).toEqual({
+      mode: "thread_bootstrap",
+      epoch: expect.stringMatching(/^summary-prefix-v1:\d+:[a-f0-9]{32}$/),
+    });
+    expect(result.estimatedTokens).toBeGreaterThan(0);
+    expect(result.messages).not.toStrictEqual(liveMessages);
+    expect(warnLog).toHaveBeenCalledWith(expect.stringContaining("prompt recall failed"));
+  });
+
   it("logs the emitted context projection epoch", async () => {
     const infoLog = vi.fn();
     const engine = createEngineWithDepsOverrides({
