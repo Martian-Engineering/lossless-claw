@@ -10457,6 +10457,8 @@ export class LcmContextEngine implements ContextEngine {
   private async compactRawContextOutsideFreshTailForRotate(params: {
     sessionId: string;
     sessionKey: string;
+    runtimeContext?: Record<string, unknown>;
+    legacyParams?: Record<string, unknown>;
   }): Promise<
     | { kind: "ready"; conversationId: number; leafPasses: number }
     | { kind: "unavailable"; reason: string }
@@ -10483,8 +10485,23 @@ export class LcmContextEngine implements ContextEngine {
       return { kind: "ready", conversationId: current.conversationId, leafPasses: 0 };
     }
 
+    const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+      current.conversationId,
+    );
+    const telemetryLegacyParams =
+      telemetry?.provider || telemetry?.model
+        ? {
+            ...(telemetry.provider ? { provider: telemetry.provider } : {}),
+            ...(telemetry.model ? { model: telemetry.model } : {}),
+          }
+        : undefined;
+    const legacyParams =
+      asRecord(params.runtimeContext) ?? params.legacyParams ?? telemetryLegacyParams;
     const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
-      legacyParams: this.buildSummarizerLegacyParams({ sessionKey: params.sessionKey }),
+      legacyParams: this.buildSummarizerLegacyParams({
+        legacyParams,
+        sessionKey: params.sessionKey,
+      }),
       breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
     if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
@@ -10602,6 +10619,8 @@ export class LcmContextEngine implements ContextEngine {
     sessionId?: string;
     sessionKey?: string;
     sessionFile: string;
+    runtimeContext?: Record<string, unknown>;
+    legacyParams?: Record<string, unknown>;
   }): Promise<RotateSessionStorageResult> {
     const sessionId = params.sessionId?.trim();
     const sessionKey = params.sessionKey?.trim();
@@ -10641,6 +10660,8 @@ export class LcmContextEngine implements ContextEngine {
         const coverage = await this.compactRawContextOutsideFreshTailForRotate({
           sessionId,
           sessionKey,
+          runtimeContext: params.runtimeContext,
+          legacyParams: params.legacyParams,
         });
         if (coverage.kind === "unavailable") {
           return coverage;
@@ -10730,6 +10751,8 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     sessionFile: string;
     lockTimeoutMs: number;
+    runtimeContext?: Record<string, unknown>;
+    legacyParams?: Record<string, unknown>;
   }): Promise<RotateSessionStorageWithBackupResult> {
     const sessionId = params.sessionId?.trim();
     const sessionKey = params.sessionKey?.trim();
@@ -10786,6 +10809,8 @@ export class LcmContextEngine implements ContextEngine {
         const coverage = await this.compactRawContextOutsideFreshTailForRotate({
           sessionId,
           sessionKey,
+          runtimeContext: params.runtimeContext,
+          legacyParams: params.legacyParams,
         });
         if (coverage.kind === "unavailable") {
           return {

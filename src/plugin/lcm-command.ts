@@ -96,6 +96,7 @@ type RotateCommandEngine = {
     sessionKey?: string;
     sessionFile: string;
     lockTimeoutMs: number;
+    runtimeContext?: Record<string, unknown>;
   }): Promise<RotateSessionStorageWithBackupResult>;
 };
 
@@ -1359,11 +1360,13 @@ async function buildRotateText(params: {
 
   let result: RotateSessionStorageWithBackupResult;
   try {
+    const runtimeContext = readCommandRuntimeContext(params.ctx);
     result = await (await params.getLcm()).rotateSessionStorageWithBackup({
       sessionId,
       sessionKey,
       sessionFile: transcriptPath,
       lockTimeoutMs: ROTATE_DATABASE_LOCK_TIMEOUT_MS,
+      ...(runtimeContext ? { runtimeContext } : {}),
     });
   } catch (error) {
     lines.push(

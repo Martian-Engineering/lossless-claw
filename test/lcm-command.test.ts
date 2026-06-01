@@ -2233,6 +2233,75 @@ describe("lcm command", () => {
     });
   });
 
+  it("passes command runtime context through to rotate", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-runtime-context-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
+    tempDirs.add(transcriptPath);
+
+    let currentConversationId = 0;
+    const mockedBackupPath = join(tmpdir(), `lcm-rotate-runtime-context-${Date.now()}.bak`);
+    tempDirs.add(mockedBackupPath);
+    writeFileSync(mockedBackupPath, "backup");
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId,
+      currentMessageCount: 1,
+      backupPath: mockedBackupPath,
+      preservedTailMessageCount: 1,
+      checkpointSize: 111,
+      bytesRemoved: 222,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const fixture = createCommandFixture({
+      deps,
+      getLcm: async () => ({
+        rotateSessionStorageWithBackup,
+      }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "rotate-runtime-context-session",
+      sessionKey: "agent:main:main",
+    });
+    currentConversationId = currentConversation.conversationId;
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+    const runtimeContext = {
+      provider: "openai",
+      model: "gpt-5.5",
+      config: { agents: { defaults: { model: "openai/gpt-5.5" } } },
+    };
+
+    const result = await fixture.command.handler(
+      createCommandContext("rotate", {
+        sessionId: "rotate-runtime-context-session",
+        sessionKey: "agent:main:main",
+        runtimeContext,
+      }),
+    );
+
+    expect(result.text).toContain("status: rotated");
+    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
+      sessionId: "rotate-runtime-context-session",
+      sessionKey: "agent:main:main",
+      sessionFile: transcriptPath,
+      lockTimeoutMs: 30_000,
+      runtimeContext,
+    });
+  });
+
   it("renders engine-reported rotate stats after waiting for other DB work", async () => {
     const transcriptPath = join(tmpdir(), `lossless-claw-rotate-backup-fail-${Date.now()}.jsonl`);
     writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");

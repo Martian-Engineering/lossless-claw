@@ -4660,6 +4660,68 @@ describe("LcmContextEngine.bootstrap", () => {
     ]);
   });
 
+  it("uses stored compaction telemetry to summarize raw context before automatic rotate", async () => {
+    const sessionFile = createSessionFilePath("lcm-rotate-storage-telemetry-model");
+    const sessionKey = "agent:main:rotate-telemetry-model";
+    const sessionId = "rotate-storage-telemetry-model-session";
+    const transcriptMessages = [
+      { role: "user", content: [{ type: "text", text: "older fact before telemetry rotate" }] },
+      { role: "assistant", content: [{ type: "text", text: "older answer before telemetry rotate" }] },
+      { role: "user", content: [{ type: "text", text: "tail user" }] },
+      { role: "assistant", content: [{ type: "text", text: "tail assistant" }] },
+    ] as AgentMessage[];
+    const sm = SessionManager.open(sessionFile);
+    for (const message of transcriptMessages.slice(0, 2)) {
+      sm.appendMessage(message);
+    }
+
+    const complete = vi.fn(async () => ({
+      content: [{ type: "text", text: "telemetry backed summary" }],
+    }));
+    const resolveModel = vi.fn((modelRef?: string, providerHint?: string) => ({
+      provider: providerHint ?? "fallback",
+      model: modelRef ?? "fallback-model",
+    }));
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 2,
+        leafChunkTokens: 1,
+        leafMinFanout: 1,
+      },
+      {
+        complete,
+        resolveModel,
+      },
+    );
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    for (const message of transcriptMessages.slice(2)) {
+      sm.appendMessage(message);
+    }
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation!.conversationId,
+      cacheState: "unknown",
+      provider: "openai",
+      model: "gpt-5.5",
+    });
+
+    const rotate = await engine.rotateSessionStorageWithBackup({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      lockTimeoutMs: 1_000,
+    });
+
+    expect(rotate).toMatchObject({ kind: "rotated" });
+    expect(resolveModel).toHaveBeenCalledWith("gpt-5.5", "openai");
+    expect(complete).toHaveBeenCalled();
+  });
+
   it("waits for an in-flight managed transaction before backing up and rotating", async () => {
     const sessionFile = createSessionFilePath("lcm-rotate-storage-wait");
     const sessionManager = SessionManager.inMemory(process.cwd());
