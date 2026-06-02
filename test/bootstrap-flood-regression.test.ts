@@ -448,3 +448,110 @@ describe("bootstrap flood regression (PR #280) — round-trip integration", () =
     ).toBe(dbCountAfterBoot);
   });
 });
+
+
+// ── #639: bootstrap replay-flood must fail OPEN, not quarantine the engine ────
+
+describe("bootstrap replay-flood fail-open (#639) — engine stays available", () => {
+  afterEach(() => {
+    closeLcmConnection();
+    for (const dir of tempDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  const userMessage = (text: string): AgentMessage =>
+    ({ role: "user", content: [{ type: "text", text }] }) as AgentMessage;
+  const assistantMessage = (text: string): AgentMessage =>
+    ({ role: "assistant", content: [{ type: "text", text }] }) as AgentMessage;
+  // SQLite `created_at` has second granularity; advance into the next second so
+  // a re-imported row lands strictly after the seeded rows (the flood guard only
+  // fires when a duplicate exists at a strictly-earlier second).
+  const advanceOneSqliteSecond = () => new Promise((resolve) => setTimeout(resolve, 1100));
+
+  it("a user-burst conversation that trips the flood guard during append-only bootstrap is skipped, not thrown", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const sessionFile = createSessionFilePath("failopen-userburst");
+
+    // User-role messages are never exempted by filterBootstrapReplayMessages
+    // (only assistant/tool count as bootstrap replay candidates), so a verbatim
+    // user burst is exactly what tripped the guard in production — conv 6 had
+    // 482 identical user rows at one created_at second.
+    const REPLAY = "verbatim user payload that repeats across the transcript";
+    const sm = SessionManager.open(sessionFile);
+    for (let i = 0; i < 4; i++) {
+      sm.appendMessage(userMessage(REPLAY));
+      sm.appendMessage(assistantMessage(`ack ${i}`));
+    }
+
+    // First bootstrap seeds the DB (first-time import skips the guard by design).
+    const boot1 = await engine.bootstrap({ sessionId, sessionFile });
+    expect(boot1.bootstrapped, "first bootstrap should seed the DB").toBe(true);
+
+    // Advance one SQLite second, append more identical user messages, then
+    // re-bootstrap → the append-only path re-imports them with the guard active.
+    await advanceOneSqliteSecond();
+    for (let i = 0; i < 5; i++) {
+      sm.appendMessage(userMessage(REPLAY));
+      sm.appendMessage(assistantMessage(`ack2 ${i}`));
+    }
+
+    // BEFORE the fix this rejects with ReplayTimestampFloodError, which the host
+    // turns into a whole-engine quarantine (fallback to the legacy engine for
+    // every session in the process). AFTER the fix it must resolve, degraded.
+    const boot2 = await engine.bootstrap({ sessionId, sessionFile });
+    expect(boot2.bootstrapped).toBe(false);
+    expect(boot2.importedMessages).toBe(0);
+    expect(boot2.reason).toBe(
+      "replay-flood guard tripped at bootstrap; conversation skipped",
+    );
+  });
+
+  it("the engine remains usable for OTHER sessions after one conversation trips the guard", async () => {
+    const engine = createEngine();
+
+    // Conversation 1: trips the flood guard on re-bootstrap.
+    const floodSession = randomUUID();
+    const floodFile = createSessionFilePath("failopen-flood");
+    const REPLAY = "verbatim user payload";
+    const floodSm = SessionManager.open(floodFile);
+    for (let i = 0; i < 4; i++) {
+      floodSm.appendMessage(userMessage(REPLAY));
+      floodSm.appendMessage(assistantMessage(`a ${i}`));
+    }
+    await engine.bootstrap({ sessionId: floodSession, sessionFile: floodFile });
+    await advanceOneSqliteSecond();
+    for (let i = 0; i < 5; i++) {
+      floodSm.appendMessage(userMessage(REPLAY));
+      floodSm.appendMessage(assistantMessage(`b ${i}`));
+    }
+    const floodBoot = await engine.bootstrap({
+      sessionId: floodSession,
+      sessionFile: floodFile,
+    });
+    expect(
+      floodBoot.reason,
+      "the offending conversation should be skipped, not throw",
+    ).toBe("replay-flood guard tripped at bootstrap; conversation skipped");
+
+    // Conversation 2: a healthy session must still bootstrap normally on the
+    // SAME engine instance — proving the engine was NOT taken down.
+    const healthySession = randomUUID();
+    const healthyFile = createSessionFilePath("failopen-healthy");
+    const healthySm = SessionManager.open(healthyFile);
+    healthySm.appendMessage(userMessage("hello"));
+    healthySm.appendMessage(assistantMessage("hi there"));
+    healthySm.appendMessage(userMessage("how are you"));
+    healthySm.appendMessage(assistantMessage("doing well"));
+    const healthyBoot = await engine.bootstrap({
+      sessionId: healthySession,
+      sessionFile: healthyFile,
+    });
+    expect(
+      healthyBoot.bootstrapped,
+      "healthy session must bootstrap after the flood skip",
+    ).toBe(true);
+    expect(healthyBoot.importedMessages).toBeGreaterThan(0);
+  });
+});

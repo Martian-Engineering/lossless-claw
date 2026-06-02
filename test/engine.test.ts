@@ -3428,9 +3428,16 @@ describe("LcmContextEngine.bootstrap", () => {
     }
 
     const engineB = createEngineAtDatabasePath(dbPath);
-    await expect(engineB.bootstrap({ sessionId, sessionFile })).rejects.toThrow(
-      "[lcm] refused replay-like message batch",
-    );
+    // #639 fail-open: the flood guard still BLOCKS the replay (nothing new is
+    // persisted -- see the length assertion below), but bootstrap must NOT throw.
+    // A bootstrap throw makes the host quarantine the entire context engine and
+    // fall back to the legacy engine for every session; we now degrade instead.
+    const reboot = await engineB.bootstrap({ sessionId, sessionFile });
+    expect(reboot).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "replay-flood guard tripped at bootstrap; conversation skipped",
+    });
 
     const after = await engineB.getConversationStore().getMessages(conversation!.conversationId);
     expect(after).toHaveLength(before.length);

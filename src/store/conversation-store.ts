@@ -8,6 +8,65 @@ import { buildMessageIdentityHash } from "./message-identity.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 
+/**
+ * Thrown by the {@link ConversationStore} replay-flood guard when a batch of
+ * identical messages exceeds the per-role threshold at a single SQLite
+ * `created_at` second.
+ *
+ * Carries a stable `isReplayTimestampFloodError` marker and a recognizable
+ * message prefix so callers can detect it even after esbuild bundling renames
+ * the class. Bootstrap catches this to fail OPEN (skip the offending
+ * conversation) rather than fail closed and quarantine the whole context
+ * engine -- see issue #639.
+ */
+export class ReplayTimestampFloodError extends Error {
+  readonly isReplayTimestampFloodError = true;
+  readonly conversationId: number;
+  readonly role: string;
+  readonly createdAt: string;
+  readonly replicatedRows: number;
+  readonly threshold: number;
+
+  constructor(params: {
+    conversationId: number;
+    role: string;
+    createdAt: string;
+    replicatedRows: number;
+    threshold: number;
+  }) {
+    super(
+      `[lcm] refused replay-like message batch: conversation=${params.conversationId} role=${params.role} createdAt=${params.createdAt} replicatedRows=${params.replicatedRows} threshold=${params.threshold}`,
+    );
+    this.name = "ReplayTimestampFloodError";
+    this.conversationId = params.conversationId;
+    this.role = params.role;
+    this.createdAt = params.createdAt;
+    this.replicatedRows = params.replicatedRows;
+    this.threshold = params.threshold;
+  }
+}
+
+export function isReplayTimestampFloodError(
+  error: unknown,
+): error is ReplayTimestampFloodError {
+  if (error instanceof ReplayTimestampFloodError) {
+    return true;
+  }
+  if (typeof error === "object" && error !== null) {
+    const candidate = error as { isReplayTimestampFloodError?: unknown; message?: unknown };
+    if (candidate.isReplayTimestampFloodError === true) {
+      return true;
+    }
+    if (
+      typeof candidate.message === "string" &&
+      candidate.message.includes("refused replay-like message batch")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export type ConversationId = number;
 export type MessageId = number;
 export type SummaryId = string;
@@ -1126,9 +1185,13 @@ export class ConversationStore {
       const replicatedCount = existingCount + candidateCount;
       const threshold = this.replayFloodThresholdForRole(role!);
       if (replicatedCount >= threshold) {
-        throw new Error(
-          `[lcm] refused replay-like message batch: conversation=${conversationId} role=${role} createdAt=${createdAt} replicatedRows=${replicatedCount} threshold=${threshold}`,
-        );
+        throw new ReplayTimestampFloodError({
+          conversationId,
+          role: role!,
+          createdAt: createdAt!,
+          replicatedRows: replicatedCount,
+          threshold,
+        });
       }
     }
   }

@@ -62,6 +62,7 @@ import {
 } from "./store/compaction-maintenance-store.js";
 import {
   ConversationStore,
+  isReplayTimestampFloodError,
   type ConversationRecord,
   type CreateMessagePartInput,
   type MessagePartRecord,
@@ -7104,7 +7105,9 @@ export class LcmContextEngine implements ContextEngine {
     const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
     const parentSessionReference = await readSessionParentSessionReference(params.sessionFile);
 
-    const result = await this.withSessionQueue(
+    let result: BootstrapResult;
+    try {
+      result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () =>
         this.conversationStore.withTransaction(async () => {
@@ -7522,6 +7525,24 @@ export class LcmContextEngine implements ContextEngine {
         }),
       { operationName: "bootstrap", context: sessionLabel },
     );
+    } catch (error) {
+      // #639 fail-OPEN: a single conversation tripping the replay-flood guard
+      // during bootstrap must NOT propagate out of bootstrap(), because the
+      // host quarantines the entire context engine on a bootstrap throw and
+      // falls back to the legacy engine for every session in the process.
+      // Skip just this conversation and keep the engine available.
+      if (isReplayTimestampFloodError(error)) {
+        this.deps.log.warn(
+          `[lcm] bootstrap: replay-flood guard tripped for ${sessionLabel}; skipping this conversation's bootstrap to keep the context engine available for all other sessions (#639 fail-open). ${describeLogError(error)}`,
+        );
+        return {
+          bootstrapped: false,
+          importedMessages: 0,
+          reason: "replay-flood guard tripped at bootstrap; conversation skipped",
+        };
+      }
+      throw error;
+    }
 
     // Post-bootstrap pruning: clean HEARTBEAT_OK turns that were already
     // in the DB from prior bootstrap cycles (before pruning was enabled).
