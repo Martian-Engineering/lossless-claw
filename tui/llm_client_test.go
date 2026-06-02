@@ -228,7 +228,7 @@ func TestSummarizeAnthropicOAuthDelegatesToCLI(t *testing.T) {
 	}
 }
 
-func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
+func TestSummarizeAnthropicOAuthCapsOversizeCLIOutput(t *testing.T) {
 	stubClaudeCLI(t)
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
 	t.Setenv("LCM_HELPER_STDOUT", strings.Repeat("word ", 200))
@@ -242,12 +242,15 @@ func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
 		http:     &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) { return nil, nil })},
 	}
 
-	_, err := client.summarize(context.Background(), "oversized", 32)
-	if err == nil {
-		t.Fatal("expected summarize to reject oversized CLI output")
+	summary, err := client.summarize(context.Background(), "oversized", 32)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "exceeded target token budget") {
-		t.Fatalf("unexpected error: %v", err)
+	if estimateTokenCount(summary) > 32+cliOutputTokenSlack {
+		t.Fatalf("expected capped summary within slack limit, got %d tokens", estimateTokenCount(summary))
+	}
+	if !strings.Contains(summary, "[Capped") {
+		t.Fatalf("expected capped marker, got %q", summary)
 	}
 }
 
