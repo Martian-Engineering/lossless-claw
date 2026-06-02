@@ -980,6 +980,13 @@ function escapeXmlAttribute(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
+function escapeXmlText(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 /** Format a Date for XML attributes in the agent's timezone. */
 function formatDateForAttribute(date: Date, timezone?: string): string {
   const tz = timezone ?? "UTC";
@@ -1012,8 +1019,8 @@ async function formatSummaryContent(
   timezone?: string,
 ): Promise<string> {
   const attributes = [
-    `id="${summary.summaryId}"`,
-    `kind="${summary.kind}"`,
+    `id="${escapeXmlAttribute(summary.summaryId)}"`,
+    `kind="${escapeXmlAttribute(summary.kind)}"`,
     `depth="${summary.depth}"`,
     `descendant_count="${summary.descendantCount}"`,
     // Taint label (issue #71): marks summary content as untrusted historical
@@ -1037,14 +1044,14 @@ async function formatSummaryContent(
     if (parents.length > 0) {
       lines.push("  <parents>");
       for (const parent of parents) {
-        lines.push(`    <summary_ref id="${parent.summaryId}" />`);
+        lines.push(`    <summary_ref id="${escapeXmlAttribute(parent.summaryId)}" />`);
       }
       lines.push("  </parents>");
     }
   }
 
   lines.push("  <content>");
-  lines.push(summary.content);
+  lines.push(escapeXmlText(summary.content));
   lines.push("  </content>");
   lines.push("</summary>");
   return lines.join("\n");
