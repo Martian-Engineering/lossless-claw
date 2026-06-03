@@ -32,6 +32,7 @@ const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.5.22";
 
 type ContextEngineCapableOpenClawPluginApi = OpenClawPluginApi & {
   registerContextEngine: (id: string, factory: ContextEngineFactory) => void;
+  registerTool: NonNullable<OpenClawPluginApi["registerTool"]>;
 };
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */

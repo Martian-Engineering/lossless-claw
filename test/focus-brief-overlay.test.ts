@@ -246,7 +246,6 @@ describe("focus brief assembly overlay", () => {
       depth: 1,
       content: "Condensed summary content that should be masked.",
       tokenCount: 8,
-      latestAt: null,
       sourceMessageTokenCount: 0,
     });
     await summaryStore.linkSummaryToParents("covered_condensed_summary", ["condensed_leaf_summary"]);

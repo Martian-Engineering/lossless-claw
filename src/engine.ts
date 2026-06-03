@@ -171,7 +171,7 @@ type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
   sessionKey?: string;
-  tokenBudget: number;
+  tokenBudget?: number;
   currentTokenCount?: number;
   compactionTarget?: "budget" | "threshold";
   customInstructions?: string;
@@ -1297,7 +1297,7 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
     "content" in message
       ? extractMessageContent(message.content)
       : "output" in message
-        ? `$ ${(message as { command: string; output: string }).command}\n${(message as { command: string; output: string }).output}`
+        ? `$ ${String(message.command ?? "")}\n${String(message.output)}`
         : "";
   const runtimeRole = toRuntimeRoleForTokenEstimate(message.role);
   const normalizedContent =
@@ -1625,14 +1625,18 @@ function extractRuntimePromptTokenCount(runtimeContext?: Record<string, unknown>
   }
 
   // 2. Sum from runtimeContext.usage (normalizeUsage output: {input, cacheRead, cacheWrite})
-  const usageSum = sumPromptTokensFromUsageRecord(asRecord(ctx["usage"]) ?? asRecord(ctx["lastCallUsage"]));
+  const usageSum = sumPromptTokensFromUsageRecord(
+    asRecord(ctx["usage"]) ?? asRecord(ctx["lastCallUsage"]) ?? null,
+  );
   if (usageSum !== undefined && usageSum > 0) {
     return usageSum;
   }
 
   // 3. Sum from promptCache.lastCallUsage (same normalized shape)
   const promptCache = asRecord(ctx["promptCache"]);
-  const promptCacheUsageSum = sumPromptTokensFromUsageRecord(asRecord(promptCache?.["lastCallUsage"]));
+  const promptCacheUsageSum = sumPromptTokensFromUsageRecord(
+    asRecord(promptCache?.["lastCallUsage"]) ?? null,
+  );
   if (promptCacheUsageSum !== undefined && promptCacheUsageSum > 0) {
     return promptCacheUsageSum;
   }
@@ -3340,7 +3344,7 @@ export class LcmContextEngine implements ContextEngine {
   private retrieval: RetrievalEngine;
   private readonly db: DatabaseSync;
   private migrated = false;
-  private readonly fts5Available: boolean;
+  private readonly fts5Available: boolean = false;
   private readonly ignoreSessionPatterns: RegExp[];
   private readonly statelessSessionPatterns: RegExp[];
   private sessionOperationQueues = new Map<
@@ -8288,6 +8292,7 @@ export class LcmContextEngine implements ContextEngine {
     autoCompactionSummary?: string;
     isHeartbeat?: boolean;
     tokenBudget?: number;
+    currentTokenCount?: number;
     /** OpenClaw runtime param name (preferred). */
     runtimeContext?: Record<string, unknown>;
     /** Back-compat param name. */
@@ -8496,6 +8501,7 @@ export class LcmContextEngine implements ContextEngine {
     const estimatedContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
     const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
     const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
+      params.currentTokenCount ??
       (
         (legacyParams ?? {}) as {
           currentTokenCount?: unknown;
@@ -10349,7 +10355,7 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    const entriesToKeep: Array<Record<string, unknown>> = [];
+    const entriesToKeep: Array<(typeof branch)[number]> = [];
     for (const type of ["session_info", "model_change", "thinking_level_change"] as const) {
       const entry = latestPreludeEntries.get(type);
       if (entry) {
@@ -10369,7 +10375,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     let previousEntryId: string | null = null;
-    const linearizedEntries = entriesToKeep.map((entry) => {
+    const linearizedEntries = entriesToKeep.map((entry): (typeof branch)[number] => {
       const nextEntry = {
         ...entry,
         parentId: previousEntryId,

@@ -623,7 +623,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       const deps = makeDeps({
         complete: vi.fn(
           () =>
-            new Promise(() => {
+            new Promise<Awaited<ReturnType<LcmDependencies["complete"]>>>(() => {
               // Intentionally unresolved to exercise the timeout fallback path.
             }),
         ),
@@ -1067,8 +1067,9 @@ describe("createLcmSummarizeFromLegacyParams", () => {
   });
 
     it("propagates runtime llm auth failures without direct credential retry", async () => {
+      const baseConfig = makeDeps().config;
       const deps = makeDeps({
-        config: { summaryTimeoutMs: 60_000 },
+        config: { ...baseConfig, summaryTimeoutMs: 60_000 },
         resolveModel: vi.fn(() => ({
           provider: "openai-codex",
           model: "gpt-5.4",

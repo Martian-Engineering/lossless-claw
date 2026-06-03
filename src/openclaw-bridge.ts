@@ -1,13 +1,31 @@
-export type {
-  AnyAgentTool,
-} from "openclaw/plugin-sdk";
-
 /**
  * Compatibility bridge for plugin-sdk context-engine symbols.
  *
  * This module intentionally keeps the context-engine contract local because
  * older OpenClaw SDK packages do not publish these newer type symbols yet.
  */
+
+export type AnyAgentTool = {
+  name: string;
+  label?: string;
+  description?: string;
+  parameters?: unknown;
+  execute: (toolCallId: string, params: Record<string, unknown>) => any | Promise<any>;
+  [key: string]: any;
+};
+
+export type PluginLifecycleContext = {
+  sessionId?: string;
+  sessionKey?: string;
+  [key: string]: any;
+};
+
+export type PluginLifecycleEvent = {
+  reason?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  [key: string]: any;
+};
 
 export type ContextEngineProjection = {
   mode: "per_turn" | "thread_bootstrap";
@@ -34,7 +52,7 @@ export type CompactResult = {
   reason?: string;
   summaryId?: string;
   error?: string;
-  result?: unknown;
+  result?: any;
 };
 
 export type IngestResult = {
@@ -84,7 +102,7 @@ export type PluginCommandContext = {
 export type OpenClawPluginCommandDefinition = {
   name?: string;
   description?: string;
-  handler?: (ctx: PluginCommandContext) => unknown | Promise<unknown>;
+  handler: (ctx: PluginCommandContext) => any | Promise<any>;
   [key: string]: any;
 };
 
@@ -97,6 +115,14 @@ export type OpenClawPluginApi = {
   log?: any;
   registerCommand: (definition: OpenClawPluginCommandDefinition) => void;
   registerContextEngine?: (id: string, factory: ContextEngineFactory) => void;
+  registerTool?: (
+    factory: (ctx: PluginLifecycleContext) => AnyAgentTool | Promise<AnyAgentTool>,
+    options?: { name?: string; [key: string]: any },
+  ) => void;
+  on: (
+    eventName: string,
+    handler: (event: PluginLifecycleEvent, ctx: PluginLifecycleContext) => unknown | Promise<unknown>,
+  ) => void;
   [key: string]: any;
 };
 
@@ -109,6 +135,9 @@ export type AgentMessage = {
   toolName?: string;
   details?: any;
   isError?: boolean;
+  stopReason?: string;
+  command?: string;
+  output?: unknown;
 };
 
 export type ContextEngine = {

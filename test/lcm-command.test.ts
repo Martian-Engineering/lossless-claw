@@ -16,10 +16,7 @@ import type { LcmDependencies } from "../src/types.js";
 function createCommandFixture(options?: {
   summarize?: LcmSummarizeFn;
   deps?: LcmDependencies;
-  getLcm?: () => Promise<{
-    rotateSessionStorageWithBackup: (...args: unknown[]) => Promise<unknown>;
-    compact?: (...args: unknown[]) => Promise<unknown>;
-  }>;
+  getLcm?: () => Promise<any>;
 }) {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-command-"));
   const dbPath = join(tempDir, "lcm.db");
@@ -2061,7 +2058,7 @@ describe("lcm command", () => {
     const hostBoundComplete = vi.fn(async () => ({
       text: "HOST BOUND REPAIR",
     }));
-    const runtimeComplete = vi.fn(async () => ({
+    const runtimeComplete = vi.fn(async (_params: Parameters<LcmDependencies["complete"]>[0]) => ({
       content: [{ type: "text", text: "RUNTIME REPAIR" }],
     }));
     const config = resolveLcmConfig({}, { dbPath: "/tmp/unused.db" });
