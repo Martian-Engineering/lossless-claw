@@ -11357,6 +11357,89 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).resolves.toBeNull();
   });
 
+  it("isolates cron runs that reuse a stable sessionKey while preserving prior runs", async () => {
+    const engine = createEngine();
+    const firstSessionId = "cron-isolated-stable-key-run-1";
+    const secondSessionId = "cron-isolated-stable-key-run-2";
+    const sessionKey = "agent:main:cron:nightly";
+
+    const oldSessionFile = createSessionFilePath("cron-isolated-stable-key-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "prior cron input should stay archived" },
+      { role: "assistant", content: "prior cron output should not leak" },
+    ]);
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+
+    const priorConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(priorConversation).not.toBeNull();
+
+    const newSessionFile = createSessionFilePath("cron-isolated-stable-key-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "current cron input" },
+      { role: "assistant", content: "current cron output" },
+    ]);
+
+    const result = await engine.bootstrap({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+    });
+
+    expect(result).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const activeConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: secondSessionId,
+      sessionKey,
+    });
+    expect(activeConversation).not.toBeNull();
+    expect(activeConversation!.conversationId).not.toBe(priorConversation!.conversationId);
+    expect(activeConversation!.sessionId).toBe(secondSessionId);
+
+    const archivedPrior = await engine.getConversationStore().getConversation(
+      priorConversation!.conversationId,
+    );
+    expect(archivedPrior?.active).toBe(false);
+    const priorMessages = await engine.getConversationStore().getMessages(
+      priorConversation!.conversationId,
+    );
+    expect(priorMessages.map((message) => message.content)).toEqual([
+      "prior cron input should stay archived",
+      "prior cron output should not leak",
+    ]);
+
+    const activeMessages = await engine.getConversationStore().getMessages(
+      activeConversation!.conversationId,
+    );
+    expect(activeMessages.map((message) => message.content)).toEqual([
+      "current cron input",
+      "current cron output",
+    ]);
+
+    const assembled = await engine.assemble({
+      sessionId: secondSessionId,
+      sessionKey,
+      messages: [makeMessage({ role: "user", content: "current live cron prompt" })],
+      tokenBudget: 4_096,
+    });
+    const assembledText = assembled.messages
+      .map((message) =>
+        typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+      )
+      .join("\n");
+    expect(assembledText).toContain("current cron input");
+    expect(assembledText).not.toContain("prior cron output should not leak");
+  });
+
   it("afterTurn fails closed on ambiguous runtime rollover while the old transcript still exists", async () => {
     const warnLog = vi.fn();
     const engine = createEngineWithDeps(

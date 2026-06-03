@@ -314,6 +314,8 @@ Lossless-claw applies `/new` pruning through `before_reset` and uses `session_en
 
 Use `ignoreSessionPatterns` or `LCM_IGNORE_SESSION_PATTERNS` to keep low-value sessions completely out of LCM. Matching sessions do not create conversations, do not store messages, and do not participate in compaction or delegated expansion grants.
 
+Cron scheduler keys (`agent:<agent>:cron:<job>...`) are isolated automatically when OpenClaw reuses the same `sessionKey` for a new runtime `sessionId`: lossless-claw archives the prior active run and creates a fresh LCM conversation for the new run. Leave cron sessions out of `ignoreSessionPatterns` when they need in-run LCM compaction.
+
 Pattern rules:
 
 - `*` matches any characters except `:`
@@ -322,7 +324,7 @@ Pattern rules:
 
 Examples:
 
-- `agent:*:cron:**` excludes cron sessions for any agent, including isolated run sessions like `agent:main:cron:daily-digest:run:run-123`
+- `agent:*:cron:**` excludes cron sessions for any agent when you want to bypass LCM entirely
 - `agent:main:subagent:**` excludes all main-agent subagent sessions
 - `agent:ops:**` excludes every session under the `ops` agent id
 

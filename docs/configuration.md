@@ -308,6 +308,8 @@ LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
 - `*` matches any characters except `:`
 - `**` matches anything, including `:`
 
+Cron scheduler keys (`agent:<agent>:cron:<job>...`) are isolated automatically when a new runtime `sessionId` reuses the same `sessionKey`. Configure `ignoreSessionPatterns` for cron only when the run should bypass LCM entirely; leave cron sessions included when they need in-run compaction.
+
 Example:
 
 ```json
