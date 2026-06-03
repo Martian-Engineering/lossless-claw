@@ -3,6 +3,7 @@ import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
+import { buildMessageIdentityHash } from "./message-identity.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 
@@ -144,6 +145,90 @@ export type TranscriptGcCandidateRecord = {
   originalByteSize: number | null;
 };
 
+export type CompactionBatchStatus = "pending" | "ready" | "active" | "superseded" | "failed";
+
+export type CompactionBatchRecord = {
+  batchId: string;
+  conversationId: number;
+  generation: number;
+  status: CompactionBatchStatus;
+  sourceMinSeq: number | null;
+  sourceMaxSeq: number | null;
+  reason: string | null;
+  error: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  publishedAt: Date | null;
+};
+
+export type CreateCompactionBatchInput = {
+  batchId: string;
+  conversationId: number;
+  generation?: number;
+  sourceMinSeq?: number | null;
+  sourceMaxSeq?: number | null;
+  reason?: string | null;
+};
+
+export type PendingCompactionSummaryInput = {
+  batchId: string;
+  summaryId: string;
+  ordinal: number;
+  conversationId: number;
+  kind: SummaryKind;
+  depth?: number;
+  content: string;
+  tokenCount: number;
+  fileIds?: string[];
+  earliestAt?: Date;
+  latestAt?: Date;
+  descendantCount?: number;
+  descendantTokenCount?: number;
+  sourceMessageTokenCount?: number;
+  model?: string;
+  sourceStartSeq?: number | null;
+  sourceEndSeq?: number | null;
+  sourceMessageIds: number[];
+  sourceIdentityHashes: string[];
+  previousSummaryIds?: string[];
+};
+
+export type PendingCompactionSummaryRecord = {
+  batchId: string;
+  summaryId: string;
+  ordinal: number;
+  status: CompactionBatchStatus;
+  conversationId: number;
+  kind: SummaryKind;
+  depth: number;
+  content: string;
+  tokenCount: number;
+  fileIds: string[];
+  earliestAt: Date | null;
+  latestAt: Date | null;
+  descendantCount: number;
+  descendantTokenCount: number;
+  sourceMessageTokenCount: number;
+  model: string;
+  sourceStartSeq: number | null;
+  sourceEndSeq: number | null;
+  sourceMessageIds: number[];
+  sourceIdentityHashes: string[];
+  previousSummaryIds: string[];
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type PreparedCompactionPublishResult = {
+  published: boolean;
+  batchId?: string;
+  summaryIds: string[];
+  tokensRemoved: number;
+  tokensAdded: number;
+  partial: boolean;
+  reason?: string;
+};
+
 // ── DB row shapes (snake_case) ────────────────────────────────────────────────
 
 interface SummaryRow {
@@ -250,7 +335,91 @@ interface TranscriptGcCandidateRow {
   tool_name: string | null;
   metadata: string | null;
 }
+
+interface CompactionBatchRow {
+  batch_id: string;
+  conversation_id: number;
+  generation: number;
+  status: CompactionBatchStatus;
+  source_min_seq: number | null;
+  source_max_seq: number | null;
+  reason: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  published_at: string | null;
+}
+
+interface PendingCompactionSummaryRow {
+  batch_id: string;
+  summary_id: string;
+  ordinal: number;
+  status: CompactionBatchStatus;
+  conversation_id: number;
+  kind: SummaryKind;
+  depth: number;
+  content: string;
+  token_count: number;
+  file_ids: string;
+  earliest_at: string | null;
+  latest_at: string | null;
+  descendant_count: number | null;
+  descendant_token_count: number | null;
+  source_message_token_count: number | null;
+  model: string | null;
+  source_start_seq: number | null;
+  source_end_seq: number | null;
+  source_message_ids: string;
+  source_identity_hashes: string;
+  previous_summary_ids: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface PublishMessageRow {
+  message_id: number;
+  seq: number;
+  role: string;
+  content: string;
+  token_count: number;
+}
+
+interface ActiveRawCoverageRow {
+  message_id: number;
+  seq: number;
+  ordinal: number;
+}
 // ── Row mappers ───────────────────────────────────────────────────────────────
+
+function parseJsonStringArray(value: string | null | undefined): string[] {
+  if (typeof value !== "string") {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((entry): entry is string => typeof entry === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseJsonNumberArray(value: string | null | undefined): number[] {
+  if (typeof value !== "string") {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed
+          .filter((entry): entry is number => Number.isInteger(entry) && entry > 0)
+          .map((entry) => Math.floor(entry))
+      : [];
+  } catch {
+    return [];
+  }
+}
 
 function toSummaryRecord(row: SummaryRow): SummaryRecord {
   let fileIds: string[] = [];
@@ -289,6 +458,67 @@ function toSummaryRecord(row: SummaryRow): SummaryRecord {
         : 0,
     model: typeof row.model === "string" ? row.model : "unknown",
     createdAt: parseUtcTimestamp(row.created_at),
+  };
+}
+
+function toCompactionBatchRecord(row: CompactionBatchRow): CompactionBatchRecord {
+  return {
+    batchId: row.batch_id,
+    conversationId: row.conversation_id,
+    generation: row.generation,
+    status: row.status,
+    sourceMinSeq: row.source_min_seq,
+    sourceMaxSeq: row.source_max_seq,
+    reason: row.reason,
+    error: row.error,
+    createdAt: parseUtcTimestamp(row.created_at),
+    updatedAt: parseUtcTimestamp(row.updated_at),
+    publishedAt: parseUtcTimestampOrNull(row.published_at),
+  };
+}
+
+function toPendingCompactionSummaryRecord(
+  row: PendingCompactionSummaryRow,
+): PendingCompactionSummaryRecord {
+  return {
+    batchId: row.batch_id,
+    summaryId: row.summary_id,
+    ordinal: row.ordinal,
+    status: row.status,
+    conversationId: row.conversation_id,
+    kind: row.kind,
+    depth: row.depth,
+    content: row.content,
+    tokenCount: row.token_count,
+    fileIds: parseJsonStringArray(row.file_ids),
+    earliestAt: parseUtcTimestampOrNull(row.earliest_at),
+    latestAt: parseUtcTimestampOrNull(row.latest_at),
+    descendantCount:
+      typeof row.descendant_count === "number" &&
+      Number.isFinite(row.descendant_count) &&
+      row.descendant_count >= 0
+        ? Math.floor(row.descendant_count)
+        : 0,
+    descendantTokenCount:
+      typeof row.descendant_token_count === "number" &&
+      Number.isFinite(row.descendant_token_count) &&
+      row.descendant_token_count >= 0
+        ? Math.floor(row.descendant_token_count)
+        : 0,
+    sourceMessageTokenCount:
+      typeof row.source_message_token_count === "number" &&
+      Number.isFinite(row.source_message_token_count) &&
+      row.source_message_token_count >= 0
+        ? Math.floor(row.source_message_token_count)
+        : 0,
+    model: typeof row.model === "string" ? row.model : "unknown",
+    sourceStartSeq: row.source_start_seq,
+    sourceEndSeq: row.source_end_seq,
+    sourceMessageIds: parseJsonNumberArray(row.source_message_ids),
+    sourceIdentityHashes: parseJsonStringArray(row.source_identity_hashes),
+    previousSummaryIds: parseJsonStringArray(row.previous_summary_ids),
+    createdAt: parseUtcTimestamp(row.created_at),
+    updatedAt: parseUtcTimestamp(row.updated_at),
   };
 }
 
@@ -876,6 +1106,771 @@ export class SummaryStore {
   /** Serialize a multi-step summary write sequence on the shared database. */
   async withTransaction<T>(operation: () => Promise<T> | T): Promise<T> {
     return withDatabaseTransaction(this.db, "BEGIN", operation);
+  }
+
+  // ── Prepared compaction batches ─────────────────────────────────────────
+
+  async createCompactionBatch(input: CreateCompactionBatchInput): Promise<CompactionBatchRecord> {
+    const generation =
+      typeof input.generation === "number" &&
+      Number.isFinite(input.generation) &&
+      input.generation >= 0
+        ? Math.floor(input.generation)
+        : ((this.db
+            .prepare(
+              `SELECT COALESCE(MAX(generation), -1) + 1 AS generation
+               FROM compaction_batches
+               WHERE conversation_id = ?`,
+            )
+            .get(input.conversationId) as { generation: number } | undefined)?.generation ?? 0);
+
+    this.db
+      .prepare(
+        `INSERT INTO compaction_batches (
+           batch_id,
+           conversation_id,
+           generation,
+           status,
+           source_min_seq,
+           source_max_seq,
+           reason
+         )
+         VALUES (?, ?, ?, 'pending', ?, ?, ?)`,
+      )
+      .run(
+        input.batchId,
+        input.conversationId,
+        generation,
+        input.sourceMinSeq ?? null,
+        input.sourceMaxSeq ?? null,
+        input.reason ?? null,
+      );
+
+    const row = this.db
+      .prepare(
+        `SELECT batch_id, conversation_id, generation, status, source_min_seq, source_max_seq,
+                reason, error, created_at, updated_at, published_at
+         FROM compaction_batches
+         WHERE batch_id = ?`,
+      )
+      .get(input.batchId) as unknown as CompactionBatchRow;
+    return toCompactionBatchRecord(row);
+  }
+
+  async insertPendingCompactionSummary(input: PendingCompactionSummaryInput): Promise<void> {
+    const depth =
+      typeof input.depth === "number" && Number.isFinite(input.depth) && input.depth >= 0
+        ? Math.floor(input.depth)
+        : input.kind === "leaf"
+          ? 0
+          : 1;
+    const descendantCount =
+      typeof input.descendantCount === "number" &&
+      Number.isFinite(input.descendantCount) &&
+      input.descendantCount >= 0
+        ? Math.floor(input.descendantCount)
+        : 0;
+    const descendantTokenCount =
+      typeof input.descendantTokenCount === "number" &&
+      Number.isFinite(input.descendantTokenCount) &&
+      input.descendantTokenCount >= 0
+        ? Math.floor(input.descendantTokenCount)
+        : 0;
+    const sourceMessageTokenCount =
+      typeof input.sourceMessageTokenCount === "number" &&
+      Number.isFinite(input.sourceMessageTokenCount) &&
+      input.sourceMessageTokenCount >= 0
+        ? Math.floor(input.sourceMessageTokenCount)
+        : 0;
+
+    this.db
+      .prepare(
+        `INSERT INTO compaction_batch_summaries (
+           batch_id,
+           summary_id,
+           ordinal,
+           status,
+           conversation_id,
+           kind,
+           depth,
+           content,
+           token_count,
+           file_ids,
+           earliest_at,
+           latest_at,
+           descendant_count,
+           descendant_token_count,
+           source_message_token_count,
+           model,
+           source_start_seq,
+           source_end_seq,
+           source_message_ids,
+           source_identity_hashes,
+           previous_summary_ids
+         )
+         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.batchId,
+        input.summaryId,
+        Math.max(0, Math.floor(input.ordinal)),
+        input.conversationId,
+        input.kind,
+        depth,
+        input.content,
+        Math.max(0, Math.floor(input.tokenCount)),
+        JSON.stringify(input.fileIds ?? []),
+        input.earliestAt instanceof Date ? input.earliestAt.toISOString() : null,
+        input.latestAt instanceof Date ? input.latestAt.toISOString() : null,
+        descendantCount,
+        descendantTokenCount,
+        sourceMessageTokenCount,
+        input.model ?? "unknown",
+        input.sourceStartSeq ?? null,
+        input.sourceEndSeq ?? null,
+        JSON.stringify(input.sourceMessageIds),
+        JSON.stringify(input.sourceIdentityHashes),
+        JSON.stringify(input.previousSummaryIds ?? []),
+      );
+  }
+
+  async markCompactionBatchReady(batchId: string): Promise<void> {
+    await this.withTransaction(() => {
+      const summaryCount = (this.db
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM compaction_batch_summaries
+           WHERE batch_id = ?`,
+        )
+        .get(batchId) as { count: number } | undefined)?.count ?? 0;
+      const status: CompactionBatchStatus = summaryCount > 0 ? "ready" : "failed";
+      const error = summaryCount > 0 ? null : "prepared batch contains no summaries";
+      this.db
+        .prepare(
+          `UPDATE compaction_batches
+           SET status = ?, error = ?, updated_at = datetime('now')
+           WHERE batch_id = ?
+             AND status = 'pending'`,
+        )
+        .run(status, error, batchId);
+      this.db
+        .prepare(
+          `UPDATE compaction_batch_summaries
+           SET status = ?, updated_at = datetime('now')
+           WHERE batch_id = ?
+             AND status = 'pending'`,
+        )
+        .run(status, batchId);
+    });
+  }
+
+  async getLatestReadyCompactionBatch(
+    conversationId: number,
+  ): Promise<CompactionBatchRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT batch_id, conversation_id, generation, status, source_min_seq, source_max_seq,
+                reason, error, created_at, updated_at, published_at
+         FROM compaction_batches
+         WHERE conversation_id = ?
+           AND status = 'ready'
+         ORDER BY generation DESC, created_at DESC, batch_id DESC
+         LIMIT 1`,
+      )
+      .get(conversationId) as unknown as CompactionBatchRow | undefined;
+    return row ? toCompactionBatchRecord(row) : null;
+  }
+
+  async getCompactionBatchSummaries(
+    batchId: string,
+  ): Promise<PendingCompactionSummaryRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT batch_id, summary_id, ordinal, status, conversation_id, kind, depth, content,
+                token_count, file_ids, earliest_at, latest_at, descendant_count,
+                descendant_token_count, source_message_token_count, model,
+                source_start_seq, source_end_seq, source_message_ids,
+                source_identity_hashes, previous_summary_ids, created_at, updated_at
+         FROM compaction_batch_summaries
+         WHERE batch_id = ?
+         ORDER BY ordinal`,
+      )
+      .all(batchId) as unknown as PendingCompactionSummaryRow[];
+    return rows.map(toPendingCompactionSummaryRecord);
+  }
+
+  async invalidatePendingCompactionBatches(
+    conversationId: number,
+    reason: string,
+  ): Promise<number> {
+    return this.withTransaction(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT batch_id
+           FROM compaction_batches
+           WHERE conversation_id = ?
+             AND status IN ('pending', 'ready')`,
+        )
+        .all(conversationId) as { batch_id: string }[];
+      if (rows.length === 0) {
+        return 0;
+      }
+      const batchIds = rows.map((row) => row.batch_id);
+      const placeholders = batchIds.map(() => "?").join(", ");
+      this.db
+        .prepare(
+          `UPDATE compaction_batch_summaries
+           SET status = 'superseded', updated_at = datetime('now')
+           WHERE batch_id IN (${placeholders})
+             AND status IN ('pending', 'ready')`,
+        )
+        .run(...batchIds);
+      this.db
+        .prepare(
+          `UPDATE compaction_batches
+           SET status = 'superseded',
+               error = ?,
+               updated_at = datetime('now')
+           WHERE batch_id IN (${placeholders})
+             AND status IN ('pending', 'ready')`,
+        )
+        .run(reason, ...batchIds);
+      return batchIds.length;
+    });
+  }
+
+  async publishLatestReadyCompactionBatch(input: {
+    conversationId: number;
+    maxSourceOrdinalExclusive?: number;
+  }): Promise<PreparedCompactionPublishResult> {
+    return this.withTransaction(() => {
+      const batch = this.db
+        .prepare(
+          `SELECT batch_id, conversation_id, generation, status, source_min_seq, source_max_seq,
+                  reason, error, created_at, updated_at, published_at
+           FROM compaction_batches
+           WHERE conversation_id = ?
+             AND status = 'ready'
+           ORDER BY generation DESC, created_at DESC, batch_id DESC
+           LIMIT 1`,
+        )
+        .get(input.conversationId) as unknown as CompactionBatchRow | undefined;
+      if (!batch) {
+        return {
+          published: false,
+          summaryIds: [],
+          tokensRemoved: 0,
+          tokensAdded: 0,
+          partial: false,
+          reason: "no ready prepared batch",
+        };
+      }
+
+      return this.publishReadyCompactionBatchInTransaction({
+        batch: toCompactionBatchRecord(batch),
+        maxSourceOrdinalExclusive: input.maxSourceOrdinalExclusive,
+      });
+    });
+  }
+
+  private publishReadyCompactionBatchInTransaction(input: {
+    batch: CompactionBatchRecord;
+    maxSourceOrdinalExclusive?: number;
+  }): PreparedCompactionPublishResult {
+    const { batch } = input;
+    const pending = this.getPendingRowsForPublish(batch.batchId);
+    if (pending.length === 0) {
+      this.markBatchFailedInTransaction(batch.batchId, "prepared batch contains no summaries");
+      return {
+        published: false,
+        batchId: batch.batchId,
+        summaryIds: [],
+        tokensRemoved: 0,
+        tokensAdded: 0,
+        partial: false,
+        reason: "prepared batch contains no summaries",
+      };
+    }
+
+    const contextItems = this.db
+      .prepare(
+        `SELECT conversation_id, ordinal, item_type, message_id, summary_id, created_at
+         FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
+      )
+      .all(batch.conversationId) as unknown as ContextItemRow[];
+    const contextByMessageId = new Map<number, ContextItemRow>();
+    for (const item of contextItems) {
+      if (item.item_type === "message" && item.message_id != null) {
+        contextByMessageId.set(item.message_id, item);
+      }
+    }
+
+    const ops: Array<{
+      summary: PendingCompactionSummaryRecord;
+      startOrdinal: number;
+      endOrdinal: number;
+      messageIds: number[];
+    }> = [];
+    let blockedByFreshTail = false;
+    for (const summary of pending) {
+      const validation = this.validatePendingSummaryForPublish({
+        summary,
+        conversationId: batch.conversationId,
+        contextByMessageId,
+        maxSourceOrdinalExclusive: input.maxSourceOrdinalExclusive,
+      });
+      if (validation.kind === "fresh-tail") {
+        blockedByFreshTail = true;
+        break;
+      }
+      if (validation.kind === "stale") {
+        this.markBatchSupersededInTransaction(batch.batchId, validation.reason);
+        return {
+          published: false,
+          batchId: batch.batchId,
+          summaryIds: [],
+          tokensRemoved: 0,
+          tokensAdded: 0,
+          partial: false,
+          reason: validation.reason,
+        };
+      }
+      ops.push({
+        summary,
+        startOrdinal: validation.startOrdinal,
+        endOrdinal: validation.endOrdinal,
+        messageIds: validation.messageIds,
+      });
+    }
+
+    if (ops.length === 0) {
+      this.markBatchSupersededInTransaction(
+        batch.batchId,
+        blockedByFreshTail
+          ? "prepared summaries are still inside the protected fresh tail"
+          : "prepared batch has no publishable summaries",
+      );
+      return {
+        published: false,
+        batchId: batch.batchId,
+        summaryIds: [],
+        tokensRemoved: 0,
+        tokensAdded: 0,
+        partial: false,
+        reason: blockedByFreshTail
+          ? "prepared summaries are still inside the protected fresh tail"
+          : "prepared batch has no publishable summaries",
+      };
+    }
+
+    const coverageReason = this.validatePreparedPublishActiveRawCoverage({
+      conversationId: batch.conversationId,
+      ops,
+    });
+    if (coverageReason) {
+      this.markBatchSupersededInTransaction(batch.batchId, coverageReason);
+      return {
+        published: false,
+        batchId: batch.batchId,
+        summaryIds: [],
+        tokensRemoved: 0,
+        tokensAdded: 0,
+        partial: false,
+        reason: coverageReason,
+      };
+    }
+
+    const existingSummaryIds = this.countExistingSummaries(ops.map((op) => op.summary.summaryId));
+    if (existingSummaryIds > 0) {
+      this.markBatchSupersededInTransaction(
+        batch.batchId,
+        "prepared summary id already exists in canonical summaries",
+      );
+      return {
+        published: false,
+        batchId: batch.batchId,
+        summaryIds: [],
+        tokensRemoved: 0,
+        tokensAdded: 0,
+        partial: false,
+        reason: "prepared summary id already exists in canonical summaries",
+      };
+    }
+
+    const insertSummaryStmt = this.db.prepare(
+      `INSERT INTO summaries (
+         summary_id,
+         conversation_id,
+         kind,
+         depth,
+         content,
+         token_count,
+         file_ids,
+         earliest_at,
+         latest_at,
+         descendant_count,
+         descendant_token_count,
+         source_message_token_count,
+         model
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const linkMessageStmt = this.db.prepare(
+      `INSERT INTO summary_messages (summary_id, message_id, ordinal)
+       VALUES (?, ?, ?)
+       ON CONFLICT (summary_id, message_id) DO NOTHING`,
+    );
+    for (const op of ops) {
+      const summary = op.summary;
+      insertSummaryStmt.run(
+        summary.summaryId,
+        batch.conversationId,
+        summary.kind,
+        summary.depth,
+        summary.content,
+        summary.tokenCount,
+        JSON.stringify(summary.fileIds),
+        summary.earliestAt?.toISOString() ?? null,
+        summary.latestAt?.toISOString() ?? null,
+        summary.descendantCount,
+        summary.descendantTokenCount,
+        summary.sourceMessageTokenCount,
+        summary.model,
+      );
+      for (let idx = 0; idx < op.messageIds.length; idx++) {
+        linkMessageStmt.run(summary.summaryId, op.messageIds[idx], idx);
+      }
+    }
+
+    for (const op of ops) {
+      this.db
+        .prepare(
+          `DELETE FROM context_items
+           WHERE conversation_id = ?
+             AND ordinal >= ?
+             AND ordinal <= ?`,
+        )
+        .run(batch.conversationId, op.startOrdinal, op.endOrdinal);
+    }
+    const insertContextStmt = this.db.prepare(
+      `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
+       VALUES (?, ?, 'summary', ?)`,
+    );
+    for (const op of ops) {
+      insertContextStmt.run(batch.conversationId, op.startOrdinal, op.summary.summaryId);
+    }
+    this.resequenceContextItemsInTransaction(batch.conversationId);
+
+    if (this.fts5Available) {
+      this.indexPublishedPreparedSummaries(ops.map((op) => op.summary));
+    }
+
+    const publishedIds = ops.map((op) => op.summary.summaryId);
+    const placeholders = publishedIds.map(() => "?").join(", ");
+    this.db
+      .prepare(
+        `UPDATE compaction_batch_summaries
+         SET status = 'active', updated_at = datetime('now')
+         WHERE batch_id = ?
+           AND summary_id IN (${placeholders})`,
+      )
+      .run(batch.batchId, ...publishedIds);
+    this.db
+      .prepare(
+        `UPDATE compaction_batch_summaries
+         SET status = 'superseded', updated_at = datetime('now')
+         WHERE batch_id = ?
+           AND status IN ('pending', 'ready')`,
+      )
+      .run(batch.batchId);
+    this.db
+      .prepare(
+        `UPDATE compaction_batches
+         SET status = 'active',
+             error = NULL,
+             updated_at = datetime('now'),
+             published_at = datetime('now')
+         WHERE batch_id = ?`,
+      )
+      .run(batch.batchId);
+
+    return {
+      published: true,
+      batchId: batch.batchId,
+      summaryIds: publishedIds,
+      tokensRemoved: ops.reduce((sum, op) => sum + op.summary.sourceMessageTokenCount, 0),
+      tokensAdded: ops.reduce((sum, op) => sum + op.summary.tokenCount, 0),
+      partial: ops.length < pending.length,
+      ...(ops.length < pending.length
+        ? { reason: "published prefix; remaining prepared summaries superseded" }
+        : {}),
+    };
+  }
+
+  private getPendingRowsForPublish(batchId: string): PendingCompactionSummaryRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT batch_id, summary_id, ordinal, status, conversation_id, kind, depth, content,
+                token_count, file_ids, earliest_at, latest_at, descendant_count,
+                descendant_token_count, source_message_token_count, model,
+                source_start_seq, source_end_seq, source_message_ids,
+                source_identity_hashes, previous_summary_ids, created_at, updated_at
+         FROM compaction_batch_summaries
+         WHERE batch_id = ?
+           AND status = 'ready'
+         ORDER BY ordinal`,
+      )
+      .all(batchId) as unknown as PendingCompactionSummaryRow[];
+    return rows.map(toPendingCompactionSummaryRecord);
+  }
+
+  private validatePendingSummaryForPublish(params: {
+    summary: PendingCompactionSummaryRecord;
+    conversationId: number;
+    contextByMessageId: Map<number, ContextItemRow>;
+    maxSourceOrdinalExclusive?: number;
+  }):
+    | { kind: "valid"; startOrdinal: number; endOrdinal: number; messageIds: number[] }
+    | { kind: "fresh-tail"; reason: string }
+    | { kind: "stale"; reason: string } {
+    const messageIds = params.summary.sourceMessageIds;
+    if (messageIds.length === 0) {
+      return { kind: "stale", reason: "prepared summary has no source messages" };
+    }
+    if (params.summary.sourceIdentityHashes.length !== messageIds.length) {
+      return { kind: "stale", reason: "prepared summary identity coverage is incomplete" };
+    }
+    const sourceStartSeq = params.summary.sourceStartSeq;
+    const sourceEndSeq = params.summary.sourceEndSeq;
+    if (
+      typeof sourceStartSeq !== "number" ||
+      typeof sourceEndSeq !== "number" ||
+      !Number.isFinite(sourceStartSeq) ||
+      !Number.isFinite(sourceEndSeq) ||
+      sourceEndSeq < sourceStartSeq
+    ) {
+      return { kind: "stale", reason: "prepared summary sequence coverage is incomplete" };
+    }
+
+    const contextRows: ContextItemRow[] = [];
+    for (const messageId of messageIds) {
+      const contextRow = params.contextByMessageId.get(messageId);
+      if (!contextRow || contextRow.item_type !== "message") {
+        return { kind: "stale", reason: "source message is no longer active raw context" };
+      }
+      contextRows.push(contextRow);
+    }
+    const ordinals = contextRows.map((row) => row.ordinal);
+    for (let idx = 1; idx < ordinals.length; idx++) {
+      if (ordinals[idx] !== ordinals[idx - 1]! + 1) {
+        return { kind: "stale", reason: "source message range is no longer contiguous" };
+      }
+    }
+
+    const maxSourceOrdinalExclusive = params.maxSourceOrdinalExclusive;
+    if (
+      typeof maxSourceOrdinalExclusive === "number" &&
+      Number.isFinite(maxSourceOrdinalExclusive) &&
+      ordinals.some((ordinal) => ordinal >= maxSourceOrdinalExclusive)
+    ) {
+      return { kind: "fresh-tail", reason: "source message range is protected as fresh tail" };
+    }
+
+    const sourceSeqs: number[] = [];
+    for (let idx = 0; idx < messageIds.length; idx++) {
+      const messageId = messageIds[idx]!;
+      const row = this.db
+        .prepare(
+          `SELECT message_id, seq, role, content, token_count
+           FROM messages
+           WHERE conversation_id = ?
+             AND message_id = ?`,
+        )
+        .get(params.conversationId, messageId) as unknown as PublishMessageRow | undefined;
+      if (!row) {
+        return { kind: "stale", reason: "source message row is missing" };
+      }
+      sourceSeqs.push(row.seq);
+      const expectedHash = params.summary.sourceIdentityHashes[idx];
+      const actualHash = buildMessageIdentityHash(row.role, row.content);
+      if (actualHash !== expectedHash) {
+        return { kind: "stale", reason: "source message identity changed" };
+      }
+    }
+    if (
+      Math.min(...sourceSeqs) !== sourceStartSeq ||
+      Math.max(...sourceSeqs) !== sourceEndSeq
+    ) {
+      return { kind: "stale", reason: "source message sequence coverage changed" };
+    }
+
+    return {
+      kind: "valid",
+      startOrdinal: Math.min(...ordinals),
+      endOrdinal: Math.max(...ordinals),
+      messageIds,
+    };
+  }
+
+  private validatePreparedPublishActiveRawCoverage(params: {
+    conversationId: number;
+    ops: Array<{
+      summary: PendingCompactionSummaryRecord;
+      messageIds: number[];
+    }>;
+  }): string | null {
+    const coveredMessageIds = new Set<number>();
+    let minSourceSeq = Infinity;
+    let maxSourceSeq = -Infinity;
+
+    for (const op of params.ops) {
+      const sourceStartSeq = op.summary.sourceStartSeq;
+      const sourceEndSeq = op.summary.sourceEndSeq;
+      if (
+        typeof sourceStartSeq !== "number" ||
+        typeof sourceEndSeq !== "number" ||
+        !Number.isFinite(sourceStartSeq) ||
+        !Number.isFinite(sourceEndSeq) ||
+        sourceEndSeq < sourceStartSeq
+      ) {
+        return "prepared summary sequence coverage is incomplete";
+      }
+      minSourceSeq = Math.min(minSourceSeq, sourceStartSeq);
+      maxSourceSeq = Math.max(maxSourceSeq, sourceEndSeq);
+      for (const messageId of op.messageIds) {
+        coveredMessageIds.add(messageId);
+      }
+    }
+
+    if (!Number.isFinite(minSourceSeq) || !Number.isFinite(maxSourceSeq)) {
+      return "prepared publish coverage is incomplete";
+    }
+
+    const activeRows = this.db
+      .prepare(
+        `SELECT ci.message_id, m.seq, ci.ordinal
+         FROM context_items ci
+         JOIN messages m ON m.message_id = ci.message_id
+         WHERE ci.conversation_id = ?
+           AND ci.item_type = 'message'
+           AND ci.message_id IS NOT NULL
+           AND m.seq <= ?
+         ORDER BY m.seq ASC, ci.ordinal ASC`,
+      )
+      .all(params.conversationId, maxSourceSeq) as unknown as ActiveRawCoverageRow[];
+
+    for (const row of activeRows) {
+      if (coveredMessageIds.has(row.message_id)) {
+        continue;
+      }
+      return row.seq < minSourceSeq
+        ? "active raw message appeared before prepared source coverage"
+        : "active raw message appeared inside prepared source coverage";
+    }
+
+    return null;
+  }
+
+  private countExistingSummaries(summaryIds: string[]): number {
+    if (summaryIds.length === 0) {
+      return 0;
+    }
+    const placeholders = summaryIds.map(() => "?").join(", ");
+    return (this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM summaries
+         WHERE summary_id IN (${placeholders})`,
+      )
+      .get(...summaryIds) as { count: number } | undefined)?.count ?? 0;
+  }
+
+  private markBatchSupersededInTransaction(batchId: string, reason: string): void {
+    this.db
+      .prepare(
+        `UPDATE compaction_batch_summaries
+         SET status = 'superseded', updated_at = datetime('now')
+         WHERE batch_id = ?
+           AND status IN ('pending', 'ready')`,
+      )
+      .run(batchId);
+    this.db
+      .prepare(
+        `UPDATE compaction_batches
+         SET status = 'superseded',
+             error = ?,
+             updated_at = datetime('now')
+         WHERE batch_id = ?
+           AND status IN ('pending', 'ready')`,
+      )
+      .run(reason, batchId);
+  }
+
+  private markBatchFailedInTransaction(batchId: string, reason: string): void {
+    this.db
+      .prepare(
+        `UPDATE compaction_batch_summaries
+         SET status = 'failed', updated_at = datetime('now')
+         WHERE batch_id = ?
+           AND status IN ('pending', 'ready')`,
+      )
+      .run(batchId);
+    this.db
+      .prepare(
+        `UPDATE compaction_batches
+         SET status = 'failed',
+             error = ?,
+             updated_at = datetime('now')
+         WHERE batch_id = ?
+           AND status IN ('pending', 'ready')`,
+      )
+      .run(reason, batchId);
+  }
+
+  private resequenceContextItemsInTransaction(conversationId: number): void {
+    const items = this.db
+      .prepare(
+        `SELECT ordinal FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal`,
+      )
+      .all(conversationId) as unknown as { ordinal: number }[];
+
+    if (items.length === 0 || !items.some((item, i) => item.ordinal !== i)) {
+      return;
+    }
+
+    const updateStmt = this.db.prepare(
+      `UPDATE context_items SET ordinal = ?
+       WHERE conversation_id = ? AND ordinal = ?`,
+    );
+    for (let i = 0; i < items.length; i++) {
+      updateStmt.run(-(i + 1), conversationId, items[i]!.ordinal);
+    }
+    for (let i = 0; i < items.length; i++) {
+      updateStmt.run(i, conversationId, -(i + 1));
+    }
+  }
+
+  private indexPublishedPreparedSummaries(summaries: PendingCompactionSummaryRecord[]): void {
+    for (const summary of summaries) {
+      try {
+        this.db
+          .prepare(`INSERT INTO summaries_fts(summary_id, content) VALUES (?, ?)`)
+          .run(summary.summaryId, summary.content);
+      } catch {
+        // FTS indexing is best-effort; the canonical summary row is authoritative.
+      }
+      try {
+        this.db
+          .prepare(`INSERT INTO summaries_fts_cjk(summary_id, content) VALUES (?, ?)`)
+          .run(summary.summaryId, summary.content);
+      } catch {
+        // CJK trigram support may be unavailable on this runtime.
+      }
+    }
   }
 
   async pruneForNewSession(conversationId: number, retainDepth: number): Promise<void> {
