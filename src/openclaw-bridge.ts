@@ -53,6 +53,14 @@ export type CompactResult = {
   summaryId?: string;
   error?: string;
   result?: any;
+  /**
+   * #639 Mode 2: set when a threshold sweep took no action and did not fail
+   * (no eligible leaf/condensed candidates remain) while still over target —
+   * terminal, non-retryable exhaustion. `ok` stays false (overflow recovery /
+   * #15 still see the honest still-over-target signal); the deferred-debt drain
+   * uses this to stop re-queuing the sweep.
+   */
+  exhausted?: boolean;
 };
 
 export type IngestResult = {

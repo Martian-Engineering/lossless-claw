@@ -4308,10 +4308,19 @@ export class LcmContextEngine implements ContextEngine {
         legacyParams: params.legacyParams,
       });
       const blockedByAuthCircuitBreaker = result.reason === "circuit breaker open";
-      const keepPending = !result.ok || blockedByAuthCircuitBreaker;
+      // #639 Mode 2: terminal compaction exhaustion (no eligible candidates while
+      // over target) is non-retryable — clear the debt instead of pinning it and
+      // climbing retry_attempts forever (which thrashes the assemble degraded
+      // fallback). executeCompactionCore still returns ok=false here, so overflow
+      // recovery keeps the honest signal; only the deferred-debt maintenance
+      // treats it as done.
+      const compactionExhausted =
+        (result as { exhausted?: boolean }).exhausted === true;
+      const keepPending =
+        (!result.ok || blockedByAuthCircuitBreaker) && !compactionExhausted;
       const failureSummary = blockedByAuthCircuitBreaker
         ? "summary provider circuit breaker is open"
-        : result.ok
+        : result.ok || compactionExhausted
           ? null
           : result.reason ?? "deferred compaction failed";
       const summarySpendBackoffUntil = keepPending
@@ -4609,6 +4618,19 @@ export class LcmContextEngine implements ContextEngine {
             : !liveContextStillExceedsTarget;
       const thresholdSweepStillOverTarget =
         isThresholdSweep && sweepResult.actionTaken && !isUnderTargetAfterSweep;
+      // #639 Mode 2 (deferred-compaction wedge): a threshold sweep that took NO
+      // action and did NOT fail (no eligible leaf/condensed candidates remain)
+      // while still over target is TERMINAL EXHAUSTION. Compaction shrinks STORED
+      // leaves but cannot reduce the host's OBSERVED live tokens, so retrying the
+      // same sweep can never make progress. We keep ok=false below (so overflow
+      // recovery / #15 still see the honest still-over-target failure) but flag
+      // it so the deferred-debt drain treats it as non-retryable and clears the
+      // debt instead of pinning maintenance.pending + climbing retry_attempts.
+      const thresholdSweepExhaustedOverTarget =
+        isThresholdSweep &&
+        !sweepResult.actionTaken &&
+        !sweepResult.authFailure &&
+        !isUnderTargetAfterSweep;
       const sweepOk =
         !sweepResult.authFailure &&
         (isUnderTargetAfterSweep || (sweepResult.actionTaken && !isThresholdSweep));
@@ -4639,6 +4661,7 @@ export class LcmContextEngine implements ContextEngine {
         ok: sweepOk,
         compacted: sweepResult.actionTaken,
         reason: sweepReason,
+        ...(thresholdSweepExhaustedOverTarget ? { exhausted: true } : {}),
         result: {
           tokensBefore: decision.currentTokens,
           tokensAfter: sweepResult.tokensAfter,

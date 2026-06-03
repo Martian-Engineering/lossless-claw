@@ -13396,7 +13396,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=near-budget"));
   });
 
-  it("assemble() preserves leading system context when degraded live context is bounded", async () => {
+  it("assemble() clears exhausted threshold debt and preserves leading system context via normal assembly (#639 Mode 2)", async () => {
     const log = {
       info: vi.fn(),
       warn: vi.fn(),
@@ -13424,11 +13424,20 @@ describe("LcmContextEngine fidelity and token budget", () => {
       tokenBudget: 10,
     });
 
+    // #639 Mode 2: an exhausted threshold debt (empty conversation -> nothing to
+    // compact) is now CLEARED rather than left pending, so assemble takes the
+    // NORMAL bounded path (trimMessagesToBudget) instead of degraded fallback.
+    // The leading system context is still preserved and the result stays bounded;
+    // the degraded-fallback safety net is still covered by the next test.
     expect(assembleResult.messages.map((message) => message.content)).toEqual([
       "critical runtime policy",
       "current delivery turn",
     ]);
-    expect(log.warn).toHaveBeenCalledWith(
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(false);
+    expect(log.warn).not.toHaveBeenCalledWith(
       expect.stringContaining("[lcm] assemble: degraded live fallback"),
     );
   });
@@ -16307,4 +16316,56 @@ describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
     ).toBe(false);
   });
 
+});
+
+// ── #639 Mode 2 — deferred-compaction wedge regression ────────────────────────
+describe("#639 Mode 2 deferred-compaction wedge (live context exceeds target, no candidates)", () => {
+  it("over-target threshold debt with no compactable candidates is exhaustion: debt clears, no retry thrash", async () => {
+    const engine = createEngine();
+    const sessionId = "wedge-639-mode2-exhaustion";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+
+    // Seed threshold debt where the live/observed context (8000) far exceeds the
+    // target derived from tokenBudget (4096), but there is NOTHING compactable
+    // (empty conversation → no leaf/condensed candidates). This is the Grynn
+    // "live context still exceeds target" terminal exhaustion: the sweep cannot
+    // reduce the host's observed live tokens, so it never gets under target.
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4096,
+      currentTokenCount: 8000,
+    });
+
+    const privateEngine = engine as unknown as {
+      drainDeferredCompactionDebtIfIdle: (params: unknown) => Promise<void>;
+    };
+    await privateEngine.drainDeferredCompactionDebtIfIdle({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 4096,
+      currentTokenCount: 8000,
+      reason: "threshold",
+    });
+
+    const m = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    // eslint-disable-next-line no-console
+    console.log(
+      `WEDGE_RESULT pending=${m?.pending} running=${m?.running} retry=${m?.retryAttempts} failure=${JSON.stringify(m?.lastFailureSummary)}`,
+    );
+
+    // FIXED behavior (exhaustion handling): no compactable candidates while over
+    // target is NON-retryable → debt clears and retry does not climb. On current
+    // (unfixed) code this stays pending=true with failure "live context still
+    // exceeds target" → the wedge.
+    expect(
+      m?.pending,
+      "exhausted (no candidates) over-target threshold debt must NOT stay pending forever",
+    ).toBe(false);
+    expect(m?.retryAttempts ?? 0, "must not accumulate retry attempts on exhaustion").toBeLessThanOrEqual(0);
+  });
 });
