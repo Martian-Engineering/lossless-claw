@@ -7273,6 +7273,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     memoryAssistantContent?: string;
     tailUserContent?: string;
     tailAssistantContent?: string;
+    tailTurns?: Array<{ userContent: string; assistantContent: string }>;
     prompt?: string;
   }): Promise<{ liveMessages: AgentMessage[]; prompt: string }> {
     const memoryUserContent =
@@ -7294,17 +7295,25 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId: params.sessionId,
       message: { role: "assistant", content: memoryAssistantContent } as AgentMessage,
     });
-    await params.engine.ingest({
-      sessionId: params.sessionId,
-      message: {
-        role: "user",
-        content: params.tailUserContent ?? "Say one neutral filler response.",
-      } as AgentMessage,
-    });
-    await params.engine.ingest({
-      sessionId: params.sessionId,
-      message: { role: "assistant", content: params.tailAssistantContent ?? "ok" } as AgentMessage,
-    });
+    const tailTurns = params.tailTurns ?? [
+      {
+        userContent: params.tailUserContent ?? "Say one neutral filler response.",
+        assistantContent: params.tailAssistantContent ?? "ok",
+      },
+    ];
+    for (const tailTurn of tailTurns) {
+      await params.engine.ingest({
+        sessionId: params.sessionId,
+        message: {
+          role: "user",
+          content: tailTurn.userContent,
+        } as AgentMessage,
+      });
+      await params.engine.ingest({
+        sessionId: params.sessionId,
+        message: { role: "assistant", content: tailTurn.assistantContent } as AgentMessage,
+      });
+    }
 
     const conversation = await params.engine.getConversationStore().getConversationForSession({
       sessionId: params.sessionId,
@@ -7675,6 +7684,45 @@ describe("LcmContextEngine.assemble canonical path", () => {
       .find((entry: unknown) => typeof entry === "string" && entry.includes("[lcm] assemble: done"));
     expect(assembleDoneLog).toEqual(expect.any(String));
     expect(assembleDoneLog).not.toContain("promptRecallMatches=");
+  });
+
+  it("uses summary-backed recall when the fact is outside a realistic fresh tail", async () => {
+    const engine = createEngineWithConfig({ freshTailCount: 8 });
+    const sessionId = "session-prompt-recall-summary-backed-fresh-tail";
+    const prompt = "What is CRABPOT_LCM_FACT? Answer with only the remembered value.";
+    const { liveMessages } = await seedPromptRecallFixture({
+      engine,
+      sessionId,
+      summaryId: "sum_prompt_recall_summary_backed_fresh_tail",
+      summaryContent:
+        "Release-gate summary preserved CRABPOT_LCM_FACT is blue-lantern-42. " +
+        "It also noted neutral filler turn 3 so the summary is not a single-key stub.",
+      tailTurns: Array.from({ length: 8 }, (_, index) => ({
+        userContent: `Neutral filler turn ${index + 1}: keep the conversation moving.`,
+        assistantContent: `ack filler ${index + 1}`,
+      })),
+      prompt,
+    });
+    const searchSpy = vi.spyOn(engine.getConversationStore(), "searchMessages");
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt,
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    const summaryCue = rendered.find((content) =>
+      content.includes('<summary id="sum_prompt_recall_summary_backed_fresh_tail"'),
+    );
+    expect(summaryCue).toEqual(expect.any(String));
+    expect(summaryCue).toContain("CRABPOT_LCM_FACT is blue-lantern-42");
+    expect(summaryCue).toContain("neutral filler turn 3");
+    expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
+    expect(searchSpy).not.toHaveBeenCalled();
   });
 
   it("does not add prompt-recall when an active summary already mentions the requested key", async () => {

@@ -131,6 +131,7 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
   });
 
   it("declares startup activation until OpenClaw always loads selected context-engine plugins", () => {
+    expect(manifest.name).toBe("Lossless Context Management");
     expect(manifest.kind).toBe("context-engine");
     expect(manifest.activation?.onStartup).toBe(true);
   });

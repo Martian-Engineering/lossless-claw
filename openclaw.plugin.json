@@ -1,5 +1,6 @@
 {
   "id": "lossless-claw",
+  "name": "Lossless Context Management",
   "kind": "context-engine",
   "activation": {
     "onStartup": true

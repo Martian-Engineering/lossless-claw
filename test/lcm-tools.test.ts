@@ -414,6 +414,106 @@ describe("LCM tools session scoping", () => {
     expect(text).toContain("session family rooted at 42 (3 segments)");
   });
 
+  it("supports grep-to-describe recovery for compacted summary matches", async () => {
+    const summaryId = "sum_crabpot_lcm_fact";
+    const createdAt = new Date("2026-01-02T00:00:00.000Z");
+    const summaryContent =
+      "Release-gate summary preserved CRABPOT_LCM_FACT is blue-lantern-42 after rotate.";
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [
+          {
+            summaryId,
+            conversationId: 42,
+            kind: "leaf",
+            snippet: summaryContent,
+            createdAt,
+          },
+        ],
+        totalMatches: 1,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: summaryId,
+        type: "summary",
+        summary: {
+          conversationId: 42,
+          kind: "leaf",
+          content: summaryContent,
+          depth: 0,
+          tokenCount: 16,
+          descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: 16,
+          fileIds: [],
+          parentIds: [],
+          childIds: [],
+          messageIds: [],
+          earliestAt: createdAt,
+          latestAt: createdAt,
+          subtree: [
+            {
+              summaryId,
+              parentSummaryId: null,
+              depthFromRoot: 0,
+              kind: "leaf",
+              depth: 0,
+              tokenCount: 16,
+              descendantCount: 0,
+              descendantTokenCount: 0,
+              sourceMessageTokenCount: 16,
+              earliestAt: createdAt,
+              latestAt: createdAt,
+              childCount: 0,
+              path: "",
+            },
+          ],
+          createdAt,
+        },
+      })),
+    };
+    const lcm = buildLcmEngine({ retrieval, conversationId: 42 }) as never;
+    const deps = makeDeps();
+
+    const grepTool = createLcmGrepTool({
+      deps,
+      lcm,
+      sessionId: "session-1",
+    });
+    const grepResult = await grepTool.execute("call-grep-summary", {
+      pattern: "CRABPOT_LCM_FACT",
+      scope: "summaries",
+      mode: "full_text",
+    });
+    const grepText = (grepResult.content[0] as { text: string }).text;
+    const matchedSummaryId = grepText.match(/\bsum_[a-z0-9_]+\b/)?.[0];
+
+    expect(matchedSummaryId).toBe(summaryId);
+    expect(grepText).toContain("CRABPOT_LCM_FACT is blue-lantern-42");
+
+    const describeTool = createLcmDescribeTool({
+      deps,
+      lcm,
+      sessionId: "session-1",
+    });
+    const describeResult = await describeTool.execute("call-describe-summary", {
+      id: matchedSummaryId,
+    });
+
+    expect(retrieval.describe).toHaveBeenCalledWith(
+      summaryId,
+      expect.objectContaining({
+        expandFile: false,
+      }),
+    );
+    const describeText = (describeResult.content[0] as { text: string }).text;
+    expect(describeText).toContain(`LCM_SUMMARY ${summaryId}`);
+    expect(describeText).toContain("manifest");
+    expect(describeText).toContain("CRABPOT_LCM_FACT is blue-lantern-42");
+    expect(JSON.stringify(describeResult.details)).not.toContain(summaryContent);
+  });
+
   it("lcm_grep rejects allConversations from a sub-agent without a delegated grant", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
