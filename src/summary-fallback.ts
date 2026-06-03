@@ -10,12 +10,16 @@ export const FALLBACK_DIRECTIVE_SUMMARY_MARKER =
 const DEFAULT_FALLBACK_DIRECTIVE_NOTE = FALLBACK_DIRECTIVE_SUMMARY_MARKER;
 const OPTIONAL_DIRECTIVE_SCOPE_PREFIX = String.raw`(?:all\s+)?(?:of\s+)?(?:(?:the|your|my|any|these|those)\s+)?`;
 const DIRECTIVE_SCOPE = String.raw`(?:(?:previous|prior|above|earlier)(?:\s+(?:system|developer))?|(?:system|developer))`;
+const UNSCOPED_DIRECTIVE_TARGET = String.raw`(?:(?:all|any)\s+)?(?:of\s+)?(?:(?:the|your|my|these|those|current|existing|original)\s+)?(?:instructions?|prompts?|rules?)`;
 const ANSWER_DAN_OBJECT = String.raw`(?:(?:me|us)|(?:(?:(?:the|this|that|your|my|any|these|those|all|every)\s+)?(?:future\s+)?(?:users?|requests?|questions?|prompts?|messages?)))`;
 const DAN_PERSONA_DIRECTIVE_PREFIX = String.raw`(?:^\s*|^\s*[A-Za-z][A-Za-z0-9 _/-]{0,40}:\s*)`;
+const FALLBACK_DIRECTIVE_CONTINUATION_PATTERN =
+  /^\s*(?:answer|reply|respond|say|output|print|return)\b[^.!?\n]{0,160}[.!?]?\s*$/i;
 const FALLBACK_DIRECTIVE_SHAPED_PATTERNS = [
   new RegExp(
     [
       String.raw`\b(ignore|disregard|forget|override)\s+${OPTIONAL_DIRECTIVE_SCOPE_PREFIX}${DIRECTIVE_SCOPE}\s+(instructions?|prompts?|rules?)\b`,
+      String.raw`\b(ignore|disregard|forget|override)\s+${UNSCOPED_DIRECTIVE_TARGET}\b`,
       String.raw`\byou\s+are\s+now\b`,
       String.raw`\bfrom\s+now\s+on\b`,
       String.raw`\breply\s+only\s+with\b`,
@@ -33,6 +37,7 @@ const FALLBACK_DIRECTIVE_SHAPED_PATTERNS = [
     "i",
   ),
   /\b(?:[Aa][Cc][Tt]\s+[Aa][Ss]|[Pp][Rr][Ee][Tt][Ee][Nn][Dd]\s+[Tt][Oo]\s+[Bb][Ee])\s+(?!Dan\b)[Dd][Aa][Nn]\b/,
+  /\b(?:[Ee][Nn][Aa][Bb][Ll][Ee]|[Aa][Cc][Tt][Ii][Vv][Aa][Tt][Ee]|[Uu][Nn][Ll][Oo][Cc][Kk]|[Ee][Nn][Tt][Ee][Rr]|[Ss][Tt][Aa][Rr][Tt]|[Uu][Ss][Ee])\s+(?!Dan\b)[Dd][Aa][Nn]\b/,
 ];
 
 export function sanitizeDeterministicFallbackText(text: string): {
@@ -47,10 +52,12 @@ export function sanitizeDeterministicFallbackText(text: string): {
   for (const unit of units) {
     if (/^\n+$/.test(unit)) {
       output.push(unit);
-      lastWasOmission = false;
       continue;
     }
-    if (FALLBACK_DIRECTIVE_SHAPED_PATTERNS.some((pattern) => pattern.test(unit))) {
+    if (
+      FALLBACK_DIRECTIVE_SHAPED_PATTERNS.some((pattern) => pattern.test(unit)) ||
+      (lastWasOmission && FALLBACK_DIRECTIVE_CONTINUATION_PATTERN.test(unit))
+    ) {
       omittedDirectiveShapedContent = true;
       if (!lastWasOmission) {
         output.push(`${FALLBACK_DIRECTIVE_OMISSION} `);
