@@ -36,8 +36,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Checkout OpenClaw contract source
-        run: git clone --depth 1 https://github.com/openclaw/openclaw "$RUNNER_TEMP/openclaw"
+      - name: Checkout declared OpenClaw contract source
+        run: |
+          OPENCLAW_CONTRACT_REF="v$(node -p "require('./package.json').openclaw.build.openclawVersion")"
+          git clone --depth 1 --branch "$OPENCLAW_CONTRACT_REF" https://github.com/openclaw/openclaw "$RUNNER_TEMP/openclaw"
 
       - name: Setup Node
         uses: actions/setup-node@v4
