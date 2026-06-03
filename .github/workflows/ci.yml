@@ -62,7 +62,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: plugin-inspector-reports
-          path: .plugin-inspector/
+          path: plugin-inspector-reports/
           if-no-files-found: ignore
 
   # Smoke-install the plugin against the latest published openclaw to catch
