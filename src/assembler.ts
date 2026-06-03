@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ContextEngine } from "./openclaw-bridge.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
@@ -1334,16 +1334,20 @@ function hasSearchablePrompt(prompt?: string): prompt is string {
 
 /**
  * Regex matching LCM image placeholder text produced by large-files.ts
- * during externalization. Two capture groups:
- *   [1] MIME type  (e.g. "image/jpeg")
- *   [2] LCM file ID (e.g. "file_abc123def456")
+ * during externalization. Three capture groups:
+ *   [1] Label     (e.g. "User image")
+ *   [2] MIME type (e.g. "image/jpeg")
+ *   [3] LCM file ID (e.g. "file_abc123def456")
  *
  * Matches all role prefixes produced by the externalizer:
  *   [User image: name.jpg (image/jpeg, 12345 bytes) | LCM file: file_xxx]
  *   [System image: ...], [Tool image: ...], [Assistant image: ...], [Image: ...]
  */
 const LCM_IMAGE_PLACEHOLDER_RE =
-  /\[(?:(?:User|System|Tool|Assistant) image|Image): [^(]+ \(([^,]+), [\d,]+ bytes\) \| LCM file: (file_[a-f0-9]{16})\]/g;
+  /\[((?:(?:User|System|Tool|Assistant) image|Image)): [^(]+ \(([^,]+), [\d,]+ bytes\) \| LCM file: (file_[a-f0-9]{16})\]/g;
+
+const MAX_REHYDRATED_IMAGE_BLOCKS = 4;
+const MAX_REHYDRATED_IMAGE_BYTES = 512_000;
 
 /**
  * Normalizes uncommon MIME subtypes to the file extension used on disk.
@@ -1383,25 +1387,46 @@ function rehydrateExternalizedImages(
   if (!largeFilesDir) return messages;
 
   const convDir = join(largeFilesDir, String(conversationId));
+  let rehydratedImageBlocks = 0;
+  let rehydratedImageBytes = 0;
 
   type ImageBlock = { type: "image"; source: { type: "base64"; media_type: string; data: string } };
 
-  function extractImageBlocks(text: string): { remaining: string; blocks: ImageBlock[] } {
+  function extractImageBlocks(
+    text: string,
+    allowedLabels: ReadonlySet<string>,
+  ): { remaining: string; blocks: ImageBlock[] } {
     const blocks: ImageBlock[] = [];
     let remaining = text;
     const re = new RegExp(LCM_IMAGE_PLACEHOLDER_RE.source, "g");
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
-      const mimeType = m[1];
-      const fileId = m[2];
-      const mimeSubtype = mimeType.split("/")[1] ?? "jpg";
+      const label = m[1];
+      if (!allowedLabels.has(label)) {
+        continue;
+      }
+      const mimeType = m[2].trim();
+      const fileId = m[3];
+      const normalizedMimeType = mimeType.toLowerCase().split(";")[0]?.trim() || mimeType;
+      const mimeSubtype = normalizedMimeType.split("/")[1] ?? "jpg";
       const ext = MIME_SUBTYPE_TO_EXT[mimeSubtype] ?? mimeSubtype;
       const filePath = join(convDir, `${fileId}.${ext}`);
       try {
         if (existsSync(filePath)) {
+          const stat = statSync(filePath);
+          if (
+            !stat.isFile() ||
+            stat.size > MAX_REHYDRATED_IMAGE_BYTES ||
+            rehydratedImageBlocks >= MAX_REHYDRATED_IMAGE_BLOCKS ||
+            rehydratedImageBytes + stat.size > MAX_REHYDRATED_IMAGE_BYTES
+          ) {
+            continue;
+          }
           const data = readFileSync(filePath).toString("base64");
           remaining = remaining.replace(m[0], "").trim();
-          blocks.push({ type: "image", source: { type: "base64", media_type: mimeType, data } });
+          blocks.push({ type: "image", source: { type: "base64", media_type: normalizedMimeType, data } });
+          rehydratedImageBlocks += 1;
+          rehydratedImageBytes += stat.size;
         }
       } catch {
         // File unreadable — leave placeholder in place.
@@ -1410,40 +1435,93 @@ function rehydrateExternalizedImages(
     return { remaining, blocks };
   }
 
-  function rehydrateMessage(msg: AgentMessage): AgentMessage {
-    if (!msg || typeof msg !== "object" || !("content" in msg)) return msg;
+  function contentPartsForText(text: string, allowedLabels: ReadonlySet<string>): unknown[] | null {
+    const { remaining, blocks } = extractImageBlocks(text, allowedLabels);
+    if (blocks.length === 0) return null;
+    const parts: unknown[] = [];
+    if (remaining) parts.push({ type: "text", text: remaining });
+    parts.push(...blocks);
+    return parts;
+  }
 
-    if (typeof msg.content === "string") {
-      const { remaining, blocks } = extractImageBlocks(msg.content);
-      if (blocks.length === 0) return msg;
-      const parts: unknown[] = [];
-      if (remaining) parts.push({ type: "text", text: remaining });
-      parts.push(...blocks);
-      return { ...msg, content: parts } as AgentMessage;
+  function rehydrateStructuredContent(
+    value: unknown,
+    allowedLabels: ReadonlySet<string>,
+  ): { value: unknown; changed: boolean } {
+    if (typeof value === "string") {
+      const parts = contentPartsForText(value, allowedLabels);
+      return parts ? { value: parts, changed: true } : { value, changed: false };
     }
 
-    if (Array.isArray(msg.content)) {
+    if (Array.isArray(value)) {
       let changed = false;
       const newContent: unknown[] = [];
-      for (const block of msg.content) {
+      for (const block of value) {
+        // Text blocks are replaced with sibling text/image blocks; other block
+        // shapes keep their wrapper and recurse through nested payload fields.
         const b = block as Record<string, unknown>;
         if (b && b["type"] === "text" && typeof b["text"] === "string") {
-          const { remaining, blocks } = extractImageBlocks(b["text"] as string);
-          if (blocks.length === 0) {
+          const parts = contentPartsForText(b["text"] as string, allowedLabels);
+          if (!parts) {
             newContent.push(block);
           } else {
             changed = true;
-            if (remaining) newContent.push({ type: "text", text: remaining });
-            newContent.push(...blocks);
+            newContent.push(...parts);
           }
         } else {
-          newContent.push(block);
+          const nested = rehydrateNestedBlock(block, allowedLabels);
+          changed = changed || nested.changed;
+          newContent.push(nested.value);
         }
       }
-      return changed ? ({ ...msg, content: newContent } as AgentMessage) : msg;
+      return { value: changed ? newContent : value, changed };
     }
 
-    return msg;
+    if (value && typeof value === "object") {
+      return rehydrateNestedBlock(value, allowedLabels);
+    }
+
+    return { value, changed: false };
+  }
+
+  function rehydrateNestedBlock(
+    block: unknown,
+    allowedLabels: ReadonlySet<string>,
+  ): { value: unknown; changed: boolean } {
+    if (!block || typeof block !== "object" || Array.isArray(block)) {
+      return { value: block, changed: false };
+    }
+
+    const b = block as Record<string, unknown>;
+    let changed = false;
+    const next: Record<string, unknown> = { ...b };
+
+    const keys = b["type"] === "function_call_output" ? ["content"] : ["content", "output"];
+    for (const key of keys) {
+      if (!(key in b)) continue;
+      const nested = rehydrateStructuredContent(b[key], allowedLabels);
+      if (nested.changed) {
+        next[key] = nested.value;
+        changed = true;
+      }
+    }
+
+    return changed ? { value: next, changed } : { value: block, changed: false };
+  }
+
+  function rehydrateMessage(msg: AgentMessage): AgentMessage {
+    if (!msg || typeof msg !== "object" || !("content" in msg)) return msg;
+
+    const allowedLabels =
+      msg.role === "user"
+        ? new Set(["User image", "Image"])
+        : msg.role === "toolResult"
+          ? new Set(["Tool image", "Image"])
+          : null;
+    if (!allowedLabels) return msg;
+
+    const content = rehydrateStructuredContent(msg.content, allowedLabels);
+    return content.changed ? ({ ...msg, content: content.value } as AgentMessage) : msg;
   }
 
   return messages.map(rehydrateMessage);
@@ -1684,6 +1762,17 @@ export class ContextAssembler {
       .map((entry) => entry.message);
     const repaired = sanitizeToolUseResultPairing(cleaned) as AgentMessage[];
     const rehydrated = rehydrateExternalizedImages(repaired, input.largeFilesDir, input.conversationId);
+    const rehydratedFreshTailMessages = rehydrateExternalizedImages(
+      sanitizeToolUseResultPairing(preSanitizeFreshTailMessages) as AgentMessage[],
+      input.largeFilesDir,
+      input.conversationId,
+    );
+    const freshTailProtectionHashes = Array.from(
+      new Set([
+        ...freshTailProtectionMessageHashes(preSanitizeFreshTailMessages),
+        ...freshTailProtectionMessageHashes(rehydratedFreshTailMessages),
+      ]),
+    );
     return {
       messages: rehydrated,
       estimatedTokens,
@@ -1712,9 +1801,7 @@ export class ContextAssembler {
         preSanitizeFreshTailMessageHashes: preSanitizeFreshTailMessages.map((message) =>
           hashMessages([message]),
         ),
-        freshTailProtectionMessageHashes: freshTailProtectionMessageHashes(
-          preSanitizeFreshTailMessages,
-        ),
+        freshTailProtectionMessageHashes: freshTailProtectionHashes,
         preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
         finalMessagesHash: hashMessages(rehydrated),
         overflowDiagnostics,
