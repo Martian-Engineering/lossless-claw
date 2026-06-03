@@ -24,7 +24,9 @@ import {
 } from "./lcm-doctor-cleaners.js";
 import {
   detectDoctorMarker,
+  getDoctorReplayResidueStats,
   getDoctorSummaryStats,
+  type DoctorReplayResidueCluster,
   type DoctorSummaryStats,
 } from "./lcm-doctor-shared.js";
 import {
@@ -898,6 +900,31 @@ function buildDoctorCleanerExampleLine(params: {
   return `conv ${formatNumber(params.conversationId)} · session key ${sessionKey} · messages ${formatNumber(params.messageCount)}${preview}`;
 }
 
+function buildReplayResidueExampleLine(cluster: DoctorReplayResidueCluster): string {
+  const sessionKey = cluster.sessionKey
+    ? formatCommand(truncateMiddle(cluster.sessionKey, 80))
+    : "missing";
+  const sessionId = formatCommand(truncateMiddle(cluster.sessionId, 80));
+  // Report a stable identity anchor and row ids, not transcript content.
+  const identity = cluster.identityHash
+    ? `identity ${cluster.identityHash.slice(0, 12)}`
+    : "legacy content identity";
+  const ids = cluster.representativeMessageIds.length > 0
+    ? cluster.representativeMessageIds.map((id) => formatNumber(id)).join(", ")
+    : "none";
+
+  return [
+    `conv ${formatNumber(cluster.conversationId)}`,
+    `session key ${sessionKey}`,
+    `session id ${sessionId}`,
+    `role ${cluster.role}`,
+    identity,
+    `repeats ${formatNumber(cluster.repeatCount)}`,
+    `pressure ~${formatNumber(cluster.tokenPressure)} tokens`,
+    `ids ${ids}`,
+  ].join(" · ");
+}
+
 async function buildStatusText(params: {
   ctx: PluginCommandContext;
   db: DatabaseSync;
@@ -1069,6 +1096,7 @@ async function buildDoctorText(params: {
   }
 
   const stats = getDoctorSummaryStats(params.db, current.stats.conversationId);
+  const replayResidue = getDoctorReplayResidueStats(params.db, current.stats.conversationId);
   const lines = [
     ...buildHeaderLines(),
     "",
@@ -1091,6 +1119,17 @@ async function buildDoctorText(params: {
       buildStatLine("emergency-fallback summaries", formatNumber(stats.emergency)),
       buildStatLine("result", stats.total === 0 ? "clean" : "issues found"),
     ]),
+    "",
+    buildSection("🔁 Transcript replay residue", [
+      buildStatLine("clusters", formatNumber(replayResidue.clusterCount)),
+      buildStatLine("repeated messages", formatNumber(replayResidue.repeatedMessageCount)),
+      buildStatLine(
+        "duplicate token pressure",
+        `~${formatNumber(replayResidue.tokenPressure)} tokens`,
+      ),
+      buildStatLine("mode", "read-only diagnostics"),
+      buildStatLine("result", replayResidue.clusterCount === 0 ? "clean" : "residue found"),
+    ]),
   ];
 
   if (stats.total > 0) {
@@ -1106,6 +1145,16 @@ async function buildDoctorText(params: {
       buildSection("🛠️ Next step", [
         `${formatCommand(`${VISIBLE_COMMAND} doctor apply`)} repairs these in place for the current conversation.`,
       ]),
+    );
+  }
+
+  if (replayResidue.clusterCount > 0) {
+    lines.push(
+      "",
+      buildSection(
+        "🧷 Replay residue examples",
+        replayResidue.clusters.map((cluster) => buildReplayResidueExampleLine(cluster)),
+      ),
     );
   }
 
