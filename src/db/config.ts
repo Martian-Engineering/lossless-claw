@@ -133,6 +133,8 @@ export type LcmConfig = {
   summaryCallWindowMs?: number;
   /** Maximum model-backed summarization calls per session/window before backoff. */
   summaryMaxCallsPerWindow?: number;
+  /** Optional shared provider/model call cap for model-backed summarization. */
+  summaryGlobalMaxCallsPerWindow?: number;
   /** Cooldown after a summarization spend guard opens. */
   summarySpendBackoffMs?: number;
   /** IANA timezone for timestamps in summaries (from TZ env or system default) */
@@ -436,6 +438,11 @@ export function resolveLcmConfigWithDiagnostics(
       parseFiniteInt(env.LCM_SUMMARY_MAX_CALLS_PER_WINDOW)
         ?? toNumber(pc.summaryMaxCallsPerWindow),
     ) ?? DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW;
+  const resolvedSummaryGlobalMaxCallsPerWindow =
+    toPositiveInteger(
+      parseFiniteInt(env.LCM_SUMMARY_GLOBAL_MAX_CALLS_PER_WINDOW)
+        ?? toNumber(pc.summaryGlobalMaxCallsPerWindow),
+    );
   const resolvedSummarySpendBackoffMs =
     toPositiveInteger(
       parseFiniteInt(env.LCM_SUMMARY_SPEND_BACKOFF_MS)
@@ -589,6 +596,7 @@ export function resolveLcmConfigWithDiagnostics(
           ?? toNumber(pc.summaryTimeoutMs) ?? 60000,
       summaryCallWindowMs: resolvedSummaryCallWindowMs,
       summaryMaxCallsPerWindow: resolvedSummaryMaxCallsPerWindow,
+      summaryGlobalMaxCallsPerWindow: resolvedSummaryGlobalMaxCallsPerWindow,
       summarySpendBackoffMs: resolvedSummarySpendBackoffMs,
       timezone: env.TZ ?? toStr(pc.timezone) ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
       pruneHeartbeatOk:

@@ -60,6 +60,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "summaryTimeoutMs": 60000,
   "summaryCallWindowMs": 600000,
   "summaryMaxCallsPerWindow": 24,
+  "summaryGlobalMaxCallsPerWindow": 240,
   "summarySpendBackoffMs": 1800000,
   "timezone": "America/Los_Angeles",
   "pruneHeartbeatOk": false,
@@ -210,6 +211,7 @@ the raw copied transcript.
 | `summaryTimeoutMs` | `integer` | `60000` | `LCM_SUMMARY_TIMEOUT_MS` | Maximum time to wait for one model-backed summarizer call. |
 | `summaryCallWindowMs` | `integer` | `600000` | `LCM_SUMMARY_CALL_WINDOW_MS` | Rolling window for the per-session summarization spend guard. |
 | `summaryMaxCallsPerWindow` | `integer` | `24` | `LCM_SUMMARY_MAX_CALLS_PER_WINDOW` | Maximum model-backed summarization calls per session/window before Lossless opens a non-auth spend backoff. |
+| `summaryGlobalMaxCallsPerWindow` | `integer` | unset | `LCM_SUMMARY_GLOBAL_MAX_CALLS_PER_WINDOW` | Optional shared provider/model summarization call cap in the same rolling window. |
 | `summarySpendBackoffMs` | `integer` | `1800000` | `LCM_SUMMARY_SPEND_BACKOFF_MS` | Cooldown after the summarization spend guard opens. |
 | `customInstructions` | `string` | `""` | `LCM_CUSTOM_INSTRUCTIONS` | Extra natural-language instructions injected into every summarization prompt. |
 
