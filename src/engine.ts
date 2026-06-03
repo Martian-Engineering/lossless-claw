@@ -8935,6 +8935,7 @@ export class LcmContextEngine implements ContextEngine {
         // Off-by-default so v4.1 behavior is preserved until the migration
         // tool has populated `messages.large_content` for the running DB.
         stubLargeToolPayloads: this.config.stubLargeToolPayloads,
+        largeFilesDir: this.config.largeFilesDir,
       });
 
       const forkLiveSuffixAppend = forkBoundedBootstrap

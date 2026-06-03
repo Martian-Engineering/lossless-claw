@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -2097,6 +2097,54 @@ describe("LcmContextEngine.ingest content extraction", () => {
     expect(assembledUser.content?.[0]?.text).toContain("please inspect");
     expect(assembledUser.content?.[1]?.text).toContain("[User image: screenshot.jpg");
     expect(JSON.stringify(assembled.messages)).not.toContain(base64Image.slice(0, 32));
+
+    const rehydratedByAssembler = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+      largeFilesDir,
+    });
+    const rehydratedHash = createHash("sha256")
+      .update(JSON.stringify([rehydratedByAssembler.messages[0]]))
+      .digest("hex")
+      .slice(0, 16);
+    expect(rehydratedByAssembler.debug.freshTailProtectionMessageHashes).toContain(
+      rehydratedHash,
+    );
+
+    const engineAssembled = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    const engineAssembledUser = engineAssembled.messages[0] as {
+      role: string;
+      content?: Array<{
+        type?: unknown;
+        text?: unknown;
+        source?: { type?: unknown; media_type?: unknown; data?: unknown };
+      }>;
+    };
+    expect(engineAssembledUser.role).toBe("user");
+    expect(engineAssembledUser.content?.[0]?.text).toContain("please inspect");
+    expect(engineAssembledUser.content?.[1]).toMatchObject({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: "image/jpeg",
+        data: Buffer.from(base64Image, "base64").toString("base64"),
+      },
+    });
+
+    writeFileSync(largeFiles[0].storageUri, Buffer.alloc(512_001));
+    const cappedAssembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+      largeFilesDir,
+    });
+    const cappedUser = cappedAssembled.messages[0] as {
+      content?: Array<{ type?: unknown; text?: unknown }>;
+    };
+    expect(cappedUser.content?.[1]?.text).toContain("[User image: screenshot.jpg");
   });
 
   it("externalizes native assistant image blocks before raw payload fallback", async () => {
@@ -2142,6 +2190,20 @@ describe("LcmContextEngine.ingest content extraction", () => {
     expect(largeFiles).toHaveLength(1);
     expect(largeFiles[0].mimeType).toBe("image/png");
     expect(largeFiles[0].fileName).toBe("assistant-image.png");
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+      largeFilesDir,
+    });
+    const assembledAssistant = assembled.messages[0] as {
+      role: string;
+      content?: Array<{ type?: unknown; text?: unknown }>;
+    };
+    expect(assembledAssistant.role).toBe("assistant");
+    expect(assembledAssistant.content?.[0]?.text).toContain("Here is the rendered chart");
+    expect(assembledAssistant.content?.[1]?.text).toContain("[Assistant image:");
   });
 
   it("externalizes native tool-result image blocks instead of persisting them inline", async () => {
@@ -2312,6 +2374,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
 
     const cases: Array<{ mimeType: string; extension: string }> = [
       { mimeType: "image/heic", extension: "heic" },
+      { mimeType: "image/HEIC", extension: "heic" },
       { mimeType: "image/avif", extension: "avif" },
       { mimeType: "image/bmp", extension: "bmp" },
     ];
@@ -2345,6 +2408,20 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(largeFiles[0].mimeType).toBe(variant.mimeType);
       expect(largeFiles[0].storageUri.endsWith(`.${variant.extension}`)).toBe(true);
       expect(largeFiles[0].fileName.endsWith(`.${variant.extension}`)).toBe(true);
+
+      const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+      const assembled = await assembler.assemble({
+        conversationId: conversation!.conversationId,
+        tokenBudget: 10_000,
+        largeFilesDir,
+      });
+      const assembledUser = assembled.messages[0] as {
+        content?: Array<{ type?: unknown; source?: { media_type?: unknown } }>;
+      };
+      expect(assembledUser.content?.[1]).toMatchObject({
+        type: "image",
+        source: { media_type: variant.mimeType.toLowerCase() },
+      });
     }
   });
 
@@ -2644,6 +2721,32 @@ describe("LcmContextEngine.ingest content extraction", () => {
     };
     expect(assembledToolResult.role).toBe("toolResult");
     expect(assembledToolResult.content?.[0]?.content?.[0]?.text).toContain("[Tool image: tool-image.png");
+
+    const rehydrated = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+      largeFilesDir,
+    });
+    const rehydratedToolResult = rehydrated.messages[1] as {
+      role: string;
+      content?: Array<{
+        content?: Array<{
+          type?: unknown;
+          source?: { type?: unknown; media_type?: unknown; data?: unknown };
+        }>;
+      }>;
+    };
+    expect(rehydratedToolResult.role).toBe("toolResult");
+    expect(rehydratedToolResult.content?.[0]?.content?.[0]).toMatchObject({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: "image/png",
+      },
+    });
+    expect(String(rehydratedToolResult.content?.[0]?.content?.[0]?.source?.data)).not.toContain(
+      fileIdMatch![0],
+    );
   });
 
   it("externalizes string-content tool-result images without converting them to text files", async () => {
@@ -8743,6 +8846,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
   it("repairs OpenAI function_call transcripts without dropping reasoning blocks", async () => {
     const engine = createEngine();
     const sessionId = "session-openai-function-call";
+    const fileId = "file_0123456789abcdef";
+    const imagePlaceholder = `[Tool image: screenshot.png (image/png, 4 bytes) | LCM file: ${fileId}]`;
 
     await engine.ingest({
       sessionId,
@@ -8772,11 +8877,20 @@ describe("LcmContextEngine.assemble canonical path", () => {
         role: "toolResult",
         toolCallId: "fc_1",
         toolName: "bash",
-        content: [{ type: "function_call_output", call_id: "fc_1", output: "/tmp" }],
+        content: [{ type: "function_call_output", call_id: "fc_1", output: imagePlaceholder }],
         isError: false,
         timestamp: Date.now(),
       } as AgentMessage,
     });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const conversationFilesDir = join(
+      engine.configView.largeFilesDir,
+      String(conversation!.conversationId),
+    );
+    mkdirSync(conversationFilesDir, { recursive: true });
+    writeFileSync(join(conversationFilesDir, `${fileId}.png`), "test");
 
     const result = await engine.assemble({
       sessionId,
@@ -8796,6 +8910,11 @@ describe("LcmContextEngine.assemble canonical path", () => {
 
     expect(result.messages[1]?.role).toBe("toolResult");
     expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("fc_1");
+    const toolResult = result.messages[1] as {
+      content?: Array<{ type?: string; output?: unknown }>;
+    };
+    expect(toolResult.content?.[0]?.type).toBe("function_call_output");
+    expect(toolResult.content?.[0]?.output).toBe(imagePlaceholder);
     expect(result.messages[2]?.role).toBe("user");
   });
 

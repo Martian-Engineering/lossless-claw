@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import type { ContextEngine } from "./openclaw-bridge.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
@@ -203,6 +205,12 @@ export interface AssembleContextInput {
    * Default: false (full v4.1 behavior).
    */
   stubLargeToolPayloads?: boolean;
+  /**
+   * Absolute path to the directory where large files (including externalized
+   * images) are stored. Required for image re-hydration. Matches the
+   * `largeFilesDir` plugin config value passed from the engine.
+   */
+  largeFilesDir?: string;
 }
 
 export interface AssembleContextResult {
@@ -1328,6 +1336,204 @@ function hasSearchablePrompt(prompt?: string): prompt is string {
   return typeof prompt === "string" && tokenizeText(prompt).length > 0;
 }
 
+
+// ── Image re-hydration ────────────────────────────────────────────────────────
+
+/**
+ * Regex matching LCM image placeholder text produced by large-files.ts
+ * during externalization. Three capture groups:
+ *   [1] Label     (e.g. "User image")
+ *   [2] MIME type (e.g. "image/jpeg")
+ *   [3] LCM file ID (e.g. "file_abc123def456")
+ *
+ * Matches all role prefixes produced by the externalizer:
+ *   [User image: name.jpg (image/jpeg, 12345 bytes) | LCM file: file_xxx]
+ *   [System image: ...], [Tool image: ...], [Assistant image: ...], [Image: ...]
+ */
+const LCM_IMAGE_PLACEHOLDER_RE =
+  /\[((?:(?:User|System|Tool|Assistant) image|Image)): [^(]+ \(([^,]+), [\d,]+ bytes\) \| LCM file: (file_[a-f0-9]{16})\]/g;
+
+const MAX_REHYDRATED_IMAGE_BLOCKS = 4;
+const MAX_REHYDRATED_IMAGE_BYTES = 512_000;
+
+/**
+ * Normalizes uncommon MIME subtypes to the file extension used on disk.
+ * `large-files.ts` stores files using this same mapping, so lookups must match.
+ */
+const MIME_SUBTYPE_TO_EXT: Record<string, string> = {
+  "svg+xml": "svg",
+  "x-icon": "ico",
+  "vnd.microsoft.icon": "ico",
+  jpeg: "jpg",
+};
+
+/**
+ * Re-hydrates externalized image placeholders in assembled messages.
+ *
+ * When lossless-claw externalizes a large image it replaces the image block
+ * with a text placeholder like:
+ *   `[User image: photo.jpg (image/jpeg, 45678 bytes) | LCM file: file_abc123]`
+ *
+ * This function scans every assembled message for those placeholders, reads
+ * the corresponding file from `largeFilesDir/<conversationId>/file_xxx.ext`,
+ * base64-encodes it, and injects a native `{type: "image", source: {...}}`
+ * block so the model receives the actual image data.
+ *
+ * Files that cannot be found or read are silently skipped — the placeholder
+ * text is left in place so the model at least knows an image was present.
+ *
+ * @param messages       - Assembled messages after sanitizeToolUseResultPairing.
+ * @param largeFilesDir  - Absolute path to the lcm-files directory.
+ * @param conversationId - Conversation ID used as the subdirectory name.
+ */
+function rehydrateExternalizedImages(
+  messages: AgentMessage[],
+  largeFilesDir: string | undefined,
+  conversationId: number,
+): AgentMessage[] {
+  if (!largeFilesDir) return messages;
+
+  const convDir = join(largeFilesDir, String(conversationId));
+  let rehydratedImageBlocks = 0;
+  let rehydratedImageBytes = 0;
+
+  type ImageBlock = { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+
+  function extractImageBlocks(
+    text: string,
+    allowedLabels: ReadonlySet<string>,
+  ): { remaining: string; blocks: ImageBlock[] } {
+    const blocks: ImageBlock[] = [];
+    let remaining = text;
+    const re = new RegExp(LCM_IMAGE_PLACEHOLDER_RE.source, "g");
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const label = m[1];
+      if (!allowedLabels.has(label)) {
+        continue;
+      }
+      const mimeType = m[2].trim();
+      const fileId = m[3];
+      const normalizedMimeType = mimeType.toLowerCase().split(";")[0]?.trim() || mimeType;
+      const mimeSubtype = normalizedMimeType.split("/")[1] ?? "jpg";
+      const ext = MIME_SUBTYPE_TO_EXT[mimeSubtype] ?? mimeSubtype;
+      const filePath = join(convDir, `${fileId}.${ext}`);
+      try {
+        if (existsSync(filePath)) {
+          const stat = statSync(filePath);
+          if (
+            !stat.isFile() ||
+            stat.size > MAX_REHYDRATED_IMAGE_BYTES ||
+            rehydratedImageBlocks >= MAX_REHYDRATED_IMAGE_BLOCKS ||
+            rehydratedImageBytes + stat.size > MAX_REHYDRATED_IMAGE_BYTES
+          ) {
+            continue;
+          }
+          const data = readFileSync(filePath).toString("base64");
+          remaining = remaining.replace(m[0], "").trim();
+          blocks.push({ type: "image", source: { type: "base64", media_type: normalizedMimeType, data } });
+          rehydratedImageBlocks += 1;
+          rehydratedImageBytes += stat.size;
+        }
+      } catch {
+        // File unreadable — leave placeholder in place.
+      }
+    }
+    return { remaining, blocks };
+  }
+
+  function contentPartsForText(text: string, allowedLabels: ReadonlySet<string>): unknown[] | null {
+    const { remaining, blocks } = extractImageBlocks(text, allowedLabels);
+    if (blocks.length === 0) return null;
+    const parts: unknown[] = [];
+    if (remaining) parts.push({ type: "text", text: remaining });
+    parts.push(...blocks);
+    return parts;
+  }
+
+  function rehydrateStructuredContent(
+    value: unknown,
+    allowedLabels: ReadonlySet<string>,
+  ): { value: unknown; changed: boolean } {
+    if (typeof value === "string") {
+      const parts = contentPartsForText(value, allowedLabels);
+      return parts ? { value: parts, changed: true } : { value, changed: false };
+    }
+
+    if (Array.isArray(value)) {
+      let changed = false;
+      const newContent: unknown[] = [];
+      for (const block of value) {
+        // Text blocks are replaced with sibling text/image blocks; other block
+        // shapes keep their wrapper and recurse through nested payload fields.
+        const b = block as Record<string, unknown>;
+        if (b && b["type"] === "text" && typeof b["text"] === "string") {
+          const parts = contentPartsForText(b["text"] as string, allowedLabels);
+          if (!parts) {
+            newContent.push(block);
+          } else {
+            changed = true;
+            newContent.push(...parts);
+          }
+        } else {
+          const nested = rehydrateNestedBlock(block, allowedLabels);
+          changed = changed || nested.changed;
+          newContent.push(nested.value);
+        }
+      }
+      return { value: changed ? newContent : value, changed };
+    }
+
+    if (value && typeof value === "object") {
+      return rehydrateNestedBlock(value, allowedLabels);
+    }
+
+    return { value, changed: false };
+  }
+
+  function rehydrateNestedBlock(
+    block: unknown,
+    allowedLabels: ReadonlySet<string>,
+  ): { value: unknown; changed: boolean } {
+    if (!block || typeof block !== "object" || Array.isArray(block)) {
+      return { value: block, changed: false };
+    }
+
+    const b = block as Record<string, unknown>;
+    let changed = false;
+    const next: Record<string, unknown> = { ...b };
+
+    const keys = b["type"] === "function_call_output" ? ["content"] : ["content", "output"];
+    for (const key of keys) {
+      if (!(key in b)) continue;
+      const nested = rehydrateStructuredContent(b[key], allowedLabels);
+      if (nested.changed) {
+        next[key] = nested.value;
+        changed = true;
+      }
+    }
+
+    return changed ? { value: next, changed } : { value: block, changed: false };
+  }
+
+  function rehydrateMessage(msg: AgentMessage): AgentMessage {
+    if (!msg || typeof msg !== "object" || !("content" in msg)) return msg;
+
+    const allowedLabels =
+      msg.role === "user"
+        ? new Set(["User image", "Image"])
+        : msg.role === "toolResult"
+          ? new Set(["Tool image", "Image"])
+          : null;
+    if (!allowedLabels) return msg;
+
+    const content = rehydrateStructuredContent(msg.content, allowedLabels);
+    return content.changed ? ({ ...msg, content: content.value } as AgentMessage) : msg;
+  }
+
+  return messages.map(rehydrateMessage);
+}
+
 // ── ContextAssembler ─────────────────────────────────────────────────────────
 
 export class ContextAssembler {
@@ -1562,8 +1768,20 @@ export class ContextAssembler {
       .filter((entry) => entry.segment === "freshTail")
       .map((entry) => entry.message);
     const repaired = sanitizeToolUseResultPairing(cleaned) as AgentMessage[];
+    const rehydrated = rehydrateExternalizedImages(repaired, input.largeFilesDir, input.conversationId);
+    const rehydratedFreshTailMessages = rehydrateExternalizedImages(
+      sanitizeToolUseResultPairing(preSanitizeFreshTailMessages) as AgentMessage[],
+      input.largeFilesDir,
+      input.conversationId,
+    );
+    const freshTailProtectionHashes = Array.from(
+      new Set([
+        ...freshTailProtectionMessageHashes(preSanitizeFreshTailMessages),
+        ...freshTailProtectionMessageHashes(rehydratedFreshTailMessages),
+      ]),
+    );
     return {
-      messages: repaired,
+      messages: rehydrated,
       estimatedTokens,
       stats: {
         rawMessageCount,
@@ -1590,11 +1808,9 @@ export class ContextAssembler {
         preSanitizeFreshTailMessageHashes: preSanitizeFreshTailMessages.map((message) =>
           hashMessages([message]),
         ),
-        freshTailProtectionMessageHashes: freshTailProtectionMessageHashes(
-          preSanitizeFreshTailMessages,
-        ),
+        freshTailProtectionMessageHashes: freshTailProtectionHashes,
         preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
-        finalMessagesHash: hashMessages(repaired),
+        finalMessagesHash: hashMessages(rehydrated),
         overflowDiagnostics,
         stubStats,
       },
@@ -1602,6 +1818,7 @@ export class ContextAssembler {
   }
 
   // ── Private helpers ──────────────────────────────────────────────────────
+
 
   private isSummaryCoveredByFocus(item: ResolvedItem, brief: FocusBriefRecord): boolean {
     if (!item.summary) {
