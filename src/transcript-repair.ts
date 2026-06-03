@@ -25,6 +25,8 @@ type ToolCallLike = {
   name?: string;
 };
 
+type WarnLogger = { warn: (message: string) => void };
+
 // -- Extraction helpers (from tool-call-id.ts) --
 
 const TOOL_CALL_TYPES = new Set([
@@ -148,6 +150,65 @@ function extractToolResultId(msg: AgentMessageLike): string | null {
   return null;
 }
 
+/**
+ * Remove duplicate assistant `tool_use` blocks during assembly.
+ *
+ * The Anthropic Messages API rejects a turn containing two assistant tool_use
+ * blocks that share an id. Duplicate-ingest can place the same tool_use id on
+ * more than one assistant message. This filters tool_use blocks whose id has
+ * already been emitted earlier in the assembled transcript (keep-first), while
+ * preserving every other block (text, distinct tool calls).
+ *
+ * - record:false leaves surviving ids out of the seen set. Used for
+ *   error/aborted turns, which are non-pairable and must not "claim" an id that
+ *   a later valid turn legitimately reuses.
+ * - dropAll:true strips every tool_use block regardless of the seen set. Also
+ *   used for error/aborted turns, whose tool_use blocks may be incomplete.
+ */
+function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
+  msg: T,
+  seenToolUseIds: Set<string>,
+  options: { dropAll?: boolean; record?: boolean } = {}
+): { message: T; dropped: ToolCallLike[] } {
+  const { dropAll = false, record = true } = options;
+  const content = msg.content;
+  if (!Array.isArray(content)) {
+    return { message: msg, dropped: [] };
+  }
+  const dropped: ToolCallLike[] = [];
+  const kept: unknown[] = [];
+  for (const block of content) {
+    if (block && typeof block === "object") {
+      const rec = block as {
+        type?: unknown;
+        id?: unknown;
+        call_id?: unknown;
+        name?: unknown;
+      };
+      const id = extractToolCallId(rec);
+      const isToolUse =
+        !!id && typeof rec.type === "string" && TOOL_CALL_TYPES.has(rec.type);
+      if (isToolUse && id) {
+        if (dropAll || seenToolUseIds.has(id)) {
+          dropped.push({
+            id,
+            name: typeof rec.name === "string" ? rec.name : undefined,
+          });
+          continue;
+        }
+        if (record) {
+          seenToolUseIds.add(id);
+        }
+      }
+    }
+    kept.push(block);
+  }
+  if (dropped.length === 0) {
+    return { message: msg, dropped };
+  }
+  return { message: { ...msg, content: kept } as T, dropped };
+}
+
 // -- Repair logic (from session-transcript-repair.ts) --
 
 function makeMissingToolResult(params: {
@@ -179,11 +240,14 @@ function makeMissingToolResult(params: {
  * - Drops orphaned toolResults with no matching tool call
  */
 export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
-  messages: T[]
+  messages: T[],
+  log?: WarnLogger
 ): T[] {
   const out: T[] = [];
   const seenToolResultIds = new Set<string>();
+  const seenToolUseIds = new Set<string>();
   let droppedDuplicateCount = 0;
+  let droppedDuplicateAssistantToolUseCount = 0;
   let droppedOrphanCount = 0;
   let moved = false;
   let changed = false;
@@ -224,18 +288,41 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
       changed = true;
     }
 
+    // Drop duplicate assistant tool_use blocks (keep-first). Two assistant
+    // tool_use blocks sharing an id cause the Anthropic API to reject the turn.
+    const stopReason = normalizedAssistant.stopReason;
+    const terminal = stopReason === "error" || stopReason === "aborted";
+    const deduped = filterAssistantToolUseBlocks(
+      normalizedAssistant,
+      seenToolUseIds,
+      // Error/aborted turns are non-pairable: strip their tool_use blocks and
+      // do not let them claim an id a later valid turn may legitimately reuse.
+      terminal ? { dropAll: true, record: false } : {}
+    );
+    const assistantMsg = deduped.message;
+    if (deduped.dropped.length > 0) {
+      changed = true;
+      droppedDuplicateAssistantToolUseCount += deduped.dropped.length;
+      const remaining = Array.isArray(assistantMsg.content)
+        ? assistantMsg.content
+        : [];
+      if (remaining.length === 0) {
+        // Nothing left after removing duplicate tool_use blocks; drop the message.
+        continue;
+      }
+    }
+
     // Skip tool call extraction for aborted or errored assistant messages.
     // When stopReason is "error" or "aborted", the tool_use blocks may be incomplete
     // and should not have synthetic tool_results created.
-    const stopReason = normalizedAssistant.stopReason;
-    if (stopReason === "error" || stopReason === "aborted") {
-      out.push(normalizedAssistant as T);
+    if (terminal) {
+      out.push(assistantMsg);
       continue;
     }
 
-    const toolCalls = extractToolCallsFromAssistant(normalizedAssistant);
+    const toolCalls = extractToolCallsFromAssistant(assistantMsg);
     if (toolCalls.length === 0) {
-      out.push(normalizedAssistant as T);
+      out.push(assistantMsg);
       continue;
     }
 
@@ -267,14 +354,12 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
       if (nextRole === "toolResult") {
         const id = extractToolResultId(next);
         if (id && toolCallIds.has(id)) {
-          if (seenToolResultIds.has(id)) {
+          if (seenToolResultIds.has(id) || spanResultsById.has(id)) {
             droppedDuplicateCount += 1;
             changed = true;
             continue;
           }
-          if (!spanResultsById.has(id)) {
-            spanResultsById.set(id, next);
-          }
+          spanResultsById.set(id, next);
           continue;
         }
       }
@@ -287,7 +372,7 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
       }
     }
 
-    out.push(normalizedAssistant as T);
+    out.push(assistantMsg);
 
     if (spanResultsById.size > 0 && remainder.length > 0) {
       moved = true;
@@ -312,6 +397,12 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
       out.push(rem);
     }
     i = j - 1;
+  }
+
+  if (droppedDuplicateAssistantToolUseCount > 0 && log) {
+    log.warn(
+      `[lossless-claw] sanitizeToolUseResultPairing dropped ${droppedDuplicateAssistantToolUseCount} duplicate assistant tool_use block(s)`
+    );
   }
 
   const changedOrMoved = changed || moved;
