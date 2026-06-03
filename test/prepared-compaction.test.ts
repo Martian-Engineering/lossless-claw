@@ -361,4 +361,81 @@ describe("prepared compaction batches", () => {
       { ordinal: 1, itemType: "message", messageId: fixture.messages[2]!.messageId },
     ]);
   });
+
+  it("marks prepared batches failed when preparation throws after durable creation", async () => {
+    const fixture = createStores();
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "prepared-compaction-throws",
+      title: "Prepared compaction throws",
+    });
+    const messages = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "old source alpha",
+        tokenCount: 20,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "old source beta",
+        tokenCount: 20,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "fresh tail gamma",
+        tokenCount: 20,
+      },
+    ]);
+    await fixture.summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+    const compaction = new CompactionEngine(
+      fixture.conversationStore,
+      fixture.summaryStore,
+      createCompactionConfig({ leafChunkTokens: 20 }),
+    );
+    const summarize = vi
+      .fn()
+      .mockResolvedValueOnce("prepared first summary")
+      .mockRejectedValueOnce(new Error("provider failed during background prep"));
+
+    await expect(
+      compaction.preparePendingLeafBatch({
+        conversationId: conversation.conversationId,
+        summarize,
+        summaryModel: "test",
+      }),
+    ).rejects.toThrow("provider failed during background prep");
+
+    const batch = fixture.db
+      .prepare(
+        `SELECT batch_id, status, error
+         FROM compaction_batches
+         WHERE conversation_id = ?`,
+      )
+      .get(conversation.conversationId) as
+      | { batch_id: string; status: string; error: string | null }
+      | undefined;
+    expect(batch).toMatchObject({
+      status: "failed",
+      error: "provider failed during background prep",
+    });
+    if (!batch) {
+      throw new Error("missing prepared compaction batch");
+    }
+    const summaryRows = fixture.db
+      .prepare(
+        `SELECT status
+         FROM compaction_batch_summaries
+         WHERE batch_id = ?`,
+      )
+      .all(batch.batch_id) as Array<{ status: string }>;
+    expect(summaryRows).toEqual([{ status: "failed" }]);
+  });
 });

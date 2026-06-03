@@ -828,64 +828,82 @@ export class CompactionEngine {
     const previousPendingSummaries: Array<{ summaryId: string; content: string }> = [];
     let sawAuthFailure = false;
 
-    for (let ordinal = 0; ordinal < chunks.length; ordinal++) {
-      const chunk = chunks[ordinal]!;
-      const previousPendingContext = previousPendingSummaries
-        .slice(-2)
-        .map((summary) => summary.content.trim())
-        .filter(Boolean)
-        .join("\n\n");
-      const previousSummaryContent =
-        previousPendingContext ||
-        (ordinal === 0
-          ? await this.resolvePriorLeafSummaryContext(input.conversationId, chunk)
-          : undefined);
-      const previousSummaryIds = previousPendingSummaries
-        .slice(-2)
-        .map((summary) => summary.summaryId);
-      const draft = await this.buildLeafSummaryDraft(
-        input.conversationId,
-        chunk,
-        input.summarize,
-        previousSummaryContent,
-      );
-      if (!draft) {
-        sawAuthFailure = true;
-        break;
+    try {
+      for (let ordinal = 0; ordinal < chunks.length; ordinal++) {
+        const chunk = chunks[ordinal]!;
+        const previousPendingContext = previousPendingSummaries
+          .slice(-2)
+          .map((summary) => summary.content.trim())
+          .filter(Boolean)
+          .join("\n\n");
+        const previousSummaryContent =
+          previousPendingContext ||
+          (ordinal === 0
+            ? await this.resolvePriorLeafSummaryContext(input.conversationId, chunk)
+            : undefined);
+        const previousSummaryIds = previousPendingSummaries
+          .slice(-2)
+          .map((summary) => summary.summaryId);
+        const draft = await this.buildLeafSummaryDraft(
+          input.conversationId,
+          chunk,
+          input.summarize,
+          previousSummaryContent,
+        );
+        if (!draft) {
+          sawAuthFailure = true;
+          break;
+        }
+
+        const summaryId = generatePreparedSummaryId(
+          batchId,
+          ordinal,
+          draft.sourceIdentityHashes,
+        );
+        await this.summaryStore.insertPendingCompactionSummary({
+          batchId,
+          summaryId,
+          ordinal,
+          conversationId: input.conversationId,
+          kind: "leaf",
+          depth: 0,
+          content: draft.content,
+          tokenCount: draft.tokenCount,
+          fileIds: draft.fileIds,
+          earliestAt: draft.earliestAt,
+          latestAt: draft.latestAt,
+          descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: draft.removedTokens,
+          model: input.summaryModel,
+          sourceStartSeq: draft.sourceStartSeq,
+          sourceEndSeq: draft.sourceEndSeq,
+          sourceMessageIds: draft.messageIds,
+          sourceIdentityHashes: draft.sourceIdentityHashes,
+          previousSummaryIds,
+        });
+        previousPendingSummaries.push({ summaryId, content: draft.content });
+        preparedCount++;
       }
 
-      const summaryId = generatePreparedSummaryId(
-        batchId,
-        ordinal,
-        draft.sourceIdentityHashes,
-      );
-      await this.summaryStore.insertPendingCompactionSummary({
-        batchId,
-        summaryId,
-        ordinal,
-        conversationId: input.conversationId,
-        kind: "leaf",
-        depth: 0,
-        content: draft.content,
-        tokenCount: draft.tokenCount,
-        fileIds: draft.fileIds,
-        earliestAt: draft.earliestAt,
-        latestAt: draft.latestAt,
-        descendantCount: 0,
-        descendantTokenCount: 0,
-        sourceMessageTokenCount: draft.removedTokens,
-        model: input.summaryModel,
-        sourceStartSeq: draft.sourceStartSeq,
-        sourceEndSeq: draft.sourceEndSeq,
-        sourceMessageIds: draft.messageIds,
-        sourceIdentityHashes: draft.sourceIdentityHashes,
-        previousSummaryIds,
-      });
-      previousPendingSummaries.push({ summaryId, content: draft.content });
-      preparedCount++;
+      await this.summaryStore.markCompactionBatchReady(batchId);
+    } catch (err) {
+      const reason =
+        err instanceof Error && err.message.trim()
+          ? err.message
+          : "background leaf preparation failed";
+      try {
+        await this.summaryStore.markCompactionBatchFailed(batchId, reason);
+      } catch (markErr) {
+        this.log.warn(
+          `[lcm] failed to mark prepared compaction batch failed: batch=${batchId} error=${
+            markErr instanceof Error ? markErr.message : String(markErr)
+          }`,
+        );
+      }
+      throw err;
     }
 
-    await this.summaryStore.markCompactionBatchReady(batchId);
     return {
       prepared: preparedCount > 0,
       batchId,

@@ -1264,6 +1264,12 @@ export class SummaryStore {
     });
   }
 
+  async markCompactionBatchFailed(batchId: string, reason: string): Promise<void> {
+    await this.withTransaction(() => {
+      this.markBatchFailedInTransaction(batchId, reason);
+    });
+  }
+
   async getLatestReadyCompactionBatch(
     conversationId: number,
   ): Promise<CompactionBatchRecord | null> {
