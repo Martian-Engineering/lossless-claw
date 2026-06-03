@@ -21,15 +21,23 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
   return {
     enabled: true,
     databasePath: ":memory:",
+    largeFilesDir: "/tmp/lcm-files",
     ignoreSessionPatterns: [],
     statelessSessionPatterns: [],
     skipStatelessSessions: false,
     contextThreshold: 0.75,
     freshTailCount: 4,
+    promptAwareEviction: false,
+    stubLargeToolPayloads: false,
+    newSessionRetainDepth: 2,
     leafMinFanout: 4,
     condensedMinFanout: 4,
     condensedMinFanoutHard: 2,
+    sweepMaxDepth: 1,
     incrementalMaxDepth: 0,
+    maxSweepIterations: 12,
+    sweepDeadlineMs: 120_000,
+    compactUntilUnderDeadlineMs: 300_000,
     leafChunkTokens: 2000,
     leafTargetTokens: 600,
     condensedTargetTokens: 900,
@@ -41,7 +49,6 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
     largeFileSummaryModel: "",
     expansionProvider: "",
     expansionModel: "",
-    autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
     transcriptGcEnabled: false,
@@ -72,8 +79,9 @@ function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
       enabled: true,
       max: 4_000,
     },
+    stripInjectedContextTags: [],
     ...overrides,
-  };
+  } as LcmConfig;
 }
 
 function createTestDeps(config: LcmConfig): LcmDependencies {

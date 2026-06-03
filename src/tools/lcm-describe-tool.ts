@@ -9,6 +9,7 @@ import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
+import type { DescribeResult } from "../retrieval.js";
 
 function formatDisplayTime(
   value: Date | string | number | null | undefined,
@@ -74,7 +75,7 @@ function normalizeRequestedTokenCap(value: unknown): number | undefined {
   return Math.max(1, Math.trunc(value));
 }
 
-function compactDescribeDetails(result: Awaited<ReturnType<LcmContextEngine["getRetrieval"]>["describe"]>) {
+function compactDescribeDetails(result: DescribeResult | null) {
   if (!result) {
     return result;
   }

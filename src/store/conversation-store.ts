@@ -1161,7 +1161,7 @@ export class ConversationStore {
       .all(...args) as unknown as MessageRow[];
 
     return rows
-      .map((row) => {
+      .map((row): MessageSearchResult | null => {
         const normalizedContent = normalizeMessageContentForFullTextIndex(row.content) ?? row.content;
         const haystack = normalizedContent.toLowerCase();
         const matchesAllTerms = plan.terms.every((term) => haystack.includes(term));

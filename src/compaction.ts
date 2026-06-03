@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { contentFromParts } from "./assembler.js";
 import type {
   ConversationStore,
@@ -206,12 +206,12 @@ function shortTzAbbr(value: Date, timezone: string): string {
   }
 }
 
-/** Generate a deterministic summary ID from content + timestamp. */
+/** Generate a collision-resistant summary ID from content and a random nonce. */
 function generateSummaryId(content: string): string {
   return (
     "sum_" +
     createHash("sha256")
-      .update(content + Date.now().toString())
+      .update(content + randomUUID())
       .digest("hex")
       .slice(0, 16)
   );

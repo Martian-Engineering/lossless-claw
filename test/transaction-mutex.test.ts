@@ -276,10 +276,7 @@ describe("transaction-mutex", () => {
         kind: "leaf",
         content: "Summary of messages 0-1",
         tokenCount: 10,
-        messageIds: [],
-        childSummaryIds: [],
         depth: 0,
-        fileIds: [],
       });
 
       await summaryStore.insertSummary({
@@ -288,10 +285,7 @@ describe("transaction-mutex", () => {
         kind: "leaf",
         content: "Summary of messages 2-3",
         tokenCount: 10,
-        messageIds: [],
-        childSummaryIds: [],
         depth: 0,
-        fileIds: [],
       });
 
       // These are launched concurrently; without the mutex, that could
@@ -356,10 +350,7 @@ describe("transaction-mutex", () => {
         kind: "leaf",
         content: "Cross-test summary",
         tokenCount: 10,
-        messageIds: [],
-        childSummaryIds: [],
         depth: 0,
-        fileIds: [],
       });
 
       // This is the core #260 scenario: one session does withTransaction
@@ -425,7 +416,6 @@ describe("transaction-mutex", () => {
             content: "Scoped summary",
             tokenCount: 10,
             depth: 0,
-            fileIds: [],
           });
           await summaryStore.linkSummaryToMessages("sum_scope_001", contextMessageIds.slice(0, 2));
           await delay(20);

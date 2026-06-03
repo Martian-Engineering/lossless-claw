@@ -1444,13 +1444,14 @@ export class ContextAssembler {
       selected.push(...evictable);
       evictableTokens = evictableTotalTokens;
     } else if (input.promptAwareEviction !== false && hasSearchablePrompt(input.prompt)) {
+      const searchablePrompt = input.prompt;
       selectionMode = "prompt-aware";
       // Prompt-aware eviction: score each evictable item by relevance to the
       // prompt, then greedily fill budget from highest-scoring items down.
       // Re-sort selected items by ordinal to restore chronological order.
       const scored = evictable.map((item, idx) => ({
         item,
-        score: scoreRelevance(item.text, input.prompt),
+        score: scoreRelevance(item.text, searchablePrompt),
         idx, // original index — higher = more recent, used as tiebreaker
       }));
       // Sort: highest relevance first; most recent (higher idx) breaks ties

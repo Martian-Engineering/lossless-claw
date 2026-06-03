@@ -14,7 +14,7 @@ import { LcmContextEngine } from "../src/engine.js";
 import type { LcmDependencies } from "../src/types.js";
 
 type SessionQueueEntry = { promise: Promise<void>; refCount: number };
-type QueueTestEngine = LcmContextEngine & {
+type QueueTestEngine = {
   sessionOperationQueues: Map<string, SessionQueueEntry>;
   withSessionQueue<T>(queueKey: string, operation: () => Promise<T>): Promise<T>;
 };
@@ -26,16 +26,23 @@ function createTestConfig(databasePath: string): LcmConfig {
   return {
     enabled: true,
     databasePath,
+    largeFilesDir: join(databasePath, "..", "lcm-files"),
     ignoreSessionPatterns: [],
     statelessSessionPatterns: [],
     skipStatelessSessions: true,
     contextThreshold: 0.75,
     freshTailCount: 8,
+    promptAwareEviction: false,
+    stubLargeToolPayloads: false,
     newSessionRetainDepth: 2,
     leafMinFanout: 8,
     condensedMinFanout: 4,
     condensedMinFanoutHard: 2,
+    sweepMaxDepth: 1,
     incrementalMaxDepth: 0,
+    maxSweepIterations: 12,
+    sweepDeadlineMs: 120_000,
+    compactUntilUnderDeadlineMs: 300_000,
     leafChunkTokens: 20_000,
     leafTargetTokens: 600,
     condensedTargetTokens: 900,
@@ -78,6 +85,7 @@ function createTestConfig(databasePath: string): LcmConfig {
       enabled: true,
       max: 40_000,
     },
+    stripInjectedContextTags: [],
   };
 }
 
@@ -96,6 +104,7 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
     readLatestAssistantReply: () => undefined,
     resolveAgentDir: () => process.env.HOME ?? tmpdir(),
     resolveSessionIdFromSessionKey: async () => undefined,
+    resolveSessionTranscriptFile: async () => undefined,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),
@@ -112,7 +121,7 @@ function createQueueTestEngine(): QueueTestEngine {
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
   dbs.push(db);
-  return new LcmContextEngine(createTestDeps(config), db) as QueueTestEngine;
+  return new LcmContextEngine(createTestDeps(config), db) as unknown as QueueTestEngine;
 }
 
 afterEach(() => {

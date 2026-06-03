@@ -1,7 +1,8 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import type { MessagePartRecord, MessageRecord, MessageRole } from "../src/store/conversation-store.js";
+import type { ConversationStore, MessagePartRecord, MessageRecord, MessageRole } from "../src/store/conversation-store.js";
 import type {
   SummaryRecord,
+  SummaryStore,
   ContextItemRecord,
   SummaryKind,
   LargeFileRecord,
@@ -2670,7 +2671,7 @@ describe("LCM integration: compaction", () => {
     await sumStore.appendContextSummary(CONV_ID, "sum_depth_zero_a");
     await sumStore.appendContextSummary(CONV_ID, "sum_depth_zero_b");
 
-    const summarize = vi.fn(async () => "Depth-aware summary output");
+    const summarize = vi.fn(async (_sourceText: string) => "Depth-aware summary output");
     const result = await depthAwareEngine.compact({
       conversationId: CONV_ID,
       tokenBudget: 140,
@@ -2679,7 +2680,7 @@ describe("LCM integration: compaction", () => {
     });
 
     expect(result.actionTaken).toBe(true);
-    const firstSourceText = summarize.mock.calls[0]?.[0] as string;
+    const firstSourceText = summarize.mock.calls[0]?.[0] ?? "";
     expect(firstSourceText).toMatch(
       /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC - \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]/,
     );
@@ -4397,8 +4398,8 @@ describe("LCM integration: media message annotation in compaction", () => {
     sumStore = createMockSummaryStore();
     wireStores(convStore, sumStore);
     compactionEngine = new CompactionEngine(
-      convStore,
-      sumStore,
+      convStore as unknown as ConversationStore,
+      sumStore as unknown as SummaryStore,
       defaultCompactionConfig,
     );
   });
@@ -4926,7 +4927,7 @@ describe("prompt-aware eviction", () => {
       contentFn: (i) => `Fresh message ${i}`,
     });
 
-    const hasSummaryInOutput = (messages: { content: unknown }[]): boolean =>
+    const hasSummaryInOutput = (messages: Array<{ content?: unknown }>): boolean =>
       messages.some((m) => extractMessageText(m.content).includes("x".repeat(10)));
 
     // Small budget: fresh tail uses ~16 tokens, remaining budget ~54; summary is ~125 tokens → dropped
