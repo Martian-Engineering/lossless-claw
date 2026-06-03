@@ -37,10 +37,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Checkout OpenClaw contract source
-        uses: actions/checkout@v4
-        with:
-          repository: openclaw/openclaw
-          path: openclaw
+        run: git clone --depth 1 https://github.com/openclaw/openclaw "$RUNNER_TEMP/openclaw"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -55,7 +52,7 @@ jobs:
         run: npm run build
 
       - name: Run OpenClaw plugin inspector
-        run: npm run plugin-inspector:ci -- --openclaw ./openclaw
+        run: npm run plugin-inspector:ci -- --openclaw "$RUNNER_TEMP/openclaw"
 
       - name: Upload plugin inspector reports
         if: always()
