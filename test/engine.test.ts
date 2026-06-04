@@ -9706,6 +9706,172 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).toBe(3);
   });
 
+  it("deduplicates persisted replay rows in ingestBatch", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-replay-dedup-session";
+    const replayedMessages: AgentMessage[] = [
+      makeMessage({
+        role: "user",
+        content: [{ type: "text", id: "raw-replay-user", text: "checkpoint replay user" }],
+      }),
+      makeMessage({
+        role: "assistant",
+        content: [{ type: "text", id: "raw-replay-assistant", text: "checkpoint replay assistant" }],
+      }),
+    ];
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: replayedMessages,
+    });
+    expect(first.ingestedCount).toBe(2);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const rawDb = createLcmDatabaseConnection(getEngineConfig(engine).databasePath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE messages SET created_at = datetime('now', '-10 seconds') WHERE conversation_id = ?`,
+        )
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const replay = await engine.ingestBatch({
+      sessionId,
+      messages: replayedMessages,
+    });
+    expect(replay.ingestedCount).toBe(0);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "checkpoint replay user",
+      "checkpoint replay assistant",
+    ]);
+    expect(
+      (await engine.getSummaryStore().getContextItems(conversation!.conversationId)).length,
+    ).toBe(2);
+  });
+
+  it("keeps content-only repeated rows in ingestBatch", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-legitimate-repeat-session";
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "hello" }),
+    });
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({ role: "user", content: "hello" }),
+        makeMessage({ role: "assistant", content: "world" }),
+      ],
+    });
+    expect(result.ingestedCount).toBe(2);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual(["hello", "hello", "world"]);
+  });
+
+  it("deduplicates single raw-id replay rows in ingestBatch", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-single-raw-replay-session";
+    const replayedMessage = makeMessage({
+      role: "tool",
+      content: [{ type: "tool_result", tool_use_id: "raw-single-tool", output: "same output" }],
+    });
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const replay = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(replay.ingestedCount).toBe(0);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([""]);
+    expect(
+      (await engine.getSummaryStore().getContextItems(conversation!.conversationId)).length,
+    ).toBe(1);
+  });
+
+  it("deduplicates raw-id replay prefix while keeping new ingestBatch tail", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-replay-tail-session";
+    const oldMessages: AgentMessage[] = [
+      makeMessage({
+        role: "user",
+        content: [{ type: "text", id: "raw-tail-user-a", text: "checkpoint replay old user" }],
+      }),
+      makeMessage({
+        role: "assistant",
+        content: [{ type: "text", id: "raw-tail-assistant-b", text: "checkpoint replay old assistant" }],
+      }),
+    ];
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: oldMessages,
+    });
+    expect(first.ingestedCount).toBe(2);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const rawDb = createLcmDatabaseConnection(getEngineConfig(engine).databasePath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE messages SET created_at = datetime('now', '-10 seconds') WHERE conversation_id = ?`,
+        )
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const replayWithTail = await engine.ingestBatch({
+      sessionId,
+      messages: [
+        ...oldMessages,
+        makeMessage({
+          role: "user",
+          content: [{ type: "text", id: "raw-tail-user-c", text: "checkpoint replay new user" }],
+        }),
+        makeMessage({
+          role: "assistant",
+          content: [{ type: "text", id: "raw-tail-assistant-d", text: "checkpoint replay new assistant" }],
+        }),
+      ],
+    });
+    expect(replayWithTail.ingestedCount).toBe(2);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "checkpoint replay old user",
+      "checkpoint replay old assistant",
+      "checkpoint replay new user",
+      "checkpoint replay new assistant",
+    ]);
+    expect(
+      (await engine.getSummaryStore().getContextItems(conversation!.conversationId)).length,
+    ).toBe(4);
+  });
+
   it("skips heartbeat turn batches in ingestBatch", async () => {
     const engine = createEngine();
     const sessionId = "batch-ingest-heartbeat-session";
@@ -9774,6 +9940,37 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(stored.map((message) => message.content)).toEqual([
       "[summary] compacted older history",
       "new assistant reply",
+    ]);
+  });
+
+  it("afterTurn keeps auto-compaction summary that matches stored text", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-summary-same-as-stored";
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "S" }),
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-same-as-stored"),
+      messages: [
+        makeMessage({ role: "assistant", content: "fresh assistant reply" }),
+      ],
+      prePromptMessageCount: 0,
+      autoCompactionSummary: "S",
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "S",
+      "S",
+      "fresh assistant reply",
     ]);
   });
 

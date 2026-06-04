@@ -6316,6 +6316,95 @@ export class LcmContextEngine implements ContextEngine {
     return { candidateRawIds: candidateRawIds.size, matchedRawIds };
   }
 
+  /** Drop exact raw-id transcript replays while preserving content-only repeated user turns. */
+  private async filterPersistedRawIdReplayBatch(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    messages: AgentMessage[];
+  }): Promise<AgentMessage[]> {
+    const matchStmt = this.db.prepare(
+      `SELECT 1 AS found
+       FROM message_parts mp
+       JOIN messages m ON m.message_id = mp.message_id
+       WHERE m.conversation_id = ?
+         AND m.role = ?
+         AND m.identity_hash = ?
+         AND mp.metadata IS NOT NULL
+         AND json_valid(mp.metadata)
+         AND (
+           json_extract(mp.metadata, '$.raw.id') = ?
+           OR json_extract(mp.metadata, '$.raw.call_id') = ?
+           OR json_extract(mp.metadata, '$.raw.toolCallId') = ?
+           OR json_extract(mp.metadata, '$.raw.tool_call_id') = ?
+           OR json_extract(mp.metadata, '$.raw.toolUseId') = ?
+           OR json_extract(mp.metadata, '$.raw.tool_use_id') = ?
+         )
+       LIMIT 1`,
+    );
+
+    const filtered: AgentMessage[] = [];
+    let replayedMessages = 0;
+
+    for (const message of params.messages) {
+      const stored = toStoredMessage(message);
+      const rawIds = new Set<string>();
+      for (const part of buildMessageParts({
+        sessionId: params.sessionId,
+        message,
+        fallbackContent: stored.content,
+      })) {
+        for (const rawId of extractRawIdsFromPartMetadata(part.metadata)) {
+          rawIds.add(rawId);
+        }
+      }
+
+      if (rawIds.size === 0) {
+        filtered.push(message);
+        continue;
+      }
+
+      const identityHash = buildMessageIdentityHash(stored.role, stored.content);
+      let alreadyPersisted = false;
+      for (const rawId of rawIds) {
+        const row = matchStmt.get(
+          params.conversationId,
+          stored.role,
+          identityHash,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+        ) as { found: number } | undefined;
+        if (row?.found === 1) {
+          alreadyPersisted = true;
+          break;
+        }
+      }
+
+      if (alreadyPersisted) {
+        replayedMessages += 1;
+      } else {
+        filtered.push(message);
+      }
+    }
+
+    if (replayedMessages > 0) {
+      const sessionContext = this.formatSessionLogContext({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+      });
+      this.deps.log.warn(
+        `[lcm] ingestBatch: dropped ${replayedMessages}/${params.messages.length} raw-id replay messages for ${sessionContext}`,
+      );
+    }
+
+    return filtered;
+  }
+
   /**
    * Existing-conversation bootstrap is a rehydrate path. It may repair small
    * crash gaps, but it must not replay already persisted transcript rows as
@@ -8257,8 +8346,23 @@ export class LcmContextEngine implements ContextEngine {
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
         return this.conversationStore.withTransaction(async () => {
+          let messages = params.messages;
+          if (!params.isHeartbeat) {
+            const conversation = await this.conversationStore.getConversationForSession({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+            });
+            if (conversation) {
+              messages = await this.filterPersistedRawIdReplayBatch({
+                conversationId: conversation.conversationId,
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                messages: params.messages,
+              });
+            }
+          }
           let ingestedCount = 0;
-          for (const message of params.messages) {
+          for (const message of messages) {
             const result = await this.ingestSingle({
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
