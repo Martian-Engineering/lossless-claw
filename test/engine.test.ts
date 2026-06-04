@@ -13338,6 +13338,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
         summarize: repairSummarize,
       });
       expect(repairResult.kind).toBe("applied");
+      if (repairResult.kind !== "applied") {
+        throw new Error(`expected doctor repair to apply: ${repairResult.reason}`);
+      }
       expect(repairResult.detected).toBe(markerSummaries.length);
       expect(repairResult.repaired).toBe(markerSummaries.length);
       expect(repairResult.skipped).toEqual([]);
