@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ContextAssembler } from "../src/assembler.js";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
-import { LcmContextEngine, type RotateSessionStorageResult } from "../src/engine.js";
+import { LcmContextEngine, type RotateSessionStorageResult, __testing } from "../src/engine.js";
 import { estimateTokens } from "../src/estimate-tokens.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { LcmProviderAuthError, LcmSummarySpendLimitError } from "../src/summarize.js";
@@ -16628,6 +16628,49 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       "hello",
       "second reply",
     ]);
+  });
+
+  describe("dedupIdentity sensitive-text normalization", () => {
+    it("normalizes sensitive field names so raw and already-normalized content produce matching identities", () => {
+      const raw = "call result token: sk-abc123xyz";
+      const rawId = __testing.dedupIdentity("assistant", raw);
+      const normalized = __testing.normalizeForDedup(raw);
+      const normalizedId = __testing.dedupIdentity("assistant", normalized);
+      expect(rawId).toBe(normalizedId);
+    });
+
+    it("normalizes sensitive keys embedded in JSON content consistently", () => {
+      const raw = '{"api_key":"abc","other":"val"}';
+      const rawId = __testing.dedupIdentity("toolResult", raw);
+      const normalized = __testing.normalizeForDedup(raw);
+      const normalizedId = __testing.dedupIdentity("toolResult", normalized);
+      expect(rawId).toBe(normalizedId);
+    });
+
+    it("does not collapse genuinely different non-sensitive content", () => {
+      const a = __testing.dedupIdentity("user", "hello world");
+      const b = __testing.dedupIdentity("user", "goodbye world");
+      expect(a).not.toBe(b);
+    });
+
+    it("distinguishes messages by role even with identical normalized content", () => {
+      const userIdentity = __testing.dedupIdentity("user", "ok");
+      const assistantIdentity = __testing.dedupIdentity("assistant", "ok");
+      expect(userIdentity).not.toBe(assistantIdentity);
+    });
+
+    it("is idempotent: applying normalizeForDedup twice yields the same result", () => {
+      const text = "token: ghp_1234567890abcdefgh api_key=mysecret";
+      const once = __testing.normalizeForDedup(text);
+      const twice = __testing.normalizeForDedup(once);
+      expect(twice).toBe(once);
+    });
+
+    it("does not modify content without sensitive keys", () => {
+      const input = "The quick brown fox jumps over the lazy dog.";
+      const normalized = __testing.normalizeForDedup(input);
+      expect(normalized).toBe(input);
+    });
   });
 });
 

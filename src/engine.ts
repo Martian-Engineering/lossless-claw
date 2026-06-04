@@ -87,6 +87,7 @@ import {
   withExclusiveDatabaseLock,
 } from "./transaction-mutex.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
+import { redactSensitiveText } from "openclaw/plugin-sdk/logging-core";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type RepairLogger = { warn: (message: string) => void };
@@ -2288,6 +2289,14 @@ function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | n
 
 function messageIdentity(role: string, content: string): string {
   return `${role}\u0000${content}`;
+}
+
+function normalizeForDedup(content: string): string {
+  return redactSensitiveText(content);
+}
+
+function dedupIdentity(role: string, content: string): string {
+  return messageIdentity(role, normalizeForDedup(content));
 }
 
 function isBootstrapReplayCandidateMessage(message: AgentMessage): boolean {
@@ -8349,8 +8358,8 @@ export class LcmContextEngine implements ContextEngine {
     // hasMessage() check which could false-positive on any repeated content.
     const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
     if (
-      messageIdentity(lastDbMessage.role, lastDbMessage.content) !==
-      messageIdentity(batchAtBoundary.role, batchAtBoundary.content)
+      dedupIdentity(lastDbMessage.role, lastDbMessage.content) !==
+      dedupIdentity(batchAtBoundary.role, batchAtBoundary.content)
     ) {
       // Prefix mismatch — attempt suffix fallback before giving up.
       return this.deduplicateSuffixFallback(
@@ -8374,8 +8383,8 @@ export class LcmContextEngine implements ContextEngine {
       const storedConversationMessage = storedMessages[i]!;
       const incomingMessage = storedBatch[i]!;
       if (
-        messageIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
-        messageIdentity(incomingMessage.role, incomingMessage.content)
+        dedupIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
+        dedupIdentity(incomingMessage.role, incomingMessage.content)
       ) {
         return batch;
       }
@@ -8397,11 +8406,11 @@ export class LcmContextEngine implements ContextEngine {
     lastDbMessage: { role: string; content: string },
     options?: { oversizedNoOverlap?: "ingest" | "skip" },
   ): Promise<AgentMessage[]> {
-    const lastBatchIdentity = messageIdentity(
+    const lastBatchIdentity = dedupIdentity(
       storedBatch[storedBatch.length - 1]!.role,
       storedBatch[storedBatch.length - 1]!.content,
     );
-    const lastDbIdentity = messageIdentity(lastDbMessage.role, lastDbMessage.content);
+    const lastDbIdentity = dedupIdentity(lastDbMessage.role, lastDbMessage.content);
 
     // Quick check: if the last DB message matches the last batch message,
     // verify that the entire batch matches the actual DB tail. Message seq
@@ -8415,8 +8424,8 @@ export class LcmContextEngine implements ContextEngine {
         let tailMatch = true;
         for (let i = 0; i < batch.length; i++) {
           if (
-            messageIdentity(tailMessages[i]!.role, tailMessages[i]!.content) !==
-            messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
+            dedupIdentity(tailMessages[i]!.role, tailMessages[i]!.content) !==
+            dedupIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
           ) {
             tailMatch = false;
             break;
@@ -8465,14 +8474,14 @@ export class LcmContextEngine implements ContextEngine {
     });
     if (allStored.length === 0) return batch;
 
-    const lastStoredIdentity = messageIdentity(
+    const lastStoredIdentity = dedupIdentity(
       allStored[allStored.length - 1]!.role,
       allStored[allStored.length - 1]!.content,
     );
 
     for (let k = batch.length - 1; k >= 0; k--) {
       if (
-        messageIdentity(storedBatch[k]!.role, storedBatch[k]!.content) !== lastStoredIdentity
+        dedupIdentity(storedBatch[k]!.role, storedBatch[k]!.content) !== lastStoredIdentity
       ) {
         continue;
       }
@@ -8481,11 +8490,11 @@ export class LcmContextEngine implements ContextEngine {
       let suffixMatch = true;
       for (let j = 0; j < matchLen; j++) {
         if (
-          messageIdentity(
+          dedupIdentity(
             allStored[startDb + j]!.role,
             allStored[startDb + j]!.content,
           ) !==
-          messageIdentity(
+          dedupIdentity(
             storedBatch[k - matchLen + 1 + j]!.role,
             storedBatch[k - matchLen + 1 + j]!.content,
           )
@@ -11852,4 +11861,4 @@ function createEmergencyFallbackSummarize(): (
 }
 
 /** @internal Exposed for unit tests only. */
-export const __testing = { readLastJsonlEntryBeforeOffset };
+export const __testing = { readLastJsonlEntryBeforeOffset, normalizeForDedup, dedupIdentity };
