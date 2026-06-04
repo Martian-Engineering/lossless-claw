@@ -9810,6 +9810,763 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).toBe(1);
   });
 
+  it("keeps changed tool output rows that reuse a raw id", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-changed-tool-output-session";
+    const firstMessage = makeMessage({
+      role: "tool",
+      content: [{ type: "tool_result", tool_use_id: "raw-changed-tool", output: "old output" }],
+    });
+    const changedMessage = makeMessage({
+      role: "tool",
+      content: [{ type: "tool_result", tool_use_id: "raw-changed-tool", output: "new output" }],
+    });
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [firstMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const changed = await engine.ingestBatch({
+      sessionId,
+      messages: [changedMessage],
+    });
+    expect(changed.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+    const changedParts = await engine.getConversationStore().getMessageParts(stored[1]!.messageId);
+    const metadata = JSON.parse(changedParts[0]!.metadata ?? "{}") as {
+      raw?: { output?: unknown };
+    };
+    expect(metadata.raw?.output).toBe("new output");
+  });
+
+  it("keeps raw-id tool rows when top-level metadata changes but raw output matches", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-raw-id-metadata-change-session";
+    const firstMessage = {
+      role: "toolResult",
+      toolName: "exec",
+      content: [{ type: "tool_result", tool_use_id: "raw-metadata-change", output: "same output" }],
+      timestamp: Date.now(),
+    } as AgentMessage;
+    const changedMessage = {
+      role: "toolResult",
+      toolName: "shell",
+      content: [{ type: "tool_result", tool_use_id: "raw-metadata-change", output: "same output" }],
+      timestamp: Date.now(),
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [firstMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const changed = await engine.ingestBatch({
+      sessionId,
+      messages: [changedMessage],
+    });
+    expect(changed.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+  });
+
+  it("deduplicates top-level tool-call replay rows in ingestBatch", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-top-level-tool-replay-session";
+    const replayedMessage = {
+      role: "tool",
+      content: "same output",
+      toolCallId: "call_top_level_replay",
+      timestamp: Date.now(),
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const replay = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(replay.ingestedCount).toBe(0);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual(["same output"]);
+    expect(
+      (await engine.getSummaryStore().getContextItems(conversation!.conversationId)).length,
+    ).toBe(1);
+  });
+
+  it("keeps top-level tool rows when metadata changes but text matches", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-top-level-metadata-change-session";
+    const firstMessage = {
+      role: "tool",
+      content: "same output",
+      toolCallId: "call_metadata_change",
+      toolName: "exec",
+      isError: false,
+      timestamp: Date.now(),
+    } as AgentMessage;
+    const changedMessage = {
+      ...firstMessage,
+      isError: true,
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [firstMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const changed = await engine.ingestBatch({
+      sessionId,
+      messages: [changedMessage],
+    });
+    expect(changed.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+  });
+
+  it("deduplicates replay rows when persistence rewrites stored content", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-rewritten-content-replay-session";
+    const toolOutput = `${"tool output line\n".repeat(160)}done`;
+    const replayedMessage = {
+      role: "toolResult",
+      toolCallId: "call_rewritten_replay",
+      toolName: "exec",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_rewritten_replay",
+          name: "exec",
+          content: [{ type: "text", text: toolOutput }],
+        },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const replay = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(replay.ingestedCount).toBe(0);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.content).toContain("[LCM Tool Output: file_");
+    expect(
+      (await engine.getSummaryStore().getLargeFilesByConversation(conversation!.conversationId)),
+    ).toHaveLength(1);
+  });
+
+  it("deduplicates externalized tool-result replay rows with aliased ids", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-externalized-alias-replay-session";
+    const toolOutput = `${"aliased externalized output\n".repeat(160)}done`;
+    const replayedMessage = {
+      role: "toolResult",
+      toolName: "exec",
+      content: [
+        {
+          type: "toolResult",
+          toolCallId: "call_externalized_alias",
+          name: "exec",
+          output: toolOutput,
+        },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const replay = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(replay.ingestedCount).toBe(0);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+    expect(
+      (await engine.getSummaryStore().getLargeFilesByConversation(conversation!.conversationId)),
+    ).toHaveLength(1);
+  });
+
+  it("deduplicates large string tool-call replay rows after content rewrite", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-large-string-tool-replay-session";
+    const toolOutput = `${"large string tool output\n".repeat(160)}done`;
+    const replayedMessage = {
+      role: "tool",
+      content: toolOutput,
+      toolCallId: "call_large_string_replay",
+      toolName: "exec",
+      timestamp: Date.now(),
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const replay = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(replay.ingestedCount).toBe(0);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.content).toContain("[LCM Tool Output: file_");
+    expect(
+      (await engine.getSummaryStore().getLargeFilesByConversation(conversation!.conversationId)),
+    ).toHaveLength(1);
+  });
+
+  it("keeps externalized tool rows when metadata changes but output matches", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-externalized-metadata-change-session";
+    const toolOutput = `${"metadata change large output\n".repeat(160)}done`;
+    const firstMessage = {
+      role: "tool",
+      content: toolOutput,
+      toolCallId: "call_externalized_metadata",
+      toolName: "exec",
+      isError: false,
+      timestamp: Date.now(),
+    } as AgentMessage;
+    const changedMessage = {
+      ...firstMessage,
+      isError: true,
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [firstMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const changed = await engine.ingestBatch({
+      sessionId,
+      messages: [changedMessage],
+    });
+    expect(changed.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+  });
+
+  it("keeps externalized tool rows when tool name changes but output matches", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-externalized-tool-name-change-session";
+    const toolOutput = `${"tool name change large output\n".repeat(160)}done`;
+    const firstMessage = {
+      role: "tool",
+      content: toolOutput,
+      toolCallId: "call_externalized_tool_name",
+      toolName: "exec",
+      timestamp: Date.now(),
+    } as AgentMessage;
+    const changedMessage = {
+      ...firstMessage,
+      toolName: "shell",
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [firstMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const changed = await engine.ingestBatch({
+      sessionId,
+      messages: [changedMessage],
+    });
+    expect(changed.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+  });
+
+  it("keeps large string tool-call replay rows when the stored sidecar is unreadable", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-missing-sidecar-replay-session";
+    const toolOutput = `${"missing sidecar tool output\n".repeat(160)}done`;
+    const replayedMessage = {
+      role: "tool",
+      content: toolOutput,
+      toolCallId: "call_missing_sidecar_replay",
+      toolName: "exec",
+      timestamp: Date.now(),
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const [largeFile] = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(largeFile).toBeDefined();
+    rmSync(largeFile!.storageUri);
+
+    const replay = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(replay.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+  });
+
+  it("deduplicates multi-part large tool-result replay rows after content rewrite", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-multi-large-tool-replay-session";
+    const firstOutput = `${"first large tool output\n".repeat(160)}done`;
+    const secondOutput = `${"second large tool output\n".repeat(160)}done`;
+    const replayedMessage = {
+      role: "toolResult",
+      toolName: "exec",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_multi_large_a",
+          name: "exec",
+          content: [{ type: "text", text: firstOutput }],
+        },
+        {
+          type: "tool_result",
+          tool_use_id: "call_multi_large_b",
+          name: "exec",
+          content: [{ type: "text", text: secondOutput }],
+        },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const replay = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(replay.ingestedCount).toBe(0);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+    expect(
+      (await engine.getSummaryStore().getLargeFilesByConversation(conversation!.conversationId)),
+    ).toHaveLength(2);
+  });
+
+  it("keeps externalized tool rows when call ids swap between parts", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-swapped-externalized-ids-session";
+    const firstOutput = `${"swapped first output\n".repeat(160)}done`;
+    const secondOutput = `${"swapped second output\n".repeat(160)}done`;
+    const firstMessage = {
+      role: "toolResult",
+      toolName: "exec",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_swap_a",
+          name: "exec",
+          content: [{ type: "text", text: firstOutput }],
+        },
+        {
+          type: "tool_result",
+          tool_use_id: "call_swap_b",
+          name: "exec",
+          content: [{ type: "text", text: secondOutput }],
+        },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+    const swappedMessage = {
+      ...firstMessage,
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_swap_b",
+          name: "exec",
+          content: [{ type: "text", text: firstOutput }],
+        },
+        {
+          type: "tool_result",
+          tool_use_id: "call_swap_a",
+          name: "exec",
+          content: [{ type: "text", text: secondOutput }],
+        },
+      ],
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [firstMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const swapped = await engine.ingestBatch({
+      sessionId,
+      messages: [swappedMessage],
+    });
+    expect(swapped.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+  });
+
+  it("deduplicates mixed inline and externalized tool-result replay rows", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-mixed-large-inline-tool-replay-session";
+    const largeOutput = `${"mixed large tool output\n".repeat(160)}done`;
+    const replayedMessage = {
+      role: "toolResult",
+      toolName: "exec",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_mixed_large",
+          name: "exec",
+          content: [{ type: "text", text: largeOutput }],
+        },
+        {
+          type: "tool_result",
+          tool_use_id: "call_mixed_inline",
+          name: "exec",
+          output: "small inline output",
+        },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const replay = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(replay.ingestedCount).toBe(0);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+    expect(
+      (await engine.getSummaryStore().getLargeFilesByConversation(conversation!.conversationId)),
+    ).toHaveLength(1);
+  });
+
+  it("keeps mixed externalized tool rows when an untagged part changes", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-externalized-untagged-change-session";
+    const largeOutput = `${"externalized with note output\n".repeat(160)}done`;
+    const firstMessage = {
+      role: "toolResult",
+      toolName: "exec",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_externalized_note",
+          name: "exec",
+          content: [{ type: "text", text: largeOutput }],
+        },
+        { type: "text", text: "old note" },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+    const changedMessage = {
+      ...firstMessage,
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_externalized_note",
+          name: "exec",
+          content: [{ type: "text", text: largeOutput }],
+        },
+        { type: "text", text: "new note" },
+      ],
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [firstMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const changed = await engine.ingestBatch({
+      sessionId,
+      messages: [changedMessage],
+    });
+    expect(changed.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+  });
+
+  it("keeps duplicate-id externalized tool rows when one occurrence changes", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-duplicate-id-externalized-session";
+    const firstOutput = `${"duplicate id first output\n".repeat(160)}done`;
+    const secondOutput = `${"duplicate id second output\n".repeat(160)}done`;
+    const changedFirstOutput = `${"changed duplicate id first output\n".repeat(160)}done`;
+    const firstMessage = {
+      role: "toolResult",
+      toolName: "exec",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_duplicate_large",
+          name: "exec",
+          content: [{ type: "text", text: firstOutput }],
+        },
+        {
+          type: "tool_result",
+          tool_use_id: "call_duplicate_large",
+          name: "exec",
+          content: [{ type: "text", text: secondOutput }],
+        },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+    const changedMessage = {
+      ...firstMessage,
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_duplicate_large",
+          name: "exec",
+          content: [{ type: "text", text: changedFirstOutput }],
+        },
+        {
+          type: "tool_result",
+          tool_use_id: "call_duplicate_large",
+          name: "exec",
+          content: [{ type: "text", text: secondOutput }],
+        },
+      ],
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [firstMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const changed = await engine.ingestBatch({
+      sessionId,
+      messages: [changedMessage],
+    });
+    expect(changed.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+  });
+
+  it("keeps multi-part replay batches with only partial raw-id overlap", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-partial-raw-overlap-session";
+    const existingMessage = makeMessage({
+      role: "tool",
+      content: [{ type: "tool_result", tool_use_id: "raw-part-existing", output: "old output" }],
+    });
+    const partiallyOverlappingMessage = makeMessage({
+      role: "tool",
+      content: [
+        { type: "tool_result", tool_use_id: "raw-part-existing", output: "old output" },
+        { type: "tool_result", tool_use_id: "raw-part-new", output: "new output" },
+      ],
+    });
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [existingMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const replayWithNewPart = await engine.ingestBatch({
+      sessionId,
+      messages: [partiallyOverlappingMessage],
+    });
+    expect(replayWithNewPart.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+    const newParts = await engine.getConversationStore().getMessageParts(stored[1]!.messageId);
+    expect(newParts.map((part) => part.toolCallId)).toEqual([
+      "raw-part-existing",
+      "raw-part-new",
+    ]);
+  });
+
+  it("keeps partial raw-id overlap when one stored id matches multiple parts", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-duplicate-row-coverage-session";
+    const existingMessage = {
+      role: "assistant",
+      toolCallId: "raw-repeated-top-level",
+      content: [
+        { type: "text", text: "existing part one" },
+        { type: "text", text: "existing part two" },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+    const partiallyOverlappingMessage = {
+      role: "assistant",
+      toolCallId: "raw-repeated-top-level",
+      content: [
+        { type: "text", text: "new part one" },
+        { type: "text", id: "raw-distinct-new-part", text: "new part two" },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [existingMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const replayWithNewPart = await engine.ingestBatch({
+      sessionId,
+      messages: [partiallyOverlappingMessage],
+    });
+    expect(replayWithNewPart.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+    const newParts = await engine.getConversationStore().getMessageParts(stored[1]!.messageId);
+    expect(newParts.map((part) => part.textContent)).toEqual([
+      "new part one",
+      "new part two",
+    ]);
+  });
+
+  it("keeps changed untagged parts that share a top-level replay id", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-top-level-id-changed-content-session";
+    const existingMessage = {
+      role: "assistant",
+      toolCallId: "raw-untagged-top-level",
+      content: [
+        { type: "text", text: "old part one" },
+        { type: "text", text: "old part two" },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+    const changedMessage = {
+      role: "assistant",
+      toolCallId: "raw-untagged-top-level",
+      content: [
+        { type: "text", text: "old part one" },
+        { type: "text", text: "new untagged part" },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+
+    const first = await engine.ingestBatch({
+      sessionId,
+      messages: [existingMessage],
+    });
+    expect(first.ingestedCount).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const changed = await engine.ingestBatch({
+      sessionId,
+      messages: [changedMessage],
+    });
+    expect(changed.ingestedCount).toBe(1);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old part one\nold part two",
+      "old part one\nnew untagged part",
+    ]);
+  });
+
   it("deduplicates raw-id replay prefix while keeping new ingestBatch tail", async () => {
     const engine = createEngine();
     const sessionId = "batch-ingest-replay-tail-session";
