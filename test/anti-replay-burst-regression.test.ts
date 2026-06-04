@@ -200,7 +200,7 @@ describe("anti-replay false-positive regression — legitimate sub-agent burst",
       // landing within the same SQLite `datetime('now')` second.
       //
       // Batch 1: 3 identical tool messages commit at second T.
-      // Batch 2: 3 more identical tool messages also at second T.
+      // Batch 2: 3 more identical tool messages commit at second T+1.
       // Pre-fix: assertNoReplayTimestampFlood throws on batch 2 because
       //   priorCount=3 + candidateCount=3 = 6 >= threshold 3.
       // Post-fix (role-aware): tool role gets a higher threshold (default 32),
@@ -218,6 +218,8 @@ describe("anti-replay false-positive regression — legitimate sub-agent burst",
         messages: mkBatch(),
         isHeartbeat: false,
       });
+
+      await waitForNextSqliteSecond();
 
       await expect(
         engine.ingestBatch({
@@ -296,7 +298,9 @@ describe("anti-replay false-positive regression — legitimate sub-agent burst",
         ),
       );
 
-      // Follow-up batch: 5 more identical tool results at same SQLite second.
+      await waitForNextSqliteSecond();
+
+      // Follow-up batch: 5 more identical tool results at the next SQLite second.
       // Pre-fix: 5 prior + 5 candidate → throws at legacy threshold 3.
       // Post-fix: 10 ≤ 32 → no throw.
       await expect(
@@ -305,6 +309,47 @@ describe("anti-replay false-positive regression — legitimate sub-agent burst",
             msg(convo.conversationId, "tool", '{"status": "ok"}'),
           ),
         ),
+      ).resolves.toBeDefined();
+    },
+  );
+
+  it(
+    "[unit] role-aware guard: mixed ASSISTANT and TOOL internal bursts do NOT throw",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "lcm-replay-burst-unit-"));
+      tempDirs.push(dir);
+      const db = createLcmDatabaseConnection(join(dir, "lcm.db"));
+      runLcmMigrations(db);
+      const store = new ConversationStore(db, {
+        replayFloodThresholdExternal: 3,
+        replayFloodThresholdInternal: 32,
+      });
+
+      const convo = await store.createConversation({
+        sessionId: randomUUID(),
+        sessionKey: "agent:test:cron:mixed-internal",
+      });
+
+      const toolPayload = '{"status": "ok"}';
+      const assistantPayload = "maintenance step completed";
+      await store.createMessagesBulk([
+        msg(convo.conversationId, "assistant", assistantPayload),
+        msg(convo.conversationId, "assistant", assistantPayload),
+        msg(convo.conversationId, "tool", toolPayload),
+        msg(convo.conversationId, "tool", toolPayload),
+      ]);
+
+      await waitForNextSqliteSecond();
+
+      await expect(
+        store.createMessagesBulk([
+          msg(convo.conversationId, "assistant", assistantPayload),
+          msg(convo.conversationId, "assistant", assistantPayload),
+          msg(convo.conversationId, "assistant", assistantPayload),
+          msg(convo.conversationId, "tool", toolPayload),
+          msg(convo.conversationId, "tool", toolPayload),
+          msg(convo.conversationId, "tool", toolPayload),
+        ]),
       ).resolves.toBeDefined();
     },
   );
