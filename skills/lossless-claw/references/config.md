@@ -518,11 +518,11 @@ Why it matters:
 
 ## Anti-replay flood guard
 
-The ingest path runs `assertNoReplayTimestampFlood` to refuse batches that look like webhook-style replay attacks (many identical messages at the same `created_at`). Because SQLite `datetime('now')` is second-granularity, legitimate idempotent bursts from sub-agents can also trip the guard if it is single-threshold. The role-aware thresholds below split the budget by message origin.
+The ingest path runs `assertNoReplayTimestampFlood` to refuse batches that look like webhook-style replay attacks (many replay-like user messages or many identical internal messages at the same `created_at`). Because SQLite `datetime('now')` is second-granularity, legitimate idempotent bursts from sub-agents can also trip the guard if it is single-threshold. The role-aware thresholds below split the budget by message origin.
 
 ### `replayFloodThresholdExternal`
 
-Max identical messages allowed in a single SQLite-second for `role=user` before the guard refuses the batch. Defaults to `3`.
+Max replay-like messages allowed in a single SQLite-second for `role=user` before the guard refuses the batch. Defaults to `3`.
 
 Why it matters:
 

@@ -275,6 +275,37 @@ describe("anti-replay false-positive regression — legitimate sub-agent burst",
   );
 
   it(
+    "[unit] role-aware guard: distinct USER replay contents share external threshold bucket",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "lcm-replay-burst-unit-"));
+      tempDirs.push(dir);
+      const db = createLcmDatabaseConnection(join(dir, "lcm.db"));
+      runLcmMigrations(db);
+      const store = new ConversationStore(db, {
+        replayFloodThresholdExternal: 3,
+        replayFloodThresholdInternal: 32,
+      });
+
+      const convo = await store.createConversation({
+        sessionId: randomUUID(),
+        sessionKey: "agent:test:webhook:distinct-user-replays",
+      });
+      const payloads = ["/cmd one", "/cmd two", "/cmd three"];
+
+      await store.createMessagesBulk(
+        payloads.map((payload) => msg(convo.conversationId, "user", payload)),
+      );
+      await waitForNextSqliteSecond();
+
+      await expect(
+        store.createMessagesBulk(
+          payloads.map((payload) => msg(convo.conversationId, "user", payload)),
+        ),
+      ).rejects.toThrow(/role=user/);
+    },
+  );
+
+  it(
     "[unit] role-aware guard: TOOL burst of 10 identical results does NOT throw",
     async () => {
       const dir = mkdtempSync(join(tmpdir(), "lcm-replay-burst-unit-"));
@@ -308,6 +339,40 @@ describe("anti-replay false-positive regression — legitimate sub-agent burst",
           Array.from({ length: 5 }, () =>
             msg(convo.conversationId, "tool", '{"status": "ok"}'),
           ),
+        ),
+      ).resolves.toBeDefined();
+    },
+  );
+
+  it(
+    "[unit] role-aware guard: distinct TOOL replay contents do not share a threshold bucket",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "lcm-replay-burst-unit-"));
+      tempDirs.push(dir);
+      const db = createLcmDatabaseConnection(join(dir, "lcm.db"));
+      runLcmMigrations(db);
+      const store = new ConversationStore(db, {
+        replayFloodThresholdExternal: 3,
+        replayFloodThresholdInternal: 6,
+      });
+
+      const convo = await store.createConversation({
+        sessionId: randomUUID(),
+        sessionKey: "agent:test:cron:distinct-tool-results",
+      });
+      const payloads = Array.from(
+        { length: 6 },
+        (_, index) => `{"status":"ok","item":${index}}`,
+      );
+
+      await store.createMessagesBulk(
+        payloads.map((payload) => msg(convo.conversationId, "tool", payload)),
+      );
+      await waitForNextSqliteSecond();
+
+      await expect(
+        store.createMessagesBulk(
+          payloads.map((payload) => msg(convo.conversationId, "tool", payload)),
         ),
       ).resolves.toBeDefined();
     },

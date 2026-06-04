@@ -837,6 +837,25 @@ describe("resolveLcmConfig", () => {
     expect(config.maxAssemblyTokenBudget).toBeUndefined();
   });
 
+  it("ignores non-positive replay flood thresholds from env and plugin config", () => {
+    const envFallback = resolveLcmConfig({
+      LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL: "0",
+      LCM_REPLAY_FLOOD_THRESHOLD_INTERNAL: "-4",
+    } as NodeJS.ProcessEnv, {
+      replayFloodThresholdExternal: 7,
+      replayFloodThresholdInternal: 9,
+    });
+    expect(envFallback.replayFloodThresholdExternal).toBe(7);
+    expect(envFallback.replayFloodThresholdInternal).toBe(9);
+
+    const defaultFallback = resolveLcmConfig({}, {
+      replayFloodThresholdExternal: 0,
+      replayFloodThresholdInternal: -1,
+    });
+    expect(defaultFallback.replayFloodThresholdExternal).toBe(3);
+    expect(defaultFallback.replayFloodThresholdInternal).toBe(32);
+  });
+
   it("derives bootstrapMaxTokens from leafChunkTokens and allows override", () => {
     expect(resolveLcmConfig({}, {
       leafChunkTokens: 80_000,

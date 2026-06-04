@@ -166,8 +166,7 @@ export type LcmConfig = {
    * (`tool`, `assistant`, `system`). These messages are not subject to
    * third-party rebroadcast and can legitimately repeat in fast sub-agent
    * bursts (e.g. idempotent tool results). Default 32 absorbs typical bursts.
-   * Set to a finite value to retain a sanity ceiling; set to `Infinity` to
-   * disable the guard for internal roles entirely.
+   * Set to a positive integer to retain a sanity ceiling.
    */
   replayFloodThresholdInternal: number;
   /** Explicit fallback provider/model pairs for compaction summarization. */
@@ -314,6 +313,17 @@ function toPositiveInteger(value: number | undefined): number | undefined {
     return undefined;
   }
   return Math.max(1, Math.floor(value));
+}
+
+/** Accept only positive integer config values. Invalid values fall back. */
+function toStrictPositiveInteger(value: number | undefined): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  if (!Number.isInteger(value) || value < 1) {
+    return undefined;
+  }
+  return value;
 }
 
 /** Coerce a plugin config value into a trimmed string array when possible. */
@@ -649,11 +659,11 @@ export function resolveLcmConfigWithDiagnostics(
         parseFiniteInt(env.LCM_CIRCUIT_BREAKER_COOLDOWN_MS)
           ?? toNumber(pc.circuitBreakerCooldownMs) ?? 1_800_000,
       replayFloodThresholdExternal:
-        parseFiniteInt(env.LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL)
-          ?? toNumber(pc.replayFloodThresholdExternal) ?? 3,
+        toStrictPositiveInteger(parseFiniteInt(env.LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL))
+          ?? toStrictPositiveInteger(toNumber(pc.replayFloodThresholdExternal)) ?? 3,
       replayFloodThresholdInternal:
-        parseFiniteInt(env.LCM_REPLAY_FLOOD_THRESHOLD_INTERNAL)
-          ?? toNumber(pc.replayFloodThresholdInternal) ?? 32,
+        toStrictPositiveInteger(parseFiniteInt(env.LCM_REPLAY_FLOOD_THRESHOLD_INTERNAL))
+          ?? toStrictPositiveInteger(toNumber(pc.replayFloodThresholdInternal)) ?? 32,
       fallbackProviders:
         parseFallbackProviders(env.LCM_FALLBACK_PROVIDERS)
           ?? toFallbackProviderArray(pc.fallbackProviders) ?? [],

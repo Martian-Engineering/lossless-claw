@@ -203,7 +203,7 @@
     },
     "replayFloodThresholdExternal": {
       "label": "Replay Flood Threshold (External)",
-      "help": "Max identical messages allowed in a single SQLite-second for third-party roles (role=user) before the anti-replay guard refuses the batch. Defaults to 3 to preserve replay defense for third-partyly-rebroadcastable input."
+      "help": "Max replay-like messages allowed in a single SQLite-second for third-party roles (role=user) before the anti-replay guard refuses the batch. Defaults to 3 to preserve replay defense for third-partyly-rebroadcastable input."
     },
     "replayFloodThresholdInternal": {
       "label": "Replay Flood Threshold (Internal)",
