@@ -310,6 +310,9 @@ function collectBlockTypes(value: unknown, out: Set<string>): void {
   if (typeof value.type === "string" && value.type.trim()) {
     out.add(value.type.trim());
   }
+  if (typeof value.rawType === "string" && value.rawType.trim()) {
+    out.add(value.rawType.trim());
+  }
   for (const nested of Object.values(value)) {
     collectBlockTypes(nested, out);
   }
@@ -345,7 +348,7 @@ function collectTextLikeFields(value: unknown, out: string[]): void {
     return;
   }
 
-  if (isReasoningLikeType(value.type)) {
+  if (isReasoningLikeType(value.type) || isReasoningLikeType(value.rawType)) {
     return;
   }
 

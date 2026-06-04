@@ -1739,7 +1739,7 @@ describe("LCM integration: compaction", () => {
       summaryId: "sum_pre_2",
       conversationId: CONV_ID,
       kind: "leaf",
-      content: "Prior summary two.",
+      content: "<think>PRIVATE_PRIOR_REASONING</think>Prior summary two.",
       tokenCount: 4,
     });
     await sumStore.appendContextSummary(CONV_ID, "sum_pre_2");
@@ -1747,7 +1747,7 @@ describe("LCM integration: compaction", () => {
       summaryId: "sum_pre_3",
       conversationId: CONV_ID,
       kind: "leaf",
-      content: "Prior summary three.",
+      content: "<thinking>PRIVATE_ONLY</thinking>",
       tokenCount: 4,
     });
     await sumStore.appendContextSummary(CONV_ID, "sum_pre_3");
@@ -1775,7 +1775,11 @@ describe("LCM integration: compaction", () => {
 
     expect(result.actionTaken).toBe(true);
     expect(summarizeCalls.length).toBeGreaterThan(0);
-    expect(summarizeCalls[0]?.previousSummary).toBe("Prior summary two.\n\nPrior summary three.");
+    expect(summarizeCalls[0]?.previousSummary).toBe("Prior summary two.");
+    expect(summarizeCalls[0]?.previousSummary).not.toContain("PRIVATE_PRIOR_REASONING");
+    expect(summarizeCalls[0]?.previousSummary).not.toContain("PRIVATE_ONLY");
+    expect(summarizeCalls[0]?.previousSummary).not.toContain("<think>");
+    expect(summarizeCalls[0]?.previousSummary).not.toContain("<thinking>");
     expect(summarizeCalls[0]?.isCondensed).toBe(false);
   });
 

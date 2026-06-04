@@ -48,6 +48,15 @@ describe("extractMeaningfulMessageText (B2: shared sanitizer)", () => {
     expect(extractMeaningfulMessageText(content)).toBe("Answer: ship the patch.");
   });
 
+  it("strips rawType reasoning blocks from legacy structured content", () => {
+    const content = JSON.stringify([
+      { rawType: "reasoning", text: "PRIVATE_RAWTYPE_REASONING" },
+      { type: "text", text: "Visible legacy text." },
+    ]);
+
+    expect(extractMeaningfulMessageText(content)).toBe("Visible legacy text.");
+  });
+
   it("strips redacted_thinking blocks (Anthropic encrypted reasoning shape)", () => {
     const content = JSON.stringify([
       {
@@ -366,6 +375,27 @@ describe("createLcmSummarizeFromLegacyParams (B1: reasoning-leak guardrail)", ()
     expect(summary).toBe("Recovered clean summary follow-on.");
     expect(summary).not.toContain("<think>");
     expect(summary).not.toContain("The user wants a digest.");
+  });
+
+  it("skips rawType reasoning blocks from provider output", async () => {
+    const deps = makeDeps({
+      complete: vi.fn(async () => ({
+        content: [
+          { type: "provider_block", rawType: "reasoning", text: "PRIVATE_RAWTYPE_REASONING" },
+          { type: "text", text: "Clean summary." },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: { provider: "openrouter", model: "qwen/qwen3-235b" },
+    });
+    const summary = await summarize!("Source text.", false);
+
+    expect(summary).toBe("Clean summary.");
+    expect(summary).not.toContain("PRIVATE_RAWTYPE_REASONING");
+    expect(deps.complete).toHaveBeenCalledTimes(1);
   });
 
   it("does not drop a clean summary that merely mentions the word 'reasoning'", async () => {

@@ -424,7 +424,12 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
   }
 
   const record = value as Record<string, unknown>;
-  const rawType = typeof record.type === "string" ? record.type.trim().toLowerCase() : "";
+  const rawType =
+    typeof record.type === "string"
+      ? record.type.trim().toLowerCase()
+      : typeof record.rawType === "string"
+        ? record.rawType.trim().toLowerCase()
+        : "";
   if (PROVIDER_REASONING_RAW_TYPES.has(rawType)) {
     return [];
   }
@@ -1529,9 +1534,13 @@ export class CompactionEngine {
         continue;
       }
       const summary = await this.summaryStore.getSummary(item.summaryId);
-      const content = typeof summary?.content === "string" ? summary.content.trim() : "";
-      if (content) {
-        summaryContents.push(content);
+      const rawContent = typeof summary?.content === "string" ? summary.content : "";
+      // Leaf continuity context is also summarizer input. Sanitize legacy
+      // summary rows here so pre-#503 reasoning blocks cannot leak forward
+      // when the next raw chunk is compacted.
+      const sanitized = extractMeaningfulMessageText(rawContent).trim();
+      if (sanitized) {
+        summaryContents.push(sanitized);
       }
     }
 
