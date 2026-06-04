@@ -44,6 +44,8 @@ export interface CompactionResult {
   level?: CompactionLevel;
   /** Whether compaction was blocked by a provider auth failure */
   authFailure?: boolean;
+  /** Whether the sweep stopped because its iteration or wall-clock budget was exhausted */
+  stoppedAtBudget?: boolean;
 }
 
 export interface CompactionConfig {
@@ -1133,6 +1135,7 @@ export class CompactionEngine {
       condensed,
       level,
       ...(hadAuthFailure ? { authFailure: true } : {}),
+      ...(stoppedAtBudget ? { stoppedAtBudget: true } : {}),
     };
   }
 

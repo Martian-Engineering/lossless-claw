@@ -12948,6 +12948,53 @@ describe("LcmContextEngine fidelity and token budget", () => {
     }
   });
 
+  it("maintain() keeps threshold debt pending when a no-action sweep stops at budget", async () => {
+    const engine = createEngine();
+    const sessionId = "maintain-deferred-no-action-budget-stop";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+    });
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: false,
+      tokensBefore: 3_500,
+      tokensAfter: 3_500,
+      condensed: false,
+      stoppedAtBudget: true,
+    });
+
+    const result = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-no-action-budget-stop"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 4_096,
+        currentTokenCount: 3_500,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenance?.lastFailureSummary).toBe("live context still exceeds target");
+    expect(maintenance?.retryAttempts).toBe(1);
+    expect(maintenance?.nextAttemptAfter).toBeInstanceOf(Date);
+    expect(result.changed).toBe(false);
+    expect(result.reason).toBe("live context still exceeds target");
+  });
+
   it("maintain() keeps threshold debt pending when partial compaction remains over target", async () => {
     const engine = createEngine();
     const sessionId = "maintain-deferred-partial-still-over-threshold";
@@ -16353,10 +16400,6 @@ describe("#639 Mode 2 deferred-compaction wedge (live context exceeds target, no
     const m = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    // eslint-disable-next-line no-console
-    console.log(
-      `WEDGE_RESULT pending=${m?.pending} running=${m?.running} retry=${m?.retryAttempts} failure=${JSON.stringify(m?.lastFailureSummary)}`,
-    );
 
     // FIXED behavior (exhaustion handling): no compactable candidates while over
     // target is NON-retryable → debt clears and retry does not climb. On current
@@ -16366,6 +16409,6 @@ describe("#639 Mode 2 deferred-compaction wedge (live context exceeds target, no
       m?.pending,
       "exhausted (no candidates) over-target threshold debt must NOT stay pending forever",
     ).toBe(false);
-    expect(m?.retryAttempts ?? 0, "must not accumulate retry attempts on exhaustion").toBeLessThanOrEqual(0);
+    expect(m?.retryAttempts ?? 0, "must not accumulate retry attempts on exhaustion").toBe(0);
   });
 });

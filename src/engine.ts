@@ -4618,6 +4618,8 @@ export class LcmContextEngine implements ContextEngine {
             : !liveContextStillExceedsTarget;
       const thresholdSweepStillOverTarget =
         isThresholdSweep && sweepResult.actionTaken && !isUnderTargetAfterSweep;
+      const thresholdSweepStoppedAtBudget =
+        (sweepResult as { stoppedAtBudget?: boolean }).stoppedAtBudget === true;
       // #639 Mode 2 (deferred-compaction wedge): a threshold sweep that took NO
       // action and did NOT fail (no eligible leaf/condensed candidates remain)
       // while still over target is TERMINAL EXHAUSTION. Compaction shrinks STORED
@@ -4630,6 +4632,7 @@ export class LcmContextEngine implements ContextEngine {
         isThresholdSweep &&
         !sweepResult.actionTaken &&
         !sweepResult.authFailure &&
+        !thresholdSweepStoppedAtBudget &&
         !isUnderTargetAfterSweep;
       const sweepOk =
         !sweepResult.authFailure &&
