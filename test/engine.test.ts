@@ -9,7 +9,7 @@ import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine, type RotateSessionStorageResult } from "../src/engine.js";
 import { estimateTokens } from "../src/estimate-tokens.js";
-import type { AgentMessage } from "../src/openclaw-bridge.js";
+import type { AgentMessage, IngestResult } from "../src/openclaw-bridge.js";
 import { LcmProviderAuthError, LcmSummarySpendLimitError } from "../src/summarize.js";
 import {
   createDelegatedExpansionGrant,
@@ -11172,18 +11172,145 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const count = await engine
       .getConversationStore()
       .getMessageCount(conversation!.conversationId);
-    expect(count).toBeGreaterThan(50);
+    expect(count).toBe(2 + entries.length);
     await expect(
       engine
         .getConversationStore()
         .countMessagesByIdentity(conversation!.conversationId, "user", "real user turn 0"),
+    ).resolves.toBe(1);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(
+          conversation!.conversationId,
+          "assistant",
+          `real assistant turn ${turns - 1}`,
+        ),
     ).resolves.toBe(1);
     // Checkpoint advanced past the placeholder so future turns take the normal
     // incremental append-only path.
     const advanced = await engine
       .getSummaryStore()
       .getConversationBootstrapState(conversation!.conversationId);
-    expect(advanced?.lastProcessedOffset).toBeGreaterThan(0);
+    expect(advanced?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: `real assistant turn ${turns - 1}` })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const countAfterReplay = await engine
+      .getConversationStore()
+      .getMessageCount(conversation!.conversationId);
+    expect(countAfterReplay).toBe(count);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(
+          conversation!.conversationId,
+          "assistant",
+          `real assistant turn ${turns - 1}`,
+        ),
+    ).resolves.toBe(1);
+  });
+
+  it("does not advance a placeholder checkpoint when no-anchor recovery throws mid-import (#639)", async () => {
+    const engine = createEngine();
+    const sessionId = "placeholder-no-anchor-import-failure";
+    const sessionKey = "agent:opsos:telegram:test:direct:placeholder-failure";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "Conversation info (untrusted metadata): alpha" }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "Conversation info (untrusted metadata): beta" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    const entries: Array<{ role: AgentMessage["role"]; content: string }> = [];
+    for (let i = 0; i < 8; i += 1) {
+      entries.push({ role: "user", content: `failure user turn ${i}` });
+      entries.push({ role: "assistant", content: `failure assistant turn ${i}` });
+    }
+    const sessionFile = createSessionFilePath("placeholder-no-anchor-import-failure");
+    writeLeafTranscript(sessionFile, entries);
+
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    const privateEngine = engine as unknown as {
+      ingestSingle: (params: {
+        sessionId: string;
+        sessionKey?: string;
+        message: AgentMessage;
+        isHeartbeat?: boolean;
+        skipReplayTimestampFloodGuard?: boolean;
+      }) => Promise<IngestResult>;
+    };
+    const originalIngestSingle = privateEngine.ingestSingle.bind(engine);
+    let transcriptImportAttempts = 0;
+    vi.spyOn(privateEngine, "ingestSingle").mockImplementation(async (params) => {
+      const content =
+        typeof params.message.content === "string"
+          ? params.message.content
+          : Array.isArray(params.message.content)
+            ? params.message.content
+                .map((block) =>
+                  block &&
+                  typeof block === "object" &&
+                  "text" in block &&
+                  typeof (block as { text?: unknown }).text === "string"
+                    ? (block as { text: string }).text
+                    : "",
+                )
+                .join("\n")
+            : "";
+      if (content.startsWith("failure user turn") || content.startsWith("failure assistant turn")) {
+        transcriptImportAttempts += 1;
+        if (transcriptImportAttempts === 3) {
+          throw new Error("simulated placeholder import failure");
+        }
+      }
+      return originalIngestSingle(params);
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "failure assistant turn 7" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(0);
+    expect(checkpoint?.lastSeenSize).toBe(0);
+    expect(checkpoint?.lastProcessedEntryHash).toBeNull();
+
+    const count = await engine
+      .getConversationStore()
+      .getMessageCount(conversation!.conversationId);
+    expect(count).toBe(4);
   });
 
   it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {

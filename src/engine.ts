@@ -8363,6 +8363,15 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.warn(
         `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
       );
+      // A reconcile exception can happen after partial transcript import. Do
+      // not leave the default "safe overlap" result in place, or afterTurn can
+      // refresh the checkpoint past unimported history and make the gap
+      // unrecoverable.
+      transcriptReconcileResult = {
+        importedMessages: 0,
+        blockedByImportCap: false,
+        hasOverlap: false,
+      };
     }
     const transcriptReconcileUnsafeToAdvance =
       transcriptReconcileResult.blockedByImportCap ||
