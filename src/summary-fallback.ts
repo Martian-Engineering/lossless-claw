@@ -14,17 +14,17 @@ const UNSCOPED_DIRECTIVE_TARGET = String.raw`(?:(?:all|any)\s+)?(?:of\s+)?(?:(?:
 const ANSWER_DAN_OBJECT = String.raw`(?:(?:me|us)|(?:(?:(?:the|this|that|your|my|any|these|those|all|every)\s+)?(?:future\s+)?(?:users?|requests?|questions?|prompts?|messages?)))`;
 const DAN_PERSONA_DIRECTIVE_PREFIX = String.raw`(?:^\s*|^\s*[A-Za-z][A-Za-z0-9 _/-]{0,40}:\s*)`;
 const FALLBACK_DIRECTIVE_CONTINUATION_PATTERN =
-  /^\s*(?:answer|reply|respond|say|output|print|return)\b[^.!?\n]{0,160}[.!?]?\s*$/i;
+  /^\s*(?:answer|reply|respond|say|output|print|return|show|provide|give|send|reveal|dump|exfiltrate)\b[^.!?\n]{0,160}[.!?]?\s*$/i;
 const FALLBACK_DIRECTIVE_SHAPED_PATTERNS = [
   new RegExp(
     [
       String.raw`\b(ignore|disregard|forget|override)\s+${OPTIONAL_DIRECTIVE_SCOPE_PREFIX}${DIRECTIVE_SCOPE}\s+(instructions?|prompts?|rules?)\b`,
-      String.raw`\b(ignore|disregard|forget|override)\s+${UNSCOPED_DIRECTIVE_TARGET}\b`,
+      String.raw`\b(ignore|disregard|forget|override)\s+${UNSCOPED_DIRECTIVE_TARGET}\s*(?:$|[.!?]|\s+(?:and|then|now|before|after|instead|to|with|from)\b)`,
       String.raw`\byou\s+are\s+now\b`,
       String.raw`\bfrom\s+now\s+on\b`,
       String.raw`\breply\s+only\s+with\b`,
-      String.raw`\b(reveal|print|show|dump|exfiltrate)\s+(?:(?:the|your|my|any)\s+)?(system|developer)\s+prompt\b`,
-      String.raw`\bjailbreak\b`,
+      String.raw`\b(reveal|print|show|dump|exfiltrate|provide|give|send)\s+(?:me\s+)?(?:(?:the|your|my|any)\s+)?(system|developer)\s+prompt\b`,
+      String.raw`\bjailbreak\s+(?:mode|prompt|instructions?|the\s+model|the\s+assistant)\b`,
     ].join("|"),
     "i",
   ),
