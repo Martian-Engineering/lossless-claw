@@ -17,6 +17,7 @@ import {
   resetDelegatedExpansionGrantsForTests,
   resolveDelegatedExpansionGrantId,
 } from "../src/expansion-auth.js";
+import { applyScopedDoctorRepair } from "../src/plugin/lcm-doctor-apply.js";
 import { detectDoctorMarker } from "../src/plugin/lcm-doctor-shared.js";
 import { RetrievalEngine } from "../src/retrieval.js";
 import type { LcmDependencies } from "../src/types.js";
@@ -13150,16 +13151,19 @@ describe("LcmContextEngine fidelity and token budget", () => {
     vi.setSystemTime(new Date("2026-05-31T12:30:00.000Z"));
     try {
       const maxSweepIterations = 5;
-      const complete = vi.fn(async () => {
+      const complete = vi.fn(async (params: Parameters<LcmDependencies["complete"]>[0]) => {
+        if (params.provider === "anthropic") {
+          throw new Error("FallbackError: secondary summarizer unavailable");
+        }
         throw new Error("FailoverError: ChatGPT prolite plan, try again in ~61 min");
       });
       const engine = createEngineWithDeps(
         {
           summaryProvider: "openai-codex",
           summaryModel: "gpt-5.3-codex",
+          fallbackProviders: [{ provider: "anthropic", model: "claude-sonnet-4-6" }],
           sweepMaxDepth: -1,
           incrementalMaxDepth: -1,
-          dynamicLeafChunkTokens: { enabled: true, max: 40_000 },
           freshTailCount: 2,
           leafMinFanout: 2,
           condensedMinFanout: 2,
@@ -13174,10 +13178,12 @@ describe("LcmContextEngine fidelity and token budget", () => {
         },
         {
           complete,
-          resolveModel: vi.fn(() => ({
-            provider: "openai-codex",
-            model: "gpt-5.3-codex",
-          })),
+          resolveModel: vi.fn((modelRef?: string, providerHint?: string) => {
+            if (providerHint === "anthropic" || modelRef === "anthropic/claude-sonnet-4-6") {
+              return { provider: "anthropic", model: "claude-sonnet-4-6" };
+            }
+            return { provider: "openai-codex", model: "gpt-5.3-codex" };
+          }),
         },
       );
       const sessionId = "maintain-provider-fallback-unlimited-depth-repairable";
@@ -13244,7 +13250,11 @@ describe("LcmContextEngine fidelity and token budget", () => {
       expect(first.changed).toBe(true);
       expect(first.reason).toBe("compacted but still over target");
       expect(complete.mock.calls.length).toBeGreaterThan(0);
-      expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations);
+      expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations * 2);
+      const calledProviders = new Set(
+        complete.mock.calls.map(([params]) => params.provider ?? ""),
+      );
+      expect(calledProviders).toEqual(new Set(["openai-codex", "anthropic"]));
 
       const maintenance = await engine
         .getCompactionMaintenanceStore()
@@ -13282,6 +13292,24 @@ describe("LcmContextEngine fidelity and token budget", () => {
       expect(contextItems.filter((item) => item.itemType === "message")).toHaveLength(2);
       expect(contextItems.filter((item) => item.itemType === "summary")).not.toHaveLength(1);
 
+      const reachableSummaryIds = new Set<string>();
+      const collectReachableSummaryIds = async (summaryId: string): Promise<void> => {
+        if (reachableSummaryIds.has(summaryId)) {
+          return;
+        }
+        reachableSummaryIds.add(summaryId);
+        for (const parent of await summaryStore.getSummaryParents(summaryId)) {
+          await collectReachableSummaryIds(parent.summaryId);
+        }
+      };
+      for (const item of contextItems) {
+        if (item.itemType === "summary" && item.summaryId != null) {
+          await collectReachableSummaryIds(item.summaryId);
+        }
+      }
+      expect(reachableSummaryIds).toContain("sum_provider_fallback_old_1");
+      expect(reachableSummaryIds).toContain("sum_provider_fallback_old_2");
+
       for (const summary of markerLeaves) {
         expect(await summaryStore.getSummaryMessages(summary.summaryId)).not.toHaveLength(0);
       }
@@ -13291,6 +13319,50 @@ describe("LcmContextEngine fidelity and token budget", () => {
       const tokensAfter = await summaryStore.getContextTokenCount(conversation.conversationId);
       expect(Number.isFinite(tokensAfter)).toBe(true);
       expect(tokensAfter).toBeLessThanOrEqual(tokensBefore);
+
+      const privateEngine = engine as unknown as { db: Parameters<typeof applyScopedDoctorRepair>[0]["db"] };
+      const repairSummarize = vi.fn(async (
+        text: string,
+        _aggressive?: boolean,
+        options?: Parameters<NonNullable<Parameters<typeof applyScopedDoctorRepair>[0]["summarize"]>>[2],
+      ) => {
+        if (options?.isCondensed) {
+          return `CONDENSED REPAIR\n${text}`;
+        }
+        return `LEAF REPAIR\n${text}`;
+      });
+      const repairResult = await applyScopedDoctorRepair({
+        db: privateEngine.db,
+        config: getEngineConfig(engine),
+        conversationId: conversation.conversationId,
+        summarize: repairSummarize,
+      });
+      expect(repairResult.kind).toBe("applied");
+      expect(repairResult.detected).toBe(markerSummaries.length);
+      expect(repairResult.repaired).toBe(markerSummaries.length);
+      expect(repairResult.skipped).toEqual([]);
+      expect(repairSummarize).toHaveBeenCalledTimes(markerSummaries.length);
+
+      const condensedRepairCalls = repairSummarize.mock.calls.filter(
+        ([, , options]) => options?.isCondensed === true,
+      );
+      expect(
+        repairSummarize.mock.calls.some(
+          ([text, , options]) =>
+            options?.isCondensed !== true &&
+            text.includes("provider stress turn 0"),
+        ),
+      ).toBe(true);
+      expect(
+        condensedRepairCalls.some(
+          ([text]) =>
+            text.includes("old provider-stress arc 1") &&
+            text.includes("old provider-stress arc 2"),
+        ),
+      ).toBe(true);
+
+      const repairedSummaries = await summaryStore.getSummariesByConversation(conversation.conversationId);
+      expect(repairedSummaries.every((summary) => detectDoctorMarker(summary.content) === null)).toBe(true);
     } finally {
       vi.useRealTimers();
     }

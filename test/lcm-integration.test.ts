@@ -3715,7 +3715,7 @@ describe("LCM integration: compactUntilUnder bounds", () => {
       convStore as any,
       sumStore as any,
       multiRoundConfig({
-        freshTailCount: 0,
+        freshTailCount: 2,
         leafChunkTokens: 100,
         leafMinFanout: 2,
         condensedMinFanout: 2,
@@ -3755,6 +3755,14 @@ describe("LCM integration: compactUntilUnder bounds", () => {
     expect(summaries.every((summary) => Number.isFinite(summary.tokenCount))).toBe(true);
     expect(summaries.every((summary) => detectDoctorMarker(summary.content) !== null)).toBe(true);
 
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    expect(contextItems.length).toBeGreaterThan(1);
+    expect(
+      contextItems
+        .filter((item) => item.itemType === "message")
+        .map((item) => item.messageId),
+    ).toEqual(convStore._messages.slice(-2).map((message) => message.messageId));
+
     const summaryIds = new Set(summaries.map((summary) => summary.summaryId));
     expect(
       sumStore._summaryParents.every(
@@ -3782,7 +3790,7 @@ describe("LCM integration: compactUntilUnder bounds", () => {
     };
 
     const coveredMessageIds = new Set<number>();
-    for (const item of await sumStore.getContextItems(CONV_ID)) {
+    for (const item of contextItems) {
       if (item.itemType === "message" && item.messageId != null) {
         coveredMessageIds.add(item.messageId);
       }
