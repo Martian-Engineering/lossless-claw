@@ -11102,6 +11102,90 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(advancedState?.lastProcessedOffset).toBeGreaterThan(0);
   });
 
+  it("recovers a placeholder-checkpoint conversation whose only DB rows are non-anchoring metadata by importing the full transcript as a new epoch (#639)", async () => {
+    // Repro of conv 3893 (agent:opsos:telegram): the DB frontier holds only
+    // injected "Conversation info (untrusted metadata)" preambles that do NOT
+    // appear in the real transcript, and the bootstrap checkpoint is a
+    // placeholder (all-zero, never ingested). Before the fix the
+    // placeholder-checkpoint-recovery branch called reconcileSessionTail
+    // WITHOUT allowNoAnchorImport, so with no anchor it imported 0 messages
+    // forever; and even with it, the no-anchor import cap (max(2*0.2,50)=50)
+    // would block a >50-message transcript. After the fix the full transcript
+    // is imported as a new epoch (cap lifted for this initial-epoch catch-up).
+    const engine = createEngine();
+    const sessionId = "placeholder-no-anchor-large-transcript";
+    const sessionKey = "agent:opsos:telegram:test:direct:placeholder-no-anchor";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "Conversation info (untrusted metadata): alpha" }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "Conversation info (untrusted metadata): beta" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    // Large transcript (120 messages > 50-message no-anchor cap), sharing no
+    // content with the 2 metadata rows so there is no anchor.
+    const turns = 60;
+    const entries: Array<{ role: AgentMessage["role"]; content: string }> = [];
+    for (let i = 0; i < turns; i += 1) {
+      entries.push({ role: "user", content: `real user turn ${i}` });
+      entries.push({ role: "assistant", content: `real assistant turn ${i}` });
+    }
+    const sessionFile = createSessionFilePath("placeholder-no-anchor-large-transcript");
+    writeLeafTranscript(sessionFile, entries);
+
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: `real assistant turn ${turns - 1}` })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const contents = messages.map((m) => m.content);
+    expect(contents).toContain("real user turn 0");
+    expect(contents).toContain(`real assistant turn ${turns - 1}`);
+    // Proves BOTH the allowNoAnchorImport pass-through AND the cap bypass:
+    // 2 metadata + 120 transcript messages, far above the old 50 cap.
+    const count = await engine
+      .getConversationStore()
+      .getMessageCount(conversation!.conversationId);
+    expect(count).toBeGreaterThan(50);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(conversation!.conversationId, "user", "real user turn 0"),
+    ).resolves.toBe(1);
+    // Checkpoint advanced past the placeholder so future turns take the normal
+    // incremental append-only path.
+    const advanced = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(advanced?.lastProcessedOffset).toBeGreaterThan(0);
+  });
+
   it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {
     const engine = createEngine();
     const sessionId = "bootstrap-transcript-epoch-no-anchor";

@@ -6141,7 +6141,17 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
 
-          const importCap = Math.max(Math.floor(existingDbCount * 0.2), 50);
+          // #639: placeholder-checkpoint recovery is an initial-epoch
+          // catch-up (the conversation has only injected metadata and never
+          // ingested its real transcript). The proportional cap
+          // (max(existingDbCount*0.2, 50)) permanently starves large
+          // pre-existing sessions, so lift it for this reason only. The
+          // replay-duplicate guard above already aborts genuine floods; every
+          // other no-anchor reason keeps the cap.
+          const importCap =
+            params.noAnchorImportReason === "placeholder-checkpoint-recovery"
+              ? Number.POSITIVE_INFINITY
+              : Math.max(Math.floor(existingDbCount * 0.2), 50);
           if (noAnchorImportMessages.length > importCap) {
             this.deps.log.warn(
               `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${noAnchorImportMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
@@ -6546,6 +6556,13 @@ export class LcmContextEngine implements ContextEngine {
                 sessionKey: params.sessionKey,
                 conversationId: conversation.conversationId,
                 historicalMessages: appended.messages,
+                // #639: a placeholder-checkpoint conversation (only injected
+                // metadata rows, never ingested its real transcript) cannot
+                // anchor that transcript, so allow importing it as a new epoch
+                // instead of giving up. The replay-duplicate guard inside
+                // reconcileSessionTail still aborts genuine floods; the import
+                // cap is lifted for this initial-epoch catch-up reason below.
+                allowNoAnchorImport: true,
                 noAnchorImportReason: "placeholder-checkpoint-recovery",
               });
               if (reconcile.importedMessages > 0) {
