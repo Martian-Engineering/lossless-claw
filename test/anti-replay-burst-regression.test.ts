@@ -100,18 +100,41 @@ function createTestConfig(databasePath: string): LcmConfig {
     customInstructions: "",
     expansionProvider: "",
     expansionModel: "",
-    pinnedFiles: [],
-    pinnedFilesPerAgent: {},
     circuitBreakerThreshold: 5,
     circuitBreakerCooldownMs: 1_800_000,
     replayFloodThresholdExternal: 3,
     replayFloodThresholdInternal: 32,
+    largeFilesDir: join(databasePath, "..", "lcm-files"),
+    promptAwareEviction: false,
+    stubLargeToolPayloads: false,
+    sweepMaxDepth: 1,
+    maxSweepIterations: 12,
+    sweepDeadlineMs: 120_000,
+    compactUntilUnderDeadlineMs: 300_000,
+    delegationTimeoutMs: 120_000,
+    summaryTimeoutMs: 60_000,
+    fallbackProviders: [],
+    cacheAwareCompaction: {
+      enabled: true,
+      cacheTTLSeconds: 300,
+      maxColdCacheCatchupPasses: 2,
+      hotCachePressureFactor: 4,
+      hotCacheBudgetHeadroomRatio: 0.2,
+      coldCacheObservationThreshold: 3,
+      criticalBudgetPressureRatio: 0.90,
+    },
+    dynamicLeafChunkTokens: {
+      enabled: true,
+      max: 40_000,
+    },
+    stripInjectedContextTags: [],
   };
 }
 
 function createTestDeps(config: LcmConfig): LcmDependencies {
   return {
     config,
+    resolveSessionTranscriptFile: async () => undefined,
     complete: vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] })),
     callGateway: vi.fn(async () => ({})),
     resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
@@ -184,9 +207,9 @@ describe("anti-replay false-positive regression — legitimate sub-agent burst",
       //   absorbing legitimate idempotent retries.
       const payload = '{"status": "ok"}';
       const mkBatch = (): AgentMessage[] => [
-        { role: "tool", content: payload } as AgentMessage,
-        { role: "tool", content: payload } as AgentMessage,
-        { role: "tool", content: payload } as AgentMessage,
+        { role: "tool", content: payload } as unknown as AgentMessage,
+        { role: "tool", content: payload } as unknown as AgentMessage,
+        { role: "tool", content: payload } as unknown as AgentMessage,
       ];
 
       await engine.ingestBatch({
