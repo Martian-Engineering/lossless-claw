@@ -17,6 +17,7 @@ import {
   resetDelegatedExpansionGrantsForTests,
   resolveDelegatedExpansionGrantId,
 } from "../src/expansion-auth.js";
+import { detectDoctorMarker } from "../src/plugin/lcm-doctor-shared.js";
 import { RetrievalEngine } from "../src/retrieval.js";
 import type { LcmDependencies } from "../src/types.js";
 
@@ -13139,6 +13140,157 @@ describe("LcmContextEngine fidelity and token budget", () => {
       expect(second.changed).toBe(false);
       expect(second.reason).toBe("deferred compaction backoff active");
       expect(complete).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("maintain() bounds provider-fallback recursive sweeps with unlimited depth and repairable lineage", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-31T12:30:00.000Z"));
+    try {
+      const maxSweepIterations = 5;
+      const complete = vi.fn(async () => {
+        throw new Error("FailoverError: ChatGPT prolite plan, try again in ~61 min");
+      });
+      const engine = createEngineWithDeps(
+        {
+          summaryProvider: "openai-codex",
+          summaryModel: "gpt-5.3-codex",
+          sweepMaxDepth: -1,
+          incrementalMaxDepth: -1,
+          dynamicLeafChunkTokens: { enabled: true, max: 40_000 },
+          freshTailCount: 2,
+          leafMinFanout: 2,
+          condensedMinFanout: 2,
+          condensedMinFanoutHard: 2,
+          leafChunkTokens: 2_500,
+          leafTargetTokens: 600,
+          condensedTargetTokens: 900,
+          summaryPrefixTargetTokens: 1,
+          maxSweepIterations,
+          sweepDeadlineMs: 1_000,
+          summarySpendBackoffMs: 30 * 60 * 1000,
+        },
+        {
+          complete,
+          resolveModel: vi.fn(() => ({
+            provider: "openai-codex",
+            model: "gpt-5.3-codex",
+          })),
+        },
+      );
+      const sessionId = "maintain-provider-fallback-unlimited-depth-repairable";
+      const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+        sessionKey: undefined,
+      });
+      const summaryStore = engine.getSummaryStore();
+      await summaryStore.insertSummary({
+        summaryId: "sum_provider_fallback_old_1",
+        conversationId: conversation.conversationId,
+        kind: "condensed",
+        depth: 1,
+        content: `old provider-stress arc 1 ${"a".repeat(3_600)}`,
+        tokenCount: 1_000,
+      });
+      await summaryStore.insertSummary({
+        summaryId: "sum_provider_fallback_old_2",
+        conversationId: conversation.conversationId,
+        kind: "condensed",
+        depth: 1,
+        content: `old provider-stress arc 2 ${"b".repeat(3_600)}`,
+        tokenCount: 1_000,
+      });
+      await summaryStore.appendContextSummary(
+        conversation.conversationId,
+        "sum_provider_fallback_old_1",
+      );
+      await summaryStore.appendContextSummary(
+        conversation.conversationId,
+        "sum_provider_fallback_old_2",
+      );
+      const rawMessages = await engine.getConversationStore().createMessagesBulk(
+        Array.from({ length: 6 }, (_, index) => ({
+          conversationId: conversation.conversationId,
+          seq: index + 1,
+          role: index % 2 === 0 ? "user" as const : "assistant" as const,
+          content: `provider stress turn ${index} ${"x".repeat(5_000)}`,
+          tokenCount: 1_000,
+          skipReplayTimestampFloodGuard: true,
+        })),
+      );
+      await summaryStore.appendContextMessages(
+        conversation.conversationId,
+        rawMessages.map((message) => message.messageId),
+      );
+      const tokensBefore = await summaryStore.getContextTokenCount(conversation.conversationId);
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+        tokenBudget: 4_096,
+        currentTokenCount: 9_000,
+      });
+
+      const first = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-provider-fallback-unlimited-depth"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+          currentTokenCount: 9_000,
+        },
+      });
+
+      expect(first.changed).toBe(true);
+      expect(first.reason).toBe("compacted but still over target");
+      expect(complete.mock.calls.length).toBeGreaterThan(0);
+      expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations);
+
+      const maintenance = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation.conversationId);
+      expect(maintenance?.pending).toBe(true);
+      expect(maintenance?.running).toBe(false);
+      expect(maintenance?.lastFailureSummary).toBe("compacted but still over target");
+      expect(maintenance?.nextAttemptAfter?.toISOString()).toBe("2026-05-31T13:00:00.000Z");
+
+      const afterFirstCallCount = complete.mock.calls.length;
+      const second = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-provider-fallback-unlimited-depth-retry"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+          currentTokenCount: 9_000,
+        },
+      });
+      expect(second.changed).toBe(false);
+      expect(second.reason).toBe("deferred compaction backoff active");
+      expect(complete).toHaveBeenCalledTimes(afterFirstCallCount);
+
+      const summaries = await summaryStore.getSummariesByConversation(conversation.conversationId);
+      const markerSummaries = summaries.filter(
+        (summary) => detectDoctorMarker(summary.content) !== null,
+      );
+      const markerLeaves = markerSummaries.filter((summary) => summary.kind === "leaf");
+      const markerCondensed = markerSummaries.filter((summary) => summary.kind === "condensed");
+      expect(markerLeaves.length).toBeGreaterThan(0);
+      expect(markerCondensed.length).toBeGreaterThan(0);
+
+      const contextItems = await summaryStore.getContextItems(conversation.conversationId);
+      expect(contextItems.length).toBeGreaterThan(1);
+      expect(contextItems.filter((item) => item.itemType === "message")).toHaveLength(2);
+      expect(contextItems.filter((item) => item.itemType === "summary")).not.toHaveLength(1);
+
+      for (const summary of markerLeaves) {
+        expect(await summaryStore.getSummaryMessages(summary.summaryId)).not.toHaveLength(0);
+      }
+      for (const summary of markerCondensed) {
+        expect(await summaryStore.getSummaryParents(summary.summaryId)).not.toHaveLength(0);
+      }
+      const tokensAfter = await summaryStore.getContextTokenCount(conversation.conversationId);
+      expect(Number.isFinite(tokensAfter)).toBe(true);
+      expect(tokensAfter).toBeLessThanOrEqual(tokensBefore);
     } finally {
       vi.useRealTimers();
     }

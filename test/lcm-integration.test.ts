@@ -11,6 +11,7 @@ import { ContextAssembler } from "../src/assembler.js";
 import { CompactionEngine, type CompactionConfig } from "../src/compaction.js";
 import { RetrievalEngine } from "../src/retrieval.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "../src/summarize.js";
+import { detectDoctorMarker } from "../src/plugin/lcm-doctor-shared.js";
 import type { LcmDependencies } from "../src/types.js";
 
 // ── Mock Store Factories ─────────────────────────────────────────────────────
@@ -3705,6 +3706,95 @@ describe("LCM integration: compactUntilUnder bounds", () => {
     expect(result.rounds).toBeGreaterThan(1);
     expect(result.success).toBe(true);
     expect(result.finalTokens).toBeLessThanOrEqual(300);
+  });
+
+  it("bounds unlimited-depth fallback-marker compaction while preserving repair lineage", async () => {
+    const maxRounds = 3;
+    const maxSweepIterations = 10;
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      multiRoundConfig({
+        freshTailCount: 0,
+        leafChunkTokens: 100,
+        leafMinFanout: 2,
+        condensedMinFanout: 2,
+        condensedMinFanoutHard: 2,
+        condensedTargetTokens: 30,
+        summaryPrefixTargetTokens: 1,
+        incrementalMaxDepth: -1,
+        maxRounds,
+        maxSweepIterations,
+        compactUntilUnderDeadlineMs: 1_000,
+      }),
+    );
+    await ingestMessages(convStore, sumStore, 8, {
+      contentFn: (i) => `Provider stress turn ${i}: ${"x".repeat(80)}`,
+      tokenCountFn: () => 80,
+    });
+
+    const fallbackSummary = "[LCM fallback summary; truncated for context management]\nrepairable fallback";
+    const summarize = vi.fn(async () => fallbackSummary);
+
+    const result = await engine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 1_000,
+      targetTokens: 1,
+      summarize,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.rounds).toBeLessThanOrEqual(maxRounds);
+    expect(summarize.mock.calls.length).toBeGreaterThan(0);
+    expect(summarize.mock.calls.length).toBeLessThanOrEqual(maxRounds * maxSweepIterations);
+    expect(Number.isFinite(result.finalTokens)).toBe(true);
+
+    const summaries = sumStore._summaries;
+    expect(summaries.length).toBeGreaterThan(0);
+    expect(summaries.some((summary) => summary.kind === "condensed")).toBe(true);
+    expect(summaries.every((summary) => Number.isFinite(summary.tokenCount))).toBe(true);
+    expect(summaries.every((summary) => detectDoctorMarker(summary.content) !== null)).toBe(true);
+
+    const summaryIds = new Set(summaries.map((summary) => summary.summaryId));
+    expect(
+      sumStore._summaryParents.every(
+        (edge) => summaryIds.has(edge.summaryId) && summaryIds.has(edge.parentSummaryId),
+      ),
+    ).toBe(true);
+
+    const collectSourceMessageIds = (summaryId: string, seen = new Set<string>()): Set<number> => {
+      if (seen.has(summaryId)) {
+        return new Set();
+      }
+      seen.add(summaryId);
+
+      const messageIds = new Set(
+        sumStore._summaryMessages
+          .filter((edge) => edge.summaryId === summaryId)
+          .map((edge) => edge.messageId),
+      );
+      for (const edge of sumStore._summaryParents.filter((parent) => parent.summaryId === summaryId)) {
+        for (const messageId of collectSourceMessageIds(edge.parentSummaryId, seen)) {
+          messageIds.add(messageId);
+        }
+      }
+      return messageIds;
+    };
+
+    const coveredMessageIds = new Set<number>();
+    for (const item of await sumStore.getContextItems(CONV_ID)) {
+      if (item.itemType === "message" && item.messageId != null) {
+        coveredMessageIds.add(item.messageId);
+      }
+      if (item.itemType === "summary" && item.summaryId != null) {
+        for (const messageId of collectSourceMessageIds(item.summaryId)) {
+          coveredMessageIds.add(messageId);
+        }
+      }
+    }
+    expect([...coveredMessageIds].toSorted((a, b) => a - b)).toEqual(
+      convStore._messages.map((message) => message.messageId),
+    );
   });
 });
 
