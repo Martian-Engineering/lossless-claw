@@ -14,6 +14,7 @@ import { formatToolOutputReference } from "./large-files.js";
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssemblySegment = "evictable" | "freshTail";
 type FocusBriefLookup = Pick<FocusBriefStore, "getActiveFocusBrief">;
+type RepairLogger = { warn: (message: string) => void };
 
 export interface AssemblyOverflowContributor {
   /** Context item ordinal in the persisted conversation window. */
@@ -1336,6 +1337,7 @@ export class ContextAssembler {
     private summaryStore: SummaryStore,
     private timezone?: string,
     private focusBriefStore?: FocusBriefLookup,
+    private log?: RepairLogger,
   ) {}
 
   /**
@@ -1561,7 +1563,7 @@ export class ContextAssembler {
     const preSanitizeFreshTailMessages = cleanedEntries
       .filter((entry) => entry.segment === "freshTail")
       .map((entry) => entry.message);
-    const repaired = sanitizeToolUseResultPairing(cleaned) as AgentMessage[];
+    const repaired = sanitizeToolUseResultPairing(cleaned, this.log) as AgentMessage[];
     return {
       messages: repaired,
       estimatedTokens,

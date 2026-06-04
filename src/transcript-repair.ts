@@ -16,6 +16,7 @@ type AgentMessageLike = {
   toolUseId?: string;
   toolName?: string;
   stopReason?: string;
+  stop_reason?: string;
   isError?: boolean;
   timestamp?: number;
 };
@@ -26,6 +27,8 @@ type ToolCallLike = {
 };
 
 type WarnLogger = { warn: (message: string) => void };
+type ToolUseDropReason = "duplicate" | "terminal";
+type DroppedToolUse = ToolCallLike & { reason: ToolUseDropReason };
 
 // -- Extraction helpers (from tool-call-id.ts) --
 
@@ -150,6 +153,46 @@ function extractToolResultId(msg: AgentMessageLike): string | null {
   return null;
 }
 
+function getTerminalStopReason(msg: AgentMessageLike): "error" | "aborted" | null {
+  const stopReason =
+    typeof msg.stopReason === "string"
+      ? msg.stopReason
+      : typeof msg.stop_reason === "string"
+        ? msg.stop_reason
+        : undefined;
+  return stopReason === "error" || stopReason === "aborted" ? stopReason : null;
+}
+
+function isThinkingLikeBlock(block: unknown): boolean {
+  return (
+    !!block &&
+    typeof block === "object" &&
+    ["thinking", "redacted_thinking", "reasoning"].includes(
+      String((block as { type?: unknown }).type ?? "")
+    )
+  );
+}
+
+function isBlankTextBlock(block: unknown): boolean {
+  return (
+    !!block &&
+    typeof block === "object" &&
+    (block as { type?: unknown }).type === "text" &&
+    typeof (block as { text?: unknown }).text === "string" &&
+    !(block as { text: string }).text.trim()
+  );
+}
+
+function isEmptyAfterToolUseDrop(content: unknown): boolean {
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return (
+    content.length === 0 ||
+    content.every((block) => isThinkingLikeBlock(block) || isBlankTextBlock(block))
+  );
+}
+
 /**
  * Remove duplicate assistant `tool_use` blocks during assembly.
  *
@@ -169,13 +212,13 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
   msg: T,
   seenToolUseIds: Set<string>,
   options: { dropAll?: boolean; record?: boolean } = {}
-): { message: T; dropped: ToolCallLike[] } {
+): { message: T; dropped: DroppedToolUse[] } {
   const { dropAll = false, record = true } = options;
   const content = msg.content;
   if (!Array.isArray(content)) {
     return { message: msg, dropped: [] };
   }
-  const dropped: ToolCallLike[] = [];
+  const dropped: DroppedToolUse[] = [];
   const kept: unknown[] = [];
   for (const block of content) {
     if (block && typeof block === "object") {
@@ -193,6 +236,7 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
           dropped.push({
             id,
             name: typeof rec.name === "string" ? rec.name : undefined,
+            reason: dropAll ? "terminal" : "duplicate",
           });
           continue;
         }
@@ -248,9 +292,20 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
   const seenToolUseIds = new Set<string>();
   let droppedDuplicateCount = 0;
   let droppedDuplicateAssistantToolUseCount = 0;
+  let droppedTerminalAssistantToolUseCount = 0;
   let droppedOrphanCount = 0;
   let moved = false;
   let changed = false;
+
+  const recordAssistantToolUseDrops = (dropped: DroppedToolUse[]) => {
+    for (const drop of dropped) {
+      if (drop.reason === "terminal") {
+        droppedTerminalAssistantToolUseCount += 1;
+      } else {
+        droppedDuplicateAssistantToolUseCount += 1;
+      }
+    }
+  };
 
   const pushToolResult = (msg: T) => {
     const id = extractToolResultId(msg);
@@ -290,8 +345,7 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
 
     // Drop duplicate assistant tool_use blocks (keep-first). Two assistant
     // tool_use blocks sharing an id cause the Anthropic API to reject the turn.
-    const stopReason = normalizedAssistant.stopReason;
-    const terminal = stopReason === "error" || stopReason === "aborted";
+    const terminal = getTerminalStopReason(normalizedAssistant) !== null;
     const deduped = filterAssistantToolUseBlocks(
       normalizedAssistant,
       seenToolUseIds,
@@ -302,11 +356,8 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
     const assistantMsg = deduped.message;
     if (deduped.dropped.length > 0) {
       changed = true;
-      droppedDuplicateAssistantToolUseCount += deduped.dropped.length;
-      const remaining = Array.isArray(assistantMsg.content)
-        ? assistantMsg.content
-        : [];
-      if (remaining.length === 0) {
+      recordAssistantToolUseDrops(deduped.dropped);
+      if (isEmptyAfterToolUseDrop(assistantMsg.content)) {
         // Nothing left after removing duplicate tool_use blocks; drop the message.
         continue;
       }
@@ -341,13 +392,27 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
 
       const nextRole = next.role;
       if (nextRole === "assistant") {
-        const nextToolCalls = extractToolCallsFromAssistant(
-          normalizeAssistantReasoningBlocks(next)
+        const normalizedNext = normalizeAssistantReasoningBlocks(next);
+        const nextTerminal = getTerminalStopReason(normalizedNext) !== null;
+        const preview = filterAssistantToolUseBlocks(
+          normalizedNext,
+          new Set(seenToolUseIds),
+          nextTerminal ? { dropAll: true, record: false } : {}
         );
+        const nextToolCalls = nextTerminal
+          ? []
+          : extractToolCallsFromAssistant(preview.message);
         if (nextToolCalls.length > 0) {
           break;
         }
-        remainder.push(next);
+        if (preview.dropped.length > 0) {
+          changed = true;
+          recordAssistantToolUseDrops(preview.dropped);
+          if (isEmptyAfterToolUseDrop(preview.message.content)) {
+            continue;
+          }
+        }
+        remainder.push(preview.message as T);
         continue;
       }
 
@@ -402,6 +467,11 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
   if (droppedDuplicateAssistantToolUseCount > 0 && log) {
     log.warn(
       `[lossless-claw] sanitizeToolUseResultPairing dropped ${droppedDuplicateAssistantToolUseCount} duplicate assistant tool_use block(s)`
+    );
+  }
+  if (droppedTerminalAssistantToolUseCount > 0 && log) {
+    log.warn(
+      `[lossless-claw] sanitizeToolUseResultPairing stripped ${droppedTerminalAssistantToolUseCount} non-pairable terminal assistant tool_use block(s)`
     );
   }
 
