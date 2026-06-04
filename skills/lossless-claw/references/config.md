@@ -469,6 +469,7 @@ Why it matters:
 
 - keeps low-value automation or noisy sessions out of the DB
 - useful for excluding certain agent lanes or ephemeral traffic entirely
+- cron scheduler keys are already isolated per runtime run, so ignore them only when they should bypass LCM compaction
 
 ### `statelessSessionPatterns`
 

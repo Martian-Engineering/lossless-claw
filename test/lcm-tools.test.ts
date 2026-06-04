@@ -514,6 +514,41 @@ describe("LCM tools session scoping", () => {
     expect(JSON.stringify(describeResult.details)).not.toContain(summaryContent);
   });
 
+  it("lcm_grep keeps isolated cron sessionKey scope on the active run", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps({
+        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
+      }),
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationIdBySessionKey: 42,
+        conversationFamilyIds: [42, 21, 7],
+      }) as never,
+      sessionKey: "agent:main:cron:nightly:run:run-123",
+    });
+    const result = await tool.execute("call-cron-family", { pattern: "deployment" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        conversationIds: [42],
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("**Conversation scope:** 42");
+    expect(text).not.toContain("session family rooted at 42");
+  });
+
   it("lcm_grep rejects allConversations from a sub-agent without a delegated grant", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({

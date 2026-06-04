@@ -6415,6 +6415,12 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<TranscriptReconcileResult> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     await this.conversationStore.withTransaction(async () => {
+      await this.rotateIsolatedCronConversationIfRuntimeChanged({
+        phase: "afterTurn",
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        createReplacement: false,
+      });
       await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
         phase: "afterTurn",
         sessionId: params.sessionId,
@@ -6973,6 +6979,57 @@ export class LcmContextEngine implements ContextEngine {
     return true;
   }
 
+  /** Cron session keys represent isolated scheduled runs, not conversation continuity. */
+  private isIsolatedCronSessionKey(sessionKey?: string): boolean {
+    const trimmed = sessionKey?.trim();
+    if (!trimmed) {
+      return false;
+    }
+    const parts = trimmed.split(":");
+    return parts.length >= 4 && parts[0] === "agent" && parts[2] === "cron";
+  }
+
+  /**
+   * Archive the prior active cron run when OpenClaw reuses a scheduler
+   * sessionKey for a new isolated runtime session.
+   */
+  private async rotateIsolatedCronConversationIfRuntimeChanged(params: {
+    phase: "bootstrap" | "assemble" | "afterTurn";
+    sessionId: string;
+    sessionKey?: string;
+    createReplacement: boolean;
+  }): Promise<boolean> {
+    const normalizedSessionId = params.sessionId.trim();
+    const normalizedSessionKey = params.sessionKey?.trim();
+    if (
+      !normalizedSessionId ||
+      !normalizedSessionKey ||
+      !this.isIsolatedCronSessionKey(normalizedSessionKey)
+    ) {
+      return false;
+    }
+
+    const activeByKey = await this.conversationStore.getConversationBySessionKey(
+      normalizedSessionKey,
+    );
+    if (!activeByKey || activeByKey.sessionId === normalizedSessionId) {
+      return false;
+    }
+
+    this.deps.log.info(
+      `[lcm] ${params.phase}: isolated cron session rollover; archiving conversation=${activeByKey.conversationId} oldSessionId=${activeByKey.sessionId} newSessionId=${normalizedSessionId} sessionKey=${normalizedSessionKey}`,
+    );
+    await this.applySessionReplacement({
+      reason: `${params.phase} isolated cron session rollover`,
+      sessionId: activeByKey.sessionId,
+      sessionKey: normalizedSessionKey,
+      nextSessionId: normalizedSessionId,
+      nextSessionKey: normalizedSessionKey,
+      createReplacement: params.createReplacement,
+    });
+    return true;
+  }
+
   private async findAmbiguousSessionKeyRuntimeRollover(params: {
     phase: "bootstrap" | "assemble" | "afterTurn";
     sessionId: string;
@@ -7140,6 +7197,12 @@ export class LcmContextEngine implements ContextEngine {
           };
           let preloadedHistoricalMessages: AgentMessage[] | undefined;
 
+          await this.rotateIsolatedCronConversationIfRuntimeChanged({
+            phase: "bootstrap",
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            createReplacement: true,
+          });
           await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
             phase: "bootstrap",
             sessionId: params.sessionId,
@@ -8769,6 +8832,12 @@ export class LcmContextEngine implements ContextEngine {
           this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
           async () =>
             this.conversationStore.withTransaction(async () => {
+              await this.rotateIsolatedCronConversationIfRuntimeChanged({
+                phase: "assemble",
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                createReplacement: false,
+              });
               await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
                 phase: "assemble",
                 sessionId: params.sessionId,
