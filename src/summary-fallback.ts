@@ -19,7 +19,7 @@ const FALLBACK_DIRECTIVE_SHAPED_PATTERNS = [
   new RegExp(
     [
       String.raw`\b(ignore|disregard|forget|override)\s+${OPTIONAL_DIRECTIVE_SCOPE_PREFIX}${DIRECTIVE_SCOPE}\s+(instructions?|prompts?|rules?)\b`,
-      String.raw`\b(ignore|disregard|forget|override)\s+${UNSCOPED_DIRECTIVE_TARGET}\s*(?:$|[.!?]|\s+(?:and|then|now|before|after|instead|to|with|from)\b)`,
+      String.raw`\b(ignore|disregard|forget|override)\s+${UNSCOPED_DIRECTIVE_TARGET}\s*(?:$|[.,;:!?]|\s+(?:and|then|now|before|after|instead|to|with|from)\b)`,
       String.raw`\byou\s+are\s+now\b`,
       String.raw`\bfrom\s+now\s+on\b`,
       String.raw`\breply\s+only\s+with\b`,
