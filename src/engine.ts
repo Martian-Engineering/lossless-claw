@@ -4212,7 +4212,7 @@ export class LcmContextEngine implements ContextEngine {
     currentTokenCount?: number;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
     legacyParams?: Record<string, unknown>;
-  }): Promise<ContextEngineMaintenanceResult | null> {
+  }): Promise<(ContextEngineMaintenanceResult & { exhausted?: boolean }) | null> {
     const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
       params.conversationId,
     );
@@ -4341,6 +4341,7 @@ export class LcmContextEngine implements ContextEngine {
         bytesFreed: 0,
         rewrittenEntries: 0,
         ...(result.reason ? { reason: result.reason } : {}),
+        ...(compactionExhausted ? { exhausted: true } : {}),
       };
     } catch (error) {
       await this.compactionMaintenanceStore.markProactiveCompactionFinished({
@@ -4375,11 +4376,12 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     tokenBudget: number;
     currentTokenCount?: number;
-  }): Promise<void> {
+  }): Promise<{ exhausted: boolean }> {
     const sessionLabel = [
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
+    let drainResult = { exhausted: false };
     await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
@@ -4406,7 +4408,7 @@ export class LcmContextEngine implements ContextEngine {
                 ...(telemetry.model ? { model: telemetry.model } : {}),
               }
             : undefined;
-        await this.consumeDeferredCompactionDebt({
+        const result = await this.consumeDeferredCompactionDebt({
           conversationId: params.conversationId,
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -4414,12 +4416,14 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: normalizedCurrentTokenCount,
           legacyParams: deferredLegacyParams,
         });
+        drainResult = { exhausted: result?.exhausted === true };
       },
       {
         operationName: "assembleDeferredCompaction",
         context: sessionLabel,
       },
     );
+    return drainResult;
   }
 
   /** Run the actual compaction body without taking the per-session queue. */
@@ -8847,7 +8851,10 @@ export class LcmContextEngine implements ContextEngine {
       );
       let deferredAssemblyDegradation:
         | {
-            reason: "near-budget" | "emergency-debt-still-pending";
+            reason:
+              | "near-budget"
+              | "emergency-debt-still-pending"
+              | "emergency-debt-exhausted";
             pressure: ReturnType<typeof resolveDeferredAssemblyPressure>;
           }
         | null = null;
@@ -8863,8 +8870,9 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.warn(
             `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
           );
+          let emergencyDrainResult: { exhausted: boolean } | null = null;
           try {
-            await this.maybeConsumeDeferredCompactionDebtForAssemble({
+            emergencyDrainResult = await this.maybeConsumeDeferredCompactionDebtForAssemble({
               conversationId: conversation.conversationId,
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
@@ -8891,6 +8899,14 @@ export class LcmContextEngine implements ContextEngine {
                 pressure,
               };
             }
+          } else if (
+            emergencyDrainResult?.exhausted === true &&
+            pressure.pressureTokenCount > pressureThreshold
+          ) {
+            deferredAssemblyDegradation = {
+              reason: "emergency-debt-exhausted",
+              pressure,
+            };
           }
         } else if (pressure.pressureTokenCount > pressureThreshold) {
           deferredAssemblyDegradation = {

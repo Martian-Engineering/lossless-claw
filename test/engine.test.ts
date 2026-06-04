@@ -13443,7 +13443,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=near-budget"));
   });
 
-  it("assemble() clears exhausted threshold debt and preserves leading system context via normal assembly (#639 Mode 2)", async () => {
+  it("assemble() clears exhausted threshold debt and preserves leading system context via degraded fallback (#639 Mode 2)", async () => {
     const log = {
       info: vi.fn(),
       warn: vi.fn(),
@@ -13471,11 +13471,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
       tokenBudget: 10,
     });
 
-    // #639 Mode 2: an exhausted threshold debt (empty conversation -> nothing to
-    // compact) is now CLEARED rather than left pending, so assemble takes the
-    // NORMAL bounded path (trimMessagesToBudget) instead of degraded fallback.
-    // The leading system context is still preserved and the result stays bounded;
-    // the degraded-fallback safety net is still covered by the next test.
+    // #639 Mode 2: exhausted threshold debt (empty conversation -> nothing to
+    // compact) is now CLEARED rather than left pending. Because this drain
+    // happens during an already-over-budget assemble call, the current turn still
+    // uses the degraded fallback instead of returning raw live messages.
     expect(assembleResult.messages.map((message) => message.content)).toEqual([
       "critical runtime policy",
       "current delivery turn",
@@ -13484,8 +13483,55 @@ describe("LcmContextEngine fidelity and token budget", () => {
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
     expect(maintenance?.pending).toBe(false);
-    expect(log.warn).not.toHaveBeenCalledWith(
+    expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("[lcm] assemble: degraded live fallback"),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("reason=emergency-debt-exhausted"),
+    );
+  });
+
+  it("assemble() bounds live context when emergency debt drain reaches exhaustion", async () => {
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDepsOverrides({ log });
+    const sessionId = "assemble-exhausted-emergency-debt-bounds-live";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 30,
+      currentTokenCount: 500,
+    });
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [
+        makeMessage({ role: "user", content: "oversized historical live turn ".repeat(100) }),
+        makeMessage({ role: "user", content: "current delivery turn" }),
+      ],
+      tokenBudget: 10,
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(false);
+    expect(assembleResult.messages.map((message) => message.content)).toEqual([
+      "current delivery turn",
+    ]);
+    expect(assembleResult.estimatedTokens).toBeLessThanOrEqual(10);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] assemble: degraded live fallback"),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("reason=emergency-debt-exhausted"),
     );
   });
 
