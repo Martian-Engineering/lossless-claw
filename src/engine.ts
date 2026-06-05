@@ -6214,6 +6214,19 @@ export class LcmContextEngine implements ContextEngine {
     const missingTail = missingTailFiltered.messages;
 
     if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
+      const replayAnalysis = await this.analyzePersistedTranscriptIdentityOverlaps({
+        conversationId,
+        messages: missingTail,
+      });
+      if (replayAnalysis.overlaps === missingTail.length) {
+        this.deps.log.warn(
+          `[lcm] reconcileSessionTail: duplicate tail replay skipped for ${sessionContext} - ${replayAnalysis.overlaps}/${missingTail.length} missing-tail candidate messages already exist. Treating transcript as reconciled to prevent repeated import-cap warnings.`,
+        );
+        this.deps.log.debug(
+          `[lcm] reconcileSessionTail: skipped duplicate tail replay for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} missingTail=${missingTail.length} existingDbCount=${existingDbCount} overlap=true`,
+        );
+        return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
+      }
       this.deps.log.warn(
         `[lcm] reconcileSessionTail: import cap exceeded for ${sessionContext} — would import ${missingTail.length} messages (existing: ${existingDbCount}). Aborting to prevent flood.`,
       );
@@ -9673,6 +9686,10 @@ export class LcmContextEngine implements ContextEngine {
     try {
       sizeBytes = (await stat(sessionFile)).size;
     } catch (error) {
+      if (isMissingFileError(error)) {
+        skip("session-file-missing");
+        return;
+      }
       this.logAutoRotateSessionFileDecision({
         ...baseLog,
         action: "warn",
