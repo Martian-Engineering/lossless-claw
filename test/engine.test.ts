@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -8477,6 +8477,78 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[0]?.role).toBe("assistant");
     expect(result.messages[1]?.role).toBe("toolResult");
     expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_2");
+  });
+
+  it("protects repaired fresh-tail assistant messages after cross-message tool-use dedupe", async () => {
+    const engine = createEngineWithConfig({ freshTailCount: 3 });
+    const sessionId = "session-fresh-tail-dedupe-protection";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "X", name: "bash", input: {} }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "X", name: "bash", input: {} },
+          { type: "toolCall", id: "Y", name: "grep", input: {} },
+        ],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "X",
+        content: [{ type: "text", text: "real X" }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "Y",
+        content: [{ type: "text", text: "real Y" }],
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+    const repairedFreshTailAssistant = assembled.messages.find(
+      (message) =>
+        message.role === "assistant" &&
+        Array.isArray(message.content) &&
+        message.content.some(
+          (block) =>
+            block &&
+            typeof block === "object" &&
+            (block as { id?: unknown }).id === "Y",
+        ) &&
+        !message.content.some(
+          (block) =>
+            block &&
+            typeof block === "object" &&
+            (block as { id?: unknown }).id === "X",
+        ),
+    );
+
+    expect(repairedFreshTailAssistant).toBeDefined();
+    const repairedHash = createHash("sha256")
+      .update(JSON.stringify([repairedFreshTailAssistant]))
+      .digest("hex")
+      .slice(0, 16);
+    expect(assembled.debug?.freshTailProtectionMessageHashes).toContain(repairedHash);
   });
 
   it("drops older orphaned assistant tool calls instead of surfacing synthetic repair results", async () => {

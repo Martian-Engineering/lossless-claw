@@ -89,6 +89,7 @@ import {
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
+type RepairLogger = { warn: (message: string) => void };
 
 const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
   "bootstrap",
@@ -2957,6 +2958,7 @@ function buildVolatileLiveInputMergedOutput(params: {
   retained: RetainedAssembledEntry[];
   appendedEntries: VolatileLiveInputEntry[];
   liveSortIndexes: Map<number, number>;
+  log?: RepairLogger;
 }): AgentMessage[] {
   const output: AgentMessage[] = [];
   const appendedEntries = params.appendedEntries
@@ -2980,7 +2982,7 @@ function buildVolatileLiveInputMergedOutput(params: {
     output.push((appendedEntries[appendedCursor] as VolatileLiveInputEntry).message);
     appendedCursor++;
   }
-  return sanitizeToolUseResultPairing(output) as AgentMessage[];
+  return sanitizeToolUseResultPairing(output, params.log) as AgentMessage[];
 }
 
 function matchVolatileLiveInputsToCoverageSlots(params: {
@@ -3156,6 +3158,7 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
   liveMessages: AgentMessage[];
   protectedAssembledIndexes?: Set<number>;
   tokenBudget: number;
+  log?: RepairLogger;
 }): {
   messages: AgentMessage[];
   estimatedTokens: number;
@@ -3287,6 +3290,13 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     output = bestCandidate.output;
     estimatedTokens = bestCandidate.estimatedTokens;
   }
+  output = buildVolatileLiveInputMergedOutput({
+    retained,
+    appendedEntries,
+    liveSortIndexes,
+    log: params.log,
+  });
+  estimatedTokens = estimateAgentMessageTokens(output);
   const appendedMessages = materializeVolatileLiveInputEntries(appendedEntries);
 
   return {
@@ -3719,6 +3729,7 @@ export class LcmContextEngine implements ContextEngine {
       this.summaryStore,
       this.config.timezone,
       this.focusBriefStore,
+      this.deps.log,
     );
 
     const compactionConfig: CompactionConfig = {
@@ -9706,6 +9717,7 @@ export class LcmContextEngine implements ContextEngine {
         liveMessages: params.messages,
         protectedAssembledIndexes,
         tokenBudget,
+        log: this.deps.log,
       });
       if (
         budgetedPromptRecallCue &&
@@ -9731,6 +9743,7 @@ export class LcmContextEngine implements ContextEngine {
           liveMessages: params.messages,
           protectedAssembledIndexes,
           tokenBudget,
+          log: this.deps.log,
         });
       }
       if (volatileLiveInputAppend.appendedMessages > 0) {

@@ -131,4 +131,240 @@ describe("sanitizeToolUseResultPairing", () => {
       messages[1],
     ]);
   });
+
+  // -- Duplicate assistant tool_use dedup (INC-2026-03-24 class) --
+
+  type Block = { type?: string; id?: string; call_id?: string; name?: string; text?: string };
+  type Msg = {
+    role: string;
+    content?: Block[];
+    toolCallId?: string;
+    toolName?: string;
+    stopReason?: string;
+    stop_reason?: string;
+  };
+
+  const assistantToolUseIds = (messages: Msg[]): string[] => {
+    const ids: string[] = [];
+    for (const m of messages) {
+      if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+      for (const b of m.content) {
+        if (b && (b.type === "toolCall" || b.type === "tool_use") && (b.id ?? b.call_id)) {
+          ids.push((b.id ?? b.call_id) as string);
+        }
+      }
+    }
+    return ids;
+  };
+  const toolResultIds = (messages: Msg[]): string[] =>
+    messages.filter((m) => m.role === "toolResult" && m.toolCallId).map((m) => m.toolCallId as string);
+
+  it("drops a duplicate assistant tool_use id repeated across two messages", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "out-1" }] },
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "out-2" }] },
+    ]);
+
+    expect(assistantToolUseIds(out)).toEqual(["X"]);
+    expect(toolResultIds(out)).toEqual(["X"]);
+  });
+
+  it("keeps a distinct tool_use in a later message while dropping the duplicate block", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "x" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "X", name: "bash" },
+          { type: "toolCall", id: "Y", name: "grep" },
+        ],
+      },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "x-dup" }] },
+      { role: "toolResult", toolCallId: "Y", content: [{ type: "text", text: "y" }] },
+    ]);
+
+    expect(assistantToolUseIds(out).sort()).toEqual(["X", "Y"]);
+    expect(toolResultIds(out).sort()).toEqual(["X", "Y"]);
+  });
+
+  it("moves a delayed real result before a mixed duplicate and new tool_use turn", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "X", name: "bash" },
+          { type: "toolCall", id: "Y", name: "grep" },
+        ],
+      },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real X" }] },
+      { role: "toolResult", toolCallId: "Y", content: [{ type: "text", text: "real Y" }] },
+    ]);
+
+    expect(out).toEqual([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real X" }] },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "Y", name: "grep" }],
+      },
+      { role: "toolResult", toolCallId: "Y", content: [{ type: "text", text: "real Y" }] },
+    ]);
+  });
+
+  it("looks past duplicate cascades after a mixed duplicate and new tool_use turn", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "X", name: "bash" },
+          { type: "toolCall", id: "Y", name: "grep" },
+        ],
+      },
+      { role: "assistant", content: [{ type: "toolCall", id: "Y", name: "grep" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real X" }] },
+      { role: "toolResult", toolCallId: "Y", content: [{ type: "text", text: "real Y" }] },
+    ]);
+
+    expect(out).toEqual([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real X" }] },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "Y", name: "grep" }],
+      },
+      { role: "toolResult", toolCallId: "Y", content: [{ type: "text", text: "real Y" }] },
+    ]);
+  });
+
+  it("does not let an aborted turn claim an id that a later valid turn reuses", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", stopReason: "aborted", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real" }] },
+    ]);
+
+    expect(assistantToolUseIds(out)).toEqual(["X"]);
+    expect(toolResultIds(out)).toEqual(["X"]);
+    expect(out.some((m) => m.stopReason === "aborted" && (m.content?.length ?? 0) > 0)).toBe(false);
+  });
+
+  it("treats snake_case terminal stop reasons as non-pairable", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", stop_reason: "error", content: [{ type: "tool_use", id: "X", name: "bash" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real" }] },
+    ]);
+
+    expect(assistantToolUseIds(out)).toEqual(["X"]);
+    expect(toolResultIds(out)).toEqual(["X"]);
+    expect(out.some((m) => m.stop_reason === "error" && (m.content?.length ?? 0) > 0)).toBe(false);
+  });
+
+  it("does not let a stripped terminal assistant turn block a delayed real result", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "assistant", stopReason: "aborted", content: [{ type: "toolCall", id: "Y", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real" }] },
+    ]);
+
+    expect(out).toEqual([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real" }] },
+    ]);
+  });
+
+  it("looks past aborted non-pairable tool_use turns for delayed results", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "A", name: "bash" }] },
+      { role: "assistant", stopReason: "aborted", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "A", content: [{ type: "text", text: "real A" }] },
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real X" }] },
+    ]);
+
+    expect(out).toEqual([
+      { role: "assistant", content: [{ type: "toolCall", id: "A", name: "bash" }] },
+      { role: "toolResult", toolCallId: "A", content: [{ type: "text", text: "real A" }] },
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real X" }] },
+    ]);
+  });
+
+  it("drops duplicate assistant turns that become reasoning-only after filtering", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "stale hidden thought" },
+          { type: "toolCall", id: "X", name: "bash" },
+        ],
+      },
+    ]);
+
+    expect(out).toEqual([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real" }] },
+    ]);
+  });
+
+  it("does not let a duplicate-only assistant turn block a delayed real result", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real" }] },
+    ]);
+
+    expect(out).toEqual([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real" }] },
+    ]);
+  });
+
+  it("drops duplicate tool results within a single assistant span", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "first" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "dup" }] },
+    ]);
+
+    expect(toolResultIds(out)).toEqual(["X"]);
+    expect(assistantToolUseIds(out)).toEqual(["X"]);
+  });
+
+  it("invokes the optional logger when duplicate assistant tool_use blocks are dropped", () => {
+    const warnings: string[] = [];
+    sanitizeToolUseResultPairing<Msg>(
+      [
+        { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+        { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "a" }] },
+        { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+        { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "b" }] },
+      ],
+      { warn: (m) => warnings.push(m) }
+    );
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("duplicate assistant tool_use");
+  });
+
+  it("logs terminal tool_use removals distinctly from duplicate removals", () => {
+    const warnings: string[] = [];
+    sanitizeToolUseResultPairing<Msg>(
+      [
+        { role: "assistant", stopReason: "aborted", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      ],
+      { warn: (m) => warnings.push(m) }
+    );
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("terminal assistant tool_use");
+    expect(warnings[0]).not.toContain("duplicate");
+  });
+
 });
