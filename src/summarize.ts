@@ -1644,11 +1644,12 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         }
         params.deps.log.warn(`${diagParts.join("; ")}; retrying with conservative settings`);
 
-        // Single retry with conservative parameters: low temperature and low
-        // reasoning budget to coax a textual response from providers that
-        // sometimes return reasoning-only or empty blocks on the first pass.
+        // Single retry with conservative parameters to coax a textual response
+        // from providers that sometimes return reasoning-only or empty blocks.
         try {
-          const retryResult = await attemptSummarizerCall("retry", "low");
+          const retryReasoning =
+            params.deps.config.enableSummaryThinking !== false ? "low" : undefined;
+          const retryResult = await attemptSummarizerCall("retry", retryReasoning);
           const retryNormalized = normalizeCompletionSummary(retryResult.content);
           const retryEnvelopeNormalized = retryNormalized.summary
             ? retryNormalized

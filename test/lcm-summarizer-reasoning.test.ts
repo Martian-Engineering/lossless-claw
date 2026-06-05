@@ -94,4 +94,40 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(calls[1]?.reasoning).toBe("low");
     expect(calls[1]?.reasoningIfSupported).toBe("low");
   });
+
+  it("does not request reasoning on retry when summary thinking is disabled", async () => {
+    const { deps, calls } = createDeps({
+      config: {
+        leafTargetTokens: 128,
+        condensedTargetTokens: 128,
+        enableSummaryThinking: false,
+      },
+      complete: async (params: Record<string, unknown>) => {
+        calls.push(params);
+        if (calls.length === 1) {
+          return { content: [] };
+        }
+        return { content: [{ type: "text", text: "Recovered summary" }] };
+      },
+    });
+
+    const summarizer = await createLcmSummarizeFromLegacyParams({
+      deps: deps as never,
+      legacyParams: {
+        provider: "openrouter",
+        model: "minimax/minimax-m2.7",
+        config: {},
+      },
+    });
+
+    expect(summarizer).toBeDefined();
+    const summary = await summarizer!.fn("Summarize this conversation.");
+
+    expect(summary).toBe("Recovered summary");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.reasoning).toBeUndefined();
+    expect(calls[0]?.reasoningIfSupported).toBeUndefined();
+    expect(calls[1]?.reasoning).toBeUndefined();
+    expect(calls[1]?.reasoningIfSupported).toBeUndefined();
+  });
 });
