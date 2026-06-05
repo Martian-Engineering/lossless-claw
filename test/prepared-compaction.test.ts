@@ -7,6 +7,12 @@ import { CompactionEngine, type CompactionConfig } from "../src/compaction.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 import { SummaryStore } from "../src/store/summary-store.js";
+import type { LcmSummarizeOptions } from "../src/summarize.js";
+
+type CapturedSummarizeCall = {
+  text: string;
+  options?: LcmSummarizeOptions;
+};
 
 function createStores() {
   const db = new DatabaseSync(":memory:");
@@ -489,6 +495,137 @@ describe("prepared compaction batches", () => {
       { ordinal: 1, itemType: "summary" },
       { ordinal: 2, itemType: "message", messageId: messages[4]!.messageId },
     ]);
+  });
+
+  it("does not inject prior canonical summary context into the first prepared leaf prompt", async () => {
+    const fixture = createStores();
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "prepared-compaction-prior-summary-context",
+      title: "Prepared compaction prior summary context",
+    });
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_prior_context",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "prior canonical summary context",
+      tokenCount: 10,
+    });
+    await fixture.summaryStore.appendContextSummary(
+      conversation.conversationId,
+      "sum_prior_context",
+    );
+    const messages = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "old source alpha",
+        tokenCount: 20,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "old source beta",
+        tokenCount: 20,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "fresh tail gamma",
+        tokenCount: 20,
+      },
+    ]);
+    await fixture.summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+    const compaction = new CompactionEngine(
+      fixture.conversationStore,
+      fixture.summaryStore,
+      createCompactionConfig(),
+    );
+    const calls: CapturedSummarizeCall[] = [];
+    const summarize = vi.fn(
+      async (text: string, _aggressive?: boolean, options?: LcmSummarizeOptions) => {
+        calls.push({ text, options });
+        return "prepared summary without prior context";
+      },
+    );
+
+    const prepared = await compaction.preparePendingLeafBatch({
+      conversationId: conversation.conversationId,
+      summarize,
+      summaryModel: "test",
+    });
+
+    expect(prepared.prepared).toBe(true);
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(calls[0]?.text).toContain("old source alpha");
+    expect(calls[0]?.text).toContain("old source beta");
+    expect(calls[0]?.text).not.toContain("fresh tail gamma");
+    expect(calls[0]?.options).toMatchObject({ isCondensed: false });
+    expect(calls[0]?.options?.previousSummary).toBeUndefined();
+  });
+
+  it("uses prior prepared leaf content for later prepared leaf prompts", async () => {
+    const fixture = createStores();
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "prepared-compaction-prepared-continuity",
+      title: "Prepared compaction prepared continuity",
+    });
+    const messages = await fixture.conversationStore.createMessagesBulk(
+      Array.from({ length: 5 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        content: `prepared continuity source ${index + 1}`,
+        tokenCount: 20,
+      })),
+    );
+    await fixture.summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+    const compaction = new CompactionEngine(
+      fixture.conversationStore,
+      fixture.summaryStore,
+      createCompactionConfig({ leafChunkTokens: 40 }),
+    );
+    const calls: CapturedSummarizeCall[] = [];
+    const summarize = vi
+      .fn()
+      .mockImplementationOnce(
+        async (text: string, _aggressive?: boolean, options?: LcmSummarizeOptions) => {
+          calls.push({ text, options });
+          return "first prepared continuity summary";
+        },
+      )
+      .mockImplementationOnce(
+        async (text: string, _aggressive?: boolean, options?: LcmSummarizeOptions) => {
+          calls.push({ text, options });
+          return "second prepared continuity summary";
+        },
+      );
+
+    const prepared = await compaction.preparePendingLeafBatch({
+      conversationId: conversation.conversationId,
+      summarize,
+      summaryModel: "test",
+    });
+
+    expect(prepared.prepared).toBe(true);
+    expect(prepared.summaryCount).toBe(2);
+    expect(summarize).toHaveBeenCalledTimes(2);
+    expect(calls[0]?.options?.previousSummary).toBeUndefined();
+    expect(calls[0]?.options).toMatchObject({ isCondensed: false });
+    expect(calls[1]?.options?.previousSummary).toBe("first prepared continuity summary");
+    expect(calls[1]?.options).toMatchObject({ isCondensed: false });
+    expect(calls[1]?.text).toContain("prepared continuity source 3");
+    expect(calls[1]?.text).toContain("prepared continuity source 4");
+    expect(calls[1]?.text).not.toContain("prepared continuity source 5");
   });
 
   it("falls back to inline leaf summarization when no prepared batch exists", async () => {

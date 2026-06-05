@@ -836,11 +836,7 @@ export class CompactionEngine {
           .map((summary) => summary.content.trim())
           .filter(Boolean)
           .join("\n\n");
-        const previousSummaryContent =
-          previousPendingContext ||
-          (ordinal === 0
-            ? await this.resolvePriorLeafSummaryContext(input.conversationId, chunk)
-            : undefined);
+        const previousSummaryContent = previousPendingContext || undefined;
         const previousSummaryIds = previousPendingSummaries
           .slice(-2)
           .map((summary) => summary.summaryId);
