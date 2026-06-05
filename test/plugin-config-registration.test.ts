@@ -9,6 +9,12 @@ import { closeLcmConnection } from "../src/db/connection.js";
 import { clearAllSharedInit } from "../src/plugin/shared-init.js";
 import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
 
+const buildMemorySystemPromptAdditionMock = vi.hoisted(() => vi.fn());
+
+vi.mock("openclaw/plugin-sdk/core", () => ({
+  buildMemorySystemPromptAddition: buildMemorySystemPromptAdditionMock,
+}));
+
 type RegisteredEngineFactory = (() => unknown) | undefined;
 type HookHandler = (event: unknown, context: unknown) => unknown;
 type RegisteredContextEngine = { id: string; factory: () => unknown };
@@ -228,6 +234,7 @@ describe("lcm plugin registration", () => {
     dbPaths.clear();
     clearAllSharedInit();
     resetStartupBannerLogsForTests();
+    buildMemorySystemPromptAdditionMock.mockReset();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     for (const dir of tempDirs) {
@@ -278,12 +285,53 @@ describe("lcm plugin registration", () => {
     delete (api as unknown as { registerContextEngine?: unknown }).registerContextEngine;
 
     expect(() => lcmPlugin.register(api)).toThrow(
-      /requires OpenClaw >=2026\.5\.22 with api\.registerContextEngine/,
+      /requires OpenClaw >=2026\.5\.28 with api\.registerContextEngine/,
     );
     expect(createSpy).not.toHaveBeenCalled();
     expect(api.registerCommand).not.toHaveBeenCalled();
     expect(api.registerTool).not.toHaveBeenCalled();
     expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("detectedHost=2026.5.1"));
+  });
+
+  it("adds registered host memory supplements to context engine assembly", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    const availableTools = new Set(["memory_search"]);
+    dbPaths.add(dbPath);
+    buildMemorySystemPromptAdditionMock.mockReturnValue(
+      "## Compiled Wiki Snapshot\nUse the current project glossary.",
+    );
+
+    const { api, getFactory } = buildApi({
+      enabled: true,
+      dbPath,
+    });
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as {
+      assemble: (params: {
+        sessionId: string;
+        messages: unknown[];
+        availableTools?: Set<string>;
+        citationsMode?: string;
+      }) => Promise<{ systemPromptAddition?: string }>;
+    };
+    const result = await engine.assemble({
+      sessionId: "missing-session",
+      messages: [],
+      availableTools,
+      citationsMode: "inline",
+    });
+
+    expect(buildMemorySystemPromptAdditionMock).toHaveBeenCalledWith({
+      availableTools,
+      citationsMode: "inline",
+    });
+    expect(result.systemPromptAddition).toBe(
+      "## Compiled Wiki Snapshot\nUse the current project glossary.",
+    );
   });
 
   it("uses api.pluginConfig values during register", { timeout: 20000 }, () => {

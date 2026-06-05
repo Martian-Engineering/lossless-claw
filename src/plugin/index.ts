@@ -7,7 +7,12 @@
 import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
-import type { ContextEngineFactory, OpenClawPluginApi } from "../openclaw-bridge.js";
+import type {
+  AssembleResult,
+  ContextEngine,
+  ContextEngineFactory,
+  OpenClawPluginApi,
+} from "../openclaw-bridge.js";
 import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
 import type { LcmConfig } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
@@ -28,7 +33,7 @@ import type {
   StartupSessionFileCandidate,
 } from "../types.js";
 
-const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.5.22";
+const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.5.28";
 
 type ContextEngineCapableOpenClawPluginApi = OpenClawPluginApi & {
   registerContextEngine: (id: string, factory: ContextEngineFactory) => void;
@@ -90,6 +95,122 @@ type RuntimeConfigSnapshotApi = {
   current?: () => unknown;
   loadConfig?: () => unknown;
 };
+
+type MemorySupplementAssembleParams = Parameters<ContextEngine["assemble"]>[0] & {
+  availableTools?: Set<string>;
+  citationsMode?: string;
+};
+
+type BuildMemorySystemPromptAddition = (params: {
+  availableTools: Set<string>;
+  citationsMode?: string;
+}) => string | undefined;
+
+type MemorySupplementModule = {
+  buildMemorySystemPromptAddition?: unknown;
+};
+
+let buildMemorySystemPromptAdditionPromise:
+  | Promise<BuildMemorySystemPromptAddition>
+  | undefined;
+
+/** Return the OpenClaw helper that renders active memory supplements for context engines. */
+async function loadBuildMemorySystemPromptAddition(): Promise<BuildMemorySystemPromptAddition> {
+  buildMemorySystemPromptAdditionPromise ??= loadBuildMemorySystemPromptAdditionModule();
+  return buildMemorySystemPromptAdditionPromise;
+}
+
+/** Import the memory prompt helper from the supported OpenClaw SDK surface. */
+async function loadBuildMemorySystemPromptAdditionModule(): Promise<BuildMemorySystemPromptAddition> {
+  const importErrors: unknown[] = [];
+  for (const modulePath of ["openclaw/plugin-sdk/core", "openclaw/plugin-sdk"]) {
+    try {
+      const mod = (await import(modulePath)) as MemorySupplementModule;
+      if (typeof mod.buildMemorySystemPromptAddition === "function") {
+        return mod.buildMemorySystemPromptAddition as BuildMemorySystemPromptAddition;
+      }
+    } catch (error) {
+      importErrors.push(error);
+    }
+  }
+  throw new Error(
+    "[lcm] OpenClaw buildMemorySystemPromptAddition is unavailable; install OpenClaw >=2026.5.28.",
+    { cause: importErrors[0] },
+  );
+}
+
+/** Delegate to the LCM engine while adding host memory supplements to assemble() results. */
+class MemorySupplementContextEngine implements ContextEngine {
+  readonly info: ContextEngine["info"];
+  readonly ingestBatch: ContextEngine["ingestBatch"];
+  readonly prepareSubagentSpawn: ContextEngine["prepareSubagentSpawn"];
+  readonly onSubagentEnded: ContextEngine["onSubagentEnded"];
+
+  constructor(private readonly inner: ContextEngine) {
+    const ingestBatch = inner.ingestBatch?.bind(inner);
+    const prepareSubagentSpawn = inner.prepareSubagentSpawn?.bind(inner);
+    const onSubagentEnded = inner.onSubagentEnded?.bind(inner);
+    this.info = inner.info;
+    this.ingestBatch = ingestBatch ? (params) => ingestBatch(params) : undefined;
+    this.prepareSubagentSpawn = prepareSubagentSpawn
+      ? (params) => prepareSubagentSpawn(params)
+      : undefined;
+    this.onSubagentEnded = onSubagentEnded ? (params) => onSubagentEnded(params) : undefined;
+  }
+
+  get config(): unknown {
+    return (this.inner as unknown as { config?: unknown }).config;
+  }
+
+  get deps(): unknown {
+    return (this.inner as unknown as { deps?: unknown }).deps;
+  }
+
+  getConversationStore(): unknown {
+    const getConversationStore = (this.inner as unknown as {
+      getConversationStore?: () => unknown;
+    }).getConversationStore;
+    if (!getConversationStore) {
+      throw new TypeError("getConversationStore is not available on the wrapped context engine");
+    }
+    return getConversationStore.call(this.inner);
+  }
+
+  getSummaryStore(): unknown {
+    const getSummaryStore = (this.inner as unknown as {
+      getSummaryStore?: () => unknown;
+    }).getSummaryStore;
+    if (!getSummaryStore) {
+      throw new TypeError("getSummaryStore is not available on the wrapped context engine");
+    }
+    return getSummaryStore.call(this.inner);
+  }
+
+  bootstrap(params: Parameters<ContextEngine["bootstrap"]>[0]) {
+    return this.inner.bootstrap(params);
+  }
+
+  ingest(params: Parameters<ContextEngine["ingest"]>[0]) {
+    return this.inner.ingest(params);
+  }
+
+  compact(params: Parameters<ContextEngine["compact"]>[0]) {
+    return this.inner.compact(params);
+  }
+
+  async assemble(params: MemorySupplementAssembleParams): Promise<AssembleResult> {
+    const result = await this.inner.assemble(params);
+    if (result.systemPromptAddition) {
+      return result;
+    }
+    const buildMemorySystemPromptAddition = await loadBuildMemorySystemPromptAddition();
+    const systemPromptAddition = buildMemorySystemPromptAddition({
+      availableTools: params.availableTools ?? new Set(),
+      citationsMode: params.citationsMode,
+    });
+    return systemPromptAddition ? { ...result, systemPromptAddition } : result;
+  }
+}
 
 /** Read the host runtime config snapshot without using deprecated APIs on newer hosts. */
 function readRuntimeConfigSnapshot(api: OpenClawPluginApi): unknown {
@@ -1461,55 +1582,11 @@ function wirePluginHandlers(
     });
   });
 
-  // Fix: Ensure host memory supplements (wiki digest, etc.) are included in assembled context.
-  // When lossless-claw is the active context engine, OpenClaw delegates prompt assembly entirely
-  // to the engine. Without this wrapper, buildMemorySystemPromptAddition() is never called and
-  // registered memory supplements are silently dropped from the prompt.
   api.registerContextEngine("lossless-claw", () => {
-    type BuildMemoryFn = (params: { availableTools: Set<string>; citationsMode?: string }) => string | undefined;
-    let _buildMemoryAddition: BuildMemoryFn | false | null = null;
-
-    async function ensureBuildMemoryAddition(): Promise<BuildMemoryFn | false> {
-      if (_buildMemoryAddition !== null) return _buildMemoryAddition;
-      try {
-        // openclaw is a peer dependency; plugin-sdk/core exports buildMemorySystemPromptAddition
-        const mod = await import("openclaw/plugin-sdk/core");
-        _buildMemoryAddition = (mod as any).buildMemorySystemPromptAddition ?? false;
-      } catch {
-        try {
-          const mod = await import("openclaw/plugin-sdk");
-          _buildMemoryAddition = (mod as any).buildMemorySystemPromptAddition ?? false;
-        } catch {
-          _buildMemoryAddition = false;
-        }
-      }
-      return _buildMemoryAddition;
-    }
-
-    function wrapEngineWithMemorySupplements<T extends { assemble: (...args: any[]) => any }>(engine: T): T {
-      if ((engine as any)._lcmMemorySupplementPatched) return engine;
-      const originalAssemble = engine.assemble.bind(engine);
-      (engine as any).assemble = async (params: any) => {
-        const result = await originalAssemble(params);
-        if (!result.systemPromptAddition) {
-          const builder = await ensureBuildMemoryAddition();
-          if (builder) {
-            const addition = builder({
-              availableTools: params.availableTools ?? new Set(),
-              citationsMode: params.citationsMode,
-            });
-            if (addition) result.systemPromptAddition = addition;
-          }
-        }
-        return result;
-      };
-      (engine as any)._lcmMemorySupplementPatched = true;
-      return engine;
-    }
-
-    const cached = shared.getCachedEngine();
-    if (cached) return wrapEngineWithMemorySupplements(cached);
-    return shared.waitForEngine().then(wrapEngineWithMemorySupplements);
+    const engine = shared.getCachedEngine();
+    return engine
+      ? new MemorySupplementContextEngine(engine)
+      : shared.waitForEngine().then((nextEngine) => new MemorySupplementContextEngine(nextEngine));
   });
 
   api.registerTool(

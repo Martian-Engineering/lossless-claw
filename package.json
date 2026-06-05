@@ -48,7 +48,7 @@
     "vitest": "^3.0.0"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.5.22"
+    "openclaw": ">=2026.5.28"
   },
   "peerDependenciesMeta": {
     "openclaw": {
@@ -63,14 +63,14 @@
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.5.22",
-      "minGatewayVersion": "2026.5.22",
+      "pluginApi": ">=2026.5.28",
+      "minGatewayVersion": "2026.5.28",
       "tested": [
-        "2026.5.22"
+        "2026.5.28"
       ]
     },
     "build": {
-      "openclawVersion": "2026.5.22"
+      "openclawVersion": "2026.5.28"
     }
   },
   "repository": {
