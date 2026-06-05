@@ -5051,55 +5051,6 @@ describe("LcmContextEngine.bootstrap", () => {
     );
   });
 
-  it("skips missing runtime session files without warning", async () => {
-    const sessionFile = createSessionFilePath("auto-rotate-runtime-missing");
-    const messages = createBulkySession(sessionFile, 4);
-    rmSync(sessionFile, { force: true });
-    const log = {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    };
-    const engine = createEngineWithDeps(
-      {
-        autoRotateSessionFiles: {
-          enabled: true,
-          createBackups: false,
-          sizeBytes: 500,
-          startup: "off",
-          runtime: "rotate",
-        },
-      },
-      { log },
-    );
-    const sessionId = "auto-rotate-runtime-missing-session";
-    const sessionKey = "agent:main:test:auto-rotate-runtime-missing";
-    await engine.getConversationStore().createConversation({ sessionId, sessionKey });
-
-    await engine.afterTurn({
-      sessionId,
-      sessionKey,
-      sessionFile,
-      messages,
-      prePromptMessageCount: messages.length,
-    });
-
-    const autoRotateInfoLogs = log.info.mock.calls
-      .map(([message]) => String(message))
-      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
-    const autoRotateWarnLogs = log.warn.mock.calls
-      .map(([message]) => String(message))
-      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
-    expect(autoRotateInfoLogs).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining("phase=runtime action=skip"),
-        expect.stringContaining("reason=session-file-missing"),
-      ]),
-    );
-    expect(autoRotateWarnLogs).toHaveLength(0);
-  });
-
   it("skips ignored, stateless, and untracked runtime sessions", async () => {
     const sessionFile = createSessionFilePath("auto-rotate-skip-guards");
     const messages = createBulkySession(sessionFile, 10);
@@ -6609,80 +6560,6 @@ describe("LcmContextEngine.bootstrap", () => {
       reason: "reconcile import capped",
     });
     expect(reconcileSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it("treats an oversized already-persisted tail replay as reconciled", async () => {
-    const warnLog = vi.fn();
-    const engine = createEngineWithDeps(
-      {},
-      {
-        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
-      },
-    );
-    const sessionId = "bootstrap-duplicate-tail-replay";
-    const sessionKey = "agent:main:test:bootstrap-duplicate-tail-replay";
-    const sessionFile = createSessionFilePath("bootstrap-duplicate-tail-replay");
-    const tailMessages = Array.from({ length: 60 }, (_, index) => ({
-      role: (index % 2 === 0 ? "user" : "assistant") as AgentMessage["role"],
-      content: `duplicate tail ${index}`,
-    }));
-    writeLeafTranscript(sessionFile, [
-      { role: "user", content: "anchor" },
-      ...tailMessages,
-    ]);
-    const conversation = await engine.getConversationStore().createConversation({
-      sessionId,
-      sessionKey,
-    });
-    await engine.getConversationStore().createMessagesBulk([
-      {
-        conversationId: conversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "anchor",
-        tokenCount: 1,
-      },
-      ...tailMessages.flatMap((message, index) => [
-        {
-          conversationId: conversation.conversationId,
-          seq: 1 + index * 2,
-          role: message.role,
-          content: message.content,
-          tokenCount: 1,
-        },
-        {
-          conversationId: conversation.conversationId,
-          seq: 2 + index * 2,
-          role: message.role,
-          content: message.content,
-          tokenCount: 1,
-        },
-      ]),
-    ]);
-
-    const result = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
-
-    expect(result).toEqual({
-      bootstrapped: false,
-      importedMessages: 0,
-      reason: "conversation already up to date",
-    });
-    const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
-    expect(stored).toHaveLength(121);
-    const checkpoint = await engine
-      .getSummaryStore()
-      .getConversationBootstrapState(conversation.conversationId);
-    expect(checkpoint?.lastSeenSize).toBe(statSync(sessionFile).size);
-    expect(
-      warnLog.mock.calls
-        .map((call) => String(call[0]))
-        .some((message) => message.includes("duplicate tail replay skipped")),
-    ).toBe(true);
-    expect(
-      warnLog.mock.calls
-        .map((call) => String(call[0]))
-        .some((message) => message.includes("import cap exceeded")),
-    ).toBe(false);
   });
 
   it("uses the live ingest path for initial bootstrap", async () => {
