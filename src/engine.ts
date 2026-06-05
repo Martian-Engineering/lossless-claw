@@ -4178,7 +4178,6 @@ export class LcmContextEngine implements ContextEngine {
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         legacyParams: params.legacyParams,
-        reason: params.reason,
       });
       this.deps.log.debug(
         `[lcm] background pending summary preparation done conversation=${params.conversationId} prepared=${result.prepared} summaries=${result.summaryCount} reason=${result.reason ?? "none"} trigger=${params.reason} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -4193,7 +4192,6 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     sessionKey?: string;
     legacyParams?: Record<string, unknown>;
-    reason: string;
   }): Promise<PreparedLeafBatchResult> {
     const compactionScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
@@ -8043,7 +8041,6 @@ export class LcmContextEngine implements ContextEngine {
                 sessionId: params.sessionId,
                 sessionKey: params.sessionKey,
                 legacyParams: asRecord(params.runtimeContext),
-                reason: "maintain",
               });
               if (prepared.prepared) {
                 pendingPreparationResult = {

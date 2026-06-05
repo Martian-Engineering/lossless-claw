@@ -1763,13 +1763,9 @@ export class CompactionEngine {
   private async publishPreparedLeafBatchIfReady(
     conversationId: number,
   ): Promise<PassResult | null> {
-    const publishLatestReadyCompactionBatch = this.summaryStore.publishLatestReadyCompactionBatch;
-    if (typeof publishLatestReadyCompactionBatch !== "function") {
-      return null;
-    }
     const contextItems = await this.getContextItemsCached(conversationId);
     const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
-    const result = await publishLatestReadyCompactionBatch.call(this.summaryStore, {
+    const result = await this.summaryStore.publishLatestReadyCompactionBatch({
       conversationId,
       maxSourceOrdinalExclusive: freshTailOrdinal,
     });

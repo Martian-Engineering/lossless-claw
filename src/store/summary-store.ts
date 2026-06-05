@@ -170,22 +170,9 @@ export type CreateCompactionBatchInput = {
   reason?: string | null;
 };
 
-export type PendingCompactionSummaryInput = {
+export type PendingCompactionSummaryInput = CreateSummaryInput & {
   batchId: string;
-  summaryId: string;
   ordinal: number;
-  conversationId: number;
-  kind: SummaryKind;
-  depth?: number;
-  content: string;
-  tokenCount: number;
-  fileIds?: string[];
-  earliestAt?: Date;
-  latestAt?: Date;
-  descendantCount?: number;
-  descendantTokenCount?: number;
-  sourceMessageTokenCount?: number;
-  model?: string;
   sourceStartSeq?: number | null;
   sourceEndSeq?: number | null;
   sourceMessageIds: number[];
@@ -193,29 +180,15 @@ export type PendingCompactionSummaryInput = {
   previousSummaryIds?: string[];
 };
 
-export type PendingCompactionSummaryRecord = {
+export type PendingCompactionSummaryRecord = SummaryRecord & {
   batchId: string;
-  summaryId: string;
   ordinal: number;
   status: CompactionBatchStatus;
-  conversationId: number;
-  kind: SummaryKind;
-  depth: number;
-  content: string;
-  tokenCount: number;
-  fileIds: string[];
-  earliestAt: Date | null;
-  latestAt: Date | null;
-  descendantCount: number;
-  descendantTokenCount: number;
-  sourceMessageTokenCount: number;
-  model: string;
   sourceStartSeq: number | null;
   sourceEndSeq: number | null;
   sourceMessageIds: number[];
   sourceIdentityHashes: string[];
   previousSummaryIds: string[];
-  createdAt: Date;
   updatedAt: Date;
 };
 
@@ -377,17 +350,14 @@ interface PendingCompactionSummaryRow {
 }
 
 interface PublishMessageRow {
-  message_id: number;
   seq: number;
   role: string;
   content: string;
-  token_count: number;
 }
 
 interface ActiveRawCoverageRow {
   message_id: number;
   seq: number;
-  ordinal: number;
 }
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
@@ -1689,7 +1659,7 @@ export class SummaryStore {
       const messageId = messageIds[idx]!;
       const row = this.db
         .prepare(
-          `SELECT message_id, seq, role, content, token_count
+          `SELECT seq, role, content
            FROM messages
            WHERE conversation_id = ?
              AND message_id = ?`,
@@ -1756,7 +1726,7 @@ export class SummaryStore {
 
     const activeRows = this.db
       .prepare(
-        `SELECT ci.message_id, m.seq, ci.ordinal
+        `SELECT ci.message_id, m.seq
          FROM context_items ci
          JOIN messages m ON m.message_id = ci.message_id
          WHERE ci.conversation_id = ?
