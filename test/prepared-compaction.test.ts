@@ -420,6 +420,77 @@ describe("prepared compaction batches", () => {
     ]);
   });
 
+  it("stops at the prepared leaf boundary instead of condensing in the same sweep", async () => {
+    const fixture = createStores();
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "prepared-compaction-depth-boundary",
+      title: "Prepared compaction depth boundary",
+    });
+    const messages = await fixture.conversationStore.createMessagesBulk(
+      Array.from({ length: 5 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        content: `depth boundary source ${index + 1}`,
+        tokenCount: 20,
+      })),
+    );
+    await fixture.summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+    const compaction = new CompactionEngine(
+      fixture.conversationStore,
+      fixture.summaryStore,
+      createCompactionConfig({
+        leafChunkTokens: 40,
+        maxSweepIterations: 2,
+        condensedMinFanout: 2,
+        condensedMinFanoutHard: 2,
+        summaryPrefixTargetTokens: 1,
+      }),
+    );
+    const prepareSummarize = vi
+      .fn()
+      .mockResolvedValueOnce("prepared depth summary one")
+      .mockResolvedValueOnce("prepared depth summary two");
+    const prepared = await compaction.preparePendingLeafBatch({
+      conversationId: conversation.conversationId,
+      summarize: prepareSummarize,
+      summaryModel: "test",
+    });
+    expect(prepared.prepared).toBe(true);
+    expect(prepared.summaryCount).toBe(2);
+    expect(prepareSummarize).toHaveBeenCalledTimes(2);
+
+    const foregroundSummarize = vi.fn(async () => {
+      throw new Error("foreground summarizer should not condense prepared summaries");
+    });
+    const compacted = await compaction.compact({
+      conversationId: conversation.conversationId,
+      tokenBudget: 40,
+      summarize: foregroundSummarize,
+      hardTrigger: false,
+    });
+
+    expect(compacted.actionTaken).toBe(true);
+    expect(foregroundSummarize).not.toHaveBeenCalled();
+    const contextItems = await fixture.summaryStore.getContextItems(conversation.conversationId);
+    const activeSummaryIds = contextItems
+      .map((item) => item.summaryId)
+      .filter((summaryId): summaryId is string => typeof summaryId === "string");
+    expect(activeSummaryIds).toHaveLength(2);
+    const activeSummaries = await Promise.all(
+      activeSummaryIds.map((summaryId) => fixture.summaryStore.getSummary(summaryId)),
+    );
+    expect(activeSummaries.map((summary) => summary?.depth)).toEqual([0, 0]);
+    expect(contextItems).toMatchObject([
+      { ordinal: 0, itemType: "summary" },
+      { ordinal: 1, itemType: "summary" },
+      { ordinal: 2, itemType: "message", messageId: messages[4]!.messageId },
+    ]);
+  });
+
   it("falls back to inline leaf summarization when no prepared batch exists", async () => {
     const fixture = await seedRawConversation();
     const compaction = new CompactionEngine(
