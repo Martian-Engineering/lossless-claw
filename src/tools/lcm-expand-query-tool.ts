@@ -172,7 +172,13 @@ type BucketExecutionResult =
     }
   | {
       conversationId: number;
-      status: "failed" | "skipped";
+      status: "failed";
+      candidateCount: number;
+      error: string;
+    }
+  | {
+      conversationId: number;
+      status: "skipped";
       candidateCount: number;
       error: string;
     };

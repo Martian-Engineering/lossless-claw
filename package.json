@@ -1,6 +1,6 @@
 {
   "name": "@martian-engineering/lossless-claw",
-  "version": "0.11.3",
+  "version": "0.12.0",
   "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with threshold compaction",
   "type": "module",
   "main": "dist/index.js",
@@ -18,8 +18,10 @@
   "scripts": {
     "build": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
     "changeset": "changeset",
-    "release:verify": "npm run build && npm test && npm pack --dry-run",
+    "plugin-inspector:ci": "npm exec --yes --package @openclaw/plugin-inspector@0.3.11 -- plugin-inspector ci --plugin-root . --out plugin-inspector-reports",
+    "release:verify": "npm run typecheck && npm run build && npm test && npm pack --dry-run",
     "test": "vitest run --dir test",
+    "typecheck": "tsc --noEmit --pretty false",
     "version-packages": "changeset version"
   },
   "files": [

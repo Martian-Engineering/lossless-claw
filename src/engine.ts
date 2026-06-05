@@ -75,7 +75,6 @@ import { buildMessageIdentityHash } from "./store/message-identity.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import {
-  buildDeterministicFallbackSummary,
   createLcmSummarizeFromLegacyParams,
   extractProviderAuthFailure,
   FALLBACK_SUMMARY_MARKER,
@@ -85,6 +84,7 @@ import {
 } from "./summarize.js";
 import type { CompleteFn, LcmDependencies, StartupSessionFileCandidate } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import { buildDeterministicFallbackSummary } from "./summary-fallback.js";
 import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
 import {
   DatabaseTransactionTimeoutError,
@@ -175,7 +175,7 @@ type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
   sessionKey?: string;
-  tokenBudget: number;
+  tokenBudget?: number;
   currentTokenCount?: number;
   compactionTarget?: "budget" | "threshold";
   customInstructions?: string;
@@ -1308,7 +1308,7 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
     "content" in message
       ? extractMessageContent(message.content)
       : "output" in message
-        ? `$ ${(message as { command: string; output: string }).command}\n${(message as { command: string; output: string }).output}`
+        ? `$ ${String(message.command ?? "")}\n${String(message.output)}`
         : "";
   const runtimeRole = toRuntimeRoleForTokenEstimate(message.role);
   const normalizedContent =
@@ -1636,14 +1636,18 @@ function extractRuntimePromptTokenCount(runtimeContext?: Record<string, unknown>
   }
 
   // 2. Sum from runtimeContext.usage (normalizeUsage output: {input, cacheRead, cacheWrite})
-  const usageSum = sumPromptTokensFromUsageRecord(asRecord(ctx["usage"]) ?? asRecord(ctx["lastCallUsage"]));
+  const usageSum = sumPromptTokensFromUsageRecord(
+    asRecord(ctx["usage"]) ?? asRecord(ctx["lastCallUsage"]) ?? null,
+  );
   if (usageSum !== undefined && usageSum > 0) {
     return usageSum;
   }
 
   // 3. Sum from promptCache.lastCallUsage (same normalized shape)
   const promptCache = asRecord(ctx["promptCache"]);
-  const promptCacheUsageSum = sumPromptTokensFromUsageRecord(asRecord(promptCache?.["lastCallUsage"]));
+  const promptCacheUsageSum = sumPromptTokensFromUsageRecord(
+    asRecord(promptCache?.["lastCallUsage"]) ?? null,
+  );
   if (promptCacheUsageSum !== undefined && promptCacheUsageSum > 0) {
     return promptCacheUsageSum;
   }
@@ -3351,7 +3355,7 @@ export class LcmContextEngine implements ContextEngine {
   private retrieval: RetrievalEngine;
   private readonly db: DatabaseSync;
   private migrated = false;
-  private readonly fts5Available: boolean;
+  private readonly fts5Available: boolean = false;
   private readonly ignoreSessionPatterns: RegExp[];
   private readonly statelessSessionPatterns: RegExp[];
   private sessionOperationQueues = new Map<
@@ -6509,6 +6513,12 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<TranscriptReconcileResult> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     await this.conversationStore.withTransaction(async () => {
+      await this.rotateIsolatedCronConversationIfRuntimeChanged({
+        phase: "afterTurn",
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        createReplacement: false,
+      });
       await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
         phase: "afterTurn",
         sessionId: params.sessionId,
@@ -7067,6 +7077,57 @@ export class LcmContextEngine implements ContextEngine {
     return true;
   }
 
+  /** Cron session keys represent isolated scheduled runs, not conversation continuity. */
+  private isIsolatedCronSessionKey(sessionKey?: string): boolean {
+    const trimmed = sessionKey?.trim();
+    if (!trimmed) {
+      return false;
+    }
+    const parts = trimmed.split(":");
+    return parts.length >= 4 && parts[0] === "agent" && parts[2] === "cron";
+  }
+
+  /**
+   * Archive the prior active cron run when OpenClaw reuses a scheduler
+   * sessionKey for a new isolated runtime session.
+   */
+  private async rotateIsolatedCronConversationIfRuntimeChanged(params: {
+    phase: "bootstrap" | "assemble" | "afterTurn";
+    sessionId: string;
+    sessionKey?: string;
+    createReplacement: boolean;
+  }): Promise<boolean> {
+    const normalizedSessionId = params.sessionId.trim();
+    const normalizedSessionKey = params.sessionKey?.trim();
+    if (
+      !normalizedSessionId ||
+      !normalizedSessionKey ||
+      !this.isIsolatedCronSessionKey(normalizedSessionKey)
+    ) {
+      return false;
+    }
+
+    const activeByKey = await this.conversationStore.getConversationBySessionKey(
+      normalizedSessionKey,
+    );
+    if (!activeByKey || activeByKey.sessionId === normalizedSessionId) {
+      return false;
+    }
+
+    this.deps.log.info(
+      `[lcm] ${params.phase}: isolated cron session rollover; archiving conversation=${activeByKey.conversationId} oldSessionId=${activeByKey.sessionId} newSessionId=${normalizedSessionId} sessionKey=${normalizedSessionKey}`,
+    );
+    await this.applySessionReplacement({
+      reason: `${params.phase} isolated cron session rollover`,
+      sessionId: activeByKey.sessionId,
+      sessionKey: normalizedSessionKey,
+      nextSessionId: normalizedSessionId,
+      nextSessionKey: normalizedSessionKey,
+      createReplacement: params.createReplacement,
+    });
+    return true;
+  }
+
   private async findAmbiguousSessionKeyRuntimeRollover(params: {
     phase: "bootstrap" | "assemble" | "afterTurn";
     sessionId: string;
@@ -7234,6 +7295,12 @@ export class LcmContextEngine implements ContextEngine {
           };
           let preloadedHistoricalMessages: AgentMessage[] | undefined;
 
+          await this.rotateIsolatedCronConversationIfRuntimeChanged({
+            phase: "bootstrap",
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            createReplacement: true,
+          });
           await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
             phase: "bootstrap",
             sessionId: params.sessionId,
@@ -8432,6 +8499,7 @@ export class LcmContextEngine implements ContextEngine {
     autoCompactionSummary?: string;
     isHeartbeat?: boolean;
     tokenBudget?: number;
+    currentTokenCount?: number;
     /** OpenClaw runtime param name (preferred). */
     runtimeContext?: Record<string, unknown>;
     /** Back-compat param name. */
@@ -8640,6 +8708,7 @@ export class LcmContextEngine implements ContextEngine {
     const estimatedContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
     const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
     const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
+      params.currentTokenCount ??
       (
         (legacyParams ?? {}) as {
           currentTokenCount?: unknown;
@@ -8934,6 +9003,12 @@ export class LcmContextEngine implements ContextEngine {
           this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
           async () =>
             this.conversationStore.withTransaction(async () => {
+              await this.rotateIsolatedCronConversationIfRuntimeChanged({
+                phase: "assemble",
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                createReplacement: false,
+              });
               await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
                 phase: "assemble",
                 sessionId: params.sessionId,
@@ -10534,7 +10609,7 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    const entriesToKeep: Array<Record<string, unknown>> = [];
+    const entriesToKeep: Array<(typeof branch)[number]> = [];
     for (const type of ["session_info", "model_change", "thinking_level_change"] as const) {
       const entry = latestPreludeEntries.get(type);
       if (entry) {
@@ -10554,7 +10629,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     let previousEntryId: string | null = null;
-    const linearizedEntries = entriesToKeep.map((entry) => {
+    const linearizedEntries = entriesToKeep.map((entry): (typeof branch)[number] => {
       const nextEntry = {
         ...entry,
         parentId: previousEntryId,

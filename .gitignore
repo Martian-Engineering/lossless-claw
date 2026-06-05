@@ -1,6 +1,7 @@
 .pebbles
 node_modules/
 dist/
+plugin-inspector-reports/
 *.tsbuildinfo
 .DS_Store
 .worktrees

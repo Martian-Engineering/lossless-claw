@@ -24,6 +24,7 @@ function buildApi(
     includeRuntimeLlm?: boolean;
     agentDir?: string;
     runtimeConfig?: Record<string, unknown>;
+    registrationMode?: string;
   },
 ): {
   api: OpenClawPluginApi;
@@ -54,6 +55,7 @@ function buildApi(
     source: "/tmp/lossless-claw",
     config: {},
     pluginConfig,
+    ...(options?.registrationMode ? { registrationMode: options.registrationMode } : {}),
     runtime: {
       subagent: {
         run: vi.fn(),
@@ -242,6 +244,29 @@ describe("lcm plugin registration", () => {
     expect(getRegisteredContextEngines()).toEqual([
       expect.objectContaining({ id: "lossless-claw" }),
     ]);
+  });
+
+  it("does not initialize runtime surfaces during CLI metadata registration", () => {
+    const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+    const { api, getRegisteredContextEngines, infoLog, warnLog } = buildApi(
+      { enabled: true },
+      {
+        includeRuntimeLlm: false,
+        registrationMode: "cli-metadata",
+      },
+    );
+
+    lcmPlugin.register(api);
+
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(getRegisteredContextEngines()).toEqual([]);
+    expect(api.registerCommand).not.toHaveBeenCalled();
+    expect(api.registerTool).not.toHaveBeenCalled();
+    expect(api.on).not.toHaveBeenCalled();
+    expect(infoLog).not.toHaveBeenCalled();
+    expect(warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("runtime.llm.complete is unavailable"),
+    );
   });
 
   it("fails fast with a compatibility diagnostic when context-engine registration is unavailable", () => {

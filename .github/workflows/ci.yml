@@ -23,8 +23,46 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run typecheck
+        run: npm run typecheck
+
       - name: Run tests
         run: npm test
+
+  plugin-inspector:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout declared OpenClaw contract source
+        run: |
+          OPENCLAW_CONTRACT_REF="v$(node -p "require('./package.json').openclaw.build.openclawVersion")"
+          git clone --depth 1 --branch "$OPENCLAW_CONTRACT_REF" https://github.com/openclaw/openclaw "$RUNNER_TEMP/openclaw"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build package bundle
+        run: npm run build
+
+      - name: Run OpenClaw plugin inspector
+        run: npm run plugin-inspector:ci -- --openclaw "$RUNNER_TEMP/openclaw"
+
+      - name: Upload plugin inspector reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-inspector-reports
+          path: plugin-inspector-reports/
+          if-no-files-found: ignore
 
   # Smoke-install the plugin against the latest published openclaw to catch
   # bundle-level breakage (esbuild externals, ESM resolution, missing default

@@ -262,7 +262,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const msg of result.messages) {
           const snippet = truncateSnippet(msg.snippet);
-          const line = `- [msg#${msg.messageId}] (${msg.role}, ${formatDisplayTime(msg.createdAt, timezone)}): ${snippet}`;
+          const line = `- [conv=${msg.conversationId} msg#${msg.messageId}] (${msg.role}, ${formatDisplayTime(msg.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
@@ -278,7 +278,7 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const sum of result.summaries) {
           const snippet = truncateSnippet(sum.snippet);
-          const line = `- [${sum.summaryId}] (${sum.kind}, ${formatDisplayTime(sum.createdAt, timezone)}): ${snippet}`;
+          const line = `- [conv=${sum.conversationId} ${sum.summaryId}] (${sum.kind}, ${formatDisplayTime(sum.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;

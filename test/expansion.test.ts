@@ -6,16 +6,23 @@ import { buildExpansionToolDefinition } from "../src/expansion.js";
 const BASE_CONFIG: LcmConfig = {
   enabled: true,
   databasePath: ":memory:",
+  largeFilesDir: "/tmp/lcm-files",
   ignoreSessionPatterns: [],
   statelessSessionPatterns: [],
   skipStatelessSessions: true,
   contextThreshold: 0.75,
   freshTailCount: 8,
+  promptAwareEviction: false,
+  stubLargeToolPayloads: false,
   newSessionRetainDepth: 2,
   leafMinFanout: 8,
   condensedMinFanout: 4,
   condensedMinFanoutHard: 2,
+  sweepMaxDepth: 1,
   incrementalMaxDepth: 0,
+  maxSweepIterations: 12,
+  sweepDeadlineMs: 120_000,
+  compactUntilUnderDeadlineMs: 300_000,
   leafChunkTokens: 20_000,
   leafTargetTokens: 600,
   condensedTargetTokens: 900,
@@ -58,6 +65,7 @@ const BASE_CONFIG: LcmConfig = {
     enabled: true,
     max: 40_000,
   },
+  stripInjectedContextTags: [],
 };
 
 function makeExpansionResult() {

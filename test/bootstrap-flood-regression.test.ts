@@ -2,32 +2,45 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
+import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies } from "../src/types.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 const tempDirs: string[] = [];
 
+function appendSessionMessage(manager: SessionManager, message: AgentMessage): string {
+  return manager.appendMessage(
+    message as unknown as Parameters<SessionManager["appendMessage"]>[0],
+  );
+}
+
 function createTestConfig(databasePath: string): LcmConfig {
   return {
     enabled: true,
     databasePath,
+    largeFilesDir: join(databasePath, "..", "lcm-files"),
     ignoreSessionPatterns: [],
     statelessSessionPatterns: [],
     skipStatelessSessions: true,
     contextThreshold: 0.75,
     freshTailCount: 8,
+    promptAwareEviction: false,
+    stubLargeToolPayloads: false,
     newSessionRetainDepth: 2,
     leafMinFanout: 8,
     condensedMinFanout: 4,
     condensedMinFanoutHard: 2,
+    sweepMaxDepth: 1,
     incrementalMaxDepth: 0,
+    maxSweepIterations: 12,
+    sweepDeadlineMs: 120_000,
+    compactUntilUnderDeadlineMs: 300_000,
     leafChunkTokens: 20_000,
     leafTargetTokens: 600,
     condensedTargetTokens: 900,
@@ -52,10 +65,25 @@ function createTestConfig(databasePath: string): LcmConfig {
     customInstructions: "",
     expansionProvider: "",
     expansionModel: "",
-    pinnedFiles: [],
-    pinnedFilesPerAgent: {},
+    delegationTimeoutMs: 120_000,
+    summaryTimeoutMs: 60_000,
     circuitBreakerThreshold: 5,
     circuitBreakerCooldownMs: 1_800_000,
+    fallbackProviders: [],
+    cacheAwareCompaction: {
+      enabled: true,
+      cacheTTLSeconds: 300,
+      maxColdCacheCatchupPasses: 2,
+      hotCachePressureFactor: 4,
+      hotCacheBudgetHeadroomRatio: 0.2,
+      coldCacheObservationThreshold: 3,
+      criticalBudgetPressureRatio: 0.90,
+    },
+    dynamicLeafChunkTokens: {
+      enabled: true,
+      max: 40_000,
+    },
+    stripInjectedContextTags: [],
   };
 }
 
@@ -86,6 +114,7 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
     },
     resolveAgentDir: () => process.env.HOME ?? tmpdir(),
     resolveSessionIdFromSessionKey: async () => undefined,
+    resolveSessionTranscriptFile: async () => undefined,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),
@@ -119,20 +148,20 @@ function buildRepeatedPatternSession(sessionFile: string, pairCount: number): vo
   const sm = SessionManager.open(sessionFile);
   for (let i = 0; i < pairCount; i++) {
     if (i % 5 === 0) {
-      sm.appendMessage({
+      appendSessionMessage(sm, {
         role: "user",
         content: [{ type: "text", text: "ping" }],
       } as AgentMessage);
-      sm.appendMessage({
+      appendSessionMessage(sm, {
         role: "assistant",
         content: [{ type: "text", text: "pong" }],
       } as AgentMessage);
     } else {
-      sm.appendMessage({
+      appendSessionMessage(sm, {
         role: "user",
         content: [{ type: "text", text: `Question ${i}` }],
       } as AgentMessage);
-      sm.appendMessage({
+      appendSessionMessage(sm, {
         role: "assistant",
         content: [{ type: "text", text: `Answer ${i}` }],
       } as AgentMessage);
@@ -307,7 +336,7 @@ describe("bootstrap flood regression (PR #280) — round-trip integration", () =
     // Add many new messages to the JSONL — these look "new" due to stale checkpoint
     const sm = SessionManager.open(sessionFile);
     for (let i = 0; i < 200; i++) {
-      sm.appendMessage({
+      appendSessionMessage(sm, {
         role: "user",
         content: [{ type: "text", text: `extra flood message ${i}` }],
       } as AgentMessage);
@@ -427,7 +456,7 @@ describe("bootstrap flood regression (PR #280) — round-trip integration", () =
     // Add enough extra messages to trigger the import cap
     const sm = SessionManager.open(sessionFile);
     for (let i = 0; i < 200; i++) {
-      sm.appendMessage({
+      appendSessionMessage(sm, {
         role: "user",
         content: [{ type: "text", text: `flood ${i}` }],
       } as AgentMessage);

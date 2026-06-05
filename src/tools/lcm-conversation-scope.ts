@@ -56,6 +56,15 @@ async function lookupConversationForSession(input: {
   return store.getConversationBySessionId(normalizedSessionId);
 }
 
+function isIsolatedCronSessionKey(sessionKey?: string): boolean {
+  const trimmed = sessionKey?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const parts = trimmed.split(":");
+  return parts.length >= 4 && parts[0] === "agent" && parts[2] === "cron";
+}
+
 /**
  * Parse an ISO-8601 timestamp tool parameter into a Date.
  *
@@ -107,6 +116,7 @@ export async function resolveLcmConversationScope(input: {
   const normalizedSessionKey = explicitSessionKey || sessionIdAsSessionKey;
   const isDelegatedSession =
     Boolean(normalizedSessionKey) && Boolean(input.deps?.isSubagentSessionKey(normalizedSessionKey!));
+  const isolateCurrentSessionFamily = isIsolatedCronSessionKey(normalizedSessionKey);
   let allowedConversationIds: number[] = [];
 
   const explicitConversationId =
@@ -213,8 +223,9 @@ export async function resolveLcmConversationScope(input: {
           error: `Conversation ${bySessionKey.conversationId} is outside delegated conversation scope.`,
         };
       }
-      const familyIds =
-        typeof (lcm.getConversationStore() as ConversationScopeStore).getConversationFamilyIds === "function"
+      const familyIds = isolateCurrentSessionFamily
+        ? [bySessionKey.conversationId]
+        : typeof (lcm.getConversationStore() as ConversationScopeStore).getConversationFamilyIds === "function"
           ? await (lcm.getConversationStore() as ConversationScopeStore).getConversationFamilyIds({
               conversationId: bySessionKey.conversationId,
               sessionKey: normalizedSessionKey,
@@ -267,8 +278,9 @@ export async function resolveLcmConversationScope(input: {
   }
 
   const store = lcm.getConversationStore() as ConversationScopeStore;
-  const familyIds =
-    typeof store.getConversationFamilyIds === "function"
+  const familyIds = isolateCurrentSessionFamily
+    ? [conversation.conversationId]
+    : typeof store.getConversationFamilyIds === "function"
       ? await store.getConversationFamilyIds({
           conversationId: conversation.conversationId,
           sessionId: normalizedSessionId,

@@ -19,7 +19,7 @@ function createDeps(
     },
     isSubagentSessionKey: (key: string) => key.includes(":subagent:"),
     normalizeAgentId: (id?: string) => id?.trim() || "main",
-    buildSubagentSystemPrompt: ({ taskSummary }) => `system: ${taskSummary ?? ""}`,
+    buildSubagentSystemPrompt: ({ taskSummary }: { taskSummary?: string }) => `system: ${taskSummary ?? ""}`,
     readLatestAssistantReply: (messages: unknown[]) => {
       const latest = messages.at(-1) as { content?: unknown } | undefined;
       return typeof latest?.content === "string" ? latest.content : undefined;
@@ -46,6 +46,7 @@ const activeSummaries: ActiveFocusSummaryRecord[] = [
     tokenCount: 1200,
     createdAt: "2026-05-16T00:00:00.000Z",
     latestAt: "2026-05-16T00:01:00.000Z",
+    maxSourceSeq: 1,
     content: "Focused alpha work, source decisions, and pending review state.",
   },
 ];

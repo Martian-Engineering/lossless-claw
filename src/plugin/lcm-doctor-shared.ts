@@ -1,5 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
-import { FALLBACK_SUMMARY_MARKER } from "../summarize.js";
+import {
+  FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+  FALLBACK_SUMMARY_MARKER,
+} from "../summary-fallback.js";
 
 export { FALLBACK_SUMMARY_MARKER };
 export const TRUNCATED_SUMMARY_PREFIX = "[Truncated from ";
@@ -63,8 +66,17 @@ type DoctorTargetRow = {
  * Detect broken summary markers that doctor should flag or repair.
  */
 export function detectDoctorMarker(content: string): DoctorMarkerKind | null {
+  if (content.startsWith(FALLBACK_DIRECTIVE_SUMMARY_MARKER)) {
+    return "fallback";
+  }
+
   if (content.startsWith(FALLBACK_SUMMARY_MARKER)) {
     return "old";
+  }
+
+  const directiveFallbackIndex = content.indexOf(FALLBACK_DIRECTIVE_SUMMARY_MARKER);
+  if (directiveFallbackIndex >= 0) {
+    return "fallback";
   }
 
   const truncatedIndex = content.indexOf(TRUNCATED_SUMMARY_PREFIX);
@@ -124,6 +136,7 @@ export function loadDoctorTargets(
          ) spc ON spc.summary_id = s.summary_id
          WHERE INSTR(COALESCE(s.content, ''), ?) > 0
             OR INSTR(COALESCE(s.content, ''), ?) > 0
+            OR INSTR(COALESCE(s.content, ''), ?) > 0
             OR COALESCE(s.model, '') = ?
             OR (
               COALESCE(s.model, '') = 'unknown'
@@ -152,6 +165,7 @@ export function loadDoctorTargets(
            AND (
              INSTR(COALESCE(s.content, ''), ?) > 0
              OR INSTR(COALESCE(s.content, ''), ?) > 0
+             OR INSTR(COALESCE(s.content, ''), ?) > 0
              OR COALESCE(s.model, '') = ?
              OR (
                COALESCE(s.model, '') = 'unknown'
@@ -165,6 +179,7 @@ export function loadDoctorTargets(
     ? statement.all(
         FALLBACK_SUMMARY_MARKER,
         TRUNCATED_SUMMARY_PREFIX,
+        FALLBACK_DIRECTIVE_SUMMARY_MARKER,
         EMERGENCY_FALLBACK_MODEL,
         BARE_EMERGENCY_TRUNCATION_MARKER,
       )
@@ -172,6 +187,7 @@ export function loadDoctorTargets(
         conversationId,
         FALLBACK_SUMMARY_MARKER,
         TRUNCATED_SUMMARY_PREFIX,
+        FALLBACK_DIRECTIVE_SUMMARY_MARKER,
         EMERGENCY_FALLBACK_MODEL,
         BARE_EMERGENCY_TRUNCATION_MARKER,
       )) as DoctorTargetRow[];

@@ -5,6 +5,8 @@ import type {
   RuntimeLlmModelOverride,
 } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import { buildDeterministicFallbackSummary } from "./summary-fallback.js";
+export { FALLBACK_SUMMARY_MARKER } from "./summary-fallback.js";
 
 export type LcmSummarizeOptions = {
   previousSummary?: string;
@@ -78,21 +80,6 @@ type SummaryMode = "normal" | "aggressive";
 
 const DEFAULT_LEAF_TARGET_TOKENS = 2400;
 const DEFAULT_CONDENSED_TARGET_TOKENS = 2000;
-export const FALLBACK_SUMMARY_MARKER = "[LCM fallback summary; truncated for context management]";
-const FALLBACK_DIRECTIVE_OMISSION =
-  "[LCM fallback summary omitted directive-shaped untrusted content].";
-const FALLBACK_DIRECTIVE_SHAPED_PATTERN = new RegExp(
-  [
-    String.raw`\b(ignore|disregard|forget|override)\s+(all\s+)?(previous|prior|above|earlier|system|developer)\s+(instructions?|prompts?|rules?)\b`,
-    String.raw`\byou\s+are\s+now\b`,
-    String.raw`\bfrom\s+now\s+on\b`,
-    String.raw`\breply\s+only\s+with\b`,
-    String.raw`\b(reveal|print|show|dump|exfiltrate)\s+(the\s+)?(system|developer)\s+prompt\b`,
-    String.raw`\bjailbreak\b`,
-    String.raw`\bDAN\b`,
-  ].join("|"),
-  "i",
-);
 const LCM_SUMMARIZER_SYSTEM_PROMPT = [
   "You are a context-compaction summarization engine. Return plain text summary content only.",
   "",
@@ -1209,71 +1196,6 @@ function buildCondensedSummaryPrompt(params: {
     return buildD2Prompt(params);
   }
   return buildD3PlusPrompt(params);
-}
-
-function sanitizeDeterministicFallbackText(text: string): {
-  sanitizedText: string;
-  omittedDirectiveShapedContent: boolean;
-} {
-  const units = text.match(/\n+|[^\n.!?]+[.!?]*\s*/g) ?? [text];
-  const output: string[] = [];
-  let omittedDirectiveShapedContent = false;
-  let lastWasOmission = false;
-
-  for (const unit of units) {
-    if (/^\n+$/.test(unit)) {
-      output.push(unit);
-      lastWasOmission = false;
-      continue;
-    }
-    if (FALLBACK_DIRECTIVE_SHAPED_PATTERN.test(unit)) {
-      omittedDirectiveShapedContent = true;
-      if (!lastWasOmission) {
-        output.push(`${FALLBACK_DIRECTIVE_OMISSION} `);
-        lastWasOmission = true;
-      }
-      continue;
-    }
-    output.push(unit);
-    lastWasOmission = false;
-  }
-
-  return {
-    sanitizedText: output.join("").replace(/[ \t]+\n/g, "\n").trim(),
-    omittedDirectiveShapedContent,
-  };
-}
-
-/**
- * Deterministic fallback summary when model output is empty.
- *
- * Keeps compaction progress monotonic instead of throwing and aborting the
- * whole compaction pass.
- */
-export function buildDeterministicFallbackSummary(text: string, targetTokens: number): string {
-  if (typeof text !== "string") return "";
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return "";
-  }
-
-  const { sanitizedText, omittedDirectiveShapedContent } =
-    sanitizeDeterministicFallbackText(trimmed);
-  const fallbackNote = omittedDirectiveShapedContent
-    ? "[LCM fallback summary; directive-shaped untrusted content omitted]"
-    : FALLBACK_SUMMARY_MARKER;
-  if (!sanitizedText) {
-    return fallbackNote;
-  }
-
-  const maxChars = Math.max(256, targetTokens * 4);
-  if (sanitizedText.length <= maxChars && !omittedDirectiveShapedContent) {
-    return sanitizedText;
-  }
-
-  const summaryText =
-    sanitizedText.length <= maxChars ? sanitizedText : sanitizedText.slice(0, maxChars).trimEnd();
-  return `${summaryText}\n${fallbackNote}`;
 }
 
 /** Normalize model refs from string or `{ primary }` config shapes. */

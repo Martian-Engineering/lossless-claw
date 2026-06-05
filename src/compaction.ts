@@ -13,6 +13,10 @@ import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
 import { LcmProviderAuthError } from "./summarize.js";
+import {
+  buildDeterministicFallbackSummary,
+  FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+} from "./summary-fallback.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -228,14 +232,12 @@ function shortTzAbbr(value: Date, timezone: string): string {
   }
 }
 
-/** Generate a collision-resistant summary ID from content plus runtime entropy. */
+/** Generate a collision-resistant summary ID from content and a random nonce. */
 function generateSummaryId(content: string): string {
   return (
     "sum_" +
     createHash("sha256")
-      .update(content + Date.now().toString())
-      .update("\0")
-      .update(randomUUID())
+      .update(content + randomUUID())
       .digest("hex")
       .slice(0, 16)
   );
@@ -2132,13 +2134,19 @@ export class CompactionEngine {
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
     const buildDeterministicFallback = (): { content: string; level: CompactionLevel } => {
-      const suffix = `\n[Truncated from ${inputTokens} tokens]`;
-      const truncated = truncateTextToEstimatedTokens(
-        sourceText,
-        Math.max(0, FALLBACK_MAX_TOKENS - estimateTokens(suffix)),
-      );
+      const truncationNote = `[Truncated from ${inputTokens} tokens]`;
+      const directiveOmissionNote = [
+        FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+        truncationNote,
+      ].join("\n");
+      const content = buildDeterministicFallbackSummary(sourceText, FALLBACK_MAX_TOKENS, {
+        maxTokens: FALLBACK_MAX_TOKENS,
+        truncationNote,
+        directiveOmissionNote,
+        alwaysAppendNote: true,
+      });
       return {
-        content: `${truncated}${suffix}`,
+        content,
         level: "fallback",
       };
     };

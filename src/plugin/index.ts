@@ -32,6 +32,7 @@ const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.5.22";
 
 type ContextEngineCapableOpenClawPluginApi = OpenClawPluginApi & {
   registerContextEngine: (id: string, factory: ContextEngineFactory) => void;
+  registerTool: NonNullable<OpenClawPluginApi["registerTool"]>;
 };
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -399,6 +400,11 @@ function assertContextEngineRegistrationAvailable(
     "upgrade OpenClaw or disable lossless-claw.";
   logOpenClawCompatibilityError(api, message);
   throw new Error(message);
+}
+
+/** Return true for OpenClaw's descriptor-only CLI registration pass. */
+function isCliMetadataRegistration(api: OpenClawPluginApi): boolean {
+  return (api as { registrationMode?: unknown }).registrationMode === "cli-metadata";
 }
 
 /** Resolve plugin config from direct runtime injection or the root OpenClaw config fallback. */
@@ -1507,6 +1513,10 @@ const lcmPlugin = {
   },
 
   register(api: OpenClawPluginApi) {
+    if (isCliMetadataRegistration(api)) {
+      return;
+    }
+
     assertContextEngineRegistrationAvailable(api);
     const registrationConfig = resolveRegistrationConfig(api);
     const deps = createLcmDependencies(api, registrationConfig);
