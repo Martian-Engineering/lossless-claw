@@ -3358,6 +3358,7 @@ export class LcmContextEngine implements ContextEngine {
     string,
     { promise: Promise<void>; refCount: number }
   >();
+  private pendingSummaryPreparationQueues = new Set<string>();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private oversizedAutoRotateCheckpointByQueueKey = new Map<string, number>();
@@ -4162,28 +4163,29 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
-    await this.withSessionQueue(
-      params.queueKey,
-      async () => {
-        const result = await this.preparePendingLeafSummaries({
-          conversationId: params.conversationId,
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          legacyParams: params.legacyParams,
-          reason: params.reason,
-        });
-        this.deps.log.debug(
-          `[lcm] background pending summary preparation done conversation=${params.conversationId} prepared=${result.prepared} summaries=${result.summaryCount} reason=${result.reason ?? "none"} trigger=${params.reason}`,
-        );
-      },
-      {
-        operationName: "backgroundPendingSummaryPreparation",
-        context: [
-          `session=${params.sessionId}`,
-          ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
-        ].join(" "),
-      },
-    );
+    if (this.pendingSummaryPreparationQueues.has(params.queueKey)) {
+      this.deps.log.debug(
+        `[lcm] background pending summary preparation skipped conversation=${params.conversationId} reason=already-running trigger=${params.reason}`,
+      );
+      return;
+    }
+
+    this.pendingSummaryPreparationQueues.add(params.queueKey);
+    const startedAt = Date.now();
+    try {
+      const result = await this.preparePendingLeafSummaries({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        legacyParams: params.legacyParams,
+        reason: params.reason,
+      });
+      this.deps.log.debug(
+        `[lcm] background pending summary preparation done conversation=${params.conversationId} prepared=${result.prepared} summaries=${result.summaryCount} reason=${result.reason ?? "none"} trigger=${params.reason} duration=${formatDurationMs(Date.now() - startedAt)}`,
+      );
+    } finally {
+      this.pendingSummaryPreparationQueues.delete(params.queueKey);
+    }
   }
 
   private async preparePendingLeafSummaries(params: {

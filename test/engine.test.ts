@@ -12533,6 +12533,103 @@ describe("LcmContextEngine fidelity and token budget", () => {
     await heldQueue;
   });
 
+  it("background pending summary preparation does not block same-session assemble", async () => {
+    let releaseSummarizer!: () => void;
+    let markSummarizerStarted!: () => void;
+    const summarizerStarted = new Promise<void>((resolve) => {
+      markSummarizerStarted = resolve;
+    });
+    const complete = vi.fn(async () => {
+      const held = new Promise<void>((resolve) => {
+        releaseSummarizer = resolve;
+      });
+      markSummarizerStarted();
+      await held;
+      return {
+        content: [{ type: "text", text: "prepared background summary" }],
+      };
+    });
+    const engine = createEngineWithDeps(
+      {
+        backgroundSummaryPreparationEnabled: true,
+        freshTailCount: 1,
+        leafChunkTokens: 20_000,
+        summaryProvider: "openai-resp",
+        summaryModel: "gpt-test",
+      },
+      { complete },
+    );
+    const sessionId = "background-preparation-assemble-session";
+    const sessionKey = "agent:main:background-preparation-assemble";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey,
+    });
+    const messages = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "old source alpha",
+        tokenCount: 20,
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "old source beta",
+        tokenCount: 20,
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "fresh tail gamma",
+        tokenCount: 20,
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(
+        conversation.conversationId,
+        messages.map((message) => message.messageId),
+      );
+
+    const privateEngine = engine as unknown as {
+      drainPendingSummaryPreparationIfIdle: (params: unknown) => Promise<void>;
+    };
+    const drainPromise = privateEngine.drainPendingSummaryPreparationIfIdle({
+      conversationId: conversation.conversationId,
+      sessionId,
+      sessionKey,
+      reason: "test",
+      queueKey: sessionKey,
+    });
+    await summarizerStarted;
+
+    let assembleSettled = false;
+    const assemblePromise = engine.assemble({
+      sessionId,
+      sessionKey,
+      messages: [makeMessage({ role: "user", content: "can you still respond?" })],
+      tokenBudget: 4_096,
+    }).then((result) => {
+      assembleSettled = true;
+      return result;
+    });
+
+    await vi.waitFor(() => expect(assembleSettled).toBe(true), { timeout: 100 });
+    expect(complete).toHaveBeenCalledTimes(1);
+
+    releaseSummarizer();
+    const assembleResult = await assemblePromise;
+    await drainPromise;
+
+    expect(assembleResult.messages.length).toBeGreaterThan(0);
+  });
+
   it("maintain() leaves deferred threshold debt pending until the host opts in", async () => {
     const engine = createEngine();
     const sessionId = "maintain-deferred-compaction-disabled";
