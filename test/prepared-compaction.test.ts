@@ -368,7 +368,7 @@ describe("prepared compaction batches", () => {
     ]);
   });
 
-  it("publishes a partial prepared batch without foreground summarization", async () => {
+  it("publishes a prepared prefix and foreground-compacts the remaining raw leaf", async () => {
     const fixture = createStores();
     const conversation = await fixture.conversationStore.createConversation({
       sessionId: "prepared-compaction-partial-publish",
@@ -403,26 +403,34 @@ describe("prepared compaction batches", () => {
     expect(prepared.summaryCount).toBe(1);
     expect(prepareSummarize).toHaveBeenCalledTimes(1);
 
-    const publishOnlySummarize = vi.fn(async () => {
-      throw new Error("foreground summarizer should not run after prepared publish");
-    });
+    const foregroundCalls: CapturedSummarizeCall[] = [];
+    const foregroundSummarize = vi.fn(
+      async (text: string, _aggressive?: boolean, options?: LcmSummarizeOptions) => {
+        foregroundCalls.push({ text, options });
+        return "inline remainder summary";
+      },
+    );
     const compacted = await compaction.compact({
       conversationId: conversation.conversationId,
       tokenBudget: 80,
-      summarize: publishOnlySummarize,
+      summarize: foregroundSummarize,
       hardTrigger: false,
     });
 
     expect(compacted.actionTaken).toBe(true);
-    expect(compacted.createdSummaryId).toEqual(expect.stringMatching(/^sum_pre_/));
-    expect(publishOnlySummarize).not.toHaveBeenCalled();
+    expect(compacted.createdSummaryId).toEqual(expect.stringMatching(/^sum_/));
+    expect(compacted.createdSummaryId).not.toEqual(expect.stringMatching(/^sum_pre_/));
+    expect(foregroundSummarize).toHaveBeenCalledTimes(1);
+    expect(foregroundCalls[0]?.text).toContain("source message 3");
+    expect(foregroundCalls[0]?.text).toContain("source message 4");
+    expect(foregroundCalls[0]?.text).not.toContain("source message 5");
+    expect(foregroundCalls[0]?.options?.previousSummary).toBe("prepared partial summary");
     await expect(
       fixture.summaryStore.getContextItems(conversation.conversationId),
     ).resolves.toMatchObject([
       { ordinal: 0, itemType: "summary" },
-      { ordinal: 1, itemType: "message", messageId: messages[2]!.messageId },
-      { ordinal: 2, itemType: "message", messageId: messages[3]!.messageId },
-      { ordinal: 3, itemType: "message", messageId: messages[4]!.messageId },
+      { ordinal: 1, itemType: "summary" },
+      { ordinal: 2, itemType: "message", messageId: messages[4]!.messageId },
     ]);
   });
 

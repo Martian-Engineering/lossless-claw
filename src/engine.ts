@@ -4160,32 +4160,41 @@ export class LcmContextEngine implements ContextEngine {
   private async drainPendingSummaryPreparationIfIdle(
     params: PendingSummaryPreparationDrainParams & { queueKey: string },
   ): Promise<void> {
+    const startedAt = Date.now();
+    const result = await this.preparePendingLeafSummariesIfSessionQueueIdle(params);
+    if (!result) {
+      return;
+    }
+    this.deps.log.debug(
+      `[lcm] background pending summary preparation done conversation=${params.conversationId} prepared=${result.prepared} summaries=${result.summaryCount} reason=${result.reason ?? "none"} trigger=${params.reason} duration=${formatDurationMs(Date.now() - startedAt)}`,
+    );
+  }
+
+  private async preparePendingLeafSummariesIfSessionQueueIdle(
+    params: PendingSummaryPreparationDrainParams & { queueKey: string },
+  ): Promise<PreparedLeafBatchResult | null> {
     if (this.sessionOperationQueues.has(params.queueKey)) {
       this.deps.log.debug(
         `[lcm] background pending summary preparation skipped conversation=${params.conversationId} reason=session-queue-busy trigger=${params.reason}`,
       );
-      return;
+      return null;
     }
 
     if (this.pendingSummaryPreparationQueues.has(params.queueKey)) {
       this.deps.log.debug(
         `[lcm] background pending summary preparation skipped conversation=${params.conversationId} reason=already-running trigger=${params.reason}`,
       );
-      return;
+      return null;
     }
 
     this.pendingSummaryPreparationQueues.add(params.queueKey);
-    const startedAt = Date.now();
     try {
-      const result = await this.preparePendingLeafSummaries({
+      return await this.preparePendingLeafSummaries({
         conversationId: params.conversationId,
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         legacyParams: params.legacyParams,
       });
-      this.deps.log.debug(
-        `[lcm] background pending summary preparation done conversation=${params.conversationId} prepared=${result.prepared} summaries=${result.summaryCount} reason=${result.reason ?? "none"} trigger=${params.reason} duration=${formatDurationMs(Date.now() - startedAt)}`,
-      );
     } finally {
       this.pendingSummaryPreparationQueues.delete(params.queueKey);
     }
@@ -8048,8 +8057,13 @@ export class LcmContextEngine implements ContextEngine {
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
-    const result = await this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    let pendingPreparationDrain:
+      | (PendingSummaryPreparationDrainParams & { queueKey: string })
+      | null = null;
+    let transcriptRewriteAttempted = false;
+    let result = await this.withSessionQueue(
+      queueKey,
       async () => {
         const conversation = await this.conversationStore.getConversationForSession({
           sessionId: params.sessionId,
@@ -8065,7 +8079,6 @@ export class LcmContextEngine implements ContextEngine {
         }
 
         let deferredCompactionResult: ContextEngineMaintenanceResult | null = null;
-        let pendingPreparationResult: ContextEngineMaintenanceResult | null = null;
         const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
           conversation.conversationId,
         );
@@ -8102,33 +8115,14 @@ export class LcmContextEngine implements ContextEngine {
             !maintenance?.pending &&
             !maintenance?.running
           ) {
-            try {
-              const prepared = await this.preparePendingLeafSummaries({
-                conversationId: conversation.conversationId,
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                legacyParams: asRecord(params.runtimeContext),
-              });
-              if (prepared.prepared) {
-                pendingPreparationResult = {
-                  changed: true,
-                  bytesFreed: 0,
-                  rewrittenEntries: 0,
-                  reason: `prepared ${prepared.summaryCount} pending summary batch`,
-                };
-              }
-            } catch (err) {
-              if (err instanceof LcmSummarySpendLimitError) {
-                pendingPreparationResult = {
-                  changed: false,
-                  bytesFreed: 0,
-                  rewrittenEntries: 0,
-                  reason: "summary spend backoff open",
-                };
-              } else {
-                throw err;
-              }
-            }
+            pendingPreparationDrain = {
+              conversationId: conversation.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              reason: "maintain",
+              legacyParams: asRecord(params.runtimeContext),
+              queueKey,
+            };
           }
         } else if (maintenance?.pending || maintenance?.running) {
           this.deps.log.debug(
@@ -8136,7 +8130,7 @@ export class LcmContextEngine implements ContextEngine {
           );
         }
 
-        const backgroundWorkResult = deferredCompactionResult ?? pendingPreparationResult;
+        const backgroundWorkResult = deferredCompactionResult;
         if (!this.config.transcriptGcEnabled) {
           return (
             backgroundWorkResult ?? {
@@ -8225,6 +8219,7 @@ export class LcmContextEngine implements ContextEngine {
           };
         }
 
+        transcriptRewriteAttempted = true;
         const result = await rewriteTranscriptEntries({
           replacements,
         });
@@ -8258,6 +8253,42 @@ export class LcmContextEngine implements ContextEngine {
       },
       { operationName: "maintain", context: sessionLabel },
     );
+    if (pendingPreparationDrain) {
+      let pendingPreparationResult: ContextEngineMaintenanceResult | null = null;
+      try {
+        const prepared =
+          await this.preparePendingLeafSummariesIfSessionQueueIdle(pendingPreparationDrain);
+        if (prepared?.prepared) {
+          pendingPreparationResult = {
+            changed: true,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: `prepared ${prepared.summaryCount} pending summary batch`,
+          };
+        }
+      } catch (err) {
+        if (err instanceof LcmSummarySpendLimitError) {
+          pendingPreparationResult = {
+            changed: false,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: "summary spend backoff open",
+          };
+        } else {
+          throw err;
+        }
+      }
+      if (pendingPreparationResult) {
+        result = transcriptRewriteAttempted
+          ? {
+              changed: result.changed || pendingPreparationResult.changed,
+              bytesFreed: result.bytesFreed,
+              rewrittenEntries: result.rewrittenEntries,
+              reason: result.reason ?? pendingPreparationResult.reason,
+            }
+          : pendingPreparationResult;
+      }
+    }
     await runRuntimeAutoRotate();
     return result;
   }
