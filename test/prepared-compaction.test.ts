@@ -362,6 +362,86 @@ describe("prepared compaction batches", () => {
     ]);
   });
 
+  it("publishes a partial prepared batch without foreground summarization", async () => {
+    const fixture = createStores();
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "prepared-compaction-partial-publish",
+      title: "Prepared compaction partial publish",
+    });
+    const messages = await fixture.conversationStore.createMessagesBulk(
+      Array.from({ length: 5 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        content: `source message ${index + 1}`,
+        tokenCount: 20,
+      })),
+    );
+    await fixture.summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+    const compaction = new CompactionEngine(
+      fixture.conversationStore,
+      fixture.summaryStore,
+      createCompactionConfig({ leafChunkTokens: 40 }),
+    );
+    const prepareSummarize = vi.fn(async () => "prepared partial summary");
+    const prepared = await compaction.preparePendingLeafBatch({
+      conversationId: conversation.conversationId,
+      summarize: prepareSummarize,
+      summaryModel: "test",
+      maxSummaries: 1,
+    });
+    expect(prepared.prepared).toBe(true);
+    expect(prepared.summaryCount).toBe(1);
+    expect(prepareSummarize).toHaveBeenCalledTimes(1);
+
+    const publishOnlySummarize = vi.fn(async () => {
+      throw new Error("foreground summarizer should not run after prepared publish");
+    });
+    const compacted = await compaction.compact({
+      conversationId: conversation.conversationId,
+      tokenBudget: 80,
+      summarize: publishOnlySummarize,
+      hardTrigger: false,
+    });
+
+    expect(compacted.actionTaken).toBe(true);
+    expect(compacted.createdSummaryId).toEqual(expect.stringMatching(/^sum_pre_/));
+    expect(publishOnlySummarize).not.toHaveBeenCalled();
+    await expect(
+      fixture.summaryStore.getContextItems(conversation.conversationId),
+    ).resolves.toMatchObject([
+      { ordinal: 0, itemType: "summary" },
+      { ordinal: 1, itemType: "message", messageId: messages[2]!.messageId },
+      { ordinal: 2, itemType: "message", messageId: messages[3]!.messageId },
+      { ordinal: 3, itemType: "message", messageId: messages[4]!.messageId },
+    ]);
+  });
+
+  it("falls back to inline leaf summarization when no prepared batch exists", async () => {
+    const fixture = await seedRawConversation();
+    const compaction = new CompactionEngine(
+      fixture.conversationStore,
+      fixture.summaryStore,
+      createCompactionConfig(),
+    );
+    const summarize = vi.fn(async () => "inline fallback summary");
+
+    const compacted = await compaction.compact({
+      conversationId: fixture.conversation.conversationId,
+      tokenBudget: 60,
+      summarize,
+      hardTrigger: false,
+    });
+
+    expect(compacted.actionTaken).toBe(true);
+    expect(compacted.createdSummaryId).toEqual(expect.stringMatching(/^sum_/));
+    expect(compacted.createdSummaryId).not.toEqual(expect.stringMatching(/^sum_pre_/));
+    expect(summarize).toHaveBeenCalledTimes(1);
+  });
+
   it("marks prepared batches failed when preparation throws after durable creation", async () => {
     const fixture = createStores();
     const conversation = await fixture.conversationStore.createConversation({

@@ -1184,6 +1184,14 @@ export class CompactionEngine {
         },
         condenseResult: null,
       });
+      return {
+        actionTaken,
+        tokensBefore,
+        tokensAfter: passTokensAfter,
+        createdSummaryId,
+        condensed,
+        level,
+      };
     }
 
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
