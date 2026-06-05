@@ -1474,7 +1474,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             },
           ],
           maxTokens: targetTokens,
-          reasoningIfSupported: "low",
+          ...(params.deps.config.enableSummaryThinking !== false
+            ? ({ reasoningIfSupported: "low" } as const)
+            : {}),
           ...(reasoning ? { reasoning } : {}),
         }), summarizerTimeoutMs, label);
 

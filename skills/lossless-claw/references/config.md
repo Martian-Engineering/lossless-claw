@@ -286,6 +286,20 @@ Why it matters:
 - keep this off unless you want transcript GC to mutate the live session file during maintenance
 - the default is `false`
 
+### `enableSummaryThinking`
+
+Controls whether the summarization model receives a low reasoning budget.
+
+Why it matters:
+
+- when `true` (default), summarization calls request `reasoningIfSupported: "low"`, allowing the model to think before producing summaries — this is the current default behavior
+- when `false`, no explicit reasoning budget is requested, which can reduce cost and keep summarization output more concise when reasoning is not needed for faithful summaries
+- set to `false` when you want to minimize token spend on reasoning during compaction, especially with reasoning-capable models
+
+Env override:
+
+- `LCM_ENABLE_SUMMARY_THINKING`
+
 ### `proactiveThresholdCompactionMode`
 
 Controls whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior.

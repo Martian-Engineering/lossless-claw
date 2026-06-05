@@ -37,6 +37,7 @@ const BASE_CONFIG: LcmConfig = {
   timezone: "UTC",
   pruneHeartbeatOk: false,
   transcriptGcEnabled: false,
+  enableSummaryThinking: true,
   proactiveThresholdCompactionMode: "deferred",
   autoRotateSessionFiles: {
     enabled: true,

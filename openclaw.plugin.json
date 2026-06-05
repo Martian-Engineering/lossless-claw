@@ -257,6 +257,10 @@
       "label": "Transcript GC",
       "help": "Enable transcript rewrite GC during maintain(); disabled by default"
     },
+    "enableSummaryThinking": {
+      "label": "Enable Summary Thinking",
+      "help": "Request low reasoning budget from the model during summarization calls"
+    },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
       "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
@@ -525,6 +529,9 @@
         "type": "boolean"
       },
       "transcriptGcEnabled": {
+        "type": "boolean"
+      },
+      "enableSummaryThinking": {
         "type": "boolean"
       },
       "proactiveThresholdCompactionMode": {

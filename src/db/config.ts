@@ -141,6 +141,8 @@ export type LcmConfig = {
   pruneHeartbeatOk: boolean;
   /** When true, maintain() may rewrite transcript entries for transcript GC. */
   transcriptGcEnabled: boolean;
+  /** When true, requests low reasoning from the model for summarization calls. */
+  enableSummaryThinking: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
   /** Automatically rotate LCM-managed session JSONL files that exceed a size ceiling. */
@@ -624,6 +626,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
           ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"
           : toBool(pc.transcriptGcEnabled) ?? false,
+      enableSummaryThinking:
+        env.LCM_ENABLE_SUMMARY_THINKING !== undefined
+          ? env.LCM_ENABLE_SUMMARY_THINKING === "true"
+          : toBool(pc.enableSummaryThinking) ?? true,
       proactiveThresholdCompactionMode,
       autoRotateSessionFiles: {
         enabled:
