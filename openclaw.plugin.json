@@ -177,6 +177,10 @@
       "label": "Summary Max Calls Per Window",
       "help": "Maximum model-backed summarization calls per session/window before Lossless opens a non-auth spend backoff"
     },
+    "summaryGlobalMaxCallsPerWindow": {
+      "label": "Summary Global Max Calls Per Window",
+      "help": "Optional shared provider/model cap for model-backed summarization calls in each summary call window"
+    },
     "summarySpendBackoffMs": {
       "label": "Summary Spend Backoff (ms)",
       "help": "Cooldown after the summarization spend guard opens"
@@ -428,6 +432,10 @@
         "minimum": 1
       },
       "summaryMaxCallsPerWindow": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "summaryGlobalMaxCallsPerWindow": {
         "type": "integer",
         "minimum": 1
       },

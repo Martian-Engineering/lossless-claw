@@ -131,6 +131,12 @@ type SummarySpendGuardState = {
   backoffUntil: number | null;
   lastReason: string | null;
 };
+
+type SummarySpendGuardLimit = {
+  scopeKey: string;
+  maxCalls: number;
+  reason: string;
+};
 type PromptCacheSnapshot = {
   lastObservedCacheRead?: number;
   lastObservedCacheWrite?: number;
@@ -3630,8 +3636,13 @@ export class LcmContextEngine implements ContextEngine {
   private resolveSummarySpendGuardConfig(): {
     windowMs: number;
     maxCalls: number;
+    globalMaxCalls?: number;
     backoffMs: number;
   } {
+    const globalMaxCalls = this.resolvePositiveConfigInteger(
+      this.config.summaryGlobalMaxCallsPerWindow,
+      0,
+    );
     return {
       windowMs: this.resolvePositiveConfigInteger(
         this.config.summaryCallWindowMs,
@@ -3641,6 +3652,7 @@ export class LcmContextEngine implements ContextEngine {
         this.config.summaryMaxCallsPerWindow,
         24,
       ),
+      ...(globalMaxCalls > 0 ? { globalMaxCalls } : {}),
       backoffMs: this.resolvePositiveConfigInteger(
         this.config.summarySpendBackoffMs,
         30 * 60 * 1000,
@@ -3654,6 +3666,43 @@ export class LcmContextEngine implements ContextEngine {
   }): string {
     const scope = params.scope?.trim() || "global";
     return `${params.kind}:${scope}`;
+  }
+
+  private resolveProviderSummarySpendScope(params: {
+    kind: "compaction" | "large-file";
+    provider?: string;
+    model?: string;
+  }): string | undefined {
+    const provider = params.provider?.trim();
+    const model = params.model?.trim();
+    if (!provider || !model) {
+      return undefined;
+    }
+    return `${params.kind}-provider:${provider}/${model}`;
+  }
+
+  private buildSummarySpendLimits(params: {
+    scopeKey: string;
+    reason: string;
+    globalScopeKey?: string;
+  }): SummarySpendGuardLimit[] {
+    const { maxCalls, globalMaxCalls } = this.resolveSummarySpendGuardConfig();
+    return [
+      {
+        scopeKey: params.scopeKey,
+        maxCalls,
+        reason: params.reason,
+      },
+      ...(params.globalScopeKey && globalMaxCalls
+        ? [
+            {
+              scopeKey: params.globalScopeKey,
+              maxCalls: globalMaxCalls,
+              reason: `${params.reason} provider/global`,
+            },
+          ]
+        : []),
+    ];
   }
 
   private openSummarySpendBackoff(params: {
@@ -3677,10 +3726,11 @@ export class LcmContextEngine implements ContextEngine {
 
   private assertSummarySpendCallAllowed(params: {
     scopeKey: string;
+    maxCalls: number;
     reason: string;
   }): void {
     const now = Date.now();
-    const { windowMs, maxCalls } = this.resolveSummarySpendGuardConfig();
+    const { windowMs } = this.resolveSummarySpendGuardConfig();
     let state = this.summarySpendGuardStates.get(params.scopeKey);
     if (state?.backoffUntil !== null && state?.backoffUntil !== undefined) {
       if (now < state.backoffUntil) {
@@ -3705,14 +3755,14 @@ export class LcmContextEngine implements ContextEngine {
       this.summarySpendGuardStates.set(params.scopeKey, state);
     }
 
-    if (state.calls >= maxCalls) {
+    if (state.calls >= params.maxCalls) {
       const backoffUntil = this.openSummarySpendBackoff({
         scopeKey: params.scopeKey,
         reason: params.reason,
         now,
       });
       this.deps.log.warn(
-        `[lcm] summary spend guard opened scope=${params.scopeKey} calls=${state.calls}/${maxCalls} reason=${params.reason.replaceAll(" ", "_")} backoffUntil=${backoffUntil.toISOString()}`,
+        `[lcm] summary spend guard opened scope=${params.scopeKey} calls=${state.calls}/${params.maxCalls} reason=${params.reason.replaceAll(" ", "_")} backoffUntil=${backoffUntil.toISOString()}`,
       );
       throw new LcmSummarySpendLimitError({
         scopeKey: params.scopeKey,
@@ -3721,6 +3771,12 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     state.lastReason = params.reason;
+  }
+
+  private assertSummarySpendCallsAllowed(limits: SummarySpendGuardLimit[]): void {
+    for (const limit of limits) {
+      this.assertSummarySpendCallAllowed(limit);
+    }
   }
 
   private recordSummarySpendCall(params: {
@@ -3754,27 +3810,36 @@ export class LcmContextEngine implements ContextEngine {
   private buildSummarySpendGuardedDeps(params: {
     scopeKey: string;
     reason: string;
+    globalKind?: "compaction" | "large-file";
   }): LcmDependencies {
-    const complete: CompleteFn = async (input) => {
-      this.assertSummarySpendCallAllowed({
+    const resolveLimits = (input: Parameters<CompleteFn>[0]): SummarySpendGuardLimit[] =>
+      this.buildSummarySpendLimits({
         scopeKey: params.scopeKey,
         reason: params.reason,
+        globalScopeKey: params.globalKind
+          ? this.resolveProviderSummarySpendScope({
+              kind: params.globalKind,
+              provider: input.provider,
+              model: input.model,
+            })
+          : undefined,
       });
+    const complete: CompleteFn = async (input) => {
+      const limits = resolveLimits(input);
+      this.assertSummarySpendCallsAllowed(limits);
       try {
         const result = await this.deps.complete(input);
         if (!extractProviderAuthFailure(result, { requireStructuralSignal: true })) {
-          this.recordSummarySpendCall({
-            scopeKey: params.scopeKey,
-            reason: params.reason,
-          });
+          for (const limit of limits) {
+            this.recordSummarySpendCall(limit);
+          }
         }
         return result;
       } catch (err) {
         if (!extractProviderAuthFailure(err)) {
-          this.recordSummarySpendCall({
-            scopeKey: params.scopeKey,
-            reason: params.reason,
-          });
+          for (const limit of limits) {
+            this.recordSummarySpendCall(limit);
+          }
         }
         throw err;
       }
@@ -3792,6 +3857,7 @@ export class LcmContextEngine implements ContextEngine {
     return async (text, aggressive, options) => {
       this.assertSummarySpendCallAllowed({
         scopeKey: params.scopeKey,
+        maxCalls: this.resolveSummarySpendGuardConfig().maxCalls,
         reason: "custom summarizer call",
       });
       try {
@@ -4845,6 +4911,7 @@ export class LcmContextEngine implements ContextEngine {
         deps: this.buildSummarySpendGuardedDeps({
           scopeKey,
           reason: "compaction summarizer call",
+          globalKind: "compaction",
         }),
         legacyParams: lp,
         customInstructions,
@@ -4893,6 +4960,7 @@ export class LcmContextEngine implements ContextEngine {
         deps: this.buildSummarySpendGuardedDeps({
           scopeKey,
           reason: "large-file summarizer call",
+          globalKind: "large-file",
         }),
         legacyParams: {
           provider,
@@ -10606,7 +10674,7 @@ export class LcmContextEngine implements ContextEngine {
           return {
             kind: "unavailable",
             reason:
-              `Lossless Claw could not summarize raw context before rotate because summary spend backoff is open until ${err.backoffUntil.toISOString()}.`,
+              `Lossless Claw could not summarize raw context before rotate because summary spend backoff is open for ${err.scopeKey} until ${err.backoffUntil.toISOString()}.`,
           };
         }
         throw err;

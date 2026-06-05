@@ -4383,6 +4383,61 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(complete).toHaveBeenCalledTimes(2);
   });
 
+  it("blocks rotate summarization when sessions exceed the shared provider spend window", async () => {
+    let summaryIndex = 0;
+    const complete = vi.fn(async () => ({
+      content: [{ type: "text", text: `rotate summary ${++summaryIndex}` }],
+    }));
+    const engine = createEngineWithDeps(
+      {
+        summaryProvider: "test-provider",
+        summaryModel: "test-model",
+        freshTailCount: 2,
+        leafChunkTokens: 1,
+        leafMinFanout: 1,
+        summaryMaxCallsPerWindow: 1,
+        summaryGlobalMaxCallsPerWindow: 2,
+        summaryCallWindowMs: 10 * 60 * 1000,
+        summarySpendBackoffMs: 30 * 60 * 1000,
+      },
+      {
+        complete,
+        resolveModel: vi.fn(() => ({ provider: "test-provider", model: "test-model" })),
+      },
+    );
+
+    for (const suffix of ["one", "two", "three"]) {
+      const sessionFile = createSessionFilePath(`lcm-rotate-global-spend-${suffix}`);
+      const sessionKey = `agent:main:rotate-global-spend-${suffix}`;
+      const sessionId = `rotate-global-spend-${suffix}-session`;
+      const sm = SessionManager.open(sessionFile);
+      for (const message of [
+        { role: "user", content: [{ type: "text", text: `older detail ${suffix}` }] },
+        { role: "assistant", content: [{ type: "text", text: `tail assistant ${suffix}` }] },
+        { role: "user", content: [{ type: "text", text: `tail user ${suffix}` }] },
+      ] as AgentMessage[]) {
+        sm.appendMessage(message);
+      }
+
+      await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+
+      const rotate = await engine.rotateSessionStorage({
+        sessionId,
+        sessionKey,
+        sessionFile,
+      });
+      if (suffix === "three") {
+        expect(rotate.kind).toBe("unavailable");
+        expect(rotate.reason).toContain("summary spend backoff is open");
+        expect(rotate.reason).toContain("compaction-provider:test-provider/test-model");
+      } else {
+        expect(rotate).toMatchObject({ kind: "rotated" });
+      }
+    }
+
+    expect(complete).toHaveBeenCalledTimes(2);
+  });
+
   it("returns rotate unavailable when summarization spend backoff opens", async () => {
     const sessionFile = createSessionFilePath("lcm-rotate-storage-spend-backoff");
     const sessionKey = "agent:main:rotate-spend-backoff";
@@ -4702,8 +4757,9 @@ describe("LcmContextEngine.bootstrap", () => {
       appendSessionMessage(sm, message);
     }
 
+    let summaryIndex = 0;
     const complete = vi.fn(async () => ({
-      content: [{ type: "text", text: "telemetry backed summary" }],
+      content: [{ type: "text", text: `telemetry backed summary ${++summaryIndex}` }],
     }));
     const resolveModel = vi.fn((modelRef?: string, providerHint?: string) => ({
       provider: providerHint ?? "fallback",

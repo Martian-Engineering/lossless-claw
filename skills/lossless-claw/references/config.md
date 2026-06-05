@@ -624,25 +624,28 @@ Why it matters:
 - guards against runaway summaries that are much larger than their target budget
 - useful when summary models are verbose or unstable
 
-### `summaryMaxCallsPerWindow`, `summaryCallWindowMs`, and `summarySpendBackoffMs`
+### `summaryMaxCallsPerWindow`, `summaryGlobalMaxCallsPerWindow`, `summaryCallWindowMs`, and `summarySpendBackoffMs`
 
-Bounds model-backed compaction and large-file summarization calls per session.
+Bounds model-backed compaction and large-file summarization calls per session. Optionally also bounds calls across sessions by provider/model.
 
 Defaults:
 
 - `summaryMaxCallsPerWindow`: `24`
+- `summaryGlobalMaxCallsPerWindow`: unset
 - `summaryCallWindowMs`: `600000`
 - `summarySpendBackoffMs`: `1800000`
 
 Env overrides:
 
 - `LCM_SUMMARY_MAX_CALLS_PER_WINDOW`
+- `LCM_SUMMARY_GLOBAL_MAX_CALLS_PER_WINDOW`
 - `LCM_SUMMARY_CALL_WINDOW_MS`
 - `LCM_SUMMARY_SPEND_BACKOFF_MS`
 
 Why they matter:
 
 - prevents non-auth provider failures, ineffective compaction, or repeated deferred debt from spending unbounded summarization calls
+- prevents many sessions from individually staying under their per-session caps while collectively exhausting a shared provider/model quota
 - keeps provider-auth failures on the separate auth circuit breaker path
 - direct deterministic fallbacks remain available when model-backed large-file summaries are throttled
 

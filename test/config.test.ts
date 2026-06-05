@@ -50,6 +50,7 @@ describe("resolveLcmConfig", () => {
     expect(config.summaryModel).toBe("");
     expect(config.summaryCallWindowMs).toBe(DEFAULT_SUMMARY_CALL_WINDOW_MS);
     expect(config.summaryMaxCallsPerWindow).toBe(DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW);
+    expect(config.summaryGlobalMaxCallsPerWindow).toBeUndefined();
     expect(config.summarySpendBackoffMs).toBe(DEFAULT_SUMMARY_SPEND_BACKOFF_MS);
     expect(config.pruneHeartbeatOk).toBe(false);
     expect(config.transcriptGcEnabled).toBe(false);
@@ -92,6 +93,7 @@ describe("resolveLcmConfig", () => {
       compactUntilUnderDeadlineMs: 90000,
       summaryCallWindowMs: 120000,
       summaryMaxCallsPerWindow: 7,
+      summaryGlobalMaxCallsPerWindow: 70,
       summarySpendBackoffMs: 240000,
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:ephemeral:**"],
@@ -143,6 +145,7 @@ describe("resolveLcmConfig", () => {
     expect(config.compactUntilUnderDeadlineMs).toBe(90000);
     expect(config.summaryCallWindowMs).toBe(120000);
     expect(config.summaryMaxCallsPerWindow).toBe(7);
+    expect(config.summaryGlobalMaxCallsPerWindow).toBe(70);
     expect(config.summarySpendBackoffMs).toBe(240000);
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
@@ -205,6 +208,7 @@ describe("resolveLcmConfig", () => {
       LCM_COMPACT_UNTIL_UNDER_DEADLINE_MS: "150000",
       LCM_SUMMARY_CALL_WINDOW_MS: "180000",
       LCM_SUMMARY_MAX_CALLS_PER_WINDOW: "9",
+      LCM_SUMMARY_GLOBAL_MAX_CALLS_PER_WINDOW: "90",
       LCM_SUMMARY_SPEND_BACKOFF_MS: "360000",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
@@ -220,6 +224,7 @@ describe("resolveLcmConfig", () => {
       compactUntilUnderDeadlineMs: 60000,
       summaryCallWindowMs: 120000,
       summaryMaxCallsPerWindow: 7,
+      summaryGlobalMaxCallsPerWindow: 70,
       summarySpendBackoffMs: 240000,
       ignoreSessionPatterns: ["agent:*:test:*"],
       statelessSessionPatterns: ["agent:*:preview:*"],
@@ -280,6 +285,7 @@ describe("resolveLcmConfig", () => {
     expect(config.compactUntilUnderDeadlineMs).toBe(150000); // env wins
     expect(config.summaryCallWindowMs).toBe(180000); // env wins
     expect(config.summaryMaxCallsPerWindow).toBe(9); // env wins
+    expect(config.summaryGlobalMaxCallsPerWindow).toBe(90); // env wins
     expect(config.summarySpendBackoffMs).toBe(360000); // env wins
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
@@ -812,6 +818,10 @@ describe("resolveLcmConfig", () => {
       minimum: 1,
     });
     expect(manifest.configSchema.properties.summaryMaxCallsPerWindow).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
+    expect(manifest.configSchema.properties.summaryGlobalMaxCallsPerWindow).toEqual({
       type: "integer",
       minimum: 1,
     });
