@@ -88,6 +88,7 @@ function createTestConfig(databasePath: string): LcmConfig {
     timezone: "UTC",
     pruneHeartbeatOk: false,
     transcriptGcEnabled: false,
+    enableSummaryThinking: true,
     proactiveThresholdCompactionMode: "deferred",
     autoRotateSessionFiles: {
       enabled: true,
