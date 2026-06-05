@@ -290,6 +290,7 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
   const out: T[] = [];
   const seenToolResultIds = new Set<string>();
   const seenToolUseIds = new Set<string>();
+  const movedToolResultIndexes = new Set<number>();
   let droppedDuplicateCount = 0;
   let droppedDuplicateAssistantToolUseCount = 0;
   let droppedTerminalAssistantToolUseCount = 0;
@@ -322,6 +323,9 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
 
   for (let i = 0; i < messages.length; i += 1) {
     const msg = messages[i];
+    if (movedToolResultIndexes.has(i)) {
+      continue;
+    }
     if (!msg || typeof msg !== "object") {
       out.push(msg);
       continue;
@@ -385,6 +389,9 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
     let j = i + 1;
     for (; j < messages.length; j += 1) {
       const next = messages[j];
+      if (movedToolResultIndexes.has(j)) {
+        continue;
+      }
       if (!next || typeof next !== "object") {
         remainder.push(next);
         continue;
@@ -403,6 +410,57 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
           ? []
           : extractToolCallsFromAssistant(preview.message);
         if (nextToolCalls.length > 0) {
+          if (preview.dropped.length > 0) {
+            const lookaheadToolUseIds = new Set(seenToolUseIds);
+            for (const call of nextToolCalls) {
+              lookaheadToolUseIds.add(call.id);
+            }
+            // The next assistant may mix stale duplicate calls from this span
+            // with new calls. Keep that assistant for its own pass, but look
+            // past it for delayed results that still belong to the current span.
+            for (let k = j + 1; k < messages.length; k += 1) {
+              if (movedToolResultIndexes.has(k)) {
+                continue;
+              }
+              const candidate = messages[k];
+              if (!candidate || typeof candidate !== "object") {
+                continue;
+              }
+              if (candidate.role === "assistant") {
+                const normalizedCandidate = normalizeAssistantReasoningBlocks(candidate);
+                const candidateTerminal =
+                  getTerminalStopReason(normalizedCandidate) !== null;
+                const candidatePreview = filterAssistantToolUseBlocks(
+                  normalizedCandidate,
+                  new Set(lookaheadToolUseIds),
+                  candidateTerminal ? { dropAll: true, record: false } : {}
+                );
+                const candidateToolCalls = candidateTerminal
+                  ? []
+                  : extractToolCallsFromAssistant(candidatePreview.message);
+                if (candidateToolCalls.length > 0) {
+                  break;
+                }
+                continue;
+              }
+              if (candidate.role !== "toolResult") {
+                continue;
+              }
+              const id = extractToolResultId(candidate);
+              if (!id || !toolCallIds.has(id)) {
+                continue;
+              }
+              movedToolResultIndexes.add(k);
+              if (seenToolResultIds.has(id) || spanResultsById.has(id)) {
+                droppedDuplicateCount += 1;
+                changed = true;
+                continue;
+              }
+              spanResultsById.set(id, candidate);
+              moved = true;
+              changed = true;
+            }
+          }
           break;
         }
         if (preview.dropped.length > 0) {

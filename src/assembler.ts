@@ -184,6 +184,32 @@ function freshTailProtectionMessageHashes(messages: AgentMessage[]): string[] {
   return hashes;
 }
 
+const FRESH_TAIL_PROTECTION_MARKER = Symbol("freshTailProtection");
+
+type FreshTailProtectionMarkedMessage = AgentMessage & {
+  [FRESH_TAIL_PROTECTION_MARKER]?: true;
+};
+
+function repairedFreshTailProtectionMessageHashes(
+  entries: Array<{ message: AgentMessage; segment: AssemblySegment }>
+): string[] {
+  const markedMessages = entries.map((entry): FreshTailProtectionMarkedMessage => {
+    if (entry.segment !== "freshTail") {
+      return entry.message as FreshTailProtectionMarkedMessage;
+    }
+    return {
+      ...entry.message,
+      [FRESH_TAIL_PROTECTION_MARKER]: true,
+    } as FreshTailProtectionMarkedMessage;
+  });
+  const repaired = sanitizeToolUseResultPairing(
+    markedMessages
+  ) as FreshTailProtectionMarkedMessage[];
+  return repaired
+    .filter((message) => message[FRESH_TAIL_PROTECTION_MARKER])
+    .map((message) => hashMessages([message]));
+}
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface AssembleContextInput {
@@ -1564,6 +1590,10 @@ export class ContextAssembler {
       .filter((entry) => entry.segment === "freshTail")
       .map((entry) => entry.message);
     const repaired = sanitizeToolUseResultPairing(cleaned, this.log) as AgentMessage[];
+    const protectionHashes = new Set([
+      ...freshTailProtectionMessageHashes(preSanitizeFreshTailMessages),
+      ...repairedFreshTailProtectionMessageHashes(cleanedEntries),
+    ]);
     return {
       messages: repaired,
       estimatedTokens,
@@ -1592,9 +1622,7 @@ export class ContextAssembler {
         preSanitizeFreshTailMessageHashes: preSanitizeFreshTailMessages.map((message) =>
           hashMessages([message]),
         ),
-        freshTailProtectionMessageHashes: freshTailProtectionMessageHashes(
-          preSanitizeFreshTailMessages,
-        ),
+        freshTailProtectionMessageHashes: [...protectionHashes],
         preSanitizeMessagesHash: hashMessages(cleaned as AgentMessage[]),
         finalMessagesHash: hashMessages(repaired),
         overflowDiagnostics,

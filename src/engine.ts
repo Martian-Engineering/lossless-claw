@@ -2987,7 +2987,6 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     retained,
     appendedEntries,
     liveSortIndexes,
-    log: params.log,
   });
   let estimatedTokens = estimateAgentMessageTokens(output);
 
@@ -3026,7 +3025,6 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
         retained: candidateRetained,
         appendedEntries: candidateAppendedEntries,
         liveSortIndexes,
-        log: params.log,
       });
       const candidateEstimatedTokens = estimateAgentMessageTokens(candidateOutput);
       const candidateFits = candidateEstimatedTokens <= params.tokenBudget;
@@ -3066,6 +3064,13 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     output = bestCandidate.output;
     estimatedTokens = bestCandidate.estimatedTokens;
   }
+  output = buildVolatileLiveInputMergedOutput({
+    retained,
+    appendedEntries,
+    liveSortIndexes,
+    log: params.log,
+  });
+  estimatedTokens = estimateAgentMessageTokens(output);
   const appendedMessages = materializeVolatileLiveInputEntries(appendedEntries);
 
   return {

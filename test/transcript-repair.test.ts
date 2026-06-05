@@ -190,6 +190,57 @@ describe("sanitizeToolUseResultPairing", () => {
     expect(toolResultIds(out).sort()).toEqual(["X", "Y"]);
   });
 
+  it("moves a delayed real result before a mixed duplicate and new tool_use turn", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "X", name: "bash" },
+          { type: "toolCall", id: "Y", name: "grep" },
+        ],
+      },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real X" }] },
+      { role: "toolResult", toolCallId: "Y", content: [{ type: "text", text: "real Y" }] },
+    ]);
+
+    expect(out).toEqual([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real X" }] },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "Y", name: "grep" }],
+      },
+      { role: "toolResult", toolCallId: "Y", content: [{ type: "text", text: "real Y" }] },
+    ]);
+  });
+
+  it("looks past duplicate cascades after a mixed duplicate and new tool_use turn", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "X", name: "bash" },
+          { type: "toolCall", id: "Y", name: "grep" },
+        ],
+      },
+      { role: "assistant", content: [{ type: "toolCall", id: "Y", name: "grep" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real X" }] },
+      { role: "toolResult", toolCallId: "Y", content: [{ type: "text", text: "real Y" }] },
+    ]);
+
+    expect(out).toEqual([
+      { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "real X" }] },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "Y", name: "grep" }],
+      },
+      { role: "toolResult", toolCallId: "Y", content: [{ type: "text", text: "real Y" }] },
+    ]);
+  });
+
   it("does not let an aborted turn claim an id that a later valid turn reuses", () => {
     const out = sanitizeToolUseResultPairing<Msg>([
       { role: "assistant", stopReason: "aborted", content: [{ type: "toolCall", id: "X", name: "bash" }] },
