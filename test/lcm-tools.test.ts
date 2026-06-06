@@ -549,6 +549,83 @@ describe("LCM tools session scoping", () => {
     expect(text).not.toContain("session family rooted at 42");
   });
 
+  it("lcm_grep scopes by explicit sessionKey parameter for resumed thread families", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps({
+        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
+      }),
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationIdBySessionKey: 3556,
+        conversationFamilyIds: [3556, 3549],
+      }) as never,
+      sessionKey: "agent:main:current-channel-session",
+    });
+    const result = await tool.execute("call-explicit-session-key", {
+      pattern: "Dade",
+      sessionKey: "agent:main:discord:thread:1480000000000000000",
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 3556,
+        conversationIds: [3556, 3549],
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("session family rooted at 3556");
+  });
+
+  it("lcm_grep rejects Discord snowflakes passed as conversationId before searching", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-discord-snowflake", {
+      pattern: "Dade",
+      conversationId: "1482752645847453710",
+    });
+
+    expect(retrieval.grep).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain(
+      "conversationId is an LCM database conversation_id, not a Discord snowflake",
+    );
+  });
+
+  it("lcm_grep schema advertises sessionKey and safe conversationId usage", () => {
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+    });
+    const parameters = tool.parameters as {
+      properties: Record<string, { description?: string }>;
+    };
+
+    expect(parameters.properties.sessionKey?.description).toContain("Stable LCM session key");
+    expect(parameters.properties.conversationId?.description).toContain("LCM database conversation_id");
+    expect(parameters.properties.conversationId?.description).toContain("Do not pass a Discord snowflake");
+  });
+
   it("lcm_grep rejects allConversations from a sub-agent without a delegated grant", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({

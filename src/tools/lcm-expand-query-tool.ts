@@ -73,9 +73,15 @@ function createLcmExpandQuerySchema(dynamicToolTimeoutMs: number) {
         "Natural-language question or task to answer using expanded context. Put the answer request here, not in query.",
     }),
     conversationId: Type.Optional(
-      Type.Number({
+      Type.Union([Type.Number(), Type.String()], {
         description:
-          "Physical conversation ID to scope expansion to. If omitted, uses the current session family.",
+          "LCM database conversation_id to scope expansion to. Accepts a small integer number or integer string. Do not pass a Discord snowflake; use sessionKey or allConversations instead. If omitted, uses the current session family.",
+      }),
+    ),
+    sessionKey: Type.Optional(
+      Type.String({
+        description:
+          "Stable LCM session key to scope expansion to. Use this for resumed Discord/thread sessions instead of passing a Discord snowflake as conversationId.",
       }),
     ),
     allConversations: Type.Optional(

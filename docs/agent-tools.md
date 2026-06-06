@@ -41,7 +41,8 @@ Use `mode: "full_text"` for keyword or topical recall. Full-text queries are not
 | `pattern` | string | ✅ | — | Search pattern |
 | `mode` | string | | `"regex"` | `"regex"` or `"full_text"` |
 | `scope` | string | | `"both"` | `"messages"`, `"summaries"`, or `"both"` |
-| `conversationId` | number | | current session family | Specific physical conversation to search |
+| `conversationId` | number/string | | current session family | LCM database conversation_id. Do not pass a Discord snowflake. |
+| `sessionKey` | string | | current session family | Stable LCM session key for resumed Discord/thread sessions |
 | `allConversations` | boolean | | `false` | Search all conversations |
 | `since` | string | | — | ISO timestamp lower bound |
 | `before` | string | | — | ISO timestamp upper bound |
@@ -81,7 +82,8 @@ Look up metadata and content for a specific summary or stored file.
 | Param | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `id` | string | ✅ | — | `sum_xxx` for summaries, `file_xxx` for files |
-| `conversationId` | number | | current session family | Scope to a specific physical conversation |
+| `conversationId` | number/string | | current session family | LCM database conversation_id. Do not pass a Discord snowflake. |
+| `sessionKey` | string | | current session family | Stable LCM session key for resumed Discord/thread sessions |
 | `allConversations` | boolean | | `false` | Allow cross-conversation lookups |
 
 **Returns for summaries:**
@@ -125,7 +127,8 @@ When `allConversations: true` is set, `lcm_expand_query` can now synthesize one 
 | `summaryIds` | string[] | ✅* | — | Specific summary IDs to expand (if no `query`) |
 | `maxTokens` | number | | 2000 | Answer length cap |
 | `timeoutMs` | number | ✅ | `delegationTimeoutMs + 30000` | Total OpenClaw dynamic tool RPC timeout; use the schema default so delegated recall can finish before the host watchdog fires |
-| `conversationId` | number | | current session family | Scope to a specific physical conversation |
+| `conversationId` | number/string | | current session family | LCM database conversation_id. Do not pass a Discord snowflake. |
+| `sessionKey` | string | | current session family | Stable LCM session key for resumed Discord/thread sessions |
 | `allConversations` | boolean | | `false` | Search across all conversations |
 
 *One of `query` or `summaryIds` is required.
@@ -191,7 +194,7 @@ listing something you need, use `lcm_expand_query` to get the full detail.
 
 ### Conversation scoping
 
-By default, tools operate on the current session family: the active conversation plus archived segments that share the same stable session identity. This keeps recall continuous across session rotation and `/reset` replacement rows without widening the search to unrelated sessions. Use `lcm_grep(..., allConversations: true)` when you need broad global discovery. Use `lcm_expand_query(..., allConversations: true)` when you want bounded synthesis across sessions. Use `conversationId` when you already know the exact physical conversation to inspect or expand.
+By default, tools operate on the current session family: the active conversation plus archived segments that share the same stable session identity. This keeps recall continuous across session rotation and `/reset` replacement rows without widening the search to unrelated sessions. Use `sessionKey` when you need to recover a resumed Discord/thread session family by stable runtime key. Use `lcm_grep(..., allConversations: true)` when you need broad global discovery. Use `lcm_expand_query(..., allConversations: true)` when you want bounded synthesis across sessions. Use `conversationId` only when you already know the exact LCM database `conversation_id` to inspect or expand; a Discord snowflake is not a valid `conversationId`.
 
 ### Performance considerations
 

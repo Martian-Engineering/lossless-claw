@@ -52,9 +52,15 @@ const LcmExpandSchema = Type.Object({
     }),
   ),
   conversationId: Type.Optional(
-    Type.Number({
+    Type.Union([Type.Number(), Type.String()], {
       description:
-        "Conversation ID to scope the expansion to. If omitted, uses the current session's conversation.",
+        "LCM database conversation_id to scope the expansion to. Accepts a small integer number or integer string. Do not pass a Discord snowflake; use sessionKey or allConversations instead. If omitted, uses the current session family.",
+    }),
+  ),
+  sessionKey: Type.Optional(
+    Type.String({
+      description:
+        "Stable LCM session key to scope expansion to. Use this for resumed Discord/thread sessions instead of passing a Discord snowflake as conversationId.",
     }),
   ),
   allConversations: Type.Optional(

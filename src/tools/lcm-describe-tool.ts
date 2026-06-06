@@ -30,9 +30,15 @@ const LcmDescribeSchema = Type.Object({
     description: "The LCM ID to look up. Use sum_xxx for summaries, file_xxx for files.",
   }),
   conversationId: Type.Optional(
-    Type.Number({
+    Type.Union([Type.Number(), Type.String()], {
       description:
-        "Physical conversation ID to scope describe lookups to. If omitted, uses the current session family.",
+        "LCM database conversation_id to scope describe lookups to. Accepts a small integer number or integer string. Do not pass a Discord snowflake; use sessionKey or allConversations instead. If omitted, uses the current session family.",
+    }),
+  ),
+  sessionKey: Type.Optional(
+    Type.String({
+      description:
+        "Stable LCM session key to scope describe lookups to. Use this for resumed Discord/thread sessions instead of passing a Discord snowflake as conversationId.",
     }),
   ),
   allConversations: Type.Optional(
