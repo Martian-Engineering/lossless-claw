@@ -391,6 +391,44 @@ function parseJsonNumberArray(value: string | null | undefined): number[] {
   }
 }
 
+function arraysEqual<T>(left: T[], right: T[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((value, index) => Object.is(value, right[index]));
+}
+
+function comparePreparedSummaryCoverage(
+  a: PendingCompactionSummaryRecord,
+  b: PendingCompactionSummaryRecord,
+): number {
+  const aStart =
+    typeof a.sourceStartSeq === "number" && Number.isFinite(a.sourceStartSeq)
+      ? a.sourceStartSeq
+      : Infinity;
+  const bStart =
+    typeof b.sourceStartSeq === "number" && Number.isFinite(b.sourceStartSeq)
+      ? b.sourceStartSeq
+      : Infinity;
+  if (aStart !== bStart) {
+    return aStart - bStart;
+  }
+
+  const aEnd =
+    typeof a.sourceEndSeq === "number" && Number.isFinite(a.sourceEndSeq)
+      ? a.sourceEndSeq
+      : Infinity;
+  const bEnd =
+    typeof b.sourceEndSeq === "number" && Number.isFinite(b.sourceEndSeq)
+      ? b.sourceEndSeq
+      : Infinity;
+  if (aEnd !== bEnd) {
+    return aEnd - bEnd;
+  }
+
+  return a.ordinal - b.ordinal;
+}
+
 function toSummaryRecord(row: SummaryRow): SummaryRecord {
   let fileIds: string[] = [];
   try {
@@ -1383,6 +1421,37 @@ export class SummaryStore {
       }
     }
 
+    const publishCandidates = this.selectPreparedPublishFrontier(pending);
+    if (publishCandidates.length === 0) {
+      this.markBatchFailedInTransaction(batch.batchId, "prepared batch contains no summaries");
+      return {
+        published: false,
+        batchId: batch.batchId,
+        summaryIds: [],
+        tokensRemoved: 0,
+        tokensAdded: 0,
+        partial: false,
+        reason: "prepared batch contains no summaries",
+      };
+    }
+
+    const treeReason = this.validatePreparedPublishTree({
+      pending,
+      roots: publishCandidates,
+    });
+    if (treeReason) {
+      this.markBatchSupersededInTransaction(batch.batchId, treeReason);
+      return {
+        published: false,
+        batchId: batch.batchId,
+        summaryIds: [],
+        tokensRemoved: 0,
+        tokensAdded: 0,
+        partial: false,
+        reason: treeReason,
+      };
+    }
+
     const ops: Array<{
       summary: PendingCompactionSummaryRecord;
       startOrdinal: number;
@@ -1390,7 +1459,7 @@ export class SummaryStore {
       messageIds: number[];
     }> = [];
     let blockedByFreshTail = false;
-    for (const summary of pending) {
+    for (const summary of publishCandidates) {
       const validation = this.validatePendingSummaryForPublish({
         summary,
         conversationId: batch.conversationId,
@@ -1441,6 +1510,11 @@ export class SummaryStore {
       };
     }
 
+    const rowsToActivate = this.collectPreparedRowsForPublish({
+      pending,
+      roots: ops.map((op) => op.summary),
+    });
+
     const coverageReason = this.validatePreparedPublishActiveRawCoverage({
       conversationId: batch.conversationId,
       ops,
@@ -1458,7 +1532,9 @@ export class SummaryStore {
       };
     }
 
-    const existingSummaryIds = this.countExistingSummaries(ops.map((op) => op.summary.summaryId));
+    const existingSummaryIds = this.countExistingSummaries(
+      rowsToActivate.map((summary) => summary.summaryId),
+    );
     if (existingSummaryIds > 0) {
       this.markBatchSupersededInTransaction(
         batch.batchId,
@@ -1498,8 +1574,12 @@ export class SummaryStore {
        VALUES (?, ?, ?)
        ON CONFLICT (summary_id, message_id) DO NOTHING`,
     );
-    for (const op of ops) {
-      const summary = op.summary;
+    const linkParentStmt = this.db.prepare(
+      `INSERT INTO summary_parents (summary_id, parent_summary_id, ordinal)
+       VALUES (?, ?, ?)
+       ON CONFLICT (summary_id, parent_summary_id) DO NOTHING`,
+    );
+    for (const summary of rowsToActivate) {
       insertSummaryStmt.run(
         summary.summaryId,
         batch.conversationId,
@@ -1515,8 +1595,20 @@ export class SummaryStore {
         summary.sourceMessageTokenCount,
         summary.model,
       );
-      for (let idx = 0; idx < op.messageIds.length; idx++) {
-        linkMessageStmt.run(summary.summaryId, op.messageIds[idx], idx);
+    }
+    const activeIds = new Set(rowsToActivate.map((summary) => summary.summaryId));
+    for (const summary of rowsToActivate) {
+      if (summary.kind === "leaf") {
+        for (let idx = 0; idx < summary.sourceMessageIds.length; idx++) {
+          linkMessageStmt.run(summary.summaryId, summary.sourceMessageIds[idx], idx);
+        }
+        continue;
+      }
+      const childSummaryIds = summary.previousSummaryIds.filter((summaryId) =>
+        activeIds.has(summaryId),
+      );
+      for (let idx = 0; idx < childSummaryIds.length; idx++) {
+        linkParentStmt.run(summary.summaryId, childSummaryIds[idx], idx);
       }
     }
 
@@ -1540,11 +1632,11 @@ export class SummaryStore {
     this.resequenceContextItemsInTransaction(batch.conversationId);
 
     if (this.fts5Available) {
-      this.indexPublishedPreparedSummaries(ops.map((op) => op.summary));
+      this.indexPublishedPreparedSummaries(rowsToActivate);
     }
 
-    const publishedIds = ops.map((op) => op.summary.summaryId);
-    const placeholders = publishedIds.map(() => "?").join(", ");
+    const activePreparedIds = rowsToActivate.map((summary) => summary.summaryId);
+    const placeholders = activePreparedIds.map(() => "?").join(", ");
     this.db
       .prepare(
         `UPDATE compaction_batch_summaries
@@ -1552,7 +1644,7 @@ export class SummaryStore {
          WHERE batch_id = ?
            AND summary_id IN (${placeholders})`,
       )
-      .run(batch.batchId, ...publishedIds);
+      .run(batch.batchId, ...activePreparedIds);
     this.db
       .prepare(
         `UPDATE compaction_batch_summaries
@@ -1572,14 +1664,16 @@ export class SummaryStore {
       )
       .run(batch.batchId);
 
+    const publishedIds = ops.map((op) => op.summary.summaryId);
+    const partial = ops.length < publishCandidates.length;
     return {
       published: true,
       batchId: batch.batchId,
       summaryIds: publishedIds,
       tokensRemoved: ops.reduce((sum, op) => sum + op.summary.sourceMessageTokenCount, 0),
       tokensAdded: ops.reduce((sum, op) => sum + op.summary.tokenCount, 0),
-      partial: ops.length < pending.length,
-      ...(ops.length < pending.length
+      partial,
+      ...(partial
         ? { reason: "published prefix; remaining prepared summaries superseded" }
         : {}),
     };
@@ -1600,6 +1694,134 @@ export class SummaryStore {
       )
       .all(batchId) as unknown as PendingCompactionSummaryRow[];
     return rows.map(toPendingCompactionSummaryRecord);
+  }
+
+  private selectPreparedPublishFrontier(
+    pending: PendingCompactionSummaryRecord[],
+  ): PendingCompactionSummaryRecord[] {
+    const pendingIds = new Set(pending.map((summary) => summary.summaryId));
+    const childSummaryIds = new Set<string>();
+    for (const summary of pending) {
+      if (summary.kind !== "condensed") {
+        continue;
+      }
+      for (const childId of summary.previousSummaryIds) {
+        if (pendingIds.has(childId)) {
+          childSummaryIds.add(childId);
+        }
+      }
+    }
+
+    return pending
+      .filter((summary) => !childSummaryIds.has(summary.summaryId))
+      .sort(comparePreparedSummaryCoverage);
+  }
+
+  private validatePreparedPublishTree(params: {
+    pending: PendingCompactionSummaryRecord[];
+    roots: PendingCompactionSummaryRecord[];
+  }): string | null {
+    const byId = new Map(params.pending.map((summary) => [summary.summaryId, summary]));
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+
+    const visit = (summary: PendingCompactionSummaryRecord): string | null => {
+      if (visited.has(summary.summaryId)) {
+        return null;
+      }
+      if (visiting.has(summary.summaryId)) {
+        return "prepared condensed summary tree contains a cycle";
+      }
+      visiting.add(summary.summaryId);
+
+      if (summary.kind === "condensed") {
+        if (summary.previousSummaryIds.length === 0) {
+          return "prepared condensed summary has no child summaries";
+        }
+
+        const sourceMessageIds: number[] = [];
+        const sourceIdentityHashes: string[] = [];
+        const sourceStartSeqs: number[] = [];
+        const sourceEndSeqs: number[] = [];
+        for (const childId of summary.previousSummaryIds) {
+          const child = byId.get(childId);
+          if (!child) {
+            return "prepared condensed summary child is missing";
+          }
+          if (child.depth !== summary.depth - 1) {
+            return "prepared condensed summary child depth mismatch";
+          }
+          const childReason = visit(child);
+          if (childReason) {
+            return childReason;
+          }
+          sourceMessageIds.push(...child.sourceMessageIds);
+          sourceIdentityHashes.push(...child.sourceIdentityHashes);
+          if (typeof child.sourceStartSeq === "number" && Number.isFinite(child.sourceStartSeq)) {
+            sourceStartSeqs.push(child.sourceStartSeq);
+          }
+          if (typeof child.sourceEndSeq === "number" && Number.isFinite(child.sourceEndSeq)) {
+            sourceEndSeqs.push(child.sourceEndSeq);
+          }
+        }
+
+        if (
+          !arraysEqual(sourceMessageIds, summary.sourceMessageIds) ||
+          !arraysEqual(sourceIdentityHashes, summary.sourceIdentityHashes)
+        ) {
+          return "prepared condensed summary child coverage is incomplete";
+        }
+        const sourceStartSeq = sourceStartSeqs.length > 0 ? Math.min(...sourceStartSeqs) : null;
+        const sourceEndSeq = sourceEndSeqs.length > 0 ? Math.max(...sourceEndSeqs) : null;
+        if (summary.sourceStartSeq !== sourceStartSeq || summary.sourceEndSeq !== sourceEndSeq) {
+          return "prepared condensed summary child sequence coverage is incomplete";
+        }
+      }
+
+      visiting.delete(summary.summaryId);
+      visited.add(summary.summaryId);
+      return null;
+    };
+
+    for (const root of params.roots) {
+      const reason = visit(root);
+      if (reason) {
+        return reason;
+      }
+    }
+
+    return null;
+  }
+
+  private collectPreparedRowsForPublish(params: {
+    pending: PendingCompactionSummaryRecord[];
+    roots: PendingCompactionSummaryRecord[];
+  }): PendingCompactionSummaryRecord[] {
+    const byId = new Map(params.pending.map((summary) => [summary.summaryId, summary]));
+    const selected = new Map<string, PendingCompactionSummaryRecord>();
+
+    const visit = (summary: PendingCompactionSummaryRecord): void => {
+      if (selected.has(summary.summaryId)) {
+        return;
+      }
+      if (summary.kind === "condensed") {
+        for (const childId of summary.previousSummaryIds) {
+          const child = byId.get(childId);
+          if (child) {
+            visit(child);
+          }
+        }
+      }
+      selected.set(summary.summaryId, summary);
+    };
+
+    for (const root of params.roots) {
+      visit(root);
+    }
+
+    return Array.from(selected.values()).sort(
+      (a, b) => a.depth - b.depth || comparePreparedSummaryCoverage(a, b),
+    );
   }
 
   private validatePendingSummaryForPublish(params: {
@@ -1716,6 +1938,9 @@ export class SummaryStore {
       minSourceSeq = Math.min(minSourceSeq, sourceStartSeq);
       maxSourceSeq = Math.max(maxSourceSeq, sourceEndSeq);
       for (const messageId of op.messageIds) {
+        if (coveredMessageIds.has(messageId)) {
+          return "prepared publish coverage overlaps";
+        }
         coveredMessageIds.add(messageId);
       }
     }

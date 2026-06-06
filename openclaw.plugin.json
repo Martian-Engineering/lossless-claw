@@ -51,7 +51,7 @@
     },
     "backgroundSummaryPreparationEnabled": {
       "label": "Background Summary Preparation",
-      "help": "When enabled, host-approved background maintenance prepares pending leaf summaries before threshold compaction and publishes them atomically later. Default off."
+      "help": "When enabled, host-approved background maintenance prepares hidden summary batches, including deeper condensed summaries when eligible, before threshold compaction validates and publishes them atomically later. Default off."
     },
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",

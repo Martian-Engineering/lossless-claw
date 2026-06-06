@@ -90,7 +90,7 @@ export type LcmConfig = {
    * Default false; flag-flip is reversible at runtime.
    */
   stubLargeToolPayloads: boolean;
-  /** When true, background maintenance prepares pending leaf summaries before threshold publish. */
+  /** When true, background maintenance prepares hidden summary batches before threshold publish. */
   backgroundSummaryPreparationEnabled?: boolean;
   newSessionRetainDepth: number;
   leafMinFanout: number;

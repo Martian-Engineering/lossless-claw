@@ -10,6 +10,7 @@ import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/conne
 import { LcmContextEngine, type RotateSessionStorageResult } from "../src/engine.js";
 import { estimateTokens } from "../src/estimate-tokens.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
+import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 import { LcmProviderAuthError, LcmSummarySpendLimitError } from "../src/summarize.js";
 import {
   createDelegatedExpansionGrant,
@@ -12861,6 +12862,151 @@ describe("LcmContextEngine fidelity and token budget", () => {
     await drainPromise;
 
     expect(assembleResult.messages.length).toBeGreaterThan(0);
+  });
+
+  it("afterTurn keeps ready prepared batches when transcript reconciliation only appends tail messages", async () => {
+    const debugLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: debugLog },
+      },
+    );
+    const sessionId = "after-turn-append-only-keeps-prepared-batch";
+    const sessionKey = "agent:main:after-turn-append-only-keeps-prepared-batch";
+    const sessionFile = createSessionFilePath("after-turn-append-only-keeps-prepared-batch");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "old prepared source alpha" },
+      { role: "assistant", content: "old prepared source beta" },
+      { role: "user", content: "fresh tail gamma" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old prepared source alpha",
+      "old prepared source beta",
+      "fresh tail gamma",
+    ]);
+
+    const [first, second] = stored;
+    if (!first || !second) {
+      throw new Error("missing prepared source messages");
+    }
+    const batch = await engine.getSummaryStore().createCompactionBatch({
+      batchId: "cb_after_turn_append_only_ready",
+      conversationId: conversation!.conversationId,
+      sourceMinSeq: first.seq,
+      sourceMaxSeq: second.seq,
+      reason: "test append-only prepared batch",
+    });
+    await engine.getSummaryStore().insertPendingCompactionSummary({
+      batchId: batch.batchId,
+      summaryId: "sum_after_turn_append_only",
+      ordinal: 0,
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "prepared summary for old append-only-safe source",
+      tokenCount: 5,
+      sourceMessageTokenCount: first.tokenCount + second.tokenCount,
+      sourceStartSeq: first.seq,
+      sourceEndSeq: second.seq,
+      sourceMessageIds: [first.messageId, second.messageId],
+      sourceIdentityHashes: [
+        buildMessageIdentityHash(first.role, first.content),
+        buildMessageIdentityHash(second.role, second.content),
+      ],
+    });
+    await engine.getSummaryStore().markCompactionBatchReady(batch.batchId);
+
+    appendFileSync(
+      sessionFile,
+      [
+        JSON.stringify({
+          message: makeMessage({ role: "user", content: "append-only imported user" }),
+        }),
+        JSON.stringify({
+          message: makeMessage({
+            role: "assistant",
+            content: "append-only imported assistant",
+          }),
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    debugLog.mockClear();
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const afterAppendStored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(afterAppendStored.map((message) => message.content)).toEqual([
+      "old prepared source alpha",
+      "old prepared source beta",
+      "fresh tail gamma",
+      "append-only imported user",
+      "append-only imported assistant",
+    ]);
+    await expect(
+      engine.getSummaryStore().getLatestReadyCompactionBatch(conversation!.conversationId),
+    ).resolves.toMatchObject({
+      batchId: batch.batchId,
+      status: "ready",
+    });
+    const debugLines = debugLog.mock.calls.map((call) => String(call[0]));
+    expect(
+      debugLines.some(
+        (line) => line.includes("superseded") && line.includes("prepared compaction"),
+      ),
+    ).toBe(false);
+    expect(
+      debugLines.some((line) =>
+        line.includes("kept prepared compaction batches after overlapping transcript reconciliation"),
+      ),
+    ).toBe(true);
+
+    await expect(
+      engine.getSummaryStore().publishLatestReadyCompactionBatch({
+        conversationId: conversation!.conversationId,
+        maxSourceOrdinalExclusive: 2,
+      }),
+    ).resolves.toMatchObject({
+      published: true,
+      summaryIds: ["sum_after_turn_append_only"],
+      partial: false,
+    });
+    await expect(
+      engine.getSummaryStore().getContextItems(conversation!.conversationId),
+    ).resolves.toMatchObject([
+      { ordinal: 0, itemType: "summary", summaryId: "sum_after_turn_append_only" },
+      { ordinal: 1, itemType: "message", messageId: stored[2]!.messageId },
+      { ordinal: 2, itemType: "message" },
+      { ordinal: 3, itemType: "message" },
+    ]);
   });
 
   it("maintain() background pending summary preparation does not block same-session ingest or assemble", async () => {

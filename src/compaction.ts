@@ -161,6 +161,31 @@ type LeafSummaryDraft = {
   sourceStartSeq: number | null;
   sourceEndSeq: number | null;
 };
+type PreparedSummaryNode = {
+  summaryId: string;
+  ordinal: number;
+  kind: "leaf" | "condensed";
+  depth: number;
+  content: string;
+  tokenCount: number;
+  fileIds: string[];
+  earliestAt?: Date;
+  latestAt?: Date;
+  descendantCount: number;
+  descendantTokenCount: number;
+  sourceMessageTokenCount: number;
+  sourceStartSeq: number | null;
+  sourceEndSeq: number | null;
+  sourceMessageIds: number[];
+  sourceIdentityHashes: string[];
+  previousSummaryIds: string[];
+};
+type PreparedCondensationCandidate = {
+  targetDepth: number;
+  startIndex: number;
+  items: PreparedSummaryNode[];
+  summaryTokens: number;
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -828,6 +853,7 @@ export class CompactionEngine {
 
     let preparedCount = 0;
     const previousPendingSummaries: Array<{ summaryId: string; content: string }> = [];
+    const preparedFrontier: PreparedSummaryNode[] = [];
     let sawAuthFailure = false;
 
     try {
@@ -858,11 +884,9 @@ export class CompactionEngine {
           ordinal,
           draft.sourceIdentityHashes,
         );
-        await this.summaryStore.insertPendingCompactionSummary({
-          batchId,
+        const node: PreparedSummaryNode = {
           summaryId,
           ordinal,
-          conversationId: input.conversationId,
           kind: "leaf",
           depth: 0,
           content: draft.content,
@@ -873,15 +897,36 @@ export class CompactionEngine {
           descendantCount: 0,
           descendantTokenCount: 0,
           sourceMessageTokenCount: draft.removedTokens,
-          model: input.summaryModel,
           sourceStartSeq: draft.sourceStartSeq,
           sourceEndSeq: draft.sourceEndSeq,
           sourceMessageIds: draft.messageIds,
           sourceIdentityHashes: draft.sourceIdentityHashes,
           previousSummaryIds,
+        };
+        await this.insertPreparedSummaryNode({
+          batchId,
+          ordinal,
+          conversationId: input.conversationId,
+          model: input.summaryModel,
+          node,
         });
         previousPendingSummaries.push({ summaryId, content: draft.content });
+        preparedFrontier.push(node);
         preparedCount++;
+      }
+
+      if (!sawAuthFailure && preparedFrontier.length > 0) {
+        const condensed = await this.preparePendingCondensedSummaries({
+          batchId,
+          conversationId: input.conversationId,
+          frontier: preparedFrontier,
+          nextOrdinal: preparedCount,
+          summarize: input.summarize,
+          summaryModel: input.summaryModel,
+          maxCondensedSummaries: this.resolveMaxSweepIterations(),
+        });
+        preparedCount += condensed.summaryCount;
+        sawAuthFailure = condensed.authFailure;
       }
 
       await this.summaryStore.markCompactionBatchReady(batchId);
@@ -1757,6 +1802,251 @@ export class CompactionEngine {
     return chunks;
   }
 
+  private async insertPreparedSummaryNode(input: {
+    batchId: string;
+    ordinal: number;
+    conversationId: number;
+    model?: string;
+    node: PreparedSummaryNode;
+  }): Promise<void> {
+    await this.summaryStore.insertPendingCompactionSummary({
+      batchId: input.batchId,
+      summaryId: input.node.summaryId,
+      ordinal: input.ordinal,
+      conversationId: input.conversationId,
+      kind: input.node.kind,
+      depth: input.node.depth,
+      content: input.node.content,
+      tokenCount: input.node.tokenCount,
+      fileIds: input.node.fileIds,
+      earliestAt: input.node.earliestAt,
+      latestAt: input.node.latestAt,
+      descendantCount: input.node.descendantCount,
+      descendantTokenCount: input.node.descendantTokenCount,
+      sourceMessageTokenCount: input.node.sourceMessageTokenCount,
+      model: input.model,
+      sourceStartSeq: input.node.sourceStartSeq,
+      sourceEndSeq: input.node.sourceEndSeq,
+      sourceMessageIds: input.node.sourceMessageIds,
+      sourceIdentityHashes: input.node.sourceIdentityHashes,
+      previousSummaryIds: input.node.previousSummaryIds,
+    });
+  }
+
+  private async preparePendingCondensedSummaries(input: {
+    batchId: string;
+    conversationId: number;
+    frontier: PreparedSummaryNode[];
+    nextOrdinal: number;
+    summarize: CompactionSummarizeFn;
+    summaryModel?: string;
+    maxCondensedSummaries: number;
+  }): Promise<{ summaryCount: number; authFailure: boolean }> {
+    let summaryCount = 0;
+    let nextOrdinal = input.nextOrdinal;
+    const maxCondensedSummaries =
+      Number.isFinite(input.maxCondensedSummaries) && input.maxCondensedSummaries > 0
+        ? Math.floor(input.maxCondensedSummaries)
+        : 0;
+
+    while (summaryCount < maxCondensedSummaries) {
+      const candidate = this.selectPreparedCondensationCandidate(input.frontier);
+      if (!candidate) {
+        break;
+      }
+
+      const draft = await this.buildPreparedCondensedSummaryNode({
+        batchId: input.batchId,
+        ordinal: nextOrdinal,
+        frontier: input.frontier,
+        candidate,
+        summarize: input.summarize,
+      });
+      if (!draft) {
+        return { summaryCount, authFailure: true };
+      }
+
+      await this.insertPreparedSummaryNode({
+        batchId: input.batchId,
+        ordinal: nextOrdinal,
+        conversationId: input.conversationId,
+        model: input.summaryModel,
+        node: draft,
+      });
+      input.frontier.splice(candidate.startIndex, candidate.items.length, draft);
+      nextOrdinal++;
+      summaryCount++;
+      await yieldToEventLoop();
+    }
+
+    return { summaryCount, authFailure: false };
+  }
+
+  private selectPreparedCondensationCandidate(
+    frontier: PreparedSummaryNode[],
+  ): PreparedCondensationCandidate | null {
+    const depthLevels = Array.from(new Set(frontier.map((summary) => summary.depth))).sort(
+      (a, b) => a - b,
+    );
+    const chunkTokenBudget = this.resolveLeafChunkTokens();
+    const minChunkTokens = this.resolveCondensedMinChunkTokens();
+
+    for (const targetDepth of depthLevels) {
+      const fanout = this.resolveFanoutForDepth(targetDepth, false);
+      const items: PreparedSummaryNode[] = [];
+      let summaryTokens = 0;
+      let startIndex = -1;
+
+      for (let index = 0; index < frontier.length; index++) {
+        const item = frontier[index]!;
+        if (item.depth !== targetDepth) {
+          if (items.length > 0) {
+            break;
+          }
+          continue;
+        }
+
+        const tokenCount = Math.max(0, Math.floor(item.tokenCount));
+        if (items.length > 0 && summaryTokens + tokenCount > chunkTokenBudget) {
+          break;
+        }
+
+        if (items.length === 0) {
+          startIndex = index;
+        }
+        items.push(item);
+        summaryTokens += tokenCount;
+        if (summaryTokens >= chunkTokenBudget) {
+          break;
+        }
+      }
+
+      if (items.length >= fanout && summaryTokens >= minChunkTokens && startIndex >= 0) {
+        return { targetDepth, startIndex, items, summaryTokens };
+      }
+    }
+
+    return null;
+  }
+
+  private async buildPreparedCondensedSummaryNode(input: {
+    batchId: string;
+    ordinal: number;
+    frontier: PreparedSummaryNode[];
+    candidate: PreparedCondensationCandidate;
+    summarize: CompactionSummarizeFn;
+  }): Promise<PreparedSummaryNode | null> {
+    const { candidate } = input;
+    const concatenated = candidate.items
+      .map((summary) => {
+        const earliestAt = summary.earliestAt ?? summary.latestAt ?? new Date(0);
+        const latestAt = summary.latestAt ?? summary.earliestAt ?? earliestAt;
+        const header = `[${formatTimestamp(earliestAt, this.config.timezone)} - ${formatTimestamp(
+          latestAt,
+          this.config.timezone,
+        )}]`;
+        return `${header}\n${summary.content}`;
+      })
+      .join("\n\n");
+    const previousSummaryContent =
+      candidate.targetDepth === 0
+        ? this.resolvePriorPreparedSummaryContextAtDepth(
+            input.frontier,
+            candidate.startIndex,
+            candidate.targetDepth,
+          )
+        : undefined;
+    const condensed = await this.summarizeWithEscalation({
+      sourceText: concatenated,
+      summarize: input.summarize,
+      options: {
+        previousSummary: previousSummaryContent,
+        isCondensed: true,
+        depth: candidate.targetDepth + 1,
+      },
+      targetTokens: this.config.condensedTargetTokens,
+    });
+    if (!condensed) {
+      this.log.warn(
+        `[lcm] prepared condensed summary skipped; depth=${candidate.targetDepth}; chunkSummaries=${candidate.items.length}`,
+      );
+      return null;
+    }
+
+    const sourceMessageIds = candidate.items.flatMap((summary) => summary.sourceMessageIds);
+    const sourceIdentityHashes = candidate.items.flatMap(
+      (summary) => summary.sourceIdentityHashes,
+    );
+    const sourceStartSeqs = candidate.items
+      .map((summary) => summary.sourceStartSeq)
+      .filter((seq): seq is number => typeof seq === "number" && Number.isFinite(seq));
+    const sourceEndSeqs = candidate.items
+      .map((summary) => summary.sourceEndSeq)
+      .filter((seq): seq is number => typeof seq === "number" && Number.isFinite(seq));
+    const earliestTimes = candidate.items
+      .map((summary) => summary.earliestAt?.getTime())
+      .filter((time): time is number => typeof time === "number" && Number.isFinite(time));
+    const latestTimes = candidate.items
+      .map((summary) => summary.latestAt?.getTime())
+      .filter((time): time is number => typeof time === "number" && Number.isFinite(time));
+    const summaryId = generatePreparedSummaryId(
+      input.batchId,
+      input.ordinal,
+      sourceIdentityHashes,
+    );
+    const tokenCount = estimateTokens(condensed.content);
+
+    return {
+      summaryId,
+      ordinal: input.ordinal,
+      kind: "condensed",
+      depth: candidate.targetDepth + 1,
+      content: condensed.content,
+      tokenCount,
+      fileIds: dedupeOrderedIds(
+        candidate.items.flatMap((summary) => [
+          ...summary.fileIds,
+          ...extractFileIdsFromContent(summary.content),
+        ]),
+      ),
+      earliestAt:
+        earliestTimes.length > 0 ? new Date(Math.min(...earliestTimes)) : undefined,
+      latestAt:
+        latestTimes.length > 0 ? new Date(Math.max(...latestTimes)) : undefined,
+      descendantCount: candidate.items.reduce(
+        (count, summary) => count + summary.descendantCount + 1,
+        0,
+      ),
+      descendantTokenCount: candidate.items.reduce(
+        (count, summary) => count + summary.tokenCount + summary.descendantTokenCount,
+        0,
+      ),
+      sourceMessageTokenCount: candidate.items.reduce(
+        (count, summary) => count + summary.sourceMessageTokenCount,
+        0,
+      ),
+      sourceStartSeq: sourceStartSeqs.length > 0 ? Math.min(...sourceStartSeqs) : null,
+      sourceEndSeq: sourceEndSeqs.length > 0 ? Math.max(...sourceEndSeqs) : null,
+      sourceMessageIds,
+      sourceIdentityHashes,
+      previousSummaryIds: candidate.items.map((summary) => summary.summaryId),
+    };
+  }
+
+  private resolvePriorPreparedSummaryContextAtDepth(
+    frontier: PreparedSummaryNode[],
+    startIndex: number,
+    targetDepth: number,
+  ): string | undefined {
+    const summaryContents = frontier
+      .slice(0, Math.max(0, startIndex))
+      .filter((summary) => summary.depth === targetDepth)
+      .slice(-2)
+      .map((summary) => summary.content.trim())
+      .filter(Boolean);
+    return summaryContents.length > 0 ? summaryContents.join("\n\n") : undefined;
+  }
+
   private async publishPreparedLeafBatchIfReady(
     conversationId: number,
   ): Promise<PassResult | null> {
@@ -1769,7 +2059,7 @@ export class CompactionEngine {
     if (!result.published) {
       if (result.reason && result.reason !== "no ready prepared batch") {
         this.log.warn(
-          `[lcm] prepared leaf publish skipped: conversation=${conversationId} reason=${result.reason}`,
+          `[lcm] prepared summary publish skipped: conversation=${conversationId} reason=${result.reason}`,
         );
       }
       return null;
@@ -1780,7 +2070,7 @@ export class CompactionEngine {
       return null;
     }
     this.log.info(
-      `[lcm] prepared leaf batch published: conversation=${conversationId} batch=${result.batchId ?? "unknown"} summaries=${result.summaryIds.length} partial=${result.partial}`,
+      `[lcm] prepared summary batch published: conversation=${conversationId} batch=${result.batchId ?? "unknown"} summaries=${result.summaryIds.length} partial=${result.partial}`,
     );
     return {
       summaryId,

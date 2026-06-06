@@ -239,6 +239,71 @@ describe("prepared compaction batches", () => {
     expect(batch).toBeNull();
   });
 
+  it("detects deleted prepared source messages before publishing", async () => {
+    const fixture = await seedRawConversation();
+    await createReadyPendingBatch(fixture);
+
+    await expect(
+      fixture.conversationStore.deleteMessages([fixture.messages[1]!.messageId]),
+    ).resolves.toBe(1);
+
+    const result = await fixture.summaryStore.publishLatestReadyCompactionBatch({
+      conversationId: fixture.conversation.conversationId,
+      maxSourceOrdinalExclusive: 2,
+    });
+
+    expect(result).toMatchObject({
+      published: false,
+      reason: "source message is no longer active raw context",
+    });
+    await expect(fixture.summaryStore.getSummary("sum_prepared_test")).resolves.toBeNull();
+    const contextItems = await fixture.summaryStore.getContextItems(
+      fixture.conversation.conversationId,
+    );
+    expect(contextItems.map((item) => item.messageId)).toEqual([
+      fixture.messages[0]!.messageId,
+      fixture.messages[2]!.messageId,
+    ]);
+    const batch = await fixture.summaryStore.getLatestReadyCompactionBatch(
+      fixture.conversation.conversationId,
+    );
+    expect(batch).toBeNull();
+  });
+
+  it("detects prepared source messages removed from active raw context", async () => {
+    const fixture = await seedRawConversation();
+    await createReadyPendingBatch(fixture);
+    fixture.db
+      .prepare(
+        `DELETE FROM context_items
+         WHERE conversation_id = ?
+           AND item_type = 'message'
+           AND message_id = ?`,
+      )
+      .run(fixture.conversation.conversationId, fixture.messages[1]!.messageId);
+
+    const result = await fixture.summaryStore.publishLatestReadyCompactionBatch({
+      conversationId: fixture.conversation.conversationId,
+      maxSourceOrdinalExclusive: 2,
+    });
+
+    expect(result).toMatchObject({
+      published: false,
+      reason: "source message is no longer active raw context",
+    });
+    await expect(fixture.summaryStore.getSummary("sum_prepared_test")).resolves.toBeNull();
+    await expect(
+      fixture.conversationStore.getMessageById(fixture.messages[1]!.messageId),
+    ).resolves.toMatchObject({
+      messageId: fixture.messages[1]!.messageId,
+      content: "old source beta",
+    });
+    const batch = await fixture.summaryStore.getLatestReadyCompactionBatch(
+      fixture.conversation.conversationId,
+    );
+    expect(batch).toBeNull();
+  });
+
   it("detects imported raw messages before prepared coverage and leaves active context unchanged", async () => {
     const fixture = await seedRawConversation();
     await createReadyPendingBatch(fixture);
@@ -366,6 +431,132 @@ describe("prepared compaction batches", () => {
       { ordinal: 0, itemType: "summary" },
       { ordinal: 1, itemType: "message", messageId: fixture.messages[2]!.messageId },
     ]);
+  });
+
+  it("prepares hidden condensed summaries to arbitrary depth before publishing", async () => {
+    const fixture = createStores();
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "prepared-compaction-hidden-depth",
+      title: "Prepared compaction hidden depth",
+    });
+    const messages = await fixture.conversationStore.createMessagesBulk(
+      Array.from({ length: 9 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        content: `prepared hidden depth source ${index + 1}`,
+        tokenCount: 8,
+      })),
+    );
+    await fixture.summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+    const compaction = new CompactionEngine(
+      fixture.conversationStore,
+      fixture.summaryStore,
+      createCompactionConfig({
+        leafChunkTokens: 8,
+        leafMinFanout: 2,
+        condensedMinFanout: 2,
+        condensedMinFanoutHard: 2,
+        condensedTargetTokens: 1,
+        maxSweepIterations: 20,
+        summaryMaxOverageFactor: 100,
+      }),
+    );
+    const calls: CapturedSummarizeCall[] = [];
+    const summarize = vi.fn(
+      async (text: string, _aggressive?: boolean, options?: LcmSummarizeOptions) => {
+        calls.push({ text, options });
+        return "ssssssssssssssss";
+      },
+    );
+
+    const prepared = await compaction.preparePendingLeafBatch({
+      conversationId: conversation.conversationId,
+      summarize,
+      summaryModel: "test",
+      maxSummaries: 8,
+    });
+
+    expect(prepared.prepared).toBe(true);
+    expect(prepared.summaryCount).toBe(15);
+    expect(summarize).toHaveBeenCalledTimes(15);
+    expect(
+      calls
+        .filter((call) => call.options?.isCondensed)
+        .map((call) => call.options?.depth),
+    ).toEqual([1, 1, 1, 1, 2, 2, 3]);
+    await expect(fixture.summaryStore.getSummariesByConversation(conversation.conversationId))
+      .resolves.toHaveLength(0);
+
+    const batch = await fixture.summaryStore.getLatestReadyCompactionBatch(
+      conversation.conversationId,
+    );
+    expect(batch).not.toBeNull();
+    const pendingRows = await fixture.summaryStore.getCompactionBatchSummaries(batch!.batchId);
+    const depthCounts = pendingRows.reduce<Record<number, number>>((counts, summary) => {
+      counts[summary.depth] = (counts[summary.depth] ?? 0) + 1;
+      return counts;
+    }, {});
+    expect(depthCounts).toEqual({ 0: 8, 1: 4, 2: 2, 3: 1 });
+    const root = pendingRows.find((summary) => summary.depth === 3);
+    expect(root).toMatchObject({
+      kind: "condensed",
+      sourceMessageIds: messages.slice(0, 8).map((message) => message.messageId),
+      sourceStartSeq: 1,
+      sourceEndSeq: 8,
+    });
+    expect(root?.previousSummaryIds).toHaveLength(2);
+
+    const publishOnlySummarize = vi.fn(async () => {
+      throw new Error("foreground summarizer should not run");
+    });
+    const compacted = await compaction.compact({
+      conversationId: conversation.conversationId,
+      tokenBudget: 64,
+      summarize: publishOnlySummarize,
+      hardTrigger: false,
+    });
+
+    expect(compacted.actionTaken).toBe(true);
+    expect(compacted.createdSummaryId).toBe(root?.summaryId);
+    expect(publishOnlySummarize).not.toHaveBeenCalled();
+    await expect(
+      fixture.summaryStore.getContextItems(conversation.conversationId),
+    ).resolves.toMatchObject([
+      { ordinal: 0, itemType: "summary", summaryId: root?.summaryId },
+      { ordinal: 1, itemType: "message", messageId: messages[8]!.messageId },
+    ]);
+    await expect(fixture.summaryStore.getSummariesByConversation(conversation.conversationId))
+      .resolves.toHaveLength(15);
+    await expect(fixture.summaryStore.getSummary(root!.summaryId)).resolves.toMatchObject({
+      kind: "condensed",
+      depth: 3,
+    });
+    const depth2Parents = await fixture.summaryStore.getSummaryParents(root!.summaryId);
+    expect(depth2Parents).toHaveLength(2);
+    expect(depth2Parents.map((summary) => summary.depth)).toEqual([2, 2]);
+    const depth1Parents = (
+      await Promise.all(
+        depth2Parents.map((summary) => fixture.summaryStore.getSummaryParents(summary.summaryId)),
+      )
+    ).flat();
+    expect(depth1Parents).toHaveLength(4);
+    expect(depth1Parents.map((summary) => summary.depth)).toEqual([1, 1, 1, 1]);
+    const leafParents = (
+      await Promise.all(
+        depth1Parents.map((summary) => fixture.summaryStore.getSummaryParents(summary.summaryId)),
+      )
+    ).flat();
+    expect(leafParents).toHaveLength(8);
+    expect(leafParents.map((summary) => summary.depth)).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+    await expect(fixture.summaryStore.getSummaryMessageSeqRange(root!.summaryId)).resolves
+      .toMatchObject({
+        minSeq: 1,
+        maxSeq: 8,
+      });
   });
 
   it("publishes a prepared prefix and foreground-compacts the remaining raw leaf", async () => {

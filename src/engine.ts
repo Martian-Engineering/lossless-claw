@@ -7272,6 +7272,7 @@ export class LcmContextEngine implements ContextEngine {
     const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
     const parentSessionReference = await readSessionParentSessionReference(params.sessionFile);
 
+    let bootstrapImportedMessagesHadOverlap = false;
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () =>
@@ -7666,6 +7667,7 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           if (reconcile.importedMessages > 0) {
+            bootstrapImportedMessagesHadOverlap = reconcile.hasOverlap;
             await persistBootstrapState(conversationId);
             return {
               bootstrapped: true,
@@ -7735,14 +7737,20 @@ export class LcmContextEngine implements ContextEngine {
         result.reason ?? null,
       );
       if (result.importedMessages > 0) {
-        const invalidated = await this.summaryStore.invalidatePendingCompactionBatches(
-          conversation.conversationId,
-          "bootstrap imported additional transcript messages",
-        );
-        if (invalidated > 0) {
+        if (bootstrapImportedMessagesHadOverlap) {
           this.deps.log.debug(
-            `[lcm] bootstrap: superseded ${invalidated} prepared compaction batch(es) after import ${sessionLabel}`,
+            `[lcm] bootstrap: kept prepared compaction batches after overlapping transcript reconciliation ${sessionLabel} importedMessages=${result.importedMessages}`,
           );
+        } else {
+          const invalidated = await this.summaryStore.invalidatePendingCompactionBatches(
+            conversation.conversationId,
+            "bootstrap imported non-overlapping transcript messages",
+          );
+          if (invalidated > 0) {
+            this.deps.log.debug(
+              `[lcm] bootstrap: superseded ${invalidated} prepared compaction batch(es) after import ${sessionLabel}`,
+            );
+          }
         }
       }
     }
@@ -8777,14 +8785,20 @@ export class LcmContextEngine implements ContextEngine {
       }
     };
     if (transcriptReconcileResult.importedMessages > 0) {
-      const invalidated = await this.summaryStore.invalidatePendingCompactionBatches(
-        conversation.conversationId,
-        "afterTurn transcript reconciliation imported additional messages",
-      );
-      if (invalidated > 0) {
+      if (transcriptReconcileResult.hasOverlap) {
         this.deps.log.debug(
-          `[lcm] afterTurn: superseded ${invalidated} prepared compaction batch(es) after transcript reconciliation ${sessionLabel}`,
+          `[lcm] afterTurn: kept prepared compaction batches after overlapping transcript reconciliation ${sessionLabel} importedMessages=${transcriptReconcileResult.importedMessages}`,
         );
+      } else {
+        const invalidated = await this.summaryStore.invalidatePendingCompactionBatches(
+          conversation.conversationId,
+          "afterTurn transcript reconciliation imported non-overlapping messages",
+        );
+        if (invalidated > 0) {
+          this.deps.log.debug(
+            `[lcm] afterTurn: superseded ${invalidated} prepared compaction batch(es) after transcript reconciliation ${sessionLabel}`,
+          );
+        }
       }
     }
     const recordAfterTurnCompactionRetry = async (
