@@ -7379,6 +7379,24 @@ export class LcmContextEngine implements ContextEngine {
             hasOverlap: sessionFileState.size === 0,
           };
         }
+        // #837: a conversation with bootstrapped_at SET but no bootstrap_state
+        // row reaches reason="checkpoint-missing" with a non-anchoring frontier
+        // (e.g. a single injected metadata preamble). Without a no-anchor import
+        // it imports 0 messages and never persists a checkpoint, so afterTurn
+        // loops the "did not cover the transcript frontier" warning forever and
+        // compaction never runs. The rotate lane already recovers via
+        // allowNoAnchorImportOnCheckpointMissing; mirror that on the afterTurn
+        // lane, but ONLY for already-bootstrapped conversations. A never
+        // -bootstrapped conversation (bootstrapped_at NULL) with a divergent
+        // rewritten transcript must still freeze per #649's no-proof-no-advance
+        // guard, so we gate on conversation.bootstrappedAt to avoid grafting a
+        // foreign transcript onto genuine history. The downstream no-anchor
+        // import path is itself guarded (replay-overlap detection, import cap,
+        // delivery-only block).
+        const recoverCheckpointMissingNoAnchor =
+          reason === "checkpoint-missing" &&
+          (params.allowNoAnchorImportOnCheckpointMissing === true ||
+            conversation.bootstrappedAt !== null);
         const reconcile = await this.reconcileSessionTail({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -7388,11 +7406,12 @@ export class LcmContextEngine implements ContextEngine {
           allowNoAnchorImport:
             reason === "path-mismatch" ||
             reason === "same-path-shrink" ||
-            (reason === "checkpoint-missing" && params.allowNoAnchorImportOnCheckpointMissing === true),
-          noAnchorImportReason:
-            reason === "checkpoint-missing" && params.allowNoAnchorImportOnCheckpointMissing === true
+            recoverCheckpointMissingNoAnchor,
+          noAnchorImportReason: recoverCheckpointMissingNoAnchor
+            ? params.allowNoAnchorImportOnCheckpointMissing === true
               ? "rotate-checkpoint-missing"
-              : reason,
+              : "checkpoint-missing-recovery"
+            : reason,
         });
         if (reconcile.blockedByImportCap) {
           return { importedMessages: 0, blockedByImportCap: true, hasOverlap: reconcile.hasOverlap };
