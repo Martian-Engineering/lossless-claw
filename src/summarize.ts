@@ -98,6 +98,16 @@ const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
 const DIAGNOSTIC_MAX_CHARS = 1200;
 const DIAGNOSTIC_SENSITIVE_KEY_PATTERN =
   /(api[-_]?key|authorization|token|secret|password|cookie|set-cookie|private[-_]?key|bearer)/i;
+const LEADING_CLOSED_REASONING_SUMMARY_BLOCK_RE =
+  /^<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\1\s*>/i;
+const STANDALONE_CLOSED_REASONING_SUMMARY_BLOCK_RE =
+  /(^|\n)[ \t]*<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\2\s*>[ \t]*(?=\n|$)/gi;
+const REASONING_SUMMARY_START_RE =
+  /^(?:<\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\]|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:)/i;
+const STANDALONE_REASONING_SUMMARY_START_RE =
+  /(^|\n)[ \t]*(?:<\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\]|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:)[\s\S]*$/i;
+const REASONING_DIAGNOSTIC_MARKER_RE =
+  /(?:<\s*\/?\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\]|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:)/i;
 const AUTH_ERROR_TEXT_PATTERN =
   /\b401\b|unauthorized|unauthorised|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|authentication failed|authorization failed|missing scope|insufficient scope|model\.request\b/i;
 const AUTH_ERROR_STATUS_KEYS = ["status", "statusCode", "status_code"] as const;
@@ -292,6 +302,9 @@ function collectBlockTypes(value: unknown, out: Set<string>): void {
   if (typeof value.type === "string" && value.type.trim()) {
     out.add(value.type.trim());
   }
+  if (typeof value.rawType === "string" && value.rawType.trim()) {
+    out.add(value.rawType.trim());
+  }
   for (const nested of Object.values(value)) {
     collectBlockTypes(nested, out);
   }
@@ -327,7 +340,7 @@ function collectTextLikeFields(value: unknown, out: string[]): void {
     return;
   }
 
-  if (isReasoningLikeType(value.type)) {
+  if (isReasoningLikeType(value.type) || isReasoningLikeType(value.rawType)) {
     return;
   }
 
@@ -390,6 +403,99 @@ function normalizeCompletionSummary(content: unknown): { summary: string; blockT
   };
 }
 
+/** Normalize top-level response fields after the primary content path fails. */
+function normalizeCompletionEnvelope(response: unknown): ReturnType<typeof normalizeCompletionSummary> {
+  if (!isRecord(response)) {
+    return normalizeCompletionSummary(response);
+  }
+  const envelope = { ...response };
+  delete envelope.content;
+  return normalizeCompletionSummary(envelope);
+}
+
+function stripLeadingClosedReasoningBlocks(value: string): { text: string; dropped: boolean } {
+  let remainder = value.trim();
+  let dropped = false;
+  while (true) {
+    const match = remainder.match(LEADING_CLOSED_REASONING_SUMMARY_BLOCK_RE);
+    if (!match) {
+      break;
+    }
+    remainder = remainder.slice(match[0].length).trimStart();
+    dropped = true;
+  }
+  return { text: remainder.trim(), dropped };
+}
+
+function stripStandaloneReasoningBlocks(value: string): { text: string; dropped: boolean } {
+  const withoutClosedBlocks = value.replace(
+    STANDALONE_CLOSED_REASONING_SUMMARY_BLOCK_RE,
+    (match, lineStart: string) => (lineStart === "\n" ? "\n" : ""),
+  );
+  const withoutTrailingOpenBlock = withoutClosedBlocks.replace(
+    STANDALONE_REASONING_SUMMARY_START_RE,
+    (match, lineStart: string) => (lineStart === "\n" ? "\n" : ""),
+  );
+  return {
+    text: withoutTrailingOpenBlock.trim(),
+    dropped: withoutTrailingOpenBlock !== value,
+  };
+}
+
+/**
+ * Remove provider reasoning/thinking payloads leaking through as summary text.
+ *
+ * Some reasoning-capable summary models (vLLM+Qwen3 per #471, Kimi K2.6 per
+ * #542) sometimes return reasoning text shaped so it slips past the
+ * type-tagged filtering in `collectTextLikeFields` — e.g. the entire
+ * summary body is wrapped in `<think>...</think>` tags, or starts with
+ * `<think>` and never closes.  Some providers also leak the same payload
+ * behind high-signal prose headers such as `Thinking Process:`.  Strip closed
+ * reasoning blocks when a visible summary follows, or treat reasoning-only
+ * output as empty so the empty-summary hardening (envelope → retry →
+ * deterministic fallback) kicks in instead of silently persisting reasoning
+ * text as the summary.  See #564.
+ */
+function sanitizeReasoningSummaryText(value: string): {
+  summary: string;
+  droppedReasoning: boolean;
+  reasoningOnly: boolean;
+} {
+  if (typeof value !== "string") {
+    return { summary: "", droppedReasoning: false, reasoningOnly: false };
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return { summary: "", droppedReasoning: false, reasoningOnly: false };
+  }
+
+  // Strip leading CLOSED `<think>...</think>` / `<thinking>...</thinking>` /
+  // `<reasoning>...</reasoning>` blocks.  A leading closed reasoning block
+  // followed by a non-empty summary body is kept as the body, but literal tag
+  // examples later in otherwise valid prose are preserved.
+  const strippedLeading = stripLeadingClosedReasoningBlocks(trimmed);
+  const strippedStandalone = stripStandaloneReasoningBlocks(strippedLeading.text);
+  const remainder = strippedStandalone.text;
+  if (!remainder) {
+    // Either the entire body was a closed reasoning block (no summary
+    // text after) or the input was empty — both are reasoning-only.
+    return { summary: "", droppedReasoning: true, reasoningOnly: true };
+  }
+
+  // Remainder still starts with an UNCLOSED reasoning marker — the
+  // provider opened a `<think>`-style block but never closed it (often a
+  // truncated stream / max_tokens cutoff before the answer began).
+  if (REASONING_SUMMARY_START_RE.test(remainder)) {
+    return { summary: "", droppedReasoning: true, reasoningOnly: true };
+  }
+
+  return {
+    summary: remainder,
+    droppedReasoning: strippedLeading.dropped || strippedStandalone.dropped,
+    reasoningOnly: false,
+  };
+}
+
 /** Format normalized block types for concise diagnostics. */
 function formatBlockTypes(blockTypes: string[]): string {
   if (blockTypes.length === 0) {
@@ -412,6 +518,9 @@ function sanitizeForDiagnostics(value: unknown, depth = 0): unknown {
     return "[max-depth]";
   }
   if (typeof value === "string") {
+    if (REASONING_DIAGNOSTIC_MARKER_RE.test(value)) {
+      return `[reasoning-like text redacted:${value.length} chars]`;
+    }
     return truncateDiagnosticText(value);
   }
   if (
@@ -1600,14 +1709,15 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const normalized = normalizeCompletionSummary(result.content);
       let summary = normalized.summary;
       let summarySource: "content" | "envelope" | "retry" | "fallback" = "content";
+      let envelopeNormalized: ReturnType<typeof normalizeCompletionSummary> | undefined;
 
       // --- Empty-summary hardening: envelope → retry → deterministic fallback ---
       if (!summary) {
         // Envelope-aware extraction: some providers place summary text in
         // top-level response fields (output, message, response) rather than
-        // inside the content array.  Re-run normalization against the full
-        // response envelope before spending an API call on a retry.
-        const envelopeNormalized = normalizeCompletionSummary(result);
+        // inside the content array.  Re-run normalization against top-level
+        // response fields before spending an API call on a retry.
+        envelopeNormalized = normalizeCompletionEnvelope(result);
         if (envelopeNormalized.summary) {
           summary = envelopeNormalized.summary;
           summarySource = "envelope";
@@ -1615,6 +1725,51 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             `[lcm] recovered summary from response envelope; provider=${provider}; model=${model}; ` +
               `block_types=${formatBlockTypes(envelopeNormalized.blockTypes)}; source=envelope`,
           );
+        }
+      }
+
+      // Reasoning-leak guardrail (#564, refs #471, #542): if the extracted
+      // summary text contains provider reasoning/thinking payloads, strip
+      // closed reasoning blocks when a visible summary follows.  Reasoning-only
+      // output is treated as empty so the retry/fallback chain runs.
+      if (summary) {
+        const rawSummaryChars = summary.length;
+        const sanitizedSummary = sanitizeReasoningSummaryText(summary);
+        if (sanitizedSummary.droppedReasoning) {
+          summary = sanitizedSummary.summary;
+        }
+        if (sanitizedSummary.reasoningOnly) {
+          // Log the block_types from the source normalization that actually
+          // produced this summary text — `normalized` is content-path, but
+          // when the summary came from `envelopeNormalized` the relevant
+          // shape is the envelope's, not the content's.
+          const droppedBlockTypes =
+            summarySource === "envelope" && envelopeNormalized
+              ? envelopeNormalized.blockTypes
+              : normalized.blockTypes;
+          params.deps.log.warn(
+            `[lcm] dropped reasoning-shaped summary on first attempt; provider=${provider}; ` +
+              `model=${model}; source=${summarySource}; ` +
+              `block_types=${formatBlockTypes(droppedBlockTypes)}; ` +
+              `summary_shape=reasoning-only; summary_chars=${rawSummaryChars}`,
+          );
+          const recoveryNormalized = envelopeNormalized ?? normalizeCompletionEnvelope(result);
+          const recoveredSummary = sanitizeReasoningSummaryText(recoveryNormalized.summary);
+          if (recoveredSummary.summary && !recoveredSummary.reasoningOnly) {
+            summary = recoveredSummary.summary;
+            envelopeNormalized = {
+              summary,
+              blockTypes: recoveryNormalized.blockTypes,
+            };
+            summarySource = "envelope";
+            params.deps.log.debug(
+              `[lcm] recovered summary from response envelope; provider=${provider}; model=${model}; ` +
+                `block_types=${formatBlockTypes(recoveryNormalized.blockTypes)}; source=envelope`,
+            );
+          } else {
+            summary = "";
+            summarySource = "content";
+          }
         }
       }
 
@@ -1650,8 +1805,34 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           const retryNormalized = normalizeCompletionSummary(retryResult.content);
           const retryEnvelopeNormalized = retryNormalized.summary
             ? retryNormalized
-            : normalizeCompletionSummary(retryResult);
+            : normalizeCompletionEnvelope(retryResult);
           summary = retryEnvelopeNormalized.summary;
+
+          // Re-apply the reasoning-leak guardrail to the retry result so a
+          // mixed reasoning+summary retry is stripped before persistence, and
+          // reasoning-only retry output drops to deterministic fallback.
+          if (summary) {
+            const rawRetrySummaryChars = summary.length;
+            const sanitizedRetrySummary = sanitizeReasoningSummaryText(summary);
+            if (sanitizedRetrySummary.droppedReasoning) {
+              summary = sanitizedRetrySummary.summary;
+            }
+            if (sanitizedRetrySummary.reasoningOnly) {
+              params.deps.log.warn(
+                `[lcm] dropped reasoning-shaped summary on retry; provider=${provider}; ` +
+                  `model=${model}; block_types=${formatBlockTypes(retryEnvelopeNormalized.blockTypes)}; ` +
+                  `summary_shape=reasoning-only; summary_chars=${rawRetrySummaryChars}`,
+              );
+              const retryRecoveryNormalized = normalizeCompletionEnvelope(retryResult);
+              const retryRecoveredSummary = sanitizeReasoningSummaryText(
+                retryRecoveryNormalized.summary,
+              );
+              summary =
+                retryRecoveredSummary.summary && !retryRecoveredSummary.reasoningOnly
+                  ? retryRecoveredSummary.summary
+                  : "";
+            }
+          }
 
           if (summary) {
             summarySource = "retry";

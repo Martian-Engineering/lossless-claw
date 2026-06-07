@@ -1438,9 +1438,16 @@ describe("LCM integration: compaction", () => {
       { type: "text", text: "Visible reply after thinking summary." },
     ]);
     const plainContent = "A plain user message.";
+    const reasoningHeadingContent =
+      "Thinking Process: this is a user bug report heading, not provider reasoning.";
 
     await ingestMessages(convStore, sumStore, 1, {
       contentFn: () => plainContent,
+      roleFn: () => "user",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => reasoningHeadingContent,
       roleFn: () => "user",
       tokenCountFn: (_i, c) => estimateTokens(c),
     });
@@ -1508,6 +1515,7 @@ describe("LCM integration: compaction", () => {
 
     // The plain user message must still be present
     expect(capturedSourceText).toContain("A plain user message.");
+    expect(capturedSourceText).toContain(reasoningHeadingContent);
   });
 
   it("leaf compaction strips redacted_thinking blocks from structured message parts", async () => {
@@ -1741,7 +1749,7 @@ describe("LCM integration: compaction", () => {
       summaryId: "sum_pre_2",
       conversationId: CONV_ID,
       kind: "leaf",
-      content: "Prior summary two.",
+      content: "<think>PRIVATE_PRIOR_REASONING_TWO</think>",
       tokenCount: 4,
     });
     await sumStore.appendContextSummary(CONV_ID, "sum_pre_2");
@@ -1749,7 +1757,7 @@ describe("LCM integration: compaction", () => {
       summaryId: "sum_pre_3",
       conversationId: CONV_ID,
       kind: "leaf",
-      content: "Prior summary three.",
+      content: "<thinking>PRIVATE_ONLY</thinking>",
       tokenCount: 4,
     });
     await sumStore.appendContextSummary(CONV_ID, "sum_pre_3");
@@ -1777,7 +1785,11 @@ describe("LCM integration: compaction", () => {
 
     expect(result.actionTaken).toBe(true);
     expect(summarizeCalls.length).toBeGreaterThan(0);
-    expect(summarizeCalls[0]?.previousSummary).toBe("Prior summary two.\n\nPrior summary three.");
+    expect(summarizeCalls[0]?.previousSummary).toBe("Prior summary one.");
+    expect(summarizeCalls[0]?.previousSummary).not.toContain("PRIVATE_PRIOR_REASONING_TWO");
+    expect(summarizeCalls[0]?.previousSummary).not.toContain("PRIVATE_ONLY");
+    expect(summarizeCalls[0]?.previousSummary).not.toContain("<think>");
+    expect(summarizeCalls[0]?.previousSummary).not.toContain("<thinking>");
     expect(summarizeCalls[0]?.isCondensed).toBe(false);
   });
 
@@ -2518,6 +2530,7 @@ describe("LCM integration: compaction", () => {
   it("depth-aware condensation sets condensed depth to max parent depth plus one", async () => {
     const depthAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
+      freshTailCount: 0,
       leafMinFanout: 2,
       condensedMinFanout: 2,
       leafChunkTokens: 200,
@@ -2737,6 +2750,7 @@ describe("LCM integration: compaction", () => {
     );
 
     const summarizeCalls: Array<{
+      text: string;
       options?: {
         previousSummary?: string;
         isCondensed?: boolean;
@@ -2745,11 +2759,11 @@ describe("LCM integration: compaction", () => {
     }> = [];
     const summarize = vi.fn(
       async (
-        _text: string,
+        text: string,
         _aggressive?: boolean,
         options?: { previousSummary?: string; isCondensed?: boolean; depth?: number },
       ) => {
-        summarizeCalls.push({ options });
+        summarizeCalls.push({ text, options });
         return "Condensed output";
       },
     );
@@ -2779,15 +2793,25 @@ describe("LCM integration: compaction", () => {
       conversationId: depthZeroConversation.conversationId,
       kind: "leaf",
       depth: 0,
-      content: "Depth zero prior context",
+      content: "<think>PRIVATE_PRIOR_REASONING</think>Depth zero prior context",
       tokenCount: 60,
     });
+    for (let index = 0; index < 4; index++) {
+      await sumStore.insertSummary({
+        summaryId: `sum_depth_zero_empty_prior_${index}`,
+        conversationId: depthZeroConversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `<thinking>PRIVATE_EMPTY_PRIOR_${index}</thinking>`,
+        tokenCount: 60,
+      });
+    }
     await sumStore.insertSummary({
       summaryId: "sum_depth_zero_focus_a",
       conversationId: depthZeroConversation.conversationId,
       kind: "leaf",
       depth: 0,
-      content: "Depth zero focus A",
+      content: "<thinking>PRIVATE_FOCUS_REASONING</thinking>Depth zero focus A",
       tokenCount: 60,
     });
     await sumStore.insertSummary({
@@ -2802,6 +2826,12 @@ describe("LCM integration: compaction", () => {
       depthZeroConversation.conversationId,
       "sum_depth_zero_prior",
     );
+    for (let index = 0; index < 4; index++) {
+      await sumStore.appendContextSummary(
+        depthZeroConversation.conversationId,
+        `sum_depth_zero_empty_prior_${index}`,
+      );
+    }
     await sumStore.appendContextSummary(
       depthZeroConversation.conversationId,
       "sum_depth_zero_focus_a",
@@ -2828,6 +2858,129 @@ describe("LCM integration: compaction", () => {
     const depthZeroCall = summarizeCalls[summarizeCalls.length - 1];
     expect(depthZeroCall?.options?.depth).toBe(1);
     expect(depthZeroCall?.options?.previousSummary).toContain("Depth zero prior context");
+    expect(depthZeroCall?.options?.previousSummary).not.toContain("PRIVATE_PRIOR_REASONING");
+    expect(depthZeroCall?.options?.previousSummary).not.toContain("PRIVATE_EMPTY_PRIOR");
+    expect(depthZeroCall?.options?.previousSummary).not.toContain("<think>");
+    expect(depthZeroCall?.options?.previousSummary).not.toContain("<thinking>");
+    expect(depthZeroCall?.text).toContain("Depth zero focus A");
+    expect(depthZeroCall?.text).toContain("Depth zero focus B");
+    expect(depthZeroCall?.text).not.toContain("PRIVATE_FOCUS_REASONING");
+    expect(depthZeroCall?.text).not.toContain("<thinking>");
+  });
+
+  it("skips condensed writes when all selected summaries sanitize empty", async () => {
+    const emptyCondensedEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      leafMinFanout: 2,
+      condensedMinFanout: 2,
+      condensedTargetTokens: 10,
+    });
+    const conversation = await convStore.createConversation({
+      sessionId: "empty-sanitized-condensed",
+    });
+
+    await sumStore.insertSummary({
+      summaryId: "sum_empty_reasoning_a",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "<think>PRIVATE_A</think>",
+      tokenCount: 60,
+    });
+    await sumStore.insertSummary({
+      summaryId: "sum_empty_reasoning_b",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "[thinking] PRIVATE_B",
+      tokenCount: 60,
+    });
+    await sumStore.appendContextSummary(conversation.conversationId, "sum_empty_reasoning_a");
+    await sumStore.appendContextSummary(conversation.conversationId, "sum_empty_reasoning_b");
+
+    const contextItems = await sumStore.getContextItems(conversation.conversationId);
+    const summaryItems = contextItems.filter((item) => item.itemType === "summary");
+    const summarize = vi.fn(async () => "Should not be called");
+    const result = await (emptyCondensedEngine as any).condensedPass(
+      conversation.conversationId,
+      summaryItems,
+      0,
+      summarize,
+    );
+
+    expect(result).toEqual({ skipped: "empty-source" });
+    expect(summarize).not.toHaveBeenCalled();
+    expect(
+      sumStore._summaries.some((summary) => summary.content === "[Truncated from 0 tokens]"),
+    ).toBe(false);
+
+    const sweepResult = await emptyCondensedEngine.compactFullSweep({
+      conversationId: conversation.conversationId,
+      tokenBudget: 10_000,
+      stopAtTokens: 1,
+      summarize,
+      force: true,
+    });
+
+    expect(sweepResult.actionTaken).toBe(false);
+    expect(sweepResult.authFailure).toBeUndefined();
+    expect(summarize).not.toHaveBeenCalled();
+  });
+
+  it("skips empty sanitized summaries when selecting condensed chunks", async () => {
+    const prefixSkipEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafMinFanout: 2,
+      condensedMinFanout: 2,
+      leafChunkTokens: 200,
+      condensedTargetTokens: 10,
+    });
+    const conversation = await convStore.createConversation({
+      sessionId: "empty-prefix-condensed",
+    });
+
+    for (const [summaryId, content] of [
+      ["sum_empty_prefix_a", "<think>PRIVATE_PREFIX_A</think>"],
+      ["sum_empty_prefix_b", "[thinking] PRIVATE_PREFIX_B"],
+      ["sum_valid_after_prefix_a", "Valid summary A"],
+      ["sum_empty_middle", "<thinking>PRIVATE_MIDDLE</thinking>"],
+      ["sum_valid_after_prefix_b", "Valid summary B"],
+    ] as const) {
+      await sumStore.insertSummary({
+        summaryId,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content,
+        tokenCount: 60,
+      });
+      await sumStore.appendContextSummary(conversation.conversationId, summaryId);
+    }
+
+    let capturedSourceText = "";
+    const summarize = vi.fn(async (text: string) => {
+      capturedSourceText = text;
+      return "Condensed valid summaries";
+    });
+
+    const result = await prefixSkipEngine.compactFullSweep({
+      conversationId: conversation.conversationId,
+      tokenBudget: 10_000,
+      stopAtTokens: 1,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.authFailure).toBeUndefined();
+    expect(summarize).toHaveBeenCalledOnce();
+    expect(capturedSourceText).toContain("Valid summary A");
+    expect(capturedSourceText).toContain("Valid summary B");
+    expect(capturedSourceText).not.toContain("PRIVATE_PREFIX");
+    expect(capturedSourceText).not.toContain("PRIVATE_MIDDLE");
+    expect(capturedSourceText).not.toContain("<think>");
+    expect(capturedSourceText).not.toContain("<thinking>");
   });
 
   it("relaxes fanout thresholds only under summarized-prefix pressure", async () => {
