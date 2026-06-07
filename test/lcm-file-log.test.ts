@@ -4,16 +4,6 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __testing, createIndependentLcmFileLogger } from "../src/lcm-file-log.js";
 
-vi.mock("openclaw/plugin-sdk/logging-core", () => ({
-  redactSensitiveText: (text: string) =>
-    text
-      .replace(/token=[^\s]+/g, "token=[REDACTED]")
-      .replace(/ghp_[A-Za-z0-9]+/g, "[REDACTED]")
-      .replace(/github_pat_[A-Za-z0-9_]+/g, "[REDACTED]")
-      .replace(/AKIA[A-Z0-9]+/g, "[REDACTED]")
-      .replace(/"token":"[^"]+"/g, '"token":"[REDACTED]"'),
-}));
-
 let tempDir: string;
 
 beforeEach(() => {
@@ -22,6 +12,7 @@ beforeEach(() => {
 
 afterEach(() => {
   fs.rmSync(tempDir, { recursive: true, force: true });
+  __testing.resetOpenClawRedactor();
 });
 
 describe("createIndependentLcmFileLogger", () => {
@@ -181,6 +172,26 @@ describe("createIndependentLcmFileLogger", () => {
     expect(record.message).not.toContain(githubPat);
     expect(record.message).not.toContain(awsKey);
     expect(record.message).not.toContain(jsonToken);
+  });
+
+  it("uses the OpenClaw redactor when the optional host dependency is available", () => {
+    const file = path.join(tempDir, "lossless-claw-test.log");
+    const redactSensitiveText = vi.fn(() => "[lcm] host redacted");
+    __testing.setOpenClawRedactor(redactSensitiveText);
+    const logger = createIndependentLcmFileLogger({
+      enabled: true,
+      file,
+      maxFileBytes: 1024 * 1024,
+    });
+
+    logger?.write("error", "[lcm] failed token=super-secret-token-value");
+
+    const record = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    expect(redactSensitiveText).toHaveBeenCalledWith(
+      "[lcm] failed token=super-secret-token-value",
+      undefined,
+    );
+    expect(record.message).toBe("[lcm] host redacted");
   });
 
   it("creates configured log files with owner-only permissions", () => {

@@ -1,7 +1,7 @@
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { redactSensitiveText as redactOpenClawSensitiveText } from "openclaw/plugin-sdk/logging-core";
 import type { IndependentLogFileConfig } from "./db/config.js";
 
 const LOG_PREFIX = "lossless-claw";
@@ -20,6 +20,10 @@ export type IndependentLogRedactionConfig = {
   mode?: "off" | "tools";
   patterns?: string[];
 };
+
+type OpenClawRedactor = (value: string, redaction?: IndependentLogRedactionConfig) => string;
+
+let openClawRedactor: OpenClawRedactor | undefined = loadOpenClawRedactor();
 
 function formatLocalDate(date: Date): string {
   const year = date.getFullYear();
@@ -169,8 +173,61 @@ function rotateLogFile(file: string): boolean {
   }
 }
 
+function loadOpenClawRedactor(): OpenClawRedactor | undefined {
+  try {
+    const require = createRequire(import.meta.url);
+    const loggingCore = require("openclaw/plugin-sdk/logging-core") as {
+      redactSensitiveText?: unknown;
+    };
+    if (typeof loggingCore.redactSensitiveText === "function") {
+      return loggingCore.redactSensitiveText as OpenClawRedactor;
+    }
+  } catch {
+    // OpenClaw is an optional peer; package tests and tooling run without it.
+  }
+  return undefined;
+}
+
+function redactionPattern(rawPattern: string): RegExp | undefined {
+  try {
+    const match = rawPattern.match(/^\/(.+)\/([dgimsuvy]*)$/);
+    if (match) {
+      const flags = match[2].includes("g") ? match[2] : `${match[2]}g`;
+      return new RegExp(match[1], flags);
+    }
+    return new RegExp(rawPattern, "gi");
+  } catch {
+    return undefined;
+  }
+}
+
+function fallbackRedactSensitiveText(
+  value: string,
+  redaction?: IndependentLogRedactionConfig,
+): string {
+  if (redaction?.mode === "off") {
+    return value;
+  }
+
+  let next = value
+    .replace(/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{10,}\b/g, "[REDACTED]")
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[REDACTED]")
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED]")
+    .replace(/\b(?:sk|rk|pk)[-_][A-Za-z0-9_-]{10,}\b/g, "[REDACTED]")
+    .replace(/\btoken=([^\s]+)/gi, "token=[REDACTED]")
+    .replace(/"token"\s*:\s*"[^"]+"/gi, '"token":"[REDACTED]"');
+
+  for (const rawPattern of redaction?.patterns ?? []) {
+    const pattern = redactionPattern(rawPattern);
+    if (pattern) {
+      next = next.replace(pattern, "[REDACTED]");
+    }
+  }
+  return next;
+}
+
 function redactSensitiveText(value: string, redaction?: IndependentLogRedactionConfig): string {
-  return redactOpenClawSensitiveText(value, redaction);
+  return (openClawRedactor ?? fallbackRedactSensitiveText)(value, redaction);
 }
 
 function appendRegularFileSync(file: string, content: string): boolean {
@@ -272,5 +329,11 @@ export function createIndependentLcmFileLogger(
 export const __testing = {
   defaultRollingPath,
   isTrustedExistingOpenClawTmpDir,
+  resetOpenClawRedactor: () => {
+    openClawRedactor = loadOpenClawRedactor();
+  },
   resolveActiveLogFile,
+  setOpenClawRedactor: (redactor: OpenClawRedactor | undefined) => {
+    openClawRedactor = redactor;
+  },
 };
