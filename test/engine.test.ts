@@ -11214,6 +11214,70 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).resolves.toBe(1);
   });
 
+  it("keeps the no-anchor import cap for placeholder checkpoints with real DB rows (#639)", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+    });
+    const sessionId = "placeholder-real-frontier-large-transcript";
+    const sessionKey = "agent:opsos:telegram:test:direct:placeholder-real-frontier";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "live real user row" }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "live real assistant row" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    const entries: Array<{ role: AgentMessage["role"]; content: string }> = [];
+    for (let i = 0; i < 60; i += 1) {
+      entries.push({ role: "user", content: `foreign user turn ${i}` });
+      entries.push({ role: "assistant", content: `foreign assistant turn ${i}` });
+    }
+    const sessionFile = createSessionFilePath("placeholder-real-frontier-large-transcript");
+    writeLeafTranscript(sessionFile, entries);
+
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "foreign assistant turn 59" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    await expect(
+      engine.getConversationStore().getMessageCount(conversation!.conversationId),
+    ).resolves.toBe(2);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(0);
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("no anchor import cap exceeded")),
+    ).toBe(true);
+  });
+
   it("keeps placeholder recovery retryable without duplicating a partially imported prefix (#639)", async () => {
     const engine = createEngine();
     const sessionId = "placeholder-no-anchor-import-failure";

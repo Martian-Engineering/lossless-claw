@@ -64,6 +64,7 @@ import {
   ConversationStore,
   type ConversationRecord,
   type CreateMessagePartInput,
+  type MessageRecord,
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
@@ -1282,6 +1283,7 @@ const PROMPT_RECALL_SEARCH_LIMIT = PROMPT_RECALL_MAX_MESSAGES * 2;
 const PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT = PROMPT_RECALL_SEARCH_LIMIT * 4;
 const DELIVERY_ONLY_TRANSCRIPT_MAX_MESSAGES = 4;
 const INJECTED_DELIVERY_TRANSCRIPT_PATTERN = /\b(?:delivery[-_\s]?mirror|config[-_\s]?audit)\b/i;
+const INJECTED_CONVERSATION_METADATA_PREFIX = "Conversation info (untrusted metadata)";
 const OPENCLAW_RUNTIME_CONTEXT_SENTINEL =
   "OpenClaw runtime context for the immediately preceding user message. This context is runtime-generated, not user-author.";
 const PROMPT_RECALL_SENSITIVE_IDENTIFIER_PATTERN =
@@ -1344,6 +1346,15 @@ function isLikelyInjectedDeliveryOnlyTranscript(messages: AgentMessage[]): boole
     messages.length > 0 &&
     messages.length <= DELIVERY_ONLY_TRANSCRIPT_MAX_MESSAGES &&
     messages.every(isLikelyInjectedDeliveryMessage)
+  );
+}
+
+function isInjectedConversationMetadataMessage(
+  message: Pick<MessageRecord, "role" | "content">,
+): boolean {
+  return (
+    message.role === "user" &&
+    message.content.trimStart().startsWith(INJECTED_CONVERSATION_METADATA_PREFIX)
   );
 }
 
@@ -5940,6 +5951,34 @@ export class LcmContextEngine implements ContextEngine {
     return { overlaps, firstNonOverlappingIndex };
   }
 
+  private async canBypassPlaceholderNoAnchorImportCap(params: {
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+    persistedPrefixLength: number;
+  }): Promise<boolean> {
+    const persistedMessages = await this.conversationStore.getMessages(params.conversationId);
+    const allowedPrefix = params.historicalMessages
+      .slice(0, params.persistedPrefixLength)
+      .map((message) => toStoredMessage(message));
+    let prefixIndex = 0;
+
+    // Only the targeted recovery shape may bypass the cap: injected metadata
+    // rows, plus an already-imported prefix when a previous retry failed.
+    for (const persisted of persistedMessages) {
+      if (isInjectedConversationMetadataMessage(persisted)) {
+        continue;
+      }
+
+      const expected = allowedPrefix[prefixIndex];
+      if (!expected || persisted.role !== expected.role || persisted.content !== expected.content) {
+        return false;
+      }
+      prefixIndex += 1;
+    }
+
+    return prefixIndex === allowedPrefix.length;
+  }
+
   private async countPersistedTranscriptIdentityOverlaps(params: {
     conversationId: number;
     messages: AgentMessage[];
@@ -6145,17 +6184,23 @@ export class LcmContextEngine implements ContextEngine {
               `[lcm] reconcileSessionTail: duplicate transcript replay guard dropped ${replayAnalysis.firstNonOverlappingIndex}/${historicalMessages.length} already-persisted prefix messages for ${sessionContext} before no-anchor import (reason: ${params.noAnchorImportReason ?? "unspecified"})`,
             );
           }
+
+          const placeholderRecoveryCanBypassCap =
+            params.noAnchorImportReason === "placeholder-checkpoint-recovery" &&
+            (await this.canBypassPlaceholderNoAnchorImportCap({
+              conversationId,
+              historicalMessages,
+              persistedPrefixLength: shouldDropPersistedPrefix
+                ? replayAnalysis.firstNonOverlappingIndex
+                : 0,
+            }));
           // #639: placeholder-checkpoint recovery is an initial-epoch
-          // catch-up (the conversation has only injected metadata and never
-          // ingested its real transcript). The proportional cap
-          // (max(existingDbCount*0.2, 50)) permanently starves large
-          // pre-existing sessions, so lift it for this reason only. The
-          // replay-duplicate guard above already aborts genuine floods; every
-          // other no-anchor reason keeps the cap.
-          const importCap =
-            params.noAnchorImportReason === "placeholder-checkpoint-recovery"
-              ? Number.POSITIVE_INFINITY
-              : Math.max(Math.floor(existingDbCount * 0.2), 50);
+          // catch-up only when the DB still contains injected metadata plus
+          // any already-imported prefix from a failed retry. Generic
+          // placeholder checkpoints keep the normal bounded cap.
+          const importCap = placeholderRecoveryCanBypassCap
+            ? Number.POSITIVE_INFINITY
+            : Math.max(Math.floor(existingDbCount * 0.2), 50);
           if (noAnchorImportMessages.length > importCap) {
             this.deps.log.warn(
               `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${noAnchorImportMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
