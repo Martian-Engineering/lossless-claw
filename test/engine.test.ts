@@ -11106,12 +11106,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
     // Repro of conv 3893 (agent:opsos:telegram): the DB frontier holds only
     // injected "Conversation info (untrusted metadata)" preambles that do NOT
     // appear in the real transcript, and the bootstrap checkpoint is a
-    // placeholder (all-zero, never ingested). Before the fix the
-    // placeholder-checkpoint-recovery branch called reconcileSessionTail
-    // WITHOUT allowNoAnchorImport, so with no anchor it imported 0 messages
-    // forever; and even with it, the no-anchor import cap (max(2*0.2,50)=50)
-    // would block a >50-message transcript. After the fix the full transcript
-    // is imported as a new epoch (cap lifted for this initial-epoch catch-up).
+    // placeholder (all-zero, never ingested). This recovery path must allow a
+    // no-anchor import and bypass the normal no-anchor cap only for the
+    // initial-epoch catch-up.
     const engine = createEngine();
     const sessionId = "placeholder-no-anchor-large-transcript";
     const sessionKey = "agent:opsos:telegram:test:direct:placeholder-no-anchor";
