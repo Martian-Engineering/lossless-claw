@@ -12406,6 +12406,79 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).resolves.toBeNull();
   });
 
+  it("afterTurn does not recover checkpoint-missing divergent transcript over real history", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-checkpoint-missing-real-history";
+    const sessionKey = "agent:main:test:checkpoint-missing-real-history";
+
+    const oldSessionFile = createSessionFilePath("after-turn-checkpoint-missing-real-history-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old checkpoint-missing real-history question" },
+      { role: "assistant", content: "old checkpoint-missing real-history answer" },
+    ]);
+    await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    expect(conversation?.bootstrappedAt).toBeTruthy();
+
+    const rawDb = createLcmDatabaseConnection(getEngineConfig(engine).databasePath);
+    try {
+      rawDb
+        .prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "rewritten unrelated checkpoint-missing question" },
+      { role: "assistant", content: "rewritten unrelated checkpoint-missing answer" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: "rewritten unrelated checkpoint-missing answer",
+        }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("did not cover the transcript frontier")),
+    ).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old checkpoint-missing real-history question",
+      "old checkpoint-missing real-history answer",
+    ]);
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+  });
+
   it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {
     const engine = createEngine();
     const sessionId = "bootstrap-transcript-epoch-no-anchor";

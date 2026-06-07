@@ -1505,6 +1505,7 @@ const PROMPT_RECALL_SEARCH_LIMIT = PROMPT_RECALL_MAX_MESSAGES * 2;
 const PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT = PROMPT_RECALL_SEARCH_LIMIT * 4;
 const DELIVERY_ONLY_TRANSCRIPT_MAX_MESSAGES = 4;
 const INJECTED_DELIVERY_TRANSCRIPT_PATTERN = /\b(?:delivery[-_\s]?mirror|config[-_\s]?audit)\b/i;
+const INJECTED_METADATA_PREAMBLE_PREFIX = "Conversation info (untrusted metadata)";
 const OPENCLAW_RUNTIME_CONTEXT_SENTINEL =
   "OpenClaw runtime context for the immediately preceding user message. This context is runtime-generated, not user-author.";
 const PROMPT_RECALL_SENSITIVE_IDENTIFIER_PATTERN =
@@ -1567,6 +1568,16 @@ function isLikelyInjectedDeliveryOnlyTranscript(messages: AgentMessage[]): boole
     messages.length > 0 &&
     messages.length <= DELIVERY_ONLY_TRANSCRIPT_MAX_MESSAGES &&
     messages.every(isLikelyInjectedDeliveryMessage)
+  );
+}
+
+function isLikelyInjectedMetadataPreambleRecord(message: {
+  role: string;
+  content: string;
+}): boolean {
+  return (
+    message.role === "user" &&
+    message.content.trimStart().startsWith(INJECTED_METADATA_PREAMBLE_PREFIX)
   );
 }
 
@@ -7387,18 +7398,31 @@ export class LcmContextEngine implements ContextEngine {
         // loops the "did not cover the transcript frontier" warning forever and
         // compaction never runs. The rotate lane already recovers via
         // allowNoAnchorImportOnCheckpointMissing; mirror that on the afterTurn
-        // lane, but ONLY for already-bootstrapped conversations. A never
-        // -bootstrapped conversation (bootstrapped_at NULL) with a divergent
-        // rewritten transcript must still freeze per #649's no-proof-no-advance
-        // guard, so we gate on conversation.bootstrappedAt to avoid grafting a
-        // foreign transcript onto genuine history. The downstream no-anchor
+        // lane, but ONLY for the observed injected-metadata frontier. A real
+        // historical DB tail with a divergent rewritten transcript must still
+        // freeze per #649's no-proof-no-advance guard, so do not treat
+        // bootstrapped_at alone as lineage proof. The downstream no-anchor
         // import path is itself guarded (replay-overlap detection, import cap,
         // delivery-only block).
-        const recoverCheckpointMissingNoAnchor =
+        let checkpointMissingMetadataFrontier = false;
+        if (
           reason === "checkpoint-missing" &&
           conversation.sessionId === params.sessionId &&
+          conversation.bootstrappedAt !== null
+        ) {
+          const [existingMessageCount, latestPersistedMessage] = await Promise.all([
+            this.conversationStore.getMessageCount(conversation.conversationId),
+            this.conversationStore.getLastMessage(conversation.conversationId),
+          ]);
+          checkpointMissingMetadataFrontier =
+            existingMessageCount === 1 &&
+            latestPersistedMessage !== null &&
+            isLikelyInjectedMetadataPreambleRecord(latestPersistedMessage);
+        }
+        const recoverCheckpointMissingNoAnchor =
+          reason === "checkpoint-missing" &&
           (params.allowNoAnchorImportOnCheckpointMissing === true ||
-            conversation.bootstrappedAt !== null);
+            checkpointMissingMetadataFrontier);
         const reconcile = await this.reconcileSessionTail({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
