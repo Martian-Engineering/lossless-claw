@@ -11214,7 +11214,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).resolves.toBe(1);
   });
 
-  it("keeps the no-anchor import cap for placeholder checkpoints with real DB rows (#639)", async () => {
+  it("keeps a bounded no-anchor import cap for placeholder checkpoints with real DB rows (#639)", async () => {
     const warnLog = vi.fn();
     const engine = createEngineWithDepsOverrides({
       log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
@@ -11239,7 +11239,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(conversation).not.toBeNull();
 
     const entries: Array<{ role: AgentMessage["role"]; content: string }> = [];
-    for (let i = 0; i < 60; i += 1) {
+    for (let i = 0; i < 600; i += 1) {
       entries.push({ role: "user", content: `foreign user turn ${i}` });
       entries.push({ role: "assistant", content: `foreign assistant turn ${i}` });
     }
@@ -11259,7 +11259,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       sessionId,
       sessionKey,
       sessionFile,
-      messages: [makeMessage({ role: "assistant", content: "foreign assistant turn 59" })],
+      messages: [makeMessage({ role: "assistant", content: "foreign assistant turn 599" })],
       prePromptMessageCount: 0,
       tokenBudget: 4_096,
     });
