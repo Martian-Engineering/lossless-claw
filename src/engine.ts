@@ -6117,30 +6117,34 @@ export class LcmContextEngine implements ContextEngine {
           const persistedIdentityOverlaps = replayAnalysis.overlaps;
           let noAnchorImportMessages = historicalMessages;
           const replayThreshold = Math.max(3, Math.ceil(historicalMessages.length * 0.5));
-          if (persistedIdentityOverlaps >= replayThreshold) {
-            if (replayAnalysis.firstNonOverlappingIndex < 0) {
-              this.deps.log.warn(
-                `[lcm] reconcileSessionTail: duplicate transcript replay blocked for ${sessionContext} - ${persistedIdentityOverlaps}/${historicalMessages.length} candidate messages already exist (reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent replay flood.`,
-              );
-              this.deps.log.debug(
-                `[lcm] reconcileSessionTail: blocked duplicate transcript replay for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} persistedIdentityOverlaps=${persistedIdentityOverlaps} overlap=false`,
-              );
-              return {
-                blockedByImportCap: true,
-                blockedReason: "duplicate-transcript-replay",
-                importedMessages: 0,
-                hasOverlap: false,
-              };
-            }
-
-            if (replayAnalysis.firstNonOverlappingIndex > 0) {
-              noAnchorImportMessages = historicalMessages.slice(replayAnalysis.firstNonOverlappingIndex);
-              this.deps.log.warn(
-                `[lcm] reconcileSessionTail: duplicate transcript replay guard dropped ${replayAnalysis.firstNonOverlappingIndex}/${historicalMessages.length} already-persisted prefix messages for ${sessionContext} before no-anchor import (reason: ${params.noAnchorImportReason ?? "unspecified"})`,
-              );
-            }
+          const shouldDropPersistedPrefix =
+            replayAnalysis.firstNonOverlappingIndex > 0 &&
+            (persistedIdentityOverlaps >= replayThreshold ||
+              params.noAnchorImportReason === "placeholder-checkpoint-recovery");
+          if (
+            replayAnalysis.firstNonOverlappingIndex < 0 &&
+            persistedIdentityOverlaps >= replayThreshold
+          ) {
+            this.deps.log.warn(
+              `[lcm] reconcileSessionTail: duplicate transcript replay blocked for ${sessionContext} - ${persistedIdentityOverlaps}/${historicalMessages.length} candidate messages already exist (reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent replay flood.`,
+            );
+            this.deps.log.debug(
+              `[lcm] reconcileSessionTail: blocked duplicate transcript replay for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} persistedIdentityOverlaps=${persistedIdentityOverlaps} overlap=false`,
+            );
+            return {
+              blockedByImportCap: true,
+              blockedReason: "duplicate-transcript-replay",
+              importedMessages: 0,
+              hasOverlap: false,
+            };
           }
 
+          if (shouldDropPersistedPrefix) {
+            noAnchorImportMessages = historicalMessages.slice(replayAnalysis.firstNonOverlappingIndex);
+            this.deps.log.warn(
+              `[lcm] reconcileSessionTail: duplicate transcript replay guard dropped ${replayAnalysis.firstNonOverlappingIndex}/${historicalMessages.length} already-persisted prefix messages for ${sessionContext} before no-anchor import (reason: ${params.noAnchorImportReason ?? "unspecified"})`,
+            );
+          }
           // #639: placeholder-checkpoint recovery is an initial-epoch
           // catch-up (the conversation has only injected metadata and never
           // ingested its real transcript). The proportional cap

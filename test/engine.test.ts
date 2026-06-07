@@ -11214,7 +11214,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).resolves.toBe(1);
   });
 
-  it("does not advance a placeholder checkpoint when no-anchor recovery throws mid-import (#639)", async () => {
+  it("keeps placeholder recovery retryable without duplicating a partially imported prefix (#639)", async () => {
     const engine = createEngine();
     const sessionId = "placeholder-no-anchor-import-failure";
     const sessionKey = "agent:opsos:telegram:test:direct:placeholder-failure";
@@ -11308,6 +11308,35 @@ describe("LcmContextEngine fidelity and token budget", () => {
       .getConversationStore()
       .getMessageCount(conversation!.conversationId);
     expect(count).toBe(4);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "failure assistant turn 7" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const retryCount = await engine
+      .getConversationStore()
+      .getMessageCount(conversation!.conversationId);
+    expect(retryCount).toBe(2 + entries.length);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(conversation!.conversationId, "user", "failure user turn 0"),
+    ).resolves.toBe(1);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(conversation!.conversationId, "assistant", "failure assistant turn 0"),
+    ).resolves.toBe(1);
+
+    const advanced = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(advanced?.lastProcessedOffset).toBe(statSync(sessionFile).size);
   });
 
   it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {
