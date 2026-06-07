@@ -7161,6 +7161,18 @@ export class LcmContextEngine implements ContextEngine {
               checkpoint.lastSeenMtimeMs === 0 &&
               checkpoint.lastProcessedOffset === 0 &&
               checkpoint.lastProcessedEntryHash === null;
+            if (params.isHeartbeat) {
+              if (!placeholderCheckpoint) {
+                await this.refreshBootstrapState({
+                  conversationId: conversation.conversationId,
+                  sessionFile: params.sessionFile,
+                });
+                this.deps.log.debug(
+                  `[lcm] afterTurn: skipped heartbeat transcript append-only delta and refreshed checkpoint conversation=${conversation.conversationId} sessionFile=${params.sessionFile} appendedMessages=${appended.messages.length}`,
+                );
+              }
+              return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+            }
             if (placeholderCheckpoint && appended.messages.length > 0) {
               const reconcile = await this.reconcileSessionTail({
                 sessionId: params.sessionId,

@@ -16055,6 +16055,76 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
     expect(conversation).toBeNull();
   });
+
+  it("afterTurn heartbeat flag skips append-only transcript deltas and advances the checkpoint", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-flag-append-only-skip";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-flag-append-only-skip";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-flag-append-only-skip");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const heartbeatMessages = [
+      makeMessage({
+        role: "user",
+        content:
+          "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+      }),
+      makeMessage({
+        role: "tool",
+        content: "# HEARTBEAT.md\n\nIf nothing needs attention, stay quiet.",
+      }),
+      makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+    ];
+    for (const message of heartbeatMessages) {
+      appendSessionMessage(sm, message);
+    }
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    let stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+    ]);
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "real user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "real assistant" }));
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "real assistant" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "real user",
+      "real assistant",
+    ]);
+  });
 });
 
 // ── afterTurn dedup guard ────────────────────────────────────────────────────
