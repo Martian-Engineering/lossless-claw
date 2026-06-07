@@ -12328,6 +12328,84 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).toBeNull();
   });
 
+  it("afterTurn does not recover checkpoint-missing transcript traffic from another runtime session", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const firstSessionId = "after-turn-checkpoint-missing-rollover-old-runtime";
+    const secondSessionId = "after-turn-checkpoint-missing-rollover-new-runtime";
+    const sessionKey = "agent:main:test:checkpoint-missing-runtime-rollover";
+
+    const oldSessionFile = createSessionFilePath("after-turn-checkpoint-missing-rollover-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old checkpoint-missing rollover question" },
+      { role: "assistant", content: "old checkpoint-missing rollover answer" },
+    ]);
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    expect(conversation?.bootstrappedAt).toBeTruthy();
+
+    const rawDb = createLcmDatabaseConnection(getEngineConfig(engine).databasePath);
+    try {
+      rawDb
+        .prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const newSessionFile = createSessionFilePath("after-turn-checkpoint-missing-rollover-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "new unrelated checkpoint-missing runtime question" },
+      { role: "assistant", content: "new unrelated checkpoint-missing runtime answer" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: "new unrelated checkpoint-missing runtime answer",
+        }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("did not cover the transcript frontier")),
+    ).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old checkpoint-missing rollover question",
+      "old checkpoint-missing rollover answer",
+    ]);
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+    await expect(
+      engine.getConversationStore().getConversationBySessionId(secondSessionId),
+    ).resolves.toBeNull();
+  });
+
   it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {
     const engine = createEngine();
     const sessionId = "bootstrap-transcript-epoch-no-anchor";

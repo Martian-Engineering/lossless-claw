@@ -7396,6 +7396,7 @@ export class LcmContextEngine implements ContextEngine {
         // delivery-only block).
         const recoverCheckpointMissingNoAnchor =
           reason === "checkpoint-missing" &&
+          conversation.sessionId === params.sessionId &&
           (params.allowNoAnchorImportOnCheckpointMissing === true ||
             conversation.bootstrappedAt !== null);
         const reconcile = await this.reconcileSessionTail({
