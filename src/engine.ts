@@ -1505,6 +1505,7 @@ const PROMPT_RECALL_SEARCH_LIMIT = PROMPT_RECALL_MAX_MESSAGES * 2;
 const PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT = PROMPT_RECALL_SEARCH_LIMIT * 4;
 const DELIVERY_ONLY_TRANSCRIPT_MAX_MESSAGES = 4;
 const INJECTED_DELIVERY_TRANSCRIPT_PATTERN = /\b(?:delivery[-_\s]?mirror|config[-_\s]?audit)\b/i;
+const INJECTED_METADATA_PREAMBLE_PREFIX = "Conversation info (untrusted metadata)";
 const OPENCLAW_RUNTIME_CONTEXT_SENTINEL =
   "OpenClaw runtime context for the immediately preceding user message. This context is runtime-generated, not user-author.";
 const PROMPT_RECALL_SENSITIVE_IDENTIFIER_PATTERN =
@@ -1567,6 +1568,16 @@ function isLikelyInjectedDeliveryOnlyTranscript(messages: AgentMessage[]): boole
     messages.length > 0 &&
     messages.length <= DELIVERY_ONLY_TRANSCRIPT_MAX_MESSAGES &&
     messages.every(isLikelyInjectedDeliveryMessage)
+  );
+}
+
+function isLikelyInjectedMetadataPreambleRecord(message: {
+  role: string;
+  content: string;
+}): boolean {
+  return (
+    message.role === "user" &&
+    message.content.trimStart().startsWith(INJECTED_METADATA_PREAMBLE_PREFIX)
   );
 }
 
@@ -6363,7 +6374,8 @@ export class LcmContextEngine implements ContextEngine {
       if (anchorIndex < 0) {
         if (params.allowNoAnchorImport) {
           if (
-            params.noAnchorImportReason === "path-mismatch" &&
+            (params.noAnchorImportReason === "path-mismatch" ||
+              params.noAnchorImportReason === "checkpoint-missing-recovery") &&
             isLikelyInjectedDeliveryOnlyTranscript(historicalMessages)
           ) {
             this.deps.log.warn(
@@ -7409,6 +7421,38 @@ export class LcmContextEngine implements ContextEngine {
             hasOverlap: sessionFileState.size === 0,
           };
         }
+        // #837: a conversation with bootstrapped_at SET but no bootstrap_state
+        // row reaches reason="checkpoint-missing" with a non-anchoring frontier
+        // (e.g. a single injected metadata preamble). Without a no-anchor import
+        // it imports 0 messages and never persists a checkpoint, so afterTurn
+        // loops the "did not cover the transcript frontier" warning forever and
+        // compaction never runs. The rotate lane already recovers via
+        // allowNoAnchorImportOnCheckpointMissing; mirror that on the afterTurn
+        // lane, but ONLY for the observed injected-metadata frontier. A real
+        // historical DB tail with a divergent rewritten transcript must still
+        // freeze per #649's no-proof-no-advance guard, so do not treat
+        // bootstrapped_at alone as lineage proof. The downstream no-anchor
+        // import path is itself guarded (replay-overlap detection, import cap,
+        // delivery-only block).
+        let checkpointMissingMetadataFrontier = false;
+        if (
+          reason === "checkpoint-missing" &&
+          conversation.sessionId === params.sessionId &&
+          conversation.bootstrappedAt !== null
+        ) {
+          const [existingMessageCount, latestPersistedMessage] = await Promise.all([
+            this.conversationStore.getMessageCount(conversation.conversationId),
+            this.conversationStore.getLastMessage(conversation.conversationId),
+          ]);
+          checkpointMissingMetadataFrontier =
+            existingMessageCount === 1 &&
+            latestPersistedMessage !== null &&
+            isLikelyInjectedMetadataPreambleRecord(latestPersistedMessage);
+        }
+        const recoverCheckpointMissingNoAnchor =
+          reason === "checkpoint-missing" &&
+          (params.allowNoAnchorImportOnCheckpointMissing === true ||
+            checkpointMissingMetadataFrontier);
         const reconcile = await this.reconcileSessionTail({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -7418,11 +7462,12 @@ export class LcmContextEngine implements ContextEngine {
           allowNoAnchorImport:
             reason === "path-mismatch" ||
             reason === "same-path-shrink" ||
-            (reason === "checkpoint-missing" && params.allowNoAnchorImportOnCheckpointMissing === true),
-          noAnchorImportReason:
-            reason === "checkpoint-missing" && params.allowNoAnchorImportOnCheckpointMissing === true
+            recoverCheckpointMissingNoAnchor,
+          noAnchorImportReason: recoverCheckpointMissingNoAnchor
+            ? params.allowNoAnchorImportOnCheckpointMissing === true
               ? "rotate-checkpoint-missing"
-              : reason,
+              : "checkpoint-missing-recovery"
+            : reason,
         });
         if (reconcile.blockedByImportCap) {
           return { importedMessages: 0, blockedByImportCap: true, hasOverlap: reconcile.hasOverlap };

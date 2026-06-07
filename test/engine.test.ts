@@ -12133,6 +12133,352 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(advancedState?.lastProcessedOffset).toBeGreaterThan(0);
   });
 
+  it("afterTurn recovers a checkpoint-missing conversation with a non-anchoring frontier instead of looping forever (#837)", async () => {
+    // #837: a conversation with bootstrapped_at set but NO
+    // conversation_bootstrap_state row classifies as reason="checkpoint-missing"
+    // on the afterTurn slow path. Unlike the rotate lane, afterTurn used to call
+    // reconcileSessionTail WITHOUT allowNoAnchorImportOnCheckpointMissing, so a
+    // DB frontier of only non-anchoring rows (e.g. an injected metadata
+    // preamble) imported 0 messages and never persisted a checkpoint. Net
+    // effect: every turn emitted "found no anchor and imported 0 messages" +
+    // "did not cover the transcript frontier" forever, compaction never ran, and
+    // the conversation was a permanent LCM no-op until manually archived.
+    //
+    // This is the sibling of the #649 follow-up above: there the transcript
+    // could not be stat/read (ENOENT) and the placeholder-seed escape hatch
+    // fired; here the transcript EXISTS with real content, so stat/read succeeds
+    // and the only escape is to let afterTurn import the no-anchor epoch the same
+    // way the rotate lane already does.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-checkpoint-missing-no-anchor-recovery";
+    const sessionKey = "agent:main:test:checkpoint-missing-no-anchor-recovery";
+
+    // Build the exact production shape: a single non-anchoring DB frontier row
+    // (the injected metadata preamble), bootstrapped_at set, and NO
+    // bootstrap_state row.
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine
+      .getConversationStore()
+      .markConversationBootstrapped(conversation!.conversationId);
+
+    const refreshed = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(refreshed?.bootstrappedAt).toBeTruthy();
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+
+    // A real, growing transcript whose messages do NOT anchor to the lone
+    // injected preamble row in the DB.
+    const sessionFile = createSessionFilePath("after-turn-checkpoint-missing-no-anchor");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "CRABPOT_837_FACT is amber-beacon-7." },
+      { role: "assistant", content: "noted the fact" },
+      { role: "user", content: "follow-up question" },
+      { role: "assistant", content: "follow-up answer" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "follow-up question" }),
+        makeMessage({ role: "assistant", content: "follow-up answer" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    // Recovery, not deadlock: the transcript history is imported and a
+    // bootstrap_state checkpoint is persisted so future turns advance.
+    const recoveredState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(recoveredState).not.toBeNull();
+    expect(recoveredState?.sessionFilePath).toBe(sessionFile);
+    expect(recoveredState?.lastProcessedOffset).toBeGreaterThan(0);
+
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).toContain("CRABPOT_837_FACT is amber-beacon-7.");
+    expect(contents).toContain("follow-up answer");
+
+    // The forever-loop warning pair must NOT have fired.
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(
+      warns.some((m) => m.includes("did not cover the transcript frontier")),
+    ).toBe(false);
+    expect(
+      warns.some((m) =>
+        m.includes("found no anchor and imported 0 messages; skipping checkpoint refresh"),
+      ),
+    ).toBe(false);
+
+    // A second ordinary turn must keep advancing on the fast path (no relapse
+    // into the checkpoint-missing slow-path loop).
+    warnLog.mockClear();
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "CRABPOT_837_FACT is amber-beacon-7." },
+      { role: "assistant", content: "noted the fact" },
+      { role: "user", content: "follow-up question" },
+      { role: "assistant", content: "follow-up answer" },
+      { role: "user", content: "third turn user" },
+      { role: "assistant", content: "third turn assistant" },
+    ]);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "third turn assistant" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const secondWarns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(
+      secondWarns.some((m) => m.includes("did not cover the transcript frontier")),
+    ).toBe(false);
+    const finalContents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(finalContents).toContain("third turn assistant");
+  });
+
+  it("afterTurn does not recover checkpoint-missing delivery-only transcript traffic", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-checkpoint-missing-delivery-only";
+    const sessionKey = "agent:main:signal:checkpoint-missing-delivery-only";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine
+      .getConversationStore()
+      .markConversationBootstrapped(conversation!.conversationId);
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+
+    const sessionFile = createSessionFilePath("after-turn-checkpoint-missing-delivery-only");
+    writeLeafTranscript(sessionFile, [
+      { role: "system", content: "delivery-mirror config-audit: refreshed host policy" },
+      { role: "system", content: "config-audit delivery-mirror: no user turn" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "assistant", content: "assistant delta without foreground user" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("delivery-only path-mismatched transcript")),
+    ).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "Conversation info (untrusted metadata): injected preamble",
+    ]);
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+  });
+
+  it("afterTurn does not recover checkpoint-missing transcript traffic from another runtime session", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const firstSessionId = "after-turn-checkpoint-missing-rollover-old-runtime";
+    const secondSessionId = "after-turn-checkpoint-missing-rollover-new-runtime";
+    const sessionKey = "agent:main:test:checkpoint-missing-runtime-rollover";
+
+    const oldSessionFile = createSessionFilePath("after-turn-checkpoint-missing-rollover-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old checkpoint-missing rollover question" },
+      { role: "assistant", content: "old checkpoint-missing rollover answer" },
+    ]);
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: firstSessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    expect(conversation?.bootstrappedAt).toBeTruthy();
+
+    const rawDb = createLcmDatabaseConnection(getEngineConfig(engine).databasePath);
+    try {
+      rawDb
+        .prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const newSessionFile = createSessionFilePath("after-turn-checkpoint-missing-rollover-new");
+    writeLeafTranscript(newSessionFile, [
+      { role: "user", content: "new unrelated checkpoint-missing runtime question" },
+      { role: "assistant", content: "new unrelated checkpoint-missing runtime answer" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: "new unrelated checkpoint-missing runtime answer",
+        }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("did not cover the transcript frontier")),
+    ).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old checkpoint-missing rollover question",
+      "old checkpoint-missing rollover answer",
+    ]);
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+    await expect(
+      engine.getConversationStore().getConversationBySessionId(secondSessionId),
+    ).resolves.toBeNull();
+  });
+
+  it("afterTurn does not recover checkpoint-missing divergent transcript over real history", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-checkpoint-missing-real-history";
+    const sessionKey = "agent:main:test:checkpoint-missing-real-history";
+
+    const oldSessionFile = createSessionFilePath("after-turn-checkpoint-missing-real-history-old");
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "old checkpoint-missing real-history question" },
+      { role: "assistant", content: "old checkpoint-missing real-history answer" },
+    ]);
+    await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    expect(conversation?.bootstrappedAt).toBeTruthy();
+
+    const rawDb = createLcmDatabaseConnection(getEngineConfig(engine).databasePath);
+    try {
+      rawDb
+        .prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    writeLeafTranscript(oldSessionFile, [
+      { role: "user", content: "rewritten unrelated checkpoint-missing question" },
+      { role: "assistant", content: "rewritten unrelated checkpoint-missing answer" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: oldSessionFile,
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: "rewritten unrelated checkpoint-missing answer",
+        }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("did not cover the transcript frontier")),
+    ).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old checkpoint-missing real-history question",
+      "old checkpoint-missing real-history answer",
+    ]);
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+  });
+
   it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {
     const engine = createEngine();
     const sessionId = "bootstrap-transcript-epoch-no-anchor";
