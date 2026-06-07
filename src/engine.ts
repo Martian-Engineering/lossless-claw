@@ -10958,7 +10958,9 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /** Scan OpenClaw-indexed startup transcripts and rotate oversized active LCM sessions. */
-  async autoRotateManagedSessionFilesAtStartup(): Promise<void> {
+  async autoRotateManagedSessionFilesAtStartup(params?: {
+    listStartupSessionFileCandidates?: () => Promise<StartupSessionFileCandidate[]>;
+  }): Promise<void> {
     const startedAt = Date.now();
     const thresholdBytes = this.config.autoRotateSessionFiles.sizeBytes;
     const mode = this.getAutoRotateSessionFileMode("startup");
@@ -10988,7 +10990,9 @@ export class LcmContextEngine implements ContextEngine {
       logSummary("engine-unhealthy");
       return;
     }
-    if (!this.deps.listStartupSessionFileCandidates) {
+    const listStartupSessionFileCandidates =
+      params?.listStartupSessionFileCandidates ?? this.deps.listStartupSessionFileCandidates;
+    if (!listStartupSessionFileCandidates) {
       logSummary("no-indexed-session-provider");
       return;
     }
@@ -10996,7 +11000,7 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     let indexedCandidates: StartupSessionFileCandidate[];
     try {
-      indexedCandidates = await this.deps.listStartupSessionFileCandidates();
+      indexedCandidates = await listStartupSessionFileCandidates();
     } catch (error) {
       summary.warned += 1;
       this.logAutoRotateSessionFileDecision({

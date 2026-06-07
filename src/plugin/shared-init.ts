@@ -19,12 +19,19 @@ import type { LcmContextEngine } from "../engine.js";
 export type SharedLcmInit = {
   /** Whether gateway_stop has been called. */
   stopped: boolean;
+  /** Whether startup maintenance has already been scheduled for this init. */
+  startupMaintenanceStarted: boolean;
   /** Sync accessor — returns the engine if already initialized, null otherwise. */
   getCachedEngine: () => LcmContextEngine | null;
   /** Async accessor for the initialized engine (waits for deferred init). */
   waitForEngine: () => Promise<LcmContextEngine>;
   /** Async accessor for the initialized DB handle (waits for deferred init). */
   waitForDatabase: () => Promise<DatabaseSync>;
+  /** Schedule startup maintenance once against the shared engine. */
+  runStartupMaintenanceOnce: (
+    scheduleStartupMaintenance: (engine: LcmContextEngine) => void,
+    logScheduleError: (error: unknown) => void,
+  ) => void;
 };
 
 const SHARED_KEY = Symbol.for(

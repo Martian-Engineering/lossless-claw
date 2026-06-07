@@ -6,6 +6,7 @@ import type { OpenClawPluginApi } from "../src/openclaw-bridge.js";
 import lcmPlugin from "../index.js";
 import * as connectionModule from "../src/db/connection.js";
 import { closeLcmConnection } from "../src/db/connection.js";
+import { LcmContextEngine } from "../src/engine.js";
 import { clearAllSharedInit } from "../src/plugin/shared-init.js";
 import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
 
@@ -281,6 +282,174 @@ describe("lcm plugin registration", () => {
     expect(warnLog).not.toHaveBeenCalledWith(
       expect.stringContaining("runtime.llm.complete is unavailable"),
     );
+  });
+
+  it("does not initialize runtime surfaces during runtime-scoped CLI metadata registration", () => {
+    const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+    const { api, getRegisteredContextEngines, infoLog, warnLog } = buildApi(
+      { enabled: true },
+      {
+        includeRuntimeLlm: false,
+      },
+    );
+    (api.runtime as { registrationMode?: string }).registrationMode = "cli-metadata";
+
+    lcmPlugin.register(api);
+
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(getRegisteredContextEngines()).toEqual([]);
+    expect(api.registerCommand).not.toHaveBeenCalled();
+    expect(api.registerTool).not.toHaveBeenCalled();
+    expect(api.on).not.toHaveBeenCalled();
+    expect(infoLog).not.toHaveBeenCalled();
+    expect(warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("runtime.llm.complete is unavailable"),
+    );
+  });
+
+  it.each(["discovery", "tool-discovery"])(
+    "does not eagerly initialize the engine during %s registration",
+    (registrationMode) => {
+      const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+      dbPaths.add(dbPath);
+      const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+      const { api, getFactory } = buildApi(
+        { enabled: true, dbPath },
+        { registrationMode },
+      );
+
+      lcmPlugin.register(api);
+
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(getFactory()).toBeTypeOf("function");
+    },
+  );
+
+  it.each(["discovery", "tool-discovery"])(
+    "does not schedule startup maintenance during %s registration",
+    async (registrationMode) => {
+      const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+      dbPaths.add(dbPath);
+      const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+      const autoRotateSpy = vi
+        .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
+        .mockResolvedValue();
+      const { api, getFactory } = buildApi(
+        { enabled: true, dbPath },
+        { registrationMode },
+      );
+
+      lcmPlugin.register(api);
+
+      const factory = getFactory();
+      expect(factory).toBeTypeOf("function");
+      await expect(Promise.resolve(factory!())).rejects.toThrow(
+        "Engine initialization is disabled during read-only plugin registration",
+      );
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(autoRotateSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it("schedules startup maintenance when live registration follows read-only registration", () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const autoRotateSpy = vi
+      .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
+      .mockResolvedValue();
+    const first = buildApi(
+      { enabled: true, dbPath },
+      { registrationMode: "discovery" },
+    );
+
+    lcmPlugin.register(first.api);
+    expect(autoRotateSpy).not.toHaveBeenCalled();
+
+    const second = buildApi({ enabled: true, dbPath });
+    lcmPlugin.register(second.api);
+
+    expect(autoRotateSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses live runtime startup APIs after read-only registration", () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const sessionStorePath = join(
+      tmpdir(),
+      `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
+    );
+    const autoRotateSpy = vi
+      .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
+      .mockResolvedValue();
+    writeFileSync(sessionStorePath, "{}\n", "utf8");
+
+    const first = buildApi(
+      { enabled: true, dbPath },
+      { registrationMode: "discovery" },
+    );
+    lcmPlugin.register(first.api);
+    expect(autoRotateSpy).not.toHaveBeenCalled();
+
+    const second = buildApi(
+      { enabled: true, dbPath },
+      {
+        runtimeConfig: {
+          session: {
+            store: sessionStorePath,
+          },
+        },
+      },
+    );
+    attachSessionStoreApi(second.api, sessionStorePath);
+    lcmPlugin.register(second.api);
+
+    expect(autoRotateSpy).toHaveBeenCalledTimes(1);
+    expect(autoRotateSpy).toHaveBeenCalledWith({
+      listStartupSessionFileCandidates: expect.any(Function),
+    });
+    rmSync(sessionStorePath, { force: true });
+  });
+
+  it("does not schedule startup maintenance during CLI runtime inspection", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    const originalArgv = process.argv;
+    dbPaths.add(dbPath);
+    const autoRotateSpy = vi
+      .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
+      .mockResolvedValue();
+    const { api, getFactory } = buildApi({ enabled: true, dbPath });
+
+    process.argv = ["node", "openclaw", "plugins", "inspect", "lossless-claw", "--runtime"];
+    try {
+      lcmPlugin.register(api);
+
+      const factory = getFactory();
+      expect(factory).toBeTypeOf("function");
+      await expect(Promise.resolve(factory!())).rejects.toThrow(
+        "Engine initialization is disabled during read-only plugin registration",
+      );
+      expect(autoRotateSpy).not.toHaveBeenCalled();
+    } finally {
+      process.argv = originalArgv;
+    }
+  });
+
+  it("does not eagerly initialize the engine during CLI runtime inspection", () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    const originalArgv = process.argv;
+    dbPaths.add(dbPath);
+    const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+    const { api, getFactory } = buildApi({ enabled: true, dbPath });
+
+    process.argv = ["node", "openclaw", "plugins", "inspect", "lossless-claw", "--runtime"];
+    try {
+      lcmPlugin.register(api);
+
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(getFactory()).toBeTypeOf("function");
+    } finally {
+      process.argv = originalArgv;
+    }
   });
 
   it("fails fast with a compatibility diagnostic when context-engine registration is unavailable", () => {

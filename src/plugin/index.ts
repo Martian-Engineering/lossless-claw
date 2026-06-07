@@ -525,7 +525,59 @@ function assertContextEngineRegistrationAvailable(
 
 /** Return true for OpenClaw's descriptor-only CLI registration pass. */
 function isCliMetadataRegistration(api: OpenClawPluginApi): boolean {
-  return (api as { registrationMode?: unknown }).registrationMode === "cli-metadata";
+  const topLevelMode = (api as { registrationMode?: unknown }).registrationMode;
+  if (topLevelMode === "cli-metadata") {
+    return true;
+  }
+  return (api.runtime as { registrationMode?: unknown } | undefined)?.registrationMode === "cli-metadata";
+}
+
+/** Return the public plugin registration mode exposed by newer OpenClaw hosts. */
+function readPluginRegistrationMode(api: OpenClawPluginApi): string | undefined {
+  const topLevelMode = (api as { registrationMode?: unknown }).registrationMode;
+  if (typeof topLevelMode === "string" && topLevelMode.trim()) {
+    return topLevelMode.trim();
+  }
+  const runtimeMode = (api.runtime as { registrationMode?: unknown } | undefined)?.registrationMode;
+  return typeof runtimeMode === "string" && runtimeMode.trim() ? runtimeMode.trim() : undefined;
+}
+
+/** Return true when the registration context is for diagnostics rather than live operation. */
+function isReadOnlyRegistrationMode(mode: string | undefined): boolean {
+  return mode === "cli-metadata" || mode === "discovery" || mode === "tool-discovery";
+}
+
+/** Detect the current OpenClaw CLI runtime inspection path before a host flag exists. */
+function isRuntimeInspectCliInvocation(argv: readonly string[] = process.argv): boolean {
+  const args = argv.slice(2);
+  const pluginsIndex = args.findIndex((arg) => arg === "plugins" || arg === "plugin");
+  if (pluginsIndex < 0) {
+    return false;
+  }
+  const subcommand = args[pluginsIndex + 1];
+  if (subcommand !== "inspect" && subcommand !== "info") {
+    return false;
+  }
+  return args.some((arg) => arg === "--runtime" || arg.startsWith("--runtime="));
+}
+
+/** Return true when the host explicitly marks this runtime load as read-only. */
+function hasReadOnlyRuntimeInspectionSignal(api: OpenClawPluginApi): boolean {
+  const runtime = isRecord(api.runtime) ? api.runtime : undefined;
+  const inspection = isRecord(runtime?.inspection) ? runtime.inspection : undefined;
+  const diagnostics = isRecord(runtime?.diagnostics) ? runtime.diagnostics : undefined;
+  return inspection?.readOnly === true || diagnostics?.readOnly === true;
+}
+
+/** Startup maintenance may write transcripts, summaries, checkpoints, or session stores. */
+function canRunStartupMaintenance(api: OpenClawPluginApi): boolean {
+  if (isReadOnlyRegistrationMode(readPluginRegistrationMode(api))) {
+    return false;
+  }
+  if (hasReadOnlyRuntimeInspectionSignal(api)) {
+    return false;
+  }
+  return !isRuntimeInspectCliInvocation();
 }
 
 /** Resolve plugin config from direct runtime injection or the root OpenClaw config fallback. */
@@ -1648,35 +1700,13 @@ const lcmPlugin = {
     const deps = createLcmDependencies(api, registrationConfig);
     const dbPath = deps.config.databasePath;
     const normalizedDbPath = normalizePath(dbPath);
-
-    // ── Singleton check ─────────────────────────────────────────────
-    // OpenClaw v2026.4.5+ calls register() per-agent-context (main,
-    // subagents, cron lanes). Reuse the existing connection and engine
-    // when the same DB path is already initialized.
-    const existingInit = getSharedInit(normalizedDbPath);
-    if (existingInit && !existingInit.stopped) {
-      deps.log.debug(`[lcm] Reusing shared engine init for db=${normalizedDbPath}`);
-      wirePluginHandlers(api, deps, existingInit);
-      return;
-    }
-
-    // ── Eager-first DB init with deferred fallback on lock ──────────
-    let database: DatabaseSync | null = null;
-    let lcm: LcmContextEngine | null = null;
-    let initPromise: Promise<LcmContextEngine> | null = null;
-    let initError: Error | null = null;
-    let resolveDeferredInit: ((engine: LcmContextEngine) => void) | null = null;
-    let rejectDeferredInit: ((error: Error) => void) | null = null;
-    let stopped = false;
-
-    /** Normalize unknown failures into stable Error instances. */
-    function toInitError(error: unknown): Error {
-      return error instanceof Error ? error : new Error(String(error));
-    }
+    const allowStartupMaintenance = canRunStartupMaintenance(api);
 
     /** Start the non-blocking startup scan for oversized LCM-managed transcripts. */
     function scheduleStartupAutoRotate(nextEngine: LcmContextEngine): void {
-      void nextEngine.autoRotateManagedSessionFilesAtStartup().catch((error) => {
+      void nextEngine.autoRotateManagedSessionFilesAtStartup({
+        listStartupSessionFileCandidates: deps.listStartupSessionFileCandidates,
+      }).catch((error) => {
         deps.log.warn(
           `[lcm] auto-rotate: phase=startup action=warn durationMs=0 reason=startup-scan-failed error=${describeLogError(error).replace(/\s+/g, "_")}`,
         );
@@ -1823,6 +1853,75 @@ const lcmPlugin = {
       });
     }
 
+    /** Schedule all startup maintenance with this registration's runtime surfaces. */
+    function scheduleStartupMaintenance(nextEngine: LcmContextEngine): void {
+      scheduleStartupAutoRotate(nextEngine);
+      scheduleStartupSessionTotalTokensRecovery(nextEngine);
+    }
+
+    function logStartupMaintenanceSchedulingError(error: unknown): void {
+      deps.log.warn(
+        `[lcm] startup maintenance scheduling failed: ${describeLogError(error)}`,
+      );
+    }
+
+    // ── Singleton check ─────────────────────────────────────────────
+    // OpenClaw v2026.4.5+ calls register() per-agent-context (main,
+    // subagents, cron lanes). Reuse the existing connection and engine
+    // when the same DB path is already initialized.
+    const existingInit = getSharedInit(normalizedDbPath);
+    if (existingInit && !existingInit.stopped) {
+      deps.log.debug(`[lcm] Reusing shared engine init for db=${normalizedDbPath}`);
+      if (allowStartupMaintenance) {
+        existingInit.runStartupMaintenanceOnce(
+          scheduleStartupMaintenance,
+          logStartupMaintenanceSchedulingError,
+        );
+      }
+      wirePluginHandlers(api, deps, existingInit);
+      return;
+    }
+
+    // ── Eager-first DB init with deferred fallback on lock ──────────
+    let database: DatabaseSync | null = null;
+    let lcm: LcmContextEngine | null = null;
+    let initPromise: Promise<LcmContextEngine> | null = null;
+    let initError: Error | null = null;
+    let resolveDeferredInit: ((engine: LcmContextEngine) => void) | null = null;
+    let rejectDeferredInit: ((error: Error) => void) | null = null;
+    let stopped = false;
+    let startupMaintenanceStarted = false;
+    let shared: SharedLcmInit | null = null;
+
+    /** Normalize unknown failures into stable Error instances. */
+    function toInitError(error: unknown): Error {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+
+    /** Schedule prompt-mutating startup maintenance once for live runtime registrations. */
+    function runStartupMaintenanceOnce(
+      scheduleStartupMaintenanceForEngine: (engine: LcmContextEngine) => void,
+      logScheduleError: (error: unknown) => void,
+    ): void {
+      if (startupMaintenanceStarted) {
+        return;
+      }
+      startupMaintenanceStarted = true;
+      if (shared) {
+        shared.startupMaintenanceStarted = true;
+      }
+
+      const cachedEngine = lcm;
+      if (cachedEngine) {
+        scheduleStartupMaintenanceForEngine(cachedEngine);
+        return;
+      }
+
+      void waitForEngine()
+        .then((nextEngine) => scheduleStartupMaintenanceForEngine(nextEngine))
+        .catch((error) => logScheduleError(error));
+    }
+
     /** Build a live DB+engine pair and roll back the DB handle if engine init fails. */
     function initializeEngine(): LcmContextEngine {
       const startedAt = Date.now();
@@ -1835,8 +1934,12 @@ const lcmPlugin = {
         (deps.log.hostInfo ?? deps.log.info)(
           `[lcm] Engine initialized for db=${normalizedDbPath} duration=${Date.now() - startedAt}ms`,
         );
-        scheduleStartupAutoRotate(nextEngine);
-        scheduleStartupSessionTotalTokensRecovery(nextEngine);
+        if (allowStartupMaintenance) {
+          runStartupMaintenanceOnce(
+            scheduleStartupMaintenance,
+            logStartupMaintenanceSchedulingError,
+          );
+        }
         return nextEngine;
       } catch (error) {
         closeLcmConnection(nextDatabase);
@@ -1880,6 +1983,9 @@ const lcmPlugin = {
 
     /** Return the initialized engine, waiting for deferred startup when the DB is lock-contended. */
     async function waitForEngine(): Promise<LcmContextEngine> {
+      if (!allowStartupMaintenance) {
+        throw new Error("[lcm] Engine initialization is disabled during read-only plugin registration");
+      }
       if (stopped) {
         throw new Error("[lcm] Database connection closed after gateway_stop");
       }
@@ -1918,45 +2024,52 @@ const lcmPlugin = {
       return database;
     }
 
-    try {
-      const nextEngine = initializeEngine();
-      initPromise = Promise.resolve(nextEngine);
-    } catch (error) {
-      const normalized = toInitError(error);
-      if (!/database is locked/i.test(normalized.message)) {
-        initError = normalized;
-        throw normalized;
-      }
+    if (allowStartupMaintenance) {
+      try {
+        const nextEngine = initializeEngine();
+        initPromise = Promise.resolve(nextEngine);
+      } catch (error) {
+        const normalized = toInitError(error);
+        if (!/database is locked/i.test(normalized.message)) {
+          initError = normalized;
+          throw normalized;
+        }
 
-      deps.log.warn("[lcm] DB locked during eager init, deferring to gateway_start");
-      ensureDeferredInitPromise();
-      api.on("gateway_start", async () => {
-        if (stopped || lcm || initError) {
-          return;
-        }
-        try {
-          const nextEngine = initializeEngine();
-          initPromise = Promise.resolve(nextEngine);
-          resolveDeferredEngine(nextEngine);
-        } catch (retryError) {
-          const normalizedRetryError = toInitError(retryError);
-          rejectDeferredEngine(normalizedRetryError);
-          deps.log.error(`[lcm] Deferred DB init failed: ${normalizedRetryError.message}`);
-        }
-      });
+        deps.log.warn("[lcm] DB locked during eager init, deferring to gateway_start");
+        ensureDeferredInitPromise();
+        api.on("gateway_start", async () => {
+          if (stopped || lcm || initError) {
+            return;
+          }
+          try {
+            const nextEngine = initializeEngine();
+            initPromise = Promise.resolve(nextEngine);
+            resolveDeferredEngine(nextEngine);
+          } catch (retryError) {
+            const normalizedRetryError = toInitError(retryError);
+            rejectDeferredEngine(normalizedRetryError);
+            deps.log.error(`[lcm] Deferred DB init failed: ${normalizedRetryError.message}`);
+          }
+        });
+      }
     }
 
-    const shared: SharedLcmInit = {
+    const nextShared: SharedLcmInit = {
       stopped: false,
+      startupMaintenanceStarted,
       getCachedEngine: () => lcm,
       waitForEngine,
       waitForDatabase,
+      runStartupMaintenanceOnce,
     };
-    setSharedInit(normalizedDbPath, shared);
+    shared = nextShared;
+    if (allowStartupMaintenance) {
+      setSharedInit(normalizedDbPath, nextShared);
+    }
 
     api.on("gateway_stop", async () => {
       stopped = true;
-      shared.stopped = true;
+      nextShared.stopped = true;
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
@@ -1968,7 +2081,7 @@ const lcmPlugin = {
       removeSharedInit(normalizedDbPath);
     });
 
-    wirePluginHandlers(api, deps, shared);
+    wirePluginHandlers(api, deps, nextShared);
 
     logStartupBannerOnce({
       key: "plugin-loaded",
