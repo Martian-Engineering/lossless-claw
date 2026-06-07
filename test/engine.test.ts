@@ -12265,6 +12265,69 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(finalContents).toContain("third turn assistant");
   });
 
+  it("afterTurn does not recover checkpoint-missing delivery-only transcript traffic", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-checkpoint-missing-delivery-only";
+    const sessionKey = "agent:main:signal:checkpoint-missing-delivery-only";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine
+      .getConversationStore()
+      .markConversationBootstrapped(conversation!.conversationId);
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+
+    const sessionFile = createSessionFilePath("after-turn-checkpoint-missing-delivery-only");
+    writeLeafTranscript(sessionFile, [
+      { role: "system", content: "delivery-mirror config-audit: refreshed host policy" },
+      { role: "system", content: "config-audit delivery-mirror: no user turn" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "assistant", content: "assistant delta without foreground user" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("delivery-only path-mismatched transcript")),
+    ).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "Conversation info (untrusted metadata): injected preamble",
+    ]);
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+  });
+
   it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {
     const engine = createEngine();
     const sessionId = "bootstrap-transcript-epoch-no-anchor";

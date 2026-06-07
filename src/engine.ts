@@ -6333,7 +6333,8 @@ export class LcmContextEngine implements ContextEngine {
       if (anchorIndex < 0) {
         if (params.allowNoAnchorImport) {
           if (
-            params.noAnchorImportReason === "path-mismatch" &&
+            (params.noAnchorImportReason === "path-mismatch" ||
+              params.noAnchorImportReason === "checkpoint-missing-recovery") &&
             isLikelyInjectedDeliveryOnlyTranscript(historicalMessages)
           ) {
             this.deps.log.warn(
