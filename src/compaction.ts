@@ -122,6 +122,10 @@ type PassResult = {
   /** Token count of the newly created summary. */
   addedTokens: number;
 };
+type CondensedPassSkipped = {
+  skipped: "empty-source";
+};
+type CondensedPassResult = PassResult | CondensedPassSkipped;
 type LeafChunkSelection = {
   items: ContextItemRecord[];
   rawTokensOutsideTail: number;
@@ -130,6 +134,7 @@ type LeafChunkSelection = {
 type CondensedChunkSelection = {
   items: ContextItemRecord[];
   summaryTokens: number;
+  meaningfulCount: number;
 };
 type CondensedPhaseCandidate = {
   targetDepth: number;
@@ -285,10 +290,14 @@ const STRUCTURED_MEDIA_NESTED_KEYS = [
   "query",
   "command",
 ] as const;
-const CLOSED_REASONING_TEXT_BLOCK_RE =
-  /<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\1\s*>/gi;
+const LEADING_CLOSED_REASONING_TEXT_BLOCK_RE =
+  /^<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\1\s*>/i;
+const STANDALONE_CLOSED_REASONING_TEXT_BLOCK_RE =
+  /(^|\n)[ \t]*<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\2\s*>[ \t]*(?=\n|$)/gi;
 const REASONING_TEXT_START_RE =
-  /^(?:<\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\]|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:)/i;
+  /^(?:<\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\])/i;
+const STANDALONE_REASONING_TEXT_START_RE =
+  /(^|\n)[ \t]*(?:<\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\])[\s\S]*$/i;
 
 const CONDENSED_MIN_INPUT_RATIO = 0.1;
 
@@ -395,9 +404,29 @@ export function stripInjectedContextBlocks(content: string, tags: string[] | und
   return result.trim();
 }
 
+type MeaningfulTextOptions = {
+  stripPlainTextReasoning?: boolean;
+};
+
 function stripPlainTextReasoningPayloads(content: string): string {
-  const strippedClosedBlocks = content.replace(CLOSED_REASONING_TEXT_BLOCK_RE, "");
-  const trimmed = strippedClosedBlocks.trim();
+  let trimmed = content.trim();
+  while (true) {
+    const match = trimmed.match(LEADING_CLOSED_REASONING_TEXT_BLOCK_RE);
+    if (!match) {
+      break;
+    }
+    trimmed = trimmed.slice(match[0].length).trimStart();
+  }
+  trimmed = trimmed
+    .replace(
+      STANDALONE_CLOSED_REASONING_TEXT_BLOCK_RE,
+      (_match, lineStart: string) => (lineStart === "\n" ? "\n" : ""),
+    )
+    .replace(
+      STANDALONE_REASONING_TEXT_START_RE,
+      (_match, lineStart: string) => (lineStart === "\n" ? "\n" : ""),
+    )
+    .trim();
   if (!trimmed) {
     return "";
   }
@@ -407,30 +436,37 @@ function stripPlainTextReasoningPayloads(content: string): string {
   return trimmed;
 }
 
+function sanitizeTextFragment(value: string, options: MeaningfulTextOptions): string {
+  const withoutMedia = stripEmbeddedMediaPayloads(value);
+  return options.stripPlainTextReasoning
+    ? stripPlainTextReasoningPayloads(withoutMedia)
+    : withoutMedia;
+}
+
 /** Extract human-readable text from structured content while ignoring attachment payload fields. */
-function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
+function extractSanitizedStructuredText(
+  value: unknown,
+  options: MeaningfulTextOptions = {},
+  depth = 0,
+): string[] {
   if (depth >= 4 || value == null) {
     return [];
   }
   if (typeof value === "string") {
-    const sanitized = stripPlainTextReasoningPayloads(stripEmbeddedMediaPayloads(value));
+    const sanitized = sanitizeTextFragment(value, options);
     return sanitized ? [sanitized] : [];
   }
   if (Array.isArray(value)) {
-    return value.flatMap((entry) => extractSanitizedStructuredText(entry, depth + 1));
+    return value.flatMap((entry) => extractSanitizedStructuredText(entry, options, depth + 1));
   }
   if (typeof value !== "object") {
     return [];
   }
 
   const record = value as Record<string, unknown>;
-  const rawType =
-    typeof record.type === "string"
-      ? record.type.trim().toLowerCase()
-      : typeof record.rawType === "string"
-        ? record.rawType.trim().toLowerCase()
-        : "";
-  if (PROVIDER_REASONING_RAW_TYPES.has(rawType)) {
+  const type = typeof record.type === "string" ? record.type.trim().toLowerCase() : "";
+  const rawType = typeof record.rawType === "string" ? record.rawType.trim().toLowerCase() : "";
+  if (PROVIDER_REASONING_RAW_TYPES.has(type) || PROVIDER_REASONING_RAW_TYPES.has(rawType)) {
     return [];
   }
   const textFragments: string[] = [];
@@ -440,18 +476,18 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
     if (typeof candidate !== "string") {
       continue;
     }
-    const sanitized = stripPlainTextReasoningPayloads(stripEmbeddedMediaPayloads(candidate));
+    const sanitized = sanitizeTextFragment(candidate, options);
     if (sanitized) {
       textFragments.push(sanitized);
     }
   }
 
-  if (MEDIA_ATTACHMENT_RAW_TYPES.has(rawType)) {
+  if (MEDIA_ATTACHMENT_RAW_TYPES.has(type) || MEDIA_ATTACHMENT_RAW_TYPES.has(rawType)) {
     return textFragments;
   }
 
   for (const key of STRUCTURED_MEDIA_NESTED_KEYS) {
-    textFragments.push(...extractSanitizedStructuredText(record[key], depth + 1));
+    textFragments.push(...extractSanitizedStructuredText(record[key], options, depth + 1));
   }
 
   return textFragments;
@@ -469,7 +505,10 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
  * @internal Exported for tests; production code reaches it via the
  * compaction-engine entry points.
  */
-export function extractMeaningfulMessageText(content: string): string {
+export function extractMeaningfulMessageText(
+  content: string,
+  options: MeaningfulTextOptions = {},
+): string {
   if (typeof content !== "string") return "";
   const trimmed = content.trim();
   if (!trimmed) {
@@ -478,7 +517,7 @@ export function extractMeaningfulMessageText(content: string): string {
   if ((trimmed.startsWith("[") && trimmed.endsWith("]")) || (trimmed.startsWith("{") && trimmed.endsWith("}"))) {
     try {
       const parsed = JSON.parse(trimmed) as unknown;
-      const extracted = extractSanitizedStructuredText(parsed)
+      const extracted = extractSanitizedStructuredText(parsed, options)
         .map((fragment) => fragment.trim())
         .filter(Boolean);
       return extracted.join("\n").trim();
@@ -486,7 +525,12 @@ export function extractMeaningfulMessageText(content: string): string {
       // Fall back to plain-text sanitation below.
     }
   }
-  return stripPlainTextReasoningPayloads(stripEmbeddedMediaPayloads(content));
+  return sanitizeTextFragment(content, options);
+}
+
+/** Normalize stored summary content before it is fed into a later summarizer pass. */
+function extractMeaningfulSummaryText(content: string): string {
+  return extractMeaningfulMessageText(content, { stripPlainTextReasoning: true });
 }
 
 /** Map stored message roles back to runtime roles for structured reconstruction. */
@@ -818,7 +862,7 @@ export class CompactionEngine {
       for (let targetDepth = 0; targetDepth < sweepMaxDepth; targetDepth++) {
         const fanout = this.resolveFanoutForDepth(targetDepth, false);
         const chunk = await this.selectOldestChunkAtDepth(conversationId, targetDepth);
-        if (chunk.items.length < fanout || chunk.summaryTokens < condensedMinChunkTokens) {
+        if (chunk.meaningfulCount < fanout || chunk.summaryTokens < condensedMinChunkTokens) {
           break;
         }
 
@@ -830,7 +874,7 @@ export class CompactionEngine {
           summarize,
           input.summaryModel,
         );
-        if (!condenseResult) {
+        if (!condenseResult || "skipped" in condenseResult) {
           break;
         }
         const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
@@ -1082,6 +1126,9 @@ export class CompactionEngine {
       if (!condenseResult) {
         hadAuthFailure = true;
         return "auth-failure";
+      }
+      if ("skipped" in condenseResult) {
+        return "no-progress";
       }
       const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
       await this.persistCompactionEvents({
@@ -1521,15 +1568,14 @@ export class CompactionEngine {
           item.ordinal < startOrdinal &&
           item.itemType === "summary" &&
           typeof item.summaryId === "string",
-      )
-      .slice(-2);
+      );
 
     if (priorSummaryItems.length === 0) {
       return undefined;
     }
 
     const summaryContents: string[] = [];
-    for (const item of priorSummaryItems) {
+    for (const item of [...priorSummaryItems].reverse()) {
       if (typeof item.summaryId !== "string") {
         continue;
       }
@@ -1538,9 +1584,12 @@ export class CompactionEngine {
       // Leaf continuity context is also summarizer input. Sanitize legacy
       // summary rows here so pre-#503 reasoning blocks cannot leak forward
       // when the next raw chunk is compacted.
-      const sanitized = extractMeaningfulMessageText(rawContent).trim();
+      const sanitized = extractMeaningfulSummaryText(rawContent).trim();
       if (sanitized) {
         summaryContents.push(sanitized);
+        if (summaryContents.length >= 2) {
+          break;
+        }
       }
     }
 
@@ -1548,7 +1597,7 @@ export class CompactionEngine {
       return undefined;
     }
 
-    return summaryContents.join("\n\n");
+    return [...summaryContents].reverse().join("\n\n");
   }
 
   /** Resolve summary token count with content-length fallback. */
@@ -1561,6 +1610,10 @@ export class CompactionEngine {
       return summary.tokenCount;
     }
     return estimateTokens(summary.content);
+  }
+
+  private summaryHasMeaningfulCondensedSource(summary: SummaryRecord): boolean {
+    return extractMeaningfulSummaryText(summary.content).trim().length > 0;
   }
 
   /** Resolve message token count with content-length fallback. */
@@ -1705,7 +1758,7 @@ export class CompactionEngine {
         targetDepth,
         freshTailOrdinal,
       );
-      if (chunk.items.length < fanout) {
+      if (chunk.meaningfulCount < fanout) {
         continue;
       }
       if (chunk.summaryTokens < minChunkTokens) {
@@ -1737,6 +1790,7 @@ export class CompactionEngine {
 
     const chunk: ContextItemRecord[] = [];
     let summaryTokens = 0;
+    let meaningfulCount = 0;
     for (const item of contextItems) {
       if (item.ordinal >= freshTailOrdinal) {
         break;
@@ -1761,20 +1815,27 @@ export class CompactionEngine {
         }
         continue;
       }
+      const hasMeaningfulSource = this.summaryHasMeaningfulCondensedSource(summary);
+      if (!hasMeaningfulSource && chunk.length === 0) {
+        continue;
+      }
       const tokenCount = this.resolveSummaryTokenCount(summary);
 
-      if (chunk.length > 0 && summaryTokens + tokenCount > chunkTokenBudget) {
+      if (hasMeaningfulSource && chunk.length > 0 && summaryTokens + tokenCount > chunkTokenBudget) {
         break;
       }
 
       chunk.push(item);
-      summaryTokens += tokenCount;
+      if (hasMeaningfulSource) {
+        meaningfulCount++;
+        summaryTokens += tokenCount;
+      }
       if (summaryTokens >= chunkTokenBudget) {
         break;
       }
     }
 
-    return { items: chunk, summaryTokens };
+    return { items: chunk, summaryTokens, meaningfulCount };
   }
 
   private async resolvePriorSummaryContextAtDepth(
@@ -1793,14 +1854,13 @@ export class CompactionEngine {
           item.ordinal < startOrdinal &&
           item.itemType === "summary" &&
           typeof item.summaryId === "string",
-      )
-      .slice(-4);
+      );
     if (priorSummaryItems.length === 0) {
       return undefined;
     }
 
     const summaryContents: string[] = [];
-    for (const item of priorSummaryItems) {
+    for (const item of [...priorSummaryItems].reverse()) {
       if (typeof item.summaryId !== "string") {
         continue;
       }
@@ -1818,16 +1878,19 @@ export class CompactionEngine {
       // Skip such summaries entirely — falling back to `rawContent` would
       // re-introduce the very thinking/reasoning payload this sanitizer is
       // trying to keep out of higher-level summarizer inputs.
-      const sanitized = extractMeaningfulMessageText(rawContent).trim();
+      const sanitized = extractMeaningfulSummaryText(rawContent).trim();
       if (sanitized) {
         summaryContents.push(sanitized);
+        if (summaryContents.length >= 2) {
+          break;
+        }
       }
     }
 
     if (summaryContents.length === 0) {
       return undefined;
     }
-    return summaryContents.slice(-2).join("\n\n");
+    return [...summaryContents].reverse().join("\n\n");
   }
 
   /**
@@ -1953,7 +2016,7 @@ export class CompactionEngine {
     const partText = parts
       .filter((part) => !isMediaAttachmentPart(part))
       .map((part) => (typeof part.textContent === "string" ? part.textContent : ""))
-      .map((text) => stripPlainTextReasoningPayloads(stripEmbeddedMediaPayloads(text)))
+      .map((text) => stripEmbeddedMediaPayloads(text))
       .map((text) => text.trim())
       .filter(Boolean)
       .join("\n")
@@ -2142,7 +2205,7 @@ export class CompactionEngine {
     targetDepth: number,
     summarize: CompactionSummarizeFn,
     summaryModel?: string,
-  ): Promise<PassResult | null> {
+  ): Promise<CondensedPassResult | null> {
     // Fetch full summary records
     const summaryRecords: SummaryRecord[] = [];
     for (const item of summaryItems) {
@@ -2171,11 +2234,17 @@ export class CompactionEngine {
         const latestAt = summary.latestAt ?? summary.createdAt;
         const tz = this.config.timezone;
         const header = `[${formatTimestamp(earliestAt, tz)} - ${formatTimestamp(latestAt, tz)}]`;
-        const sanitized = extractMeaningfulMessageText(summary.content).trim();
+        const sanitized = extractMeaningfulSummaryText(summary.content).trim();
         return sanitized ? `${header}\n${sanitized}` : "";
       })
       .filter((entry) => entry.trim().length > 0)
       .join("\n\n");
+    if (!concatenated.trim()) {
+      this.log.warn(
+        `[lcm] condensed compaction skipped summary write; conversationId=${conversationId}; depth=${targetDepth}; chunkSummaries=${summaryRecords.length}; sanitized_source=empty`,
+      );
+      return { skipped: "empty-source" };
+    }
     const fileIds = dedupeOrderedIds(
       summaryRecords.flatMap((summary) => [
         ...summary.fileIds,

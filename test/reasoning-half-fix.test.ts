@@ -57,6 +57,19 @@ describe("extractMeaningfulMessageText (B2: shared sanitizer)", () => {
     expect(extractMeaningfulMessageText(content)).toBe("Visible legacy text.");
   });
 
+  it("strips rawType reasoning blocks even when type is generic", () => {
+    const content = JSON.stringify([
+      {
+        type: "provider_block",
+        rawType: "reasoning",
+        text: "PRIVATE_PROVIDER_REASONING",
+      },
+      { type: "text", text: "Visible provider text." },
+    ]);
+
+    expect(extractMeaningfulMessageText(content)).toBe("Visible provider text.");
+  });
+
   it("strips redacted_thinking blocks (Anthropic encrypted reasoning shape)", () => {
     const content = JSON.stringify([
       {
@@ -102,23 +115,71 @@ describe("extractMeaningfulMessageText (B2: shared sanitizer)", () => {
     ).toBe("Just a plain log line about reasoning.");
   });
 
+  it("preserves reasoning-looking plain text in raw messages", () => {
+    expect(
+      extractMeaningfulMessageText(
+        "Thinking Process: user pasted a bug report that starts with this heading.",
+      ),
+    ).toBe("Thinking Process: user pasted a bug report that starts with this heading.");
+    expect(
+      extractMeaningfulMessageText("<think>Document the provider tag syntax."),
+    ).toBe("<think>Document the provider tag syntax.");
+  });
+
   it("strips raw closed reasoning tags from legacy plain-text summaries", () => {
     expect(
       extractMeaningfulMessageText(
         "<think>PRIVATE_LEGACY_REASONING</think>Visible legacy summary.",
+        { stripPlainTextReasoning: true },
       ),
     ).toBe("Visible legacy summary.");
   });
 
+  it("preserves literal closed reasoning tags inside legacy summary prose", () => {
+    expect(
+      extractMeaningfulMessageText(
+        "User asked whether <think>foo</think> is supported.",
+        { stripPlainTextReasoning: true },
+      ),
+    ).toBe("User asked whether <think>foo</think> is supported.");
+  });
+
+  it("strips standalone trailing reasoning sections from legacy summaries", () => {
+    expect(
+      extractMeaningfulMessageText(
+        "Visible legacy summary.\n<think>PRIVATE_TRAILING_REASONING</think>",
+        { stripPlainTextReasoning: true },
+      ),
+    ).toBe("Visible legacy summary.");
+    expect(
+      extractMeaningfulMessageText(
+        "Visible legacy summary.\n[thinking] PRIVATE_TRAILING_REASONING",
+        { stripPlainTextReasoning: true },
+      ),
+    ).toBe("Visible legacy summary.");
+  });
+
+  it("preserves prose headings inside legacy summaries", () => {
+    expect(
+      extractMeaningfulMessageText(
+        "Thinking Process: user-authored section that was summarized.",
+        { stripPlainTextReasoning: true },
+      ),
+    ).toBe("Thinking Process: user-authored section that was summarized.");
+  });
+
   it("drops raw reasoning-only legacy plain-text summaries", () => {
     expect(
-      extractMeaningfulMessageText("<thinking>PRIVATE_LEGACY_REASONING</thinking>"),
+      extractMeaningfulMessageText("<thinking>PRIVATE_LEGACY_REASONING</thinking>", {
+        stripPlainTextReasoning: true,
+      }),
     ).toBe("");
     expect(
       extractMeaningfulMessageText(
         "Thinking Process: PRIVATE_LEGACY_REASONING before the answer.",
+        { stripPlainTextReasoning: true },
       ),
-    ).toBe("");
+    ).toBe("Thinking Process: PRIVATE_LEGACY_REASONING before the answer.");
   });
 });
 
@@ -398,6 +459,31 @@ describe("createLcmSummarizeFromLegacyParams (B1: reasoning-leak guardrail)", ()
     expect(deps.complete).toHaveBeenCalledTimes(1);
   });
 
+  it("recovers from envelope when content text is reasoning-only", async () => {
+    const deps = makeDeps({
+      complete: vi.fn(async () => ({
+        content: [{ type: "text", text: "<think>PRIVATE_CONTENT_REASONING</think>" }],
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Recovered envelope summary." }],
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: { provider: "openrouter", model: "qwen/qwen3-235b" },
+    });
+    const summary = await summarize!("Source text.", false);
+
+    expect(summary).toBe("Recovered envelope summary.");
+    expect(summary).not.toContain("PRIVATE_CONTENT_REASONING");
+    expect(deps.complete).toHaveBeenCalledTimes(1);
+  });
+
   it("does not drop a clean summary that merely mentions the word 'reasoning'", async () => {
     const deps = makeDeps({
       complete: vi.fn(async () => ({
@@ -419,6 +505,74 @@ describe("createLcmSummarizeFromLegacyParams (B1: reasoning-leak guardrail)", ()
     expect(summary).toBe(
       "User asked about reasoning models and how thinking budgets work.",
     );
+    expect(deps.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves literal closed thinking tags inside clean provider summaries", async () => {
+    const deps = makeDeps({
+      complete: vi.fn(async () => ({
+        content: [
+          {
+            type: "text",
+            text: "User asked whether <think>foo</think> is supported.",
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: { provider: "openrouter", model: "qwen/qwen3-235b" },
+    });
+    const summary = await summarize!("Source text.", false);
+
+    expect(summary).toBe("User asked whether <think>foo</think> is supported.");
+    expect(deps.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("strips standalone trailing reasoning blocks from provider summaries", async () => {
+    const deps = makeDeps({
+      complete: vi.fn(async () => ({
+        content: [
+          {
+            type: "text",
+            text: "Visible provider summary.\n<think>PRIVATE_TRAILING_REASONING</think>",
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: { provider: "openrouter", model: "qwen/qwen3-235b" },
+    });
+    const summary = await summarize!("Source text.", false);
+
+    expect(summary).toBe("Visible provider summary.");
+    expect(summary).not.toContain("PRIVATE_TRAILING_REASONING");
+    expect(deps.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("strips trailing Thinking Process sections from provider summaries", async () => {
+    const deps = makeDeps({
+      complete: vi.fn(async () => ({
+        content: [
+          {
+            type: "text",
+            text: "Visible provider summary.\nThinking Process: PRIVATE_TRAILING_REASONING",
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: { provider: "openrouter", model: "qwen/qwen3-235b" },
+    });
+    const summary = await summarize!("Source text.", false);
+
+    expect(summary).toBe("Visible provider summary.");
+    expect(summary).not.toContain("PRIVATE_TRAILING_REASONING");
     expect(deps.complete).toHaveBeenCalledTimes(1);
   });
 });

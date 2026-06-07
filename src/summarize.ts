@@ -110,10 +110,14 @@ const DIAGNOSTIC_MAX_OBJECT_KEYS = 16;
 const DIAGNOSTIC_MAX_CHARS = 1200;
 const DIAGNOSTIC_SENSITIVE_KEY_PATTERN =
   /(api[-_]?key|authorization|token|secret|password|cookie|set-cookie|private[-_]?key|bearer)/i;
-const CLOSED_REASONING_SUMMARY_BLOCK_RE =
-  /<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\1\s*>/gi;
+const LEADING_CLOSED_REASONING_SUMMARY_BLOCK_RE =
+  /^<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\1\s*>/i;
+const STANDALONE_CLOSED_REASONING_SUMMARY_BLOCK_RE =
+  /(^|\n)[ \t]*<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\2\s*>[ \t]*(?=\n|$)/gi;
 const REASONING_SUMMARY_START_RE =
   /^(?:<\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\]|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:)/i;
+const STANDALONE_REASONING_SUMMARY_START_RE =
+  /(^|\n)[ \t]*(?:<\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\]|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:)[\s\S]*$/i;
 const REASONING_DIAGNOSTIC_MARKER_RE =
   /(?:<\s*\/?\s*(?:think|thinking|reasoning)(?:\s[^>]*)?>|<\|\s*(?:start_of_)?(?:think|thinking|reasoning)\s*\|>|\[\s*(?:think|thinking|reasoning)\s*\]|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:)/i;
 const AUTH_ERROR_TEXT_PATTERN =
@@ -411,6 +415,45 @@ function normalizeCompletionSummary(content: unknown): { summary: string; blockT
   };
 }
 
+/** Normalize top-level response fields after the primary content path fails. */
+function normalizeCompletionEnvelope(response: unknown): ReturnType<typeof normalizeCompletionSummary> {
+  if (!isRecord(response)) {
+    return normalizeCompletionSummary(response);
+  }
+  const envelope = { ...response };
+  delete envelope.content;
+  return normalizeCompletionSummary(envelope);
+}
+
+function stripLeadingClosedReasoningBlocks(value: string): { text: string; dropped: boolean } {
+  let remainder = value.trim();
+  let dropped = false;
+  while (true) {
+    const match = remainder.match(LEADING_CLOSED_REASONING_SUMMARY_BLOCK_RE);
+    if (!match) {
+      break;
+    }
+    remainder = remainder.slice(match[0].length).trimStart();
+    dropped = true;
+  }
+  return { text: remainder.trim(), dropped };
+}
+
+function stripStandaloneReasoningBlocks(value: string): { text: string; dropped: boolean } {
+  const withoutClosedBlocks = value.replace(
+    STANDALONE_CLOSED_REASONING_SUMMARY_BLOCK_RE,
+    (match, lineStart: string) => (lineStart === "\n" ? "\n" : ""),
+  );
+  const withoutTrailingOpenBlock = withoutClosedBlocks.replace(
+    STANDALONE_REASONING_SUMMARY_START_RE,
+    (match, lineStart: string) => (lineStart === "\n" ? "\n" : ""),
+  );
+  return {
+    text: withoutTrailingOpenBlock.trim(),
+    dropped: withoutTrailingOpenBlock !== value,
+  };
+}
+
 /**
  * Remove provider reasoning/thinking payloads leaking through as summary text.
  *
@@ -438,14 +481,13 @@ function sanitizeReasoningSummaryText(value: string): {
     return { summary: "", droppedReasoning: false, reasoningOnly: false };
   }
 
-  // Strip every CLOSED `<think>...</think>` / `<thinking>...</thinking>` /
-  // `<reasoning>...</reasoning>` block.  A closed reasoning block followed
-  // by a non-empty summary body (the common pattern when the provider
-  // emits a reasoning trace and then a normal answer, e.g.
-  // `<think>...</think>Actual summary text`) is kept, but the reasoning
-  // prefix itself must not be persisted.
-  const withoutClosedThink = trimmed.replace(CLOSED_REASONING_SUMMARY_BLOCK_RE, "");
-  const remainder = withoutClosedThink.trim();
+  // Strip leading CLOSED `<think>...</think>` / `<thinking>...</thinking>` /
+  // `<reasoning>...</reasoning>` blocks.  A leading closed reasoning block
+  // followed by a non-empty summary body is kept as the body, but literal tag
+  // examples later in otherwise valid prose are preserved.
+  const strippedLeading = stripLeadingClosedReasoningBlocks(trimmed);
+  const strippedStandalone = stripStandaloneReasoningBlocks(strippedLeading.text);
+  const remainder = strippedStandalone.text;
   if (!remainder) {
     // Either the entire body was a closed reasoning block (no summary
     // text after) or the input was empty — both are reasoning-only.
@@ -461,7 +503,7 @@ function sanitizeReasoningSummaryText(value: string): {
 
   return {
     summary: remainder,
-    droppedReasoning: remainder !== trimmed,
+    droppedReasoning: strippedLeading.dropped || strippedStandalone.dropped,
     reasoningOnly: false,
   };
 }
@@ -1751,9 +1793,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       if (!summary) {
         // Envelope-aware extraction: some providers place summary text in
         // top-level response fields (output, message, response) rather than
-        // inside the content array.  Re-run normalization against the full
-        // response envelope before spending an API call on a retry.
-        envelopeNormalized = normalizeCompletionSummary(result);
+        // inside the content array.  Re-run normalization against top-level
+        // response fields before spending an API call on a retry.
+        envelopeNormalized = normalizeCompletionEnvelope(result);
         if (envelopeNormalized.summary) {
           summary = envelopeNormalized.summary;
           summarySource = "envelope";
@@ -1789,8 +1831,23 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               `block_types=${formatBlockTypes(droppedBlockTypes)}; ` +
               `summary_shape=reasoning-only; summary_chars=${rawSummaryChars}`,
           );
-          summary = "";
-          summarySource = "content";
+          const recoveryNormalized = envelopeNormalized ?? normalizeCompletionEnvelope(result);
+          const recoveredSummary = sanitizeReasoningSummaryText(recoveryNormalized.summary);
+          if (recoveredSummary.summary && !recoveredSummary.reasoningOnly) {
+            summary = recoveredSummary.summary;
+            envelopeNormalized = {
+              summary,
+              blockTypes: recoveryNormalized.blockTypes,
+            };
+            summarySource = "envelope";
+            params.deps.log.debug(
+              `[lcm] recovered summary from response envelope; provider=${provider}; model=${model}; ` +
+                `block_types=${formatBlockTypes(recoveryNormalized.blockTypes)}; source=envelope`,
+            );
+          } else {
+            summary = "";
+            summarySource = "content";
+          }
         }
       }
 
@@ -1825,7 +1882,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           const retryNormalized = normalizeCompletionSummary(retryResult.content);
           const retryEnvelopeNormalized = retryNormalized.summary
             ? retryNormalized
-            : normalizeCompletionSummary(retryResult);
+            : normalizeCompletionEnvelope(retryResult);
           summary = retryEnvelopeNormalized.summary;
 
           // Re-apply the reasoning-leak guardrail to the retry result so a
@@ -1843,7 +1900,14 @@ export async function createLcmSummarizeFromLegacyParams(params: {
                   `model=${model}; block_types=${formatBlockTypes(retryEnvelopeNormalized.blockTypes)}; ` +
                   `summary_shape=reasoning-only; summary_chars=${rawRetrySummaryChars}`,
               );
-              summary = "";
+              const retryRecoveryNormalized = normalizeCompletionEnvelope(retryResult);
+              const retryRecoveredSummary = sanitizeReasoningSummaryText(
+                retryRecoveryNormalized.summary,
+              );
+              summary =
+                retryRecoveredSummary.summary && !retryRecoveredSummary.reasoningOnly
+                  ? retryRecoveredSummary.summary
+                  : "";
             }
           }
 
