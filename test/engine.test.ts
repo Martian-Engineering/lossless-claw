@@ -11278,7 +11278,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).toBe(true);
   });
 
-  it("keeps placeholder recovery retryable without duplicating a partially imported prefix (#639)", async () => {
+  it("rolls back failed placeholder recovery before retrying the full transcript (#639)", async () => {
     const engine = createEngine();
     const sessionId = "placeholder-no-anchor-import-failure";
     const sessionKey = "agent:opsos:telegram:test:direct:placeholder-failure";
@@ -11371,7 +11371,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const count = await engine
       .getConversationStore()
       .getMessageCount(conversation!.conversationId);
-    expect(count).toBe(4);
+    expect(count).toBe(2);
 
     await engine.afterTurn({
       sessionId,

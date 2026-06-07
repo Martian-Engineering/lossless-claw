@@ -6120,8 +6120,7 @@ export class LcmContextEngine implements ContextEngine {
           const replayThreshold = Math.max(3, Math.ceil(historicalMessages.length * 0.5));
           const shouldDropPersistedPrefix =
             replayAnalysis.firstNonOverlappingIndex > 0 &&
-            (persistedIdentityOverlaps >= replayThreshold ||
-              params.noAnchorImportReason === "placeholder-checkpoint-recovery");
+            persistedIdentityOverlaps >= replayThreshold;
           if (
             replayAnalysis.firstNonOverlappingIndex < 0 &&
             persistedIdentityOverlaps >= replayThreshold
@@ -6192,18 +6191,21 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
 
-          let importedMessages = 0;
-          for (const message of noAnchorImportMessages) {
-            const result = await this.ingestSingle({
-              sessionId,
-              sessionKey: params.sessionKey,
-              message,
-              skipReplayTimestampFloodGuard: true,
-            });
-            if (result.ingested) {
-              importedMessages += 1;
+          const importedMessages = await this.conversationStore.withTransaction(async () => {
+            let count = 0;
+            for (const message of noAnchorImportMessages) {
+              const result = await this.ingestSingle({
+                sessionId,
+                sessionKey: params.sessionKey,
+                message,
+                skipReplayTimestampFloodGuard: true,
+              });
+              if (result.ingested) {
+                count += 1;
+              }
             }
-          }
+            return count;
+          });
           this.deps.log.warn(
             `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} importedMessages=${importedMessages} overlap=false`,
           );
