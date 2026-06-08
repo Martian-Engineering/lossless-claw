@@ -3838,20 +3838,35 @@ export class LcmContextEngine implements ContextEngine {
     runtimeContext?: Record<string, unknown>;
     legacyParams?: Record<string, unknown>;
   }): RuntimeThresholdContext {
-    const context = asRecord(params.runtimeContext) ?? asRecord(params.legacyParams) ?? {};
-    const provider = safeString(context.provider)?.trim() ?? safeString(context.providerId)?.trim();
-    const model = safeString(context.model)?.trim() ?? safeString(context.modelId)?.trim();
+    const runtimeContext = asRecord(params.runtimeContext) ?? {};
+    const legacyParams = asRecord(params.legacyParams) ?? {};
+    const provider =
+      safeString(runtimeContext.provider)?.trim()
+      ?? safeString(runtimeContext.providerId)?.trim()
+      ?? safeString(legacyParams.provider)?.trim()
+      ?? safeString(legacyParams.providerId)?.trim();
+    const model =
+      safeString(runtimeContext.model)?.trim()
+      ?? safeString(runtimeContext.modelId)?.trim()
+      ?? safeString(legacyParams.model)?.trim()
+      ?? safeString(legacyParams.modelId)?.trim();
     const modelRef =
       model && provider && !model.includes("/")
         ? `${provider}/${model}`
         : model;
     const modelContextWindow =
-      this.normalizePositiveInteger(context.modelContextWindow)
-      ?? this.normalizePositiveInteger(context.modelContextWindowTokens)
-      ?? this.normalizePositiveInteger(context.contextWindow)
-      ?? this.normalizePositiveInteger(context.contextWindowTokens)
-      ?? this.normalizePositiveInteger(context.maxContextTokens)
-      ?? this.normalizePositiveInteger(context.contextWindowMax);
+      this.normalizePositiveInteger(runtimeContext.modelContextWindow)
+      ?? this.normalizePositiveInteger(runtimeContext.modelContextWindowTokens)
+      ?? this.normalizePositiveInteger(runtimeContext.contextWindow)
+      ?? this.normalizePositiveInteger(runtimeContext.contextWindowTokens)
+      ?? this.normalizePositiveInteger(runtimeContext.maxContextTokens)
+      ?? this.normalizePositiveInteger(runtimeContext.contextWindowMax)
+      ?? this.normalizePositiveInteger(legacyParams.modelContextWindow)
+      ?? this.normalizePositiveInteger(legacyParams.modelContextWindowTokens)
+      ?? this.normalizePositiveInteger(legacyParams.contextWindow)
+      ?? this.normalizePositiveInteger(legacyParams.contextWindowTokens)
+      ?? this.normalizePositiveInteger(legacyParams.maxContextTokens)
+      ?? this.normalizePositiveInteger(legacyParams.contextWindowMax);
 
     return {
       ...(provider ? { provider } : {}),
@@ -9516,7 +9531,8 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
+    const legacyCompactionParams = asRecord(params.legacyCompactionParams);
+    const legacyParams = asRecord(params.runtimeContext) ?? legacyCompactionParams;
     const DEFAULT_AFTER_TURN_TOKEN_BUDGET = 128_000;
     const resolvedTokenBudget = this.resolveTokenBudget({
       tokenBudget: params.tokenBudget,
@@ -9618,7 +9634,7 @@ export class LcmContextEngine implements ContextEngine {
         sessionKey: params.sessionKey,
         tokenBudget,
         runtimeContext: params.runtimeContext,
-        legacyParams,
+        legacyParams: legacyCompactionParams,
       });
       const thresholdDecision = await this.compaction.evaluate(
         conversation.conversationId,

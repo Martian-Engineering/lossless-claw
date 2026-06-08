@@ -11892,6 +11892,52 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000, 50_000);
   });
 
+  it("afterTurn falls back to legacy model context-window metadata for threshold overrides", async () => {
+    const engine = createEngineWithConfig({
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.1,
+        },
+      ],
+    });
+    const sessionId = "after-turn-window-override-legacy-metadata";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+          options?: { contextThreshold?: number },
+        ) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 80_000,
+      threshold: 50_000,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-window-override-legacy-metadata"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 500_000,
+      runtimeContext: {
+        currentTokenCount: 80_000,
+      },
+      legacyCompactionParams: {
+        modelContextWindow: 200_000,
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 500_000, 80_000, {
+      contextThreshold: 0.1,
+    });
+  });
+
   it("afterTurn schedules a deferred threshold drain even when compactionTelemetry has no provider/model", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-no-cache-context-threshold";
