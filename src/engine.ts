@@ -9612,6 +9612,7 @@ export class LcmContextEngine implements ContextEngine {
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         tokenBudget,
+        runtimeContext: params.runtimeContext,
         legacyParams,
       });
       const thresholdDecision = await this.compaction.evaluate(
