@@ -5554,6 +5554,100 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(bootstrapState?.lastProcessedEntryHash).not.toBe(firstBootstrapState!.lastProcessedEntryHash);
   });
 
+  it("skips synthetic heartbeat polls during bootstrap full-reconcile", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-reconcile-heartbeat-polls");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-reconcile-heartbeat-polls";
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    await engine
+      .getSummaryStore()
+      .upsertConversationBootstrapState({
+        conversationId: conversation!.conversationId,
+        sessionFilePath: sessionFile,
+        lastSeenSize: 1,
+        lastSeenMtimeMs: 0,
+        lastProcessedOffset: 1,
+        lastProcessedEntryHash: "mismatch",
+      });
+
+    for (let index = 0; index < 4; index += 1) {
+      appendSessionMessage(sm, makeMessage({ role: "user", content: "[OpenClaw heartbeat poll]" }));
+    }
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "already bootstrapped",
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual(["seed user", "seed assistant"]);
+  });
+
+  it("skips heartbeat ACK turns while reconciling real bootstrap tail messages", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-reconcile-heartbeat-turn-tail");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-reconcile-heartbeat-turn-tail";
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    await engine
+      .getSummaryStore()
+      .upsertConversationBootstrapState({
+        conversationId: conversation!.conversationId,
+        sessionFilePath: sessionFile,
+        lastSeenSize: 1,
+        lastSeenMtimeMs: 0,
+        lastProcessedOffset: 1,
+        lastProcessedEntryHash: "mismatch",
+      });
+
+    appendSessionMessage(
+      sm,
+      makeMessage({
+        role: "user",
+        content: "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+      }),
+    );
+    appendSessionMessage(
+      sm,
+      makeMessage({ role: "tool", content: "# HEARTBEAT.md\n\nIf nothing needs attention, stay quiet." }),
+    );
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "real recovered user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "real recovered assistant" }));
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "real recovered user",
+      "real recovered assistant",
+    ]);
+  });
+
   it("imports appended tail messages without replaying full reconciliation", async () => {
     const sessionFile = createSessionFilePath("append-only-tail");
     const sm = SessionManager.open(sessionFile);

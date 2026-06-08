@@ -6392,7 +6392,11 @@ export class LcmContextEngine implements ContextEngine {
             messages: historicalMessages,
           });
           const persistedIdentityOverlaps = replayAnalysis.overlaps;
-          let noAnchorImportMessages = historicalMessages;
+          let noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
+            messages: historicalMessages,
+            sessionContext,
+            source: "reconcileSessionTail no-anchor",
+          });
           const replayThreshold = Math.max(3, Math.ceil(historicalMessages.length * 0.5));
           if (persistedIdentityOverlaps >= replayThreshold) {
             if (replayAnalysis.firstNonOverlappingIndex < 0) {
@@ -6411,7 +6415,11 @@ export class LcmContextEngine implements ContextEngine {
             }
 
             if (replayAnalysis.firstNonOverlappingIndex > 0) {
-              noAnchorImportMessages = historicalMessages.slice(replayAnalysis.firstNonOverlappingIndex);
+              noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
+                messages: historicalMessages.slice(replayAnalysis.firstNonOverlappingIndex),
+                sessionContext,
+                source: "reconcileSessionTail no-anchor replay-prefix",
+              });
               this.deps.log.warn(
                 `[lcm] reconcileSessionTail: duplicate transcript replay guard dropped ${replayAnalysis.firstNonOverlappingIndex}/${historicalMessages.length} already-persisted prefix messages for ${sessionContext} before no-anchor import (reason: ${params.noAnchorImportReason ?? "unspecified"})`,
               );
@@ -6492,7 +6500,11 @@ export class LcmContextEngine implements ContextEngine {
       source: "reconcileSessionTail",
       priorMessages: historicalMessages.slice(0, anchorIndex + 1),
     });
-    const missingTail = missingTailFiltered.messages;
+    const missingTail = this.filterSyntheticHeartbeatTranscriptMessages({
+      messages: missingTailFiltered.messages,
+      sessionContext,
+      source: "reconcileSessionTail",
+    });
 
     if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
       this.deps.log.warn(
@@ -7515,6 +7527,20 @@ export class LcmContextEngine implements ContextEngine {
         };
   }
 
+  private filterSyntheticHeartbeatTranscriptMessages(params: {
+    messages: AgentMessage[];
+    sessionContext: string;
+    source: string;
+  }): AgentMessage[] {
+    const filtered = filterSyntheticHeartbeatMessages(params.messages);
+    if (filtered.skipped > 0) {
+      this.deps.log.debug(
+        `[lcm] ${params.source}: skipped ${filtered.skipped}/${params.messages.length} synthetic heartbeat transcript messages for ${params.sessionContext}`,
+      );
+    }
+    return filtered.messages;
+  }
+
   private async reconcileTranscriptTailForAfterTurn(params: {
     sessionId: string;
     sessionKey?: string;
@@ -8037,7 +8063,11 @@ export class LcmContextEngine implements ContextEngine {
                   source: "bootstrap append-only",
                   sessionFile: params.sessionFile,
                 });
-                const replayFilteredMessages = replayFiltered.messages;
+                const replayFilteredMessages = this.filterSyntheticHeartbeatTranscriptMessages({
+                  messages: replayFiltered.messages,
+                  sessionContext: appendOnlySessionContext,
+                  source: "bootstrap append-only",
+                });
                 const appendOnlyOverlapsPersisted = await this.appendOnlyMessagesOverlapPersistedTranscript({
                   conversationId,
                   messages: replayFilteredMessages,
@@ -11788,6 +11818,7 @@ export class LcmContextEngine implements ContextEngine {
 
 const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
 const HEARTBEAT_TURN_MARKER = "heartbeat.md";
+const OPENCLAW_HEARTBEAT_POLL = "[openclaw heartbeat poll]";
 
 /**
  * Detect whether an assistant message is a heartbeat ack.
@@ -11817,6 +11848,64 @@ function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolean {
   }
 
   return false;
+}
+
+function filterSyntheticHeartbeatMessages(
+  messages: AgentMessage[],
+): { messages: AgentMessage[]; skipped: number } {
+  if (messages.length === 0) {
+    return { messages, skipped: 0 };
+  }
+
+  const skipIndexes = new Set<number>();
+  for (let index = 0; index < messages.length; index += 1) {
+    const stored = toStoredMessage(messages[index]!);
+    if (
+      stored.role === "user" &&
+      stored.content.trim().toLowerCase() === OPENCLAW_HEARTBEAT_POLL
+    ) {
+      skipIndexes.add(index);
+    }
+  }
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const stored = toStoredMessage(messages[index]!);
+    if (stored.role !== "assistant" || !isHeartbeatOkContent(stored.content)) {
+      continue;
+    }
+
+    let turnStart = -1;
+    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+      const previous = toStoredMessage(messages[cursor]!);
+      if (previous.role === "user") {
+        turnStart = cursor;
+        break;
+      }
+    }
+    if (turnStart < 0) {
+      continue;
+    }
+
+    const turnMessages = messages
+      .slice(turnStart, index + 1)
+      .map((message) => toStoredMessage(message));
+    if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
+      continue;
+    }
+
+    for (let cursor = turnStart; cursor <= index; cursor += 1) {
+      skipIndexes.add(cursor);
+    }
+  }
+
+  if (skipIndexes.size === 0) {
+    return { messages, skipped: 0 };
+  }
+
+  return {
+    messages: messages.filter((_, index) => !skipIndexes.has(index)),
+    skipped: skipIndexes.size,
+  };
 }
 
 function turnLooksLikeHeartbeatTurn(turnMessages: Array<{ content: string }>): boolean {
