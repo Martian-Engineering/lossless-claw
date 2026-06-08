@@ -30,6 +30,44 @@ Good default:
 
 - `0.75`
 
+### `contextThresholdOverrides`
+
+Optional ordered rules that choose a different compaction threshold for matching runtime contexts.
+
+Supported match fields:
+
+- `model`: exact runtime model id, such as `openai/gpt-5.5`
+- `modelContextWindowMin`: match models/windows at or above this token count
+- `modelContextWindowMax`: match models/windows at or below this token count
+- `sessionPattern`: session-key glob, using the same `*` and `**` semantics as ignored/stateless sessions
+
+Rules are AND-matched: if a rule includes both `model` and `sessionPattern`, both must match. If multiple rules match, Lossless picks the highest-specificity rule, then the earliest rule in the array for ties. If no rule matches, it falls back to global `contextThreshold`.
+
+Example:
+
+```json
+{
+  "contextThreshold": 0.75,
+  "contextThresholdOverrides": [
+    {
+      "name": "large-context-models",
+      "match": { "modelContextWindowMin": 900000 },
+      "contextThreshold": 0.15
+    },
+    {
+      "name": "telegram-sessions",
+      "match": { "sessionPattern": "agent:*:telegram:**" },
+      "contextThreshold": 0.3
+    }
+  ]
+}
+```
+
+Debugging:
+
+- threshold-selection logs include the selected threshold, source, rule index/name, token budget, threshold tokens, model, context-window value, and match reason
+- there is no env-var override for `contextThresholdOverrides`; use plugin config for structured rules
+
 ### `freshTailCount`
 
 Keeps the newest messages raw instead of compacting them.

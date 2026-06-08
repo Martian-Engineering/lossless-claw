@@ -28,7 +28,7 @@ import {
   type AssemblyOverflowDiagnostics,
 } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
-import type { LcmConfig } from "./db/config.js";
+import type { ContextThresholdOverride, LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
 import {
@@ -49,7 +49,7 @@ import {
 import { describeLogError } from "./lcm-log.js";
 import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
-import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
+import { compileSessionPattern, compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
 import {
   CompactionTelemetryStore,
@@ -142,6 +142,22 @@ type PromptCacheSnapshot = {
   lastCacheTouchAt?: Date;
   provider?: string;
   model?: string;
+};
+type RuntimeThresholdContext = {
+  provider?: string;
+  model?: string;
+  modelRef?: string;
+  modelContextWindow?: number;
+};
+type ResolvedContextThreshold = {
+  contextThreshold: number;
+  source: "global" | "override";
+  reason: string;
+  ruleIndex?: number;
+  ruleName?: string;
+  specificity: number;
+  modelRef?: string;
+  modelContextWindow?: number;
 };
 type TranscriptRewriteReplacement = {
   entryId: string;
@@ -3810,6 +3826,199 @@ export class LcmContextEngine implements ContextEngine {
     return matchesSessionPattern(trimmedKey, this.statelessSessionPatterns);
   }
 
+  private normalizePositiveInteger(value: unknown): number | undefined {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 1) {
+      return undefined;
+    }
+    return Math.floor(value);
+  }
+
+  private readRuntimeThresholdContext(params: {
+    tokenBudget: number;
+    runtimeContext?: Record<string, unknown>;
+    legacyParams?: Record<string, unknown>;
+  }): RuntimeThresholdContext {
+    const context = asRecord(params.runtimeContext) ?? asRecord(params.legacyParams) ?? {};
+    const provider = safeString(context.provider)?.trim() ?? safeString(context.providerId)?.trim();
+    const model = safeString(context.model)?.trim() ?? safeString(context.modelId)?.trim();
+    const modelRef =
+      model && provider && !model.includes("/")
+        ? `${provider}/${model}`
+        : model;
+    const modelContextWindow =
+      this.normalizePositiveInteger(context.modelContextWindow)
+      ?? this.normalizePositiveInteger(context.modelContextWindowTokens)
+      ?? this.normalizePositiveInteger(context.contextWindow)
+      ?? this.normalizePositiveInteger(context.contextWindowTokens)
+      ?? this.normalizePositiveInteger(context.maxContextTokens)
+      ?? this.normalizePositiveInteger(context.contextWindowMax)
+      ?? params.tokenBudget;
+
+    return {
+      ...(provider ? { provider } : {}),
+      ...(model ? { model } : {}),
+      ...(modelRef ? { modelRef } : {}),
+      modelContextWindow,
+    };
+  }
+
+  private contextThresholdOverrideSpecificity(rule: ContextThresholdOverride): number {
+    let score = 0;
+    if (rule.match.model) {
+      score += 100;
+    }
+    if (rule.match.sessionPattern) {
+      score += 50;
+    }
+    if (rule.match.modelContextWindowMin !== undefined) {
+      score += 20;
+    }
+    if (rule.match.modelContextWindowMax !== undefined) {
+      score += 20;
+    }
+    return score;
+  }
+
+  private contextThresholdOverrideMatches(params: {
+    rule: ContextThresholdOverride;
+    sessionKey?: string;
+    runtime: RuntimeThresholdContext;
+  }): boolean {
+    const { rule, runtime } = params;
+    if (rule.match.model) {
+      const normalizedRuleModel = rule.match.model.trim();
+      const candidates = [runtime.modelRef, runtime.model].filter(
+        (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0,
+      );
+      if (!candidates.includes(normalizedRuleModel)) {
+        return false;
+      }
+    }
+
+    if (rule.match.sessionPattern) {
+      const sessionKey = params.sessionKey?.trim();
+      if (!sessionKey || !compileSessionPattern(rule.match.sessionPattern).test(sessionKey)) {
+        return false;
+      }
+    }
+
+    if (
+      rule.match.modelContextWindowMin !== undefined &&
+      runtime.modelContextWindow !== undefined &&
+      runtime.modelContextWindow < rule.match.modelContextWindowMin
+    ) {
+      return false;
+    }
+    if (
+      rule.match.modelContextWindowMax !== undefined &&
+      runtime.modelContextWindow !== undefined &&
+      runtime.modelContextWindow > rule.match.modelContextWindowMax
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private describeContextThresholdOverrideReason(params: {
+    rule: ContextThresholdOverride;
+    runtime: RuntimeThresholdContext;
+    sessionKey?: string;
+  }): string {
+    const parts: string[] = [];
+    if (params.rule.match.model) {
+      parts.push(`model=${params.rule.match.model}`);
+    }
+    if (params.rule.match.modelContextWindowMin !== undefined) {
+      parts.push(`modelContextWindow>=${params.rule.match.modelContextWindowMin}`);
+    }
+    if (params.rule.match.modelContextWindowMax !== undefined) {
+      parts.push(`modelContextWindow<=${params.rule.match.modelContextWindowMax}`);
+    }
+    if (params.rule.match.sessionPattern) {
+      parts.push(`sessionPattern=${params.rule.match.sessionPattern}`);
+    }
+    if (params.runtime.modelContextWindow !== undefined) {
+      parts.push(`resolvedModelContextWindow=${params.runtime.modelContextWindow}`);
+    }
+    return parts.join(",");
+  }
+
+  private resolveContextThreshold(params: {
+    sessionId: string;
+    sessionKey?: string;
+    tokenBudget: number;
+    runtimeContext?: Record<string, unknown>;
+    legacyParams?: Record<string, unknown>;
+  }): ResolvedContextThreshold {
+    const runtime = this.readRuntimeThresholdContext({
+      tokenBudget: params.tokenBudget,
+      runtimeContext: params.runtimeContext,
+      legacyParams: params.legacyParams,
+    });
+    let best:
+      | {
+          rule: ContextThresholdOverride;
+          index: number;
+          specificity: number;
+        }
+      | undefined;
+
+    (this.config.contextThresholdOverrides ?? []).forEach((rule, index) => {
+      if (!this.contextThresholdOverrideMatches({ rule, sessionKey: params.sessionKey, runtime })) {
+        return;
+      }
+      const specificity = this.contextThresholdOverrideSpecificity(rule);
+      if (!best || specificity > best.specificity) {
+        best = { rule, index, specificity };
+      }
+    });
+
+    if (!best) {
+      return {
+        contextThreshold: this.config.contextThreshold,
+        source: "global",
+        reason: "no_override_matched",
+        specificity: 0,
+        ...(runtime.modelRef ? { modelRef: runtime.modelRef } : {}),
+        ...(runtime.modelContextWindow !== undefined
+          ? { modelContextWindow: runtime.modelContextWindow }
+          : {}),
+      };
+    }
+
+    return {
+      contextThreshold: best.rule.contextThreshold,
+      source: "override",
+      ruleIndex: best.index,
+      ...(best.rule.name ? { ruleName: best.rule.name } : {}),
+      reason: this.describeContextThresholdOverrideReason({
+        rule: best.rule,
+        runtime,
+        sessionKey: params.sessionKey,
+      }),
+      specificity: best.specificity,
+      ...(runtime.modelRef ? { modelRef: runtime.modelRef } : {}),
+      ...(runtime.modelContextWindow !== undefined
+        ? { modelContextWindow: runtime.modelContextWindow }
+        : {}),
+    };
+  }
+
+  private logContextThresholdSelection(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    tokenBudget: number;
+    thresholdTokens: number;
+    resolved: ResolvedContextThreshold;
+    phase: string;
+  }): void {
+    this.deps.log.info(
+      `[lcm] threshold: selected phase=${params.phase} conversation=${params.conversationId} session=${params.sessionId} ${params.sessionKey?.trim() ? `sessionKey=${params.sessionKey.trim()} ` : ""}threshold=${params.resolved.contextThreshold} thresholdTokens=${params.thresholdTokens} tokenBudget=${params.tokenBudget} source=${params.resolved.source} ruleIndex=${params.resolved.ruleIndex ?? "none"} ruleName=${params.resolved.ruleName ?? "none"} specificity=${params.resolved.specificity} model=${params.resolved.modelRef ?? "none"} modelContextWindow=${params.resolved.modelContextWindow ?? "none"} reason=${params.resolved.reason.replaceAll(" ", "_")}`,
+    );
+  }
+
   // ── Circuit breaker helpers ──────────────────────────────────────────────
 
   private getCircuitBreakerState(key: string): CircuitBreakerState {
@@ -4514,11 +4723,30 @@ export class LcmContextEngine implements ContextEngine {
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
+        const resolvedContextThreshold = this.resolveContextThreshold({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget: resolvedTokenBudget,
+          runtimeContext: params.runtimeContext,
+          legacyParams: params.legacyParams,
+        });
         const thresholdDecision = await this.compaction.evaluate(
           params.conversationId,
           resolvedTokenBudget,
           resolvedCurrentTokenCount,
+          ...(resolvedContextThreshold.source === "override"
+            ? [{ contextThreshold: resolvedContextThreshold.contextThreshold }]
+            : []),
         );
+        this.logContextThresholdSelection({
+          conversationId: params.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget: resolvedTokenBudget,
+          thresholdTokens: thresholdDecision.threshold,
+          resolved: resolvedContextThreshold,
+          phase: "maintain",
+        });
         if (!thresholdDecision.shouldCompact) {
           const result: CompactResult = {
             ok: true,
@@ -4735,10 +4963,25 @@ export class LcmContextEngine implements ContextEngine {
           }
         ).currentTokenCount,
     );
+    const resolvedContextThreshold = this.resolveContextThreshold({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      tokenBudget,
+      runtimeContext: params.runtimeContext,
+      legacyParams,
+    });
     const decision =
       observedTokens !== undefined
-        ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
-        : await this.compaction.evaluate(conversationId, tokenBudget);
+        ? resolvedContextThreshold.source === "override"
+          ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens, {
+              contextThreshold: resolvedContextThreshold.contextThreshold,
+            })
+          : await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
+        : resolvedContextThreshold.source === "override"
+          ? await this.compaction.evaluate(conversationId, tokenBudget, undefined, {
+              contextThreshold: resolvedContextThreshold.contextThreshold,
+            })
+          : await this.compaction.evaluate(conversationId, tokenBudget);
     const targetTokens =
       params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
     // Codex can report a live prompt count that includes runtime framing,
@@ -4789,6 +5032,16 @@ export class LcmContextEngine implements ContextEngine {
     const liveContextStillExceedsTarget =
       thresholdPressureTokens !== undefined && thresholdPressureTokens >= targetTokens;
 
+    this.logContextThresholdSelection({
+      conversationId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      tokenBudget,
+      thresholdTokens: decision.threshold,
+      resolved: resolvedContextThreshold,
+      phase: "compact",
+    });
+
     this.deps.log.info(
       `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} projectedTokens=${decisionProjectedTokens ?? "none"} rawTokensOutsideTail=${decisionRawTokensOutsideTail ?? "none"} thresholdPressureTokens=${thresholdPressureTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} shouldCompact=${decision.shouldCompact}`,
     );
@@ -4820,6 +5073,9 @@ export class LcmContextEngine implements ContextEngine {
         sweepResult = await this.compaction.compact({
           conversationId,
           tokenBudget,
+          ...(resolvedContextThreshold.source === "override"
+            ? { contextThreshold: resolvedContextThreshold.contextThreshold }
+            : {}),
           summarize,
           force: forceThresholdSweep,
           hardTrigger: false,
@@ -4960,6 +5216,9 @@ export class LcmContextEngine implements ContextEngine {
       compactResult = await this.compaction.compactUntilUnder({
         conversationId,
         tokenBudget,
+        ...(resolvedContextThreshold.source === "override"
+          ? { contextThreshold: resolvedContextThreshold.contextThreshold }
+          : {}),
         targetTokens: convergenceTargetTokens,
         ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
         summarize,
@@ -9349,11 +9608,29 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
+      const resolvedContextThreshold = this.resolveContextThreshold({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget,
+        legacyParams,
+      });
       const thresholdDecision = await this.compaction.evaluate(
         conversation.conversationId,
         tokenBudget,
         observedCurrentTokenCount,
+        ...(resolvedContextThreshold.source === "override"
+          ? [{ contextThreshold: resolvedContextThreshold.contextThreshold }]
+          : []),
       );
+      this.logContextThresholdSelection({
+        conversationId: conversation.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget,
+        thresholdTokens: thresholdDecision.threshold,
+        resolved: resolvedContextThreshold,
+        phase: "afterTurn",
+      });
       const thresholdDiagnostics = {
         projectedTokenCount: thresholdDecision.projectedTokens,
         rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,

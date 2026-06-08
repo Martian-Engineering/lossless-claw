@@ -30,6 +30,23 @@ Most installations only need to override a handful of keys. If you want a comple
   "statelessSessionPatterns": [],
   "skipStatelessSessions": true,
   "contextThreshold": 0.75,
+  "contextThresholdOverrides": [
+    {
+      "name": "large-context-models",
+      "match": { "modelContextWindowMin": 900000 },
+      "contextThreshold": 0.15
+    },
+    {
+      "name": "small-context-models",
+      "match": { "modelContextWindowMax": 250000 },
+      "contextThreshold": 0.2
+    },
+    {
+      "name": "telegram-sessions",
+      "match": { "sessionPattern": "agent:*:telegram:**" },
+      "contextThreshold": 0.3
+    }
+  ],
   "freshTailCount": 64,
   "freshTailMaxTokens": 24000,
   "promptAwareEviction": false,
@@ -180,6 +197,7 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
 | `contextThreshold` | `number` | `0.75` | `LCM_CONTEXT_THRESHOLD` | Fraction of the active model context window that triggers compaction. |
+| `contextThresholdOverrides` | `Array<{ name?: string; match: object; contextThreshold: number }>` | `[]` | none | Optional ordered rules that override `contextThreshold` by model id, model context-window range, or session glob pattern. |
 | `freshTailCount` | `integer` | `64` | `LCM_FRESH_TAIL_COUNT` | Number of newest messages always kept raw. |
 | `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. The newest message is always preserved even if it exceeds the cap. |
 | `promptAwareEviction` | `boolean` | `false` | `LCM_PROMPT_AWARE_EVICTION_ENABLED` | When enabled, budget-constrained assembly keeps older evictable items by prompt relevance instead of pure chronology. This improves retrieval under tight budgets, but it can reduce prompt-cache hit rates because the preserved prefix changes as prompts change. |
@@ -265,13 +283,15 @@ Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capabil
 
 Automatic compaction is threshold-only:
 
-- `afterTurn()` evaluates `contextThreshold` against the active token budget
+- `afterTurn()` evaluates the resolved context threshold against the active token budget
 - below threshold, no automatic compaction runs and no leaf debt is recorded
 - at or above threshold, inline mode runs a threshold full sweep immediately
 - deferred mode records one coalesced `"threshold"` maintenance row and normally drains it in the background or host-approved `maintain()`
 - pre-assembly drain is reserved as an emergency safeguard when the live prompt is already over the active token budget
 
 Lossless still records prompt-cache telemetry for status and diagnostics, but cache hotness no longer delays threshold debt. Legacy `cacheAwareCompaction.*` and `dynamicLeafChunkTokens.*` settings remain accepted so existing OpenClaw config continues to load, but they do not change automatic compaction behavior.
+
+`contextThresholdOverrides` are optional and never replace the global fallback. Each rule's `match` object can include `model`, `modelContextWindowMin`, `modelContextWindowMax`, and `sessionPattern`; all fields in a rule must match. If several rules match, Lossless picks the highest-specificity rule, then the earliest rule in the array for ties. Exact `model` matches have higher specificity than `sessionPattern` matches, and session-pattern matches have higher specificity than context-window range matches. Threshold selection logs include the chosen threshold, source, rule index/name, token budget, threshold tokens, model, context-window value, and match reason.
 
 Full sweeps first run leaf passes until there are no more eligible raw-message chunks outside the fresh tail. Condensation is then driven by summarized-prefix pressure: the routine condensation phase obeys `sweepMaxDepth`, and if the summarized prefix still exceeds `summaryPrefixTargetTokens`, a pressure phase may use `condensedMinFanoutHard` and condense deeper. Total context pressure starts the sweep, but does not by itself force deeper condensation once the raw prefix has been summarized.
 

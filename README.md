@@ -140,6 +140,18 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
           "leafChunkTokens": 80000,
           "newSessionRetainDepth": 2,
           "contextThreshold": 0.75,
+          "contextThresholdOverrides": [
+            {
+              "name": "large-context-models",
+              "match": { "modelContextWindowMin": 900000 },
+              "contextThreshold": 0.15
+            },
+            {
+              "name": "telegram-sessions",
+              "match": { "sessionPattern": "agent:*:telegram:**" },
+              "contextThreshold": 0.3
+            }
+          ],
           "incrementalMaxDepth": 1,
           "cacheAwareCompaction": {
             "enabled": true,
@@ -285,6 +297,7 @@ LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
 - **leafChunkTokens=20000** limits how large each leaf compaction chunk can grow before LCM summarizes it. Increase this when your summary provider is quota-limited and frequent leaf compactions are exhausting that quota.
 - **incrementalMaxDepth=1** runs one condensed pass after each leaf compaction by default. Set to `0` for leaf-only behavior, a larger positive integer for a deeper cap, or `-1` for unlimited cascading.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
+- **contextThresholdOverrides** optionally picks a different threshold for matching model ids, model context-window ranges, or session patterns. If no rule matches, LCM falls back to `contextThreshold`.
 
 ### Session exclusion patterns
 
