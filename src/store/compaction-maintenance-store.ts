@@ -44,6 +44,30 @@ type ConversationCompactionMaintenanceRow = {
 
 const DEFERRED_COMPACTION_RETRY_BASE_MS = 5 * 60 * 1000;
 const DEFERRED_COMPACTION_RETRY_MAX_MS = 30 * 60 * 1000;
+const MAINTENANCE_INSERT_COLUMNS = [
+  "conversation_id",
+  "pending",
+  "requested_at",
+  "reason",
+  "running",
+  "last_started_at",
+  "last_finished_at",
+  "last_failure_summary",
+  "token_budget",
+  "current_token_count",
+  "projected_token_count",
+  "raw_tokens_outside_tail",
+  "context_threshold",
+  "context_threshold_source",
+  "retry_attempts",
+  "next_attempt_after",
+] as const;
+const MAINTENANCE_INSERT_PLACEHOLDERS = MAINTENANCE_INSERT_COLUMNS.map(() => "?").join(", ");
+const MAINTENANCE_UPDATE_ASSIGNMENTS = MAINTENANCE_INSERT_COLUMNS.filter(
+  (column) => column !== "conversation_id",
+)
+  .map((column) => `${column} = excluded.${column}`)
+  .join(",\n           ");
 
 function computeDeferredCompactionRetryDelayMs(attempts: number): number {
   const safeAttempts = Number.isFinite(attempts) ? Math.max(1, Math.floor(attempts)) : 1;
@@ -192,79 +216,36 @@ export class CompactionMaintenanceStore {
   private async saveConversationCompactionMaintenance(
     record: ConversationCompactionMaintenanceRecord,
   ): Promise<void> {
+    const values = [
+      record.conversationId,
+      record.pending ? 1 : 0,
+      record.requestedAt?.toISOString() ?? null,
+      record.reason ?? null,
+      record.running ? 1 : 0,
+      record.lastStartedAt?.toISOString() ?? null,
+      record.lastFinishedAt?.toISOString() ?? null,
+      record.lastFailureSummary ?? null,
+      record.tokenBudget ?? null,
+      record.currentTokenCount ?? null,
+      record.projectedTokenCount ?? null,
+      record.rawTokensOutsideTail ?? null,
+      record.contextThreshold ?? null,
+      record.contextThresholdSource ?? null,
+      record.retryAttempts,
+      record.nextAttemptAfter?.toISOString() ?? null,
+    ];
     this.db
       .prepare(
         `INSERT INTO conversation_compaction_maintenance (
-           conversation_id,
-           pending,
-           requested_at,
-           reason,
-           running,
-           last_started_at,
-           last_finished_at,
-           last_failure_summary,
-           token_budget,
-           current_token_count,
-           projected_token_count,
-           raw_tokens_outside_tail,
-           context_threshold,
-           context_threshold_source,
-           retry_attempts,
-           next_attempt_after
+           ${MAINTENANCE_INSERT_COLUMNS.join(",\n           ")}
          ) VALUES (
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?,
-           ?
+           ${MAINTENANCE_INSERT_PLACEHOLDERS}
          )
          ON CONFLICT(conversation_id) DO UPDATE SET
-           pending = excluded.pending,
-           requested_at = excluded.requested_at,
-           reason = excluded.reason,
-           running = excluded.running,
-           last_started_at = excluded.last_started_at,
-           last_finished_at = excluded.last_finished_at,
-           last_failure_summary = excluded.last_failure_summary,
-           token_budget = excluded.token_budget,
-           current_token_count = excluded.current_token_count,
-           projected_token_count = excluded.projected_token_count,
-           raw_tokens_outside_tail = excluded.raw_tokens_outside_tail,
-           context_threshold = excluded.context_threshold,
-           context_threshold_source = excluded.context_threshold_source,
-           retry_attempts = excluded.retry_attempts,
-           next_attempt_after = excluded.next_attempt_after,
+           ${MAINTENANCE_UPDATE_ASSIGNMENTS},
            updated_at = datetime('now')`,
       )
-      .run(
-        record.conversationId,
-        record.pending ? 1 : 0,
-        record.requestedAt?.toISOString() ?? null,
-        record.reason ?? null,
-        record.running ? 1 : 0,
-        record.lastStartedAt?.toISOString() ?? null,
-        record.lastFinishedAt?.toISOString() ?? null,
-        record.lastFailureSummary ?? null,
-        record.tokenBudget ?? null,
-        record.currentTokenCount ?? null,
-        record.projectedTokenCount ?? null,
-        record.rawTokensOutsideTail ?? null,
-        record.contextThreshold ?? null,
-        record.contextThresholdSource ?? null,
-        record.retryAttempts,
-        record.nextAttemptAfter?.toISOString() ?? null,
-      );
+      .run(...values);
   }
 
   /** Record or refresh deferred proactive-compaction debt for a conversation. */
