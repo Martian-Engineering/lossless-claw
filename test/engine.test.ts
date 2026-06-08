@@ -14454,7 +14454,14 @@ describe("LcmContextEngine fidelity and token budget", () => {
   });
 
   it("maintain() consumes deferred threshold debt when the host opts in", async () => {
-    const engine = createEngine();
+    const engine = createEngineWithConfig({
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.1,
+        },
+      ],
+    });
     const sessionId = "maintain-deferred-compaction-enabled";
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
@@ -14462,8 +14469,8 @@ describe("LcmContextEngine fidelity and token budget", () => {
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
-      tokenBudget: 4_096,
-      currentTokenCount: 3_500,
+      tokenBudget: 500_000,
+      currentTokenCount: 80_000,
     });
     const privateEngine = engine as unknown as {
       executeCompactionCore: (params: unknown) => Promise<unknown>;
@@ -14482,8 +14489,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
       sessionFile: createSessionFilePath("maintain-deferred-compaction-enabled-maintain"),
       runtimeContext: {
         allowDeferredCompactionExecution: true,
-        tokenBudget: 4_096,
-        currentTokenCount: 3_500,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
+        modelContextWindow: 200_000,
       },
     });
 
@@ -14494,9 +14502,13 @@ describe("LcmContextEngine fidelity and token budget", () => {
       expect.objectContaining({
         conversationId: conversation.conversationId,
         sessionId,
-        tokenBudget: 4_096,
-        currentTokenCount: 3_500,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
         compactionTarget: "threshold",
+        contextThresholdOverride: expect.objectContaining({
+          contextThreshold: 0.1,
+          source: "override",
+        }),
       }),
     );
     expect(maintenance?.pending).toBe(false);

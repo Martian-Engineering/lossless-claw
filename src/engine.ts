@@ -191,6 +191,7 @@ type CompactionExecutionParams = {
   tokenBudget?: number;
   currentTokenCount?: number;
   compactionTarget?: "budget" | "threshold";
+  contextThresholdOverride?: ResolvedContextThreshold;
   customInstructions?: string;
   /** OpenClaw runtime param name (preferred). */
   runtimeContext?: Record<string, unknown>;
@@ -4740,16 +4741,16 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
         maintenance.projectedTokenCount ?? undefined,
       );
+      const resolvedContextThreshold = this.resolveContextThreshold({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget: resolvedTokenBudget,
+        runtimeContext: params.runtimeContext,
+        legacyParams: params.legacyParams,
+      });
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
-        const resolvedContextThreshold = this.resolveContextThreshold({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          tokenBudget: resolvedTokenBudget,
-          runtimeContext: params.runtimeContext,
-          legacyParams: params.legacyParams,
-        });
         const thresholdDecision = await this.compaction.evaluate(
           params.conversationId,
           resolvedTokenBudget,
@@ -4798,6 +4799,7 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget: resolvedTokenBudget,
         currentTokenCount: resolvedCurrentTokenCount,
         compactionTarget: "threshold",
+        contextThresholdOverride: resolvedContextThreshold,
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
       });
@@ -4983,13 +4985,15 @@ export class LcmContextEngine implements ContextEngine {
           }
         ).currentTokenCount,
     );
-    const resolvedContextThreshold = this.resolveContextThreshold({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-      tokenBudget,
-      runtimeContext: params.runtimeContext,
-      legacyParams,
-    });
+    const resolvedContextThreshold =
+      params.contextThresholdOverride
+      ?? this.resolveContextThreshold({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget,
+        runtimeContext: params.runtimeContext,
+        legacyParams,
+      });
     const decision =
       observedTokens !== undefined
         ? resolvedContextThreshold.source === "override"
