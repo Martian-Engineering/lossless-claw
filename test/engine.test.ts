@@ -11948,6 +11948,64 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
   });
 
+  it("afterTurn forwards legacy-only resolved threshold overrides into inline compaction", async () => {
+    const engine = createEngineWithConfig({
+      proactiveThresholdCompactionMode: "inline",
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.1,
+        },
+      ],
+    });
+    const sessionId = "after-turn-inline-threshold-override-legacy-metadata";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+          options?: { contextThreshold?: number },
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 80_000,
+      threshold: 50_000,
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-inline-threshold-override-legacy-metadata"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 500_000,
+      runtimeContext: {
+        currentTokenCount: 80_000,
+      },
+      legacyCompactionParams: {
+        modelContextWindow: 200_000,
+      },
+    });
+
+    expect(compactSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        compactionTarget: "threshold",
+        contextThresholdOverride: expect.objectContaining({
+          contextThreshold: 0.1,
+          source: "override",
+        }),
+      }),
+    );
+  });
+
   it("afterTurn schedules a deferred threshold drain even when compactionTelemetry has no provider/model", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-no-cache-context-threshold";

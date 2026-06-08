@@ -9708,6 +9708,7 @@ export class LcmContextEngine implements ContextEngine {
             tokenBudget,
             currentTokenCount: observedCurrentTokenCount,
             compactionTarget: "threshold",
+            contextThresholdOverride: resolvedContextThreshold,
             legacyParams,
           });
           if (!compactResult.ok) {
@@ -10337,6 +10338,7 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget?: number;
     currentTokenCount?: number;
     compactionTarget?: "budget" | "threshold";
+    contextThresholdOverride?: ResolvedContextThreshold;
     customInstructions?: string;
     /** OpenClaw runtime param name (preferred). */
     runtimeContext?: Record<string, unknown>;
@@ -10390,6 +10392,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget: params.tokenBudget,
           currentTokenCount: params.currentTokenCount,
           compactionTarget: params.compactionTarget,
+          contextThresholdOverride: params.contextThresholdOverride,
           customInstructions: params.customInstructions,
           runtimeContext: params.runtimeContext,
           legacyParams: params.legacyParams,
