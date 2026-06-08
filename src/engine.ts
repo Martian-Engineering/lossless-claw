@@ -4751,14 +4751,19 @@ export class LcmContextEngine implements ContextEngine {
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
-        const thresholdDecision = await this.compaction.evaluate(
-          params.conversationId,
-          resolvedTokenBudget,
-          resolvedCurrentTokenCount,
-          ...(resolvedContextThreshold.source === "override"
-            ? [{ contextThreshold: resolvedContextThreshold.contextThreshold }]
-            : []),
-        );
+        const thresholdDecision =
+          resolvedContextThreshold.source === "override"
+            ? await this.compaction.evaluate(
+                params.conversationId,
+                resolvedTokenBudget,
+                resolvedCurrentTokenCount,
+                { contextThreshold: resolvedContextThreshold.contextThreshold },
+              )
+            : await this.compaction.evaluate(
+                params.conversationId,
+                resolvedTokenBudget,
+                resolvedCurrentTokenCount,
+              );
         this.logContextThresholdSelection({
           conversationId: params.conversationId,
           sessionId: params.sessionId,
@@ -9640,14 +9645,19 @@ export class LcmContextEngine implements ContextEngine {
         runtimeContext: params.runtimeContext,
         legacyParams: legacyCompactionParams,
       });
-      const thresholdDecision = await this.compaction.evaluate(
-        conversation.conversationId,
-        tokenBudget,
-        observedCurrentTokenCount,
-        ...(resolvedContextThreshold.source === "override"
-          ? [{ contextThreshold: resolvedContextThreshold.contextThreshold }]
-          : []),
-      );
+      const thresholdDecision =
+        resolvedContextThreshold.source === "override"
+          ? await this.compaction.evaluate(
+              conversation.conversationId,
+              tokenBudget,
+              observedCurrentTokenCount,
+              { contextThreshold: resolvedContextThreshold.contextThreshold },
+            )
+          : await this.compaction.evaluate(
+              conversation.conversationId,
+              tokenBudget,
+              observedCurrentTokenCount,
+            );
       this.logContextThresholdSelection({
         conversationId: conversation.conversationId,
         sessionId: params.sessionId,
