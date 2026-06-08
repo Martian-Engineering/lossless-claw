@@ -1564,6 +1564,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const runSummarizerCall = async (
         label: string,
         reasoning?: string,
+        maxTokensOverride?: number,
       ) =>
         withTimeout(params.deps.complete({
           provider,
@@ -1579,7 +1580,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               content: prompt,
             },
           ],
-          maxTokens: targetTokens,
+          maxTokens: maxTokensOverride ?? targetTokens,
           ...(params.deps.config.enableSummaryThinking !== false
             ? ({ reasoningIfSupported: "low" } as const)
             : {}),
@@ -1589,9 +1590,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const attemptSummarizerCall = async (
         label: string,
         reasoning?: string,
+        maxTokensOverride?: number,
       ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
         try {
-          const result = await runSummarizerCall(label, reasoning);
+          const result = await runSummarizerCall(label, reasoning, maxTokensOverride);
           const policyFailure = extractRuntimeLlmPolicyFailure(result);
           if (policyFailure) {
             throw new LcmRuntimeLlmPolicyError({
@@ -1798,10 +1800,15 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
         // Single retry with conservative parameters to coax a textual response
         // from providers that sometimes return reasoning-only or empty blocks.
+        // Use the configured max output tokens so high-reasoning models have
+        // enough budget for both reasoning and content tokens.
+        const retryMaxTokens = isCondensed
+          ? Math.max(targetTokens, condensedTargetTokens)
+          : Math.max(targetTokens, leafTargetTokens);
         try {
           const retryReasoning =
             params.deps.config.enableSummaryThinking !== false ? "low" : undefined;
-          const retryResult = await attemptSummarizerCall("retry", retryReasoning);
+          const retryResult = await attemptSummarizerCall("retry", retryReasoning, retryMaxTokens);
           const retryNormalized = normalizeCompletionSummary(retryResult.content);
           const retryEnvelopeNormalized = retryNormalized.summary
             ? retryNormalized

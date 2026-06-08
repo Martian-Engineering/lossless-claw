@@ -1676,6 +1676,41 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(diagnostics).toContain("retry succeeded");
     });
 
+    it("uses leafTargetTokens as maxTokens on retry when targetTokens is small", async () => {
+      let callCount = 0;
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "openai",
+          model: "gpt-5.3-codex",
+        })),
+        complete: vi.fn(async () => {
+          callCount++;
+          if (callCount === 1) {
+            return { content: [] };
+          }
+          return { content: [{ type: "text", text: "Recovered summary with larger maxTokens." }] };
+        }),
+      });
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+      });
+
+      // Very short input so targetTokens floor (192) is well below leafTargetTokens (600)
+      const summary = await summarize!("Hi", false);
+
+      expect(summary).toBe("Recovered summary with larger maxTokens.");
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+
+      const firstArgs = vi.mocked(deps.complete).mock.calls[0]?.[0];
+      const retryArgs = vi.mocked(deps.complete).mock.calls[1]?.[0];
+
+      expect(firstArgs?.maxTokens).toBe(192);
+      expect(retryArgs?.maxTokens).toBe(deps.config.leafTargetTokens);
+      expect(retryArgs?.reasoning).toBe("low");
+    });
+
     it("falls back to truncation when retry also returns empty for non-text-only blocks", async () => {
       const deps = makeDeps({
         resolveModel: vi.fn(() => ({
