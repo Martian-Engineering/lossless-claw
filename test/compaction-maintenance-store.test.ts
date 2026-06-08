@@ -95,6 +95,23 @@ describe("CompactionMaintenanceStore", () => {
       contextThreshold: 0.15,
       contextThresholdSource: "override",
     });
+
+    await store.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 700,
+      currentTokenCount: 400,
+    });
+
+    const refreshed = await store.getConversationCompactionMaintenance(conversation.conversationId);
+    expect(refreshed).toMatchObject({
+      pending: true,
+      reason: "leaf-trigger",
+      tokenBudget: 700,
+      currentTokenCount: 400,
+      contextThreshold: null,
+      contextThresholdSource: null,
+    });
   });
 
   it("records retry backoff after failures and clears it after success", async () => {

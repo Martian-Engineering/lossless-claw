@@ -292,9 +292,8 @@ export class CompactionMaintenanceStore {
         currentTokenCount: input.currentTokenCount ?? existing?.currentTokenCount ?? null,
         projectedTokenCount: input.projectedTokenCount ?? existing?.projectedTokenCount ?? null,
         rawTokensOutsideTail: input.rawTokensOutsideTail ?? existing?.rawTokensOutsideTail ?? null,
-        contextThreshold: input.contextThreshold ?? existing?.contextThreshold ?? null,
-        contextThresholdSource:
-          input.contextThresholdSource ?? existing?.contextThresholdSource ?? null,
+        contextThreshold: input.contextThreshold ?? null,
+        contextThresholdSource: input.contextThresholdSource ?? null,
       }),
     );
   }
