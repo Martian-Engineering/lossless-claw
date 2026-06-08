@@ -210,10 +210,8 @@ export class CompactionMaintenanceStore {
            context_threshold,
            context_threshold_source,
            retry_attempts,
-           next_attempt_after,
-           updated_at
+           next_attempt_after
          ) VALUES (
-           ?,
            ?,
            ?,
            ?,
@@ -247,7 +245,7 @@ export class CompactionMaintenanceStore {
            context_threshold_source = excluded.context_threshold_source,
            retry_attempts = excluded.retry_attempts,
            next_attempt_after = excluded.next_attempt_after,
-           updated_at = excluded.updated_at`,
+           updated_at = datetime('now')`,
       )
       .run(
         record.conversationId,
@@ -266,7 +264,6 @@ export class CompactionMaintenanceStore {
         record.contextThresholdSource ?? null,
         record.retryAttempts,
         record.nextAttemptAfter?.toISOString() ?? null,
-        record.updatedAt.toISOString(),
       );
   }
 
