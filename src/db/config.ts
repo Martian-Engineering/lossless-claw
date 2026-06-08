@@ -404,6 +404,17 @@ function parsePositiveIntegerMatcher(value: unknown, path: string): number | und
   return parsed;
 }
 
+function parseNonEmptyStringMatcher(value: unknown, path: string): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = toStr(value);
+  if (parsed === undefined) {
+    throw new Error(`${path} must be a non-empty string`);
+  }
+  return parsed;
+}
+
 function toContextThresholdOverrides(value: unknown): ContextThresholdOverride[] {
   if (value === undefined) {
     return [];
@@ -423,8 +434,11 @@ function toContextThresholdOverrides(value: unknown): ContextThresholdOverride[]
       throw new Error(`${path}.match must be an object`);
     }
 
-    const model = toStr(matchRecord.model);
-    const sessionPattern = toStr(matchRecord.sessionPattern);
+    const model = parseNonEmptyStringMatcher(matchRecord.model, `${path}.match.model`);
+    const sessionPattern = parseNonEmptyStringMatcher(
+      matchRecord.sessionPattern,
+      `${path}.match.sessionPattern`,
+    );
     const modelContextWindowMin = parsePositiveIntegerMatcher(
       matchRecord.modelContextWindowMin,
       `${path}.match.modelContextWindowMin`,

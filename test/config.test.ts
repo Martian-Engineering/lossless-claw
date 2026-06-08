@@ -777,6 +777,20 @@ describe("resolveLcmConfig", () => {
         ],
       })
     ).toThrow(/modelContextWindowMin/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { model: "   " }, contextThreshold: 0.5 },
+        ],
+      })
+    ).toThrow(/model/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { sessionPattern: "" }, contextThreshold: 0.5 },
+        ],
+      })
+    ).toThrow(/sessionPattern/);
   });
 
   it("ships a manifest with dynamicLeafChunkTokens in schema", () => {

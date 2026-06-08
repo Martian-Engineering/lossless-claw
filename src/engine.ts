@@ -3851,8 +3851,7 @@ export class LcmContextEngine implements ContextEngine {
       ?? this.normalizePositiveInteger(context.contextWindow)
       ?? this.normalizePositiveInteger(context.contextWindowTokens)
       ?? this.normalizePositiveInteger(context.maxContextTokens)
-      ?? this.normalizePositiveInteger(context.contextWindowMax)
-      ?? params.tokenBudget;
+      ?? this.normalizePositiveInteger(context.contextWindowMax);
 
     return {
       ...(provider ? { provider } : {}),
@@ -3903,18 +3902,24 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (
-      rule.match.modelContextWindowMin !== undefined &&
-      runtime.modelContextWindow !== undefined &&
-      runtime.modelContextWindow < rule.match.modelContextWindowMin
+      rule.match.modelContextWindowMin !== undefined ||
+      rule.match.modelContextWindowMax !== undefined
     ) {
-      return false;
-    }
-    if (
-      rule.match.modelContextWindowMax !== undefined &&
-      runtime.modelContextWindow !== undefined &&
-      runtime.modelContextWindow > rule.match.modelContextWindowMax
-    ) {
-      return false;
+      if (runtime.modelContextWindow === undefined) {
+        return false;
+      }
+      if (
+        rule.match.modelContextWindowMin !== undefined &&
+        runtime.modelContextWindow < rule.match.modelContextWindowMin
+      ) {
+        return false;
+      }
+      if (
+        rule.match.modelContextWindowMax !== undefined &&
+        runtime.modelContextWindow > rule.match.modelContextWindowMax
+      ) {
+        return false;
+      }
     }
 
     return true;

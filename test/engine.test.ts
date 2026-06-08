@@ -11849,6 +11849,49 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(compactSpy).not.toHaveBeenCalled();
   });
 
+  it("afterTurn does not use tokenBudget as a model context-window override fallback", async () => {
+    const engine = createEngineWithConfig({
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.1,
+        },
+      ],
+    });
+    const sessionId = "after-turn-window-override-requires-explicit-window";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+          options?: { contextThreshold?: number },
+        ) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 50_000,
+      threshold: 150_000,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-window-override-requires-explicit-window"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 200_000,
+      runtimeContext: {
+        currentTokenCount: 50_000,
+        provider: "openai",
+        model: "gpt-5.5",
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000, 50_000);
+  });
+
   it("afterTurn schedules a deferred threshold drain even when compactionTelemetry has no provider/model", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-no-cache-context-threshold";
