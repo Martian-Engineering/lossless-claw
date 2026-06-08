@@ -80,6 +80,8 @@ describe("CompactionMaintenanceStore", () => {
       currentTokenCount: 300,
       projectedTokenCount: 620,
       rawTokensOutsideTail: 320,
+      contextThreshold: 0.15,
+      contextThresholdSource: "override",
     });
 
     const record = await store.getConversationCompactionMaintenance(conversation.conversationId);
@@ -90,6 +92,8 @@ describe("CompactionMaintenanceStore", () => {
       currentTokenCount: 300,
       projectedTokenCount: 620,
       rawTokensOutsideTail: 320,
+      contextThreshold: 0.15,
+      contextThresholdSource: "override",
     });
   });
 

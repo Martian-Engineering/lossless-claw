@@ -11936,6 +11936,16 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 500_000, 80_000, {
       contextThreshold: 0.1,
     });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance).toMatchObject({
+      pending: true,
+      contextThreshold: 0.1,
+      contextThresholdSource: "override",
+    });
   });
 
   it("afterTurn schedules a deferred threshold drain even when compactionTelemetry has no provider/model", async () => {
@@ -14471,6 +14481,8 @@ describe("LcmContextEngine fidelity and token budget", () => {
       reason: "threshold",
       tokenBudget: 500_000,
       currentTokenCount: 80_000,
+      contextThreshold: 0.1,
+      contextThresholdSource: "override",
     });
     const privateEngine = engine as unknown as {
       executeCompactionCore: (params: unknown) => Promise<unknown>;
@@ -14491,7 +14503,6 @@ describe("LcmContextEngine fidelity and token budget", () => {
         allowDeferredCompactionExecution: true,
         tokenBudget: 500_000,
         currentTokenCount: 80_000,
-        modelContextWindow: 200_000,
       },
     });
 

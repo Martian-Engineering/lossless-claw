@@ -159,6 +159,23 @@ type ResolvedContextThreshold = {
   modelRef?: string;
   modelContextWindow?: number;
 };
+
+function persistedContextThresholdOverride(
+  maintenance: ConversationCompactionMaintenanceRecord,
+): ResolvedContextThreshold | undefined {
+  if (
+    typeof maintenance.contextThreshold !== "number" ||
+    !Number.isFinite(maintenance.contextThreshold)
+  ) {
+    return undefined;
+  }
+  return {
+    contextThreshold: maintenance.contextThreshold,
+    source: maintenance.contextThresholdSource === "override" ? "override" : "global",
+    specificity: 0,
+    reason: "persisted deferred threshold debt",
+  };
+}
 type TranscriptRewriteReplacement = {
   entryId: string;
   message: AgentMessage;
@@ -4575,6 +4592,7 @@ export class LcmContextEngine implements ContextEngine {
     currentTokenCount?: number;
     projectedTokenCount?: number;
     rawTokensOutsideTail?: number;
+    contextThreshold?: ResolvedContextThreshold;
   }): Promise<void> {
     await this.compactionMaintenanceStore.requestProactiveCompactionDebt({
       conversationId: params.conversationId,
@@ -4583,6 +4601,8 @@ export class LcmContextEngine implements ContextEngine {
       currentTokenCount: params.currentTokenCount ?? null,
       projectedTokenCount: params.projectedTokenCount ?? null,
       rawTokensOutsideTail: params.rawTokensOutsideTail ?? null,
+      contextThreshold: params.contextThreshold?.contextThreshold ?? null,
+      contextThresholdSource: params.contextThreshold?.source ?? null,
     });
     this.deps.log.debug(
       `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"} projectedTokenCount=${params.projectedTokenCount ?? "null"} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"}`,
@@ -4741,13 +4761,15 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
         maintenance.projectedTokenCount ?? undefined,
       );
-      const resolvedContextThreshold = this.resolveContextThreshold({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        tokenBudget: resolvedTokenBudget,
-        runtimeContext: params.runtimeContext,
-        legacyParams: params.legacyParams,
-      });
+      const resolvedContextThreshold =
+        persistedContextThresholdOverride(maintenance)
+        ?? this.resolveContextThreshold({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget: resolvedTokenBudget,
+          runtimeContext: params.runtimeContext,
+          legacyParams: params.legacyParams,
+        });
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
@@ -9597,7 +9619,11 @@ export class LcmContextEngine implements ContextEngine {
     };
     const recordAfterTurnCompactionRetry = async (
       reason: string,
-      diagnostics?: { projectedTokenCount?: number; rawTokensOutsideTail?: number },
+      diagnostics?: {
+        projectedTokenCount?: number;
+        rawTokensOutsideTail?: number;
+        contextThreshold?: ResolvedContextThreshold;
+      },
     ): Promise<void> => {
       try {
         await this.recordDeferredCompactionDebt({
@@ -9607,6 +9633,7 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: observedCurrentTokenCount,
           projectedTokenCount: diagnostics?.projectedTokenCount,
           rawTokensOutsideTail: diagnostics?.rawTokensOutsideTail,
+          contextThreshold: diagnostics?.contextThreshold,
         });
       } catch (err) {
         this.deps.log.warn(
@@ -9670,6 +9697,7 @@ export class LcmContextEngine implements ContextEngine {
       const thresholdDiagnostics = {
         projectedTokenCount: thresholdDecision.projectedTokens,
         rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
+        contextThreshold: resolvedContextThreshold,
       };
       if (this.config.proactiveThresholdCompactionMode === "inline") {
         if (thresholdDecision.shouldCompact) {
@@ -9695,6 +9723,7 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: observedCurrentTokenCount,
           projectedTokenCount: thresholdDecision.projectedTokens,
           rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
+          contextThreshold: resolvedContextThreshold,
         });
         deferredCompactionDrain = {
           tokenBudget,
