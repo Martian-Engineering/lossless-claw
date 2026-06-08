@@ -229,7 +229,7 @@ export class CompactionMaintenanceStore {
            ?,
            ?,
            ?,
-           datetime('now')
+           ?
          )
          ON CONFLICT(conversation_id) DO UPDATE SET
            pending = excluded.pending,
@@ -247,7 +247,7 @@ export class CompactionMaintenanceStore {
            context_threshold_source = excluded.context_threshold_source,
            retry_attempts = excluded.retry_attempts,
            next_attempt_after = excluded.next_attempt_after,
-           updated_at = datetime('now')`,
+           updated_at = excluded.updated_at`,
       )
       .run(
         record.conversationId,
@@ -266,6 +266,7 @@ export class CompactionMaintenanceStore {
         record.contextThresholdSource ?? null,
         record.retryAttempts,
         record.nextAttemptAfter?.toISOString() ?? null,
+        record.updatedAt.toISOString(),
       );
   }
 
