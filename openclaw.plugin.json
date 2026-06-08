@@ -189,6 +189,10 @@
       "label": "Summary Max Overage Factor",
       "help": "Maximum allowed overage factor for summaries relative to target tokens (default 3). Summaries exceeding this are deterministically truncated."
     },
+    "fallbackMaxTokens": {
+      "label": "Fallback Max Tokens",
+      "help": "Maximum token budget for deterministic fallback summaries when the LLM summarizer fails (default 512)"
+    },
     "customInstructions": {
       "label": "Custom Instructions",
       "help": "Natural language instructions injected into all summarization prompts (e.g., formatting rules, tone control)"
@@ -465,6 +469,10 @@
       },
       "summaryMaxOverageFactor": {
         "type": "number",
+        "minimum": 1
+      },
+      "fallbackMaxTokens": {
+        "type": "integer",
         "minimum": 1
       },
       "customInstructions": {

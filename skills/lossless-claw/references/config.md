@@ -683,6 +683,23 @@ Why it matters:
 - guards against runaway summaries that are much larger than their target budget
 - useful when summary models are verbose or unstable
 
+### `fallbackMaxTokens`
+
+| | |
+| --- | --- |
+| Type | `integer` |
+| Default | `512` |
+| Env | `LCM_FALLBACK_MAX_TOKENS` |
+
+Maximum token budget for deterministic fallback summaries when the LLM summarizer is unavailable.
+
+Why it matters:
+
+- when the LLM summarizer fails (auth errors, timeout, empty output), Lossless falls back to a purely local truncation-based summary
+- this fallback is bounded by `fallbackMaxTokens` so it cannot balloon the context
+- lower values produce more aggressive truncation; higher values preserve more source text at the cost of larger fallback summaries
+- the default `512` is conservative; raise it if you prefer richer fallback summaries over more aggressive truncation
+
 ### `summaryMaxCallsPerWindow`, `summaryCallWindowMs`, and `summarySpendBackoffMs`
 
 Bounds model-backed compaction and large-file summarization calls per session.
