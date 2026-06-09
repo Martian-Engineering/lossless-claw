@@ -96,6 +96,8 @@ export type LcmConfig = {
    * Default false; flag-flip is reversible at runtime.
    */
   stubLargeToolPayloads: boolean;
+  /** When true, background maintenance prepares hidden summary batches before threshold publish. */
+  backgroundSummaryPreparationEnabled?: boolean;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -573,6 +575,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_STUB_LARGE_TOOL_PAYLOADS !== undefined
           ? env.LCM_STUB_LARGE_TOOL_PAYLOADS === "true"
           : toBool(pc.stubLargeToolPayloads) ?? false,
+      backgroundSummaryPreparationEnabled:
+        env.LCM_BACKGROUND_SUMMARY_PREPARATION_ENABLED !== undefined
+          ? env.LCM_BACKGROUND_SUMMARY_PREPARATION_ENABLED === "true"
+          : toBool(pc.backgroundSummaryPreparationEnabled) ?? false,
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,

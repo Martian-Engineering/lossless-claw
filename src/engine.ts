@@ -27,7 +27,11 @@ import {
   pickToolName,
   type AssemblyOverflowDiagnostics,
 } from "./assembler.js";
-import { CompactionEngine, type CompactionConfig } from "./compaction.js";
+import {
+  CompactionEngine,
+  type CompactionConfig,
+  type PreparedLeafBatchResult,
+} from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
@@ -196,6 +200,13 @@ type DeferredCompactionDebtDrainParams = {
   tokenBudget: number;
   currentTokenCount?: number;
   reason: string;
+};
+type PendingSummaryPreparationDrainParams = {
+  conversationId: number;
+  sessionId: string;
+  sessionKey?: string;
+  reason: string;
+  legacyParams?: Record<string, unknown>;
 };
 
 function buildContextEngineProjectionEpoch(
@@ -3594,6 +3605,7 @@ export class LcmContextEngine implements ContextEngine {
     string,
     { promise: Promise<void>; refCount: number }
   >();
+  private pendingSummaryPreparationQueues = new Set<string>();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private oversizedAutoRotateCheckpointByQueueKey = new Map<string, number>();
@@ -4372,6 +4384,101 @@ export class LcmContextEngine implements ContextEngine {
         );
       });
     });
+  }
+
+  private schedulePendingSummaryPreparation(params: PendingSummaryPreparationDrainParams): void {
+    if (this.config.backgroundSummaryPreparationEnabled !== true) {
+      return;
+    }
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    setImmediate(() => {
+      void this.drainPendingSummaryPreparationIfIdle({
+        ...params,
+        queueKey,
+      }).catch((err) => {
+        this.deps.log.warn(
+          `[lcm] background pending summary preparation failed conversation=${params.conversationId} session=${params.sessionId}: ${describeLogError(err)}`,
+        );
+      });
+    });
+  }
+
+  private async drainPendingSummaryPreparationIfIdle(
+    params: PendingSummaryPreparationDrainParams & { queueKey: string },
+  ): Promise<void> {
+    const startedAt = Date.now();
+    const result = await this.preparePendingLeafSummariesIfSessionQueueIdle(params);
+    if (!result) {
+      return;
+    }
+    this.deps.log.debug(
+      `[lcm] background pending summary preparation done conversation=${params.conversationId} prepared=${result.prepared} summaries=${result.summaryCount} reason=${result.reason ?? "none"} trigger=${params.reason} duration=${formatDurationMs(Date.now() - startedAt)}`,
+    );
+  }
+
+  private async preparePendingLeafSummariesIfSessionQueueIdle(
+    params: PendingSummaryPreparationDrainParams & { queueKey: string },
+  ): Promise<PreparedLeafBatchResult | null> {
+    if (this.sessionOperationQueues.has(params.queueKey)) {
+      this.deps.log.debug(
+        `[lcm] background pending summary preparation skipped conversation=${params.conversationId} reason=session-queue-busy trigger=${params.reason}`,
+      );
+      return null;
+    }
+
+    if (this.pendingSummaryPreparationQueues.has(params.queueKey)) {
+      this.deps.log.debug(
+        `[lcm] background pending summary preparation skipped conversation=${params.conversationId} reason=already-running trigger=${params.reason}`,
+      );
+      return null;
+    }
+
+    this.pendingSummaryPreparationQueues.add(params.queueKey);
+    try {
+      return await this.preparePendingLeafSummaries({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        legacyParams: params.legacyParams,
+      });
+    } finally {
+      this.pendingSummaryPreparationQueues.delete(params.queueKey);
+    }
+  }
+
+  private async preparePendingLeafSummaries(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    legacyParams?: Record<string, unknown>;
+  }): Promise<PreparedLeafBatchResult> {
+    const compactionScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
+      legacyParams: this.buildSummarizerLegacyParams({
+        legacyParams: params.legacyParams,
+        sessionKey: params.sessionKey,
+      }),
+      breakerScope: compactionScope,
+    });
+    if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
+      return {
+        prepared: false,
+        summaryCount: 0,
+        reason: "circuit breaker open",
+      };
+    }
+
+    const result = await this.compaction.preparePendingLeafBatch({
+      conversationId: params.conversationId,
+      summarize,
+      summaryModel,
+    });
+    if (result.authFailure && breakerKey) {
+      this.recordCompactionAuthFailure(breakerKey);
+    } else if (result.prepared && breakerKey) {
+      this.recordCompactionSuccess(breakerKey);
+    }
+    return result;
   }
 
   /**
@@ -7851,6 +7958,7 @@ export class LcmContextEngine implements ContextEngine {
     const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
     const parentSessionReference = await readSessionParentSessionReference(params.sessionFile);
 
+    let bootstrapImportedMessagesHadOverlap = false;
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () =>
@@ -8249,6 +8357,7 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           if (reconcile.importedMessages > 0) {
+            bootstrapImportedMessagesHadOverlap = reconcile.hasOverlap;
             await persistBootstrapState(conversationId);
             return {
               bootstrapped: true,
@@ -8317,6 +8426,23 @@ export class LcmContextEngine implements ContextEngine {
         result.importedMessages,
         result.reason ?? null,
       );
+      if (result.importedMessages > 0) {
+        if (bootstrapImportedMessagesHadOverlap) {
+          this.deps.log.debug(
+            `[lcm] bootstrap: kept prepared compaction batches after overlapping transcript reconciliation ${sessionLabel} importedMessages=${result.importedMessages}`,
+          );
+        } else {
+          const invalidated = await this.summaryStore.invalidatePendingCompactionBatches(
+            conversation.conversationId,
+            "bootstrap imported non-overlapping transcript messages",
+          );
+          if (invalidated > 0) {
+            this.deps.log.debug(
+              `[lcm] bootstrap: superseded ${invalidated} prepared compaction batch(es) after import ${sessionLabel}`,
+            );
+          }
+        }
+      }
     }
 
     this.deps.log.debug(
@@ -8629,8 +8755,13 @@ export class LcmContextEngine implements ContextEngine {
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
-    const result = await this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    let pendingPreparationDrain:
+      | (PendingSummaryPreparationDrainParams & { queueKey: string })
+      | null = null;
+    let transcriptRewriteAttempted = false;
+    let result = await this.withSessionQueue(
+      queueKey,
       async () => {
         const conversation = await this.conversationStore.getConversationForSession({
           sessionId: params.sessionId,
@@ -8677,15 +8808,30 @@ export class LcmContextEngine implements ContextEngine {
               legacyParams: asRecord(params.runtimeContext),
             });
           }
+          if (
+            this.config.backgroundSummaryPreparationEnabled === true &&
+            !maintenance?.pending &&
+            !maintenance?.running
+          ) {
+            pendingPreparationDrain = {
+              conversationId: conversation.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              reason: "maintain",
+              legacyParams: asRecord(params.runtimeContext),
+              queueKey,
+            };
+          }
         } else if (maintenance?.pending || maintenance?.running) {
           this.deps.log.debug(
             `[lcm] maintain: deferred compaction debt pending conversation=${conversation.conversationId} ${sessionLabel} but host runtimeContext.allowDeferredCompactionExecution is disabled`,
           );
         }
 
+        const backgroundWorkResult = deferredCompactionResult;
         if (!this.config.transcriptGcEnabled) {
           return (
-            deferredCompactionResult ?? {
+            backgroundWorkResult ?? {
               changed: false,
               bytesFreed: 0,
               rewrittenEntries: 0,
@@ -8696,7 +8842,7 @@ export class LcmContextEngine implements ContextEngine {
 
         if (!hostApprovedRuntimeMaintenance) {
           return (
-            deferredCompactionResult ?? {
+            backgroundWorkResult ?? {
               changed: false,
               bytesFreed: 0,
               rewrittenEntries: 0,
@@ -8707,7 +8853,7 @@ export class LcmContextEngine implements ContextEngine {
 
         if (typeof params.runtimeContext?.rewriteTranscriptEntries !== "function") {
           return (
-            deferredCompactionResult ?? {
+            backgroundWorkResult ?? {
               changed: false,
               bytesFreed: 0,
               rewrittenEntries: 0,
@@ -8725,7 +8871,7 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.debug(
             `[lcm] maintain: no transcript GC candidates conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
-          return deferredCompactionResult ?? {
+          return backgroundWorkResult ?? {
             changed: false,
             bytesFreed: 0,
             rewrittenEntries: 0,
@@ -8763,7 +8909,7 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.debug(
             `[lcm] maintain: no matching transcript entries conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
-          return deferredCompactionResult ?? {
+          return backgroundWorkResult ?? {
             changed: false,
             bytesFreed: 0,
             rewrittenEntries: 0,
@@ -8771,6 +8917,7 @@ export class LcmContextEngine implements ContextEngine {
           };
         }
 
+        transcriptRewriteAttempted = true;
         const result = await rewriteTranscriptEntries({
           replacements,
         });
@@ -8788,12 +8935,12 @@ export class LcmContextEngine implements ContextEngine {
           }
         }
 
-        const combinedResult = deferredCompactionResult
+        const combinedResult = backgroundWorkResult
           ? {
-              changed: deferredCompactionResult.changed || result.changed,
+              changed: backgroundWorkResult.changed || result.changed,
               bytesFreed: result.bytesFreed,
               rewrittenEntries: result.rewrittenEntries,
-              reason: result.reason ?? deferredCompactionResult.reason,
+              reason: result.reason ?? backgroundWorkResult.reason,
             }
           : result;
 
@@ -8804,6 +8951,42 @@ export class LcmContextEngine implements ContextEngine {
       },
       { operationName: "maintain", context: sessionLabel },
     );
+    if (pendingPreparationDrain) {
+      let pendingPreparationResult: ContextEngineMaintenanceResult | null = null;
+      try {
+        const prepared =
+          await this.preparePendingLeafSummariesIfSessionQueueIdle(pendingPreparationDrain);
+        if (prepared?.prepared) {
+          pendingPreparationResult = {
+            changed: true,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: `prepared ${prepared.summaryCount} pending summary batch`,
+          };
+        }
+      } catch (err) {
+        if (err instanceof LcmSummarySpendLimitError) {
+          pendingPreparationResult = {
+            changed: false,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: "summary spend backoff open",
+          };
+        } else {
+          throw err;
+        }
+      }
+      if (pendingPreparationResult) {
+        result = transcriptRewriteAttempted
+          ? {
+              changed: result.changed || pendingPreparationResult.changed,
+              bytesFreed: result.bytesFreed,
+              rewrittenEntries: result.rewrittenEntries,
+              reason: result.reason ?? pendingPreparationResult.reason,
+            }
+          : pendingPreparationResult;
+      }
+    }
     await runRuntimeAutoRotate();
     return result;
   }
@@ -9306,6 +9489,23 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
     };
+    if (transcriptReconcileResult.importedMessages > 0) {
+      if (transcriptReconcileResult.hasOverlap) {
+        this.deps.log.debug(
+          `[lcm] afterTurn: kept prepared compaction batches after overlapping transcript reconciliation ${sessionLabel} importedMessages=${transcriptReconcileResult.importedMessages}`,
+        );
+      } else {
+        const invalidated = await this.summaryStore.invalidatePendingCompactionBatches(
+          conversation.conversationId,
+          "afterTurn transcript reconciliation imported non-overlapping messages",
+        );
+        if (invalidated > 0) {
+          this.deps.log.debug(
+            `[lcm] afterTurn: superseded ${invalidated} prepared compaction batch(es) after transcript reconciliation ${sessionLabel}`,
+          );
+        }
+      }
+    }
     const recordAfterTurnCompactionRetry = async (
       reason: string,
       diagnostics?: { projectedTokenCount?: number; rawTokensOutsideTail?: number },
@@ -9335,6 +9535,7 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: number;
         }
       | null = null;
+    let pendingSummaryPreparationDrain: { reason: string } | null = null;
 
     try {
       await this.updateCompactionTelemetry({
@@ -9388,6 +9589,11 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: observedCurrentTokenCount,
           reason: "threshold",
         };
+      } else if (
+        this.config.backgroundSummaryPreparationEnabled === true &&
+        (thresholdDecision.rawTokensOutsideTail ?? 0) > 0
+      ) {
+        pendingSummaryPreparationDrain = { reason: "afterTurn" };
       }
     } catch (err) {
       this.deps.log.warn(
@@ -9407,6 +9613,16 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget: deferredCompactionDrain.tokenBudget,
         currentTokenCount: deferredCompactionDrain.currentTokenCount,
         reason: deferredCompactionDrain.reason,
+      });
+    }
+
+    if (pendingSummaryPreparationDrain) {
+      this.schedulePendingSummaryPreparation({
+        conversationId: conversation.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        reason: pendingSummaryPreparationDrain.reason,
+        legacyParams,
       });
     }
 
@@ -10267,11 +10483,25 @@ export class LcmContextEngine implements ContextEngine {
               && Number.isFinite(this.config.newSessionRetainDepth)
                 ? this.config.newSessionRetainDepth
                 : 2;
+            await this.summaryStore.invalidatePendingCompactionBatches(
+              conversation.conversationId,
+              "/new lifecycle reset",
+            );
             await this.summaryStore.pruneForNewSession(conversation.conversationId, retainDepth);
             this.deps.log.info(
               `[lcm] /new pruned conversation ${conversation.conversationId} to retain depth ${retainDepth}`,
             );
             return;
+          }
+          const existing = await this.conversationStore.getConversationForSession({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+          });
+          if (existing) {
+            await this.summaryStore.invalidatePendingCompactionBatches(
+              existing.conversationId,
+              "/reset lifecycle replacement",
+            );
           }
           await this.applySessionReplacement({
             reason: "/reset",
@@ -11224,6 +11454,10 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
+      await this.summaryStore.invalidatePendingCompactionBatches(
+        current.conversationId,
+        "session transcript rotation",
+      );
       const rewriteResult = await this.rewriteTranscriptForRotate({
         conversationId: current.conversationId,
         sessionFile: params.sessionFile,
@@ -11405,6 +11639,16 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] rotate: reconciled transcript before summary coverage session=${params.sessionId} sessionKey=${params.sessionKey} sessionFile=${params.sessionFile} importedMessages=${result.importedMessages}`,
         );
+        const conversation = await this.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+        if (conversation) {
+          await this.summaryStore.invalidatePendingCompactionBatches(
+            conversation.conversationId,
+            "rotate transcript reconciliation imported additional messages",
+          );
+        }
       }
       return { kind: "ready", importedMessages: result.importedMessages };
     } catch (err) {

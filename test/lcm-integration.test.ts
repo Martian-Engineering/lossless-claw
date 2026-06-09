@@ -356,6 +356,15 @@ function createMockSummaryStore() {
       return total;
     }),
 
+    publishLatestReadyCompactionBatch: vi.fn(async () => ({
+      published: false,
+      summaryIds: [],
+      tokensRemoved: 0,
+      tokensAdded: 0,
+      partial: false,
+      reason: "no ready prepared batch",
+    })),
+
     // ── Summary CRUD ────────────────────────────────────────────────────
 
     insertSummary: vi.fn(

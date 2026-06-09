@@ -87,6 +87,22 @@ Good default:
 - `false`
 - enable it only after migration and live validation
 
+### `backgroundSummaryPreparationEnabled`
+
+Controls whether background maintenance prepares pending summary batches before threshold compaction needs them.
+
+Why it matters:
+
+- prepared leaves can be condensed further at arbitrary depths while the batch stays hidden
+- prepared summaries stay non-canonical and invisible to assembly, search, transcript GC, and doctor checks
+- threshold compaction can validate and publish a ready batch atomically instead of making every prepared summarizer call on the foreground path
+- stale or incomplete batches are superseded and the existing full-sweep compaction path remains the fallback
+
+Good default:
+
+- `false`
+- enable it only when the host is allowed to run background maintenance and the summarizer budget is acceptable
+
 ### `leafChunkTokens`
 
 Caps how much raw material gets summarized into one leaf summary.

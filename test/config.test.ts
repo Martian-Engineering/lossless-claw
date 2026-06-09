@@ -34,6 +34,7 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(64);
     expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.promptAwareEviction).toBe(false);
+    expect(config.backgroundSummaryPreparationEnabled).toBe(false);
     expect(config.newSessionRetainDepth).toBe(2);
     expect(config.sweepMaxDepth).toBe(1);
     expect(config.incrementalMaxDepth).toBe(1);
@@ -82,6 +83,7 @@ describe("resolveLcmConfig", () => {
       freshTailCount: 16,
       freshTailMaxTokens: 12000,
       promptAwareEviction: false,
+      backgroundSummaryPreparationEnabled: true,
       leafChunkTokens: 80000,
       sweepMaxDepth: 2,
       newSessionRetainDepth: 3,
@@ -133,6 +135,7 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(16);
     expect(config.freshTailMaxTokens).toBe(12000);
     expect(config.promptAwareEviction).toBe(false);
+    expect(config.backgroundSummaryPreparationEnabled).toBe(true);
     expect(config.newSessionRetainDepth).toBe(3);
     expect(config.leafChunkTokens).toBe(80000);
     expect(config.sweepMaxDepth).toBe(2);
@@ -177,6 +180,7 @@ describe("resolveLcmConfig", () => {
       LCM_FRESH_TAIL_COUNT: "64",
       LCM_FRESH_TAIL_MAX_TOKENS: "32000",
       LCM_PROMPT_AWARE_EVICTION_ENABLED: "false",
+      LCM_BACKGROUND_SUMMARY_PREPARATION_ENABLED: "true",
       LCM_NEW_SESSION_RETAIN_DEPTH: "5",
       LCM_ENABLED: "false",
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
@@ -212,6 +216,7 @@ describe("resolveLcmConfig", () => {
       freshTailCount: 16,
       freshTailMaxTokens: 12000,
       promptAwareEviction: true,
+      backgroundSummaryPreparationEnabled: false,
       sweepMaxDepth: 2,
       incrementalMaxDepth: -1,
       summaryPrefixTargetTokens: 32000,
@@ -271,6 +276,7 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.freshTailMaxTokens).toBe(32000); // env wins
     expect(config.promptAwareEviction).toBe(false); // env wins
+    expect(config.backgroundSummaryPreparationEnabled).toBe(true); // env wins
     expect(config.newSessionRetainDepth).toBe(5); // env wins
     expect(config.sweepMaxDepth).toBe(4); // new env wins deprecated env/config
     expect(config.incrementalMaxDepth).toBe(4); // alias mirrors sweepMaxDepth
@@ -704,6 +710,12 @@ describe("resolveLcmConfig", () => {
 
   it("ships a manifest with promptAwareEviction in schema", () => {
     expect(manifest.configSchema.properties.promptAwareEviction).toEqual({
+      type: "boolean",
+    });
+  });
+
+  it("ships a manifest with backgroundSummaryPreparationEnabled in schema", () => {
+    expect(manifest.configSchema.properties.backgroundSummaryPreparationEnabled).toEqual({
       type: "boolean",
     });
   });

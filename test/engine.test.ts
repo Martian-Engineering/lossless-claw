@@ -10,6 +10,7 @@ import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/conne
 import { LcmContextEngine, type RotateSessionStorageResult } from "../src/engine.js";
 import { estimateTokens } from "../src/estimate-tokens.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
+import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 import { LcmProviderAuthError, LcmSummarySpendLimitError } from "../src/summarize.js";
 import {
   createDelegatedExpansionGrant,
@@ -14330,6 +14331,339 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
     releaseQueue();
     await heldQueue;
+  });
+
+  it("background pending summary preparation does not block same-session assemble", async () => {
+    let releaseSummarizer!: () => void;
+    let markSummarizerStarted!: () => void;
+    const summarizerStarted = new Promise<void>((resolve) => {
+      markSummarizerStarted = resolve;
+    });
+    const complete = vi.fn(async () => {
+      const held = new Promise<void>((resolve) => {
+        releaseSummarizer = resolve;
+      });
+      markSummarizerStarted();
+      await held;
+      return {
+        content: [{ type: "text", text: "prepared background summary" }],
+      };
+    });
+    const engine = createEngineWithDeps(
+      {
+        backgroundSummaryPreparationEnabled: true,
+        freshTailCount: 1,
+        leafChunkTokens: 20_000,
+        summaryProvider: "openai-resp",
+        summaryModel: "gpt-test",
+      },
+      { complete },
+    );
+    const sessionId = "background-preparation-assemble-session";
+    const sessionKey = "agent:main:background-preparation-assemble";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey,
+    });
+    const messages = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "old source alpha",
+        tokenCount: 20,
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "old source beta",
+        tokenCount: 20,
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "fresh tail gamma",
+        tokenCount: 20,
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(
+        conversation.conversationId,
+        messages.map((message) => message.messageId),
+      );
+
+    const privateEngine = engine as unknown as {
+      drainPendingSummaryPreparationIfIdle: (params: unknown) => Promise<void>;
+    };
+    const drainPromise = privateEngine.drainPendingSummaryPreparationIfIdle({
+      conversationId: conversation.conversationId,
+      sessionId,
+      sessionKey,
+      reason: "test",
+      queueKey: sessionKey,
+    });
+    await summarizerStarted;
+
+    let assembleSettled = false;
+    const assemblePromise = engine.assemble({
+      sessionId,
+      sessionKey,
+      messages: [makeMessage({ role: "user", content: "can you still respond?" })],
+      tokenBudget: 4_096,
+    }).then((result) => {
+      assembleSettled = true;
+      return result;
+    });
+
+    await vi.waitFor(() => expect(assembleSettled).toBe(true), { timeout: 100 });
+    expect(complete).toHaveBeenCalledTimes(1);
+
+    releaseSummarizer();
+    const assembleResult = await assemblePromise;
+    await drainPromise;
+
+    expect(assembleResult.messages.length).toBeGreaterThan(0);
+  });
+
+  it("afterTurn keeps ready prepared batches when transcript reconciliation only appends tail messages", async () => {
+    const debugLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: debugLog },
+      },
+    );
+    const sessionId = "after-turn-append-only-keeps-prepared-batch";
+    const sessionKey = "agent:main:after-turn-append-only-keeps-prepared-batch";
+    const sessionFile = createSessionFilePath("after-turn-append-only-keeps-prepared-batch");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "old prepared source alpha" },
+      { role: "assistant", content: "old prepared source beta" },
+      { role: "user", content: "fresh tail gamma" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old prepared source alpha",
+      "old prepared source beta",
+      "fresh tail gamma",
+    ]);
+
+    const [first, second] = stored;
+    if (!first || !second) {
+      throw new Error("missing prepared source messages");
+    }
+    const batch = await engine.getSummaryStore().createCompactionBatch({
+      batchId: "cb_after_turn_append_only_ready",
+      conversationId: conversation!.conversationId,
+      sourceMinSeq: first.seq,
+      sourceMaxSeq: second.seq,
+      reason: "test append-only prepared batch",
+    });
+    await engine.getSummaryStore().insertPendingCompactionSummary({
+      batchId: batch.batchId,
+      summaryId: "sum_after_turn_append_only",
+      ordinal: 0,
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "prepared summary for old append-only-safe source",
+      tokenCount: 5,
+      sourceMessageTokenCount: first.tokenCount + second.tokenCount,
+      sourceStartSeq: first.seq,
+      sourceEndSeq: second.seq,
+      sourceMessageIds: [first.messageId, second.messageId],
+      sourceIdentityHashes: [
+        buildMessageIdentityHash(first.role, first.content),
+        buildMessageIdentityHash(second.role, second.content),
+      ],
+    });
+    await engine.getSummaryStore().markCompactionBatchReady(batch.batchId);
+
+    appendFileSync(
+      sessionFile,
+      [
+        JSON.stringify({
+          message: makeMessage({ role: "user", content: "append-only imported user" }),
+        }),
+        JSON.stringify({
+          message: makeMessage({
+            role: "assistant",
+            content: "append-only imported assistant",
+          }),
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    debugLog.mockClear();
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const afterAppendStored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(afterAppendStored.map((message) => message.content)).toEqual([
+      "old prepared source alpha",
+      "old prepared source beta",
+      "fresh tail gamma",
+      "append-only imported user",
+      "append-only imported assistant",
+    ]);
+    await expect(
+      engine.getSummaryStore().getLatestReadyCompactionBatch(conversation!.conversationId),
+    ).resolves.toMatchObject({
+      batchId: batch.batchId,
+      status: "ready",
+    });
+    const debugLines = debugLog.mock.calls.map((call) => String(call[0]));
+    expect(
+      debugLines.some(
+        (line) => line.includes("superseded") && line.includes("prepared compaction"),
+      ),
+    ).toBe(false);
+    expect(
+      debugLines.some((line) =>
+        line.includes("kept prepared compaction batches after overlapping transcript reconciliation"),
+      ),
+    ).toBe(true);
+
+    await expect(
+      engine.getSummaryStore().publishLatestReadyCompactionBatch({
+        conversationId: conversation!.conversationId,
+        maxSourceOrdinalExclusive: 2,
+      }),
+    ).resolves.toMatchObject({
+      published: true,
+      summaryIds: ["sum_after_turn_append_only"],
+      partial: false,
+    });
+    await expect(
+      engine.getSummaryStore().getContextItems(conversation!.conversationId),
+    ).resolves.toMatchObject([
+      { ordinal: 0, itemType: "summary", summaryId: "sum_after_turn_append_only" },
+      { ordinal: 1, itemType: "message", messageId: stored[2]!.messageId },
+      { ordinal: 2, itemType: "message" },
+      { ordinal: 3, itemType: "message" },
+    ]);
+  });
+
+  it("maintain() background pending summary preparation does not block same-session ingest or assemble", async () => {
+    let releaseSummarizer!: () => void;
+    let markSummarizerStarted!: () => void;
+    const summarizerStarted = new Promise<void>((resolve) => {
+      markSummarizerStarted = resolve;
+    });
+    const complete = vi.fn(async () => {
+      const held = new Promise<void>((resolve) => {
+        releaseSummarizer = resolve;
+      });
+      markSummarizerStarted();
+      await held;
+      return {
+        content: [{ type: "text", text: "prepared maintain summary" }],
+      };
+    });
+    const engine = createEngineWithDeps(
+      {
+        backgroundSummaryPreparationEnabled: true,
+        freshTailCount: 1,
+        leafChunkTokens: 20_000,
+        summaryProvider: "openai-resp",
+        summaryModel: "gpt-test",
+      },
+      { complete },
+    );
+    const sessionId = "maintain-background-preparation-assemble-session";
+    const sessionKey = "agent:main:maintain-background-preparation-assemble";
+    const seedResult = await engine.ingestBatch({
+      sessionId,
+      sessionKey,
+      messages: [
+        makeMessage({ role: "user", content: "old maintain source alpha" }),
+        makeMessage({ role: "assistant", content: "old maintain source beta" }),
+        makeMessage({ role: "user", content: "fresh maintain tail gamma" }),
+      ],
+    });
+    expect(seedResult.ingestedCount).toBe(3);
+
+    let maintainSettled = false;
+    const maintainPromise = engine.maintain({
+      sessionId,
+      sessionKey,
+      sessionFile: createSessionFilePath("maintain-background-preparation-assemble"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+      },
+    }).then((result) => {
+      maintainSettled = true;
+      return result;
+    });
+    await summarizerStarted;
+    expect(maintainSettled).toBe(false);
+
+    let ingestSettled = false;
+    const ingestPromise = engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "normal foreground message" }),
+    }).then((result) => {
+      ingestSettled = true;
+      return result;
+    });
+
+    await vi.waitFor(() => expect(ingestSettled).toBe(true), { timeout: 100 });
+    const ingestResult = await ingestPromise;
+    expect(ingestResult.ingested).toBe(true);
+    expect(maintainSettled).toBe(false);
+
+    let assembleSettled = false;
+    const assemblePromise = engine.assemble({
+      sessionId,
+      sessionKey,
+      messages: [makeMessage({ role: "user", content: "can you still respond?" })],
+      tokenBudget: 4_096,
+    }).then((result) => {
+      assembleSettled = true;
+      return result;
+    });
+
+    await vi.waitFor(() => expect(assembleSettled).toBe(true), { timeout: 100 });
+    expect(complete).toHaveBeenCalledTimes(1);
+
+    releaseSummarizer();
+    const assembleResult = await assemblePromise;
+    const maintainResult = await maintainPromise;
+
+    expect(assembleResult.messages.length).toBeGreaterThan(0);
+    expect(maintainResult.changed).toBe(true);
   });
 
   it("maintain() leaves deferred threshold debt pending until the host opts in", async () => {

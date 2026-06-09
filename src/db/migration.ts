@@ -201,6 +201,68 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   }
 }
 
+function ensureCompactionBatchTables(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS compaction_batches (
+      batch_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      generation INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'ready', 'active', 'superseded', 'failed')),
+      source_min_seq INTEGER,
+      source_max_seq INTEGER,
+      reason TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      published_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS compaction_batch_summaries (
+      batch_id TEXT NOT NULL REFERENCES compaction_batches(batch_id) ON DELETE CASCADE,
+      summary_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'ready', 'active', 'superseded', 'failed')),
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
+      depth INTEGER NOT NULL DEFAULT 0,
+      content TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      file_ids TEXT NOT NULL DEFAULT '[]',
+      earliest_at TEXT,
+      latest_at TEXT,
+      descendant_count INTEGER NOT NULL DEFAULT 0,
+      descendant_token_count INTEGER NOT NULL DEFAULT 0,
+      source_message_token_count INTEGER NOT NULL DEFAULT 0,
+      model TEXT NOT NULL DEFAULT 'unknown',
+      source_start_seq INTEGER,
+      source_end_seq INTEGER,
+      source_message_ids TEXT NOT NULL DEFAULT '[]',
+      source_identity_hashes TEXT NOT NULL DEFAULT '[]',
+      previous_summary_ids TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (batch_id, summary_id),
+      UNIQUE (batch_id, ordinal),
+      UNIQUE (summary_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS compaction_batches_conversation_status_idx
+      ON compaction_batches (conversation_id, status, generation, created_at);
+    CREATE INDEX IF NOT EXISTS compaction_batch_summaries_batch_status_idx
+      ON compaction_batch_summaries (batch_id, status, ordinal);
+  `);
+
+  const summaryColumns = db
+    .prepare(`PRAGMA table_info(compaction_batch_summaries)`)
+    .all() as SummaryColumnInfo[];
+  const hasConversationId = summaryColumns.some((col) => col.name === "conversation_id");
+  if (!hasConversationId) {
+    db.exec(
+      `ALTER TABLE compaction_batch_summaries ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+}
+
 function ensureFocusBriefTables(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS focus_briefs (
@@ -1101,6 +1163,49 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS compaction_batches (
+      batch_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      generation INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'ready', 'active', 'superseded', 'failed')),
+      source_min_seq INTEGER,
+      source_max_seq INTEGER,
+      reason TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      published_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS compaction_batch_summaries (
+      batch_id TEXT NOT NULL REFERENCES compaction_batches(batch_id) ON DELETE CASCADE,
+      summary_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'ready', 'active', 'superseded', 'failed')),
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
+      depth INTEGER NOT NULL DEFAULT 0,
+      content TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      file_ids TEXT NOT NULL DEFAULT '[]',
+      earliest_at TEXT,
+      latest_at TEXT,
+      descendant_count INTEGER NOT NULL DEFAULT 0,
+      descendant_token_count INTEGER NOT NULL DEFAULT 0,
+      source_message_token_count INTEGER NOT NULL DEFAULT 0,
+      model TEXT NOT NULL DEFAULT 'unknown',
+      source_start_seq INTEGER,
+      source_end_seq INTEGER,
+      source_message_ids TEXT NOT NULL DEFAULT '[]',
+      source_identity_hashes TEXT NOT NULL DEFAULT '[]',
+      previous_summary_ids TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (batch_id, summary_id),
+      UNIQUE (batch_id, ordinal),
+      UNIQUE (summary_id)
+    );
+
     CREATE TABLE IF NOT EXISTS focus_briefs (
       brief_id TEXT PRIMARY KEY,
       conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
@@ -1151,6 +1256,10 @@ export function runLcmMigrations(
       ON conversation_bootstrap_state (session_file_path, updated_at);
     CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
       ON conversation_compaction_telemetry (cache_state, updated_at);
+    CREATE INDEX IF NOT EXISTS compaction_batches_conversation_status_idx
+      ON compaction_batches (conversation_id, status, generation, created_at);
+    CREATE INDEX IF NOT EXISTS compaction_batch_summaries_batch_status_idx
+      ON compaction_batch_summaries (batch_id, status, ordinal);
     CREATE INDEX IF NOT EXISTS focus_briefs_conversation_status_idx
       ON focus_briefs (conversation_id, status, created_at);
     CREATE INDEX IF NOT EXISTS focus_brief_sources_summary_idx
@@ -1231,6 +1340,9 @@ export function runLcmMigrations(
     );
     runMigrationStep("ensureCompactionMaintenanceColumns", log, () =>
       ensureCompactionMaintenanceColumns(db),
+    );
+    runMigrationStep("ensureCompactionBatchTables", log, () =>
+      ensureCompactionBatchTables(db),
     );
     runMigrationStep("ensureFocusBriefTables", log, () => ensureFocusBriefTables(db));
     runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));

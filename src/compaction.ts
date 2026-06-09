@@ -11,6 +11,7 @@ import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/sum
 import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
+import { buildMessageIdentityHash } from "./store/message-identity.js";
 import { LcmProviderAuthError } from "./summarize.js";
 import {
   buildDeterministicFallbackSummary,
@@ -50,6 +51,14 @@ export interface CompactionResult {
   authFailure?: boolean;
   /** Whether the sweep stopped because its iteration or wall-clock budget was exhausted */
   stoppedAtBudget?: boolean;
+}
+
+export interface PreparedLeafBatchResult {
+  prepared: boolean;
+  batchId?: string;
+  summaryCount: number;
+  authFailure?: boolean;
+  reason?: string;
 }
 
 export interface CompactionConfig {
@@ -146,6 +155,44 @@ type CondensedPhaseCandidate = {
   targetDepth: number;
   chunk: CondensedChunkSelection;
 };
+type LeafSummaryDraft = {
+  content: string;
+  level: CompactionLevel;
+  tokenCount: number;
+  fileIds: string[];
+  earliestAt?: Date;
+  latestAt?: Date;
+  removedTokens: number;
+  messageIds: number[];
+  sourceIdentityHashes: string[];
+  sourceStartSeq: number | null;
+  sourceEndSeq: number | null;
+};
+type PreparedSummaryNode = {
+  summaryId: string;
+  ordinal: number;
+  kind: "leaf" | "condensed";
+  depth: number;
+  content: string;
+  tokenCount: number;
+  fileIds: string[];
+  earliestAt?: Date;
+  latestAt?: Date;
+  descendantCount: number;
+  descendantTokenCount: number;
+  sourceMessageTokenCount: number;
+  sourceStartSeq: number | null;
+  sourceEndSeq: number | null;
+  sourceMessageIds: number[];
+  sourceIdentityHashes: string[];
+  previousSummaryIds: string[];
+};
+type PreparedCondensationCandidate = {
+  targetDepth: number;
+  startIndex: number;
+  items: PreparedSummaryNode[];
+  summaryTokens: number;
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -225,6 +272,38 @@ function generateSummaryId(content: string): string {
       .update(content + randomUUID())
       .digest("hex")
       .slice(0, 16)
+  );
+}
+
+function generateCompactionBatchId(conversationId: number): string {
+  return (
+    "cb_" +
+    createHash("sha256")
+      .update(String(conversationId))
+      .update("\0")
+      .update(Date.now().toString())
+      .update("\0")
+      .update(Math.random().toString())
+      .digest("hex")
+      .slice(0, 20)
+  );
+}
+
+function generatePreparedSummaryId(
+  batchId: string,
+  ordinal: number,
+  sourceIdentityHashes: string[],
+): string {
+  return (
+    "sum_pre_" +
+    createHash("sha256")
+      .update(batchId)
+      .update("\0")
+      .update(String(ordinal))
+      .update("\0")
+      .update(sourceIdentityHashes.join("\0"))
+      .digest("hex")
+      .slice(0, 20)
   );
 }
 
@@ -789,6 +868,172 @@ export class CompactionEngine {
     return this.withContextCache(() => this._compactLeafImpl(input));
   }
 
+  async preparePendingLeafBatch(input: {
+    conversationId: number;
+    summarize: CompactionSummarizeFn;
+    summaryModel?: string;
+    maxSummaries?: number;
+  }): Promise<PreparedLeafBatchResult> {
+    return this.withContextCache(() => this._preparePendingLeafBatchImpl(input));
+  }
+
+  private async _preparePendingLeafBatchImpl(input: {
+    conversationId: number;
+    summarize: CompactionSummarizeFn;
+    summaryModel?: string;
+    maxSummaries?: number;
+  }): Promise<PreparedLeafBatchResult> {
+    const existingReady = await this.summaryStore.getLatestReadyCompactionBatch(
+      input.conversationId,
+    );
+    if (existingReady) {
+      return {
+        prepared: false,
+        batchId: existingReady.batchId,
+        summaryCount: 0,
+        reason: "ready prepared batch already exists",
+      };
+    }
+
+    const chunks = await this.selectLeafPreparationChunks(
+      input.conversationId,
+      input.maxSummaries,
+    );
+    if (chunks.length === 0) {
+      return {
+        prepared: false,
+        summaryCount: 0,
+        reason: "no compactable raw-message chunks outside fresh tail",
+      };
+    }
+
+    const batchId = generateCompactionBatchId(input.conversationId);
+    const sourceSeqs: number[] = [];
+    for (const chunk of chunks) {
+      for (const item of chunk) {
+        if (item.messageId == null) {
+          continue;
+        }
+        const message = await this.conversationStore.getMessageById(item.messageId);
+        if (message) {
+          sourceSeqs.push(message.seq);
+        }
+      }
+    }
+
+    await this.summaryStore.createCompactionBatch({
+      batchId,
+      conversationId: input.conversationId,
+      sourceMinSeq: sourceSeqs.length > 0 ? Math.min(...sourceSeqs) : null,
+      sourceMaxSeq: sourceSeqs.length > 0 ? Math.max(...sourceSeqs) : null,
+      reason: "background leaf preparation",
+    });
+
+    let preparedCount = 0;
+    const previousPendingSummaries: Array<{ summaryId: string; content: string }> = [];
+    const preparedFrontier: PreparedSummaryNode[] = [];
+    let sawAuthFailure = false;
+
+    try {
+      for (let ordinal = 0; ordinal < chunks.length; ordinal++) {
+        const chunk = chunks[ordinal]!;
+        const previousPendingContext = previousPendingSummaries
+          .slice(-2)
+          .map((summary) => summary.content.trim())
+          .filter(Boolean)
+          .join("\n\n");
+        const previousSummaryContent = previousPendingContext || undefined;
+        const previousSummaryIds = previousPendingSummaries
+          .slice(-2)
+          .map((summary) => summary.summaryId);
+        const draft = await this.buildLeafSummaryDraft(
+          input.conversationId,
+          chunk,
+          input.summarize,
+          previousSummaryContent,
+        );
+        if (!draft) {
+          sawAuthFailure = true;
+          break;
+        }
+
+        const summaryId = generatePreparedSummaryId(
+          batchId,
+          ordinal,
+          draft.sourceIdentityHashes,
+        );
+        const node: PreparedSummaryNode = {
+          summaryId,
+          ordinal,
+          kind: "leaf",
+          depth: 0,
+          content: draft.content,
+          tokenCount: draft.tokenCount,
+          fileIds: draft.fileIds,
+          earliestAt: draft.earliestAt,
+          latestAt: draft.latestAt,
+          descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: draft.removedTokens,
+          sourceStartSeq: draft.sourceStartSeq,
+          sourceEndSeq: draft.sourceEndSeq,
+          sourceMessageIds: draft.messageIds,
+          sourceIdentityHashes: draft.sourceIdentityHashes,
+          previousSummaryIds,
+        };
+        await this.insertPreparedSummaryNode({
+          batchId,
+          ordinal,
+          conversationId: input.conversationId,
+          model: input.summaryModel,
+          node,
+        });
+        previousPendingSummaries.push({ summaryId, content: draft.content });
+        preparedFrontier.push(node);
+        preparedCount++;
+      }
+
+      if (!sawAuthFailure && preparedFrontier.length > 0) {
+        const condensed = await this.preparePendingCondensedSummaries({
+          batchId,
+          conversationId: input.conversationId,
+          frontier: preparedFrontier,
+          nextOrdinal: preparedCount,
+          summarize: input.summarize,
+          summaryModel: input.summaryModel,
+          maxCondensedSummaries: this.resolveMaxSweepIterations(),
+        });
+        preparedCount += condensed.summaryCount;
+        sawAuthFailure = condensed.authFailure;
+      }
+
+      await this.summaryStore.markCompactionBatchReady(batchId);
+    } catch (err) {
+      const reason =
+        err instanceof Error && err.message.trim()
+          ? err.message
+          : "background leaf preparation failed";
+      try {
+        await this.summaryStore.markCompactionBatchFailed(batchId, reason);
+      } catch (markErr) {
+        this.log.warn(
+          `[lcm] failed to mark prepared compaction batch failed: batch=${batchId} error=${
+            markErr instanceof Error ? markErr.message : String(markErr)
+          }`,
+        );
+      }
+      throw err;
+    }
+
+    return {
+      prepared: preparedCount > 0,
+      batchId,
+      summaryCount: preparedCount,
+      ...(sawAuthFailure ? { authFailure: true, reason: "provider auth failure" } : {}),
+      ...(!sawAuthFailure && preparedCount === 0 ? { reason: "no summaries prepared" } : {}),
+    };
+  }
+
   private async _compactLeafImpl(input: {
     conversationId: number;
     tokenBudget: number;
@@ -982,6 +1227,7 @@ export class CompactionEngine {
     let previousTokens = tokensBefore;
     let hadAuthFailure = false;
     let stoppedForNoProgress = false;
+    let runningTokens = tokensBefore;
 
     // Sweep bounds: a single full sweep must not run an unbounded number of
     // summarizer passes, nor exceed a wall-clock budget. Both phases share
@@ -1036,10 +1282,37 @@ export class CompactionEngine {
       return false;
     };
 
+    const preparedPublishResult = await this.publishPreparedLeafBatchIfReady(conversationId);
+    if (preparedPublishResult) {
+      const passTokensBefore = runningTokens;
+      const passTokensAfter =
+        passTokensBefore -
+        preparedPublishResult.removedTokens +
+        preparedPublishResult.addedTokens;
+      actionTaken = true;
+      createdSummaryId = preparedPublishResult.summaryId;
+      level = preparedPublishResult.level;
+      runningTokens = passTokensAfter;
+      previousTokens = passTokensAfter;
+      await this.persistCompactionEvents({
+        conversationId,
+        tokensBefore: passTokensBefore,
+        tokensAfterLeaf: passTokensAfter,
+        tokensAfterFinal: passTokensAfter,
+        leafResult: {
+          summaryId: preparedPublishResult.summaryId,
+          level: preparedPublishResult.level,
+        },
+        condenseResult: null,
+      });
+      const publishedSummary = await this.summaryStore.getSummary(preparedPublishResult.summaryId);
+      previousSummaryContent = publishedSummary?.content;
+      await yieldToEventLoop();
+    }
+
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
     // Delta tracking: maintain a running token count instead of re-querying DB
     // after each pass. The arithmetic is exact: tokensAfter = tokensBefore - removed + added.
-    let runningTokens = tokensBefore;
     while (true) {
       if (sweepBudgetExhausted("leaf")) {
         break;
@@ -1552,6 +1825,341 @@ export class CompactionEngine {
     }
 
     return { items: chunk, rawTokensOutsideTail, threshold };
+  }
+
+  private async selectLeafPreparationChunks(
+    conversationId: number,
+    maxSummariesOverride?: number,
+  ): Promise<ContextItemRecord[][]> {
+    const contextItems = await this.getContextItemsCached(conversationId);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
+    const chunkTokenBudget = this.resolveLeafChunkTokens();
+    const maxSummaries =
+      typeof maxSummariesOverride === "number" &&
+      Number.isFinite(maxSummariesOverride) &&
+      maxSummariesOverride > 0
+        ? Math.floor(maxSummariesOverride)
+        : this.resolveMaxSweepIterations();
+
+    const chunks: ContextItemRecord[][] = [];
+    let current: ContextItemRecord[] = [];
+    let currentTokens = 0;
+
+    const flushCurrent = (): void => {
+      if (current.length === 0) {
+        return;
+      }
+      chunks.push(current);
+      current = [];
+      currentTokens = 0;
+    };
+
+    for (const item of contextItems) {
+      if (item.ordinal >= freshTailOrdinal || chunks.length >= maxSummaries) {
+        break;
+      }
+      if (item.itemType !== "message" || item.messageId == null) {
+        flushCurrent();
+        continue;
+      }
+
+      const messageTokens = await this.getMessageTokenCount(item.messageId);
+      if (current.length > 0 && currentTokens + messageTokens > chunkTokenBudget) {
+        flushCurrent();
+        if (chunks.length >= maxSummaries) {
+          break;
+        }
+      }
+
+      current.push(item);
+      currentTokens += messageTokens;
+      if (currentTokens >= chunkTokenBudget) {
+        flushCurrent();
+      }
+    }
+    if (chunks.length < maxSummaries) {
+      flushCurrent();
+    }
+
+    return chunks;
+  }
+
+  private async insertPreparedSummaryNode(input: {
+    batchId: string;
+    ordinal: number;
+    conversationId: number;
+    model?: string;
+    node: PreparedSummaryNode;
+  }): Promise<void> {
+    await this.summaryStore.insertPendingCompactionSummary({
+      batchId: input.batchId,
+      summaryId: input.node.summaryId,
+      ordinal: input.ordinal,
+      conversationId: input.conversationId,
+      kind: input.node.kind,
+      depth: input.node.depth,
+      content: input.node.content,
+      tokenCount: input.node.tokenCount,
+      fileIds: input.node.fileIds,
+      earliestAt: input.node.earliestAt,
+      latestAt: input.node.latestAt,
+      descendantCount: input.node.descendantCount,
+      descendantTokenCount: input.node.descendantTokenCount,
+      sourceMessageTokenCount: input.node.sourceMessageTokenCount,
+      model: input.model,
+      sourceStartSeq: input.node.sourceStartSeq,
+      sourceEndSeq: input.node.sourceEndSeq,
+      sourceMessageIds: input.node.sourceMessageIds,
+      sourceIdentityHashes: input.node.sourceIdentityHashes,
+      previousSummaryIds: input.node.previousSummaryIds,
+    });
+  }
+
+  private async preparePendingCondensedSummaries(input: {
+    batchId: string;
+    conversationId: number;
+    frontier: PreparedSummaryNode[];
+    nextOrdinal: number;
+    summarize: CompactionSummarizeFn;
+    summaryModel?: string;
+    maxCondensedSummaries: number;
+  }): Promise<{ summaryCount: number; authFailure: boolean }> {
+    let summaryCount = 0;
+    let nextOrdinal = input.nextOrdinal;
+    const maxCondensedSummaries =
+      Number.isFinite(input.maxCondensedSummaries) && input.maxCondensedSummaries > 0
+        ? Math.floor(input.maxCondensedSummaries)
+        : 0;
+
+    while (summaryCount < maxCondensedSummaries) {
+      const candidate = this.selectPreparedCondensationCandidate(input.frontier);
+      if (!candidate) {
+        break;
+      }
+
+      const draft = await this.buildPreparedCondensedSummaryNode({
+        batchId: input.batchId,
+        ordinal: nextOrdinal,
+        frontier: input.frontier,
+        candidate,
+        summarize: input.summarize,
+      });
+      if (!draft) {
+        return { summaryCount, authFailure: true };
+      }
+
+      await this.insertPreparedSummaryNode({
+        batchId: input.batchId,
+        ordinal: nextOrdinal,
+        conversationId: input.conversationId,
+        model: input.summaryModel,
+        node: draft,
+      });
+      input.frontier.splice(candidate.startIndex, candidate.items.length, draft);
+      nextOrdinal++;
+      summaryCount++;
+      await yieldToEventLoop();
+    }
+
+    return { summaryCount, authFailure: false };
+  }
+
+  private selectPreparedCondensationCandidate(
+    frontier: PreparedSummaryNode[],
+  ): PreparedCondensationCandidate | null {
+    const depthLevels = Array.from(new Set(frontier.map((summary) => summary.depth))).sort(
+      (a, b) => a - b,
+    );
+    const chunkTokenBudget = this.resolveLeafChunkTokens();
+    const minChunkTokens = this.resolveCondensedMinChunkTokens();
+
+    for (const targetDepth of depthLevels) {
+      const fanout = this.resolveFanoutForDepth(targetDepth, false);
+      const items: PreparedSummaryNode[] = [];
+      let summaryTokens = 0;
+      let startIndex = -1;
+
+      for (let index = 0; index < frontier.length; index++) {
+        const item = frontier[index]!;
+        if (item.depth !== targetDepth) {
+          if (items.length > 0) {
+            break;
+          }
+          continue;
+        }
+
+        const tokenCount = Math.max(0, Math.floor(item.tokenCount));
+        if (items.length > 0 && summaryTokens + tokenCount > chunkTokenBudget) {
+          break;
+        }
+
+        if (items.length === 0) {
+          startIndex = index;
+        }
+        items.push(item);
+        summaryTokens += tokenCount;
+        if (summaryTokens >= chunkTokenBudget) {
+          break;
+        }
+      }
+
+      if (items.length >= fanout && summaryTokens >= minChunkTokens && startIndex >= 0) {
+        return { targetDepth, startIndex, items, summaryTokens };
+      }
+    }
+
+    return null;
+  }
+
+  private async buildPreparedCondensedSummaryNode(input: {
+    batchId: string;
+    ordinal: number;
+    frontier: PreparedSummaryNode[];
+    candidate: PreparedCondensationCandidate;
+    summarize: CompactionSummarizeFn;
+  }): Promise<PreparedSummaryNode | null> {
+    const { candidate } = input;
+    const concatenated = candidate.items
+      .map((summary) => {
+        const earliestAt = summary.earliestAt ?? summary.latestAt ?? new Date(0);
+        const latestAt = summary.latestAt ?? summary.earliestAt ?? earliestAt;
+        const header = `[${formatTimestamp(earliestAt, this.config.timezone)} - ${formatTimestamp(
+          latestAt,
+          this.config.timezone,
+        )}]`;
+        return `${header}\n${summary.content}`;
+      })
+      .join("\n\n");
+    const previousSummaryContent =
+      candidate.targetDepth === 0
+        ? this.resolvePriorPreparedSummaryContextAtDepth(
+            input.frontier,
+            candidate.startIndex,
+            candidate.targetDepth,
+          )
+        : undefined;
+    const condensed = await this.summarizeWithEscalation({
+      sourceText: concatenated,
+      summarize: input.summarize,
+      options: {
+        previousSummary: previousSummaryContent,
+        isCondensed: true,
+        depth: candidate.targetDepth + 1,
+      },
+      targetTokens: this.config.condensedTargetTokens,
+    });
+    if (!condensed) {
+      this.log.warn(
+        `[lcm] prepared condensed summary skipped; depth=${candidate.targetDepth}; chunkSummaries=${candidate.items.length}`,
+      );
+      return null;
+    }
+
+    const sourceMessageIds = candidate.items.flatMap((summary) => summary.sourceMessageIds);
+    const sourceIdentityHashes = candidate.items.flatMap(
+      (summary) => summary.sourceIdentityHashes,
+    );
+    const sourceStartSeqs = candidate.items
+      .map((summary) => summary.sourceStartSeq)
+      .filter((seq): seq is number => typeof seq === "number" && Number.isFinite(seq));
+    const sourceEndSeqs = candidate.items
+      .map((summary) => summary.sourceEndSeq)
+      .filter((seq): seq is number => typeof seq === "number" && Number.isFinite(seq));
+    const earliestTimes = candidate.items
+      .map((summary) => summary.earliestAt?.getTime())
+      .filter((time): time is number => typeof time === "number" && Number.isFinite(time));
+    const latestTimes = candidate.items
+      .map((summary) => summary.latestAt?.getTime())
+      .filter((time): time is number => typeof time === "number" && Number.isFinite(time));
+    const summaryId = generatePreparedSummaryId(
+      input.batchId,
+      input.ordinal,
+      sourceIdentityHashes,
+    );
+    const tokenCount = estimateTokens(condensed.content);
+
+    return {
+      summaryId,
+      ordinal: input.ordinal,
+      kind: "condensed",
+      depth: candidate.targetDepth + 1,
+      content: condensed.content,
+      tokenCount,
+      fileIds: dedupeOrderedIds(
+        candidate.items.flatMap((summary) => [
+          ...summary.fileIds,
+          ...extractFileIdsFromContent(summary.content),
+        ]),
+      ),
+      earliestAt:
+        earliestTimes.length > 0 ? new Date(Math.min(...earliestTimes)) : undefined,
+      latestAt:
+        latestTimes.length > 0 ? new Date(Math.max(...latestTimes)) : undefined,
+      descendantCount: candidate.items.reduce(
+        (count, summary) => count + summary.descendantCount + 1,
+        0,
+      ),
+      descendantTokenCount: candidate.items.reduce(
+        (count, summary) => count + summary.tokenCount + summary.descendantTokenCount,
+        0,
+      ),
+      sourceMessageTokenCount: candidate.items.reduce(
+        (count, summary) => count + summary.sourceMessageTokenCount,
+        0,
+      ),
+      sourceStartSeq: sourceStartSeqs.length > 0 ? Math.min(...sourceStartSeqs) : null,
+      sourceEndSeq: sourceEndSeqs.length > 0 ? Math.max(...sourceEndSeqs) : null,
+      sourceMessageIds,
+      sourceIdentityHashes,
+      previousSummaryIds: candidate.items.map((summary) => summary.summaryId),
+    };
+  }
+
+  private resolvePriorPreparedSummaryContextAtDepth(
+    frontier: PreparedSummaryNode[],
+    startIndex: number,
+    targetDepth: number,
+  ): string | undefined {
+    const summaryContents = frontier
+      .slice(0, Math.max(0, startIndex))
+      .filter((summary) => summary.depth === targetDepth)
+      .slice(-2)
+      .map((summary) => summary.content.trim())
+      .filter(Boolean);
+    return summaryContents.length > 0 ? summaryContents.join("\n\n") : undefined;
+  }
+
+  private async publishPreparedLeafBatchIfReady(
+    conversationId: number,
+  ): Promise<PassResult | null> {
+    const contextItems = await this.getContextItemsCached(conversationId);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
+    const result = await this.summaryStore.publishLatestReadyCompactionBatch({
+      conversationId,
+      maxSourceOrdinalExclusive: freshTailOrdinal,
+    });
+    if (!result.published) {
+      if (result.reason && result.reason !== "no ready prepared batch") {
+        this.log.warn(
+          `[lcm] prepared summary publish skipped: conversation=${conversationId} reason=${result.reason}`,
+        );
+      }
+      return null;
+    }
+    this.invalidateContextCache(conversationId);
+    const summaryId = result.summaryIds[result.summaryIds.length - 1];
+    if (!summaryId) {
+      return null;
+    }
+    this.log.info(
+      `[lcm] prepared summary batch published: conversation=${conversationId} batch=${result.batchId ?? "unknown"} summaries=${result.summaryIds.length} partial=${result.partial}`,
+    );
+    return {
+      summaryId,
+      level: "normal",
+      removedTokens: result.tokensRemoved,
+      addedTokens: result.tokensAdded,
+    };
   }
 
   /**
@@ -2090,19 +2698,21 @@ export class CompactionEngine {
 
   // ── Private: Leaf Pass ───────────────────────────────────────────────────
 
-  /**
-   * Summarize a chunk of messages into one leaf summary.
-   */
-  private async leafPass(
+  private async buildLeafSummaryDraft(
     conversationId: number,
     messageItems: ContextItemRecord[],
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
-    summaryModel?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
-    // Fetch full message content for each context item
-    const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
-      [];
+  ): Promise<LeafSummaryDraft | null> {
+    const messageContents: Array<{
+      messageId: number;
+      seq: number;
+      role: MessageRole;
+      rawContent: string;
+      content: string;
+      createdAt: Date;
+      tokenCount: number;
+    }> = [];
     for (const item of messageItems) {
       if (item.messageId == null) {
         continue;
@@ -2111,6 +2721,9 @@ export class CompactionEngine {
       if (msg) {
         messageContents.push({
           messageId: msg.messageId,
+          seq: msg.seq,
+          role: msg.role,
+          rawContent: msg.content,
           content: await this.resolveLeafSummaryMessageContent(msg),
           createdAt: msg.createdAt,
           tokenCount: this.resolveMessageTokenCount(msg),
@@ -2144,13 +2757,11 @@ export class CompactionEngine {
     });
     if (!summary) {
       this.log.warn(
-        `[lcm] leaf compaction skipped summary write; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
+        `[lcm] leaf compaction skipped summary draft; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
       );
       return null;
     }
 
-    // Persist the leaf summary
-    const summaryId = generateSummaryId(summary.content);
     const tokenCount = estimateTokens(summary.content);
     // Note: removedTokens uses resolveMessageTokenCount values (which fall back to
     // estimateTokens for messages with token_count <= 0). This can diverge from
@@ -2162,6 +2773,56 @@ export class CompactionEngine {
       (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
       0,
     );
+    const seqs = messageContents.map((message) => message.seq);
+
+    return {
+      content: summary.content,
+      level: summary.level,
+      tokenCount,
+      fileIds,
+      earliestAt:
+        messageContents.length > 0
+          ? new Date(Math.min(...messageContents.map((message) => message.createdAt.getTime())))
+          : undefined,
+      latestAt:
+        messageContents.length > 0
+          ? new Date(Math.max(...messageContents.map((message) => message.createdAt.getTime())))
+          : undefined,
+      removedTokens,
+      messageIds: messageContents.map((message) => message.messageId),
+      sourceIdentityHashes: messageContents.map((message) =>
+        buildMessageIdentityHash(message.role, message.rawContent),
+      ),
+      sourceStartSeq: seqs.length > 0 ? Math.min(...seqs) : null,
+      sourceEndSeq: seqs.length > 0 ? Math.max(...seqs) : null,
+    };
+  }
+
+  /**
+   * Summarize a chunk of messages into one leaf summary.
+   */
+  private async leafPass(
+    conversationId: number,
+    messageItems: ContextItemRecord[],
+    summarize: CompactionSummarizeFn,
+    previousSummaryContent?: string,
+    summaryModel?: string,
+  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
+    const draft = await this.buildLeafSummaryDraft(
+      conversationId,
+      messageItems,
+      summarize,
+      previousSummaryContent,
+    );
+    if (!draft) {
+      this.log.warn(
+        `[lcm] leaf compaction skipped summary write; conversationId=${conversationId}; chunkMessages=${messageItems.length}`,
+      );
+      return null;
+    }
+
+    // Persist the leaf summary
+    const summaryId = generateSummaryId(draft.content);
 
     await this.summaryStore.withTransaction(async () => {
       await this.summaryStore.insertSummary({
@@ -2169,26 +2830,19 @@ export class CompactionEngine {
         conversationId,
         kind: "leaf",
         depth: 0,
-        content: summary.content,
-        tokenCount,
-        fileIds,
-        earliestAt:
-          messageContents.length > 0
-            ? new Date(Math.min(...messageContents.map((message) => message.createdAt.getTime())))
-            : undefined,
-        latestAt:
-          messageContents.length > 0
-            ? new Date(Math.max(...messageContents.map((message) => message.createdAt.getTime())))
-            : undefined,
+        content: draft.content,
+        tokenCount: draft.tokenCount,
+        fileIds: draft.fileIds,
+        earliestAt: draft.earliestAt,
+        latestAt: draft.latestAt,
         descendantCount: 0,
         descendantTokenCount: 0,
-        sourceMessageTokenCount: removedTokens,
+        sourceMessageTokenCount: draft.removedTokens,
         model: summaryModel,
       });
 
       // Link to source messages before the context swap becomes visible.
-      const messageIds = messageContents.map((m) => m.messageId);
-      await this.summaryStore.linkSummaryToMessages(summaryId, messageIds);
+      await this.summaryStore.linkSummaryToMessages(summaryId, draft.messageIds);
 
       // Replace the message range in context with the new summary.
       const ordinals = messageItems.map((ci) => ci.ordinal);
@@ -2204,7 +2858,13 @@ export class CompactionEngine {
     });
     this.invalidateContextCache(conversationId);
 
-    return { summaryId, level: summary.level, content: summary.content, removedTokens, addedTokens: tokenCount };
+    return {
+      summaryId,
+      level: draft.level,
+      content: draft.content,
+      removedTokens: draft.removedTokens,
+      addedTokens: draft.tokenCount,
+    };
   }
 
   // ── Private: Condensed Pass ──────────────────────────────────────────────
