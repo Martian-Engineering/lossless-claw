@@ -56,10 +56,11 @@ import {
 } from "./transaction-mutex.js";
 import { getTranscriptEntryId, getTranscriptEntryMeta, readAppendedLeafPathMessages, readLastJsonlEntryBeforeOffset, readLeafPathMessages, readLeafPathRawEntries, readSessionParentSessionReference, readTranscriptHeader, type TranscriptRawEntry } from "./transcript.js";
 import { resolveEpochRoute, selectEntryIdTail, transcriptImportCap } from "./reconcile-plan.js";
+import { AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON, SessionRolloverDetector } from "./session-rollover.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
-import { batchLooksLikeHeartbeatAckTurn, filterSyntheticHeartbeatMessages, isHeartbeatNoiseContent, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
+import { batchLooksLikeHeartbeatAckTurn, filterSyntheticHeartbeatMessages, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isLikelyInjectedDeliveryOnlyTranscript, isLikelyInjectedMetadataPreambleRecord, isOpenClawRuntimeContextLeak, toStoredMessage, type StoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, createLosslessMessageSignature, isBootstrapReplayCandidateMessage, messageIdentity, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
@@ -82,15 +83,6 @@ const LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapab
 ];
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
-const AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON =
-  "ambiguous session-key runtime rollover";
-/**
- * How many recent persisted messages an ambiguous-rollover freshness check
- * compares against the new transcript. Wide enough that a continuation of
- * this conversation cannot plausibly avoid every recent message, small
- * enough to stay cheap on conversations with thousands of rows.
- */
-const AMBIGUOUS_ROLLOVER_OVERLAP_WINDOW = 50;
 /**
  * How deep into the conversation tail a flush-lagged runtime row can sit.
  * Flush lag is a same-turn phenomenon (the runtime persisted a row moments
@@ -98,20 +90,8 @@ const AMBIGUOUS_ROLLOVER_OVERLAP_WINDOW = 50;
  * unstamped rows, not flush lag.
  */
 const FLUSH_LAG_ADOPTION_TAIL_WINDOW = 16;
-/**
- * Widened fallback window used when the recent window contains no
- * lineage-discriminating content (e.g. a lane that idled on heartbeat
- * traffic before freezing).
- */
-const AMBIGUOUS_ROLLOVER_OVERLAP_WIDE_WINDOW = 500;
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
-type SummarySpendGuardState = {
-  windowStartedAt: number;
-  calls: number;
-  backoffUntil: number | null;
-  lastReason: string | null;
-};
 type PromptCacheSnapshot = {
   lastObservedCacheRead?: number;
   lastObservedCacheWrite?: number;
@@ -347,12 +327,6 @@ type TranscriptReconcileResult = {
   transcriptCovered?: boolean;
 };
 
-type AmbiguousSessionKeyRuntimeRollover = {
-  conversationId: number;
-  activeSessionId: string;
-  sessionKey: string;
-  trackedSessionFile: string;
-};
 
 export class LcmContextEngine implements ContextEngine {
   readonly info: ContextEngineInfo;
@@ -414,6 +388,9 @@ export class LcmContextEngine implements ContextEngine {
 
   // ── After-turn batch replay dedup ────────────────────────────────────────
   private readonly batchDeduplicator: BatchDeduplicator;
+
+  // ── Missed-lifecycle rollover detection ──────────────────────────────────
+  private readonly sessionRolloverDetector: SessionRolloverDetector;
 
   /** Last file state successfully covered by `reconcileTranscriptTailForAfterTurn`
    *  slow-path full re-reads, keyed by `${sessionQueueKey}\u0000${sessionFile}`
@@ -514,6 +491,12 @@ export class LcmContextEngine implements ContextEngine {
       (params) => this.resolveLargeFileTextSummarizer(params),
     );
     this.batchDeduplicator = new BatchDeduplicator(this.conversationStore, this.deps);
+    this.sessionRolloverDetector = new SessionRolloverDetector(
+      this.conversationStore,
+      this.summaryStore,
+      this.deps,
+      (params) => this.applySessionReplacement(params),
+    );
     this.focusBriefStore = new FocusBriefStore(this.db);
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
@@ -3189,13 +3172,13 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<TranscriptReconcileResult> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     await this.conversationStore.withTransaction(async () => {
-      await this.rotateIsolatedCronConversationIfRuntimeChanged({
+      await this.sessionRolloverDetector.rotateIsolatedCronConversationIfRuntimeChanged({
         phase: "afterTurn",
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         createReplacement: false,
       });
-      await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+      await this.sessionRolloverDetector.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
         phase: "afterTurn",
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
@@ -3516,7 +3499,7 @@ export class LcmContextEngine implements ContextEngine {
         const historicalMessages = await readLeafPathMessages(params.sessionFile);
         if (reason === "path-mismatch") {
           const ambiguousRollover =
-            await this.findAmbiguousSessionKeyRuntimeRollover({
+            await this.sessionRolloverDetector.findAmbiguousSessionKeyRuntimeRollover({
               phase: "afterTurn",
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
@@ -3528,7 +3511,7 @@ export class LcmContextEngine implements ContextEngine {
                 ambiguousRollover.conversationId,
               );
             const hasFrontierAnchor =
-              await this.transcriptContainsCurrentConversationTailAnchor({
+              await this.sessionRolloverDetector.transcriptContainsCurrentConversationTailAnchor({
                 conversationId: ambiguousRollover.conversationId,
                 historicalMessages,
                 checkpointEntryHash: activeBootstrapState?.lastProcessedEntryHash,
@@ -3539,7 +3522,7 @@ export class LcmContextEngine implements ContextEngine {
               // skipped (unsafe-to-advance), and the next turn reconciles
               // the full transcript into the fresh conversation.
               const rotatedForFreshTranscript =
-                await this.rotateAmbiguousRolloverForProvablyFreshTranscript({
+                await this.sessionRolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
                   phase: "afterTurn",
                   sessionId: params.sessionId,
                   rollover: ambiguousRollover,
@@ -3554,7 +3537,7 @@ export class LcmContextEngine implements ContextEngine {
                   hasOverlap: false,
                 };
               }
-              this.logAmbiguousSessionKeyRuntimeRollover({
+              this.sessionRolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
                 phase: "afterTurn",
                 rollover: ambiguousRollover,
                 sessionId: params.sessionId,
@@ -3845,455 +3828,6 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
-  /**
-   * Recover lifecycle splits that the host missed when it pruned a transcript
-   * file before Lossless saw a reset/session_end hook. Without this, stable
-   * session keys can reattach a new runtime UUID to a stale active conversation
-   * and assemble old assistant tails as if they belonged to the new turn.
-   */
-  private async rotateStaleSessionKeyConversationIfTrackedTranscriptMissing(params: {
-    phase: "bootstrap" | "assemble" | "afterTurn";
-    sessionId: string;
-    sessionKey?: string;
-    sessionFile?: string;
-    createReplacement?: boolean;
-  }): Promise<boolean> {
-    const normalizedSessionKey = params.sessionKey?.trim();
-    if (!normalizedSessionKey) {
-      return false;
-    }
-
-    const activeByKey = await this.conversationStore.getConversationBySessionKey(
-      normalizedSessionKey,
-    );
-    if (!activeByKey || activeByKey.sessionId === params.sessionId) {
-      return false;
-    }
-
-    const activeBootstrapState = await this.summaryStore.getConversationBootstrapState(
-      activeByKey.conversationId,
-    );
-    const trackedSessionFile = activeBootstrapState?.sessionFilePath;
-    if (typeof trackedSessionFile !== "string" || trackedSessionFile.length === 0) {
-      return false;
-    }
-
-    const transcriptRotated =
-      params.sessionFile === undefined || trackedSessionFile !== params.sessionFile;
-    if (!transcriptRotated) {
-      return false;
-    }
-
-    try {
-      await stat(trackedSessionFile);
-      return false;
-    } catch (err) {
-      if (!isMissingFileError(err)) {
-        this.deps.log.warn(
-          `[lcm] ${params.phase}: could not verify tracked transcript path conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
-        );
-        return false;
-      }
-    }
-
-    this.deps.log.warn(
-      `[lcm] ${params.phase}: detected reset/rollover without prior lifecycle split; rotating conversation=${activeByKey.conversationId} session=${params.sessionId} sessionKey=${normalizedSessionKey} oldSessionId=${activeByKey.sessionId} oldFile=${trackedSessionFile}${params.sessionFile ? ` newFile=${params.sessionFile}` : ""}`,
-    );
-    await this.applySessionReplacement({
-      reason: `${params.phase} session-file rollover fallback`,
-      sessionId: activeByKey.sessionId,
-      sessionKey: normalizedSessionKey,
-      nextSessionId: params.sessionId,
-      nextSessionKey: normalizedSessionKey,
-      createReplacement: params.createReplacement ?? true,
-    });
-    return true;
-  }
-
-  /** Cron session keys represent isolated scheduled runs, not conversation continuity. */
-  private isIsolatedCronSessionKey(sessionKey?: string): boolean {
-    const trimmed = sessionKey?.trim();
-    if (!trimmed) {
-      return false;
-    }
-    const parts = trimmed.split(":");
-    return parts.length >= 4 && parts[0] === "agent" && parts[2] === "cron";
-  }
-
-  /**
-   * Archive the prior active cron run when OpenClaw reuses a scheduler
-   * sessionKey for a new isolated runtime session.
-   */
-  private async rotateIsolatedCronConversationIfRuntimeChanged(params: {
-    phase: "bootstrap" | "assemble" | "afterTurn";
-    sessionId: string;
-    sessionKey?: string;
-    createReplacement: boolean;
-  }): Promise<boolean> {
-    const normalizedSessionId = params.sessionId.trim();
-    const normalizedSessionKey = params.sessionKey?.trim();
-    if (
-      !normalizedSessionId ||
-      !normalizedSessionKey ||
-      !this.isIsolatedCronSessionKey(normalizedSessionKey)
-    ) {
-      return false;
-    }
-
-    const activeByKey = await this.conversationStore.getConversationBySessionKey(
-      normalizedSessionKey,
-    );
-    if (!activeByKey || activeByKey.sessionId === normalizedSessionId) {
-      return false;
-    }
-
-    this.deps.log.info(
-      `[lcm] ${params.phase}: isolated cron session rollover; archiving conversation=${activeByKey.conversationId} oldSessionId=${activeByKey.sessionId} newSessionId=${normalizedSessionId} sessionKey=${normalizedSessionKey}`,
-    );
-    await this.applySessionReplacement({
-      reason: `${params.phase} isolated cron session rollover`,
-      sessionId: activeByKey.sessionId,
-      sessionKey: normalizedSessionKey,
-      nextSessionId: normalizedSessionId,
-      nextSessionKey: normalizedSessionKey,
-      createReplacement: params.createReplacement,
-    });
-    return true;
-  }
-
-  private async findAmbiguousSessionKeyRuntimeRollover(params: {
-    phase: "bootstrap" | "assemble" | "afterTurn";
-    sessionId: string;
-    sessionKey?: string;
-    sessionFile?: string;
-  }): Promise<AmbiguousSessionKeyRuntimeRollover | null> {
-    const normalizedSessionKey = params.sessionKey?.trim();
-    if (!normalizedSessionKey) {
-      return null;
-    }
-
-    const activeByKey = await this.conversationStore.getConversationBySessionKey(
-      normalizedSessionKey,
-    );
-    if (!activeByKey || activeByKey.sessionId === params.sessionId) {
-      return null;
-    }
-
-    const activeBootstrapState = await this.summaryStore.getConversationBootstrapState(
-      activeByKey.conversationId,
-    );
-    const trackedSessionFile = activeBootstrapState?.sessionFilePath;
-    if (typeof trackedSessionFile !== "string" || trackedSessionFile.length === 0) {
-      return null;
-    }
-
-    if (params.sessionFile !== undefined && trackedSessionFile === params.sessionFile) {
-      return null;
-    }
-
-    try {
-      await stat(trackedSessionFile);
-    } catch (err) {
-      if (!isMissingFileError(err)) {
-        this.deps.log.warn(
-          `[lcm] ${params.phase}: could not verify tracked transcript path for ambiguous runtime rollover guard conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
-        );
-      }
-      return null;
-    }
-
-    return {
-      conversationId: activeByKey.conversationId,
-      activeSessionId: activeByKey.sessionId,
-      sessionKey: normalizedSessionKey,
-      trackedSessionFile,
-    };
-  }
-
-  private logAmbiguousSessionKeyRuntimeRollover(params: {
-    phase: "bootstrap" | "assemble" | "afterTurn";
-    rollover: AmbiguousSessionKeyRuntimeRollover;
-    sessionId: string;
-    sessionFile?: string;
-  }): void {
-    this.deps.log.warn(
-      `[lcm] ${params.phase}: ${AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON}; preserving conversation=${params.rollover.conversationId} session=${params.sessionId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} oldFile=${params.rollover.trackedSessionFile}${params.sessionFile ? ` newFile=${params.sessionFile}` : ""}`,
-    );
-  }
-
-  /**
-   * Judge whether the new runtime's transcript is provably FRESH relative to
-   * a key-conflicting conversation: zero identity overlap with the
-   * conversation's recent persisted history AND every timestamped candidate
-   * entry postdates the conversation's last persisted message. Freshness is
-   * judged on content+time evidence — never on transcript size — so lanes
-   * that ran frozen for days (and accumulated history) still qualify.
-   * Fails closed on missing evidence.
-   */
-  private async evaluateAmbiguousRolloverFreshness(params: {
-    conversationId: number;
-    candidateMessages: AgentMessage[];
-  }): Promise<{
-    fresh: boolean;
-    reason: string;
-    lastPersistedAt: Date | null;
-    firstCandidateAt: number | null;
-  }> {
-    if (isLikelyInjectedDeliveryOnlyTranscript(params.candidateMessages)) {
-      return {
-        fresh: false,
-        reason: "delivery-only-synthetic-transcript",
-        lastPersistedAt: null,
-        firstCandidateAt: null,
-      };
-    }
-
-    // Every candidate must carry a usable timestamp (message timestamp or
-    // transcript envelope timestamp); any untimestamped entry means the
-    // transcript's age cannot be proven, so fail closed.
-    let firstCandidateAt: number | null = null;
-    for (const message of params.candidateMessages) {
-      const ts = (message as { timestamp?: unknown }).timestamp;
-      let resolved: number | null =
-        typeof ts === "number" && Number.isFinite(ts) && ts > 0 ? ts : null;
-      if (resolved === null) {
-        const envelopeTimestamp = getTranscriptEntryMeta(message)?.timestamp;
-        if (typeof envelopeTimestamp === "string") {
-          const parsed = Date.parse(envelopeTimestamp);
-          if (Number.isFinite(parsed) && parsed > 0) {
-            resolved = parsed;
-          }
-        }
-      }
-      if (resolved === null) {
-        return {
-          fresh: false,
-          reason: "candidate-missing-timestamp",
-          lastPersistedAt: null,
-          firstCandidateAt,
-        };
-      }
-      firstCandidateAt = firstCandidateAt === null ? resolved : Math.min(firstCandidateAt, resolved);
-    }
-    if (firstCandidateAt === null) {
-      return {
-        fresh: false,
-        reason: "no-candidate-timestamps",
-        lastPersistedAt: null,
-        firstCandidateAt,
-      };
-    }
-
-    const lastPersisted = await this.conversationStore.getLastMessage(params.conversationId);
-    if (!lastPersisted) {
-      // Nothing persisted to protect: time evidence alone is sufficient and
-      // archiving an empty conversation is harmless.
-      return { fresh: true, reason: "empty-conversation", lastPersistedAt: null, firstCandidateAt };
-    }
-    if (firstCandidateAt <= lastPersisted.createdAt.getTime()) {
-      return {
-        fresh: false,
-        reason: "candidate-entries-predate-last-persisted",
-        lastPersistedAt: lastPersisted.createdAt,
-        firstCandidateAt,
-      };
-    }
-
-    // Identity overlap against recent persisted history. Only
-    // lineage-DISCRIMINATING content participates: synthetic heartbeat
-    // traffic and content that recurs within the window appear identically
-    // in every session and prove nothing (live incident: a week-idle lane's
-    // entire recent window was heartbeat polls, false-blocking the heal).
-    // Empty stored content (pure tool rows) is likewise skipped.
-    const collectDiscriminatingIdentities = async (window: number): Promise<Set<string>> => {
-      const records = await this.conversationStore.getLastMessages(
-        params.conversationId,
-        window,
-      );
-      const counts = new Map<string, number>();
-      for (const record of records) {
-        if (
-          record.content.trim().length === 0 ||
-          isHeartbeatNoiseContent(record.role, record.content)
-        ) {
-          continue;
-        }
-        const identity = messageIdentity(record.role, record.content);
-        counts.set(identity, (counts.get(identity) ?? 0) + 1);
-      }
-      const identities = new Set<string>();
-      for (const [identity, count] of counts) {
-        if (count === 1) {
-          identities.add(identity);
-        }
-      }
-      return identities;
-    };
-    let persistedIdentities = await collectDiscriminatingIdentities(
-      AMBIGUOUS_ROLLOVER_OVERLAP_WINDOW,
-    );
-    if (persistedIdentities.size === 0) {
-      persistedIdentities = await collectDiscriminatingIdentities(
-        AMBIGUOUS_ROLLOVER_OVERLAP_WIDE_WINDOW,
-      );
-    }
-    if (persistedIdentities.size === 0) {
-      // Even the widened window holds nothing but template noise: the
-      // overlap test has no signal in either direction. The per-entry time
-      // gate above already proved every new entry postdates the last
-      // persisted message — a transcript wholly created after persistence
-      // stopped cannot be a lost continuation of stored content. A wrongful
-      // rotation only archives (fully reversible, still queryable) while
-      // staying frozen silently loses data, so proceed on time evidence.
-      return {
-        fresh: true,
-        reason: "fresh-time-evidence-only-no-comparable-history",
-        lastPersistedAt: lastPersisted.createdAt,
-        firstCandidateAt,
-      };
-    }
-    let checkedCandidateIdentity = false;
-    for (const message of params.candidateMessages) {
-      const stored = toStoredMessage(message);
-      if (
-        stored.content.trim().length === 0 ||
-        isHeartbeatNoiseContent(stored.role, stored.content)
-      ) {
-        continue;
-      }
-      checkedCandidateIdentity = true;
-      if (persistedIdentities.has(messageIdentity(stored.role, stored.content))) {
-        return {
-          fresh: false,
-          reason: "identity-overlap-with-persisted-history",
-          lastPersistedAt: lastPersisted.createdAt,
-          firstCandidateAt,
-        };
-      }
-    }
-    if (!checkedCandidateIdentity) {
-      return {
-        fresh: false,
-        reason: "no-comparable-candidate-content",
-        lastPersistedAt: lastPersisted.createdAt,
-        firstCandidateAt,
-      };
-    }
-
-    return { fresh: true, reason: "fresh", lastPersistedAt: lastPersisted.createdAt, firstCandidateAt };
-  }
-
-  /**
-   * Tier-2 resolution for ambiguous session-key runtime rollovers
-   * (lossless-claw-30b.8): a provably fresh new transcript means the
-   * rollover is a legitimate reset, not a foreign transcript sharing the
-   * key. Archive the old conversation (fully preserved and queryable) so
-   * the new session can bind and bootstrap normally instead of leaving the
-   * lane frozen outside LCM indefinitely. Returns true when rotated;
-   * false leaves the existing freeze-and-preserve behavior in place.
-   */
-  private async rotateAmbiguousRolloverForProvablyFreshTranscript(params: {
-    phase: "bootstrap" | "assemble" | "afterTurn";
-    sessionId: string;
-    rollover: AmbiguousSessionKeyRuntimeRollover;
-    candidateMessages: AgentMessage[];
-    createReplacement: boolean;
-  }): Promise<boolean> {
-    let verdict: Awaited<ReturnType<LcmContextEngine["evaluateAmbiguousRolloverFreshness"]>>;
-    try {
-      verdict = await this.evaluateAmbiguousRolloverFreshness({
-        conversationId: params.rollover.conversationId,
-        candidateMessages: params.candidateMessages,
-      });
-    } catch (err) {
-      this.deps.log.warn(
-        `[lcm] ${params.phase}: ambiguous rollover freshness check failed conversation=${params.rollover.conversationId} error=${describeLogError(err)}`,
-      );
-      return false;
-    }
-    if (!verdict.fresh) {
-      this.deps.log.warn(
-        `[lcm] ${params.phase}: ambiguous rollover not provably fresh conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
-      );
-      return false;
-    }
-
-    await this.applySessionReplacement({
-      reason: `${params.phase} ambiguous rollover fresh-transcript rotation`,
-      sessionId: params.rollover.activeSessionId,
-      sessionKey: params.rollover.sessionKey,
-      nextSessionId: params.sessionId,
-      nextSessionKey: params.rollover.sessionKey,
-      createReplacement: params.createReplacement,
-    });
-    // Postcondition: applySessionReplacement has internal no-op paths (e.g.
-    // a fresh lifecycle row is left in place). Claiming "resolved" while the
-    // key is still bound to the old session would hide a live freeze behind
-    // healed-looking logs, so verify the binding actually moved.
-    const bindingAfter = await this.conversationStore.getConversationBySessionKey(
-      params.rollover.sessionKey,
-    );
-    if (
-      bindingAfter &&
-      bindingAfter.conversationId === params.rollover.conversationId &&
-      bindingAfter.sessionId === params.rollover.activeSessionId
-    ) {
-      this.deps.log.warn(
-        `[lcm] ${params.phase}: ambiguous rollover rotation had no effect (lifecycle no-op) conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId}; leaving lane frozen`,
-      );
-      return false;
-    }
-
-    this.deps.log.warn(
-      `[lcm] ${params.phase}: ambiguous rollover resolved by fresh-transcript rotation conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId} candidateMessages=${params.candidateMessages.length} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
-    );
-    return true;
-  }
-
-  private async transcriptContainsCurrentConversationTailAnchor(params: {
-    conversationId: number;
-    historicalMessages: AgentMessage[];
-    checkpointEntryHash?: string | null;
-  }): Promise<boolean> {
-    if (params.historicalMessages.length === 0) {
-      return false;
-    }
-
-    const persistedMessages = await this.conversationStore.getMessages(params.conversationId);
-    if (persistedMessages.length < 2 || !params.checkpointEntryHash) {
-      return false;
-    }
-
-    const storedHistoricalMessages = params.historicalMessages.map((message) =>
-      toStoredMessage(message),
-    );
-    const tailLength = Math.min(3, persistedMessages.length);
-    const persistedTail = persistedMessages.slice(-tailLength);
-    for (let index = tailLength - 1; index < storedHistoricalMessages.length; index += 1) {
-      if (
-        createBootstrapEntryHash(storedHistoricalMessages[index]!) !==
-        params.checkpointEntryHash
-      ) {
-        continue;
-      }
-      const historicalTail = storedHistoricalMessages.slice(index - tailLength + 1, index + 1);
-      // A single common tail like "Done" is not enough to bind a new runtime to
-      // an existing keyed conversation. Require a contiguous persisted suffix.
-      const tailsMatch = persistedTail.every((persistedMessage, tailIndex) => {
-        const historical = historicalTail[tailIndex];
-        return (
-          historical !== undefined &&
-          messageIdentity(persistedMessage.role, persistedMessage.content) ===
-            messageIdentity(historical.role, historical.content)
-        );
-      });
-      if (tailsMatch) {
-        return true;
-      }
-    }
-
-    return false;
-  }
 
   async bootstrap(params: {
     sessionId: string;
@@ -4357,20 +3891,20 @@ export class LcmContextEngine implements ContextEngine {
           };
           let preloadedHistoricalMessages: AgentMessage[] | undefined;
 
-          await this.rotateIsolatedCronConversationIfRuntimeChanged({
+          await this.sessionRolloverDetector.rotateIsolatedCronConversationIfRuntimeChanged({
             phase: "bootstrap",
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             createReplacement: true,
           });
-          await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+          await this.sessionRolloverDetector.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
             phase: "bootstrap",
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             sessionFile: params.sessionFile,
           });
           const ambiguousRollover =
-            await this.findAmbiguousSessionKeyRuntimeRollover({
+            await this.sessionRolloverDetector.findAmbiguousSessionKeyRuntimeRollover({
               phase: "bootstrap",
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
@@ -4383,7 +3917,7 @@ export class LcmContextEngine implements ContextEngine {
                 ambiguousRollover.conversationId,
               );
             const hasFrontierAnchor =
-              await this.transcriptContainsCurrentConversationTailAnchor({
+              await this.sessionRolloverDetector.transcriptContainsCurrentConversationTailAnchor({
                 conversationId: ambiguousRollover.conversationId,
                 historicalMessages: preloadedHistoricalMessages,
                 checkpointEntryHash: activeBootstrapState?.lastProcessedEntryHash,
@@ -4394,7 +3928,7 @@ export class LcmContextEngine implements ContextEngine {
               // and fall through so getOrCreateConversation below binds the
               // new session and the initial import ingests its transcript.
               const rotatedForFreshTranscript =
-                await this.rotateAmbiguousRolloverForProvablyFreshTranscript({
+                await this.sessionRolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
                   phase: "bootstrap",
                   sessionId: params.sessionId,
                   rollover: ambiguousRollover,
@@ -4402,7 +3936,7 @@ export class LcmContextEngine implements ContextEngine {
                   createReplacement: false,
                 });
               if (!rotatedForFreshTranscript) {
-                this.logAmbiguousSessionKeyRuntimeRollover({
+                this.sessionRolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
                   phase: "bootstrap",
                   rollover: ambiguousRollover,
                   sessionId: params.sessionId,
@@ -5843,13 +5377,13 @@ export class LcmContextEngine implements ContextEngine {
           this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
           async () =>
             this.conversationStore.withTransaction(async () => {
-              await this.rotateIsolatedCronConversationIfRuntimeChanged({
+              await this.sessionRolloverDetector.rotateIsolatedCronConversationIfRuntimeChanged({
                 phase: "assemble",
                 sessionId: params.sessionId,
                 sessionKey: params.sessionKey,
                 createReplacement: false,
               });
-              await this.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+              await this.sessionRolloverDetector.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
                 phase: "assemble",
                 sessionId: params.sessionId,
                 sessionKey: params.sessionKey,
@@ -5874,7 +5408,7 @@ export class LcmContextEngine implements ContextEngine {
         return safeFallback();
       }
       const ambiguousRollover =
-        await this.findAmbiguousSessionKeyRuntimeRollover({
+        await this.sessionRolloverDetector.findAmbiguousSessionKeyRuntimeRollover({
           phase: "assemble",
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -5885,7 +5419,7 @@ export class LcmContextEngine implements ContextEngine {
         // evidence — judging freshness on it could wrongly archive a
         // continuing conversation. bootstrap/afterTurn heal with the full
         // transcript file on the next call.
-        this.logAmbiguousSessionKeyRuntimeRollover({
+        this.sessionRolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
           phase: "assemble",
           rollover: ambiguousRollover,
           sessionId: params.sessionId,
