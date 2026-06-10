@@ -144,6 +144,12 @@ const AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON =
  * enough to stay cheap on conversations with thousands of rows.
  */
 const AMBIGUOUS_ROLLOVER_OVERLAP_WINDOW = 50;
+/**
+ * Widened fallback window used when the recent window contains no
+ * lineage-discriminating content (e.g. a lane that idled on heartbeat
+ * traffic before freezing).
+ */
+const AMBIGUOUS_ROLLOVER_OVERLAP_WIDE_WINDOW = 500;
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
 type CircuitBreakerState = {
@@ -8234,25 +8240,55 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    // Identity overlap against the recent persisted tail. Empty stored
-    // content (pure tool rows) is skipped on both sides: it matches
-    // trivially and proves nothing about lineage.
-    const recentPersisted = await this.conversationStore.getLastMessages(
-      params.conversationId,
+    // Identity overlap against recent persisted history. Only
+    // lineage-DISCRIMINATING content participates: synthetic heartbeat
+    // traffic and content that recurs within the window appear identically
+    // in every session and prove nothing (live incident: a week-idle lane's
+    // entire recent window was heartbeat polls, false-blocking the heal).
+    // Empty stored content (pure tool rows) is likewise skipped.
+    const collectDiscriminatingIdentities = async (window: number): Promise<Set<string>> => {
+      const records = await this.conversationStore.getLastMessages(
+        params.conversationId,
+        window,
+      );
+      const counts = new Map<string, number>();
+      for (const record of records) {
+        if (
+          record.content.trim().length === 0 ||
+          isHeartbeatNoiseContent(record.role, record.content)
+        ) {
+          continue;
+        }
+        const identity = messageIdentity(record.role, record.content);
+        counts.set(identity, (counts.get(identity) ?? 0) + 1);
+      }
+      const identities = new Set<string>();
+      for (const [identity, count] of counts) {
+        if (count === 1) {
+          identities.add(identity);
+        }
+      }
+      return identities;
+    };
+    let persistedIdentities = await collectDiscriminatingIdentities(
       AMBIGUOUS_ROLLOVER_OVERLAP_WINDOW,
     );
-    const persistedIdentities = new Set<string>();
-    for (const record of recentPersisted) {
-      if (record.content.trim().length > 0) {
-        persistedIdentities.add(messageIdentity(record.role, record.content));
-      }
+    if (persistedIdentities.size === 0) {
+      persistedIdentities = await collectDiscriminatingIdentities(
+        AMBIGUOUS_ROLLOVER_OVERLAP_WIDE_WINDOW,
+      );
     }
     if (persistedIdentities.size === 0) {
-      // Nothing comparable persisted (e.g. only empty tool rows): the
-      // overlap test would pass vacuously, which is not proof. Fail closed.
+      // Even the widened window holds nothing but template noise: the
+      // overlap test has no signal in either direction. The per-entry time
+      // gate above already proved every new entry postdates the last
+      // persisted message — a transcript wholly created after persistence
+      // stopped cannot be a lost continuation of stored content. A wrongful
+      // rotation only archives (fully reversible, still queryable) while
+      // staying frozen silently loses data, so proceed on time evidence.
       return {
-        fresh: false,
-        reason: "no-comparable-persisted-content",
+        fresh: true,
+        reason: "fresh-time-evidence-only-no-comparable-history",
         lastPersistedAt: lastPersisted.createdAt,
         firstCandidateAt,
       };
@@ -8260,7 +8296,10 @@ export class LcmContextEngine implements ContextEngine {
     let checkedCandidateIdentity = false;
     for (const message of params.candidateMessages) {
       const stored = toStoredMessage(message);
-      if (stored.content.trim().length === 0) {
+      if (
+        stored.content.trim().length === 0 ||
+        isHeartbeatNoiseContent(stored.role, stored.content)
+      ) {
         continue;
       }
       checkedCandidateIdentity = true;
@@ -12601,6 +12640,19 @@ const OPENCLAW_HEARTBEAT_POLL = "[openclaw heartbeat poll]";
  */
 function isHeartbeatOkContent(content: string): boolean {
   return content.trim().toLowerCase() === HEARTBEAT_OK_TOKEN;
+}
+
+/**
+ * Synthetic heartbeat traffic (poll prompts and HEARTBEAT_OK acks) recurs
+ * identically in every session, so it can never discriminate lineage in
+ * the ambiguous-rollover freshness check.
+ */
+function isHeartbeatNoiseContent(role: string, content: string): boolean {
+  const normalized = content.trim().toLowerCase();
+  if (role === "user" && normalized === OPENCLAW_HEARTBEAT_POLL) {
+    return true;
+  }
+  return role === "assistant" && normalized === HEARTBEAT_OK_TOKEN;
 }
 
 function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolean {
