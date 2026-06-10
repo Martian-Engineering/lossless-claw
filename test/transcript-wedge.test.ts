@@ -105,9 +105,11 @@ type PrivateEngine = {
     compactUntilUnder: (...args: unknown[]) => Promise<unknown>;
   };
   resolveSessionQueueKey: (sessionId: string, sessionKey?: string) => string;
-  resolveSummarySpendScope: (params: { kind: string; scope: string | undefined }) => string;
-  openSummarySpendBackoff: (params: { scopeKey: string; reason: string }) => Date;
-  getSummarySpendBackoffUntil: (scopeKey: string) => Date | null;
+  compactionGuards: {
+    resolveSummarySpendScope: (params: { kind: string; scope: string | undefined }) => string;
+    openSummarySpendBackoff: (params: { scopeKey: string; reason: string }) => Date;
+    getSummarySpendBackoffUntil: (scopeKey: string) => Date | null;
+  };
 };
 
 function privateEngine(engine: LcmContextEngine): PrivateEngine {
@@ -116,7 +118,7 @@ function privateEngine(engine: LcmContextEngine): PrivateEngine {
 
 function spendScopeKey(engine: LcmContextEngine, sessionId: string, sessionKey?: string): string {
   const internals = privateEngine(engine);
-  return internals.resolveSummarySpendScope({
+  return internals.compactionGuards.resolveSummarySpendScope({
     kind: "compaction",
     scope: internals.resolveSessionQueueKey(sessionId, sessionKey),
   });
@@ -177,7 +179,7 @@ describe("transcript wedge terminal verdict", () => {
     expect(compactSpy).toHaveBeenCalledTimes(1);
     // Terminal verdict: no spend backoff — throttling a non-retryable state
     // only blocks a later manual repair attempt.
-    expect(internals.getSummarySpendBackoffUntil(spendScopeKey(engine, sessionId))).toBeNull();
+    expect(internals.compactionGuards.getSummarySpendBackoffUntil(spendScopeKey(engine, sessionId))).toBeNull();
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("transcript wedge detected"),
     );

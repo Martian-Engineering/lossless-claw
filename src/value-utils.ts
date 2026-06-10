@@ -50,3 +50,10 @@ export function asRecord(value: unknown): Record<string, unknown> | undefined {
 export function safeBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
+
+/** Coerce a config value to a positive integer, falling back when unset/invalid. */
+export function resolvePositiveInteger(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : fallback;
+}

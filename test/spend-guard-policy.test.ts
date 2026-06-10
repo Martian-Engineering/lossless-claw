@@ -107,9 +107,11 @@ type PrivateEngine = {
     compactUntilUnder: (...args: unknown[]) => Promise<unknown>;
   };
   resolveSessionQueueKey: (sessionId: string, sessionKey?: string) => string;
-  resolveSummarySpendScope: (params: { kind: string; scope: string | undefined }) => string;
-  openSummarySpendBackoff: (params: { scopeKey: string; reason: string }) => Date;
-  getSummarySpendBackoffUntil: (scopeKey: string) => Date | null;
+  compactionGuards: {
+    resolveSummarySpendScope: (params: { kind: string; scope: string | undefined }) => string;
+    openSummarySpendBackoff: (params: { scopeKey: string; reason: string }) => Date;
+    getSummarySpendBackoffUntil: (scopeKey: string) => Date | null;
+  };
 };
 
 function privateEngine(engine: LcmContextEngine): PrivateEngine {
@@ -118,7 +120,7 @@ function privateEngine(engine: LcmContextEngine): PrivateEngine {
 
 function spendScopeKey(engine: LcmContextEngine, sessionId: string, sessionKey?: string): string {
   const internals = privateEngine(engine);
-  return internals.resolveSummarySpendScope({
+  return internals.compactionGuards.resolveSummarySpendScope({
     kind: "compaction",
     scope: internals.resolveSessionQueueKey(sessionId, sessionKey),
   });
@@ -151,8 +153,8 @@ describe("summary spend guard policy", () => {
 
     const internals = privateEngine(engine);
     const scopeKey = spendScopeKey(engine, sessionId);
-    internals.openSummarySpendBackoff({ scopeKey, reason: "earlier automatic failure" });
-    expect(internals.getSummarySpendBackoffUntil(scopeKey)).not.toBeNull();
+    internals.compactionGuards.openSummarySpendBackoff({ scopeKey, reason: "earlier automatic failure" });
+    expect(internals.compactionGuards.getSummarySpendBackoffUntil(scopeKey)).not.toBeNull();
 
     vi.spyOn(internals.compaction, "evaluate").mockResolvedValue(thresholdEvaluation);
     const compactSpy = vi.spyOn(internals.compaction, "compact").mockResolvedValue({
@@ -171,7 +173,7 @@ describe("summary spend guard policy", () => {
     expect(result.reason).not.toBe("summary spend backoff open");
     expect(result.compacted).toBe(true);
     expect(compactSpy).toHaveBeenCalled();
-    expect(internals.getSummarySpendBackoffUntil(scopeKey)).toBeNull();
+    expect(internals.compactionGuards.getSummarySpendBackoffUntil(scopeKey)).toBeNull();
     expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("manual request cleared summary spend backoff"),
     );
@@ -207,7 +209,7 @@ describe("summary spend guard policy", () => {
 
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("compacted but still over target");
-    expect(internals.getSummarySpendBackoffUntil(spendScopeKey(engine, sessionId))).toBeNull();
+    expect(internals.compactionGuards.getSummarySpendBackoffUntil(spendScopeKey(engine, sessionId))).toBeNull();
     expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("spend backoff skipped"),
     );
@@ -234,7 +236,7 @@ describe("summary spend guard policy", () => {
 
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("compacted but still over target");
-    expect(internals.getSummarySpendBackoffUntil(spendScopeKey(engine, sessionId))).not.toBeNull();
+    expect(internals.compactionGuards.getSummarySpendBackoffUntil(spendScopeKey(engine, sessionId))).not.toBeNull();
   });
 
   it("chains threshold sweeps until the target is reached", async () => {
@@ -262,7 +264,7 @@ describe("summary spend guard policy", () => {
     expect(result.reason).toBe("compacted");
     expect(compactSpy).toHaveBeenCalledTimes(3);
     expect(result.result?.details?.rounds).toBe(3);
-    expect(internals.getSummarySpendBackoffUntil(spendScopeKey(engine, sessionId))).toBeNull();
+    expect(internals.compactionGuards.getSummarySpendBackoffUntil(spendScopeKey(engine, sessionId))).toBeNull();
   });
 
 });

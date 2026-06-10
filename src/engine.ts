@@ -17,6 +17,7 @@ import type {
 } from "./openclaw-bridge.js";
 import { contentFromParts, ContextAssembler, pickToolCallId, pickToolIsError, pickToolName } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
+import { CompactionGuards } from "./compaction-guards.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
@@ -50,15 +51,8 @@ import { ConversationStore, type ConversationRecord } from "./store/conversation
 import { buildMessageIdentityHash } from "./store/message-identity.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
-import {
-  createLcmSummarizeFromLegacyParams,
-  extractProviderAuthFailure,
-  FALLBACK_SUMMARY_MARKER,
-  LcmProviderAuthError,
-  LcmSummarySpendLimitError,
-  type LcmSummarizeFn,
-} from "./summarize.js";
-import type { CompleteFn, LcmDependencies, StartupSessionFileCandidate } from "./types.js";
+import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
+import type { LcmDependencies, StartupSessionFileCandidate } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import { buildDeterministicFallbackSummary } from "./summary-fallback.js";
 import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
@@ -78,7 +72,7 @@ import { createBootstrapEntryHash, createLosslessMessageSignature, isBootstrapRe
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { externalizedReplayMetadataMatches, extractPlainToolReplayTextsById, extractRawBlockIdsFromPartMetadata, extractRawBlockSignatureFromPartMetadata, extractRawIdsFromPartMetadata, listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
 import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
-import { asRecord, formatDurationMs, isMissingFileError, normalizeSessionFilePathForComparison, safeBoolean, safeString } from "./value-utils.js";
+import { asRecord, formatDurationMs, isMissingFileError, normalizeSessionFilePathForComparison, resolvePositiveInteger, safeBoolean, safeString } from "./value-utils.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
@@ -118,11 +112,6 @@ const FLUSH_LAG_ADOPTION_TAIL_WINDOW = 16;
 const AMBIGUOUS_ROLLOVER_OVERLAP_WIDE_WINDOW = 500;
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
-type CircuitBreakerState = {
-  failures: number;
-  openSince: number | null;
-};
-
 type SummarySpendGuardState = {
   windowStartedAt: number;
   calls: number;
@@ -423,11 +412,8 @@ export class LcmContextEngine implements ContextEngine {
    */
   private lastFullReadFileState = new Map<number, { size: number; mtimeMs: number }>();
 
-  // ── Circuit breaker for compaction auth failures ──
-  private circuitBreakerStates = new Map<string, CircuitBreakerState>();
-
-  // ── Non-auth spend guard for model-backed summarization calls ───────────
-  private summarySpendGuardStates = new Map<string, SummarySpendGuardState>();
+  // ── Circuit breaker + summary spend guard ───────────────────────────────
+  private readonly compactionGuards: CompactionGuards;
 
   /** Last file state successfully covered by `reconcileTranscriptTailForAfterTurn`
    *  slow-path full re-reads, keyed by `${sessionQueueKey}\u0000${sessionFile}`
@@ -449,6 +435,7 @@ export class LcmContextEngine implements ContextEngine {
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
     this.config = deps.config;
+    this.compactionGuards = new CompactionGuards(this.config, this.deps);
     this.ignoreSessionPatterns = compileSessionPatterns(this.config.ignoreSessionPatterns);
     this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
     this.db = database;
@@ -626,281 +613,13 @@ export class LcmContextEngine implements ContextEngine {
     return matchesSessionPattern(trimmedKey, this.statelessSessionPatterns);
   }
 
-  // ── Circuit breaker helpers ──────────────────────────────────────────────
-
-  private getCircuitBreakerState(key: string): CircuitBreakerState {
-    let state = this.circuitBreakerStates.get(key);
-    if (!state) {
-      state = { failures: 0, openSince: null };
-      this.circuitBreakerStates.set(key, state);
-    }
-    return state;
-  }
-
-  private isCircuitBreakerOpen(key: string): boolean {
-    const state = this.circuitBreakerStates.get(key);
-    if (!state || state.openSince === null) return false;
-    const elapsed = Date.now() - state.openSince;
-    if (elapsed >= this.config.circuitBreakerCooldownMs) {
-      this.resetCircuitBreaker(key);
-      return false;
-    }
-    return true;
-  }
-
-  private recordCompactionAuthFailure(key: string): void {
-    const state = this.getCircuitBreakerState(key);
-    state.failures++;
-    const halfThreshold = Math.ceil(this.config.circuitBreakerThreshold / 2);
-    if (state.failures === halfThreshold && state.failures < this.config.circuitBreakerThreshold) {
-      this.deps.log.warn(
-        `[lcm] WARNING: compaction degraded — ${state.failures}/${this.config.circuitBreakerThreshold} consecutive auth failures for ${key}`,
-      );
-    }
-    if (state.failures >= this.config.circuitBreakerThreshold) {
-      state.openSince = Date.now();
-      const cooldownMin = Math.round(this.config.circuitBreakerCooldownMs / 60000);
-      this.deps.log.warn(
-        `[lcm] CIRCUIT BREAKER OPEN: compaction disabled for ${key}. Auto-retry in ${cooldownMin}m. LCM is operating in degraded mode.`,
-      );
-    }
-  }
-
-  private recordCompactionSuccess(key: string): void {
-    const state = this.circuitBreakerStates.get(key);
-    if (!state) {
-      return;
-    }
-    if (state.failures > 0 || state.openSince !== null) {
-      this.deps.log.info(
-        `[lcm] compaction circuit breaker CLOSED: successful compaction for ${key} after ${state.failures} prior failures.`,
-      );
-    }
-    this.resetCircuitBreaker(key);
-  }
-
-  private resetCircuitBreaker(key: string): void {
-    this.circuitBreakerStates.delete(key);
-  }
-
-  private resolvePositiveConfigInteger(value: unknown, fallback: number): number {
-    return typeof value === "number" && Number.isFinite(value) && value > 0
-      ? Math.floor(value)
-      : fallback;
-  }
-
-  private resolveSummarySpendGuardConfig(): {
-    windowMs: number;
-    maxCalls: number;
-    backoffMs: number;
-  } {
-    return {
-      windowMs: this.resolvePositiveConfigInteger(
-        this.config.summaryCallWindowMs,
-        10 * 60 * 1000,
-      ),
-      maxCalls: this.resolvePositiveConfigInteger(
-        this.config.summaryMaxCallsPerWindow,
-        24,
-      ),
-      backoffMs: this.resolvePositiveConfigInteger(
-        this.config.summarySpendBackoffMs,
-        30 * 60 * 1000,
-      ),
-    };
-  }
-
-  private resolveSummarySpendScope(params: {
-    kind: "compaction" | "large-file" | "custom";
-    scope: string | undefined;
-  }): string {
-    const scope = params.scope?.trim() || "global";
-    return `${params.kind}:${scope}`;
-  }
-
-  private openSummarySpendBackoff(params: {
-    scopeKey: string;
-    reason: string;
-    now?: number;
-  }): Date {
-    const now = params.now ?? Date.now();
-    const { backoffMs } = this.resolveSummarySpendGuardConfig();
-    const state = this.summarySpendGuardStates.get(params.scopeKey) ?? {
-      windowStartedAt: now,
-      calls: 0,
-      backoffUntil: null,
-      lastReason: null,
-    };
-    state.backoffUntil = now + backoffMs;
-    state.lastReason = params.reason;
-    this.summarySpendGuardStates.set(params.scopeKey, state);
-    return new Date(state.backoffUntil);
-  }
-
   /**
    * Operation-wide deadline for chaining threshold sweeps within a single
    * compact() attempt. Reuses the compactUntilUnder operation deadline so
    * both recovery loops share one wall-clock contract.
    */
   private resolveSweepChainDeadlineMs(): number {
-    return this.resolvePositiveConfigInteger(this.config.compactUntilUnderDeadlineMs, 300_000);
-  }
-
-  /**
-   * Clear an open spend backoff for a scope, returning the prior expiry if
-   * one was open. Used by user-initiated compaction: an explicit repair
-   * request is informed consent to spend, so it must not silently no-op
-   * behind a backoff opened by an earlier automatic attempt.
-   */
-  private clearSummarySpendBackoff(scopeKey: string): Date | null {
-    const state = this.summarySpendGuardStates.get(scopeKey);
-    if (!state?.backoffUntil || state.backoffUntil <= Date.now()) {
-      return null;
-    }
-    const previous = new Date(state.backoffUntil);
-    state.backoffUntil = null;
-    state.lastReason = null;
-    state.windowStartedAt = Date.now();
-    state.calls = 0;
-    return previous;
-  }
-
-  private assertSummarySpendCallAllowed(params: {
-    scopeKey: string;
-    reason: string;
-  }): void {
-    const now = Date.now();
-    const { windowMs, maxCalls } = this.resolveSummarySpendGuardConfig();
-    let state = this.summarySpendGuardStates.get(params.scopeKey);
-    if (state?.backoffUntil !== null && state?.backoffUntil !== undefined) {
-      if (now < state.backoffUntil) {
-        throw new LcmSummarySpendLimitError({
-          scopeKey: params.scopeKey,
-          backoffUntil: new Date(state.backoffUntil),
-        });
-      }
-      state.windowStartedAt = now;
-      state.calls = 0;
-      state.backoffUntil = null;
-      state.lastReason = null;
-    }
-
-    if (!state || now - state.windowStartedAt >= windowMs) {
-      state = {
-        windowStartedAt: now,
-        calls: 0,
-        backoffUntil: null,
-        lastReason: null,
-      };
-      this.summarySpendGuardStates.set(params.scopeKey, state);
-    }
-
-    if (state.calls >= maxCalls) {
-      const backoffUntil = this.openSummarySpendBackoff({
-        scopeKey: params.scopeKey,
-        reason: params.reason,
-        now,
-      });
-      this.deps.log.warn(
-        `[lcm] summary spend guard opened scope=${params.scopeKey} calls=${state.calls}/${maxCalls} reason=${params.reason.replaceAll(" ", "_")} backoffUntil=${backoffUntil.toISOString()}`,
-      );
-      throw new LcmSummarySpendLimitError({
-        scopeKey: params.scopeKey,
-        backoffUntil,
-      });
-    }
-
-    state.lastReason = params.reason;
-  }
-
-  private recordSummarySpendCall(params: {
-    scopeKey: string;
-    reason: string;
-  }): void {
-    const now = Date.now();
-    const { windowMs } = this.resolveSummarySpendGuardConfig();
-    let state = this.summarySpendGuardStates.get(params.scopeKey);
-    if (!state || now - state.windowStartedAt >= windowMs) {
-      state = {
-        windowStartedAt: now,
-        calls: 0,
-        backoffUntil: null,
-        lastReason: null,
-      };
-      this.summarySpendGuardStates.set(params.scopeKey, state);
-    }
-    state.calls += 1;
-    state.lastReason = params.reason;
-  }
-
-  private getSummarySpendBackoffUntil(scopeKey: string): Date | null {
-    const state = this.summarySpendGuardStates.get(scopeKey);
-    if (!state?.backoffUntil) {
-      return null;
-    }
-    return state.backoffUntil > Date.now() ? new Date(state.backoffUntil) : null;
-  }
-
-  private buildSummarySpendGuardedDeps(params: {
-    scopeKey: string;
-    reason: string;
-  }): LcmDependencies {
-    const complete: CompleteFn = async (input) => {
-      this.assertSummarySpendCallAllowed({
-        scopeKey: params.scopeKey,
-        reason: params.reason,
-      });
-      try {
-        const result = await this.deps.complete(input);
-        if (!extractProviderAuthFailure(result, { requireStructuralSignal: true })) {
-          this.recordSummarySpendCall({
-            scopeKey: params.scopeKey,
-            reason: params.reason,
-          });
-        }
-        return result;
-      } catch (err) {
-        if (!extractProviderAuthFailure(err)) {
-          this.recordSummarySpendCall({
-            scopeKey: params.scopeKey,
-            reason: params.reason,
-          });
-        }
-        throw err;
-      }
-    };
-    return {
-      ...this.deps,
-      complete,
-    };
-  }
-
-  private guardCustomSummarize(params: {
-    summarize: LcmSummarizeFn;
-    scopeKey: string;
-  }): LcmSummarizeFn {
-    return async (text, aggressive, options) => {
-      this.assertSummarySpendCallAllowed({
-        scopeKey: params.scopeKey,
-        reason: "custom summarizer call",
-      });
-      try {
-        const result = await params.summarize(text, aggressive, options);
-        this.recordSummarySpendCall({
-          scopeKey: params.scopeKey,
-          reason: "custom summarizer call",
-        });
-        return result;
-      } catch (err) {
-        if (!(err instanceof LcmProviderAuthError)) {
-          this.recordSummarySpendCall({
-            scopeKey: params.scopeKey,
-            reason: "custom summarizer call",
-          });
-        }
-        throw err;
-      }
-    };
+    return resolvePositiveInteger(this.config.compactUntilUnderDeadlineMs, 300_000);
   }
 
   /** Ensure DB schema is up-to-date. Called lazily on first bootstrap/ingest/assemble/compact. */
@@ -1232,7 +951,7 @@ export class LcmContextEngine implements ContextEngine {
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
-    const summarySpendScopeKey = this.resolveSummarySpendScope({
+    const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
       kind: "compaction",
       scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
@@ -1314,7 +1033,7 @@ export class LcmContextEngine implements ContextEngine {
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
-    const summarySpendScopeKey = this.resolveSummarySpendScope({
+    const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
       kind: "compaction",
       scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
@@ -1414,7 +1133,7 @@ export class LcmContextEngine implements ContextEngine {
           ? null
           : result.reason ?? "deferred compaction failed";
       const summarySpendBackoffUntil = keepPending
-        ? this.getSummarySpendBackoffUntil(summarySpendScopeKey)
+        ? this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey)
         : null;
       await this.compactionMaintenanceStore.markProactiveCompactionFinished({
         conversationId: params.conversationId,
@@ -1550,12 +1269,12 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const compactionScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
-    const summarySpendScopeKey = this.resolveSummarySpendScope({
+    const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
       kind: "compaction",
       scope: compactionScope,
     });
     if (manualCompactionRequested) {
-      const clearedBackoffUntil = this.clearSummarySpendBackoff(summarySpendScopeKey);
+      const clearedBackoffUntil = this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
       if (clearedBackoffUntil) {
         this.deps.log.info(
           `[lcm] compact: manual request cleared summary spend backoff conversation=${params.conversationId} ${sessionLabel} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
@@ -1570,7 +1289,7 @@ export class LcmContextEngine implements ContextEngine {
       customInstructions: params.customInstructions,
       breakerScope: compactionScope,
     });
-    if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
+    if (breakerKey && this.compactionGuards.isCircuitBreakerOpen(breakerKey)) {
       return {
         ok: true,
         compacted: false,
@@ -1729,7 +1448,7 @@ export class LcmContextEngine implements ContextEngine {
       let chainedSweeps = 1;
       let lastRoundMadeProgress = sweepResult.actionTaken === true;
       const sweepChainDeadlineAt = startedAt + this.resolveSweepChainDeadlineMs();
-      const maxChainedSweeps = this.resolvePositiveConfigInteger(
+      const maxChainedSweeps = resolvePositiveInteger(
         this.config.maxSweepIterations,
         12,
       );
@@ -1771,9 +1490,9 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       if (sweepResult.authFailure && breakerKey) {
-        this.recordCompactionAuthFailure(breakerKey);
+        this.compactionGuards.recordCompactionAuthFailure(breakerKey);
       } else if (sweepResult.actionTaken && breakerKey) {
-        this.recordCompactionSuccess(breakerKey);
+        this.compactionGuards.recordCompactionSuccess(breakerKey);
       }
       if (sweepResult.actionTaken) {
         await this.markLeafCompactionTelemetrySuccess({ conversationId });
@@ -1844,7 +1563,7 @@ export class LcmContextEngine implements ContextEngine {
             `[lcm] compact: spend backoff skipped conversation=${conversationId} ${sessionLabel} scope=${summarySpendScopeKey} reason=still_progressing chainedSweeps=${chainedSweeps} tokensAfter=${sweepResult.tokensAfter}`,
           );
         } else {
-          this.openSummarySpendBackoff({
+          this.compactionGuards.openSummarySpendBackoff({
             scopeKey: summarySpendScopeKey,
             reason: sweepReason,
           });
@@ -1925,9 +1644,9 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (compactResult.authFailure && breakerKey) {
-      this.recordCompactionAuthFailure(breakerKey);
+      this.compactionGuards.recordCompactionAuthFailure(breakerKey);
     } else if (compactResult.rounds > 0 && breakerKey) {
-      this.recordCompactionSuccess(breakerKey);
+      this.compactionGuards.recordCompactionSuccess(breakerKey);
     }
 
     const didCompact = compactResult.rounds > 0;
@@ -1945,7 +1664,7 @@ export class LcmContextEngine implements ContextEngine {
           : "already under target"
         : "could not reach target";
     if (!compactResult.success && !compactResult.authFailure) {
-      this.openSummarySpendBackoff({
+      this.compactionGuards.openSummarySpendBackoff({
         scopeKey: summarySpendScopeKey,
         reason: compactUntilReason,
       });
@@ -2043,13 +1762,13 @@ export class LcmContextEngine implements ContextEngine {
   }> {
     const lp = params.legacyParams ?? {};
     const breakerScope = params.breakerScope || "global";
-    const scopeKey = this.resolveSummarySpendScope({
+    const scopeKey = this.compactionGuards.resolveSummarySpendScope({
       kind: "compaction",
       scope: breakerScope,
     });
     if (typeof lp.summarize === "function") {
       return {
-        summarize: this.guardCustomSummarize({
+        summarize: this.compactionGuards.guardCustomSummarize({
           summarize: lp.summarize as LcmSummarizeFn,
           scopeKey,
         }),
@@ -2063,7 +1782,7 @@ export class LcmContextEngine implements ContextEngine {
           ? params.customInstructions
           : (this.config.customInstructions || undefined);
       const runtimeSummarizer = await createLcmSummarizeFromLegacyParams({
-        deps: this.buildSummarySpendGuardedDeps({
+        deps: this.compactionGuards.buildSummarySpendGuardedDeps({
           scopeKey,
           reason: "compaction summarizer call",
         }),
@@ -2103,7 +1822,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
-      const scopeKey = this.resolveSummarySpendScope({
+      const scopeKey = this.compactionGuards.resolveSummarySpendScope({
         kind: "large-file",
         scope:
           typeof params?.conversationId === "number"
@@ -2111,7 +1830,7 @@ export class LcmContextEngine implements ContextEngine {
             : "global",
       });
       const result = await createLcmSummarizeFromLegacyParams({
-        deps: this.buildSummarySpendGuardedDeps({
+        deps: this.compactionGuards.buildSummarySpendGuardedDeps({
           scopeKey,
           reason: "large-file summarizer call",
         }),
@@ -9167,7 +8886,7 @@ export class LcmContextEngine implements ContextEngine {
       }),
       breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
-    if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
+    if (breakerKey && this.compactionGuards.isCircuitBreakerOpen(breakerKey)) {
       return {
         kind: "unavailable",
         reason: "Lossless Claw could not summarize raw context before rotate because the summary provider circuit breaker is open.",
@@ -9200,7 +8919,7 @@ export class LcmContextEngine implements ContextEngine {
       if (!result.actionTaken) {
         if (result.authFailure) {
           if (breakerKey) {
-            this.recordCompactionAuthFailure(breakerKey);
+            this.compactionGuards.recordCompactionAuthFailure(breakerKey);
           }
           return {
             kind: "unavailable",
@@ -9215,7 +8934,7 @@ export class LcmContextEngine implements ContextEngine {
         return { kind: "ready", conversationId: current.conversationId, leafPasses };
       }
       if (breakerKey) {
-        this.recordCompactionSuccess(breakerKey);
+        this.compactionGuards.recordCompactionSuccess(breakerKey);
       }
       leafPasses += 1;
     }
