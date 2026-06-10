@@ -144,6 +144,13 @@ const AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON =
  * enough to stay cheap on conversations with thousands of rows.
  */
 const AMBIGUOUS_ROLLOVER_OVERLAP_WINDOW = 50;
+/**
+ * How deep into the conversation tail a flush-lagged runtime row can sit.
+ * Flush lag is a same-turn phenomenon (the runtime persisted a row moments
+ * before the transcript caught up), so matches deeper than this are legacy
+ * unstamped rows, not flush lag.
+ */
+const FLUSH_LAG_ADOPTION_TAIL_WINDOW = 16;
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
 type CircuitBreakerState = {
@@ -6271,10 +6278,11 @@ export class LcmContextEngine implements ContextEngine {
         continue;
       }
       if (
-        await this.conversationStore.hasUnstampedMessageByIdentity(
+        await this.conversationStore.hasRecentUnstampedMessageByIdentity(
           params.conversationId,
           stored.role,
           stored.content,
+          FLUSH_LAG_ADOPTION_TAIL_WINDOW,
         )
       ) {
         adoptableFlushLagOverlaps += 1;
