@@ -6225,19 +6225,119 @@ export class LcmContextEngine implements ContextEngine {
   private async appendOnlyMessagesOverlapPersistedTranscript(params: {
     conversationId: number;
     messages: AgentMessage[];
+    /**
+     * The appended slice BEFORE replay/heartbeat filtering. Filtered-out
+     * entries are legitimate parents for surviving entries, so the linear-
+     * chain check consults their ids to avoid false rewrite verdicts.
+     */
+    unfilteredMessages?: AgentMessage[];
     sessionContext: string;
     source: string;
   }): Promise<boolean> {
+    // Entry-id-bearing messages are judged by id, not content identity: a
+    // fresh entry id is a NEW entry even when its content is byte-identical
+    // to persisted history. Repeated identical tool calls are legitimate
+    // (lossless-claw-3071: a tool loop re-reading the same file made the
+    // identity check scream "already persisted" every iteration, forcing a
+    // full re-read per tool call). Two cases still defer to full
+    // reconciliation: an already-persisted entry id (genuine replay), and a
+    // fresh id whose content matches an UNSTAMPED persisted row (flush-lag
+    // catch-up — the full path adopts the id onto that row instead of
+    // importing a duplicate).
+    const idLessMessages: AgentMessage[] = [];
+    let persistedEntryIdOverlaps = 0;
+    let adoptableFlushLagOverlaps = 0;
+    for (const message of params.messages) {
+      const entryId = getTranscriptEntryId(message);
+      if (entryId === null) {
+        idLessMessages.push(message);
+        continue;
+      }
+      if (
+        await this.conversationStore.hasMessageByTranscriptEntryId(
+          params.conversationId,
+          entryId,
+        )
+      ) {
+        persistedEntryIdOverlaps += 1;
+        continue;
+      }
+      const stored = toStoredMessage(message);
+      if (
+        await this.conversationStore.hasUnstampedMessageByIdentity(
+          params.conversationId,
+          stored.role,
+          stored.content,
+        )
+      ) {
+        adoptableFlushLagOverlaps += 1;
+      }
+    }
+    if (persistedEntryIdOverlaps > 0 || adoptableFlushLagOverlaps > 0) {
+      this.deps.log.warn(
+        `[lcm] transcript import guard: ${params.source} found ${persistedEntryIdOverlaps} already-persisted transcript entry ids and ${adoptableFlushLagOverlaps} adoptable flush-lagged identities across ${params.messages.length} messages for ${params.sessionContext}; falling back to full reconciliation`,
+      );
+      return true;
+    }
+    // Fresh ids must also EXTEND the persisted tail rather than branch from
+    // an ancestor: a host history rewrite re-issues content under new ids by
+    // reparenting onto an OLDER persisted entry, and those entries need the
+    // full path's stale-id re-stamping, not a blind append. The rewrite
+    // signature is a parent that IS persisted but is NOT the tip and not
+    // part of this appended slice. Parents unknown to the DB are benign —
+    // the append-only checkpoint already verified the file prefix, and
+    // pruned rows, replay-filtered entries, and flush gaps all leave
+    // unknown-parent links that are genuine continuation.
+    if (params.messages.length > idLessMessages.length) {
+      const newestPersistedEntryId = await this.conversationStore.getNewestTranscriptEntryId(
+        params.conversationId,
+      );
+      if (newestPersistedEntryId !== null) {
+        const sliceEntryIds = new Set<string>();
+        for (const message of params.unfilteredMessages ?? params.messages) {
+          const entryId = getTranscriptEntryMeta(message)?.entryId;
+          if (entryId) {
+            sliceEntryIds.add(entryId);
+          }
+        }
+        for (const message of params.messages) {
+          const meta = getTranscriptEntryMeta(message);
+          const parentId = meta?.parentId ?? null;
+          if (
+            parentId === null ||
+            parentId === newestPersistedEntryId ||
+            sliceEntryIds.has(parentId)
+          ) {
+            continue;
+          }
+          if (
+            await this.conversationStore.hasMessageByTranscriptEntryId(
+              params.conversationId,
+              parentId,
+            )
+          ) {
+            this.deps.log.warn(
+              `[lcm] transcript import guard: ${params.source} appended entry reparents onto a non-tip persisted entry (suffix rewrite) for ${params.sessionContext}; falling back to full reconciliation`,
+            );
+            return true;
+          }
+        }
+      }
+    }
+    if (idLessMessages.length === 0) {
+      return false;
+    }
+
     const overlaps = await this.countPersistedTranscriptIdentityOverlaps({
       conversationId: params.conversationId,
-      messages: params.messages,
+      messages: idLessMessages,
     });
     if (overlaps === 0) {
       return false;
     }
 
     this.deps.log.warn(
-      `[lcm] transcript import guard: ${params.source} found ${overlaps}/${params.messages.length} already-persisted message identities for ${params.sessionContext}; falling back to full reconciliation`,
+      `[lcm] transcript import guard: ${params.source} found ${overlaps}/${idLessMessages.length} already-persisted message identities (id-less entries) for ${params.sessionContext}; falling back to full reconciliation`,
     );
     return true;
   }
@@ -7518,6 +7618,7 @@ export class LcmContextEngine implements ContextEngine {
             const appendOnlyOverlapsPersisted = await this.appendOnlyMessagesOverlapPersistedTranscript({
               conversationId: conversation.conversationId,
               messages: replayFilteredMessages,
+              unfilteredMessages: appended.messages,
               sessionContext: appendOnlySessionContext,
               source: "afterTurn transcript reconcile append-only",
             });
@@ -8661,6 +8762,7 @@ export class LcmContextEngine implements ContextEngine {
                 const appendOnlyOverlapsPersisted = await this.appendOnlyMessagesOverlapPersistedTranscript({
                   conversationId,
                   messages: replayFilteredMessages,
+                  unfilteredMessages: appended.messages,
                   sessionContext: appendOnlySessionContext,
                   source: "bootstrap append-only",
                 });
