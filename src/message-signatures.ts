@@ -63,10 +63,6 @@ export function createLosslessMessageSignature(message: AgentMessage): string {
   });
 }
 
-export function createBootstrapReplaySignature(message: AgentMessage): string {
-  return createLosslessMessageSignature(message);
-}
-
 export function hashAgentMessageForAssemblyProtection(message: AgentMessage): string {
   return createHash("sha256").update(JSON.stringify([message])).digest("hex").slice(0, 16);
 }

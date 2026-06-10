@@ -74,7 +74,7 @@ import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./boot
 import { batchLooksLikeHeartbeatAckTurn, filterSyntheticHeartbeatMessages, isHeartbeatNoiseContent, isHeartbeatOkContent, turnLooksLikeHeartbeatTurn } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
 import { RAW_PAYLOAD_EXTERNALIZATION_REASON, buildMessageParts, extractMessageContent, extractStructuredText, filterPersistableMessages, hasPersistableMessageRole, hasReplayCriticalRawBlock, isLikelyInjectedDeliveryOnlyTranscript, isLikelyInjectedMetadataPreambleRecord, isOpenClawRuntimeContextLeak, serializeRawPayloadContent, toStoredMessage, type StoredMessage } from "./message-content.js";
-import { createBootstrapEntryHash, createBootstrapReplaySignature, isBootstrapReplayCandidateMessage, messageIdentity, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
+import { createBootstrapEntryHash, createLosslessMessageSignature, isBootstrapReplayCandidateMessage, messageIdentity, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { externalizedReplayMetadataMatches, extractPlainToolReplayTextsById, extractRawBlockIdsFromPartMetadata, extractRawBlockSignatureFromPartMetadata, extractRawIdsFromPartMetadata, listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
 import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
@@ -4323,8 +4323,8 @@ export class LcmContextEngine implements ContextEngine {
       return { messages: params.messages, replayGuardExemptPrefixLength: 0 };
     }
 
-    const incomingSignatures = replayCandidates.map(createBootstrapReplaySignature);
-    const earlierSignatures = earlierReplayCandidates.map(createBootstrapReplaySignature);
+    const incomingSignatures = replayCandidates.map(createLosslessMessageSignature);
+    const earlierSignatures = earlierReplayCandidates.map(createLosslessMessageSignature);
 
     let replayPrefixLength = 0;
     prefixLoop:
