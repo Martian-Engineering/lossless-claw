@@ -57,3 +57,11 @@ export function resolvePositiveInteger(value: unknown, fallback: number): number
     ? Math.floor(value)
     : fallback;
 }
+
+/** Normalize an optional count: non-negative finite numbers floor to int, everything else is undefined. */
+export function normalizeOptionalCount(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return undefined;
+  }
+  return Math.floor(value);
+}

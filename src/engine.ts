@@ -19,6 +19,7 @@ import { contentFromParts, ContextAssembler, pickToolCallId, pickToolIsError, pi
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import { BatchDeduplicator } from "./batch-dedup.js";
 import { CompactionGuards } from "./compaction-guards.js";
+import { CompactionTelemetryRecorder } from "./compaction-telemetry.js";
 import { LargeFileInterceptor } from "./large-file-interceptor.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
@@ -35,11 +36,7 @@ import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
-import {
-  CompactionTelemetryStore,
-  type ConversationCompactionTelemetryRecord,
-  type CacheState,
-} from "./store/compaction-telemetry-store.js";
+import { CompactionTelemetryStore } from "./store/compaction-telemetry-store.js";
 import { CompactionMaintenanceStore } from "./store/compaction-maintenance-store.js";
 import { ConversationStore, type ConversationRecord } from "./store/conversation-store.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
@@ -67,7 +64,7 @@ import { createBootstrapEntryHash, createLosslessMessageSignature, isBootstrapRe
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { externalizedReplayMetadataMatches, extractPlainToolReplayTextsById, extractRawBlockIdsFromPartMetadata, extractRawBlockSignatureFromPartMetadata, extractRawIdsFromPartMetadata, listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
 import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
-import { asRecord, formatDurationMs, isMissingFileError, normalizeSessionFilePathForComparison, resolvePositiveInteger, safeBoolean, safeString } from "./value-utils.js";
+import { asRecord, formatDurationMs, isMissingFileError, normalizeSessionFilePathForComparison, resolvePositiveInteger, safeString } from "./value-utils.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
@@ -92,17 +89,6 @@ const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 const FLUSH_LAG_ADOPTION_TAIL_WINDOW = 16;
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
-type PromptCacheSnapshot = {
-  lastObservedCacheRead?: number;
-  lastObservedCacheWrite?: number;
-  lastObservedPromptTokenCount?: number;
-  cacheState: CacheState;
-  retention?: string;
-  sawExplicitBreak: boolean;
-  lastCacheTouchAt?: Date;
-  provider?: string;
-  model?: string;
-};
 type TranscriptRewriteReplacement = {
   entryId: string;
   message: AgentMessage;
@@ -392,6 +378,9 @@ export class LcmContextEngine implements ContextEngine {
   // ── Missed-lifecycle rollover detection ──────────────────────────────────
   private readonly sessionRolloverDetector: SessionRolloverDetector;
 
+  // ── Compaction telemetry + deferred-debt recording ───────────────────────
+  private readonly telemetryRecorder: CompactionTelemetryRecorder;
+
   /** Last file state successfully covered by `reconcileTranscriptTailForAfterTurn`
    *  slow-path full re-reads, keyed by `${sessionQueueKey}\u0000${sessionFile}`
    *  (same NUL-escape separator pattern as `messageIdentity`). Long-running
@@ -500,6 +489,11 @@ export class LcmContextEngine implements ContextEngine {
     this.focusBriefStore = new FocusBriefStore(this.db);
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
+    this.telemetryRecorder = new CompactionTelemetryRecorder(
+      this.compactionTelemetryStore,
+      this.compactionMaintenanceStore,
+      this.deps,
+    );
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -718,198 +712,8 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /** Normalize token counters that may legitimately be zero. */
-  private normalizeOptionalCount(value: unknown): number | undefined {
-    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-      return undefined;
-    }
-    return Math.floor(value);
-  }
 
-  /** Extract the current prompt-cache snapshot from runtime context, if present. */
-  private readPromptCacheSnapshot(runtimeContext?: Record<string, unknown>): PromptCacheSnapshot | null {
-    const promptCache = asRecord(runtimeContext?.promptCache);
-    const provider = safeString(runtimeContext?.provider)?.trim()
-      ?? safeString(runtimeContext?.providerId)?.trim();
-    const model = safeString(runtimeContext?.model)?.trim()
-      ?? safeString(runtimeContext?.modelId)?.trim();
-    if (!promptCache && !provider && !model) {
-      return null;
-    }
 
-    const lastCallUsage = asRecord(promptCache?.lastCallUsage);
-    const observation = asRecord(promptCache?.observation);
-    const cacheRead = this.normalizeOptionalCount(lastCallUsage?.cacheRead);
-    const cacheWrite = this.normalizeOptionalCount(lastCallUsage?.cacheWrite);
-    const promptTokenCount = (() => {
-      const input = this.normalizeOptionalCount(lastCallUsage?.input) ?? 0;
-      const total = input + (cacheRead ?? 0) + (cacheWrite ?? 0);
-      return total > 0 ? total : undefined;
-    })();
-    const sawExplicitBreak = safeBoolean(observation?.broke) === true;
-    const retention = safeString(promptCache?.retention)?.trim();
-    const lastCacheTouchAtRaw = promptCache?.lastCacheTouchAt;
-    const lastCacheTouchAt =
-      typeof lastCacheTouchAtRaw === "number" && Number.isFinite(lastCacheTouchAtRaw)
-        ? new Date(lastCacheTouchAtRaw)
-        : undefined;
-    const hasUsageSignal = cacheRead !== undefined || cacheWrite !== undefined;
-    const hasObservationSignal =
-      typeof observation?.cacheRead === "number"
-      || typeof observation?.previousCacheRead === "number"
-      || sawExplicitBreak;
-
-    let cacheState: CacheState = "unknown";
-    if (sawExplicitBreak) {
-      cacheState = "cold";
-    } else if (typeof cacheRead === "number" && cacheRead > 0) {
-      cacheState = "hot";
-    } else if (typeof cacheWrite === "number" && cacheWrite > 0) {
-      cacheState = "hot";
-    } else if (hasUsageSignal || hasObservationSignal) {
-      cacheState = "cold";
-    }
-
-    return {
-      ...(cacheRead !== undefined ? { lastObservedCacheRead: cacheRead } : {}),
-      ...(cacheWrite !== undefined ? { lastObservedCacheWrite: cacheWrite } : {}),
-      ...(promptTokenCount !== undefined
-        ? { lastObservedPromptTokenCount: promptTokenCount }
-        : {}),
-      cacheState,
-      ...(retention ? { retention } : {}),
-      sawExplicitBreak,
-      ...(lastCacheTouchAt ? { lastCacheTouchAt } : {}),
-      ...(provider ? { provider } : {}),
-      ...(model ? { model } : {}),
-    };
-  }
-
-  /** Persist the current turn's compaction telemetry for later policy decisions. */
-  private async updateCompactionTelemetry(params: {
-    conversationId: number;
-    runtimeContext?: Record<string, unknown>;
-    tokenBudget?: number;
-    rawTokensOutsideTail?: number;
-  }): Promise<ConversationCompactionTelemetryRecord | null> {
-    const snapshot = this.readPromptCacheSnapshot(params.runtimeContext);
-    const existing = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-      params.conversationId,
-    );
-    if (!snapshot && params.rawTokensOutsideTail === undefined) {
-      return existing;
-    }
-
-    const now = new Date();
-    const turnsSinceLeafCompaction =
-      (existing?.turnsSinceLeafCompaction ?? 0) + 1;
-    const tokensAccumulatedSinceLeafCompaction =
-      params.rawTokensOutsideTail ?? existing?.tokensAccumulatedSinceLeafCompaction ?? 0;
-    const touchedPromptCache =
-      snapshot?.lastCacheTouchAt
-      ?? (
-        snapshot
-        && (snapshot.lastObservedCacheRead !== undefined || snapshot.lastObservedCacheWrite !== undefined)
-          ? now
-          : existing?.lastCacheTouchAt ?? null
-      );
-    const consecutiveColdObservations =
-      snapshot?.sawExplicitBreak
-        ? Math.max(existing?.consecutiveColdObservations ?? 0, 1)
-        : snapshot?.cacheState === "hot"
-          ? 0
-          : snapshot?.cacheState === "cold"
-            ? (existing?.consecutiveColdObservations ?? 0) + 1
-            : existing?.consecutiveColdObservations ?? 0;
-    await this.compactionTelemetryStore.upsertConversationCompactionTelemetry({
-      conversationId: params.conversationId,
-      lastObservedCacheRead: snapshot?.lastObservedCacheRead ?? existing?.lastObservedCacheRead ?? null,
-      lastObservedCacheWrite:
-        snapshot?.lastObservedCacheWrite ?? existing?.lastObservedCacheWrite ?? null,
-      lastObservedPromptTokenCount:
-        snapshot?.lastObservedPromptTokenCount ?? existing?.lastObservedPromptTokenCount ?? null,
-      lastObservedCacheHitAt:
-        snapshot?.cacheState === "hot"
-          ? now
-          : existing?.lastObservedCacheHitAt ?? null,
-      lastObservedCacheBreakAt:
-        snapshot?.sawExplicitBreak
-          ? now
-          : existing?.lastObservedCacheBreakAt ?? null,
-      cacheState: snapshot?.cacheState ?? existing?.cacheState ?? "unknown",
-      consecutiveColdObservations,
-      retention: snapshot?.retention ?? existing?.retention ?? null,
-      lastLeafCompactionAt: existing?.lastLeafCompactionAt ?? null,
-      turnsSinceLeafCompaction,
-      tokensAccumulatedSinceLeafCompaction,
-      lastActivityBand: existing?.lastActivityBand ?? "low",
-      lastApiCallAt: now,
-      lastCacheTouchAt: touchedPromptCache,
-      provider: snapshot?.provider ?? existing?.provider ?? null,
-      model: snapshot?.model ?? existing?.model ?? null,
-    });
-    const updated = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-      params.conversationId,
-    );
-    if (updated) {
-      this.deps.log.debug(
-        `[lcm] compaction telemetry updated: conversation=${params.conversationId} cacheState=${updated.cacheState} coldObservationStreak=${updated.consecutiveColdObservations} cacheRead=${updated.lastObservedCacheRead ?? "null"} cacheWrite=${updated.lastObservedCacheWrite ?? "null"} promptTokenCount=${updated.lastObservedPromptTokenCount ?? "null"} retention=${updated.retention ?? "null"} lastApiCallAt=${updated.lastApiCallAt?.toISOString() ?? "null"} lastCacheTouchAt=${updated.lastCacheTouchAt?.toISOString() ?? "null"} provider=${updated.provider ?? "null"} model=${updated.model ?? "null"} turnsSinceLeafCompaction=${updated.turnsSinceLeafCompaction} tokensSinceLeafCompaction=${updated.tokensAccumulatedSinceLeafCompaction} activityBand=${updated.lastActivityBand} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"} tokenBudget=${params.tokenBudget ?? "null"}`,
-      );
-    }
-    return updated;
-  }
-
-  /** Reset refill counters after successful summary-producing compaction. */
-  private async markLeafCompactionTelemetrySuccess(params: {
-    conversationId: number;
-  }): Promise<void> {
-    const existing = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-      params.conversationId,
-    );
-    await this.compactionTelemetryStore.upsertConversationCompactionTelemetry({
-      conversationId: params.conversationId,
-      lastObservedCacheRead: existing?.lastObservedCacheRead ?? null,
-      lastObservedCacheWrite: existing?.lastObservedCacheWrite ?? null,
-      lastObservedPromptTokenCount: existing?.lastObservedPromptTokenCount ?? null,
-      lastObservedCacheHitAt: existing?.lastObservedCacheHitAt ?? null,
-      lastObservedCacheBreakAt: existing?.lastObservedCacheBreakAt ?? null,
-      cacheState: existing?.cacheState ?? "unknown",
-      consecutiveColdObservations: existing?.consecutiveColdObservations ?? 0,
-      retention: existing?.retention ?? null,
-      lastLeafCompactionAt: new Date(),
-      turnsSinceLeafCompaction: 0,
-      tokensAccumulatedSinceLeafCompaction: 0,
-      lastActivityBand: existing?.lastActivityBand ?? "low",
-      lastApiCallAt: existing?.lastApiCallAt ?? null,
-      lastCacheTouchAt: existing?.lastCacheTouchAt ?? null,
-      provider: existing?.provider ?? null,
-      model: existing?.model ?? null,
-    });
-    this.deps.log.debug(
-      `[lcm] compaction telemetry reset after compaction: conversation=${params.conversationId} cacheState=${existing?.cacheState ?? "unknown"} activityBand=${existing?.lastActivityBand ?? "low"}`,
-    );
-  }
-
-  /** Persist a coalesced proactive-compaction debt record for later maintenance. */
-  private async recordDeferredCompactionDebt(params: {
-    conversationId: number;
-    reason: string;
-    tokenBudget: number;
-    currentTokenCount?: number;
-    projectedTokenCount?: number;
-    rawTokensOutsideTail?: number;
-  }): Promise<void> {
-    await this.compactionMaintenanceStore.requestProactiveCompactionDebt({
-      conversationId: params.conversationId,
-      reason: params.reason,
-      tokenBudget: params.tokenBudget,
-      currentTokenCount: params.currentTokenCount ?? null,
-      projectedTokenCount: params.projectedTokenCount ?? null,
-      rawTokensOutsideTail: params.rawTokensOutsideTail ?? null,
-    });
-    this.deps.log.debug(
-      `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"} projectedTokenCount=${params.projectedTokenCount ?? "null"} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"}`,
-    );
-  }
 
   /** Try deferred compaction later without letting it jump ahead of foreground work. */
   private scheduleDeferredCompactionDebtDrain(params: DeferredCompactionDebtDrainParams): void {
@@ -1484,7 +1288,7 @@ export class LcmContextEngine implements ContextEngine {
         this.compactionGuards.recordCompactionSuccess(breakerKey);
       }
       if (sweepResult.actionTaken) {
-        await this.markLeafCompactionTelemetrySuccess({ conversationId });
+        await this.telemetryRecorder.markLeafCompactionTelemetrySuccess({ conversationId });
       }
       const sweepTokensAfter = resolveSweepTokensAfter(sweepResult);
       const projectedTokensAfterSweep = projectSweepTokensAfter(sweepTokensAfter);
@@ -1640,7 +1444,7 @@ export class LcmContextEngine implements ContextEngine {
 
     const didCompact = compactResult.rounds > 0;
     if (didCompact) {
-      await this.markLeafCompactionTelemetrySuccess({ conversationId });
+      await this.telemetryRecorder.markLeafCompactionTelemetrySuccess({ conversationId });
     }
 
     const compactUntilReason = compactResult.authFailure
@@ -5151,7 +4955,7 @@ export class LcmContextEngine implements ContextEngine {
       diagnostics?: { projectedTokenCount?: number; rawTokensOutsideTail?: number },
     ): Promise<void> => {
       try {
-        await this.recordDeferredCompactionDebt({
+        await this.telemetryRecorder.recordDeferredCompactionDebt({
           conversationId: conversation.conversationId,
           reason,
           tokenBudget,
@@ -5177,7 +4981,7 @@ export class LcmContextEngine implements ContextEngine {
       | null = null;
 
     try {
-      await this.updateCompactionTelemetry({
+      await this.telemetryRecorder.updateCompactionTelemetry({
         conversationId: conversation.conversationId,
         runtimeContext: legacyParams,
         tokenBudget,
@@ -5215,7 +5019,7 @@ export class LcmContextEngine implements ContextEngine {
           }
         }
       } else if (thresholdDecision.shouldCompact) {
-        await this.recordDeferredCompactionDebt({
+        await this.telemetryRecorder.recordDeferredCompactionDebt({
           conversationId: conversation.conversationId,
           reason: "threshold",
           tokenBudget,
