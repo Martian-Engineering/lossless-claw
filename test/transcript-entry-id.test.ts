@@ -1030,3 +1030,208 @@ describe("stale entry-id adoption after host history rewrites", () => {
     expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(120);
   });
 });
+
+// ── lossless-claw-3071: repeated identical content must not defeat the
+// append-only import path ─────────────────────────────────────────────────────
+describe("repeated identical tool calls (lossless-claw-3071)", () => {
+  const header = JSON.stringify({
+    type: "session",
+    version: 3,
+    id: "repeat-loop-header",
+    timestamp: new Date().toISOString(),
+    cwd: process.cwd(),
+  });
+  const entryLine = (
+    id: string,
+    parentId: string | null,
+    role: AgentMessage["role"],
+    text: string,
+  ) =>
+    JSON.stringify({
+      type: "message",
+      id,
+      parentId,
+      timestamp: new Date().toISOString(),
+      message: { role, content: [{ type: "text", text }] },
+    });
+
+  function engineWarn(engine: LcmContextEngine): ReturnType<typeof vi.fn> {
+    return (engine as unknown as { deps: { log: { warn: ReturnType<typeof vi.fn> } } }).deps.log
+      .warn;
+  }
+
+  it("imports byte-identical repeated turns once per entry id via the append-only path", async () => {
+    const sessionFile = createSessionFilePath("repeat-identical-turns");
+    // Live incident shape: a tool loop appends a byte-identical
+    // tool_use/result pair (fresh entry ids) every iteration. The old
+    // identity-based guard declared each appended pair "already persisted"
+    // and forced a full re-read per iteration.
+    const callText = "Read first 200 lines of SKILL.md";
+    const resultText = "---\nname: github\ndescription: GitHub CLI skill";
+
+    let parent: string | null = null;
+    let lines = `${header}\n`;
+    const appendPair = (iteration: number): void => {
+      const callId = `repeat-call-${iteration}`;
+      const resultId = `repeat-result-${iteration}`;
+      lines += `${entryLine(callId, parent, "assistant", callText)}\n`;
+      lines += `${entryLine(resultId, callId, "toolResult", resultText)}\n`;
+      parent = resultId;
+      writeFileSync(sessionFile, lines, "utf8");
+    };
+
+    const engine = createEngine();
+    const sessionId = "repeat-identical-turns";
+    const runtimePair = [
+      { role: "assistant", content: [{ type: "text", text: callText }] } as AgentMessage,
+      { role: "toolResult", content: [{ type: "text", text: resultText }] } as AgentMessage,
+    ];
+
+    for (let iteration = 1; iteration <= 4; iteration += 1) {
+      appendPair(iteration);
+      await engine.afterTurn({
+        sessionId,
+        sessionFile,
+        messages: runtimePair,
+        prePromptMessageCount: 0,
+      });
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationForSession({ sessionId });
+      const persisted = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      // Every iteration lands exactly its own pair: no refusal, no dupes.
+      expect(persisted).toHaveLength(iteration * 2);
+    }
+
+    // The append-only path must never have been disqualified by content
+    // identity: fresh entry ids are new entries by definition.
+    const fullReconcileFallbacks = engineWarn(engine).mock.calls
+      .map((call: unknown[]) => String(call[0]))
+      .filter((message: string) => message.includes("falling back to full reconciliation"));
+    expect(fullReconcileFallbacks).toEqual([]);
+  });
+
+  it("still falls back to full reconciliation when an appended entry id is already persisted", async () => {
+    const sessionFile = createSessionFilePath("repeat-replayed-entry-id");
+    let lines = `${header}\n${entryLine("replay-1", null, "user", "question one")}\n${entryLine(
+      "replay-2",
+      "replay-1",
+      "assistant",
+      "answer one",
+    )}\n`;
+    writeFileSync(sessionFile, lines, "utf8");
+
+    const engine = createEngine();
+    const sessionId = "repeat-replayed-entry-id";
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [
+        { role: "user", content: [{ type: "text", text: "question one" }] } as AgentMessage,
+        { role: "assistant", content: [{ type: "text", text: "answer one" }] } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+    });
+
+    // A replay snapshot re-appends an ALREADY-persisted entry id: that is a
+    // genuine overlap and must still route through full reconciliation
+    // (which dedupes by id) instead of blind append-only ingest.
+    lines += `${entryLine("replay-2", "replay-1", "assistant", "answer one")}\n`;
+    lines += `${entryLine("replay-3", "replay-2", "user", "question two")}\n`;
+    writeFileSync(sessionFile, lines, "utf8");
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [
+        { role: "user", content: [{ type: "text", text: "question two" }] } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+    });
+
+    expect(
+      engineWarn(engine).mock.calls
+        .map((call: unknown[]) => String(call[0]))
+        .some((message: string) =>
+          message.includes("already-persisted transcript entry ids"),
+        ),
+    ).toBe(true);
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const persisted = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    // No duplicate rows from the replayed id; the new question imports once.
+    expect(persisted.map((message) => message.content)).toEqual([
+      "question one",
+      "answer one",
+      "question two",
+    ]);
+  });
+
+  it("legacy unstamped empty-content rows do not false-flag flush-lag adoption", async () => {
+    const sessionFile = createSessionFilePath("repeat-empty-content-legacy");
+    // Conversation with a LEGACY unstamped empty-content assistant row (the
+    // stored shape of pre-migration pure tool-call messages). On the live
+    // incident lane, thousands of these matched every appended tool-call
+    // message by identity and forced full reconciliation per iteration.
+    const engine = createEngine();
+    const sessionId = "repeat-empty-content-legacy";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+    await engine.getConversationStore().createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "assistant",
+      content: "",
+      tokenCount: 0,
+    });
+    await engine.getConversationStore().createMessage({
+      conversationId: conversation.conversationId,
+      seq: 2,
+      role: "user",
+      content: "anchor question",
+      tokenCount: 4,
+    });
+
+    const callText = "";
+    let lines = `${header}\n${entryLine("legacy-1", null, "user", "anchor question")}\n`;
+    writeFileSync(sessionFile, lines, "utf8");
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+    });
+
+    // Appended pure-tool-call pair: assistant content stores as empty.
+    lines += `${JSON.stringify({
+      type: "message",
+      id: "legacy-2",
+      parentId: "legacy-1",
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_x", name: "read", arguments: { path: "f" } },
+        ],
+      },
+    })}\n${entryLine("legacy-3", "legacy-2", "toolResult", "file contents here")}\n`;
+    writeFileSync(sessionFile, lines, "utf8");
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+    });
+
+    const fallbacks = engineWarn(engine).mock.calls
+      .map((call: unknown[]) => String(call[0]))
+      .filter((message: string) => message.includes("falling back to full reconciliation"));
+    expect(fallbacks).toEqual([]);
+  });
+});

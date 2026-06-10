@@ -901,6 +901,58 @@ export class ConversationStore {
     return row?.count ?? 0;
   }
 
+  /** Newest persisted transcript entry id (by seq), or null when none. */
+  async getNewestTranscriptEntryId(conversationId: ConversationId): Promise<string | null> {
+    const row = this.db
+      .prepare(
+        `SELECT transcript_entry_id AS id
+       FROM messages
+       WHERE conversation_id = ? AND transcript_entry_id IS NOT NULL
+       ORDER BY seq DESC
+       LIMIT 1`,
+      )
+      .get(conversationId) as unknown as { id?: string } | undefined;
+    return row?.id ?? null;
+  }
+
+  /**
+   * Whether an identity-matching row WITHIN THE TAIL WINDOW exists that has
+   * NOT been stamped with a transcript entry id — i.e. a flush-lagged
+   * runtime row (persisted moments ago, always tail-adjacent) that a
+   * transcript catch-up entry should adopt instead of importing a
+   * duplicate. Legacy pre-migration rows deeper in history also lack entry
+   * ids but are NOT flush lag; matching them would defer every repeated
+   * content and mis-target adoption.
+   */
+  async hasRecentUnstampedMessageByIdentity(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    tailWindow: number,
+  ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found
+       FROM (
+         SELECT message_id, transcript_entry_id, identity_hash, role, content
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq DESC
+         LIMIT ?
+       )
+       WHERE transcript_entry_id IS NULL
+         AND identity_hash = ?
+         AND role = ?
+         AND content = ?
+       LIMIT 1`,
+      )
+      .get(conversationId, Math.max(1, Math.floor(tailWindow)), identityHash, role, content) as unknown as
+      | { found?: number }
+      | undefined;
+    return row?.found === 1;
+  }
+
   async countMessagesByIdentityHash(
     conversationId: ConversationId,
     role: MessageRole,
