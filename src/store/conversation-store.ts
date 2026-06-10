@@ -33,6 +33,13 @@ export type CreateMessageInput = {
   content: string;
   tokenCount: number;
   identityHash?: string;
+  /**
+   * Stable JSONL envelope id of the transcript entry this message was
+   * imported from. Enforced unique per conversation (partial index), so
+   * transcript replays cannot duplicate rows. Null/undefined for runtime
+   * ingests and envelope-less transcripts.
+   */
+  transcriptEntryId?: string | null;
   // Use only when the caller is intentionally importing a fresh transcript epoch.
   skipReplayTimestampFloodGuard?: boolean;
 };
@@ -599,8 +606,8 @@ export class ConversationStore {
 
     const result = this.db
       .prepare(
-        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         prepared.conversationId,
@@ -609,6 +616,7 @@ export class ConversationStore {
         prepared.content,
         prepared.tokenCount,
         prepared.identityHash,
+        prepared.transcriptEntryId ?? null,
         prepared.createdAt,
       );
 
@@ -637,8 +645,8 @@ export class ConversationStore {
     );
 
     const insertStmt = this.db.prepare(
-      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
       `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
@@ -654,6 +662,7 @@ export class ConversationStore {
         input.content,
         input.tokenCount,
         input.identityHash,
+        input.transcriptEntryId ?? null,
         input.createdAt,
       );
 
@@ -727,6 +736,46 @@ export class ConversationStore {
       .get(conversationId, identityHash, role, content) as unknown as CountRow | undefined;
 
     return row?.count === 1;
+  }
+
+  async hasMessageByTranscriptEntryId(
+    conversationId: ConversationId,
+    transcriptEntryId: string,
+  ): Promise<boolean> {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS count
+       FROM messages
+       WHERE conversation_id = ? AND transcript_entry_id = ?
+       LIMIT 1`,
+      )
+      .get(conversationId, transcriptEntryId) as unknown as CountRow | undefined;
+
+    return row?.count === 1;
+  }
+
+  /** Return the subset of `entryIds` that already exist for the conversation. */
+  async filterExistingTranscriptEntryIds(
+    conversationId: ConversationId,
+    entryIds: readonly string[],
+  ): Promise<Set<string>> {
+    const existing = new Set<string>();
+    const chunkSize = 400;
+    for (let start = 0; start < entryIds.length; start += chunkSize) {
+      const chunk = entryIds.slice(start, start + chunkSize);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT transcript_entry_id
+         FROM messages
+         WHERE conversation_id = ? AND transcript_entry_id IN (${placeholders})`,
+        )
+        .all(conversationId, ...chunk) as unknown as Array<{ transcript_entry_id: string }>;
+      for (const row of rows) {
+        existing.add(row.transcript_entry_id);
+      }
+    }
+    return existing;
   }
 
   async countMessagesByIdentity(

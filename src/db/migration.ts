@@ -339,6 +339,22 @@ function ensureMessageLargeContentColumn(db: DatabaseSync): void {
   }
 }
 
+/**
+ * Transcript-entry-id reconciliation: the stable JSONL envelope id of the
+ * transcript entry a message was imported from. NULL for runtime-array
+ * ingests, legacy rows, and transcripts without envelopes. The partial
+ * unique index makes transcript imports idempotent — replaying a transcript
+ * region can never duplicate rows. See
+ * specs/transcript-reconciliation-by-entry-id.md.
+ */
+function ensureMessageTranscriptEntryIdColumn(db: DatabaseSync): void {
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasTranscriptEntryId = messageColumns.some((col) => col.name === "transcript_entry_id");
+  if (!hasTranscriptEntryId) {
+    db.exec(`ALTER TABLE messages ADD COLUMN transcript_entry_id TEXT`);
+  }
+}
+
 function ensureConversationBootstrapStateForkColumns(db: DatabaseSync): void {
   const columns = db
     .prepare(`PRAGMA table_info(conversation_bootstrap_state)`)
@@ -951,6 +967,7 @@ export function runLcmMigrations(
       content TEXT NOT NULL,
       token_count INTEGER NOT NULL,
       identity_hash TEXT,
+      transcript_entry_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (conversation_id, seq)
     );
@@ -1224,6 +1241,18 @@ export function runLcmMigrations(
     runMigrationStep("createMessagesIdentityHashIndex", log, () =>
       db.exec(
         `CREATE INDEX IF NOT EXISTS messages_conv_identity_hash_idx ON messages (conversation_id, identity_hash)`,
+      ),
+    );
+    runMigrationStep("ensureMessageTranscriptEntryIdColumn", log, () =>
+      ensureMessageTranscriptEntryIdColumn(db),
+    );
+    // Partial unique index: NULL entry ids (legacy rows, runtime ingests) are
+    // exempt, so this only enforces idempotency for transcript-imported rows.
+    runMigrationStep("createMessagesTranscriptEntryIdIndex", log, () =>
+      db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS messages_conv_entry_unique_idx
+         ON messages (conversation_id, transcript_entry_id)
+         WHERE transcript_entry_id IS NOT NULL`,
       ),
     );
     runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
