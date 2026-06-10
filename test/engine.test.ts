@@ -15480,25 +15480,27 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
 
     const largeToolContent = "tool output. ".repeat(200); // well above 20-token threshold
+    const liveMessages = [
+      makeMessage({ role: "user", content: "current turn" }),
+      makeMessage({
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call_1", name: "exec", input: {} }],
+      }),
+      makeMessage({
+        role: "toolResult",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_1",
+            output: largeToolContent,
+          },
+        ],
+      }),
+    ];
+    const originalLiveMessages = structuredClone(liveMessages);
     const assembleResult = await engine.assemble({
       sessionId,
-      messages: [
-        makeMessage({ role: "user", content: "current turn" }),
-        makeMessage({
-          role: "assistant",
-          content: [{ type: "tool_use", id: "call_1", name: "exec", input: {} }],
-        }),
-        makeMessage({
-          role: "toolResult",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: "call_1",
-              output: largeToolContent,
-            },
-          ],
-        }),
-      ],
+      messages: liveMessages,
       tokenBudget: 100,
     });
 
@@ -15514,6 +15516,27 @@ describe("LcmContextEngine fidelity and token budget", () => {
         && text.includes("externalizedFileId");
     });
     expect(hasStub).toBe(true);
+    expect(liveMessages).toEqual(originalLiveMessages);
+
+    const firstLargeFiles = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation.conversationId);
+    expect(firstLargeFiles).toHaveLength(1);
+
+    const secondAssembleResult = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 100,
+    });
+    const secondHasStub = secondAssembleResult.messages.some((msg) => {
+      const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+      return text.includes(`[LCM Tool Output: ${firstLargeFiles[0]!.fileId}`)
+        && text.includes("externalizedFileId");
+    });
+    expect(secondHasStub).toBe(true);
+    await expect(
+      engine.getSummaryStore().getLargeFilesByConversation(conversation.conversationId),
+    ).resolves.toHaveLength(1);
   });
 
   it("assemble() clears exhausted threshold debt and preserves leading system context via degraded fallback (#639 Mode 2)", async () => {
