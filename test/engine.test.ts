@@ -14817,7 +14817,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
       });
       expect(first.changed).toBe(true);
       expect(first.reason).toBe("compacted but still over target");
-      expect(compactFullSweepSpy).toHaveBeenCalledTimes(1);
+      // The sweep chain retries once after the first partial round and stops
+      // when the second round shows no further reduction.
+      expect(compactFullSweepSpy).toHaveBeenCalledTimes(2);
 
       const second = await engine.maintain({
         sessionId,
@@ -14830,7 +14832,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       });
       expect(second.changed).toBe(false);
       expect(second.reason).toBe("deferred compaction backoff active");
-      expect(compactFullSweepSpy).toHaveBeenCalledTimes(1);
+      expect(compactFullSweepSpy).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }
@@ -17974,7 +17976,9 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(result.result?.tokensAfter).toBe(9_000);
     expect(result.result?.details).toEqual(
       expect.objectContaining({
-        rounds: 1,
+        // Two chained sweeps: the first makes progress, the second shows no
+        // further reduction and ends the chain.
+        rounds: 2,
         targetTokens: 8_200,
       }),
     );
