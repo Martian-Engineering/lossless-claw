@@ -10415,6 +10415,27 @@ export class LcmContextEngine implements ContextEngine {
         );
         return safeFallback();
       }
+
+      // Intercept large tool results in live messages so even degraded
+      // fallback paths send stubbed content to the model. The
+      // afterTurn ingest path also runs `interceptLargeToolResults` on
+      // persisted messages, but live params.messages are sent to the
+      // model before afterTurn runs; without this pre-flight intercept
+      // the degraded live fallback (and even normal assemble for
+      // current-turn tool results) sends raw content while the DB
+      // already has stubbed references.
+      if (this.config.stubLargeToolPayloads) {
+        for (let i = 0; i < params.messages.length; i++) {
+          const message = params.messages[i]!;
+          const intercepted = await this.interceptLargeToolResults({
+            conversationId: conversation.conversationId,
+            message,
+          });
+          if (intercepted) {
+            params.messages[i] = intercepted.rewrittenMessage;
+          }
+        }
+      }
       const ambiguousRollover =
         await this.findAmbiguousSessionKeyRuntimeRollover({
           phase: "assemble",

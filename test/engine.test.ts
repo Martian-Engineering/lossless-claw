@@ -15439,6 +15439,83 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=near-budget"));
   });
 
+  it("assemble() intercepts large tool results in live messages before degraded fallback", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        largeFileTokenThreshold: 20,
+        stubLargeToolPayloads: true,
+        largeFilesDir,
+      },
+      { log },
+    );
+    const sessionId = "assemble-intercepts-large-tool-results-before-degraded";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored content",
+        tokenCount: 20,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 100,
+      currentTokenCount: 90,
+    });
+
+    const largeToolContent = "tool output. ".repeat(200); // well above 20-token threshold
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [
+        makeMessage({ role: "user", content: "current turn" }),
+        makeMessage({
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_1", name: "exec", input: {} }],
+        }),
+        makeMessage({
+          role: "toolResult",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_1",
+              output: largeToolContent,
+            },
+          ],
+        }),
+      ],
+      tokenBudget: 100,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] assemble: degraded live fallback"),
+    );
+    // The tool result should have been intercepted and replaced with a
+    // [LCM Tool Output: …] stub; the output field should reference the
+    // externalized file, not contain the raw content.
+    const hasStub = assembleResult.messages.some((msg) => {
+      const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+      return text.includes("[LCM Tool Output: file_")
+        && text.includes("externalizedFileId");
+    });
+    expect(hasStub).toBe(true);
+  });
+
   it("assemble() clears exhausted threshold debt and preserves leading system context via degraded fallback (#639 Mode 2)", async () => {
     const log = {
       info: vi.fn(),
