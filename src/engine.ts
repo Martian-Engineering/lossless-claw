@@ -93,6 +93,7 @@ import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import {
   extractBootstrapMessageCandidate,
   getTranscriptEntryId,
+  getTranscriptEntryMeta,
   isBootstrapMessage,
   parseBootstrapJsonl,
   readAppendedLeafPathMessages,
@@ -136,6 +137,13 @@ const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 const AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON =
   "ambiguous session-key runtime rollover";
+/**
+ * How many recent persisted messages an ambiguous-rollover freshness check
+ * compares against the new transcript. Wide enough that a continuation of
+ * this conversation cannot plausibly avoid every recent message, small
+ * enough to stay cheap on conversations with thousands of rows.
+ */
+const AMBIGUOUS_ROLLOVER_OVERLAP_WINDOW = 50;
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
 type CircuitBreakerState = {
@@ -3393,7 +3401,8 @@ type TranscriptReconcileResult = {
     | "import-cap"
     | "cross-conversation-raw-id"
     | "duplicate-transcript-replay"
-    | "ambiguous-session-key-runtime-rollover";
+    | "ambiguous-session-key-runtime-rollover"
+    | "ambiguous-rollover-rotated-fresh-transcript";
   importedMessages: number;
   hasOverlap: boolean;
   /**
@@ -7660,6 +7669,26 @@ export class LcmContextEngine implements ContextEngine {
                 checkpointEntryHash: activeBootstrapState?.lastProcessedEntryHash,
               });
             if (!hasFrontierAnchor) {
+              // Tier-2 resolution: archive the frozen conversation and
+              // create the replacement now. This turn's persistence is
+              // skipped (unsafe-to-advance), and the next turn reconciles
+              // the full transcript into the fresh conversation.
+              const rotatedForFreshTranscript =
+                await this.rotateAmbiguousRolloverForProvablyFreshTranscript({
+                  phase: "afterTurn",
+                  sessionId: params.sessionId,
+                  rollover: ambiguousRollover,
+                  candidateMessages: historicalMessages,
+                  createReplacement: true,
+                });
+              if (rotatedForFreshTranscript) {
+                return {
+                  importedMessages: 0,
+                  blockedByImportCap: false,
+                  blockedReason: "ambiguous-rollover-rotated-fresh-transcript",
+                  hasOverlap: false,
+                };
+              }
               this.logAmbiguousSessionKeyRuntimeRollover({
                 phase: "afterTurn",
                 rollover: ambiguousRollover,
@@ -8127,6 +8156,202 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  /**
+   * Judge whether the new runtime's transcript is provably FRESH relative to
+   * a key-conflicting conversation: zero identity overlap with the
+   * conversation's recent persisted history AND every timestamped candidate
+   * entry postdates the conversation's last persisted message. Freshness is
+   * judged on content+time evidence — never on transcript size — so lanes
+   * that ran frozen for days (and accumulated history) still qualify.
+   * Fails closed on missing evidence.
+   */
+  private async evaluateAmbiguousRolloverFreshness(params: {
+    conversationId: number;
+    candidateMessages: AgentMessage[];
+  }): Promise<{
+    fresh: boolean;
+    reason: string;
+    lastPersistedAt: Date | null;
+    firstCandidateAt: number | null;
+  }> {
+    if (isLikelyInjectedDeliveryOnlyTranscript(params.candidateMessages)) {
+      return {
+        fresh: false,
+        reason: "delivery-only-synthetic-transcript",
+        lastPersistedAt: null,
+        firstCandidateAt: null,
+      };
+    }
+
+    // Every candidate must carry a usable timestamp (message timestamp or
+    // transcript envelope timestamp); any untimestamped entry means the
+    // transcript's age cannot be proven, so fail closed.
+    let firstCandidateAt: number | null = null;
+    for (const message of params.candidateMessages) {
+      const ts = (message as { timestamp?: unknown }).timestamp;
+      let resolved: number | null =
+        typeof ts === "number" && Number.isFinite(ts) && ts > 0 ? ts : null;
+      if (resolved === null) {
+        const envelopeTimestamp = getTranscriptEntryMeta(message)?.timestamp;
+        if (typeof envelopeTimestamp === "string") {
+          const parsed = Date.parse(envelopeTimestamp);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            resolved = parsed;
+          }
+        }
+      }
+      if (resolved === null) {
+        return {
+          fresh: false,
+          reason: "candidate-missing-timestamp",
+          lastPersistedAt: null,
+          firstCandidateAt,
+        };
+      }
+      firstCandidateAt = firstCandidateAt === null ? resolved : Math.min(firstCandidateAt, resolved);
+    }
+    if (firstCandidateAt === null) {
+      return {
+        fresh: false,
+        reason: "no-candidate-timestamps",
+        lastPersistedAt: null,
+        firstCandidateAt,
+      };
+    }
+
+    const lastPersisted = await this.conversationStore.getLastMessage(params.conversationId);
+    if (!lastPersisted) {
+      // Nothing persisted to protect: time evidence alone is sufficient and
+      // archiving an empty conversation is harmless.
+      return { fresh: true, reason: "empty-conversation", lastPersistedAt: null, firstCandidateAt };
+    }
+    if (firstCandidateAt <= lastPersisted.createdAt.getTime()) {
+      return {
+        fresh: false,
+        reason: "candidate-entries-predate-last-persisted",
+        lastPersistedAt: lastPersisted.createdAt,
+        firstCandidateAt,
+      };
+    }
+
+    // Identity overlap against the recent persisted tail. Empty stored
+    // content (pure tool rows) is skipped on both sides: it matches
+    // trivially and proves nothing about lineage.
+    const recentPersisted = await this.conversationStore.getLastMessages(
+      params.conversationId,
+      AMBIGUOUS_ROLLOVER_OVERLAP_WINDOW,
+    );
+    const persistedIdentities = new Set<string>();
+    for (const record of recentPersisted) {
+      if (record.content.trim().length > 0) {
+        persistedIdentities.add(messageIdentity(record.role, record.content));
+      }
+    }
+    if (persistedIdentities.size === 0) {
+      // Nothing comparable persisted (e.g. only empty tool rows): the
+      // overlap test would pass vacuously, which is not proof. Fail closed.
+      return {
+        fresh: false,
+        reason: "no-comparable-persisted-content",
+        lastPersistedAt: lastPersisted.createdAt,
+        firstCandidateAt,
+      };
+    }
+    let checkedCandidateIdentity = false;
+    for (const message of params.candidateMessages) {
+      const stored = toStoredMessage(message);
+      if (stored.content.trim().length === 0) {
+        continue;
+      }
+      checkedCandidateIdentity = true;
+      if (persistedIdentities.has(messageIdentity(stored.role, stored.content))) {
+        return {
+          fresh: false,
+          reason: "identity-overlap-with-persisted-history",
+          lastPersistedAt: lastPersisted.createdAt,
+          firstCandidateAt,
+        };
+      }
+    }
+    if (!checkedCandidateIdentity) {
+      return {
+        fresh: false,
+        reason: "no-comparable-candidate-content",
+        lastPersistedAt: lastPersisted.createdAt,
+        firstCandidateAt,
+      };
+    }
+
+    return { fresh: true, reason: "fresh", lastPersistedAt: lastPersisted.createdAt, firstCandidateAt };
+  }
+
+  /**
+   * Tier-2 resolution for ambiguous session-key runtime rollovers
+   * (lossless-claw-30b.8): a provably fresh new transcript means the
+   * rollover is a legitimate reset, not a foreign transcript sharing the
+   * key. Archive the old conversation (fully preserved and queryable) so
+   * the new session can bind and bootstrap normally instead of leaving the
+   * lane frozen outside LCM indefinitely. Returns true when rotated;
+   * false leaves the existing freeze-and-preserve behavior in place.
+   */
+  private async rotateAmbiguousRolloverForProvablyFreshTranscript(params: {
+    phase: "bootstrap" | "assemble" | "afterTurn";
+    sessionId: string;
+    rollover: AmbiguousSessionKeyRuntimeRollover;
+    candidateMessages: AgentMessage[];
+    createReplacement: boolean;
+  }): Promise<boolean> {
+    let verdict: Awaited<ReturnType<LcmContextEngine["evaluateAmbiguousRolloverFreshness"]>>;
+    try {
+      verdict = await this.evaluateAmbiguousRolloverFreshness({
+        conversationId: params.rollover.conversationId,
+        candidateMessages: params.candidateMessages,
+      });
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] ${params.phase}: ambiguous rollover freshness check failed conversation=${params.rollover.conversationId} error=${describeLogError(err)}`,
+      );
+      return false;
+    }
+    if (!verdict.fresh) {
+      this.deps.log.warn(
+        `[lcm] ${params.phase}: ambiguous rollover not provably fresh conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
+      );
+      return false;
+    }
+
+    await this.applySessionReplacement({
+      reason: `${params.phase} ambiguous rollover fresh-transcript rotation`,
+      sessionId: params.rollover.activeSessionId,
+      sessionKey: params.rollover.sessionKey,
+      nextSessionId: params.sessionId,
+      nextSessionKey: params.rollover.sessionKey,
+      createReplacement: params.createReplacement,
+    });
+    // Postcondition: applySessionReplacement has internal no-op paths (e.g.
+    // a fresh lifecycle row is left in place). Claiming "resolved" while the
+    // key is still bound to the old session would hide a live freeze behind
+    // healed-looking logs, so verify the binding actually moved.
+    const bindingAfter = await this.conversationStore.getConversationBySessionKey(
+      params.rollover.sessionKey,
+    );
+    if (
+      bindingAfter &&
+      bindingAfter.conversationId === params.rollover.conversationId &&
+      bindingAfter.sessionId === params.rollover.activeSessionId
+    ) {
+      this.deps.log.warn(
+        `[lcm] ${params.phase}: ambiguous rollover rotation had no effect (lifecycle no-op) conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId}; leaving lane frozen`,
+      );
+      return false;
+    }
+
+    this.deps.log.warn(
+      `[lcm] ${params.phase}: ambiguous rollover resolved by fresh-transcript rotation conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId} candidateMessages=${params.candidateMessages.length} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
+    );
+    return true;
+  }
+
   private async transcriptContainsCurrentConversationTailAnchor(params: {
     conversationId: number;
     historicalMessages: AgentMessage[];
@@ -8266,17 +8491,31 @@ export class LcmContextEngine implements ContextEngine {
                 checkpointEntryHash: activeBootstrapState?.lastProcessedEntryHash,
               });
             if (!hasFrontierAnchor) {
-              this.logAmbiguousSessionKeyRuntimeRollover({
-                phase: "bootstrap",
-                rollover: ambiguousRollover,
-                sessionId: params.sessionId,
-                sessionFile: params.sessionFile,
-              });
-              return {
-                bootstrapped: false,
-                importedMessages: 0,
-                reason: AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON,
-              };
+              // Tier-2 resolution: a provably fresh new transcript means
+              // this is a legitimate reset; archive the old conversation
+              // and fall through so getOrCreateConversation below binds the
+              // new session and the initial import ingests its transcript.
+              const rotatedForFreshTranscript =
+                await this.rotateAmbiguousRolloverForProvablyFreshTranscript({
+                  phase: "bootstrap",
+                  sessionId: params.sessionId,
+                  rollover: ambiguousRollover,
+                  candidateMessages: preloadedHistoricalMessages,
+                  createReplacement: false,
+                });
+              if (!rotatedForFreshTranscript) {
+                this.logAmbiguousSessionKeyRuntimeRollover({
+                  phase: "bootstrap",
+                  rollover: ambiguousRollover,
+                  sessionId: params.sessionId,
+                  sessionFile: params.sessionFile,
+                });
+                return {
+                  bootstrapped: false,
+                  importedMessages: 0,
+                  reason: AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON,
+                };
+              }
             }
           }
 
@@ -9553,7 +9792,11 @@ export class LcmContextEngine implements ContextEngine {
       transcriptReconcileResult.blockedByImportCap ||
       (!transcriptReconcileResult.hasOverlap && transcriptReconcileResult.importedMessages === 0);
     const transcriptReconcileBlockedByAmbiguousRollover =
-      transcriptReconcileResult.blockedReason === "ambiguous-session-key-runtime-rollover";
+      transcriptReconcileResult.blockedReason === "ambiguous-session-key-runtime-rollover" ||
+      // Rotated-fresh skips this turn the same way: the replacement
+      // conversation is empty, so telemetry/compaction work below would run
+      // against it for nothing; the next turn binds and reconciles normally.
+      transcriptReconcileResult.blockedReason === "ambiguous-rollover-rotated-fresh-transcript";
     let dedupedNewMessages: AgentMessage[] = [];
     if (transcriptReconcileUnsafeToAdvance) {
       if (newMessages.length > 0 || params.autoCompactionSummary) {
@@ -10023,6 +10266,11 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
         });
       if (ambiguousRollover) {
+        // No tier-2 resolution here: assemble only sees the host's live
+        // window (often just the new prompt), which is not transcript
+        // evidence — judging freshness on it could wrongly archive a
+        // continuing conversation. bootstrap/afterTurn heal with the full
+        // transcript file on the next call.
         this.logAmbiguousSessionKeyRuntimeRollover({
           phase: "assemble",
           rollover: ambiguousRollover,
