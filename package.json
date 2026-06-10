@@ -40,9 +40,9 @@
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",
     "@changesets/cli": "^2.30.0",
-    "@earendil-works/pi-agent-core": ">=0.74 <1",
-    "@earendil-works/pi-ai": ">=0.74 <1",
-    "@earendil-works/pi-coding-agent": ">=0.74 <1",
+    "@earendil-works/pi-agent-core": "^0.79.0",
+    "@earendil-works/pi-ai": "^0.79.0",
+    "@earendil-works/pi-coding-agent": "^0.79.0",
     "esbuild": "^0.28.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
