@@ -618,14 +618,35 @@ export class LargeFileInterceptor {
   private async externalizeLargeTextPayload(params: {
     conversationId: number;
     content: string;
+    fileId?: string;
     fileName?: string;
     mimeType?: string;
     formatReference: (input: { fileId: string; byteSize: number; summary: string }) => string;
   }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
+    if (params.fileId) {
+      const existing = await this.summaryStore.getLargeFile(params.fileId);
+      if (existing) {
+        const byteSize = existing.byteSize ?? Buffer.byteLength(params.content, "utf8");
+        const summary =
+          existing.explorationSummary ??
+          `${params.fileName ?? "large payload"} (${byteSize.toLocaleString("en-US")} bytes)`;
+        return {
+          fileId: existing.fileId,
+          byteSize,
+          summary,
+          reference: params.formatReference({
+            fileId: existing.fileId,
+            byteSize,
+            summary,
+          }),
+        };
+      }
+    }
+
     const summarizeText = await this.resolveLargeFileTextSummarizer({
       conversationId: params.conversationId,
     });
-    const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const fileId = params.fileId ?? `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const extension = extensionFromNameOrMime(params.fileName, params.mimeType);
     const storageUri = await this.storeLargeFileContent({
       conversationId: params.conversationId,
@@ -725,6 +746,7 @@ export class LargeFileInterceptor {
   async interceptLargeToolResults(params: {
     conversationId: number;
     message: AgentMessage;
+    getFileId?: (input: { content: string; toolName: string; callId?: string }) => string;
   }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
     if (
       (params.message.role !== "toolResult" && params.message.role !== "tool") ||
@@ -813,9 +835,18 @@ export class LargeFileInterceptor {
         safeString(record.name) ??
         topLevelToolName ??
         "tool-result";
+      const callId =
+        safeString(record.tool_use_id) ??
+        safeString(record.toolUseId) ??
+        safeString(record.tool_call_id) ??
+        safeString(record.toolCallId) ??
+        safeString(record.call_id) ??
+        safeString(record.id) ??
+        topLevelToolCallId;
       const externalized = await this.externalizeLargeTextPayload({
         conversationId: params.conversationId,
         content: extractedText,
+        fileId: params.getFileId?.({ content: extractedText, toolName, callId }),
         fileName: `${toolName}.txt`,
         mimeType: "text/plain",
         formatReference: ({ fileId, byteSize, summary }) =>
@@ -847,14 +878,6 @@ export class LargeFileInterceptor {
             toolOutputExternalized: true,
             externalizationReason: "large_tool_result",
           };
-      const callId =
-        safeString(record.tool_use_id) ??
-        safeString(record.toolUseId) ??
-        safeString(record.tool_call_id) ??
-        safeString(record.toolCallId) ??
-        safeString(record.call_id) ??
-        safeString(record.id) ??
-        topLevelToolCallId;
       if (callId) {
         if (normalizedRawType === "function_call_output") {
           compactBlock.call_id = callId;

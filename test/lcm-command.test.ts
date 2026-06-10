@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
@@ -2841,7 +2842,8 @@ describe("lcm command", () => {
 
   it("registers a Telegram native progress placeholder", () => {
     const config = resolveLcmConfig({}, { dbPath: "/tmp/unused.db" });
-    const command = createLcmCommand({ db: vi.fn(), config });
+    const dbProvider = vi.fn() as unknown as () => DatabaseSync;
+    const command = createLcmCommand({ db: dbProvider, config });
 
     expect(command.nativeProgressMessages).toEqual({
       telegram: "Lossless Claw is working...",
