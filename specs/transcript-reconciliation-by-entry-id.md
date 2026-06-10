@@ -188,13 +188,20 @@ the next turn's idempotent transcript read.
   order. Missing entries first attempt **adoption**: an identity-matched row
   with a NULL entry id (runtime flush-lag rows, pre-migration data) is
   stamped with the entry id instead of imported, healing legacy rows in
-  place. Entry-id anchoring is immune to post-ingest content rewriting
-  (tool-result externalization), which defeats content-identity anchors.
+  place. Entry-id anchoring also survives post-ingest content rewriting
+  (tool-result externalization) — *but not the way the original draft of
+  this spec claimed*: the host implements content rewriting as copy-on-write
+  re-append under **new** entry ids (see Phase 5), so the surviving anchor
+  is the unchanged prefix, and the rewritten suffix heals via stale-id
+  adoption rather than id equality.
 - *(Adjusted during implementation.)* Repeated content arriving under fresh
-  entry ids is now imported as genuine traffic instead of tripping the
+  entry ids is imported as genuine traffic instead of tripping the
   user-role replay-flood guard — the host's SessionManager declared them new
   entries, and true replays (same ids) are skipped exactly. The import cap
-  still bounds id-bearing imports as a sanity limit.
+  still bounds id-bearing imports as a sanity limit. *(Refined in Phase 5:
+  when the identity-matched original's entry id has left the leaf path, the
+  fresh id is a host re-issue for the same message and is adopted, not
+  imported; only repeats whose originals are still live import as new.)*
 
 **Effect:** rewritten/rotated transcripts are recognized exactly instead of
 inferred; the anchor scan, occurrence counting, and the per-process file-stat
@@ -220,6 +227,45 @@ memo cache become legacy-only paths.
   machinery.
 - Transcript reading/parsing fully lives in `src/transcript.ts` (done in
   Phase 1); `engine.ts` shrank accordingly.
+
+### Phase 5 — Leaf-path reconciliation and stale-id adoption
+
+Added after auditing the *actual* host source (see the corrected addendum
+below): entry ids identify tree **nodes**, not logical messages. The host
+implements every history edit — the `rewriteTranscriptEntries` hook this
+plugin's transcript GC calls, the host's own oversized-tool-result
+truncation, and gateway chat edits — as copy-on-write: it branches at the
+first replaced entry's parent and re-appends the whole active suffix as new
+entries with freshly generated ids. The replaced entries stay in the file
+as an abandoned branch, and the internal old→new id map is not returned to
+the caller. Without countermeasures, the re-issued ids read as "genuine new
+traffic" and the suffix re-imports as content duplicates — with the flood
+guard intentionally disabled for id-bearing imports.
+
+- **Leaf-path reading.** `readLeafPathMessages` now walks the `parentId`
+  chain from the file's last entry (the host's leaf) when every line
+  carries an envelope id, so abandoned branches are invisible to
+  reconciliation. A mid-file `parentId: null` reached from the leaf is a
+  genuine root (host `resetLeaf`). Id-less cohorts, dangling parents,
+  cycles, and JSON-array files keep the legacy flatten behavior.
+- **Stale-id adoption.** A missing leaf-path entry that fails NULL-id
+  adoption next looks for an identity-matched row whose stored entry id has
+  left the leaf path — a row stranded by a host rewrite — and re-stamps it
+  with the re-issued id instead of importing a duplicate
+  (`adoptStaleTranscriptEntryId`). Runs in both the entry-id reconcile loop
+  and the no-anchor new-epoch import (declared rollovers, path-mismatch
+  rotations, compaction successors).
+- **No-anchor replay block scoped to id-less traffic.** A fully id-bearing
+  no-anchor batch resolves identity overlaps exactly via adoption, so the
+  content replay-overlap block (which would freeze a rewritten epoch with
+  ≥ 3 identical kept messages) applies only to id-less batches. Adoption
+  reports `hasOverlap` so the checkpoint refreshes instead of re-entering
+  the slow path every turn.
+- **Known gap (accepted).** An entry whose *content* was replaced (the
+  externalized stub itself) matches no identity and imports as a new row —
+  one row per actually-replaced entry, bounded by the import cap. Closing
+  it exactly requires the host to return its old→new id map from
+  `rewriteTranscriptEntries` (it already builds one); deferred by decision.
 
 ## What stays
 
@@ -261,6 +307,8 @@ memo cache become legacy-only paths.
   import with adoption
 - [x] Phase 4 — pure planner functions in `src/reconcile-plan.ts` +
   `src/transcript.ts` extraction
+- [x] Phase 5 — leaf-path reading + stale-id adoption for host
+  copy-on-write rewrites
 
 ## Addendum: what the host source settles (post-implementation)
 
@@ -268,18 +316,43 @@ The four phases above are deliberately additive — a strangler-fig pattern
 that routes id-bearing traffic onto exact paths while keeping every legacy
 path bit-for-bit intact (`src/` ended at +992/−286). The open question was
 how much of the legacy machinery is genuinely required by the host versus
-retained out of caution. The transcript writer is `SessionManager` from
-`@earendil-works/pi-coding-agent` (this plugin imports the same class for
-its rotate path), and reading its source answers that question in both
-directions.
+retained out of caution.
+
+> **Correction (2026-06-10).** The first draft of this addendum audited
+> `SessionManager` from `@earendil-works/pi-coding-agent`. OpenClaw no
+> longer uses that package — the transcript writer is the in-tree embedded
+> harness (`openclaw/src/agents/sessions/session-manager.ts` and
+> `src/agents/embedded-agent-runner/`), forked from pi and format-identical
+> (v3, same entry types) *today*, but evolving independently. A sweep of
+> 920 live session files confirmed: all v3, every message line id-bearing,
+> zero JSON-array files. The behavioral claims below were re-verified
+> against the embedded source; the one the original audit got wrong —
+> id stability under content rewrites — is what Phase 5 fixes. Note this
+> plugin still imports the pi `SessionManager` for its rotate and GC
+> entry-id mapping paths; that pairing works while the formats match and
+> should be replaced with the plugin's own parser (tracked separately).
 
 ### Confirmed: entry ids are unconditional in the current format
 
 `appendMessage` always writes `{type:"message", id, parentId, timestamp,
-message}` with a collision-checked 8-hex id, and the session header always
-carries an id (v3 format). No code path writes an id-less message line. For
-any transcript the current host writes, the entry-id path covers 100% of
+message}` with a generated id (8-hex with full-UUID fallback in the
+embedded `SessionManager`; other host writer paths use full UUIDs — ids
+are opaque strings either way), and the session header always carries an
+id (v3 format). No code path writes an id-less message line. For any
+transcript the current host writes, the entry-id path covers 100% of
 traffic.
+
+### Corrected: entry ids are node ids, not message ids
+
+The original audit concluded entry ids were stable identities. They are —
+for *appends*. Every history edit is copy-on-write: the host re-appends
+the active suffix under new ids (`transcript-rewrite.ts`), used by this
+plugin's own transcript GC, by the host's oversized-tool-result
+truncation, and by gateway chat edits. `v1→v2` migration likewise
+regenerates every id. Compaction-successor rotation, corruption recovery,
+and `v2→v3` migration preserve entry ids (corruption recovery and
+rotation re-issue the *header* id only). Phase 5 exists because of this
+distinction.
 
 ### Confirmed: two "legacy" paths are load-bearing host behavior
 
@@ -312,12 +385,13 @@ and is a deletion candidate pending a maintainer decision.
 ### Discovery: sessions are trees, not logs
 
 Entries carry `parentId`; `branch()` / `resetLeaf()` create alternate paths
-within the same append-only file. `readLeafPathMessages`, despite its name,
-flattens *all* branches in file order, so LCM imports messages from
-abandoned branches today. That is a plausible source of "duplicate-ish
-content" incidents independent of replay. The `parentId` metadata captured
-in Phase 1 is sufficient to follow the actual leaf path; leaf-path-aware
-reconciliation is the highest-value follow-up this audit surfaced.
+within the same append-only file. `readLeafPathMessages` historically
+flattened *all* branches in file order, so LCM imported messages from
+abandoned branches — a plausible source of "duplicate-ish content"
+incidents independent of replay, and the amplifier that turned host
+copy-on-write rewrites into duplicate imports. Phase 5 made the function
+live up to its name: it follows the actual leaf path whenever the file has
+full id coverage.
 
 ### Revised deletion picture
 
@@ -329,6 +403,8 @@ reconciliation is the highest-value follow-up this audit surfaced.
 | JSON-array parsing | Deletable — nothing writes it today (needs maintainer decision) |
 | Timestamp-flood guards | Demote — only protect file-less-window runtime ingests now |
 | `deduplicateAfterTurnBatch` oversized/suffix heuristics | Likely collapsible into the alignment helper; scoped to the file-less window |
+| No-anchor replay-overlap block + prefix drop | Id-less traffic only as of Phase 5 — id-bearing batches resolve overlaps exactly via adoption |
+| Flatten-in-file-order transcript reading | Fallback only as of Phase 5 — leaf-path walk covers all full-id-coverage files |
 
 Net: the "require entry ids and delete the legacy stack" option is smaller
 than the pre-audit estimate, because the host's deferred-flush design makes
