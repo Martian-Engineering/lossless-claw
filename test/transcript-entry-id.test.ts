@@ -738,3 +738,191 @@ describe("afterTurn covered-frontier alignment", () => {
     expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(4);
   });
 });
+
+describe("stale entry-id adoption after host history rewrites", () => {
+  const headerLine = (headerId: string) =>
+    JSON.stringify({
+      type: "session",
+      version: 3,
+      id: headerId,
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    });
+  const entryLine = (
+    id: string,
+    parentId: string | null,
+    role: AgentMessage["role"],
+    text: string,
+  ) =>
+    JSON.stringify({
+      type: "message",
+      id,
+      parentId,
+      timestamp: new Date().toISOString(),
+      message: { role, content: [{ type: "text", text }] },
+    });
+
+  async function readRows(
+    engine: LcmContextEngine,
+    conversationId: number,
+  ): Promise<Array<{ content: string; transcript_entry_id: string | null }>> {
+    const config = (engine as unknown as { config: LcmConfig }).config;
+    const db = createLcmDatabaseConnection(config.databasePath);
+    try {
+      return db
+        .prepare(
+          `SELECT content, transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+        )
+        .all(conversationId) as Array<{ content: string; transcript_entry_id: string | null }>;
+    } finally {
+      closeLcmConnection(db);
+    }
+  }
+
+  it("re-stamps rows stranded by a host suffix rewrite instead of duplicating", async () => {
+    const sessionFile = createSessionFilePath("stale-id-suffix-rewrite");
+    const header = headerLine("stale-id-rewrite-header");
+    const prefix = [
+      entryLine("a", null, "user", "q1"),
+      entryLine("b", "a", "assistant", "a1"),
+      entryLine("c", "b", "assistant", "big payload"),
+      entryLine("d", "c", "assistant", "a2"),
+    ];
+    writeFileSync(sessionFile, [header, ...prefix].join("\n") + "\n", "utf8");
+
+    const engine = createEngine();
+    const sessionId = "stale-id-suffix-rewrite";
+    await engine.bootstrap({ sessionId, sessionFile });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const conversationId = conversation!.conversationId;
+    expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(4);
+
+    // Host rewriteTranscriptEntries: branch from "b" and re-append the suffix
+    // under new ids — "c" replaced with a stub, "d" copied verbatim. The old
+    // c/d remain in the file as an abandoned branch.
+    writeFileSync(
+      sessionFile,
+      [
+        header,
+        ...prefix,
+        entryLine("c2", "b", "assistant", "[LCM Tool Output: stub]"),
+        entryLine("d2", "c2", "assistant", "a2"),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+    });
+
+    const rows = await readRows(engine, conversationId);
+    // The verbatim re-appended "a2" adopted the re-issued id d2 instead of
+    // importing a duplicate; only the replaced stub is a genuinely new row.
+    expect(rows.map((row) => row.content)).toEqual([
+      "q1",
+      "a1",
+      "big payload",
+      "a2",
+      "[LCM Tool Output: stub]",
+    ]);
+    expect(rows.map((row) => row.transcript_entry_id)).toEqual(["a", "b", "c", "d2", "c2"]);
+  });
+
+  it("re-stamps across a declared epoch rollover that kept only re-issued ids", async () => {
+    const sessionFile = createSessionFilePath("stale-id-rollover");
+    const padding = "x".repeat(200);
+    writeFileSync(
+      sessionFile,
+      [
+        headerLine("stale-id-epoch-one"),
+        entryLine("a", null, "user", "q1"),
+        entryLine("b", "a", "assistant", `kept answer ${padding}`),
+        entryLine("c", "b", "user", `kept follow-up ${padding}`),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const engine = createEngine();
+    const sessionId = "stale-id-rollover";
+    await engine.bootstrap({ sessionId, sessionFile });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const conversationId = conversation!.conversationId;
+    expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(3);
+
+    // Compaction-successor style rotation after a rewrite: same path, new
+    // header id, and the surviving tail carries re-issued ids only.
+    writeFileSync(
+      sessionFile,
+      [
+        headerLine("stale-id-epoch-two"),
+        entryLine("b2", null, "assistant", `kept answer ${padding}`),
+        entryLine("c2", "b2", "user", `kept follow-up ${padding}`),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+    });
+
+    const rows = await readRows(engine, conversationId);
+    expect(rows.map((row) => row.content)).toEqual([
+      "q1",
+      `kept answer ${padding}`,
+      `kept follow-up ${padding}`,
+    ]);
+    // The surviving rows adopted the successor's re-issued ids; nothing
+    // imported twice.
+    expect(rows.map((row) => row.transcript_entry_id)).toEqual(["a", "b2", "c2"]);
+  });
+
+  it("still imports repeated content under a fresh id when the original is live", async () => {
+    const sessionFile = createSessionFilePath("stale-id-live-repeat");
+    const header = headerLine("stale-id-live-repeat-header");
+    writeFileSync(
+      sessionFile,
+      [header, entryLine("a", null, "user", "hello")].join("\n") + "\n",
+      "utf8",
+    );
+
+    const engine = createEngine();
+    const sessionId = "stale-id-live-repeat";
+    await engine.bootstrap({ sessionId, sessionFile });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const conversationId = conversation!.conversationId;
+
+    // The user repeats the same prompt later in the same live path: "a" is
+    // still on the leaf path, so its row must NOT be re-stamped — the repeat
+    // is genuine new traffic.
+    writeFileSync(
+      sessionFile,
+      [
+        header,
+        entryLine("a", null, "user", "hello"),
+        entryLine("b", "a", "assistant", "hi there"),
+        entryLine("c", "b", "user", "hello"),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+    });
+
+    const rows = await readRows(engine, conversationId);
+    expect(rows.map((row) => row.content)).toEqual(["hello", "hi there", "hello"]);
+    expect(rows.map((row) => row.transcript_entry_id)).toEqual(["a", "b", "c"]);
+  });
+});

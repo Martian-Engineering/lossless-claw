@@ -6073,8 +6073,14 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
+    // Ids on the current leaf path. A persisted row whose entry id is NOT in
+    // this set was stranded by a host history rewrite (the suffix was
+    // re-appended under new ids) and is eligible for stale-id re-stamping.
+    const leafEntryIds = new Set(entryIds);
+
     let importedMessages = 0;
     let adoptedMessages = 0;
+    let restampedMessages = 0;
     for (const message of missingTail) {
       const entryId = getTranscriptEntryId(message)!;
       const stored = toStoredMessage(message);
@@ -6086,6 +6092,17 @@ export class LcmContextEngine implements ContextEngine {
       );
       if (adopted) {
         adoptedMessages += 1;
+        continue;
+      }
+      const restamped = await this.adoptStaleTranscriptEntryId({
+        conversationId,
+        leafEntryIds,
+        role: stored.role,
+        content: stored.content,
+        entryId,
+      });
+      if (restamped) {
+        restampedMessages += 1;
         continue;
       }
       // Entry-id-verified imports are exact (the id is proven absent), so the
@@ -6102,9 +6119,45 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     this.deps.log.debug(
-      `[lcm] reconcileSessionTail: entry-id path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages}`,
+      `[lcm] reconcileSessionTail: entry-id path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} restampedMessages=${restampedMessages}`,
     );
     return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+  }
+
+  /**
+   * Re-stamp an identity-matched row whose stored entry id has left the
+   * transcript's leaf path. Host history rewrites (rewriteTranscriptEntries,
+   * the host's own tool-result truncation, gateway chat edits) re-append the
+   * active suffix under freshly generated ids; the stranded rows are the
+   * same messages, so they adopt the re-issued id instead of importing a
+   * duplicate. Rows whose ids are still on the leaf path are live entries
+   * and never touched. Returns true when a row was re-stamped.
+   */
+  private async adoptStaleTranscriptEntryId(params: {
+    conversationId: number;
+    leafEntryIds: ReadonlySet<string>;
+    role: StoredMessage["role"];
+    content: string;
+    entryId: string;
+  }): Promise<boolean> {
+    const candidates = await this.conversationStore.listTranscriptEntryIdsByIdentity(
+      params.conversationId,
+      params.role,
+      params.content,
+    );
+    for (const candidate of candidates) {
+      if (params.leafEntryIds.has(candidate.transcriptEntryId)) {
+        continue;
+      }
+      const restamped = await this.conversationStore.restampTranscriptEntryId(
+        candidate.messageId,
+        params.entryId,
+      );
+      if (restamped) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private async reconcileSessionTail(params: {
@@ -6277,8 +6330,18 @@ export class LcmContextEngine implements ContextEngine {
             sessionContext,
             source: "reconcileSessionTail no-anchor",
           });
+          // A fully id-bearing batch resolves identity overlaps exactly:
+          // identity matches adopt the re-issued entry id (host rewrites and
+          // rotations re-append the surviving suffix under new ids) and only
+          // genuinely-new entries import. The replay-overlap block below
+          // exists for id-less ambiguity, where overlap could equally mean a
+          // replayed file; applying it here would freeze rewritten-epoch
+          // transcripts instead of healing them.
+          const allEntryIdBearing =
+            noAnchorImportMessages.length > 0 &&
+            noAnchorImportMessages.every((message) => getTranscriptEntryId(message) !== null);
           const replayThreshold = Math.max(3, Math.ceil(historicalMessages.length * 0.5));
-          if (persistedIdentityOverlaps >= replayThreshold) {
+          if (!allEntryIdBearing && persistedIdentityOverlaps >= replayThreshold) {
             if (replayAnalysis.firstNonOverlappingIndex < 0) {
               this.deps.log.warn(
                 `[lcm] reconcileSessionTail: duplicate transcript replay blocked for ${sessionContext} - ${persistedIdentityOverlaps}/${historicalMessages.length} candidate messages already exist (reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent replay flood.`,
@@ -6344,8 +6407,45 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
 
+          // Ids on the current leaf path, for stale-id re-stamping of rows
+          // stranded by the rewrite/rotation that produced this new epoch.
+          const noAnchorLeafEntryIds = new Set(
+            historicalMessages
+              .map((message) => getTranscriptEntryId(message))
+              .filter((id): id is string => id !== null),
+          );
           let importedMessages = 0;
+          let adoptedMessages = 0;
           for (const message of noAnchorImportMessages) {
+            const entryId = getTranscriptEntryId(message);
+            if (entryId) {
+              const alreadyPersisted = await this.conversationStore.hasMessageByTranscriptEntryId(
+                conversationId,
+                entryId,
+              );
+              if (alreadyPersisted) {
+                continue;
+              }
+              const stored = toStoredMessage(message);
+              const adopted =
+                (await this.conversationStore.adoptTranscriptEntryId(
+                  conversationId,
+                  stored.role,
+                  stored.content,
+                  entryId,
+                )) ||
+                (await this.adoptStaleTranscriptEntryId({
+                  conversationId,
+                  leafEntryIds: noAnchorLeafEntryIds,
+                  role: stored.role,
+                  content: stored.content,
+                  entryId,
+                }));
+              if (adopted) {
+                adoptedMessages += 1;
+                continue;
+              }
+            }
             const result = await this.ingestSingle({
               sessionId,
               sessionKey: params.sessionKey,
@@ -6357,9 +6457,13 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
           this.deps.log.warn(
-            `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} importedMessages=${importedMessages} overlap=false`,
+            `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} overlap=${adoptedMessages > 0}`,
           );
-          return { blockedByImportCap: false, importedMessages, hasOverlap: false };
+          // Adoption proves the "new epoch" overlaps persisted history (the
+          // host re-issued ids for messages we already hold), so report the
+          // overlap — the caller then refreshes the checkpoint instead of
+          // re-entering this path every turn.
+          return { blockedByImportCap: false, importedMessages, hasOverlap: adoptedMessages > 0 };
         }
         this.deps.log.debug(
           `[lcm] reconcileSessionTail: no anchor for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=false`,

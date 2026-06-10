@@ -805,6 +805,61 @@ export class ConversationStore {
     return result.changes > 0;
   }
 
+  /**
+   * List identity-matching rows that already carry a transcript entry id,
+   * oldest first. The engine compares these ids against the transcript's
+   * current leaf path to find rows stranded by a host history rewrite
+   * (rewriteTranscriptEntries re-appends the suffix under new ids).
+   */
+  async listTranscriptEntryIdsByIdentity(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+  ): Promise<Array<{ messageId: number; transcriptEntryId: string }>> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, transcript_entry_id
+       FROM messages
+       WHERE conversation_id = ?
+         AND transcript_entry_id IS NOT NULL
+         AND identity_hash = ?
+         AND role = ?
+         AND content = ?
+       ORDER BY seq`,
+      )
+      .all(conversationId, identityHash, role, content) as unknown as Array<{
+      message_id: number;
+      transcript_entry_id: string;
+    }>;
+    return rows.map((row) => ({
+      messageId: row.message_id,
+      transcriptEntryId: row.transcript_entry_id,
+    }));
+  }
+
+  /**
+   * Replace a row's stale transcript entry id with the id the host re-issued
+   * for the same message. Returns false when the new id already exists for
+   * the conversation (unique-index race: another path imported it first).
+   */
+  async restampTranscriptEntryId(
+    messageId: number,
+    transcriptEntryId: string,
+  ): Promise<boolean> {
+    try {
+      const result = this.db
+        .prepare(`UPDATE messages SET transcript_entry_id = ? WHERE message_id = ?`)
+        .run(transcriptEntryId, messageId);
+      return result.changes > 0;
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
   /** Return the subset of `entryIds` that already exist for the conversation. */
   async filterExistingTranscriptEntryIds(
     conversationId: ConversationId,
