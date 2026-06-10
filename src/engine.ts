@@ -8392,6 +8392,7 @@ export class LcmContextEngine implements ContextEngine {
         batchHashes,
         storedMessageCount,
         "prefix-mismatch",
+        { onNoOverlap: "ingest" },
       );
     }
 
