@@ -118,6 +118,10 @@ export type UpsertConversationBootstrapStateInput = {
   lastSeenMtimeMs: number;
   lastProcessedOffset: number;
   lastProcessedEntryHash?: string | null;
+  /** Transcript session-header id; a non-null value overwrites, null preserves. */
+  sessionHeaderId?: string | null;
+  /** Envelope id of the last processed transcript entry (exact resume anchor). */
+  lastProcessedEntryId?: string | null;
   forkBounded?: boolean;
   forkSourceMessageCount?: number;
 };
@@ -129,6 +133,8 @@ export type ConversationBootstrapStateRecord = {
   lastSeenMtimeMs: number;
   lastProcessedOffset: number;
   lastProcessedEntryHash: string | null;
+  sessionHeaderId: string | null;
+  lastProcessedEntryId: string | null;
   forkBounded: boolean;
   forkSourceMessageCount: number;
   updatedAt: Date;
@@ -234,6 +240,8 @@ interface ConversationBootstrapStateRow {
   last_seen_mtime_ms: number;
   last_processed_offset: number;
   last_processed_entry_hash: string | null;
+  session_header_id: string | null;
+  last_processed_entry_id: string | null;
   fork_bounded: number;
   fork_source_message_count: number;
   updated_at: string;
@@ -337,6 +345,8 @@ function toConversationBootstrapStateRecord(
     lastSeenMtimeMs: row.last_seen_mtime_ms,
     lastProcessedOffset: row.last_processed_offset,
     lastProcessedEntryHash: row.last_processed_entry_hash,
+    sessionHeaderId: row.session_header_id ?? null,
+    lastProcessedEntryId: row.last_processed_entry_id ?? null,
     forkBounded: row.fork_bounded === 1,
     forkSourceMessageCount:
       typeof row.fork_source_message_count === "number" &&
@@ -1560,7 +1570,8 @@ export class SummaryStore {
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, fork_bounded,
+                last_processed_offset, last_processed_entry_hash, session_header_id,
+                last_processed_entry_id, fork_bounded,
                 fork_source_message_count, updated_at
          FROM conversation_bootstrap_state
          WHERE conversation_id = ?`,
@@ -1581,16 +1592,23 @@ export class SummaryStore {
            last_seen_mtime_ms,
            last_processed_offset,
            last_processed_entry_hash,
+           session_header_id,
+           last_processed_entry_id,
            fork_bounded,
            fork_source_message_count
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (conversation_id) DO UPDATE SET
            session_file_path = excluded.session_file_path,
            last_seen_size = excluded.last_seen_size,
            last_seen_mtime_ms = excluded.last_seen_mtime_ms,
            last_processed_offset = excluded.last_processed_offset,
            last_processed_entry_hash = excluded.last_processed_entry_hash,
+           session_header_id = COALESCE(
+             excluded.session_header_id,
+             conversation_bootstrap_state.session_header_id
+           ),
+           last_processed_entry_id = excluded.last_processed_entry_id,
            fork_bounded = CASE
              WHEN excluded.fork_bounded = 1 THEN 1
              WHEN conversation_bootstrap_state.session_file_path != excluded.session_file_path THEN 0
@@ -1610,6 +1628,8 @@ export class SummaryStore {
         Math.max(0, Math.floor(input.lastSeenMtimeMs)),
         Math.max(0, Math.floor(input.lastProcessedOffset)),
         input.lastProcessedEntryHash ?? null,
+        input.sessionHeaderId ?? null,
+        input.lastProcessedEntryId ?? null,
         input.forkBounded === true ? 1 : 0,
         Math.max(0, Math.floor(input.forkSourceMessageCount ?? 0)),
       );
@@ -1617,7 +1637,8 @@ export class SummaryStore {
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, fork_bounded,
+                last_processed_offset, last_processed_entry_hash, session_header_id,
+                last_processed_entry_id, fork_bounded,
                 fork_source_message_count, updated_at
          FROM conversation_bootstrap_state
          WHERE conversation_id = ?`,

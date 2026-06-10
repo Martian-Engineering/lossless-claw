@@ -3417,7 +3417,7 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(after.slice(-3).map((message) => message.content)).toEqual(["alpha", "gamma", "beta"]);
   });
 
-  it("keeps the replay flood guard active for user-leading append-only replay batches", async () => {
+  it("skips replayed transcript lines exactly while importing repeated content under fresh entry ids", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
     tempDirs.push(tempDir);
     const dbPath = join(tempDir, "lcm.db");
@@ -3456,20 +3456,38 @@ describe("LcmContextEngine.bootstrap", () => {
       closeLcmConnection(rawDb);
     }
 
+    // A true replay duplicates JSONL lines verbatim — same entry ids. The
+    // entry-id reconciliation must skip every one without tripping guards.
+    const replayedLines = readFileSync(sessionFile, "utf8")
+      .split("\n")
+      .filter((line) => line.includes('"type":"message"') && line.includes("question"));
+    expect(replayedLines.length).toBe(3);
+    appendFileSync(sessionFile, replayedLines.join("\n") + "\n", "utf8");
+
+    const engineB = createEngineAtDatabasePath(dbPath);
+    const replayResult = await engineB.bootstrap({ sessionId, sessionFile });
+    expect(replayResult.importedMessages ?? 0).toBe(0);
+    const afterReplay = await engineB.getConversationStore().getMessages(conversation!.conversationId);
+    expect(afterReplay).toHaveLength(before.length);
+    await engineB.dispose();
+
+    // Repeated content written by the host as NEW entries (fresh entry ids)
+    // is genuine conversation traffic, not a replay — it must import.
+    const smAppend = SessionManager.open(sessionFile);
     for (const question of ["question 1", "question 2", "question 3"]) {
-      appendSessionMessage(sm, {
+      appendSessionMessage(smAppend, {
         role: "user",
         content: [{ type: "text", text: question }],
       } as AgentMessage);
     }
 
-    const engineB = createEngineAtDatabasePath(dbPath);
-    await expect(engineB.bootstrap({ sessionId, sessionFile })).rejects.toThrow(
-      "[lcm] refused replay-like message batch",
-    );
+    const engineC = createEngineAtDatabasePath(dbPath);
+    const freshResult = await engineC.bootstrap({ sessionId, sessionFile });
+    expect(freshResult.bootstrapped).toBe(true);
+    expect(freshResult.importedMessages).toBe(3);
 
-    const after = await engineB.getConversationStore().getMessages(conversation!.conversationId);
-    expect(after).toHaveLength(before.length);
+    const after = await engineC.getConversationStore().getMessages(conversation!.conversationId);
+    expect(after).toHaveLength(before.length + 3);
   });
 
   it("skips reopening the transcript when checkpoint stats match", async () => {
@@ -6668,7 +6686,7 @@ describe("LcmContextEngine.bootstrap", () => {
       reason: "reconcile import capped",
     });
     expect(warnLog).toHaveBeenCalledWith(
-      `[lcm] reconcileSessionTail: import cap exceeded for conversation=${conversation!.conversationId} session=${sessionId} sessionKey=${sessionKey} — would import 60 messages (existing: 2). Aborting to prevent flood.`,
+      `[lcm] reconcileSessionTail: entry-id import cap exceeded for conversation=${conversation!.conversationId} session=${sessionId} sessionKey=${sessionKey} — would import 60 messages (existing: 2). Aborting to prevent flood.`,
     );
 
     const storedAfterCap = await engine.getConversationStore().getMessages(conversation!.conversationId);

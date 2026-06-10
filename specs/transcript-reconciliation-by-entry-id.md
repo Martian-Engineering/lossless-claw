@@ -180,10 +180,21 @@ the next turn's idempotent transcript read.
      sanity bounds only.
   3. Header ID absent (legacy/array-mode transcripts) → existing heuristic
      reason taxonomy unchanged.
-- Entry-ID set-difference import: for transcripts where (nearly) all entries
-  carry IDs, `reconcileSessionTail` skips the backward anchor scan and
-  occurrence counting entirely — one batched query for which IDs already
-  exist, then import the missing ones in order.
+- Entry-ID set-difference import: for transcripts where all entries carry
+  IDs, `reconcileSessionTail` skips the backward anchor scan and occurrence
+  counting entirely (`reconcileSessionTailByEntryIds`) — anchor on the
+  checkpoint's `last_processed_entry_id` (or the newest persisted ID), one
+  batched existence query for the tail, then import the missing entries in
+  order. Missing entries first attempt **adoption**: an identity-matched row
+  with a NULL entry id (runtime flush-lag rows, pre-migration data) is
+  stamped with the entry id instead of imported, healing legacy rows in
+  place. Entry-id anchoring is immune to post-ingest content rewriting
+  (tool-result externalization), which defeats content-identity anchors.
+- *(Adjusted during implementation.)* Repeated content arriving under fresh
+  entry ids is now imported as genuine traffic instead of tripping the
+  user-role replay-flood guard — the host's SessionManager declared them new
+  entries, and true replays (same ids) are skipped exactly. The import cap
+  still bounds id-bearing imports as a sanity limit.
 
 **Effect:** rewritten/rotated transcripts are recognized exactly instead of
 inferred; the anchor scan, occurrence counting, and the per-process file-stat
@@ -249,7 +260,7 @@ memo cache become legacy-only paths.
   partial unique index, entry-ID idempotent ingest
 - [x] Phase 2 — `transcriptCovered` + exact covered-frontier alignment;
   heuristic dedup retained only for uncovered paths
-- [ ] Phase 3 — session-header epochs, entry-ID checkpoints, set-difference
-  import
+- [x] Phase 3 — session-header epochs, entry-ID checkpoints, set-difference
+  import with adoption
 - [ ] Phase 4 — pure `planTranscriptImport` planner + `src/transcript.ts`
   extraction

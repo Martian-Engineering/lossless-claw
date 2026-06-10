@@ -60,6 +60,59 @@ function extractEnvelopeMeta(entry: Record<string, unknown>): TranscriptEntryMet
   };
 }
 
+export type TranscriptHeader = {
+  /** Stable id from the leading `{type:"session", id}` line; null when absent. */
+  sessionHeaderId: string | null;
+  parentSession: string | null;
+};
+
+/**
+ * Read the session header line (first non-whitespace line) of a transcript.
+ * A rewritten or rotated transcript gets a new header id, so comparing the
+ * stored header id against the file's declares epoch changes exactly instead
+ * of inferring them from path/size heuristics.
+ */
+export async function readTranscriptHeader(sessionFile: string): Promise<TranscriptHeader> {
+  const empty: TranscriptHeader = { sessionHeaderId: null, parentSession: null };
+  try {
+    const stream = createReadStream(sessionFile, { encoding: "utf8" });
+    const lines = createInterface({
+      input: stream,
+      crlfDelay: Infinity,
+    });
+    try {
+      for await (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(trimmed) as {
+            type?: unknown;
+            id?: unknown;
+            parentSession?: unknown;
+          };
+          if (parsed.type !== "session") {
+            return empty;
+          }
+          return {
+            sessionHeaderId: normalizeEnvelopeString(parsed.id),
+            parentSession: normalizeEnvelopeString(parsed.parentSession),
+          };
+        } catch {
+          return empty;
+        }
+      }
+    } finally {
+      lines.close();
+      stream.destroy();
+    }
+  } catch {
+    return empty;
+  }
+  return empty;
+}
+
 export function isBootstrapMessage(value: unknown): value is AgentMessage {
   if (!value || typeof value !== "object") {
     return false;

@@ -484,6 +484,226 @@ describe("afterTurn covered-frontier alignment", () => {
     ]);
   });
 
+  it("adopts the entry id onto flush-lagged runtime rows when the transcript catches up", async () => {
+    const sessionFile = createSessionFilePath("entry-id-adoption");
+    // Write the transcript envelopes directly so flush timing is
+    // deterministic (SessionManager persists asynchronously).
+    const header = JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "entry-id-adoption-header",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    });
+    const entryLine = (id: string, role: AgentMessage["role"], text: string) =>
+      JSON.stringify({
+        type: "message",
+        id,
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        message: { role, content: [{ type: "text", text }] },
+      });
+    writeFileSync(sessionFile, `${header}\n${entryLine("adopt-1", "user", "question one")}\n`, "utf8");
+
+    const engine = createEngine();
+    const sessionId = "entry-id-adoption";
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("user", "question one"), makeMessage("assistant", "answer one")],
+      prePromptMessageCount: 0,
+    });
+
+    writeFileSync(
+      sessionFile,
+      `${header}\n${entryLine("adopt-1", "user", "question one")}\n${entryLine("adopt-2", "assistant", "answer one")}\n${entryLine("adopt-3", "user", "question two")}\n`,
+      "utf8",
+    );
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("user", "question two")],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const config = (engine as unknown as { config: LcmConfig }).config;
+    const db = createLcmDatabaseConnection(config.databasePath);
+    try {
+      const rows = db
+        .prepare(
+          `SELECT content, transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+        )
+        .all(conversation!.conversationId) as Array<{
+        content: string;
+        transcript_entry_id: string | null;
+      }>;
+      expect(rows.map((row) => row.content)).toEqual([
+        "question one",
+        "answer one",
+        "question two",
+      ]);
+      // The runtime-persisted "answer one" row was adopted (stamped with the
+      // catch-up entry's id) instead of duplicated.
+      expect(rows.map((row) => row.transcript_entry_id)).toEqual([
+        "adopt-1",
+        "adopt-2",
+        "adopt-3",
+      ]);
+    } finally {
+      closeLcmConnection(db);
+    }
+  });
+
+  it("anchors by entry id even when stored content was rewritten (externalization)", async () => {
+    const sessionFile = createSessionFilePath("entry-id-rewritten-content");
+    const header = JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "rewritten-content-header",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    });
+    const entryLine = (index: number, role: AgentMessage["role"], text: string) =>
+      JSON.stringify({
+        type: "message",
+        id: `rewrite-${index}`,
+        parentId: index === 0 ? null : `rewrite-${index - 1}`,
+        timestamp: new Date().toISOString(),
+        message: { role, content: [{ type: "text", text }] },
+      });
+    const initialLines = [0, 1, 2, 3].map((index) =>
+      entryLine(index, index % 2 === 0 ? "user" : "assistant", `turn ${index}`),
+    );
+    writeFileSync(sessionFile, [header, ...initialLines].join("\n") + "\n", "utf8");
+
+    const engine = createEngine();
+    const sessionId = "entry-id-rewritten-content";
+    await engine.bootstrap({ sessionId, sessionFile });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const conversationId = conversation!.conversationId;
+
+    // Simulate post-ingest content rewriting (tool-result externalization)
+    // plus checkpoint loss — the combination that defeats content-identity
+    // anchors and used to freeze conversations.
+    const config = (engine as unknown as { config: LcmConfig }).config;
+    const db = createLcmDatabaseConnection(config.databasePath);
+    try {
+      db.prepare(`UPDATE messages SET content = 'externalized-stub-' || seq`).run();
+      db.prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`).run(
+        conversationId,
+      );
+    } finally {
+      closeLcmConnection(db);
+    }
+
+    const appendedLines = [
+      entryLine(4, "user", "turn 4"),
+      entryLine(5, "assistant", "turn 5"),
+    ];
+    writeFileSync(
+      sessionFile,
+      [header, ...initialLines, ...appendedLines].join("\n") + "\n",
+      "utf8",
+    );
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+    });
+
+    const messages = await engine.getConversationStore().getMessages(conversationId);
+    expect(messages).toHaveLength(6);
+    expect(messages.at(-2)?.content).toBe("turn 4");
+    expect(messages.at(-1)?.content).toBe("turn 5");
+  });
+
+  it("imports a same-path rewritten transcript as a declared epoch rollover", async () => {
+    const sessionFile = createSessionFilePath("declared-epoch-rollover");
+    const headerLine = (headerId: string) =>
+      JSON.stringify({
+        type: "session",
+        version: 3,
+        id: headerId,
+        timestamp: new Date().toISOString(),
+        cwd: process.cwd(),
+      });
+    const entryLine = (id: string, role: AgentMessage["role"], text: string) =>
+      JSON.stringify({
+        type: "message",
+        id,
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        message: { role, content: [{ type: "text", text }] },
+      });
+    writeFileSync(
+      sessionFile,
+      [
+        headerLine("epoch-one-header"),
+        entryLine("old-1", "user", "old epoch question"),
+        entryLine("old-2", "assistant", "old epoch answer"),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const warnLog = vi.fn();
+    const tempDir = createTempDir("lcm-entry-id-rollover-");
+    const config = createTestConfig(join(tempDir, "lcm.db"));
+    const deps = createTestDeps(config);
+    deps.log = { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() };
+    const db = createLcmDatabaseConnection(config.databasePath);
+    const engine = new LcmContextEngine(deps, db);
+    const sessionId = "declared-epoch-rollover";
+    await engine.bootstrap({ sessionId, sessionFile });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const conversationId = conversation!.conversationId;
+    expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(2);
+
+    // Rewrite the same path as a brand-new session (new header id, fresh
+    // entry ids, larger than the old file so this is not a shrink).
+    const padding = "x".repeat(160);
+    writeFileSync(
+      sessionFile,
+      [
+        headerLine("epoch-two-header"),
+        entryLine("new-1", "user", `new epoch question ${padding}`),
+        entryLine("new-2", "assistant", `new epoch answer ${padding}`),
+        entryLine("new-3", "user", `new epoch follow-up ${padding}`),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+    });
+
+    expect(
+      warnLog.mock.calls.some((call) =>
+        String(call[0]).includes("declared epoch rollover"),
+      ),
+    ).toBe(true);
+    const messages = await engine.getConversationStore().getMessages(conversationId);
+    expect(messages.map((message) => message.content)).toEqual([
+      "old epoch question",
+      "old epoch answer",
+      `new epoch question ${padding}`,
+      `new epoch answer ${padding}`,
+      `new epoch follow-up ${padding}`,
+    ]);
+  });
+
   it("fails closed on a stale replay batch that overlaps persisted history", async () => {
     const sessionFile = createSessionFilePath("covered-stale-replay");
     const manager = SessionManager.open(sessionFile);

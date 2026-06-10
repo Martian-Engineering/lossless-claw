@@ -929,6 +929,8 @@ describe("runLcmMigrations summary depth backfill", () => {
       "last_seen_mtime_ms",
       "last_processed_offset",
       "last_processed_entry_hash",
+      "session_header_id",
+      "last_processed_entry_id",
       "fork_bounded",
       "fork_source_message_count",
       "updated_at",

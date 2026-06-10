@@ -96,6 +96,7 @@ import {
   readLastJsonlEntryBeforeOffset,
   readLeafPathMessages,
   readSessionParentSessionReference,
+  readTranscriptHeader,
 } from "./transcript.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
@@ -5996,12 +5997,132 @@ export class LcmContextEngine implements ContextEngine {
    * Reconcile session-file history with persisted messages and append only the
    * tail that is present in JSONL but missing from LCM.
    */
+  /**
+   * Exact reconciliation for transcripts whose entries all carry stable
+   * envelope ids: anchor on the checkpoint's last processed entry id (or the
+   * newest id already persisted), then import only the tail entries whose
+   * ids are missing — adopting identity-matched rows that were persisted
+   * without an id (runtime flush lag, pre-migration data) instead of
+   * importing duplicates. Entry-id matching is immune to content rewriting
+   * (externalized tool results), which defeats content-identity anchors.
+   *
+   * Returns null when no id lineage links the transcript to this
+   * conversation; the caller's content-identity machinery and no-anchor
+   * guards then decide.
+   */
+  private async reconcileSessionTailByEntryIds(params: {
+    sessionId: string;
+    sessionKey?: string;
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+    entryIds: string[];
+    lastProcessedEntryId?: string | null;
+    existingDbCount: number;
+    sessionContext: string;
+    startedAt: number;
+  }): Promise<TranscriptReconcileResult | null> {
+    const { conversationId, historicalMessages, entryIds, sessionContext, startedAt } = params;
+
+    let anchorIndex = params.lastProcessedEntryId
+      ? entryIds.lastIndexOf(params.lastProcessedEntryId)
+      : -1;
+    let knownExisting: Set<string>;
+    if (anchorIndex >= 0) {
+      knownExisting = await this.conversationStore.filterExistingTranscriptEntryIds(
+        conversationId,
+        entryIds.slice(anchorIndex + 1),
+      );
+    } else {
+      knownExisting = await this.conversationStore.filterExistingTranscriptEntryIds(
+        conversationId,
+        entryIds,
+      );
+      if (knownExisting.size === 0) {
+        return null;
+      }
+      for (let index = entryIds.length - 1; index >= 0; index -= 1) {
+        if (knownExisting.has(entryIds[index]!)) {
+          anchorIndex = index;
+          break;
+        }
+      }
+    }
+
+    if (anchorIndex >= historicalMessages.length - 1) {
+      this.deps.log.debug(
+        `[lcm] reconcileSessionTail: entry-id anchor at tip for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=true`,
+      );
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
+    }
+
+    const candidates: AgentMessage[] = [];
+    for (let index = anchorIndex + 1; index < historicalMessages.length; index += 1) {
+      if (!knownExisting.has(entryIds[index]!)) {
+        candidates.push(historicalMessages[index]!);
+      }
+    }
+    const missingTail = this.filterSyntheticHeartbeatTranscriptMessages({
+      messages: candidates,
+      sessionContext,
+      source: "reconcileSessionTail entry-id",
+    });
+
+    if (
+      params.existingDbCount > 0 &&
+      missingTail.length > Math.max(params.existingDbCount * 0.2, 50)
+    ) {
+      this.deps.log.warn(
+        `[lcm] reconcileSessionTail: entry-id import cap exceeded for ${sessionContext} — would import ${missingTail.length} messages (existing: ${params.existingDbCount}). Aborting to prevent flood.`,
+      );
+      return {
+        blockedByImportCap: true,
+        blockedReason: "import-cap",
+        importedMessages: 0,
+        hasOverlap: true,
+      };
+    }
+
+    let importedMessages = 0;
+    let adoptedMessages = 0;
+    for (const message of missingTail) {
+      const entryId = getTranscriptEntryId(message)!;
+      const stored = toStoredMessage(message);
+      const adopted = await this.conversationStore.adoptTranscriptEntryId(
+        conversationId,
+        stored.role,
+        stored.content,
+        entryId,
+      );
+      if (adopted) {
+        adoptedMessages += 1;
+        continue;
+      }
+      // Entry-id-verified imports are exact (the id is proven absent), so the
+      // same-second replay flood heuristic does not apply.
+      const result = await this.ingestSingle({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        message,
+        skipReplayTimestampFloodGuard: true,
+      });
+      if (result.ingested) {
+        importedMessages += 1;
+      }
+    }
+
+    this.deps.log.debug(
+      `[lcm] reconcileSessionTail: entry-id path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages}`,
+    );
+    return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+  }
+
   private async reconcileSessionTail(params: {
     sessionId: string;
     sessionKey?: string;
     conversationId: number;
     historicalMessages: AgentMessage[];
     checkpointEntryHash?: string | null;
+    lastProcessedEntryId?: string | null;
     skipContentAnchorScan?: boolean;
     allowNoAnchorImport?: boolean;
     noAnchorImportReason?: string;
@@ -6028,6 +6149,26 @@ export class LcmContextEngine implements ContextEngine {
       return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
     }
     const existingDbCount = await this.conversationStore.getMessageCount(conversationId);
+
+    // Exact path: when every transcript entry carries a stable envelope id,
+    // anchor and diff by id instead of content identity.
+    const candidateEntryIds = historicalMessages.map((message) => getTranscriptEntryId(message));
+    if (candidateEntryIds.every((entryId): entryId is string => entryId !== null)) {
+      const entryIdResult = await this.reconcileSessionTailByEntryIds({
+        sessionId,
+        sessionKey: params.sessionKey,
+        conversationId,
+        historicalMessages,
+        entryIds: candidateEntryIds,
+        lastProcessedEntryId: params.lastProcessedEntryId,
+        existingDbCount,
+        sessionContext,
+        startedAt,
+      });
+      if (entryIdResult) {
+        return entryIdResult;
+      }
+    }
 
     const storedHistoricalMessages = historicalMessages.map((message) => toStoredMessage(message));
 
@@ -7252,21 +7393,42 @@ export class LcmContextEngine implements ContextEngine {
           reason === "checkpoint-missing" &&
           (params.allowNoAnchorImportOnCheckpointMissing === true ||
             checkpointMissingMetadataFrontier);
+        // A transcript whose session header id differs from the checkpoint's
+        // is a *declared* epoch change (rewrite/rotation) — no heuristics
+        // needed, so a same-path full rewrite may import as a new epoch
+        // instead of freezing on "no anchor". The no-anchor path's replay
+        // guards and import caps still apply as sanity bounds.
+        const transcriptHeader = await readTranscriptHeader(params.sessionFile);
+        const declaredEpochRollover =
+          checkpoint?.sessionHeaderId != null &&
+          transcriptHeader.sessionHeaderId != null &&
+          checkpoint.sessionHeaderId !== transcriptHeader.sessionHeaderId;
+        if (declaredEpochRollover) {
+          this.deps.log.warn(
+            `[lcm] afterTurn: transcript session header changed (${checkpoint?.sessionHeaderId} -> ${transcriptHeader.sessionHeaderId}); treating as declared epoch rollover conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+          );
+        }
         const reconcile = await this.reconcileSessionTail({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
           conversationId: conversation.conversationId,
           historicalMessages,
+          lastProcessedEntryId: declaredEpochRollover
+            ? null
+            : checkpoint?.lastProcessedEntryId ?? null,
           skipContentAnchorScan: reason === "same-path-shrink",
           allowNoAnchorImport:
             reason === "path-mismatch" ||
             reason === "same-path-shrink" ||
+            declaredEpochRollover ||
             recoverCheckpointMissingNoAnchor,
           noAnchorImportReason: recoverCheckpointMissingNoAnchor
             ? params.allowNoAnchorImportOnCheckpointMissing === true
               ? "rotate-checkpoint-missing"
               : "checkpoint-missing-recovery"
-            : reason,
+            : declaredEpochRollover && reason === "append-only-ineligible"
+              ? "declared-epoch-rollover"
+              : reason,
         });
         if (reconcile.blockedByImportCap) {
           return { importedMessages: 0, blockedByImportCap: true, hasOverlap: reconcile.hasOverlap };
@@ -7355,6 +7517,24 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<void> {
     const latestDbMessage = await this.conversationStore.getLastMessage(params.conversationId);
     const fileStats = params.fileStats ?? (await stat(params.sessionFile));
+    // The checkpoint marks the whole file processed (offset = size), so the
+    // exact resume anchor is the envelope id of the file's last message entry.
+    let lastProcessedEntryId: string | null = null;
+    const lastEntryLine = await readLastJsonlEntryBeforeOffset(
+      params.sessionFile,
+      fileStats.size,
+      true,
+    );
+    if (lastEntryLine) {
+      try {
+        const parsed = JSON.parse(lastEntryLine) as { id?: unknown; uuid?: unknown };
+        const rawId = typeof parsed.id === "string" ? parsed.id : typeof parsed.uuid === "string" ? parsed.uuid : "";
+        lastProcessedEntryId = rawId.trim() || null;
+      } catch {
+        // Bare-message lines have no envelope id.
+      }
+    }
+    const header = await readTranscriptHeader(params.sessionFile);
     await this.summaryStore.upsertConversationBootstrapState({
       conversationId: params.conversationId,
       sessionFilePath: params.sessionFile,
@@ -7371,6 +7551,8 @@ export class LcmContextEngine implements ContextEngine {
                 tokenCount: latestDbMessage.tokenCount,
               })
             : null,
+      sessionHeaderId: header.sessionHeaderId,
+      lastProcessedEntryId,
       forkBounded: params.forkBounded,
       forkSourceMessageCount: params.forkSourceMessageCount,
     });
@@ -7999,6 +8181,10 @@ export class LcmContextEngine implements ContextEngine {
               transcriptEpochReason === "same-path-shrink"
                 ? undefined
                 : bootstrapState?.lastProcessedEntryHash,
+            lastProcessedEntryId:
+              transcriptEpochReason === "same-path-shrink"
+                ? undefined
+                : bootstrapState?.lastProcessedEntryId,
             skipContentAnchorScan: transcriptEpochReason === "same-path-shrink",
             allowNoAnchorImport: transcriptEpochRotated,
             noAnchorImportReason: transcriptEpochReason,

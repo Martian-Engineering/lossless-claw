@@ -771,6 +771,40 @@ export class ConversationStore {
     return row?.count === 1;
   }
 
+  /**
+   * Stamp a transcript entry id onto the earliest identity-matching row that
+   * has none. Heals rows persisted from the runtime array (flush lag) or
+   * before the entry-id migration when the transcript later delivers the
+   * same message with its envelope id, instead of importing a duplicate.
+   * Returns true when a row was adopted.
+   */
+  async adoptTranscriptEntryId(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    transcriptEntryId: string,
+  ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const result = this.db
+      .prepare(
+        `UPDATE messages
+       SET transcript_entry_id = ?
+       WHERE message_id = (
+         SELECT message_id
+         FROM messages
+         WHERE conversation_id = ?
+           AND transcript_entry_id IS NULL
+           AND identity_hash = ?
+           AND role = ?
+           AND content = ?
+         ORDER BY seq
+         LIMIT 1
+       )`,
+      )
+      .run(transcriptEntryId, conversationId, identityHash, role, content);
+    return result.changes > 0;
+  }
+
   /** Return the subset of `entryIds` that already exist for the conversation. */
   async filterExistingTranscriptEntryIds(
     conversationId: ConversationId,
