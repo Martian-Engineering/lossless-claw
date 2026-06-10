@@ -1,0 +1,717 @@
+/**
+ * Volatile live-input coverage matching: reconciles unsaved live messages against the assembled prefix at prompt time.
+ *
+ * Extracted from engine.ts (Phase 1 of the engine decomposition).
+ */
+import { contentFromParts } from "./assembler.js";
+import { buildMessageParts, toStoredMessage, toSyntheticMessagePartRecord } from "./message-content.js";
+import { createLiveCoverageSignature, hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
+import type { AgentMessage } from "./openclaw-bridge.js";
+import { estimateAgentMessageTokens } from "./token-accounting.js";
+import { buildToolPairIndexesByAssembledIndex, expandProtectedToolPairIndexes, expandToolPairLiveSortIndexes } from "./tool-pairing.js";
+import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
+import { open } from "node:fs/promises";
+
+export type RepairLogger = { warn: (message: string) => void };
+
+export function normalizeSummaryOverlapText(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+export function messageContentCoveredBySummary(params: {
+  message: AgentMessage;
+  summary: string;
+}): boolean {
+  const content = normalizeSummaryOverlapText(toStoredMessage(params.message).content);
+  if (content.length < 24) {
+    return false;
+  }
+  const summary = normalizeSummaryOverlapText(params.summary);
+  if (!summary.includes(content)) {
+    return false;
+  }
+  // Bare substring match is too loose: a 24+ char user instruction can
+  // coincidentally appear inside a long narrative summary and get silently
+  // dropped. Require one of:
+  //   1. content appears at the very start or end of the summary, OR
+  //   2. content appears inside a quoted block — double quotes ("..."),
+  //      single quotes ('...'), or backticks (`...`). All three quote
+  //      styles survive normalization and are emitted by the summarizer
+  //      when it embeds verbatim user text.
+  // Otherwise treat it as a coincidental collision and keep the message.
+  if (summary.startsWith(content) || summary.endsWith(content)) {
+    return true;
+  }
+  // Walk each quote-delimited span (cheap; summaries are bounded) and check
+  // membership. Use double-quoted literals to match the rest of the file.
+  for (const quoteChar of ["\"", "'", "`"]) {
+    let cursor = 0;
+    while (cursor < summary.length) {
+      const open = summary.indexOf(quoteChar, cursor);
+      if (open < 0) break;
+      const close = summary.indexOf(quoteChar, open + 1);
+      if (close < 0) {
+        // Unmatched opening quote: don't break out of the entire scan —
+        // a later well-formed quoted span may still contain the content.
+        // Skip past this lone opener and continue.
+        cursor = open + 1;
+        continue;
+      }
+      const span = summary.slice(open + 1, close);
+      if (span.includes(content)) {
+        return true;
+      }
+      cursor = close + 1;
+    }
+  }
+  return false;
+}
+
+export const INTER_SESSION_MESSAGE_MARKER = "[Inter-session message]";
+
+export const INTERNAL_CONTEXT_BEGIN_MARKER = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
+
+export const INTERNAL_CONTEXT_END_MARKER = "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+
+export const INTERNAL_TASK_COMPLETION_EVENT_MARKER = "[Internal task completion event]";
+
+export const FALLBACK_RETRY_PROMPT_MARKER =
+  "[Retry after the previous model attempt failed or timed out]";
+
+export const NORMALIZED_INTER_SESSION_MESSAGE_MARKER = normalizeSummaryOverlapText(INTER_SESSION_MESSAGE_MARKER);
+
+export const NORMALIZED_INTERNAL_TASK_COMPLETION_EVENT_MARKER = normalizeSummaryOverlapText(
+  INTERNAL_TASK_COMPLETION_EVENT_MARKER,
+);
+
+export function hasFallbackRetryPromptMarker(content: string): boolean {
+  return content.split(/\r?\n/).some((line) => line.trim() === FALLBACK_RETRY_PROMPT_MARKER);
+}
+
+export function hasCompleteInternalContextBlock(content: string): boolean {
+  const beginIndex = content.indexOf(INTERNAL_CONTEXT_BEGIN_MARKER);
+  if (beginIndex < 0) {
+    return false;
+  }
+  return (
+    content.indexOf(
+      INTERNAL_CONTEXT_END_MARKER,
+      beginIndex + INTERNAL_CONTEXT_BEGIN_MARKER.length,
+    ) >= 0
+  );
+}
+
+export function isVolatileLiveInputContent(content: string): boolean {
+  const trimmed = content.trimStart();
+  if (hasFallbackRetryPromptMarker(trimmed)) {
+    return true;
+  }
+  if (!hasCompleteInternalContextBlock(trimmed)) {
+    return false;
+  }
+  const normalized = normalizeSummaryOverlapText(trimmed);
+  if (normalized.startsWith(NORMALIZED_INTER_SESSION_MESSAGE_MARKER)) {
+    return true;
+  }
+  return (
+    trimmed.startsWith(INTERNAL_CONTEXT_BEGIN_MARKER) &&
+    normalized.includes(NORMALIZED_INTERNAL_TASK_COMPLETION_EVENT_MARKER)
+  );
+}
+
+export function stripTrailingAssistantPrefill(messages: AgentMessage[]): AgentMessage[] {
+  const trimmed = messages.slice();
+  while (trimmed.length > 0 && trimmed[trimmed.length - 1]?.role === "assistant") {
+    trimmed.pop();
+  }
+  return trimmed;
+}
+
+export function isVolatileLiveInputMessage(message: AgentMessage): boolean {
+  const stored = toStoredMessage(message);
+  if (stored.role !== "user" && stored.role !== "system") {
+    return false;
+  }
+  if (!stored.content.trim()) {
+    return false;
+  }
+  return isVolatileLiveInputContent(stored.content);
+}
+
+export function normalizeLiveMessageForAssemblyReconciliation(message: AgentMessage): AgentMessage {
+  const stored = toStoredMessage(message);
+  if (stored.role !== "system" && stored.role !== "tool") {
+    return message;
+  }
+  const runtimeRole = stored.role === "system" ? "user" : "toolResult";
+  const parts =
+    "content" in message
+      ? buildMessageParts({
+          sessionId: "live-reconciliation",
+          message,
+          fallbackContent: stored.content,
+        }).map((part) => toSyntheticMessagePartRecord(part, 0))
+      : [];
+  const content = contentFromParts(parts, runtimeRole, stored.content);
+  return {
+    ...message,
+    role: runtimeRole,
+    content,
+  } as AgentMessage;
+}
+
+export function countNonOverlappingOccurrences(params: {
+  haystack: string;
+  needle: string;
+}): number {
+  if (!params.needle) {
+    return 0;
+  }
+  let count = 0;
+  let cursor = 0;
+  while (cursor <= params.haystack.length) {
+    const found = params.haystack.indexOf(params.needle, cursor);
+    if (found < 0) {
+      break;
+    }
+    count++;
+    cursor = found + params.needle.length;
+  }
+  return count;
+}
+
+export function liveInputCoverageCapacity(params: {
+  assembledMessage: AgentMessage;
+  liveMessage: AgentMessage;
+  /**
+   * When true, the live message is a volatile input that was never persisted to
+   * DB. Summary substring coverage is insufficient for such messages because a
+   * summary that contains similar text is summarizing a *past* turn — it does
+   * not prove the current turn's volatile input is already represented.
+   */
+  isVolatileLiveInput?: boolean;
+}): number {
+  const assembled = toStoredMessage(params.assembledMessage);
+  const live = toStoredMessage(params.liveMessage);
+  if (messagesHaveSameLiveCoverageSignature(params.assembledMessage, params.liveMessage)) {
+    return 1;
+  }
+
+  // Volatile live inputs are never persisted to DB. A summary containing
+  // similar text covers a *past* occurrence, not the current live input.
+  // Only exact assembled message matches (handled above) can cover a
+  // volatile input — a historical summary paraphrase is insufficient.
+  if (params.isVolatileLiveInput) {
+    return 0;
+  }
+
+  // Substring coverage is only safe for LCM summary wrappers. Raw assembled
+  // turns must match exactly, otherwise normalized near-matches can hide a
+  // distinct volatile live input.
+  if (!assembled.content.includes("<summary ") || !assembled.content.includes("</summary>")) {
+    return 0;
+  }
+
+  const liveText = normalizeSummaryOverlapText(live.content);
+  if (liveText.length < 24) {
+    return 0;
+  }
+  const assembledText = normalizeSummaryOverlapText(assembled.content);
+  return countNonOverlappingOccurrences({ haystack: assembledText, needle: liveText });
+}
+
+export function isSummaryWrapperContent(content: string): boolean {
+  return content.includes("<summary ") && content.includes("</summary>");
+}
+
+export type VolatileLiveInputEntry = {
+  message: AgentMessage;
+  liveIndex: number;
+};
+
+export type VolatileLiveInputCandidate = VolatileLiveInputEntry & {
+  liveText: string;
+};
+
+export type VolatileLiveInputCoverageSlot = {
+  assembledIndex: number;
+};
+
+export type RetainedAssembledEntry = {
+  message: AgentMessage;
+  index: number;
+};
+
+export function materializeVolatileLiveInputEntries(entries: VolatileLiveInputEntry[]): AgentMessage[] {
+  return entries
+    .slice()
+    .sort((a, b) => a.liveIndex - b.liveIndex)
+    .map((entry) => entry.message);
+}
+
+export function resolveProtectedFreshTailAssembledIndexes(params: {
+  assembledMessages: AgentMessage[];
+  freshTailMessageHashes?: string[];
+}): Set<number> {
+  const protectedIndexes = new Set<number>();
+  const usedIndexes = new Set<number>();
+  for (const hash of params.freshTailMessageHashes ?? []) {
+    for (let index = params.assembledMessages.length - 1; index >= 0; index--) {
+      if (usedIndexes.has(index)) {
+        continue;
+      }
+      const message = params.assembledMessages[index] as AgentMessage;
+      if (hashAgentMessageForAssemblyProtection(message) === hash) {
+        protectedIndexes.add(index);
+        usedIndexes.add(index);
+        break;
+      }
+    }
+  }
+  return protectedIndexes;
+}
+
+export function resolveExactAssembledLiveSortIndexes(params: {
+  assembledMessages: AgentMessage[];
+  liveMessages: AgentMessage[];
+}): Map<number, number> {
+  const liveSortIndexes = new Map<number, number>();
+  const usedAssembledIndexes = new Set<number>();
+  for (let liveIndex = params.liveMessages.length - 1; liveIndex >= 0; liveIndex--) {
+    const liveMessage = params.liveMessages[liveIndex] as AgentMessage;
+    for (
+      let assembledIndex = params.assembledMessages.length - 1;
+      assembledIndex >= 0;
+      assembledIndex--
+    ) {
+      if (usedAssembledIndexes.has(assembledIndex)) {
+        continue;
+      }
+      const assembledMessage = params.assembledMessages[assembledIndex] as AgentMessage;
+      if (messagesHaveSameLiveCoverageSignature(assembledMessage, liveMessage)) {
+        liveSortIndexes.set(assembledIndex, liveIndex);
+        usedAssembledIndexes.add(assembledIndex);
+        break;
+      }
+    }
+  }
+  return liveSortIndexes;
+}
+
+export function mergeCoveredVolatileLiveSortIndexes(params: {
+  exactLiveSortIndexes: Map<number, number>;
+  coveredEntriesByAssembledIndex: Map<number, VolatileLiveInputEntry[]>;
+}): Map<number, number> {
+  const liveSortIndexes = new Map(params.exactLiveSortIndexes);
+  for (const [assembledIndex, entries] of params.coveredEntriesByAssembledIndex.entries()) {
+    const coveredLiveIndex = Math.min(...entries.map((entry) => entry.liveIndex));
+    const existingLiveIndex = liveSortIndexes.get(assembledIndex);
+    if (existingLiveIndex === undefined || coveredLiveIndex < existingLiveIndex) {
+      liveSortIndexes.set(assembledIndex, coveredLiveIndex);
+    }
+  }
+  return liveSortIndexes;
+}
+
+export function buildVolatileLiveInputMergedOutput(params: {
+  retained: RetainedAssembledEntry[];
+  appendedEntries: VolatileLiveInputEntry[];
+  liveSortIndexes: Map<number, number>;
+  log?: RepairLogger;
+}): AgentMessage[] {
+  const output: AgentMessage[] = [];
+  const appendedEntries = params.appendedEntries
+    .slice()
+    .sort((left, right) => left.liveIndex - right.liveIndex);
+  let appendedCursor = 0;
+  for (const retainedEntry of params.retained) {
+    const retainedLiveIndex = params.liveSortIndexes.get(retainedEntry.index);
+    if (retainedLiveIndex !== undefined) {
+      while (
+        appendedCursor < appendedEntries.length &&
+        (appendedEntries[appendedCursor] as VolatileLiveInputEntry).liveIndex < retainedLiveIndex
+      ) {
+        output.push((appendedEntries[appendedCursor] as VolatileLiveInputEntry).message);
+        appendedCursor++;
+      }
+    }
+    output.push(retainedEntry.message);
+  }
+  while (appendedCursor < appendedEntries.length) {
+    output.push((appendedEntries[appendedCursor] as VolatileLiveInputEntry).message);
+    appendedCursor++;
+  }
+  return sanitizeToolUseResultPairing(output, params.log) as AgentMessage[];
+}
+
+export function matchVolatileLiveInputsToCoverageSlots(params: {
+  assembledMessages: AgentMessage[];
+  volatileLiveInputs: VolatileLiveInputCandidate[];
+}): Map<number, number> {
+  const entryIndexesByLiveText = new Map<string, number[]>();
+  for (let entryIndex = 0; entryIndex < params.volatileLiveInputs.length; entryIndex++) {
+    const entry = params.volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate;
+    const entryIndexes = entryIndexesByLiveText.get(entry.liveText);
+    if (entryIndexes) {
+      entryIndexes.push(entryIndex);
+    } else {
+      entryIndexesByLiveText.set(entry.liveText, [entryIndex]);
+    }
+  }
+
+  const slots: VolatileLiveInputCoverageSlot[] = [];
+  const candidateSlotIndexesByEntryIndex = params.volatileLiveInputs.map(() => [] as number[]);
+  const addCandidateSlots = (entryIndexes: number[], assembledIndex: number, slotCount: number) => {
+    const slotIndexes: number[] = [];
+    for (let slotOffset = 0; slotOffset < slotCount; slotOffset++) {
+      slotIndexes.push(slots.length);
+      slots.push({ assembledIndex });
+    }
+    for (const entryIndex of entryIndexes) {
+      candidateSlotIndexesByEntryIndex[entryIndex]?.push(...slotIndexes);
+    }
+  };
+
+  for (const [liveText, entryIndexes] of entryIndexesByLiveText.entries()) {
+    for (let assembledIndex = 0; assembledIndex < params.assembledMessages.length; assembledIndex++) {
+      const assembledMessage = params.assembledMessages[assembledIndex] as AgentMessage;
+      const assembled = toStoredMessage(assembledMessage);
+      if (!isSummaryWrapperContent(assembled.content)) {
+        const exactEntryIndexes = entryIndexes.filter((entryIndex) =>
+          messagesHaveSameLiveCoverageSignature(
+            assembledMessage,
+            (params.volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate).message,
+          )
+        );
+        if (exactEntryIndexes.length > 0) {
+          addCandidateSlots(exactEntryIndexes, assembledIndex, 1);
+        }
+        continue;
+      }
+
+      const representativeEntry = params.volatileLiveInputs[entryIndexes[0] as number] as VolatileLiveInputCandidate;
+      const capacity = liveInputCoverageCapacity({
+        assembledMessage,
+        liveMessage: representativeEntry.message,
+        isVolatileLiveInput: true,
+      });
+      if (capacity <= 0) {
+        continue;
+      }
+
+      const entryIndexesBySignature = new Map<string, number[]>();
+      for (const entryIndex of entryIndexes) {
+        const entry = params.volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate;
+        const signature = createLiveCoverageSignature(entry.message);
+        const signatureEntryIndexes = entryIndexesBySignature.get(signature);
+        if (signatureEntryIndexes) {
+          signatureEntryIndexes.push(entryIndex);
+        } else {
+          entryIndexesBySignature.set(signature, [entryIndex]);
+        }
+      }
+
+      let exactSlotCount = 0;
+      for (const signatureEntryIndexes of entryIndexesBySignature.values()) {
+        const firstEntry = params.volatileLiveInputs[signatureEntryIndexes[0] as number] as VolatileLiveInputCandidate;
+        const liveContent = toStoredMessage(firstEntry.message).content;
+        const exactCapacity = liveContent
+          ? countNonOverlappingOccurrences({ haystack: assembled.content, needle: liveContent })
+          : 0;
+        const slotCount = Math.min(exactCapacity, signatureEntryIndexes.length);
+        if (slotCount > 0) {
+          addCandidateSlots(signatureEntryIndexes, assembledIndex, slotCount);
+          exactSlotCount += slotCount;
+        }
+      }
+
+      const genericSlotCount = Math.min(
+        Math.max(0, capacity - exactSlotCount),
+        Math.max(0, entryIndexes.length - exactSlotCount),
+      );
+      if (genericSlotCount > 0) {
+        addCandidateSlots(entryIndexes, assembledIndex, genericSlotCount);
+      }
+    }
+  }
+
+  const slotToEntryIndex = new Map<number, number>();
+  const tryAssignEntry = (entryIndex: number, visitedSlots: Set<number>): boolean => {
+    const candidateSlotIndexes = candidateSlotIndexesByEntryIndex[entryIndex] ?? [];
+    for (const slotIndex of candidateSlotIndexes) {
+      if (visitedSlots.has(slotIndex)) {
+        continue;
+      }
+      visitedSlots.add(slotIndex);
+      const currentEntryIndex = slotToEntryIndex.get(slotIndex);
+      if (
+        currentEntryIndex === undefined ||
+        tryAssignEntry(currentEntryIndex, visitedSlots)
+      ) {
+        slotToEntryIndex.set(slotIndex, entryIndex);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (let entryIndex = 0; entryIndex < params.volatileLiveInputs.length; entryIndex++) {
+    tryAssignEntry(entryIndex, new Set<number>());
+  }
+
+  const entryToAssembledIndex = new Map<number, number>();
+  for (const [slotIndex, entryIndex] of slotToEntryIndex.entries()) {
+    const slot = slots[slotIndex] as VolatileLiveInputCoverageSlot;
+    entryToAssembledIndex.set(entryIndex, slot.assembledIndex);
+  }
+  return entryToAssembledIndex;
+}
+
+export function collectUncoveredVolatileLiveInputs(params: {
+  assembledMessages: AgentMessage[];
+  liveMessages: AgentMessage[];
+}): {
+  entries: VolatileLiveInputEntry[];
+  estimatedTokens: number;
+  coveredEntriesByAssembledIndex: Map<number, VolatileLiveInputEntry[]>;
+} {
+  const volatileLiveInputs = params.liveMessages
+    .map((message, liveIndex) => ({ message, liveIndex }))
+    .filter((entry) => isVolatileLiveInputMessage(entry.message))
+    .map((entry) => ({
+      ...entry,
+      liveText: normalizeSummaryOverlapText(toStoredMessage(entry.message).content),
+    }));
+  const uncovered: VolatileLiveInputEntry[] = [];
+  const coveredEntriesByAssembledIndex = new Map<number, VolatileLiveInputEntry[]>();
+  const entryToAssembledIndex = matchVolatileLiveInputsToCoverageSlots({
+    assembledMessages: params.assembledMessages,
+    volatileLiveInputs,
+  });
+
+  for (let entryIndex = 0; entryIndex < volatileLiveInputs.length; entryIndex++) {
+    const entry = volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate;
+    const assembledIndex = entryToAssembledIndex.get(entryIndex);
+    if (assembledIndex !== undefined) {
+      const coveredEntries = coveredEntriesByAssembledIndex.get(assembledIndex);
+      if (coveredEntries) {
+        coveredEntries.push(entry);
+      } else {
+        coveredEntriesByAssembledIndex.set(assembledIndex, [entry]);
+      }
+    } else {
+      uncovered.push(entry);
+    }
+  }
+
+  return {
+    entries: uncovered,
+    estimatedTokens: estimateAgentMessageTokens(materializeVolatileLiveInputEntries(uncovered)),
+    coveredEntriesByAssembledIndex,
+  };
+}
+
+export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
+  assembledMessages: AgentMessage[];
+  assembledEstimatedTokens: number;
+  liveMessages: AgentMessage[];
+  protectedAssembledIndexes?: Set<number>;
+  tokenBudget: number;
+  log?: RepairLogger;
+}): {
+  messages: AgentMessage[];
+  estimatedTokens: number;
+  appendedMessages: number;
+  appendedTokens: number;
+  evictedMessages: number;
+  evictedTokens: number;
+  overBudget: boolean;
+} {
+  const liveMessages = params.liveMessages.map(normalizeLiveMessageForAssemblyReconciliation);
+  const protectedAssembledIndexes = expandProtectedToolPairIndexes({
+    assembledMessages: params.assembledMessages,
+    protectedAssembledIndexes: params.protectedAssembledIndexes ?? new Set<number>(),
+  });
+  const uncovered = collectUncoveredVolatileLiveInputs({
+    assembledMessages: params.assembledMessages,
+    liveMessages,
+  });
+  if (uncovered.entries.length === 0) {
+    return {
+      messages: params.assembledMessages,
+      estimatedTokens: params.assembledEstimatedTokens,
+      appendedMessages: 0,
+      appendedTokens: 0,
+      evictedMessages: 0,
+      evictedTokens: 0,
+      overBudget: params.assembledEstimatedTokens > params.tokenBudget,
+    };
+  }
+
+  let retained = params.assembledMessages.map((message, index) => ({ message, index }));
+  let appendedEntries = uncovered.entries.slice();
+  const toolPairIndexesByIndex = buildToolPairIndexesByAssembledIndex(params.assembledMessages);
+  const exactLiveSortIndexes = resolveExactAssembledLiveSortIndexes({
+    assembledMessages: params.assembledMessages,
+    liveMessages,
+  });
+  const exactLiveProtectedIndexes = expandProtectedToolPairIndexes({
+    assembledMessages: params.assembledMessages,
+    protectedAssembledIndexes: new Set(exactLiveSortIndexes.keys()),
+  });
+  const liveSortIndexes = expandToolPairLiveSortIndexes({
+    assembledMessages: params.assembledMessages,
+    liveSortIndexes: mergeCoveredVolatileLiveSortIndexes({
+      exactLiveSortIndexes,
+      coveredEntriesByAssembledIndex: uncovered.coveredEntriesByAssembledIndex,
+    }),
+  });
+  let evictedMessages = 0;
+  let evictedTokens = 0;
+  let output = buildVolatileLiveInputMergedOutput({
+    retained,
+    appendedEntries,
+    liveSortIndexes,
+  });
+  let estimatedTokens = estimateAgentMessageTokens(output);
+
+  while (retained.length > 0 && estimatedTokens > params.tokenBudget) {
+    let bestCandidate:
+      | {
+          evictAssembledIndexes: Set<number>;
+          output: AgentMessage[];
+          estimatedTokens: number;
+          appendedEntries: VolatileLiveInputEntry[];
+        }
+      | undefined;
+    for (let evictIndex = 0; evictIndex < retained.length; evictIndex++) {
+      const entry = retained[evictIndex] as RetainedAssembledEntry;
+      const evictAssembledIndexes = toolPairIndexesByIndex.get(entry.index) ?? new Set([entry.index]);
+      const candidateEvictsExactLiveTurn = Array.from(evictAssembledIndexes).some((index) =>
+        exactLiveProtectedIndexes.has(index)
+      );
+      const candidateEvictsProtectedTurn = Array.from(evictAssembledIndexes).some((index) =>
+        protectedAssembledIndexes.has(index)
+      );
+      if (candidateEvictsExactLiveTurn || candidateEvictsProtectedTurn) {
+        continue;
+      }
+      const restoredCoveredEntries = Array.from(evictAssembledIndexes).flatMap(
+        (index) => uncovered.coveredEntriesByAssembledIndex.get(index) ?? [],
+      );
+      const candidateRetained = retained.filter(
+        (retainedEntry) => !evictAssembledIndexes.has(retainedEntry.index),
+      );
+      const candidateAppendedEntries =
+        restoredCoveredEntries.length > 0
+          ? [...appendedEntries, ...restoredCoveredEntries]
+          : appendedEntries;
+      const candidateOutput = buildVolatileLiveInputMergedOutput({
+        retained: candidateRetained,
+        appendedEntries: candidateAppendedEntries,
+        liveSortIndexes,
+      });
+      const candidateEstimatedTokens = estimateAgentMessageTokens(candidateOutput);
+      const candidateFits = candidateEstimatedTokens <= params.tokenBudget;
+      const bestFits =
+        bestCandidate !== undefined && bestCandidate.estimatedTokens <= params.tokenBudget;
+      if (
+        bestCandidate === undefined ||
+        (candidateFits && !bestFits) ||
+        (candidateFits &&
+          bestFits &&
+          candidateEstimatedTokens > bestCandidate.estimatedTokens) ||
+        (!candidateFits &&
+          !bestFits &&
+          candidateEstimatedTokens < bestCandidate.estimatedTokens)
+      ) {
+        bestCandidate = {
+          evictAssembledIndexes,
+          output: candidateOutput,
+          estimatedTokens: candidateEstimatedTokens,
+          appendedEntries: candidateAppendedEntries,
+        };
+      }
+    }
+    if (!bestCandidate) {
+      break;
+    }
+    const removedEntries = retained.filter((entry) =>
+      bestCandidate.evictAssembledIndexes.has(entry.index),
+    );
+    retained = retained.filter((entry) => !bestCandidate.evictAssembledIndexes.has(entry.index));
+    appendedEntries = bestCandidate.appendedEntries;
+    for (const removed of removedEntries) {
+      uncovered.coveredEntriesByAssembledIndex.delete(removed.index);
+      evictedTokens += toStoredMessage(removed.message).tokenCount;
+    }
+    evictedMessages += removedEntries.length;
+    output = bestCandidate.output;
+    estimatedTokens = bestCandidate.estimatedTokens;
+  }
+  output = buildVolatileLiveInputMergedOutput({
+    retained,
+    appendedEntries,
+    liveSortIndexes,
+    log: params.log,
+  });
+  estimatedTokens = estimateAgentMessageTokens(output);
+  const appendedMessages = materializeVolatileLiveInputEntries(appendedEntries);
+
+  return {
+    messages: output,
+    estimatedTokens,
+    appendedMessages: appendedMessages.length,
+    appendedTokens: estimateAgentMessageTokens(appendedMessages),
+    evictedMessages,
+    evictedTokens,
+    overBudget: estimatedTokens > params.tokenBudget,
+  };
+}
+
+export function resolveForkBoundedLiveSuffix(params: {
+  assembledMessages: AgentMessage[];
+  liveMessages: AgentMessage[];
+  forkSourceMessageCount: number;
+}): AgentMessage[] {
+  const liveMessages = params.liveMessages.map(normalizeLiveMessageForAssemblyReconciliation);
+  const forkSourceMessageCount = Math.max(0, Math.floor(params.forkSourceMessageCount));
+  const anchorSearchEnd =
+    forkSourceMessageCount > 0
+      ? Math.min(liveMessages.length, forkSourceMessageCount)
+      : liveMessages.length;
+  let anchorLiveIndex = -1;
+  for (let liveIndex = anchorSearchEnd - 1; liveIndex >= 0; liveIndex--) {
+    const liveMessage = liveMessages[liveIndex] as AgentMessage;
+    for (
+      let assembledIndex = params.assembledMessages.length - 1;
+      assembledIndex >= 0;
+      assembledIndex--
+    ) {
+      const assembledMessage = params.assembledMessages[assembledIndex] as AgentMessage;
+      if (messagesHaveSameLiveCoverageSignature(assembledMessage, liveMessage)) {
+        anchorLiveIndex = liveIndex;
+        break;
+      }
+    }
+    if (anchorLiveIndex >= 0) {
+      break;
+    }
+  }
+
+  if (anchorLiveIndex >= 0) {
+    return liveMessages.slice(anchorLiveIndex + 1);
+  }
+
+  if (forkSourceMessageCount > 0 && liveMessages.length >= forkSourceMessageCount) {
+    return liveMessages.slice(forkSourceMessageCount);
+  }
+
+  // If the host provides a short live snapshot rather than the copied fork
+  // branch, keep that snapshot; it is no longer the raw parent prefix.
+  if (forkSourceMessageCount > 0 && liveMessages.length < forkSourceMessageCount) {
+    return liveMessages;
+  }
+
+  return [];
+}
