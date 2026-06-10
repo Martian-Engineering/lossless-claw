@@ -261,3 +261,77 @@ memo cache become legacy-only paths.
   import with adoption
 - [x] Phase 4 — pure planner functions in `src/reconcile-plan.ts` +
   `src/transcript.ts` extraction
+
+## Addendum: what the host source settles (post-implementation)
+
+The four phases above are deliberately additive — a strangler-fig pattern
+that routes id-bearing traffic onto exact paths while keeping every legacy
+path bit-for-bit intact (`src/` ended at +992/−286). The open question was
+how much of the legacy machinery is genuinely required by the host versus
+retained out of caution. The transcript writer is `SessionManager` from
+`@earendil-works/pi-coding-agent` (this plugin imports the same class for
+its rotate path), and reading its source answers that question in both
+directions.
+
+### Confirmed: entry ids are unconditional in the current format
+
+`appendMessage` always writes `{type:"message", id, parentId, timestamp,
+message}` with a collision-checked 8-hex id, and the session header always
+carries an id (v3 format). No code path writes an id-less message line. For
+any transcript the current host writes, the entry-id path covers 100% of
+traffic.
+
+### Confirmed: two "legacy" paths are load-bearing host behavior
+
+1. **Deferred flush is by design.** `SessionManager._persist` buffers every
+   entry in memory until the first *assistant* message exists, then writes
+   the whole file at once. Every new session therefore passes through a
+   window where the transcript file does not exist on disk. The
+   missing-file → runtime-array persistence fallback (and Phase 2's
+   covered-frontier alignment) is **permanent architecture**, not a
+   transitional compatibility shim. This also retroactively explains the
+   flush-lag regression fixture that forced the Phase 2 adjustment, and is
+   a plausible contributor to several historical dual-source bugs.
+2. **Same-path rewrites are real host events.** `setSessionFile` rewrites
+   the file in place on version migration, recreates corrupted/empty files
+   with a *new* header id, and `_rewriteFile` serves branch/compaction
+   operations. Phase 3's header-id rollover detection maps to actual host
+   behavior; the rewrite/shrink handling cannot be deleted, only kept in
+   its declared form.
+
+### Confirmed: the id-less cohort is real but aging
+
+v1 session files had no entry ids; `migrateV1ToV2` adds them when the host
+next loads the file (and `_rewriteFile`s it). LCM can read not-yet-migrated
+v1 files directly (startup scans, resumed archives), so the content-anchor
+machinery is needed for exactly that cohort until it ages out. The
+JSON-array transcript format, by contrast, is written by nothing in the
+current host — its origin predates this repo's squashed import history —
+and is a deletion candidate pending a maintainer decision.
+
+### Discovery: sessions are trees, not logs
+
+Entries carry `parentId`; `branch()` / `resetLeaf()` create alternate paths
+within the same append-only file. `readLeafPathMessages`, despite its name,
+flattens *all* branches in file order, so LCM imports messages from
+abandoned branches today. That is a plausible source of "duplicate-ish
+content" incidents independent of replay. The `parentId` metadata captured
+in Phase 1 is sufficient to follow the actual leaf path; leaf-path-aware
+reconciliation is the highest-value follow-up this audit surfaced.
+
+### Revised deletion picture
+
+| Component | Verdict from host source |
+|---|---|
+| Runtime-array fallback + covered alignment | Keep permanently — deferred flush guarantees file-less turns |
+| Header-id rollover, entry-id checkpoints | Keep — maps to real `_rewriteFile`/migration events |
+| Content anchor scan + occurrence counting | Keep until v1 files age out, then delete |
+| JSON-array parsing | Deletable — nothing writes it today (needs maintainer decision) |
+| Timestamp-flood guards | Demote — only protect file-less-window runtime ingests now |
+| `deduplicateAfterTurnBatch` oversized/suffix heuristics | Likely collapsible into the alignment helper; scoped to the file-less window |
+
+Net: the "require entry ids and delete the legacy stack" option is smaller
+than the pre-audit estimate, because the host's deferred-flush design makes
+the dual-source problem permanent. The code that remains, remains because
+the host architecture demands it — not because behavior preservation was
+assumed.
