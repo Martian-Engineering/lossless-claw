@@ -86,14 +86,17 @@ function createTestDeps(config: LcmConfig, log: LogMock): LcmDependencies {
   } as unknown as LcmDependencies;
 }
 
-function createEngine(): {
+function createEngine(configOverrides: Partial<LcmConfig> = {}): {
   engine: LcmContextEngine;
   log: LogMock;
   db: ReturnType<typeof createLcmDatabaseConnection>;
 } {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-rollover-"));
   tempDirs.push(tempDir);
-  const config = createTestConfig(join(tempDir, "lcm.db"));
+  const config = {
+    ...createTestConfig(join(tempDir, "lcm.db")),
+    ...configOverrides,
+  };
   const db = createLcmDatabaseConnection(config.databasePath);
   dbs.push(db);
   const log: LogMock = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -136,7 +139,7 @@ async function seedFrozenLane(
   );
   const base = Date.now() - 7 * 24 * 60 * 60 * 1000;
   for (const [index, content] of persistedContents.entries()) {
-    await engine.ingest({
+    await seedHistoricalMessage(engine, {
       sessionId: OLD_SESSION_ID,
       sessionKey: SESSION_KEY,
       message: makeMessage(index % 2 === 0 ? "user" : "assistant", content, base + index),
@@ -202,6 +205,29 @@ function freshEntries(count = 6): Array<{ role: string; text: string; timestamp:
     text: `fresh rolled-session turn ${index}`,
     timestamp: base + index,
   }));
+}
+
+/**
+ * Seed backdated history through the full ingest pipeline but skip the
+ * replay-timestamp flood guard. The guard buckets user rows by insert-second
+ * regardless of content, so seeding loops trip it whenever a fast machine
+ * lands three user ingests in the same wall-clock second — these tests
+ * backdate created_at immediately afterwards anyway.
+ */
+async function seedHistoricalMessage(
+  engine: LcmContextEngine,
+  params: { sessionId: string; sessionKey?: string; message: AgentMessage },
+): Promise<void> {
+  await (
+    engine as unknown as {
+      ingestSingle: (p: {
+        sessionId: string;
+        sessionKey?: string;
+        message: AgentMessage;
+        skipReplayTimestampFloodGuard?: boolean;
+      }) => Promise<unknown>;
+    }
+  ).ingestSingle({ ...params, skipReplayTimestampFloodGuard: true });
 }
 
 describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
@@ -447,10 +473,14 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
   });
 
-  it("assemble never rotates: live-window evidence is not transcript evidence", async () => {
-    const { engine, log, db } = createEngine();
+  it("assemble never rotates or writes live tool-output files before rollover safety checks", async () => {
+    const { engine, log, db } = createEngine({
+      largeFileTokenThreshold: 20,
+      stubLargeToolPayloads: true,
+    });
     const lane = await seedFrozenLane(engine, db);
 
+    const oversizedToolOutput = "tool output. ".repeat(200);
     const result = await engine.assemble({
       sessionId: NEW_SESSION_ID,
       sessionKey: SESSION_KEY,
@@ -459,6 +489,22 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
           role: "user",
           content: "brand new prompt that would look fresh",
           timestamp: Date.now() + 60_000,
+        } as unknown as AgentMessage,
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_1", name: "exec", input: {} }],
+          timestamp: Date.now() + 60_001,
+        } as unknown as AgentMessage,
+        {
+          role: "toolResult",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_1",
+              output: oversizedToolOutput,
+            },
+          ],
+          timestamp: Date.now() + 60_002,
         } as unknown as AgentMessage,
       ],
       tokenBudget: 10_000,
@@ -476,6 +522,9 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       .getConversationBySessionKey(SESSION_KEY);
     expect(conversation?.conversationId).toBe(lane.conversationId);
     expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
+    await expect(
+      engine.getSummaryStore().getLargeFilesByConversation(lane.conversationId),
+    ).resolves.toEqual([]);
   });
 
   it("reports a lifecycle no-op honestly instead of claiming the lane healed", async () => {
@@ -534,7 +583,7 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     }
     const base = Date.now() - 7 * 24 * 60 * 60 * 1000;
     for (const [index, entry] of heartbeatContents.entries()) {
-      await engine.ingest({
+      await seedHistoricalMessage(engine, {
         sessionId: OLD_SESSION_ID,
         sessionKey: SESSION_KEY,
         message: makeMessage(entry.role, entry.content, base + index),
@@ -604,7 +653,7 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       { role: "user", content: "Daily status template line" },
     ];
     for (const [index, entry] of noise.entries()) {
-      await engine.ingest({
+      await seedHistoricalMessage(engine, {
         sessionId: OLD_SESSION_ID,
         sessionKey: SESSION_KEY,
         message: makeMessage(entry.role, entry.content, base + index),
@@ -641,4 +690,3 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
   });
 });
-
