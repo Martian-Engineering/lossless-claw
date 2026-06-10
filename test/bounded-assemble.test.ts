@@ -19,6 +19,7 @@ import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies } from "../src/types.js";
+import { createTestConfig as createSharedTestConfig } from "./helpers.js";
 
 const tempDirs: string[] = [];
 const engines: LcmContextEngine[] = [];
@@ -39,77 +40,7 @@ afterEach(() => {
 });
 
 function createTestConfig(databasePath: string): LcmConfig {
-  return {
-    enabled: true,
-    databasePath,
-    largeFilesDir: join(databasePath, "..", "lcm-files"),
-    ignoreSessionPatterns: [],
-    statelessSessionPatterns: [],
-    skipStatelessSessions: true,
-    contextThreshold: 0.75,
-    freshTailCount: 4,
-    promptAwareEviction: false,
-    stubLargeToolPayloads: false,
-    newSessionRetainDepth: 2,
-    leafMinFanout: 8,
-    condensedMinFanout: 4,
-    condensedMinFanoutHard: 2,
-    sweepMaxDepth: 1,
-    incrementalMaxDepth: 0,
-    maxSweepIterations: 12,
-    sweepDeadlineMs: 120_000,
-    compactUntilUnderDeadlineMs: 300_000,
-    leafChunkTokens: 20_000,
-    leafTargetTokens: 600,
-    condensedTargetTokens: 900,
-    maxExpandTokens: 4000,
-    largeFileTokenThreshold: 25_000,
-    summaryProvider: "",
-    summaryModel: "",
-    largeFileSummaryProvider: "",
-    largeFileSummaryModel: "",
-    expansionProvider: "",
-    expansionModel: "",
-    delegationTimeoutMs: 120_000,
-    summaryTimeoutMs: 60_000,
-    timezone: "UTC",
-    pruneHeartbeatOk: false,
-    transcriptGcEnabled: false,
-    enableSummaryThinking: true,
-    proactiveThresholdCompactionMode: "deferred",
-    autoRotateSessionFiles: {
-      enabled: true,
-      createBackups: false,
-      sizeBytes: 2 * 1024 * 1024,
-      startup: "rotate",
-      runtime: "rotate",
-    },
-    independentLogFile: {
-      enabled: false,
-      maxFileBytes: 100 * 1024 * 1024,
-    },
-    summaryMaxOverageFactor: 3,
-    customInstructions: "",
-    circuitBreakerThreshold: 5,
-    circuitBreakerCooldownMs: 1_800_000,
-    replayFloodThresholdExternal: 3,
-    replayFloodThresholdInternal: 32,
-    fallbackProviders: [],
-    cacheAwareCompaction: {
-      enabled: true,
-      cacheTTLSeconds: 300,
-      maxColdCacheCatchupPasses: 2,
-      hotCachePressureFactor: 4,
-      hotCacheBudgetHeadroomRatio: 0.2,
-      coldCacheObservationThreshold: 3,
-      criticalBudgetPressureRatio: 0.9,
-    },
-    dynamicLeafChunkTokens: {
-      enabled: true,
-      max: 40_000,
-    },
-    stripInjectedContextTags: [],
-  };
+  return createSharedTestConfig(databasePath, { freshTailCount: 4 });
 }
 
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
