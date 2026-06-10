@@ -5,6 +5,7 @@
  */
 import { toStoredMessage } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
+import type { ConversationStore } from "./store/conversation-store.js";
 
 export const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
 
@@ -117,4 +118,71 @@ export function turnLooksLikeHeartbeatTurn(turnMessages: Array<{ content: string
   return turnMessages.some((message) =>
     message.content.toLowerCase().includes(HEARTBEAT_TURN_MARKER),
   );
+}
+
+
+/**
+ * Detect HEARTBEAT_OK turn cycles in a conversation and delete them.
+ *
+ * A HEARTBEAT_OK turn is: a user message (the heartbeat prompt), followed by
+ * any tool call/result messages, ending with an assistant message that is a
+ * heartbeat ack. The entire sequence has no durable information value for LCM.
+ *
+ * Detection: assistant content (trimmed, lowercased) starts with "heartbeat_ok"
+ * and any text after is not alphanumeric (matches OpenClaw core's ack detection).
+ * This catches both exact "HEARTBEAT_OK" and chatty variants like
+ * "HEARTBEAT_OK — weekend, no market".
+ *
+ * Returns the number of messages deleted.
+ */
+export async function pruneHeartbeatOkTurns(
+conversationStore: ConversationStore,
+conversationId: number,
+): Promise<number> {
+  const allMessages = await conversationStore.getMessages(conversationId);
+  if (allMessages.length === 0) {
+    return 0;
+  }
+
+  const toDelete: number[] = [];
+
+  // Walk through messages finding HEARTBEAT_OK assistant replies, then
+  // collect the entire turn (back to the preceding user message).
+  for (let i = 0; i < allMessages.length; i++) {
+    const msg = allMessages[i];
+    if (msg.role !== "assistant") {
+      continue;
+    }
+    if (!isHeartbeatOkContent(msg.content)) {
+      continue;
+    }
+
+    // Found an exact HEARTBEAT_OK reply. Walk backward to find the turn start
+    // (the preceding user message).
+    const turnMessages = [msg];
+    for (let j = i - 1; j >= 0; j--) {
+      const prev = allMessages[j];
+      turnMessages.push(prev);
+      if (prev.role === "user") {
+        break; // Found turn start
+      }
+    }
+
+    if (!turnMessages.some((record) => record.role === "user")) {
+      continue;
+    }
+    if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
+      continue;
+    }
+
+    toDelete.push(...turnMessages.map((record) => record.messageId));
+  }
+
+  if (toDelete.length === 0) {
+    return 0;
+  }
+
+  // Deduplicate (a message could theoretically appear in multiple turns)
+  const uniqueIds = [...new Set(toDelete)];
+  return conversationStore.deleteMessages(uniqueIds);
 }

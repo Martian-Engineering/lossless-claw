@@ -17,6 +17,7 @@ import type {
 } from "./openclaw-bridge.js";
 import { contentFromParts, ContextAssembler, pickToolCallId, pickToolIsError, pickToolName } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
+import { BatchDeduplicator } from "./batch-dedup.js";
 import { CompactionGuards } from "./compaction-guards.js";
 import { LargeFileInterceptor } from "./large-file-interceptor.js";
 import type { LcmConfig } from "./db/config.js";
@@ -58,7 +59,7 @@ import { resolveEpochRoute, selectEntryIdTail, transcriptImportCap } from "./rec
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
-import { batchLooksLikeHeartbeatAckTurn, filterSyntheticHeartbeatMessages, isHeartbeatNoiseContent, isHeartbeatOkContent, turnLooksLikeHeartbeatTurn } from "./heartbeat-filter.js";
+import { batchLooksLikeHeartbeatAckTurn, filterSyntheticHeartbeatMessages, isHeartbeatNoiseContent, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isLikelyInjectedDeliveryOnlyTranscript, isLikelyInjectedMetadataPreambleRecord, isOpenClawRuntimeContextLeak, toStoredMessage, type StoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, createLosslessMessageSignature, isBootstrapReplayCandidateMessage, messageIdentity, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
@@ -411,6 +412,9 @@ export class LcmContextEngine implements ContextEngine {
   // ── Large-payload interception at ingest ────────────────────────────────
   private readonly largeFileInterceptor: LargeFileInterceptor;
 
+  // ── After-turn batch replay dedup ────────────────────────────────────────
+  private readonly batchDeduplicator: BatchDeduplicator;
+
   /** Last file state successfully covered by `reconcileTranscriptTailForAfterTurn`
    *  slow-path full re-reads, keyed by `${sessionQueueKey}\u0000${sessionFile}`
    *  (same NUL-escape separator pattern as `messageIdentity`). Long-running
@@ -509,6 +513,7 @@ export class LcmContextEngine implements ContextEngine {
       this.summaryStore,
       (params) => this.resolveLargeFileTextSummarizer(params),
     );
+    this.batchDeduplicator = new BatchDeduplicator(this.conversationStore, this.deps);
     this.focusBriefStore = new FocusBriefStore(this.db);
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
@@ -4666,7 +4671,7 @@ export class LcmContextEngine implements ContextEngine {
             // Prune HEARTBEAT_OK turns from the freshly imported data
             let prunedMessages = 0;
             if (this.config.pruneHeartbeatOk) {
-              const pruned = await this.pruneHeartbeatOkTurns(conversationId);
+              const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversationId);
               prunedMessages = pruned;
               if (pruned > 0) {
                 this.deps.log.info(
@@ -4780,7 +4785,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
         });
         if (conversation) {
-          const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
+          const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId);
           if (pruned > 0) {
             await this.refreshBootstrapState({
               conversationId: conversation.conversationId,
@@ -4816,291 +4821,6 @@ export class LcmContextEngine implements ContextEngine {
     return result;
   }
 
-  /**
-   * Remove messages from the batch that already exist in the DB for this session.
-   * Conservative replay detection: only strip a prefix when the incoming
-   * batch begins with the entire stored transcript for the session.
-   *
-   * Fixes two issues from #246:
-   * 1. Replaced hasMessage() fast-path with aligned-tail check — the old
-   *    approach false-positives on legitimate repeated first messages
-   * 2. Dedup now runs on newMessages only, before autoCompactionSummary
-   *    is prepended — synthetic summaries can no longer interfere with
-   *    replay detection
-   */
-  /**
-   * After a covered transcript reconcile the DB tail IS the transcript
-   * frontier, so the runtime turn delta needs exact alignment, not heuristic
-   * dedup. Three cases:
-   *  - the transcript flushed the whole turn: the batch aligns fully with the
-   *    DB tail — nothing to ingest;
-   *  - the transcript flush lagged mid-turn: a prefix of the batch aligns
-   *    with the DB tail — ingest only the remainder;
-   *  - no tail alignment: a batch with zero persisted-identity overlap is a
-   *    genuinely unflushed new turn (ingest all); any overlap means a stale
-   *    replay snapshot — fail closed, because a covered transcript read will
-   *    deliver anything real on the next turn idempotently.
-   */
-  private async alignRuntimeBatchAgainstCoveredFrontier(
-    sessionId: string,
-    sessionKey: string | undefined,
-    batch: AgentMessage[],
-  ): Promise<AgentMessage[]> {
-    if (batch.length === 0) return batch;
-
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId,
-      sessionKey,
-    });
-    if (!conversation) return batch;
-    const conversationId = conversation.conversationId;
-
-    const storedBatch = batch.map((message) => toStoredMessage(message));
-    const tail = await this.conversationStore.getLastMessages(conversationId, batch.length);
-    for (let k = Math.min(tail.length, batch.length); k > 0; k -= 1) {
-      const tailSlice = tail.slice(tail.length - k);
-      let aligned = true;
-      for (let i = 0; i < k; i += 1) {
-        if (
-          messageIdentity(tailSlice[i]!.role, tailSlice[i]!.content) !==
-          messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
-        ) {
-          aligned = false;
-          break;
-        }
-      }
-      if (aligned) {
-        return batch.slice(k);
-      }
-    }
-
-    let persistedIdentityOverlaps = 0;
-    for (const stored of storedBatch) {
-      if (await this.conversationStore.hasMessage(conversationId, stored.role, stored.content)) {
-        persistedIdentityOverlaps += 1;
-      }
-    }
-    if (persistedIdentityOverlaps > 0) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: runtime batch does not align with the covered transcript frontier and overlaps persisted history (${persistedIdentityOverlaps}/${batch.length}); failing closed — the transcript reconcile delivers real messages next turn conversation=${conversationId}`,
-      );
-      return [];
-    }
-    return batch;
-  }
-
-  private async deduplicateAfterTurnBatch(
-    sessionId: string,
-    sessionKey: string | undefined,
-    batch: AgentMessage[],
-    options?: { oversizedNoOverlap?: "ingest" | "skip" },
-  ): Promise<AgentMessage[]> {
-    if (batch.length === 0) return batch;
-
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId,
-      sessionKey,
-    });
-    if (!conversation) return batch;
-
-    const conversationId = conversation.conversationId;
-    const storedMessageCount = await this.conversationStore.getMessageCount(conversationId);
-    if (storedMessageCount === 0) return batch;
-
-    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
-    if (!lastDbMessage) return batch;
-
-    const storedBatch = batch.map((m) => toStoredMessage(m));
-
-    // When the DB already has more messages than the incoming batch,
-    // the batch may be a tail-only replay. Try tail-matching first,
-    // then fall back to suffix-matching.
-    if (storedMessageCount > batch.length) {
-      return this.deduplicateOversizedBatch(
-        conversationId,
-        batch,
-        storedBatch,
-        storedMessageCount,
-        lastDbMessage,
-        options,
-      );
-    }
-
-    // Aligned-tail check: DB's last message must match the message at the
-    // exact replay boundary in the incoming batch. This replaces the
-    // hasMessage() check which could false-positive on any repeated content.
-    const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
-    if (
-      messageIdentity(lastDbMessage.role, lastDbMessage.content) !==
-      messageIdentity(batchAtBoundary.role, batchAtBoundary.content)
-    ) {
-      // Prefix mismatch — attempt suffix fallback before giving up.
-      return this.deduplicateSuffixFallback(
-        conversationId,
-        batch,
-        storedBatch,
-        storedMessageCount,
-        "prefix-mismatch",
-      );
-    }
-
-    // Full proof: incoming batch must start with the entire stored transcript
-    // in exact order before we trim anything.
-    const storedMessages = await this.conversationStore.getMessages(conversationId, {
-      limit: storedMessageCount,
-    });
-    if (storedMessages.length !== storedMessageCount) {
-      return batch;
-    }
-    for (let i = 0; i < storedMessageCount; i += 1) {
-      const storedConversationMessage = storedMessages[i]!;
-      const incomingMessage = storedBatch[i]!;
-      if (
-        messageIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
-        messageIdentity(incomingMessage.role, incomingMessage.content)
-      ) {
-        return batch;
-      }
-    }
-
-    return batch.slice(storedMessageCount);
-  }
-
-  /**
-   * Handle the case where the DB has more messages than the incoming batch.
-   * The batch is likely a tail-only replay after compaction — try to match
-   * the entire batch against the tail of stored messages.
-   */
-  private async deduplicateOversizedBatch(
-    conversationId: number,
-    batch: AgentMessage[],
-    storedBatch: ReturnType<typeof toStoredMessage>[],
-    storedMessageCount: number,
-    lastDbMessage: { role: string; content: string },
-    options?: { oversizedNoOverlap?: "ingest" | "skip" },
-  ): Promise<AgentMessage[]> {
-    const lastBatchIdentity = messageIdentity(
-      storedBatch[storedBatch.length - 1]!.role,
-      storedBatch[storedBatch.length - 1]!.content,
-    );
-    const lastDbIdentity = messageIdentity(lastDbMessage.role, lastDbMessage.content);
-
-    // Quick check: if the last DB message matches the last batch message,
-    // verify that the entire batch matches the actual DB tail. Message seq
-    // can have gaps after maintenance deletes, so do not derive seq from count.
-    if (lastDbIdentity === lastBatchIdentity) {
-      const storedMessages = await this.conversationStore.getMessages(conversationId, {
-        limit: storedMessageCount,
-      });
-      const tailMessages = storedMessages.slice(-batch.length);
-      if (tailMessages.length === batch.length) {
-        let tailMatch = true;
-        for (let i = 0; i < batch.length; i++) {
-          if (
-            messageIdentity(tailMessages[i]!.role, tailMessages[i]!.content) !==
-            messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
-          ) {
-            tailMatch = false;
-            break;
-          }
-        }
-        if (tailMatch) {
-          this.deps.log.debug(
-            `[lcm] dedup: tail-match detected, batch already fully stored ` +
-              `(storedCount=${storedMessageCount} batchLen=${batch.length}), skipping entire batch`,
-          );
-          return [];
-        }
-      }
-    }
-
-    // Fall back to suffix matching. If the DB is already longer than the
-    // incoming afterTurn batch and no suffix overlap exists, fail closed:
-    // importing the whole short batch as new would duplicate/pollute LCM with
-    // stale runtime tail snapshots. The transcript reconcile path runs before
-    // this and is responsible for importing genuine missing JSONL tail turns.
-    return this.deduplicateSuffixFallback(
-      conversationId,
-      batch,
-      storedBatch,
-      storedMessageCount,
-      "oversized",
-      { onNoOverlap: options?.oversizedNoOverlap ?? "skip" },
-    );
-  }
-
-  /**
-   * Suffix-matching fallback: scan the batch from the end looking for a
-   * boundary where the stored transcript's tail aligns with a suffix of the
-   * batch. Returns only the genuinely new messages after that boundary.
-   */
-  private async deduplicateSuffixFallback(
-    conversationId: number,
-    batch: AgentMessage[],
-    storedBatch: ReturnType<typeof toStoredMessage>[],
-    storedMessageCount: number,
-    context: string,
-    options?: { onNoOverlap?: "ingest" | "skip" },
-  ): Promise<AgentMessage[]> {
-    const allStored = await this.conversationStore.getMessages(conversationId, {
-      limit: storedMessageCount,
-    });
-    if (allStored.length === 0) return batch;
-
-    const lastStoredIdentity = messageIdentity(
-      allStored[allStored.length - 1]!.role,
-      allStored[allStored.length - 1]!.content,
-    );
-
-    for (let k = batch.length - 1; k >= 0; k--) {
-      if (
-        messageIdentity(storedBatch[k]!.role, storedBatch[k]!.content) !== lastStoredIdentity
-      ) {
-        continue;
-      }
-      const matchLen = Math.min(k + 1, allStored.length);
-      const startDb = allStored.length - matchLen;
-      let suffixMatch = true;
-      for (let j = 0; j < matchLen; j++) {
-        if (
-          messageIdentity(
-            allStored[startDb + j]!.role,
-            allStored[startDb + j]!.content,
-          ) !==
-          messageIdentity(
-            storedBatch[k - matchLen + 1 + j]!.role,
-            storedBatch[k - matchLen + 1 + j]!.content,
-          )
-        ) {
-          suffixMatch = false;
-          break;
-        }
-      }
-      const newSlice = batch.slice(k + 1);
-      if (suffixMatch && (newSlice.length > 0 || matchLen > 1)) {
-        this.deps.log.debug(
-          `[lcm] dedup: ${context} suffix-match at batch[${k}], ` +
-            `returning ${newSlice.length} new messages ` +
-            `(storedCount=${storedMessageCount} batchLen=${batch.length})`,
-        );
-        return newSlice;
-      }
-    }
-
-    if (options?.onNoOverlap === "skip") {
-      this.deps.log.warn(
-        `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
-          `no overlap found — fail-closed skipping full batch`,
-      );
-      return [];
-    }
-
-    this.deps.log.warn(
-      `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
-        `no overlap found — ingesting full batch`,
-    );
-    return batch;
-  }
   /**
    * Rebuild a compact tool-result message from stored message parts.
    *
@@ -5707,7 +5427,7 @@ export class LcmContextEngine implements ContextEngine {
       // tail is exact — use precise alignment instead of the heuristic
       // dedup stack, and persist only what the transcript flush has not
       // delivered yet.
-      dedupedNewMessages = await this.alignRuntimeBatchAgainstCoveredFrontier(
+      dedupedNewMessages = await this.batchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier(
         params.sessionId,
         params.sessionKey,
         newMessages,
@@ -5718,7 +5438,7 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
     } else {
-      dedupedNewMessages = await this.deduplicateAfterTurnBatch(
+      dedupedNewMessages = await this.batchDeduplicator.deduplicateAfterTurnBatch(
         params.sessionId,
         params.sessionKey,
         newMessages,
@@ -5807,7 +5527,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
         });
         if (conversation) {
-          const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
+          const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId);
           if (pruned > 0) {
             const sessionContext = this.formatSessionLogContext({
               conversationId: conversation.conversationId,
@@ -8415,70 +8135,6 @@ export class LcmContextEngine implements ContextEngine {
     return this.compactionMaintenanceStore;
   }
 
-  // ── Heartbeat pruning ──────────────────────────────────────────────────
-
-  /**
-   * Detect HEARTBEAT_OK turn cycles in a conversation and delete them.
-   *
-   * A HEARTBEAT_OK turn is: a user message (the heartbeat prompt), followed by
-   * any tool call/result messages, ending with an assistant message that is a
-   * heartbeat ack. The entire sequence has no durable information value for LCM.
-   *
-   * Detection: assistant content (trimmed, lowercased) starts with "heartbeat_ok"
-   * and any text after is not alphanumeric (matches OpenClaw core's ack detection).
-   * This catches both exact "HEARTBEAT_OK" and chatty variants like
-   * "HEARTBEAT_OK — weekend, no market".
-   *
-   * Returns the number of messages deleted.
-   */
-  private async pruneHeartbeatOkTurns(conversationId: number): Promise<number> {
-    const allMessages = await this.conversationStore.getMessages(conversationId);
-    if (allMessages.length === 0) {
-      return 0;
-    }
-
-    const toDelete: number[] = [];
-
-    // Walk through messages finding HEARTBEAT_OK assistant replies, then
-    // collect the entire turn (back to the preceding user message).
-    for (let i = 0; i < allMessages.length; i++) {
-      const msg = allMessages[i];
-      if (msg.role !== "assistant") {
-        continue;
-      }
-      if (!isHeartbeatOkContent(msg.content)) {
-        continue;
-      }
-
-      // Found an exact HEARTBEAT_OK reply. Walk backward to find the turn start
-      // (the preceding user message).
-      const turnMessages = [msg];
-      for (let j = i - 1; j >= 0; j--) {
-        const prev = allMessages[j];
-        turnMessages.push(prev);
-        if (prev.role === "user") {
-          break; // Found turn start
-        }
-      }
-
-      if (!turnMessages.some((record) => record.role === "user")) {
-        continue;
-      }
-      if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
-        continue;
-      }
-
-      toDelete.push(...turnMessages.map((record) => record.messageId));
-    }
-
-    if (toDelete.length === 0) {
-      return 0;
-    }
-
-    // Deduplicate (a message could theoretically appear in multiple turns)
-    const uniqueIds = [...new Set(toDelete)];
-    return this.conversationStore.deleteMessages(uniqueIds);
-  }
 }
 
 // ── Heartbeat detection ─────────────────────────────────────────────────────
