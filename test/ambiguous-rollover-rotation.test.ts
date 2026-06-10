@@ -589,4 +589,125 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       expect.stringContaining("resolved by fresh-transcript rotation"),
     );
   });
+  it("heals a heartbeat-idle lane on time evidence alone (live conv-1 shape)", async () => {
+    const { engine, log, db } = createEngine();
+    // The lane's entire recent history is synthetic heartbeat traffic —
+    // the live incident shape: no lineage-discriminating content at all.
+    const heartbeatContents: Array<{ role: string; content: string }> = [];
+    for (let index = 0; index < 60; index += 1) {
+      heartbeatContents.push(
+        index % 2 === 0
+          ? { role: "user", content: "[OpenClaw heartbeat poll]" }
+          : { role: "assistant", content: "HEARTBEAT_OK" },
+      );
+    }
+    const base = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    for (const [index, entry] of heartbeatContents.entries()) {
+      await engine.ingest({
+        sessionId: OLD_SESSION_ID,
+        sessionKey: SESSION_KEY,
+        message: makeMessage(entry.role, entry.content, base + index),
+      });
+    }
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(conversation).not.toBeNull();
+    db.prepare(
+      "UPDATE messages SET created_at = datetime('now', '-7 days') WHERE conversation_id = ?",
+    ).run(conversation!.conversationId);
+    const trackedFile = createTempFile("old-heartbeat-tracked.jsonl", "{}\n");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: trackedFile,
+      lastSeenSize: 3,
+      lastSeenMtimeMs: Date.now() - 7 * 24 * 60 * 60 * 1000,
+      lastProcessedOffset: 3,
+      lastProcessedEntryHash: "0".repeat(64),
+    });
+
+    // The rolled transcript also carries heartbeat polls (every session
+    // does) plus genuinely new content.
+    const rolledBase = Date.now() + 60_000;
+    const newSessionFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-heartbeat-idle`,
+      entries: [
+        { role: "user", text: "[OpenClaw heartbeat poll]", timestamp: rolledBase },
+        { role: "assistant", text: "HEARTBEAT_OK", timestamp: rolledBase + 1 },
+        { role: "user", text: "real new work after the roll", timestamp: rolledBase + 2 },
+      ],
+    });
+    const result = await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rotation"),
+    );
+    expect(result.bootstrapped).toBe(true);
+    const rebound = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
+    // The heartbeat history is archived intact, not deleted.
+    const preserved = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(preserved).toHaveLength(60);
+  });
+
+  it("heartbeat polls and recurring template content never block the heal", async () => {
+    const { engine, log, db } = createEngine();
+    const lane = await seedFrozenLane(engine, db);
+    // Add recurring template noise on top of the unique history: heartbeat
+    // polls and a thrice-repeated boilerplate line.
+    const base = Date.now() - 6 * 24 * 60 * 60 * 1000;
+    const noise = [
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "assistant", content: "HEARTBEAT_OK" },
+      { role: "user", content: "Daily status template line" },
+      { role: "user", content: "[OpenClaw heartbeat poll]" },
+      { role: "user", content: "Daily status template line" },
+      { role: "user", content: "Daily status template line" },
+    ];
+    for (const [index, entry] of noise.entries()) {
+      await engine.ingest({
+        sessionId: OLD_SESSION_ID,
+        sessionKey: SESSION_KEY,
+        message: makeMessage(entry.role, entry.content, base + index),
+      });
+    }
+    db.prepare(
+      "UPDATE messages SET created_at = datetime('now', '-6 days') WHERE conversation_id = ?",
+    ).run(lane.conversationId);
+
+    // The rolled transcript shares ONLY the template noise — heartbeats and
+    // the recurring boilerplate — plus fresh content. No unique overlap.
+    const rolledBase = Date.now() + 60_000;
+    const newSessionFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-template-noise`,
+      entries: [
+        { role: "user", text: "[OpenClaw heartbeat poll]", timestamp: rolledBase },
+        { role: "user", text: "Daily status template line", timestamp: rolledBase + 1 },
+        { role: "user", text: "fresh post-roll question", timestamp: rolledBase + 2 },
+      ],
+    });
+    const result = await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rotation"),
+    );
+    expect(result.bootstrapped).toBe(true);
+    const rebound = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
+  });
 });
+
