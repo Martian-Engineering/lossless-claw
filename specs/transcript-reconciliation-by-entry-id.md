@@ -202,27 +202,24 @@ memo cache become legacy-only paths.
 
 ### Phase 4 — Pure reconciliation planner
 
-- New `src/reconcile-plan.ts` exposes a pure function:
-
-  ```ts
-  planTranscriptImport(params: {
-    entries: TranscriptEntry[];
-    existingEntryIds: ReadonlySet<string>;
-    checkpoint: { sessionHeaderId: string | null; lastProcessedEntryId: string | null } | null;
-    transcriptHeaderId: string | null;
-  }): {
-    decision: "append" | "epoch-rollover" | "legacy-heuristics" | "noop";
-    toImport: TranscriptEntry[];
-    reason: string;
-  }
-  ```
-
-  No IO, no logging, no store access — unit-testable without the engine.
-- `reconcileSessionTail` consults the planner first; only the
-  `legacy-heuristics` decision falls through to the existing content-identity
+- New `src/reconcile-plan.ts` — no IO, no logging, no store access;
+  unit-testable without the engine. *(Adjusted during implementation:
+  instead of one monolithic `planTranscriptImport`, the planner is three
+  composable pure functions, because the synthetic-heartbeat filter must run
+  between candidate selection and the cap check and operates on message
+  content the planner does not see.)*
+  - `selectEntryIdTail({entryIds, existingEntryIds, lastProcessedEntryId})`
+    → `no-id-lineage` | `at-tip` | `tail{anchorIndex, missingIndexes}` —
+    the anchor/set-difference core of `reconcileSessionTailByEntryIds`.
+  - `resolveEpochRoute({checkpointHeaderId, transcriptHeaderId})` →
+    `same-epoch` | `declared-rollover` | `undeclared`.
+  - `transcriptImportCap(existingDbCount)` — the single definition of the
+    max(20%, 50) sanity bound, replacing three inline copies.
+- `reconcileSessionTail` consults the entry-id planner first; only the
+  `no-id-lineage` outcome falls through to the existing content-identity
   machinery.
-- Transcript reading/parsing fully lives in `src/transcript.ts`;
-  `engine.ts` shrinks accordingly.
+- Transcript reading/parsing fully lives in `src/transcript.ts` (done in
+  Phase 1); `engine.ts` shrank accordingly.
 
 ## What stays
 
@@ -262,5 +259,5 @@ memo cache become legacy-only paths.
   heuristic dedup retained only for uncovered paths
 - [x] Phase 3 — session-header epochs, entry-ID checkpoints, set-difference
   import with adoption
-- [ ] Phase 4 — pure `planTranscriptImport` planner + `src/transcript.ts`
-  extraction
+- [x] Phase 4 — pure planner functions in `src/reconcile-plan.ts` +
+  `src/transcript.ts` extraction

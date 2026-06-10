@@ -98,6 +98,7 @@ import {
   readSessionParentSessionReference,
   readTranscriptHeader,
 } from "./transcript.js";
+import { resolveEpochRoute, selectEntryIdTail, transcriptImportCap } from "./reconcile-plan.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type RepairLogger = { warn: (message: string) => void };
@@ -6023,44 +6024,34 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<TranscriptReconcileResult | null> {
     const { conversationId, historicalMessages, entryIds, sessionContext, startedAt } = params;
 
-    let anchorIndex = params.lastProcessedEntryId
+    // Query existence only for the tail when the checkpoint anchor is still
+    // in the transcript; otherwise probe every id to find the newest
+    // persisted one.
+    const checkpointAnchorIndex = params.lastProcessedEntryId
       ? entryIds.lastIndexOf(params.lastProcessedEntryId)
       : -1;
-    let knownExisting: Set<string>;
-    if (anchorIndex >= 0) {
-      knownExisting = await this.conversationStore.filterExistingTranscriptEntryIds(
-        conversationId,
-        entryIds.slice(anchorIndex + 1),
-      );
-    } else {
-      knownExisting = await this.conversationStore.filterExistingTranscriptEntryIds(
-        conversationId,
-        entryIds,
-      );
-      if (knownExisting.size === 0) {
-        return null;
-      }
-      for (let index = entryIds.length - 1; index >= 0; index -= 1) {
-        if (knownExisting.has(entryIds[index]!)) {
-          anchorIndex = index;
-          break;
-        }
-      }
-    }
+    const knownExisting = await this.conversationStore.filterExistingTranscriptEntryIds(
+      conversationId,
+      checkpointAnchorIndex >= 0 ? entryIds.slice(checkpointAnchorIndex + 1) : entryIds,
+    );
+    const selection = selectEntryIdTail({
+      entryIds,
+      existingEntryIds: knownExisting,
+      lastProcessedEntryId: params.lastProcessedEntryId,
+    });
 
-    if (anchorIndex >= historicalMessages.length - 1) {
+    if (selection.kind === "no-id-lineage") {
+      return null;
+    }
+    if (selection.kind === "at-tip") {
       this.deps.log.debug(
         `[lcm] reconcileSessionTail: entry-id anchor at tip for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=true`,
       );
       return { blockedByImportCap: false, importedMessages: 0, hasOverlap: true };
     }
 
-    const candidates: AgentMessage[] = [];
-    for (let index = anchorIndex + 1; index < historicalMessages.length; index += 1) {
-      if (!knownExisting.has(entryIds[index]!)) {
-        candidates.push(historicalMessages[index]!);
-      }
-    }
+    const anchorIndex = selection.anchorIndex;
+    const candidates = selection.missingIndexes.map((index) => historicalMessages[index]!);
     const missingTail = this.filterSyntheticHeartbeatTranscriptMessages({
       messages: candidates,
       sessionContext,
@@ -6069,7 +6060,7 @@ export class LcmContextEngine implements ContextEngine {
 
     if (
       params.existingDbCount > 0 &&
-      missingTail.length > Math.max(params.existingDbCount * 0.2, 50)
+      missingTail.length > transcriptImportCap(params.existingDbCount)
     ) {
       this.deps.log.warn(
         `[lcm] reconcileSessionTail: entry-id import cap exceeded for ${sessionContext} — would import ${missingTail.length} messages (existing: ${params.existingDbCount}). Aborting to prevent flood.`,
@@ -6315,7 +6306,7 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
 
-          const importCap = Math.max(Math.floor(existingDbCount * 0.2), 50);
+          const importCap = transcriptImportCap(existingDbCount);
           if (noAnchorImportMessages.length > importCap) {
             this.deps.log.warn(
               `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${noAnchorImportMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
@@ -6395,7 +6386,7 @@ export class LcmContextEngine implements ContextEngine {
       source: "reconcileSessionTail",
     });
 
-    if (existingDbCount > 0 && missingTail.length > Math.max(existingDbCount * 0.2, 50)) {
+    if (existingDbCount > 0 && missingTail.length > transcriptImportCap(existingDbCount)) {
       this.deps.log.warn(
         `[lcm] reconcileSessionTail: import cap exceeded for ${sessionContext} — would import ${missingTail.length} messages (existing: ${existingDbCount}). Aborting to prevent flood.`,
       );
@@ -7400,9 +7391,10 @@ export class LcmContextEngine implements ContextEngine {
         // guards and import caps still apply as sanity bounds.
         const transcriptHeader = await readTranscriptHeader(params.sessionFile);
         const declaredEpochRollover =
-          checkpoint?.sessionHeaderId != null &&
-          transcriptHeader.sessionHeaderId != null &&
-          checkpoint.sessionHeaderId !== transcriptHeader.sessionHeaderId;
+          resolveEpochRoute({
+            checkpointHeaderId: checkpoint?.sessionHeaderId,
+            transcriptHeaderId: transcriptHeader.sessionHeaderId,
+          }) === "declared-rollover";
         if (declaredEpochRollover) {
           this.deps.log.warn(
             `[lcm] afterTurn: transcript session header changed (${checkpoint?.sessionHeaderId} -> ${transcriptHeader.sessionHeaderId}); treating as declared epoch rollover conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
