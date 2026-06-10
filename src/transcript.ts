@@ -180,13 +180,77 @@ export function parseBootstrapJsonl(raw: string, options?: {
   return { messages, sawNonWhitespace, hadMalformedLine };
 }
 
-/** Load recoverable messages from a JSON/JSONL session file without full-file reads for JSONL. */
+/** One parsed transcript line that participates in the entry tree. */
+type TranscriptLineRecord = {
+  entryId: string | null;
+  parentId: string | null;
+  message: AgentMessage | null;
+};
+
+/**
+ * Select the active leaf path from parsed transcript lines, or null when the
+ * file is not eligible for path-following and the caller must flatten.
+ *
+ * OpenClaw transcripts are trees: every entry carries `parentId`, and history
+ * edits (rewriteTranscriptEntries, branch, resetLeaf) re-append the active
+ * suffix as new entries, leaving the replaced ones in the file as an
+ * abandoned branch. The file's last entry is the current leaf, so walking
+ * its parent chain to a root yields exactly the entries the host considers
+ * live. Returns null (flatten fallback) when any record lacks an entry id
+ * (bare `{role, content}` lines, v1 transcripts), a parent link is dangling,
+ * or the chain cycles. A replayed line with a duplicate id resolves to its
+ * last occurrence. A mid-file `parentId: null` reached from the leaf is a
+ * genuine root (host resetLeaf); entries before it are an abandoned branch.
+ */
+function selectLeafPathRecords(records: TranscriptLineRecord[]): TranscriptLineRecord[] | null {
+  if (records.length === 0) {
+    return null;
+  }
+  const byId = new Map<string, TranscriptLineRecord>();
+  for (const record of records) {
+    if (!record.entryId) {
+      return null;
+    }
+    byId.set(record.entryId, record);
+  }
+  const path: TranscriptLineRecord[] = [];
+  const visited = new Set<string>();
+  let current: TranscriptLineRecord | undefined = records[records.length - 1];
+  while (current) {
+    const currentId = current.entryId!;
+    if (visited.has(currentId)) {
+      return null;
+    }
+    visited.add(currentId);
+    path.push(current);
+    if (current.parentId === null) {
+      break;
+    }
+    const parent = byId.get(current.parentId);
+    if (!parent) {
+      return null;
+    }
+    current = parent;
+  }
+  path.reverse();
+  return path;
+}
+
+/**
+ * Load recoverable messages from a JSON/JSONL session file.
+ *
+ * When every transcript line carries an envelope id, only the active leaf
+ * path (see selectLeafPathRecords) is returned, so abandoned branches left
+ * behind by host history edits are invisible to reconciliation. Files
+ * without full id coverage keep the legacy flatten-in-file-order behavior.
+ */
 export async function readLeafPathMessages(sessionFile: string): Promise<AgentMessage[]> {
   try {
     let sawNonWhitespace = false;
     let jsonArrayMode = false;
     let jsonArrayBuffer = "";
-    const messages: AgentMessage[] = [];
+    const records: TranscriptLineRecord[] = [];
+    const flattened: AgentMessage[] = [];
     const stream = createReadStream(sessionFile, { encoding: "utf8" });
     const lines = createInterface({
       input: stream,
@@ -209,9 +273,38 @@ export async function readLeafPathMessages(sessionFile: string): Promise<AgentMe
         continue;
       }
 
-      const parsed = parseBootstrapJsonl(line);
-      if (parsed.messages.length > 0) {
-        messages.push(...parsed.messages);
+      const item = line.trim();
+      if (!item) {
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(item);
+      } catch {
+        continue;
+      }
+      if (
+        parsed !== null &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        (parsed as { type?: unknown }).type === "session"
+      ) {
+        // The session header is not part of the entry tree.
+        continue;
+      }
+      const candidate = extractBootstrapMessageCandidate(parsed);
+      if (candidate) {
+        flattened.push(candidate);
+      }
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const meta = extractEnvelopeMeta(parsed as Record<string, unknown>);
+        // Track every id-bearing entry (messages and non-message entry types
+        // alike — both link the parent chain) plus bare envelope-less
+        // messages, which force the flatten fallback. Non-entry junk lines
+        // (no id, no message) are ignored, matching the flatten behavior.
+        if (meta.entryId !== null || candidate) {
+          records.push({ entryId: meta.entryId, parentId: meta.parentId, message: candidate });
+        }
       }
     }
 
@@ -231,7 +324,13 @@ export async function readLeafPathMessages(sessionFile: string): Promise<AgentMe
       }
     }
 
-    return messages;
+    const leafPath = selectLeafPathRecords(records);
+    if (leafPath) {
+      return leafPath
+        .map((record) => record.message)
+        .filter((message): message is AgentMessage => message !== null);
+    }
+    return flattened;
   } catch {
     return [];
   }

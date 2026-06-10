@@ -495,15 +495,19 @@ describe("afterTurn covered-frontier alignment", () => {
       timestamp: new Date().toISOString(),
       cwd: process.cwd(),
     });
-    const entryLine = (id: string, role: AgentMessage["role"], text: string) =>
+    const entryLine = (id: string, parentId: string | null, role: AgentMessage["role"], text: string) =>
       JSON.stringify({
         type: "message",
         id,
-        parentId: null,
+        parentId,
         timestamp: new Date().toISOString(),
         message: { role, content: [{ type: "text", text }] },
       });
-    writeFileSync(sessionFile, `${header}\n${entryLine("adopt-1", "user", "question one")}\n`, "utf8");
+    writeFileSync(
+      sessionFile,
+      `${header}\n${entryLine("adopt-1", null, "user", "question one")}\n`,
+      "utf8",
+    );
 
     const engine = createEngine();
     const sessionId = "entry-id-adoption";
@@ -516,7 +520,7 @@ describe("afterTurn covered-frontier alignment", () => {
 
     writeFileSync(
       sessionFile,
-      `${header}\n${entryLine("adopt-1", "user", "question one")}\n${entryLine("adopt-2", "assistant", "answer one")}\n${entryLine("adopt-3", "user", "question two")}\n`,
+      `${header}\n${entryLine("adopt-1", null, "user", "question one")}\n${entryLine("adopt-2", "adopt-1", "assistant", "answer one")}\n${entryLine("adopt-3", "adopt-2", "user", "question two")}\n`,
       "utf8",
     );
     await engine.afterTurn({
@@ -634,11 +638,11 @@ describe("afterTurn covered-frontier alignment", () => {
         timestamp: new Date().toISOString(),
         cwd: process.cwd(),
       });
-    const entryLine = (id: string, role: AgentMessage["role"], text: string) =>
+    const entryLine = (id: string, parentId: string | null, role: AgentMessage["role"], text: string) =>
       JSON.stringify({
         type: "message",
         id,
-        parentId: null,
+        parentId,
         timestamp: new Date().toISOString(),
         message: { role, content: [{ type: "text", text }] },
       });
@@ -646,8 +650,8 @@ describe("afterTurn covered-frontier alignment", () => {
       sessionFile,
       [
         headerLine("epoch-one-header"),
-        entryLine("old-1", "user", "old epoch question"),
-        entryLine("old-2", "assistant", "old epoch answer"),
+        entryLine("old-1", null, "user", "old epoch question"),
+        entryLine("old-2", "old-1", "assistant", "old epoch answer"),
       ].join("\n") + "\n",
       "utf8",
     );
@@ -675,9 +679,9 @@ describe("afterTurn covered-frontier alignment", () => {
       sessionFile,
       [
         headerLine("epoch-two-header"),
-        entryLine("new-1", "user", `new epoch question ${padding}`),
-        entryLine("new-2", "assistant", `new epoch answer ${padding}`),
-        entryLine("new-3", "user", `new epoch follow-up ${padding}`),
+        entryLine("new-1", null, "user", `new epoch question ${padding}`),
+        entryLine("new-2", "new-1", "assistant", `new epoch answer ${padding}`),
+        entryLine("new-3", "new-2", "user", `new epoch follow-up ${padding}`),
       ].join("\n") + "\n",
       "utf8",
     );

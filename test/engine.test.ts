@@ -3184,25 +3184,21 @@ describe("LcmContextEngine.bootstrap", () => {
     const result = await engine.bootstrap({ sessionId, sessionFile });
 
     expect(result.bootstrapped).toBe(true);
-    expect(result.importedMessages).toBe(4);
+    expect(result.importedMessages).toBe(2);
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
     expect(conversation!.bootstrappedAt).not.toBeNull();
 
+    // The abandoned pre-branch turns are not on the leaf path and stay out.
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(stored).toHaveLength(4);
-    expect(stored.map((m) => m.content)).toEqual([
-      "root user",
-      "abandoned assistant",
-      "abandoned user",
-      "active assistant",
-    ]);
+    expect(stored).toHaveLength(2);
+    expect(stored.map((m) => m.content)).toEqual(["root user", "active assistant"]);
 
     const contextItems = await engine
       .getSummaryStore()
       .getContextItems(conversation!.conversationId);
-    expect(contextItems).toHaveLength(4);
+    expect(contextItems).toHaveLength(2);
     expect(contextItems.every((item) => item.itemType === "message")).toBe(true);
 
     const bootstrapState = await engine
