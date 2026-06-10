@@ -52,6 +52,123 @@ export function estimateTokens(text: string): number {
   return Math.ceil(tokens);
 }
 
+/** Fixed token cost substituted for embedded binary/image payloads. */
+const OPAQUE_BINARY_PART_TOKEN_ESTIMATE = 1_600;
+
+/** Strings at least this long are checked for base64-style opaque data. */
+const OPAQUE_BINARY_MIN_CHARS = 4_096;
+
+/**
+ * Field names that carry binary payloads (image/document sources). Only
+ * values under these keys are eligible for fixed-cost substitution: base64
+ * or hex that appears inside ordinary text/content fields IS tokenized per
+ * character at the model boundary and must be counted in full.
+ */
+const OPAQUE_BINARY_FIELD_KEYS = new Set([
+  "data",
+  "image",
+  "imageData",
+  "image_data",
+  "base64",
+  "bytes",
+  "source",
+]);
+
+/**
+ * Heuristic for embedded binary payloads providers price per item rather
+ * than per character: data: URLs anywhere, or base64-shaped blobs under a
+ * known binary field key.
+ */
+function isLikelyOpaqueBinaryString(key: string, value: string): boolean {
+  if (value.length < OPAQUE_BINARY_MIN_CHARS) {
+    return false;
+  }
+  if (value.startsWith("data:")) {
+    return true;
+  }
+  if (!OPAQUE_BINARY_FIELD_KEYS.has(key)) {
+    return false;
+  }
+  const head = value.slice(0, 512);
+  return /^[A-Za-z0-9+/=\r\n]+$/.test(head) && /[0-9]/.test(head) && /[A-Za-z]/.test(head);
+}
+
+/**
+ * Memoized serialized estimates keyed by message object identity. assemble()
+ * re-measures candidate outputs repeatedly while packing to budget; without
+ * memoization a 400-message tool-heavy transcript costs ~O(n²) full
+ * serializations per turn. Host-side in-place truncation of a cached message
+ * leaves a stale (higher) estimate, which only errs toward safety.
+ */
+const serializedEstimateCache = new WeakMap<object, number>();
+
+/**
+ * Estimate the model-boundary token cost of a full message object by
+ * serializing the entire structure, not just its text blocks.
+ *
+ * The LLM-boundary prompt renderer serializes structured tool-call payloads
+ * (tool inputs, tool result objects, mirrored identifiers) that text-only
+ * estimators never see. On tool-heavy transcripts a text-only estimate can
+ * undercount the real prompt by 2-3x, which lets "budgeted" assembly output
+ * overflow the model. Serializing the whole message tracks the boundary
+ * estimate closely; binary payloads under image/document fields are
+ * substituted with a fixed per-part cost so images do not dominate.
+ */
+export function estimateSerializedMessageTokens(message: unknown): number {
+  const cacheable = typeof message === "object" && message !== null;
+  if (cacheable) {
+    const cached = serializedEstimateCache.get(message as object);
+    if (cached !== undefined) {
+      return cached;
+    }
+  }
+  let opaqueParts = 0;
+  let serialized = "";
+  try {
+    // Agent messages are JSON-parsed transcript/provider data, so cycles do
+    // not occur in practice; shared (DAG) references serialize in full,
+    // which is what the model boundary sees too.
+    serialized =
+      JSON.stringify(message, (key, value) => {
+        if (typeof value === "string" && isLikelyOpaqueBinaryString(key, value)) {
+          opaqueParts += 1;
+          return "[opaque binary payload]";
+        }
+        return value;
+      }) ?? "";
+  } catch {
+    // Cyclic or otherwise non-serializable input: fall back to a shallow
+    // per-part estimate so the result is never silently near-zero.
+    serialized = "";
+    const content = (message as { content?: unknown } | null)?.content;
+    if (typeof content === "string") {
+      serialized = content;
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        try {
+          serialized += JSON.stringify(part) ?? "";
+        } catch {
+          // skip unserializable part
+        }
+      }
+    }
+  }
+  const estimate = estimateTokens(serialized) + opaqueParts * OPAQUE_BINARY_PART_TOKEN_ESTIMATE;
+  if (cacheable) {
+    serializedEstimateCache.set(message as object, estimate);
+  }
+  return estimate;
+}
+
+/** Sum of `estimateSerializedMessageTokens` across a message list. */
+export function estimateSerializedMessagesTokens(messages: readonly unknown[]): number {
+  let total = 0;
+  for (const message of messages) {
+    total += estimateSerializedMessageTokens(message);
+  }
+  return total;
+}
+
 /**
  * Truncate text so the estimated token count stays within `maxTokens`.
  *

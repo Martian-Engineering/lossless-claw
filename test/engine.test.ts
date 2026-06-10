@@ -8,7 +8,11 @@ import { ContextAssembler } from "../src/assembler.js";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine, type RotateSessionStorageResult } from "../src/engine.js";
-import { estimateTokens } from "../src/estimate-tokens.js";
+import {
+  estimateSerializedMessageTokens,
+  estimateSerializedMessagesTokens,
+  estimateTokens,
+} from "../src/estimate-tokens.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { LcmProviderAuthError, LcmSummarySpendLimitError } from "../src/summarize.js";
 import {
@@ -7331,7 +7335,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
 
     expect(result.messages).not.toBe(liveMessages);
     expect(result.messages).toStrictEqual(liveMessages);
-    expect(result.estimatedTokens).toBe(0);
+    // Bounded fallback reports the real serialized estimate instead of 0.
+    expect(result.estimatedTokens).toBeGreaterThan(0);
     expect(result.contextProjection).toBeUndefined();
   });
 
@@ -8461,7 +8466,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
 
     expect(result.messages).not.toBe(liveMessages);
     expect(result.messages).toStrictEqual(liveMessages);
-    expect(result.estimatedTokens).toBe(0);
+    // Bounded fallback reports the real serialized estimate instead of 0.
+    expect(result.estimatedTokens).toBeGreaterThan(0);
   });
 
   it("falls back to live context when assembled result has no user turns (cold-cache new session)", async () => {
@@ -8496,7 +8502,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
     // re-introduces the prefill-rejection bug fixed by safeFallback.
     expect(result.messages).not.toBe(liveMessages);
     expect(result.messages).toStrictEqual(liveMessages);
-    expect(result.estimatedTokens).toBe(0);
+    // Bounded fallback reports the real serialized estimate instead of 0.
+    expect(result.estimatedTokens).toBeGreaterThan(0);
   });
 
   it("does not fall back when assembled result has user turns even if it ends with assistant", async () => {
@@ -11682,10 +11689,11 @@ describe("LcmContextEngine fidelity and token budget", () => {
       threshold: 3_072,
     });
 
+    const turnMessage = makeMessage({ role: "assistant", content: "tiny" });
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("after-turn-local-current-token-count-fallback"),
-      messages: [makeMessage({ role: "assistant", content: "tiny" })],
+      messages: [turnMessage],
       prePromptMessageCount: 0,
       tokenBudget: 4_096,
       runtimeContext: {
@@ -11694,7 +11702,12 @@ describe("LcmContextEngine fidelity and token budget", () => {
       },
     });
 
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 4_096, estimateTokens("tiny"));
+    // Local estimates use full-message serialization so structured payloads count.
+    expect(evaluateSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      4_096,
+      estimateSerializedMessageTokens(turnMessage),
+    );
   });
 
   it("afterTurn records deferred threshold debt instead of compacting inline by default", async () => {
@@ -15478,7 +15491,11 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(assembleResult.messages.map((message) => message.content)).toEqual([
       "current delivery turn",
     ]);
-    expect(assembleResult.estimatedTokens).toBeLessThanOrEqual(10);
+    // The single kept message exceeds the tiny budget; the estimate is the
+    // honest serialized size of what was returned.
+    expect(assembleResult.estimatedTokens).toBe(
+      estimateSerializedMessagesTokens(assembleResult.messages),
+    );
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("[lcm] assemble: degraded live fallback"),
     );

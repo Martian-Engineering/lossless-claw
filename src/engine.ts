@@ -79,7 +79,11 @@ import {
   type LcmSummarizeFn,
 } from "./summarize.js";
 import type { CompleteFn, LcmDependencies, StartupSessionFileCandidate } from "./types.js";
-import { estimateTokens } from "./estimate-tokens.js";
+import {
+  estimateSerializedMessageTokens,
+  estimateSerializedMessagesTokens,
+  estimateTokens,
+} from "./estimate-tokens.js";
 import { buildDeterministicFallbackSummary } from "./summary-fallback.js";
 import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
 import {
@@ -1729,56 +1733,16 @@ function createBootstrapEntryHash(message: StoredMessage | null): string | null 
     .digest("hex");
 }
 
-function estimateMessageContentTokensForAfterTurn(content: unknown): number {
-  if (typeof content === "string") {
-    return estimateTokens(content);
-  }
-  if (Array.isArray(content)) {
-    let total = 0;
-    for (const part of content) {
-      if (!part || typeof part !== "object") {
-        continue;
-      }
-      const record = part as Record<string, unknown>;
-      const text =
-        typeof record.text === "string"
-          ? record.text
-          : typeof record.thinking === "string"
-            ? record.thinking
-            : "";
-      if (text) {
-        total += estimateTokens(text);
-      }
-    }
-    return total;
-  }
-  if (content == null) {
-    return 0;
-  }
-  const serialized = JSON.stringify(content);
-  return estimateTokens(typeof serialized === "string" ? serialized : "");
-}
-
+/**
+ * Estimate live transcript tokens at the model boundary.
+ *
+ * Uses full-message serialization so structured tool-call payloads count.
+ * A text-block-only estimate undercounts tool-heavy transcripts by 2-3x,
+ * which previously let over-budget prompts pass every live pressure check
+ * while the host's LLM-boundary estimate rejected them.
+ */
 function estimateSessionTokenCountForAfterTurn(messages: AgentMessage[]): number {
-  let total = 0;
-  for (const message of messages) {
-    if ("content" in message) {
-      total += estimateMessageContentTokensForAfterTurn(message.content);
-      continue;
-    }
-    if ("command" in message || "output" in message) {
-      const commandText =
-        typeof (message as { command?: unknown }).command === "string"
-          ? (message as { command?: string }).command
-          : "";
-      const outputText =
-        typeof (message as { output?: unknown }).output === "string"
-          ? (message as { output?: string }).output
-          : "";
-      total += estimateTokens(`${commandText}\n${outputText}`);
-    }
-  }
-  return total;
+  return estimateSerializedMessagesTokens(messages);
 }
 
 function normalizeNonNegativeInteger(value: unknown): number | undefined {
@@ -2422,8 +2386,15 @@ function isVolatileLiveInputContent(content: string): boolean {
   );
 }
 
+/**
+ * Estimate live message tokens for prompt-budget math.
+ *
+ * Serializes the full message structure (matching the model-boundary
+ * renderer) instead of the stored-content token count, which omits
+ * structured tool payloads and undercounts tool-heavy live messages.
+ */
 function estimateAgentMessageTokens(messages: AgentMessage[]): number {
-  return messages.reduce((total, message) => total + toStoredMessage(message).tokenCount, 0);
+  return estimateSerializedMessagesTokens(messages);
 }
 
 function stripTrailingAssistantPrefill(messages: AgentMessage[]): AgentMessage[] {
@@ -3368,10 +3339,143 @@ function resolveForkBoundedLiveSuffix(params: {
   return [];
 }
 
+/**
+ * Suffix-trim live messages for prompt bounding, measured by serialized
+ * (model-boundary) token estimate.
+ *
+ * Unlike `trimBootstrapMessagesToBudget` (which selects what to *persist*
+ * during bootstrap and stays on stored-content counts), this bounds what is
+ * *sent to the model*, so it must count structured tool payloads that the
+ * stored-content estimate omits.
+ */
 function trimMessagesToBudget(messages: AgentMessage[], tokenBudget: number): AgentMessage[] {
-  return stripTrailingAssistantPrefill(
-    trimBootstrapMessagesToBudget(messages, Math.max(0, Math.floor(tokenBudget))),
+  const safeMaxTokens = Number.isFinite(tokenBudget) ? Math.max(0, Math.floor(tokenBudget)) : 0;
+  if (messages.length === 0) {
+    return [];
+  }
+  if (safeMaxTokens <= 0) {
+    return stripTrailingAssistantPrefill([messages[messages.length - 1]!]);
+  }
+  const kept: AgentMessage[] = [];
+  let totalTokens = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    const tokenCount = estimateSerializedMessageTokens(message);
+    if (kept.length > 0 && totalTokens + tokenCount > safeMaxTokens) {
+      break;
+    }
+    kept.push(message);
+    totalTokens += tokenCount;
+  }
+  // A single oversized tail message exceeding the budget returns empty,
+  // matching the bootstrap trim contract callers already handle.
+  if (kept.length === 1 && totalTokens > safeMaxTokens) {
+    return [];
+  }
+  kept.reverse();
+  return stripTrailingAssistantPrefill(kept);
+}
+
+/**
+ * Safety ratio applied to the assembly token budget when clamping final
+ * output by serialized (model-boundary) estimate. Leaves headroom for the
+ * host's reserve tokens and renderer overhead beyond our approximation.
+ */
+const SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO = 0.9;
+
+/**
+ * Final budget clamp on assembled output, measured by serialized
+ * (model-boundary) token estimate rather than stored-content counts.
+ *
+ * Assembly budgets enforced on stored token counts can diverge from the
+ * real prompt when live message objects carry structured payloads that
+ * stored content omits (e.g. transcripts imported from a previous harness).
+ * This clamp keeps the newest suffix that fits, drops leading tool results
+ * orphaned by eviction, and re-seats the most recent user turn if eviction
+ * removed every user message.
+ */
+function clampMessagesToSerializedBudget(params: {
+  messages: AgentMessage[];
+  tokenBudget: number;
+}): {
+  messages: AgentMessage[];
+  serializedTokens: number;
+  serializedTokensBefore: number;
+  clamped: boolean;
+  evictedMessages: number;
+  overBudget: boolean;
+} {
+  // Trigger only when the serialized estimate actually exceeds the budget;
+  // once eviction is unavoidable, clamp down to the safety target so the
+  // result leaves headroom for host reserve tokens and renderer overhead.
+  const triggerTokens = Math.max(1, Math.floor(params.tokenBudget));
+  const targetTokens = Math.max(
+    1,
+    Math.floor(params.tokenBudget * SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO),
   );
+  const serializedTokensBefore = estimateSerializedMessagesTokens(params.messages);
+  if (serializedTokensBefore <= triggerTokens || params.messages.length === 0) {
+    return {
+      messages: params.messages,
+      serializedTokens: serializedTokensBefore,
+      serializedTokensBefore,
+      clamped: false,
+      evictedMessages: 0,
+      overBudget: serializedTokensBefore > triggerTokens,
+    };
+  }
+
+  // Keep the newest suffix that fits the target (always at least one message).
+  const kept: AgentMessage[] = [];
+  let keptTokens = 0;
+  for (let index = params.messages.length - 1; index >= 0; index -= 1) {
+    const message = params.messages[index]!;
+    const tokenCount = estimateSerializedMessageTokens(message);
+    if (kept.length > 0 && keptTokens + tokenCount > targetTokens) {
+      break;
+    }
+    kept.push(message);
+    keptTokens += tokenCount;
+  }
+  kept.reverse();
+
+  // Eviction may have removed the assistant tool_use partner of leading
+  // tool results; drop those orphans rather than ship unpaired results.
+  while (kept.length > 1 && toRuntimeRoleForTokenEstimate(kept[0]!.role) === "toolResult") {
+    keptTokens -= estimateSerializedMessageTokens(kept[0]!);
+    kept.shift();
+  }
+
+  // The provider rejects contexts with no user turn; re-seat the most
+  // recent evicted user message if the suffix lost every one of them.
+  if (!kept.some((message) => toRuntimeRoleForTokenEstimate(message.role) === "user")) {
+    for (let index = params.messages.length - kept.length - 1; index >= 0; index -= 1) {
+      const candidate = params.messages[index]!;
+      if (toRuntimeRoleForTokenEstimate(candidate.role) === "user") {
+        kept.unshift(candidate);
+        keptTokens += estimateSerializedMessageTokens(candidate);
+        break;
+      }
+    }
+  }
+
+  // If stripping the assistant tail would empty the result (a transcript
+  // with no user turns at all), keep the unstripped suffix instead; the
+  // estimate must describe whichever set is actually returned.
+  const stripped = stripTrailingAssistantPrefill(kept);
+  const finalMessages = stripped.length > 0 ? stripped : kept;
+  const serializedTokens =
+    finalMessages.length === kept.length
+      ? keptTokens
+      : estimateSerializedMessagesTokens(finalMessages);
+  return {
+    messages: finalMessages,
+    serializedTokens,
+    serializedTokensBefore,
+    clamped: true,
+    evictedMessages: params.messages.length - finalMessages.length,
+    overBudget: serializedTokens > targetTokens,
+  };
 }
 
 function isProtectedLeadingLiveContextMessage(message: AgentMessage): boolean {
@@ -9589,6 +9693,23 @@ export class LcmContextEngine implements ContextEngine {
           ? Math.floor(params.tokenBudget)
           : 128_000,
       );
+      // Bounded variant of safeFallback for paths where this engine manages
+      // the conversation but cannot produce assembled coverage. Returning the
+      // raw live transcript unbounded here is how an over-budget prompt
+      // reaches the model, so clamp it to the budget by serialized estimate.
+      const boundedLiveFallback = (reason: string): AssembleResult => {
+        const fallback = safeFallback();
+        const clamp = clampMessagesToSerializedBudget({
+          messages: fallback.messages,
+          tokenBudget,
+        });
+        if (clamp.clamped || clamp.overBudget) {
+          this.deps.log.warn(
+            `[lcm] assemble: bounded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${reason} serializedTokensBefore=${clamp.serializedTokensBefore} serializedTokens=${clamp.serializedTokens} evictedMessages=${clamp.evictedMessages} tokenBudget=${tokenBudget} overBudget=${clamp.overBudget}`,
+          );
+        }
+        return { messages: clamp.messages, estimatedTokens: clamp.serializedTokens };
+      };
       const liveContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
       const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
         conversation.conversationId,
@@ -9696,7 +9817,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.debug(
           `[lcm] assemble: no context items conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return safeFallback();
+        return boundedLiveFallback("no-context-items");
       }
 
       // Guard against incomplete bootstrap/coverage: if the DB only has
@@ -9712,7 +9833,7 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.debug(
             `[lcm] assemble: falling back to live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${params.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
-          return safeFallback();
+          return boundedLiveFallback("coverage-trails-live");
         }
       }
 
@@ -9765,7 +9886,7 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.debug(
           `[lcm] assemble: empty assembled output, using live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return safeFallback();
+        return boundedLiveFallback("empty-assembled-output");
       }
 
       // Guard: if assembled context contains no user turns at all (e.g. a new session
@@ -9790,12 +9911,12 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.debug(
           `[lcm] assemble: assembled context has no user turns, falling back to live context to prevent prefill errors conversation=${conversation.conversationId} ${sessionLabel} assembledMessages=${preRecallMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        // Use safeFallback() so the result is a *new* array; otherwise the
+        // Bounded fallback still returns a *new* array; otherwise the
         // gateway's `assembled.messages !== sourceMessages` reference-equality
         // check falls through to raw sourceMessages (still ending in assistant)
         // and re-introduces the prefill-rejection bug fixed by safeFallback in
         // the other early-return paths.
-        return safeFallback();
+        return boundedLiveFallback("no-user-turns");
       }
 
       let promptRecallCue: {
@@ -9881,6 +10002,37 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
 
+      // Final budget clamp by serialized (model-boundary) estimate. Internal
+      // budget math above runs on stored-content token counts, which undercount
+      // live messages that carry structured tool payloads; this is the last
+      // line of defense that keeps assembled output deliverable to the model.
+      let serializedClamp = clampMessagesToSerializedBudget({
+        messages: volatileLiveInputAppend.messages,
+        tokenBudget,
+      });
+      if (serializedClamp.clamped && budgetedPromptRecallCue) {
+        // The recall cue is optional enrichment: drop it before evicting any
+        // real context, mirroring the internal cue-vs-eviction priority.
+        const cueMessage = budgetedPromptRecallCue.message;
+        const withoutCue = volatileLiveInputAppend.messages.filter(
+          (message) => message !== cueMessage,
+        );
+        if (withoutCue.length < volatileLiveInputAppend.messages.length) {
+          serializedClamp = clampMessagesToSerializedBudget({
+            messages: withoutCue,
+            tokenBudget,
+          });
+          budgetedPromptRecallCue = null;
+        }
+      }
+      if (serializedClamp.clamped || serializedClamp.overBudget) {
+        this.deps.log.warn(
+          `[lcm] assemble: serialized budget clamp conversation=${conversation.conversationId} ${sessionLabel} serializedTokensBefore=${serializedClamp.serializedTokensBefore} serializedTokens=${serializedClamp.serializedTokens} internalEstimatedTokens=${volatileLiveInputAppend.estimatedTokens} evictedMessages=${serializedClamp.evictedMessages} tokenBudget=${tokenBudget} clamped=${serializedClamp.clamped} overBudget=${serializedClamp.overBudget}`,
+        );
+      }
+      const finalMessages = serializedClamp.messages;
+      const finalEstimatedTokens = serializedClamp.serializedTokens;
+
       // v4.2 §B — surface stub telemetry on the standard "assemble: done" line
       // so live watchers can grep stubbedCount/tokensSaved without needing the
       // full assemble-debug bag.
@@ -9909,12 +10061,12 @@ export class LcmContextEngine implements ContextEngine {
         ? ` contextProjectionFingerprint=${contextProjectionFingerprint}`
         : "";
       this.deps.log.info(
-        `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} summaryContextItems=${summaryContextItems} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${volatileLiveInputAppend.messages.length} tokenBudget=${tokenBudget} estimatedTokens=${volatileLiveInputAppend.estimatedTokens} contextProjectionMode=thread_bootstrap contextProjectionEpoch=${contextProjectionEpoch}${contextProjectionFingerprintLog}${stubStatsLog}${volatileLiveInputLog}${promptRecallLog} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} summaryContextItems=${summaryContextItems} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${finalMessages.length} tokenBudget=${tokenBudget} estimatedTokens=${finalEstimatedTokens} internalEstimatedTokens=${volatileLiveInputAppend.estimatedTokens} serializedClamped=${serializedClamp.clamped} contextProjectionMode=thread_bootstrap contextProjectionEpoch=${contextProjectionEpoch}${contextProjectionFingerprintLog}${stubStatsLog}${volatileLiveInputLog}${promptRecallLog} duration=${formatDurationMs(Date.now() - startedAt)}`,
 
       );
       const prefixChange = describeAssembledPrefixChange(
         this.getPreviousAssembledSnapshot(conversation.conversationId),
-        volatileLiveInputAppend.messages,
+        finalMessages,
       );
       this.setPreviousAssembledSnapshot(
         conversation.conversationId,
@@ -9943,8 +10095,8 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const result: AssembleResult = {
-        messages: volatileLiveInputAppend.messages,
-        estimatedTokens: volatileLiveInputAppend.estimatedTokens,
+        messages: finalMessages,
+        estimatedTokens: finalEstimatedTokens,
         contextProjection: {
           mode: "thread_bootstrap",
           epoch: contextProjectionEpoch,
@@ -9957,7 +10109,26 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.debug(
         `[lcm] assemble: failed for session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} error=${describeLogError(err)}`,
       );
-      return safeFallback();
+      // Clamp even the error fallback: an unbounded live transcript here is
+      // exactly how an over-budget prompt reaches the model.
+      const fallback = safeFallback();
+      const fallbackBudget = this.applyAssemblyBudgetCap(
+        typeof params.tokenBudget === "number" &&
+        Number.isFinite(params.tokenBudget) &&
+        params.tokenBudget > 0
+          ? Math.floor(params.tokenBudget)
+          : 128_000,
+      );
+      const clamp = clampMessagesToSerializedBudget({
+        messages: fallback.messages,
+        tokenBudget: fallbackBudget,
+      });
+      if (clamp.clamped || clamp.overBudget) {
+        this.deps.log.warn(
+          `[lcm] assemble: bounded live fallback session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=assemble-error serializedTokensBefore=${clamp.serializedTokensBefore} serializedTokens=${clamp.serializedTokens} evictedMessages=${clamp.evictedMessages} tokenBudget=${fallbackBudget} overBudget=${clamp.overBudget}`,
+        );
+      }
+      return { messages: clamp.messages, estimatedTokens: clamp.serializedTokens };
     }
   }
 
