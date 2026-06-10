@@ -4025,6 +4025,34 @@ export class LcmContextEngine implements ContextEngine {
     return new Date(state.backoffUntil);
   }
 
+  /**
+   * Operation-wide deadline for chaining threshold sweeps within a single
+   * compact() attempt. Reuses the compactUntilUnder operation deadline so
+   * both recovery loops share one wall-clock contract.
+   */
+  private resolveSweepChainDeadlineMs(): number {
+    return this.resolvePositiveConfigInteger(this.config.compactUntilUnderDeadlineMs, 300_000);
+  }
+
+  /**
+   * Clear an open spend backoff for a scope, returning the prior expiry if
+   * one was open. Used by user-initiated compaction: an explicit repair
+   * request is informed consent to spend, so it must not silently no-op
+   * behind a backoff opened by an earlier automatic attempt.
+   */
+  private clearSummarySpendBackoff(scopeKey: string): Date | null {
+    const state = this.summarySpendGuardStates.get(scopeKey);
+    if (!state?.backoffUntil || state.backoffUntil <= Date.now()) {
+      return null;
+    }
+    const previous = new Date(state.backoffUntil);
+    state.backoffUntil = null;
+    state.lastReason = null;
+    state.windowStartedAt = Date.now();
+    state.calls = 0;
+    return previous;
+  }
+
   private assertSummarySpendCallAllowed(params: {
     scopeKey: string;
     reason: string;
@@ -4814,6 +4842,14 @@ export class LcmContextEngine implements ContextEngine {
       kind: "compaction",
       scope: compactionScope,
     });
+    if (manualCompactionRequested) {
+      const clearedBackoffUntil = this.clearSummarySpendBackoff(summarySpendScopeKey);
+      if (clearedBackoffUntil) {
+        this.deps.log.info(
+          `[lcm] compact: manual request cleared summary spend backoff conversation=${params.conversationId} ${sessionLabel} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
+        );
+      }
+    }
     const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
       legacyParams: this.buildSummarizerLegacyParams({
         legacyParams,
@@ -4919,9 +4955,32 @@ export class LcmContextEngine implements ContextEngine {
         forceCompaction ||
         runtimeAdjustedSweepTargetTokens !== undefined ||
         projectedRawBacklogPressure;
-      let sweepResult: Awaited<ReturnType<CompactionEngine["compact"]>>;
-      try {
-        sweepResult = await this.compaction.compact({
+      const isThresholdSweep = params.compactionTarget === "threshold";
+      // Per-round helpers so the chain loop below can re-evaluate target
+      // pressure after every sweep with the same projection rules.
+      const resolveSweepTokensAfter = (
+        result: Awaited<ReturnType<CompactionEngine["compact"]>>,
+      ): number | undefined =>
+        typeof result.tokensAfter === "number" && Number.isFinite(result.tokensAfter)
+          ? result.tokensAfter
+          : undefined;
+      const projectSweepTokensAfter = (tokensAfter: number | undefined): number | undefined =>
+        tokensAfter !== undefined &&
+        (runtimeAdjustedSweepTargetTokens !== undefined || projectedRawBacklogPressure)
+          ? tokensAfter + observedRuntimeOverhead
+          : tokensAfter;
+      const isUnderTargetAfter = (
+        result: Awaited<ReturnType<CompactionEngine["compact"]>>,
+      ): boolean => {
+        const projected = projectSweepTokensAfter(resolveSweepTokensAfter(result));
+        return projected !== undefined
+          ? projected <= targetTokens
+          : isThresholdSweep
+            ? false
+            : !liveContextStillExceedsTarget;
+      };
+      const runSweepOnce = (): ReturnType<CompactionEngine["compact"]> =>
+        this.compaction.compact({
           conversationId,
           tokenBudget,
           summarize,
@@ -4932,6 +4991,10 @@ export class LcmContextEngine implements ContextEngine {
             ? { stopAtTokens: runtimeAdjustedSweepTargetTokens }
             : {}),
         });
+
+      let sweepResult: Awaited<ReturnType<CompactionEngine["compact"]>>;
+      try {
+        sweepResult = await runSweepOnce();
       } catch (err) {
         if (err instanceof LcmSummarySpendLimitError) {
           this.deps.log.warn(
@@ -4946,6 +5009,55 @@ export class LcmContextEngine implements ContextEngine {
         throw err;
       }
 
+      // A single sweep is bounded by its own wall-clock deadline and can end
+      // mid-recovery with real progress persisted. Chain further sweeps while
+      // each round keeps reducing tokens and the target is still above us,
+      // bounded by the operation-wide deadline, instead of failing the
+      // attempt and punishing progress with a spend backoff.
+      let chainedSweeps = 1;
+      let lastRoundMadeProgress = sweepResult.actionTaken === true;
+      const sweepChainDeadlineAt = startedAt + this.resolveSweepChainDeadlineMs();
+      const maxChainedSweeps = this.resolvePositiveConfigInteger(
+        this.config.maxSweepIterations,
+        12,
+      );
+      let previousTokensAfter = resolveSweepTokensAfter(sweepResult);
+      while (
+        isThresholdSweep &&
+        !sweepResult.authFailure &&
+        lastRoundMadeProgress &&
+        !isUnderTargetAfter(sweepResult) &&
+        chainedSweeps < maxChainedSweeps &&
+        Date.now() < sweepChainDeadlineAt
+      ) {
+        let next: Awaited<ReturnType<CompactionEngine["compact"]>>;
+        try {
+          next = await runSweepOnce();
+        } catch (err) {
+          if (err instanceof LcmSummarySpendLimitError) {
+            // The per-window call guard tripped mid-chain; keep the progress
+            // already persisted and let the normal result handling proceed.
+            this.deps.log.warn(
+              `[lcm] compact: spend guard stopped sweep chain conversation=${conversationId} ${sessionLabel} scope=${err.scopeKey} chainedSweeps=${chainedSweeps} backoffUntil=${err.backoffUntil.toISOString()}`,
+            );
+            break;
+          }
+          throw err;
+        }
+        chainedSweeps += 1;
+        const nextTokensAfter = resolveSweepTokensAfter(next);
+        lastRoundMadeProgress =
+          next.actionTaken === true &&
+          (previousTokensAfter === undefined ||
+            (nextTokensAfter !== undefined && nextTokensAfter < previousTokensAfter));
+        sweepResult = {
+          ...next,
+          actionTaken: sweepResult.actionTaken || next.actionTaken,
+          createdSummaryId: next.createdSummaryId ?? sweepResult.createdSummaryId,
+        };
+        previousTokensAfter = nextTokensAfter ?? previousTokensAfter;
+      }
+
       if (sweepResult.authFailure && breakerKey) {
         this.recordCompactionAuthFailure(breakerKey);
       } else if (sweepResult.actionTaken && breakerKey) {
@@ -4954,22 +5066,9 @@ export class LcmContextEngine implements ContextEngine {
       if (sweepResult.actionTaken) {
         await this.markLeafCompactionTelemetrySuccess({ conversationId });
       }
-      const sweepTokensAfter =
-        typeof sweepResult.tokensAfter === "number" && Number.isFinite(sweepResult.tokensAfter)
-          ? sweepResult.tokensAfter
-          : undefined;
-      const projectedTokensAfterSweep =
-        sweepTokensAfter !== undefined &&
-        (runtimeAdjustedSweepTargetTokens !== undefined || projectedRawBacklogPressure)
-          ? sweepTokensAfter + observedRuntimeOverhead
-          : sweepTokensAfter;
-      const isThresholdSweep = params.compactionTarget === "threshold";
-      const isUnderTargetAfterSweep =
-        projectedTokensAfterSweep !== undefined
-          ? projectedTokensAfterSweep <= targetTokens
-          : isThresholdSweep
-            ? false
-            : !liveContextStillExceedsTarget;
+      const sweepTokensAfter = resolveSweepTokensAfter(sweepResult);
+      const projectedTokensAfterSweep = projectSweepTokensAfter(sweepTokensAfter);
+      const isUnderTargetAfterSweep = isUnderTargetAfter(sweepResult);
       const thresholdSweepStillOverTarget =
         isThresholdSweep && sweepResult.actionTaken && !isUnderTargetAfterSweep;
       const thresholdSweepStoppedAtBudget =
@@ -5004,14 +5103,26 @@ export class LcmContextEngine implements ContextEngine {
             : manualCompactionRequested
               ? "nothing to compact"
               : "live context still exceeds target";
+      let spendBackoffOpened = false;
       if (thresholdSweepStillOverTarget && !sweepResult.authFailure) {
-        this.openSummarySpendBackoff({
-          scopeKey: summarySpendScopeKey,
-          reason: sweepReason,
-        });
+        if (lastRoundMadeProgress) {
+          // The attempt ended at a deadline while still reducing tokens.
+          // Progress is persisted; the deferred drain or next attempt
+          // continues from here, so opening a backoff would only punish
+          // a recovery that is working.
+          this.deps.log.info(
+            `[lcm] compact: spend backoff skipped conversation=${conversationId} ${sessionLabel} scope=${summarySpendScopeKey} reason=still_progressing chainedSweeps=${chainedSweeps} tokensAfter=${sweepResult.tokensAfter}`,
+          );
+        } else {
+          this.openSummarySpendBackoff({
+            scopeKey: summarySpendScopeKey,
+            reason: sweepReason,
+          });
+          spendBackoffOpened = true;
+        }
       }
       this.deps.log.info(
-        `[lcm] compact: done conversation=${conversationId} ${sessionLabel} ok=${sweepOk} compacted=${sweepResult.actionTaken} reason=${sweepReason.replaceAll(" ", "_")} tokensBefore=${decision.currentTokens} tokensAfter=${sweepResult.tokensAfter} createdSummaryId=${sweepResult.createdSummaryId ?? "none"} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        `[lcm] compact: done conversation=${conversationId} ${sessionLabel} ok=${sweepOk} compacted=${sweepResult.actionTaken} reason=${sweepReason.replaceAll(" ", "_")} tokensBefore=${decision.currentTokens} tokensAfter=${sweepResult.tokensAfter} createdSummaryId=${sweepResult.createdSummaryId ?? "none"} chainedSweeps=${chainedSweeps} spendBackoffOpened=${spendBackoffOpened} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
 
       return {
@@ -5023,7 +5134,7 @@ export class LcmContextEngine implements ContextEngine {
           tokensBefore: decision.currentTokens,
           tokensAfter: sweepResult.tokensAfter,
           details: {
-            rounds: sweepResult.actionTaken ? 1 : 0,
+            rounds: sweepResult.actionTaken ? chainedSweeps : 0,
             targetTokens: runtimeAdjustedSweepTargetTokens ?? targetTokens,
             ...(runtimeAdjustedSweepTargetTokens !== undefined || projectedRawBacklogPressure
               ? {
