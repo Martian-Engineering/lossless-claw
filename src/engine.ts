@@ -7883,6 +7883,15 @@ export class LcmContextEngine implements ContextEngine {
     lastPersistedAt: Date | null;
     firstCandidateAt: number | null;
   }> {
+    if (isLikelyInjectedDeliveryOnlyTranscript(params.candidateMessages)) {
+      return {
+        fresh: false,
+        reason: "delivery-only-synthetic-transcript",
+        lastPersistedAt: null,
+        firstCandidateAt: null,
+      };
+    }
+
     // Every candidate must carry a usable timestamp (message timestamp or
     // transcript envelope timestamp); any untimestamped entry means the
     // transcript's age cannot be proven, so fail closed.
@@ -7957,11 +7966,13 @@ export class LcmContextEngine implements ContextEngine {
         firstCandidateAt,
       };
     }
+    let checkedCandidateIdentity = false;
     for (const message of params.candidateMessages) {
       const stored = toStoredMessage(message);
       if (stored.content.trim().length === 0) {
         continue;
       }
+      checkedCandidateIdentity = true;
       if (persistedIdentities.has(messageIdentity(stored.role, stored.content))) {
         return {
           fresh: false,
@@ -7970,6 +7981,14 @@ export class LcmContextEngine implements ContextEngine {
           firstCandidateAt,
         };
       }
+    }
+    if (!checkedCandidateIdentity) {
+      return {
+        fresh: false,
+        reason: "no-comparable-candidate-content",
+        lastPersistedAt: lastPersisted.createdAt,
+        firstCandidateAt,
+      };
     }
 
     return { fresh: true, reason: "fresh", lastPersistedAt: lastPersisted.createdAt, firstCandidateAt };

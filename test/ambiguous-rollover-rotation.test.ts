@@ -238,7 +238,7 @@ async function seedFrozenLane(
  */
 function writeRolledTranscript(params: {
   name: string;
-  entries: Array<{ role: string; text: string; timestamp?: number }>;
+  entries: Array<{ role: string; text?: string; content?: unknown; timestamp?: number }>;
 }): string {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-rollover-file-"));
   tempDirs.push(tempDir);
@@ -253,7 +253,7 @@ function writeRolledTranscript(params: {
       timestamp: new Date(entry.timestamp ?? Date.now()).toISOString(),
       message: {
         role: entry.role,
-        content: [{ type: "text", text: entry.text }],
+        content: entry.content ?? [{ type: "text", text: entry.text ?? "" }],
         ...(entry.timestamp !== undefined ? { timestamp: entry.timestamp } : {}),
       },
     });
@@ -432,6 +432,88 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       .getConversationStore()
       .getConversationBySessionKey(SESSION_KEY);
     expect(conversation?.conversationId).toBe(lane.conversationId);
+  });
+
+  it("stays frozen when the rolled transcript contains only delivery/config traffic", async () => {
+    const { engine, log, db } = createEngine();
+    const lane = await seedFrozenLane(engine, db);
+
+    const newSessionFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-delivery-only`,
+      entries: [
+        {
+          role: "system",
+          text: "delivery-mirror: delivered pending runtime notification",
+          timestamp: Date.now() + 60_000,
+        },
+        {
+          role: "system",
+          text: "config audit: refreshed runtime delivery settings",
+          timestamp: Date.now() + 60_001,
+        },
+      ],
+    });
+
+    const result = await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(result.bootstrapped).toBe(false);
+    expect(result.reason).toBe("ambiguous session-key runtime rollover");
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=delivery-only-synthetic-transcript"),
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rotation"),
+    );
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(conversation?.conversationId).toBe(lane.conversationId);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
+  });
+
+  it("stays frozen when the rolled transcript has no comparable message content", async () => {
+    const { engine, log, db } = createEngine();
+    const lane = await seedFrozenLane(engine, db);
+
+    const newSessionFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-empty-content`,
+      entries: [
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu-empty", name: "noop", input: {} }],
+          timestamp: Date.now() + 60_000,
+        },
+        {
+          role: "assistant",
+          content: [{ type: "reasoning", text: "private chain" }],
+          timestamp: Date.now() + 60_001,
+        },
+      ],
+    });
+
+    const result = await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(result.bootstrapped).toBe(false);
+    expect(result.reason).toBe("ambiguous session-key runtime rollover");
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=no-comparable-candidate-content"),
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rotation"),
+    );
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(conversation?.conversationId).toBe(lane.conversationId);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
   });
 
   it("assemble never rotates: live-window evidence is not transcript evidence", async () => {
