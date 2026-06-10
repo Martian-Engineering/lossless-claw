@@ -126,7 +126,7 @@ independently with tests green.
 any host that writes entry IDs. Flood guards stop being the only line of
 defense.
 
-### Phase 2 — Transcript as the single persistence source in `afterTurn`
+### Phase 2 — Exact runtime-batch alignment against the covered frontier
 
 - `TranscriptReconcileResult` gains `transcriptCovered: boolean` — true only
   when the reconcile path actually read the transcript to EOF (append-only
@@ -134,17 +134,32 @@ defense.
   overlap / imported). The missing-file and unreadable-file fallbacks that
   return `hasOverlap: true` to "allow live afterTurn persistence" set it
   false.
-- In `afterTurn`: when `transcriptCovered` is true, the runtime messages
-  array is **not** persisted (the transcript reconcile already imported the
-  turn; if the host flushed the transcript late, the next turn's append-only
-  read imports the remainder idempotently). When false, the existing
-  runtime-array path runs unchanged.
+- *(Adjusted during implementation.)* The original plan — skip runtime-array
+  persistence entirely when covered — is unsafe: the host can fire
+  `afterTurn` before flushing the turn's tail to the transcript, and the
+  regression suite encodes that case. Reading the file to EOF proves the DB
+  matches the file, not that the file contains the turn.
+- Instead, when covered, the runtime batch is reconciled by **exact tail
+  alignment** (`alignRuntimeBatchAgainstCoveredFrontier`): because the DB
+  tail now provably equals the transcript frontier, either (a) the batch
+  aligns fully with the tail — nothing to ingest, (b) a prefix aligns —
+  ingest only the flush-lagged remainder, or (c) nothing aligns — ingest all
+  if the batch has zero persisted-identity overlap (genuinely unflushed
+  turn), otherwise fail closed (stale replay snapshot; the next covered
+  transcript read delivers anything real, idempotently).
+- Flush-lagged messages persisted from the runtime array carry no entry id;
+  when the transcript catches up, the existing identity-overlap guards
+  (append-only overlap check + anchor scan) dedupe the catch-up entries.
+  This cross-pipeline overlap is why Phase 3's entry-id set-difference
+  import must *adopt* identity-matched NULL-entry-id tail rows (stamp the
+  entry id onto the matched row) rather than blindly importing every
+  missing id.
 - `deduplicateAfterTurnBatch` and its oversized/suffix fallbacks remain for
-  the not-covered fallback path only, and are no longer load-bearing on the
-  common path.
+  the not-covered fallback path only.
 
-**Effect:** on the common path there is exactly one writer. The
-dual-pipeline dedup heuristics stop running every turn.
+**Effect:** on the common path the heuristic dedup stack is replaced by one
+exact, explainable rule, and every fail-closed outcome is self-healing via
+the next turn's idempotent transcript read.
 
 ### Phase 3 — Declared epochs and exact checkpoints
 
@@ -232,8 +247,8 @@ memo cache become legacy-only paths.
 
 - [x] Phase 1 — envelope-preserving parser, `transcript_entry_id` column +
   partial unique index, entry-ID idempotent ingest
-- [ ] Phase 2 — `transcriptCovered` gating; runtime array persists only as
-  fallback
+- [x] Phase 2 — `transcriptCovered` + exact covered-frontier alignment;
+  heuristic dedup retained only for uncovered paths
 - [ ] Phase 3 — session-header epochs, entry-ID checkpoints, set-difference
   import
 - [ ] Phase 4 — pure `planTranscriptImport` planner + `src/transcript.ts`

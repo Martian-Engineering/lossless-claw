@@ -706,6 +706,23 @@ export class ConversationStore {
     return rows.map(toMessageRecord);
   }
 
+  /** Last `count` messages in seq order (oldest of the tail first). */
+  async getLastMessages(conversationId: ConversationId, count: number): Promise<MessageRecord[]> {
+    if (count <= 0) {
+      return [];
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+       FROM messages
+       WHERE conversation_id = ?
+       ORDER BY seq DESC
+       LIMIT ?`,
+      )
+      .all(conversationId, Math.floor(count)) as unknown as MessageRow[];
+    return rows.reverse().map(toMessageRecord);
+  }
+
   async getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(

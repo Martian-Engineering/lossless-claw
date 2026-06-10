@@ -3284,6 +3284,16 @@ type TranscriptReconcileResult = {
     | "ambiguous-session-key-runtime-rollover";
   importedMessages: number;
   hasOverlap: boolean;
+  /**
+   * True only when the transcript file was actually read to its frontier and
+   * reconciled into the DB this call (or proven already reconciled). When
+   * true, the transcript is the single persistence source for the turn and
+   * afterTurn must NOT also persist the runtime messages array; flush-lagged
+   * tail messages arrive on the next turn's append-only read, idempotently.
+   * False on every path that allows live runtime persistence because the
+   * transcript was missing, unreadable, or skipped.
+   */
+  transcriptCovered?: boolean;
 };
 
 type AmbiguousSessionKeyRuntimeRollover = {
@@ -6824,6 +6834,8 @@ export class LcmContextEngine implements ContextEngine {
             return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
           }
           if (batchLooksLikeHeartbeatAckTurn(historicalMessages)) {
+            // Not covered: the runtime batch path owns conversation creation
+            // and heartbeat-ack pruning for brand-new sessions.
             return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
           }
           const bootstrapMessages = trimBootstrapMessagesToBudget(
@@ -6869,6 +6881,7 @@ export class LcmContextEngine implements ContextEngine {
             importedMessages,
             blockedByImportCap: bootstrapMessages.length < historicalMessages.length,
             hasOverlap: true,
+            transcriptCovered: true,
           };
         }
 
@@ -6921,7 +6934,14 @@ export class LcmContextEngine implements ContextEngine {
                   `[lcm] afterTurn: skipped heartbeat transcript append-only delta and refreshed checkpoint conversation=${conversation.conversationId} sessionFile=${params.sessionFile} appendedMessages=${appended.messages.length}`,
                 );
               }
-              return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+              // Heartbeat turns are never persisted; the append-only delta is
+              // intentionally skipped, so the transcript counts as covered.
+              return {
+                importedMessages: 0,
+                blockedByImportCap: false,
+                hasOverlap: true,
+                transcriptCovered: true,
+              };
             }
             if (placeholderCheckpoint && appended.messages.length > 0) {
               const reconcile = await this.reconcileSessionTail({
@@ -6942,7 +6962,10 @@ export class LcmContextEngine implements ContextEngine {
                   sessionFile: params.sessionFile,
                 });
               }
-              return reconcile;
+              return {
+                ...reconcile,
+                transcriptCovered: reconcile.hasOverlap || reconcile.importedMessages > 0,
+              };
             }
 
             const appendOnlySessionContext = this.formatSessionLogContext({
@@ -6988,7 +7011,12 @@ export class LcmContextEngine implements ContextEngine {
                   sessionFile: params.sessionFile,
                 });
               }
-              return { importedMessages, blockedByImportCap: false, hasOverlap: true };
+              return {
+                importedMessages,
+                blockedByImportCap: false,
+                hasOverlap: true,
+                transcriptCovered: true,
+              };
             }
           }
         }
@@ -7019,7 +7047,14 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.debug(
             `[lcm] afterTurn: transcript reconcile slow path skipped (file state already read this process) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
           );
-          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+          // The memo is only populated after a successful covered full read,
+          // and the file has not changed since — still covered.
+          return {
+            importedMessages: 0,
+            blockedByImportCap: false,
+            hasOverlap: true,
+            transcriptCovered: true,
+          };
         }
 
         const rememberSlowReadState = (): void => {
@@ -7177,6 +7212,8 @@ export class LcmContextEngine implements ContextEngine {
               `[lcm] afterTurn: transcript reconcile slow path read empty messages from non-empty file (${sessionFileState?.size ?? "?"} bytes) — skipping checkpoint refresh to avoid dropping messages on parser failure conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
             );
           }
+          // An empty transcript cannot carry the turn — let the runtime
+          // batch persist it (transcriptCovered stays false).
           return {
             importedMessages: 0,
             blockedByImportCap: false,
@@ -7262,6 +7299,7 @@ export class LcmContextEngine implements ContextEngine {
           importedMessages: reconcile.importedMessages,
           blockedByImportCap: false,
           hasOverlap: reconcile.hasOverlap,
+          transcriptCovered: true,
         };
   }
 
@@ -8075,6 +8113,67 @@ export class LcmContextEngine implements ContextEngine {
    *    is prepended — synthetic summaries can no longer interfere with
    *    replay detection
    */
+  /**
+   * After a covered transcript reconcile the DB tail IS the transcript
+   * frontier, so the runtime turn delta needs exact alignment, not heuristic
+   * dedup. Three cases:
+   *  - the transcript flushed the whole turn: the batch aligns fully with the
+   *    DB tail — nothing to ingest;
+   *  - the transcript flush lagged mid-turn: a prefix of the batch aligns
+   *    with the DB tail — ingest only the remainder;
+   *  - no tail alignment: a batch with zero persisted-identity overlap is a
+   *    genuinely unflushed new turn (ingest all); any overlap means a stale
+   *    replay snapshot — fail closed, because a covered transcript read will
+   *    deliver anything real on the next turn idempotently.
+   */
+  private async alignRuntimeBatchAgainstCoveredFrontier(
+    sessionId: string,
+    sessionKey: string | undefined,
+    batch: AgentMessage[],
+  ): Promise<AgentMessage[]> {
+    if (batch.length === 0) return batch;
+
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    if (!conversation) return batch;
+    const conversationId = conversation.conversationId;
+
+    const storedBatch = batch.map((message) => toStoredMessage(message));
+    const tail = await this.conversationStore.getLastMessages(conversationId, batch.length);
+    for (let k = Math.min(tail.length, batch.length); k > 0; k -= 1) {
+      const tailSlice = tail.slice(tail.length - k);
+      let aligned = true;
+      for (let i = 0; i < k; i += 1) {
+        if (
+          messageIdentity(tailSlice[i]!.role, tailSlice[i]!.content) !==
+          messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
+        ) {
+          aligned = false;
+          break;
+        }
+      }
+      if (aligned) {
+        return batch.slice(k);
+      }
+    }
+
+    let persistedIdentityOverlaps = 0;
+    for (const stored of storedBatch) {
+      if (await this.conversationStore.hasMessage(conversationId, stored.role, stored.content)) {
+        persistedIdentityOverlaps += 1;
+      }
+    }
+    if (persistedIdentityOverlaps > 0) {
+      this.deps.log.warn(
+        `[lcm] afterTurn: runtime batch does not align with the covered transcript frontier and overlaps persisted history (${persistedIdentityOverlaps}/${batch.length}); failing closed — the transcript reconcile delivers real messages next turn conversation=${conversationId}`,
+      );
+      return [];
+    }
+    return batch;
+  }
+
   private async deduplicateAfterTurnBatch(
     sessionId: string,
     sessionKey: string | undefined,
@@ -8883,6 +8982,21 @@ export class LcmContextEngine implements ContextEngine {
       if (transcriptReconcileBlockedByAmbiguousRollover) {
         await runRuntimeAutoRotate();
         return;
+      }
+    } else if (transcriptReconcileResult.transcriptCovered) {
+      // The transcript reconcile read the file to its frontier, so the DB
+      // tail is exact — use precise alignment instead of the heuristic
+      // dedup stack, and persist only what the transcript flush has not
+      // delivered yet.
+      dedupedNewMessages = await this.alignRuntimeBatchAgainstCoveredFrontier(
+        params.sessionId,
+        params.sessionKey,
+        newMessages,
+      );
+      if (newMessages.length > 0 && dedupedNewMessages.length < newMessages.length) {
+        this.deps.log.debug(
+          `[lcm] afterTurn: transcript covered the frontier; runtime batch aligned to ${dedupedNewMessages.length}/${newMessages.length} unflushed messages ${sessionLabel}`,
+        );
       }
     } else {
       dedupedNewMessages = await this.deduplicateAfterTurnBatch(

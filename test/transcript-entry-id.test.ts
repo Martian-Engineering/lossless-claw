@@ -408,3 +408,109 @@ describe("entry-id idempotent ingest", () => {
     expect(countAfter).toBe(countBefore);
   });
 });
+
+describe("afterTurn covered-frontier alignment", () => {
+  function makeMessage(role: AgentMessage["role"], text: string): AgentMessage {
+    return { role, content: [{ type: "text", text }] } as AgentMessage;
+  }
+
+  it("does not duplicate a turn that the transcript already flushed", async () => {
+    const sessionFile = createSessionFilePath("covered-full-flush");
+    const manager = SessionManager.open(sessionFile);
+    appendSessionMessage(manager, makeMessage("user", "question one"));
+    appendSessionMessage(manager, makeMessage("assistant", "answer one"));
+
+    const engine = createEngine();
+    const sessionId = "covered-full-flush";
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("user", "question one"), makeMessage("assistant", "answer one")],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual(["question one", "answer one"]);
+  });
+
+  it("persists only the flush-lagged remainder, then dedupes the transcript catch-up", async () => {
+    const sessionFile = createSessionFilePath("covered-flush-lag");
+    const manager = SessionManager.open(sessionFile);
+    appendSessionMessage(manager, makeMessage("user", "question one"));
+
+    const engine = createEngine();
+    const sessionId = "covered-flush-lag";
+    // Turn 1: the transcript flushed only the user prompt; the assistant
+    // reply exists only in the runtime batch.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("user", "question one"), makeMessage("assistant", "answer one")],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const conversationId = conversation!.conversationId;
+    const afterTurnOne = await engine.getConversationStore().getMessages(conversationId);
+    expect(afterTurnOne.map((message) => message.content)).toEqual([
+      "question one",
+      "answer one",
+    ]);
+
+    // Turn 2: the transcript catches up (flushes the assistant reply) and a
+    // new prompt arrives. The caught-up reply must not import twice even
+    // though the transcript copy carries an entry id and the runtime row
+    // does not.
+    appendSessionMessage(manager, makeMessage("assistant", "answer one"));
+    appendSessionMessage(manager, makeMessage("user", "question two"));
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("user", "question two"), makeMessage("assistant", "answer two")],
+      prePromptMessageCount: 0,
+    });
+
+    const afterTurnTwo = await engine.getConversationStore().getMessages(conversationId);
+    expect(afterTurnTwo.map((message) => message.content)).toEqual([
+      "question one",
+      "answer one",
+      "question two",
+      "answer two",
+    ]);
+  });
+
+  it("fails closed on a stale replay batch that overlaps persisted history", async () => {
+    const sessionFile = createSessionFilePath("covered-stale-replay");
+    const manager = SessionManager.open(sessionFile);
+    const texts = ["turn one", "turn two", "turn three", "turn four"];
+    for (const [index, text] of texts.entries()) {
+      appendSessionMessage(manager, makeMessage(index % 2 === 0 ? "user" : "assistant", text));
+    }
+
+    const engine = createEngine();
+    const sessionId = "covered-stale-replay";
+    await engine.bootstrap({ sessionId, sessionFile });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const conversationId = conversation!.conversationId;
+    expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(4);
+
+    // Stale runtime snapshot replaying the middle of history: no tail
+    // alignment, but identity overlap with persisted rows.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("assistant", "turn two"), makeMessage("user", "turn three")],
+      prePromptMessageCount: 0,
+    });
+
+    expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(4);
+  });
+});
