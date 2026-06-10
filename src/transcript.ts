@@ -187,6 +187,12 @@ type TranscriptLineRecord = {
   message: AgentMessage | null;
 };
 
+/** Minimal linkage every leaf-path walk participant must expose. */
+type TranscriptTreeNode = {
+  entryId: string | null;
+  parentId: string | null;
+};
+
 /**
  * Select the active leaf path from parsed transcript lines, or null when the
  * file is not eligible for path-following and the caller must flatten.
@@ -202,20 +208,20 @@ type TranscriptLineRecord = {
  * last occurrence. A mid-file `parentId: null` reached from the leaf is a
  * genuine root (host resetLeaf); entries before it are an abandoned branch.
  */
-function selectLeafPathRecords(records: TranscriptLineRecord[]): TranscriptLineRecord[] | null {
+function selectLeafPathRecords<T extends TranscriptTreeNode>(records: T[]): T[] | null {
   if (records.length === 0) {
     return null;
   }
-  const byId = new Map<string, TranscriptLineRecord>();
+  const byId = new Map<string, T>();
   for (const record of records) {
     if (!record.entryId) {
       return null;
     }
     byId.set(record.entryId, record);
   }
-  const path: TranscriptLineRecord[] = [];
+  const path: T[] = [];
   const visited = new Set<string>();
-  let current: TranscriptLineRecord | undefined = records[records.length - 1];
+  let current: T | undefined = records[records.length - 1];
   while (current) {
     const currentId = current.entryId!;
     if (visited.has(currentId)) {
@@ -333,6 +339,65 @@ export async function readLeafPathMessages(sessionFile: string): Promise<AgentMe
     return flattened;
   } catch {
     return [];
+  }
+}
+
+/** Raw transcript entry line as parsed JSON, envelope fields untouched. */
+export type TranscriptRawEntry = Record<string, unknown>;
+
+export type TranscriptRawLeafPath = {
+  /** The raw `{type:"session", ...}` header line, or null when absent. */
+  header: TranscriptRawEntry | null;
+  /**
+   * Entries of every type on the active leaf path in root→leaf order, or in
+   * file order when the file lacks full id coverage (flatten fallback).
+   */
+  entries: TranscriptRawEntry[];
+};
+
+/**
+ * Read a JSONL transcript's raw entries along the active leaf path. This is
+ * the read-only replacement for opening the file with a SessionManager —
+ * unlike `SessionManager.open`, it never migrates or rewrites the file.
+ * Non-message entry types (session_info, model_change, compaction, custom,
+ * ...) are included; the session header is returned separately.
+ */
+export async function readLeafPathRawEntries(sessionFile: string): Promise<TranscriptRawLeafPath> {
+  const result: TranscriptRawLeafPath = { header: null, entries: [] };
+  try {
+    const stream = createReadStream(sessionFile, { encoding: "utf8" });
+    const lines = createInterface({
+      input: stream,
+      crlfDelay: Infinity,
+    });
+    const records: Array<TranscriptTreeNode & { raw: TranscriptRawEntry }> = [];
+    for await (const line of lines) {
+      const item = line.trim();
+      if (!item) {
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(item);
+      } catch {
+        continue;
+      }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        continue;
+      }
+      const raw = parsed as TranscriptRawEntry;
+      if (raw.type === "session") {
+        result.header ??= raw;
+        continue;
+      }
+      const meta = extractEnvelopeMeta(raw);
+      records.push({ entryId: meta.entryId, parentId: meta.parentId, raw });
+    }
+    const leafPath = selectLeafPathRecords(records);
+    result.entries = (leafPath ?? records).map((record) => record.raw);
+    return result;
+  } catch {
+    return result;
   }
 }
 

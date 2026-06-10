@@ -5,7 +5,6 @@ import type { FileHandle } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
   ContextEngine,
   ContextEngineInfo,
@@ -95,8 +94,10 @@ import {
   readAppendedLeafPathMessages,
   readLastJsonlEntryBeforeOffset,
   readLeafPathMessages,
+  readLeafPathRawEntries,
   readSessionParentSessionReference,
   readTranscriptHeader,
+  type TranscriptRawEntry,
 } from "./transcript.js";
 import { resolveEpochRoute, selectEntryIdTail, transcriptImportCap } from "./reconcile-plan.js";
 
@@ -758,17 +759,22 @@ function extractTranscriptToolCallId(message: AgentMessage): string | undefined 
   return undefined;
 }
 
-function listTranscriptToolResultEntryIdsByCallId(sessionFile: string): Map<string, string> {
-  const sessionManager = SessionManager.open(sessionFile);
-  const branch = sessionManager.getBranch();
+async function listTranscriptToolResultEntryIdsByCallId(
+  sessionFile: string,
+): Promise<Map<string, string>> {
+  const leafPathMessages = await readLeafPathMessages(sessionFile);
   const entryIdsByCallId = new Map<string, string>();
   const duplicateCallIds = new Set<string>();
 
-  for (const entry of branch) {
-    if (entry.type !== "message" || entry.message.role !== "toolResult") {
+  for (const message of leafPathMessages) {
+    if (message.role !== "toolResult") {
       continue;
     }
-    const toolCallId = extractTranscriptToolCallId(entry.message as AgentMessage);
+    const entryId = getTranscriptEntryId(message);
+    if (!entryId) {
+      continue;
+    }
+    const toolCallId = extractTranscriptToolCallId(message);
     if (!toolCallId) {
       continue;
     }
@@ -776,7 +782,7 @@ function listTranscriptToolResultEntryIdsByCallId(sessionFile: string): Map<stri
       duplicateCallIds.add(toolCallId);
       continue;
     }
-    entryIdsByCallId.set(toolCallId, entry.id);
+    entryIdsByCallId.set(toolCallId, entryId);
   }
 
   for (const duplicateCallId of duplicateCallIds) {
@@ -8852,7 +8858,7 @@ export class LcmContextEngine implements ContextEngine {
           };
         }
 
-        const transcriptEntryIdsByCallId = listTranscriptToolResultEntryIdsByCallId(
+        const transcriptEntryIdsByCallId = await listTranscriptToolResultEntryIdsByCallId(
           params.sessionFile,
         );
         const replacements: TranscriptRewriteReplacement[] = [];
@@ -11267,9 +11273,13 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number;
     sessionFile: string;
   }): Promise<RotateTranscriptRewriteResult> {
-    const sessionManager = SessionManager.open(params.sessionFile);
-    const header = sessionManager.getHeader();
-    const branch = sessionManager.getBranch();
+    const { header, entries: branch } = await readLeafPathRawEntries(params.sessionFile);
+    if (!header) {
+      // SessionManager.open used to synthesize a header (and rewrite the
+      // file) here; reading is now side-effect free, so a headerless file is
+      // the host's problem to recover, not ours to rotate.
+      throw new Error("session file has no session header; refusing to rotate");
+    }
     const originalStats = await stat(params.sessionFile);
 
     const messageIndices: number[] = [];
@@ -11288,10 +11298,15 @@ export class LcmContextEngine implements ContextEngine {
         ? (messageIndices[messageIndices.length - keepTailMessageCount] ?? branch.length)
         : branch.length;
 
-    const latestPreludeEntries = new Map<string, (typeof branch)[number]>();
+    const latestPreludeEntries = new Map<string, TranscriptRawEntry>();
     for (let index = 0; index < anchorIndex; index += 1) {
       const entry = branch[index];
-      if (entry && isRotatePreservedEntryType(entry.type) && entry.type !== "message") {
+      if (
+        entry &&
+        typeof entry.type === "string" &&
+        isRotatePreservedEntryType(entry.type) &&
+        entry.type !== "message"
+      ) {
         latestPreludeEntries.set(entry.type, entry);
       }
     }
@@ -11306,7 +11321,7 @@ export class LcmContextEngine implements ContextEngine {
 
     for (let index = anchorIndex; index < branch.length; index += 1) {
       const entry = branch[index];
-      if (entry && isRotatePreservedEntryType(entry.type)) {
+      if (entry && typeof entry.type === "string" && isRotatePreservedEntryType(entry.type)) {
         entriesToKeep.push({ ...entry });
       }
     }
@@ -11316,8 +11331,8 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     let previousEntryId: string | null = null;
-    const linearizedEntries = entriesToKeep.map((entry): (typeof branch)[number] => {
-      const nextEntry = {
+    const linearizedEntries = entriesToKeep.map((entry): TranscriptRawEntry => {
+      const nextEntry: TranscriptRawEntry = {
         ...entry,
         parentId: previousEntryId,
       };

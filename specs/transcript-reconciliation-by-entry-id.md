@@ -327,10 +327,14 @@ retained out of caution.
 > 920 live session files confirmed: all v3, every message line id-bearing,
 > zero JSON-array files. The behavioral claims below were re-verified
 > against the embedded source; the one the original audit got wrong —
-> id stability under content rewrites — is what Phase 5 fixes. Note this
-> plugin still imports the pi `SessionManager` for its rotate and GC
-> entry-id mapping paths; that pairing works while the formats match and
-> should be replaced with the plugin's own parser (tracked separately).
+> id stability under content rewrites — is what Phase 5 fixes. The plugin's
+> last two runtime uses of the pi `SessionManager` (rotate, GC entry-id
+> mapping) were replaced with the plugin's own read-only parser
+> (`readLeafPathRawEntries`), and `@earendil-works/*` moved to
+> devDependencies — pi's `SessionManager.open` migrates and rewrites v1/v2
+> or empty files as a side effect, and the pi package no longer tracks the
+> host's in-tree format. Tests still write fixtures through it while the
+> formats remain identical.
 
 ### Confirmed: entry ids are unconditional in the current format
 

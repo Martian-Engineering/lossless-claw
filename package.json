@@ -1,7 +1,7 @@
 {
   "name": "@martian-engineering/lossless-claw",
   "version": "0.12.0",
-  "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with threshold compaction",
+  "description": "Lossless Context Management plugin for OpenClaw \u2014 DAG-based conversation summarization with threshold compaction",
   "type": "module",
   "main": "dist/index.js",
   "license": "MIT",
@@ -35,14 +35,14 @@
     "LICENSE"
   ],
   "dependencies": {
-    "@earendil-works/pi-agent-core": ">=0.74 <1",
-    "@earendil-works/pi-ai": ">=0.74 <1",
-    "@earendil-works/pi-coding-agent": ">=0.74 <1",
     "@sinclair/typebox": "0.34.48"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",
     "@changesets/cli": "^2.30.0",
+    "@earendil-works/pi-agent-core": ">=0.74 <1",
+    "@earendil-works/pi-ai": ">=0.74 <1",
+    "@earendil-works/pi-coding-agent": ">=0.74 <1",
     "esbuild": "^0.28.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
