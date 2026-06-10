@@ -4843,6 +4843,17 @@ export class LcmContextEngine implements ContextEngine {
         !sweepResult.authFailure &&
         !thresholdSweepStoppedAtBudget &&
         !isUnderTargetAfterSweep;
+      // Transcript wedge (lossless-claw-30b.4): terminal exhaustion with an
+      // explicit host-observed token count means stored compaction has
+      // nothing left to shrink while the live transcript keeps the session
+      // over target. Surface a reset-required verdict instead of the generic
+      // failure so hosts and users learn the actual recovery (/new or
+      // re-bootstrap). Requires observedTokens so overhead inferred from
+      // estimator methodology gaps alone cannot condemn a recoverable
+      // session, and never fires on budget-stopped sweeps (more sweeps can
+      // still make progress there).
+      const thresholdSweepTranscriptWedge =
+        thresholdSweepExhaustedOverTarget && observedTokens !== undefined;
       const sweepOk =
         !sweepResult.authFailure &&
         (isUnderTargetAfterSweep || (sweepResult.actionTaken && !isThresholdSweep));
@@ -4856,9 +4867,16 @@ export class LcmContextEngine implements ContextEngine {
           ? "compacted"
           : isUnderTargetAfterSweep
             ? "already under target"
+            : thresholdSweepTranscriptWedge
+              ? "stored compaction exhausted but live context still exceeds target; transcript reset required"
             : manualCompactionRequested
               ? "nothing to compact"
               : "live context still exceeds target";
+      if (thresholdSweepTranscriptWedge) {
+        this.deps.log.warn(
+          `[lcm] compact: transcript wedge detected conversation=${conversationId} ${sessionLabel} storedTokensAfter=${sweepTokensAfter ?? "none"} targetTokens=${targetTokens} observedTokens=${observedTokens} observedRuntimeOverhead=${observedRuntimeOverhead} projectedTokensAfter=${projectedTokensAfterSweep ?? "none"} — stored compaction cannot reduce the live transcript; reset the session (/new) or re-bootstrap`,
+        );
+      }
       let spendBackoffOpened = false;
       if (thresholdSweepStillOverTarget && !sweepResult.authFailure) {
         if (lastRoundMadeProgress) {

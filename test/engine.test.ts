@@ -17864,7 +17864,11 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
 
     expect(result.ok).toBe(false);
     expect(result.compacted).toBe(false);
-    expect(result.reason).toBe("live context still exceeds target");
+    // Terminal exhaustion with a host-observed count is now surfaced as the
+    // transcript-wedge verdict instead of the generic failure.
+    expect(result.reason).toBe(
+      "stored compaction exhausted but live context still exceeds target; transcript reset required",
+    );
     expect(result.result?.tokensBefore).toBe(12_000);
     expect(result.result?.tokensAfter).toBe(7_000);
     expect(result.result?.details).toEqual(
