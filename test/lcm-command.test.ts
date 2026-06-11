@@ -1205,6 +1205,102 @@ describe("lcm command", () => {
     expect(result.text).not.toContain(`conversation id: ${otherConversation.conversationId}`);
   });
 
+  it("reports duplicate high-token transcript replay residue without mutating messages", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-replay-current",
+      sessionKey: "agent:main:telegram:direct:doctor-replay-current",
+    });
+    const otherConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-replay-other",
+      sessionKey: "agent:main:telegram:direct:doctor-replay-other",
+    });
+    const replayPayload = "historical transcript payload ".repeat(160);
+
+    const duplicates = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "assistant",
+        content: replayPayload,
+        tokenCount: 1800,
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: replayPayload,
+        tokenCount: 1800,
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: replayPayload,
+        tokenCount: 1800,
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: otherConversation.conversationId,
+        seq: 0,
+        role: "assistant",
+        content: replayPayload,
+        tokenCount: 1800,
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: otherConversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: replayPayload,
+        tokenCount: 1800,
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+
+    const beforeCount = await fixture.conversationStore.countMessagesByIdentity(
+      currentConversation.conversationId,
+      "assistant",
+      replayPayload,
+    );
+    const result = await fixture.command.handler(
+      createCommandContext("doctor", {
+        sessionKey: "agent:main:telegram:direct:doctor-replay-current",
+      }),
+    );
+    const afterCount = await fixture.conversationStore.countMessagesByIdentity(
+      currentConversation.conversationId,
+      "assistant",
+      replayPayload,
+    );
+
+    expect(beforeCount).toBe(3);
+    expect(afterCount).toBe(3);
+    expect(result.text).toContain("**🔁 Transcript replay residue**");
+    expect(result.text).toContain("mode: read-only diagnostics");
+    expect(result.text).toContain("clusters: 1");
+    expect(result.text).toContain("duplicate token pressure: ~3,600 tokens");
+    expect(result.text).toContain(`conv ${currentConversation.conversationId}`);
+    expect(result.text).toContain("session key `agent:main:telegram:direct:doctor-replay-current`");
+    expect(result.text).toContain("session id `doctor-replay-current`");
+    expect(result.text).toContain("role assistant");
+    expect(result.text).toContain("repeats 3");
+    expect(result.text).toContain("pressure ~3,600 tokens");
+    expect(result.text).toContain(
+      `ids ${duplicates.map((message) => message.messageId).join(", ")}`,
+    );
+    expect(result.text).not.toContain(`conv ${otherConversation.conversationId}`);
+    expect(result.text).not.toContain("doctor-replay-other");
+    expect(result.text).not.toContain(replayPayload);
+  });
+
   it("reports a clean scoped doctor result for the resolved current conversation", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
