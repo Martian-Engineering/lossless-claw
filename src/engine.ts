@@ -437,6 +437,7 @@ export class LcmContextEngine implements ContextEngine {
       maxRounds: 10,
       timezone: this.config.timezone,
       summaryMaxOverageFactor: this.config.summaryMaxOverageFactor,
+      fallbackMaxTokens: this.config.fallbackMaxTokens,
       stripInjectedContextTags: this.config.stripInjectedContextTags,
     };
     this.compaction = new CompactionEngine(

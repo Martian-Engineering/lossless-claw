@@ -926,11 +926,18 @@ describe("resolveLcmConfig", () => {
       minimum: 1,
     });
   });
+  it("ships a manifest with fallbackMaxTokens in schema", () => {
+    expect(manifest.configSchema.properties.fallbackMaxTokens).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
+  });
   it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.bootstrapMaxTokens).toBe(6000);
     expect(config.delegationTimeoutMs).toBe(120000);
     expect(config.summaryMaxOverageFactor).toBe(3);
+    expect(config.fallbackMaxTokens).toBe(512);
     expect(config.maxAssemblyTokenBudget).toBeUndefined();
     expect(config.independentLogFile).toEqual({
       enabled: true,
@@ -1014,16 +1021,19 @@ describe("resolveLcmConfig", () => {
       LCM_BOOTSTRAP_MAX_TOKENS: "still-nope",
       LCM_CONTEXT_THRESHOLD: "bad",
       LCM_SUMMARY_MAX_OVERAGE_FACTOR: "nah",
+      LCM_FALLBACK_MAX_TOKENS: "not-a-number",
     } as NodeJS.ProcessEnv, {
       leafChunkTokens: 80_000,
       contextThreshold: 0.5,
       summaryMaxOverageFactor: 5,
+      fallbackMaxTokens: 768,
     });
 
     expect(config.leafChunkTokens).toBe(80_000);
     expect(config.bootstrapMaxTokens).toBe(24_000);
     expect(config.contextThreshold).toBe(0.5);
     expect(config.summaryMaxOverageFactor).toBe(5);
+    expect(config.fallbackMaxTokens).toBe(768);
   });
 
   it("reads summaryMaxOverageFactor and maxAssemblyTokenBudget from plugin config", () => {
@@ -1033,6 +1043,13 @@ describe("resolveLcmConfig", () => {
     });
     expect(config.summaryMaxOverageFactor).toBe(5);
     expect(config.maxAssemblyTokenBudget).toBe(30000);
+  });
+
+  it("reads fallbackMaxTokens from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      fallbackMaxTokens: 1024,
+    });
+    expect(config.fallbackMaxTokens).toBe(1024);
   });
 
   it("env vars override summaryMaxOverageFactor and maxAssemblyTokenBudget", () => {
@@ -1045,6 +1062,15 @@ describe("resolveLcmConfig", () => {
     });
     expect(config.summaryMaxOverageFactor).toBe(2.5);
     expect(config.maxAssemblyTokenBudget).toBe(16000);
+  });
+
+  it("env vars override fallbackMaxTokens", () => {
+    const config = resolveLcmConfig({
+      LCM_FALLBACK_MAX_TOKENS: "2048",
+    } as NodeJS.ProcessEnv, {
+      fallbackMaxTokens: 1024,
+    });
+    expect(config.fallbackMaxTokens).toBe(2048);
   });
 });
 

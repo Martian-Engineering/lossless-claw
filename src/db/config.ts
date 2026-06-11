@@ -174,6 +174,8 @@ export type LcmConfig = {
   maxAssemblyTokenBudget?: number;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
+  /** Maximum token budget for deterministic fallback summaries when the LLM summarizer fails (default 512). */
+  fallbackMaxTokens?: number;
   /** Custom instructions injected into all summarization prompts. */
   customInstructions: string;
   /** Consecutive auth failures before the compaction circuit breaker trips (default 5). */
@@ -794,6 +796,9 @@ export function resolveLcmConfigWithDiagnostics(
       summaryMaxOverageFactor:
         parseFiniteNumber(env.LCM_SUMMARY_MAX_OVERAGE_FACTOR)
           ?? toNumber(pc.summaryMaxOverageFactor) ?? 3,
+      fallbackMaxTokens:
+        parseFiniteInt(env.LCM_FALLBACK_MAX_TOKENS)
+          ?? toNumber(pc.fallbackMaxTokens) ?? 512,
       customInstructions:
         env.LCM_CUSTOM_INSTRUCTIONS?.trim() ?? toStr(pc.customInstructions) ?? "",
       circuitBreakerThreshold:
