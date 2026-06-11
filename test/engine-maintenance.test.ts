@@ -173,6 +173,73 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(maintenanceResult.changed).toBe(true);
   });
 
+  it("maintain() drains threshold debt with the persisted threshold override", async () => {
+    const engine = createEngineWithConfig({
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.1,
+        },
+      ],
+    });
+    const sessionId = "maintain-deferred-compaction-persisted-override";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    // Debt recorded by an earlier afterTurn that matched an override rule.
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 500_000,
+      currentTokenCount: 80_000,
+      contextThreshold: 0.1,
+      contextThresholdSource: "override",
+    });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeCompactionCoreSpy = vi.spyOn(
+      privateEngine,
+      "executeCompactionCore",
+    ).mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    // The maintain() call carries no model metadata: the drain must reuse the
+    // persisted threshold rather than re-resolving (and missing) the rule.
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-persisted-override"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: conversation.conversationId,
+        sessionId,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
+        compactionTarget: "threshold",
+        contextThresholdOverride: expect.objectContaining({
+          contextThreshold: 0.1,
+          source: "override",
+        }),
+      }),
+    );
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenanceResult.changed).toBe(true);
+  });
+
   it("maintain() clears stale legacy non-threshold debt when threshold no longer applies", async () => {
     const engine = createEngine();
     const sessionId = "maintain-legacy-leaf-debt-cleared";
@@ -212,7 +279,9 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(evaluateSpy).toHaveBeenCalledWith(conversation.conversationId, 4_096, 1_024);
+    expect(evaluateSpy).toHaveBeenCalledWith(conversation.conversationId, 4_096, 1_024, {
+      contextThreshold: 0.75,
+    });
     expect(executeCompactionCoreSpy).not.toHaveBeenCalled();
     expect(maintenance?.pending).toBe(false);
     expect(maintenance?.running).toBe(false);

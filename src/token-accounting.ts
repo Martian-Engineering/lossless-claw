@@ -6,7 +6,7 @@
 import { estimateSerializedMessagesTokens, estimateTokens } from "./estimate-tokens.js";
 import { isTextBlock } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
-import { asRecord } from "./value-utils.js";
+import { asRecord, safeString } from "./value-utils.js";
 
 export function toRuntimeRoleForTokenEstimate(role: string): "user" | "assistant" | "toolResult" {
   if (role === "tool" || role === "toolResult") {
@@ -167,6 +167,62 @@ export function extractRuntimePromptTokenCount(runtimeContext?: Record<string, u
     return promptCacheUsageSum;
   }
 
+  return undefined;
+}
+
+export type RuntimeModelInfo = {
+  provider?: string;
+  model?: string;
+};
+
+/**
+ * Extract the provider/model identity the host reported in a runtime
+ * context or legacy compaction params record. All consumers of host model
+ * metadata (telemetry, threshold overrides) must read it through here so
+ * the accepted key spellings stay in one place.
+ */
+export function extractRuntimeModelInfo(
+  runtimeContext?: Record<string, unknown>,
+): RuntimeModelInfo {
+  const ctx = asRecord(runtimeContext);
+  if (!ctx) {
+    return {};
+  }
+  const provider =
+    safeString(ctx["provider"])?.trim() ?? safeString(ctx["providerId"])?.trim();
+  const model = safeString(ctx["model"])?.trim() ?? safeString(ctx["modelId"])?.trim();
+  return {
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
+  };
+}
+
+/** Accepted host key spellings for the active model's context window, in priority order. */
+const MODEL_CONTEXT_WINDOW_KEYS = [
+  "modelContextWindow",
+  "contextWindow",
+  "contextWindowTokens",
+  "maxContextTokens",
+] as const;
+
+/**
+ * Extract the active model's context-window size (tokens) from host runtime
+ * metadata. Returns undefined when the host did not report one; callers must
+ * not substitute the token budget, which can be capped well below the window.
+ */
+export function extractRuntimeModelContextWindow(
+  runtimeContext?: Record<string, unknown>,
+): number | undefined {
+  const ctx = asRecord(runtimeContext);
+  if (!ctx) {
+    return undefined;
+  }
+  for (const key of MODEL_CONTEXT_WINDOW_KEYS) {
+    const value = ctx[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 1) {
+      return Math.floor(value);
+    }
+  }
   return undefined;
 }
 

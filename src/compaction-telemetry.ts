@@ -11,6 +11,7 @@ import {
   type CompactionTelemetryStore,
   type ConversationCompactionTelemetryRecord,
 } from "./store/compaction-telemetry-store.js";
+import { extractRuntimeModelInfo } from "./token-accounting.js";
 import type { LcmDependencies } from "./types.js";
 import { asRecord, normalizeOptionalCount, safeBoolean, safeString } from "./value-utils.js";
 
@@ -36,10 +37,7 @@ export class CompactionTelemetryRecorder {
   /** Extract the current prompt-cache snapshot from runtime context, if present. */
   private readPromptCacheSnapshot(runtimeContext?: Record<string, unknown>): PromptCacheSnapshot | null {
     const promptCache = asRecord(runtimeContext?.promptCache);
-    const provider = safeString(runtimeContext?.provider)?.trim()
-      ?? safeString(runtimeContext?.providerId)?.trim();
-    const model = safeString(runtimeContext?.model)?.trim()
-      ?? safeString(runtimeContext?.modelId)?.trim();
+    const { provider, model } = extractRuntimeModelInfo(runtimeContext);
     if (!promptCache && !provider && !model) {
       return null;
     }
@@ -205,6 +203,8 @@ export class CompactionTelemetryRecorder {
     currentTokenCount?: number;
     projectedTokenCount?: number;
     rawTokensOutsideTail?: number;
+    contextThreshold?: number;
+    contextThresholdSource?: "global" | "override";
   }): Promise<void> {
     await this.compactionMaintenanceStore.requestProactiveCompactionDebt({
       conversationId: params.conversationId,
@@ -213,9 +213,11 @@ export class CompactionTelemetryRecorder {
       currentTokenCount: params.currentTokenCount ?? null,
       projectedTokenCount: params.projectedTokenCount ?? null,
       rawTokensOutsideTail: params.rawTokensOutsideTail ?? null,
+      contextThreshold: params.contextThreshold ?? null,
+      contextThresholdSource: params.contextThresholdSource ?? null,
     });
     this.deps.log.debug(
-      `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"} projectedTokenCount=${params.projectedTokenCount ?? "null"} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"}`,
+      `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"} projectedTokenCount=${params.projectedTokenCount ?? "null"} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"} contextThreshold=${params.contextThreshold ?? "null"} contextThresholdSource=${params.contextThresholdSource ?? "null"}`,
     );
   }
 }

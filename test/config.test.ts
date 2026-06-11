@@ -31,6 +31,7 @@ describe("resolveLcmConfig", () => {
     expect(config.statelessSessionPatterns).toEqual([]);
     expect(config.skipStatelessSessions).toBe(true);
     expect(config.contextThreshold).toBe(0.75);
+    expect(config.contextThresholdOverrides).toEqual([]);
     expect(config.freshTailCount).toBe(64);
     expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.promptAwareEviction).toBe(false);
@@ -79,6 +80,17 @@ describe("resolveLcmConfig", () => {
   it("reads values from plugin config", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: 0.5,
+      contextThresholdOverrides: [
+        {
+          name: "large-context",
+          match: { modelContextWindowMin: 900000 },
+          contextThreshold: 0.15,
+        },
+        {
+          match: { model: "openai/gpt-5.5", sessionPattern: "agent:*:telegram:**" },
+          contextThreshold: 0.35,
+        },
+      ],
       freshTailCount: 16,
       freshTailMaxTokens: 12000,
       promptAwareEviction: false,
@@ -130,6 +142,17 @@ describe("resolveLcmConfig", () => {
     expect(config.statelessSessionPatterns).toEqual(["agent:*:ephemeral:**"]);
     expect(config.skipStatelessSessions).toBe(false);
     expect(config.contextThreshold).toBe(0.5);
+    expect(config.contextThresholdOverrides).toEqual([
+      {
+        name: "large-context",
+        match: { modelContextWindowMin: 900000 },
+        contextThreshold: 0.15,
+      },
+      {
+        match: { model: "openai/gpt-5.5", sessionPattern: "agent:*:telegram:**" },
+        contextThreshold: 0.35,
+      },
+    ]);
     expect(config.freshTailCount).toBe(16);
     expect(config.freshTailMaxTokens).toBe(12000);
     expect(config.promptAwareEviction).toBe(false);
@@ -706,6 +729,68 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.promptAwareEviction).toEqual({
       type: "boolean",
     });
+  });
+
+  it("ships a manifest with contextThresholdOverrides in schema", () => {
+    expect(manifest.configSchema.properties.contextThresholdOverrides).toMatchObject({
+      type: "array",
+      items: {
+        type: "object",
+        required: ["match", "contextThreshold"],
+        properties: {
+          match: {
+            type: "object",
+            minProperties: 1,
+          },
+          contextThreshold: {
+            type: "number",
+            minimum: 0,
+            maximum: 1,
+          },
+        },
+      },
+    });
+  });
+
+  it("rejects invalid contextThresholdOverrides", () => {
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { model: "openai/gpt-5.5" }, contextThreshold: 1.5 },
+        ],
+      })
+    ).toThrow(/contextThreshold/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: {}, contextThreshold: 0.5 },
+        ],
+      })
+    ).toThrow(/at least one matcher/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          {
+            match: { modelContextWindowMin: 900000, modelContextWindowMax: 250000 },
+            contextThreshold: 0.5,
+          },
+        ],
+      })
+    ).toThrow(/modelContextWindowMin/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { model: "   " }, contextThreshold: 0.5 },
+        ],
+      })
+    ).toThrow(/model/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { sessionPattern: "" }, contextThreshold: 0.5 },
+        ],
+      })
+    ).toThrow(/sessionPattern/);
   });
 
   it("ships a manifest with dynamicLeafChunkTokens in schema", () => {

@@ -149,6 +149,17 @@ type CondensedPhaseCandidate = {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/**
+ * Pick the effective compaction threshold for one call: a valid per-call
+ * override (resolved upstream from contextThresholdOverrides) or the
+ * engine-wide configured threshold.
+ */
+function effectiveContextThreshold(config: CompactionConfig, override?: number): number {
+  if (typeof override === "number" && Number.isFinite(override) && override >= 0 && override <= 1) {
+    return override;
+  }
+  return config.contextThreshold;
+}
 
 /** Deterministically cap summary text so the persisted output stays within maxTokens. */
 function capSummaryText(
@@ -690,6 +701,7 @@ export class CompactionEngine {
     conversationId: number,
     tokenBudget: number,
     observedTokenCount?: number,
+    options?: { contextThreshold?: number },
   ): Promise<CompactionDecision> {
     const storedTokens = await this.summaryStore.getContextTokenCount(conversationId);
     const liveTokens =
@@ -703,7 +715,9 @@ export class CompactionEngine {
     const projectedTokens =
       liveTokens > 0 ? liveTokens + (rawTokensOutsideTail ?? 0) : undefined;
     const currentTokens = Math.max(storedTokens, projectedTokens ?? liveTokens);
-    const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
+    const threshold = Math.floor(
+      effectiveContextThreshold(this.config, options?.contextThreshold) * tokenBudget,
+    );
 
     if (currentTokens > threshold) {
       return {
@@ -757,6 +771,8 @@ export class CompactionEngine {
   async compact(input: {
     conversationId: number;
     tokenBudget: number;
+    /** Per-call threshold override resolved from contextThresholdOverrides. */
+    contextThreshold?: number;
     /** LLM call function for summarization */
     summarize: CompactionSummarizeFn;
     force?: boolean;
@@ -779,6 +795,7 @@ export class CompactionEngine {
   async compactLeaf(input: {
     conversationId: number;
     tokenBudget: number;
+    contextThreshold?: number;
     summarize: CompactionSummarizeFn;
     leafChunkTokens?: number;
     force?: boolean;
@@ -792,6 +809,7 @@ export class CompactionEngine {
   private async _compactLeafImpl(input: {
     conversationId: number;
     tokenBudget: number;
+    contextThreshold?: number;
     summarize: CompactionSummarizeFn;
     leafChunkTokens?: number;
     force?: boolean;
@@ -802,7 +820,9 @@ export class CompactionEngine {
     const { conversationId, tokenBudget, summarize, force } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
-    const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
+    const threshold = Math.floor(
+      effectiveContextThreshold(this.config, input.contextThreshold) * tokenBudget,
+    );
     const leafTrigger = await this.evaluateLeafTrigger(conversationId, input.leafChunkTokens);
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
@@ -925,6 +945,8 @@ export class CompactionEngine {
   async compactFullSweep(input: {
     conversationId: number;
     tokenBudget: number;
+    /** Per-call threshold override resolved from contextThresholdOverrides. */
+    contextThreshold?: number;
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
@@ -943,7 +965,8 @@ export class CompactionEngine {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
-    const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
+    const contextThreshold = effectiveContextThreshold(this.config, input.contextThreshold);
+    const threshold = Math.floor(contextThreshold * tokenBudget);
     const stopAtTokens =
       typeof input.stopAtTokens === "number" &&
       Number.isFinite(input.stopAtTokens) &&
@@ -1092,7 +1115,10 @@ export class CompactionEngine {
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.
     const preferredMaxSourceDepth = this.resolveSweepMaxDepth();
-    const summaryPrefixTargetTokens = this.resolveSummaryPrefixTargetTokens(tokenBudget);
+    const summaryPrefixTargetTokens = this.resolveSummaryPrefixTargetTokens(
+      tokenBudget,
+      contextThreshold,
+    );
     const hasSummaryPrefixPressure = async (): Promise<boolean> =>
       (await this.countSummaryTokensOutsideFreshTail(conversationId)) > summaryPrefixTargetTokens;
     const hasStopTargetPressure = (): boolean =>
@@ -1228,6 +1254,8 @@ export class CompactionEngine {
   async compactUntilUnder(input: {
     conversationId: number;
     tokenBudget: number;
+    /** Per-call threshold override resolved from contextThresholdOverrides. */
+    contextThreshold?: number;
     targetTokens?: number;
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
@@ -1239,6 +1267,7 @@ export class CompactionEngine {
   private async _compactUntilUnderImpl(input: {
     conversationId: number;
     tokenBudget: number;
+    contextThreshold?: number;
     targetTokens?: number;
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
@@ -1298,6 +1327,7 @@ export class CompactionEngine {
       const result = await this.compact({
         conversationId,
         tokenBudget,
+        contextThreshold: input.contextThreshold,
         summarize,
         force: true,
         summaryModel: input.summaryModel,
@@ -1711,7 +1741,10 @@ export class CompactionEngine {
   }
 
   /** Resolve the summarized-prefix pressure target for this token budget. */
-  private resolveSummaryPrefixTargetTokens(tokenBudget: number): number {
+  private resolveSummaryPrefixTargetTokens(
+    tokenBudget: number,
+    contextThresholdOverride?: number,
+  ): number {
     if (
       typeof this.config.summaryPrefixTargetTokens === "number" &&
       Number.isFinite(this.config.summaryPrefixTargetTokens) &&
@@ -1719,7 +1752,10 @@ export class CompactionEngine {
     ) {
       return Math.floor(this.config.summaryPrefixTargetTokens);
     }
-    const threshold = Math.max(1, Math.floor(this.config.contextThreshold * tokenBudget));
+    const threshold = Math.max(
+      1,
+      Math.floor(effectiveContextThreshold(this.config, contextThresholdOverride) * tokenBudget),
+    );
     const derivedTarget = Math.floor(threshold * 0.5);
     return Math.max(
       this.config.condensedTargetTokens,

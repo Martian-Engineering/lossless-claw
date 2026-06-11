@@ -25,6 +25,10 @@
       "label": "Context Threshold",
       "help": "Fraction of context window that triggers compaction (0.0–1.0)"
     },
+    "contextThresholdOverrides": {
+      "label": "Context Threshold Overrides",
+      "help": "Optional ordered rules that override contextThreshold by model, model context-window range, or session glob pattern"
+    },
     "sweepMaxDepth": {
       "label": "Sweep Max Depth",
       "help": "Preferred maximum condensation source depth during routine full sweeps (0 = leaf only, -1 = unlimited). Pressure sweeps may go deeper when summarized context remains above target."
@@ -317,6 +321,50 @@
         "type": "number",
         "minimum": 0,
         "maximum": 1
+      },
+      "contextThresholdOverrides": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "match",
+            "contextThreshold"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "match": {
+              "type": "object",
+              "additionalProperties": false,
+              "minProperties": 1,
+              "properties": {
+                "model": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "modelContextWindowMin": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "modelContextWindowMax": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "sessionPattern": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "contextThreshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        }
       },
       "sweepMaxDepth": {
         "type": "integer",

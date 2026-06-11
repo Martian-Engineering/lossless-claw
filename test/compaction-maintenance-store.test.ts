@@ -80,6 +80,8 @@ describe("CompactionMaintenanceStore", () => {
       currentTokenCount: 300,
       projectedTokenCount: 620,
       rawTokensOutsideTail: 320,
+      contextThreshold: 0.15,
+      contextThresholdSource: "override",
     });
 
     const record = await store.getConversationCompactionMaintenance(conversation.conversationId);
@@ -90,6 +92,27 @@ describe("CompactionMaintenanceStore", () => {
       currentTokenCount: 300,
       projectedTokenCount: 620,
       rawTokensOutsideTail: 320,
+      contextThreshold: 0.15,
+      contextThresholdSource: "override",
+    });
+
+    // Re-recording debt without a threshold resets it instead of inheriting
+    // the previous decision's threshold.
+    await store.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 700,
+      currentTokenCount: 400,
+    });
+
+    const refreshed = await store.getConversationCompactionMaintenance(conversation.conversationId);
+    expect(refreshed).toMatchObject({
+      pending: true,
+      reason: "leaf-trigger",
+      tokenBudget: 700,
+      currentTokenCount: 400,
+      contextThreshold: null,
+      contextThresholdSource: null,
     });
   });
 
