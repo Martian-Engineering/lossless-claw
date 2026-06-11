@@ -19,7 +19,7 @@ import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies } from "../src/types.js";
-import { createTestConfig as createSharedTestConfig } from "./helpers.js";
+import { createTestConfig as createSharedTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
 
 const tempDirs: string[] = [];
 const engines: LcmContextEngine[] = [];
@@ -56,29 +56,10 @@ function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: st
 }
 
 function createTestDeps(config: LcmConfig): LcmDependencies {
-  return {
-    config,
-    complete: vi.fn(async () => ({
-      content: [{ type: "text", text: "summary output" }],
-    })),
-    callGateway: vi.fn(async () => ({})),
-    resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
-    parseAgentSessionKey,
-    isSubagentSessionKey: (sessionKey: string) => sessionKey.includes(":subagent:"),
-    normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
-    buildSubagentSystemPrompt: () => "subagent prompt",
+  return createSharedTestDeps(config, {
     readLatestAssistantReply: () => undefined,
     resolveAgentDir: () => tmpdir(),
-    resolveSessionIdFromSessionKey: async () => undefined,
-    resolveSessionTranscriptFile: async () => undefined,
-    agentLaneSubagent: "subagent",
-    log: {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    },
-  } as unknown as LcmDependencies;
+  });
 }
 
 function createEngine(): LcmContextEngine {

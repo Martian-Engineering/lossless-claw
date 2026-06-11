@@ -12,7 +12,7 @@ import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import type { LcmDependencies } from "../src/types.js";
-import { createTestConfig } from "./helpers.js";
+import { createTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
 
 type SessionQueueEntry = { promise: Promise<void>; refCount: number };
 type QueueTestEngine = {
@@ -25,29 +25,11 @@ const dbs: ReturnType<typeof createLcmDatabaseConnection>[] = [];
 
 
 function createTestDeps(config: LcmConfig): LcmDependencies {
-  return {
-    config,
-    complete: vi.fn(async () => ({
-      content: [{ type: "text", text: "summary output" }],
-    })),
-    callGateway: vi.fn(async () => ({})),
-    resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
+  return createSharedTestDeps(config, {
     parseAgentSessionKey: () => null,
     isSubagentSessionKey: () => false,
-    normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
-    buildSubagentSystemPrompt: () => "subagent prompt",
     readLatestAssistantReply: () => undefined,
-    resolveAgentDir: () => process.env.HOME ?? tmpdir(),
-    resolveSessionIdFromSessionKey: async () => undefined,
-    resolveSessionTranscriptFile: async () => undefined,
-    agentLaneSubagent: "subagent",
-    log: {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    },
-  };
+  });
 }
 
 function createQueueTestEngine(): QueueTestEngine {

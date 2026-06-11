@@ -37,7 +37,7 @@ import { runLcmMigrations } from "../src/db/migration.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import type { CreateMessageInput, MessageRole } from "../src/store/conversation-store.js";
-import { createTestConfig } from "./helpers.js";
+import { createTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
 
 let __seqCounter = 0;
 function msg(
@@ -65,28 +65,10 @@ const tempDirs: string[] = [];
 
 
 function createTestDeps(config: LcmConfig): LcmDependencies {
-  return {
-    config,
-    resolveSessionTranscriptFile: async () => undefined,
+  return createSharedTestDeps(config, {
     complete: vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] })),
-    callGateway: vi.fn(async () => ({})),
-    resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
-    parseAgentSessionKey: (key: string) => {
-      const t = key.trim();
-      if (!t.startsWith("agent:")) return null;
-      const p = t.split(":");
-      if (p.length < 3) return null;
-      return { agentId: p[1] ?? "main", suffix: p.slice(2).join(":") };
-    },
-    isSubagentSessionKey: (key: string) => key.includes(":subagent:"),
-    normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
-    buildSubagentSystemPrompt: () => "subagent prompt",
     readLatestAssistantReply: () => undefined,
-    resolveAgentDir: () => process.env.HOME ?? tmpdir(),
-    resolveSessionIdFromSessionKey: async () => undefined,
-    agentLaneSubagent: "subagent",
-    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-  };
+  });
 }
 
 function createEngine(configOverrides?: Partial<LcmConfig>): LcmContextEngine {

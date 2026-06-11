@@ -14,7 +14,7 @@ import {
   readLeafPathMessages,
 } from "../src/transcript.js";
 import type { LcmDependencies } from "../src/types.js";
-import { createTestConfig } from "./helpers.js";
+import { createTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
 
 const tempDirs: string[] = [];
 
@@ -37,35 +37,9 @@ function createTempDir(prefix: string): string {
 
 
 function createTestDeps(config: LcmConfig): LcmDependencies {
-  return {
-    config,
-    complete: vi.fn(async () => ({
-      content: [{ type: "text", text: "summary output" }],
-    })),
-    callGateway: vi.fn(async () => ({})),
-    resolveModel: vi.fn(() => ({ provider: "anthropic", model: "claude-opus-4-5" })),
-    parseAgentSessionKey: (key: string) => {
-      const trimmed = key.trim();
-      if (!trimmed.startsWith("agent:")) return null;
-      const parts = trimmed.split(":");
-      if (parts.length < 3) return null;
-      return { agentId: parts[1] ?? "main", suffix: parts.slice(2).join(":") };
-    },
-    isSubagentSessionKey: (key: string) => key.includes(":subagent:"),
-    normalizeAgentId: (id?: string) => (id?.trim() ? id : "main"),
-    buildSubagentSystemPrompt: () => "subagent prompt",
+  return createSharedTestDeps(config, {
     readLatestAssistantReply: () => undefined,
-    resolveAgentDir: () => process.env.HOME ?? tmpdir(),
-    resolveSessionIdFromSessionKey: async () => undefined,
-    resolveSessionTranscriptFile: async () => undefined,
-    agentLaneSubagent: "subagent",
-    log: {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    },
-  };
+  });
 }
 
 function createEngine(): LcmContextEngine {
