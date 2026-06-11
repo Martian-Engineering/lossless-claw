@@ -1594,6 +1594,14 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
   };
 }
 
+function storedMessageIdentityHash(stored: StoredMessage): string {
+  return buildMessageIdentityHash(stored.role, stored.content);
+}
+
+function computeBatchIdentityHashes(batch: AgentMessage[]): string[] {
+  return batch.map((m) => storedMessageIdentityHash(toStoredMessage(m)));
+}
+
 function isLikelyInjectedDeliveryMessage(message: AgentMessage): boolean {
   const stored = toStoredMessage(message);
   return stored.role === "system" && INJECTED_DELIVERY_TRANSCRIPT_PATTERN.test(stored.content);
@@ -9211,10 +9219,10 @@ export class LcmContextEngine implements ContextEngine {
     const storedMessageCount = await this.conversationStore.getMessageCount(conversationId);
     if (storedMessageCount === 0) return batch;
 
-    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
-    if (!lastDbMessage) return batch;
+    const lastDbIdentityHash = await this.conversationStore.getLastMessageIdentityHash(conversationId);
+    if (!lastDbIdentityHash) return batch;
 
-    const storedBatch = batch.map((m) => toStoredMessage(m));
+    const batchHashes = computeBatchIdentityHashes(batch);
 
     // When the DB already has more messages than the incoming batch,
     // the batch may be a tail-only replay. Try tail-matching first,
@@ -9223,46 +9231,38 @@ export class LcmContextEngine implements ContextEngine {
       return this.deduplicateOversizedBatch(
         conversationId,
         batch,
-        storedBatch,
+        batchHashes,
         storedMessageCount,
-        lastDbMessage,
+        lastDbIdentityHash,
         options,
       );
     }
 
-    // Aligned-tail check: DB's last message must match the message at the
-    // exact replay boundary in the incoming batch. This replaces the
-    // hasMessage() check which could false-positive on any repeated content.
-    const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
-    if (
-      messageIdentity(lastDbMessage.role, lastDbMessage.content) !==
-      messageIdentity(batchAtBoundary.role, batchAtBoundary.content)
-    ) {
-      // Prefix mismatch — attempt suffix fallback before giving up.
+    // Aligned-tail check: DB's last message identity_hash must match the
+    // message at the exact replay boundary in the incoming batch.
+    const batchAtBoundaryHash = batchHashes[storedMessageCount - 1]!;
+    if (batchAtBoundaryHash !== lastDbIdentityHash) {
       return this.deduplicateSuffixFallback(
         conversationId,
         batch,
-        storedBatch,
+        batchHashes,
         storedMessageCount,
         "prefix-mismatch",
+        { onNoOverlap: "ingest" },
       );
     }
 
     // Full proof: incoming batch must start with the entire stored transcript
     // in exact order before we trim anything.
-    const storedMessages = await this.conversationStore.getMessages(conversationId, {
-      limit: storedMessageCount,
-    });
-    if (storedMessages.length !== storedMessageCount) {
+    const recentDbHashes = await this.conversationStore.getRecentMessageIdentityHashes(
+      conversationId,
+      storedMessageCount,
+    );
+    if (recentDbHashes.length !== storedMessageCount) {
       return batch;
     }
     for (let i = 0; i < storedMessageCount; i += 1) {
-      const storedConversationMessage = storedMessages[i]!;
-      const incomingMessage = storedBatch[i]!;
-      if (
-        messageIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
-        messageIdentity(incomingMessage.role, incomingMessage.content)
-      ) {
+      if (recentDbHashes[i] !== batchHashes[i]) {
         return batch;
       }
     }
@@ -9278,32 +9278,24 @@ export class LcmContextEngine implements ContextEngine {
   private async deduplicateOversizedBatch(
     conversationId: number,
     batch: AgentMessage[],
-    storedBatch: ReturnType<typeof toStoredMessage>[],
+    batchHashes: string[],
     storedMessageCount: number,
-    lastDbMessage: { role: string; content: string },
+    lastDbIdentityHash: string,
     options?: { oversizedNoOverlap?: "ingest" | "skip" },
   ): Promise<AgentMessage[]> {
-    const lastBatchIdentity = messageIdentity(
-      storedBatch[storedBatch.length - 1]!.role,
-      storedBatch[storedBatch.length - 1]!.content,
-    );
-    const lastDbIdentity = messageIdentity(lastDbMessage.role, lastDbMessage.content);
+    const lastBatchHash = batchHashes[batchHashes.length - 1]!;
 
-    // Quick check: if the last DB message matches the last batch message,
-    // verify that the entire batch matches the actual DB tail. Message seq
-    // can have gaps after maintenance deletes, so do not derive seq from count.
-    if (lastDbIdentity === lastBatchIdentity) {
-      const storedMessages = await this.conversationStore.getMessages(conversationId, {
-        limit: storedMessageCount,
-      });
-      const tailMessages = storedMessages.slice(-batch.length);
-      if (tailMessages.length === batch.length) {
+    // Quick check: if the last DB identity_hash matches the last batch
+    // identity_hash, verify that the entire batch matches the actual DB tail.
+    if (lastDbIdentityHash === lastBatchHash) {
+      const tailHashes = await this.conversationStore.getRecentMessageIdentityHashes(
+        conversationId,
+        batch.length,
+      );
+      if (tailHashes.length === batch.length) {
         let tailMatch = true;
         for (let i = 0; i < batch.length; i++) {
-          if (
-            messageIdentity(tailMessages[i]!.role, tailMessages[i]!.content) !==
-            messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
-          ) {
+          if (tailHashes[i] !== batchHashes[i]) {
             tailMatch = false;
             break;
           }
@@ -9318,15 +9310,11 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    // Fall back to suffix matching. If the DB is already longer than the
-    // incoming afterTurn batch and no suffix overlap exists, fail closed:
-    // importing the whole short batch as new would duplicate/pollute LCM with
-    // stale runtime tail snapshots. The transcript reconcile path runs before
-    // this and is responsible for importing genuine missing JSONL tail turns.
+    // Fall back to suffix matching.
     return this.deduplicateSuffixFallback(
       conversationId,
       batch,
-      storedBatch,
+      batchHashes,
       storedMessageCount,
       "oversized",
       { onNoOverlap: options?.oversizedNoOverlap ?? "skip" },
@@ -9341,41 +9329,27 @@ export class LcmContextEngine implements ContextEngine {
   private async deduplicateSuffixFallback(
     conversationId: number,
     batch: AgentMessage[],
-    storedBatch: ReturnType<typeof toStoredMessage>[],
+    batchHashes: string[],
     storedMessageCount: number,
     context: string,
     options?: { onNoOverlap?: "ingest" | "skip" },
   ): Promise<AgentMessage[]> {
-    const allStored = await this.conversationStore.getMessages(conversationId, {
-      limit: storedMessageCount,
-    });
-    if (allStored.length === 0) return batch;
-
-    const lastStoredIdentity = messageIdentity(
-      allStored[allStored.length - 1]!.role,
-      allStored[allStored.length - 1]!.content,
+    const allRecentHashes = await this.conversationStore.getRecentMessageIdentityHashes(
+      conversationId,
+      storedMessageCount,
     );
+    if (allRecentHashes.length === 0) return batch;
+
+    const lastStoredHash = allRecentHashes[allRecentHashes.length - 1]!;
 
     for (let k = batch.length - 1; k >= 0; k--) {
-      if (
-        messageIdentity(storedBatch[k]!.role, storedBatch[k]!.content) !== lastStoredIdentity
-      ) {
-        continue;
-      }
-      const matchLen = Math.min(k + 1, allStored.length);
-      const startDb = allStored.length - matchLen;
+      if (batchHashes[k] !== lastStoredHash) continue;
+
+      const matchLen = Math.min(k + 1, allRecentHashes.length);
+      const startDb = allRecentHashes.length - matchLen;
       let suffixMatch = true;
       for (let j = 0; j < matchLen; j++) {
-        if (
-          messageIdentity(
-            allStored[startDb + j]!.role,
-            allStored[startDb + j]!.content,
-          ) !==
-          messageIdentity(
-            storedBatch[k - matchLen + 1 + j]!.role,
-            storedBatch[k - matchLen + 1 + j]!.content,
-          )
-        ) {
+        if (allRecentHashes[startDb + j] !== batchHashes[k - matchLen + 1 + j]) {
           suffixMatch = false;
           break;
         }
@@ -9391,7 +9365,9 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    if (options?.onNoOverlap === "skip") {
+    // Default to skip: only ingest when caller explicitly opts in via onNoOverlap.
+    const onNoOverlap = options?.onNoOverlap ?? "skip";
+    if (onNoOverlap === "skip") {
       this.deps.log.warn(
         `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
           `no overlap found — fail-closed skipping full batch`,
