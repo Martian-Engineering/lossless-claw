@@ -12561,6 +12561,8 @@ describe("LcmContextEngine fidelity and token budget", () => {
     writeLeafTranscript(oldSessionFile, [
       { role: "user", content: "old checkpoint-missing real-history question" },
       { role: "assistant", content: "old checkpoint-missing real-history answer" },
+      { role: "user", content: "old checkpoint-missing real-history followup" },
+      { role: "assistant", content: "old checkpoint-missing real-history followup answer" },
     ]);
     await engine.bootstrap({
       sessionId,
@@ -12613,10 +12615,159 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(stored.map((message) => message.content)).toEqual([
       "old checkpoint-missing real-history question",
       "old checkpoint-missing real-history answer",
+      "old checkpoint-missing real-history followup",
+      "old checkpoint-missing real-history followup answer",
     ]);
     expect(
       await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
     ).toBeNull();
+  });
+
+  it("placeholder checkpoint recovery allows no-anchor import for new sessions (#875)", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "placeholder-checkpoint-no-anchor-875";
+    const sessionKey = "agent:main:test:placeholder-checkpoint-no-anchor-875";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "non-anchoring primer 875" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    const sessionFile = createSessionFilePath("placeholder-checkpoint-no-anchor-875");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "875 transcript user turn one" },
+      { role: "assistant", content: "875 transcript assistant turn one" },
+      { role: "user", content: "875 transcript user turn two" },
+      { role: "assistant", content: "875 transcript assistant turn two" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "875 transcript assistant turn two" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).toContain("875 transcript user turn one");
+    expect(contents).toContain("875 transcript assistant turn one");
+    expect(contents).toContain("875 transcript user turn two");
+    expect(contents).toContain("875 transcript assistant turn two");
+
+    const advancedState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(advancedState).not.toBeNull();
+    expect(advancedState?.lastProcessedOffset).toBeGreaterThan(0);
+
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("did not cover the transcript frontier")),
+    ).toBe(false);
+  });
+
+  it("checkpoint-missing allows no-anchor import when existingMessageCount <= 3 (#875)", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "checkpoint-missing-low-count-875";
+    const sessionKey = "agent:main:test:checkpoint-missing-low-count-875";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "low count primer one 875" }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "low count primer two 875" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine
+      .getConversationStore()
+      .markConversationBootstrapped(conversation!.conversationId);
+
+    const refreshed = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(refreshed?.bootstrappedAt).toBeTruthy();
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+
+    const sessionFile = createSessionFilePath("checkpoint-missing-low-count-875");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "875 low count transcript user" },
+      { role: "assistant", content: "875 low count transcript assistant" },
+      { role: "user", content: "875 low count transcript followup" },
+      { role: "assistant", content: "875 low count transcript followup reply" },
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "assistant", content: "875 low count transcript followup reply" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const recoveredState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(recoveredState).not.toBeNull();
+    expect(recoveredState?.sessionFilePath).toBe(sessionFile);
+    expect(recoveredState?.lastProcessedOffset).toBeGreaterThan(0);
+
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).toContain("875 low count transcript user");
+    expect(contents).toContain("875 low count transcript followup reply");
+
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("did not cover the transcript frontier")),
+    ).toBe(false);
   });
 
   it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {

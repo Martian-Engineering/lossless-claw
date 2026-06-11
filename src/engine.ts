@@ -7647,6 +7647,7 @@ export class LcmContextEngine implements ContextEngine {
                 sessionKey: params.sessionKey,
                 conversationId: conversation.conversationId,
                 historicalMessages: appended.messages,
+                allowNoAnchorImport: true,
                 noAnchorImportReason: "placeholder-checkpoint-recovery",
               });
               if (reconcile.importedMessages > 0) {
@@ -7953,6 +7954,7 @@ export class LcmContextEngine implements ContextEngine {
         // import path is itself guarded (replay-overlap detection, import cap,
         // delivery-only block).
         let checkpointMissingMetadataFrontier = false;
+        let checkpointMissingLowMessageCount = false;
         if (
           reason === "checkpoint-missing" &&
           conversation.sessionId === params.sessionId &&
@@ -7966,11 +7968,13 @@ export class LcmContextEngine implements ContextEngine {
             existingMessageCount === 1 &&
             latestPersistedMessage !== null &&
             isLikelyInjectedMetadataPreambleRecord(latestPersistedMessage);
+          checkpointMissingLowMessageCount = existingMessageCount <= 3;
         }
         const recoverCheckpointMissingNoAnchor =
           reason === "checkpoint-missing" &&
           (params.allowNoAnchorImportOnCheckpointMissing === true ||
-            checkpointMissingMetadataFrontier);
+            checkpointMissingMetadataFrontier ||
+            checkpointMissingLowMessageCount);
         // A transcript whose session header id differs from the checkpoint's
         // is a *declared* epoch change (rewrite/rotation) — no heuristics
         // needed, so a same-path full rewrite may import as a new epoch
