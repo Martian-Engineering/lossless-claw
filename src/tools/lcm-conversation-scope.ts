@@ -65,6 +65,59 @@ function isIsolatedCronSessionKey(sessionKey?: string): boolean {
   return parts.length >= 4 && parts[0] === "agent" && parts[2] === "cron";
 }
 
+const CONVERSATION_ID_SCOPE_ERROR =
+  "conversationId is an LCM database conversation_id, not a Discord snowflake. Use sessionKey or allConversations.";
+
+function normalizeSessionKeyParam(value: unknown): { sessionKey?: string; error?: string } {
+  if (value === undefined) {
+    return {};
+  }
+  if (typeof value !== "string") {
+    return { error: "sessionKey must be a string when provided." };
+  }
+  const sessionKey = value.trim();
+  if (!sessionKey) {
+    return { error: "sessionKey must be a non-empty string when provided." };
+  }
+  return { sessionKey };
+}
+
+function normalizeConversationIdParam(value: unknown): { conversationId?: number; error?: string } {
+  if (value === undefined) {
+    return {};
+  }
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1) {
+      return { error: "conversationId must be a positive integer." };
+    }
+    if (!Number.isSafeInteger(value)) {
+      return { error: CONVERSATION_ID_SCOPE_ERROR };
+    }
+    return { conversationId: value };
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return { error: "conversationId must be a positive integer when provided." };
+    }
+    if (!/^\d+$/.test(trimmed)) {
+      return { error: "conversationId must be a positive integer string when provided." };
+    }
+    const parsed = BigInt(trimmed);
+    if (parsed < 1n) {
+      return { error: "conversationId must be a positive integer." };
+    }
+    if (parsed > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return { error: CONVERSATION_ID_SCOPE_ERROR };
+    }
+    return { conversationId: Number(parsed) };
+  }
+
+  return { error: "conversationId must be a positive integer or integer string when provided." };
+}
+
 /**
  * Parse an ISO-8601 timestamp tool parameter into a Date.
  *
@@ -105,7 +158,15 @@ export async function resolveLcmConversationScope(input: {
   deps?: Pick<LcmDependencies, "isSubagentSessionKey" | "resolveSessionIdFromSessionKey">;
 }): Promise<LcmConversationScope> {
   const { lcm, params } = input;
-  const explicitSessionKey = input.sessionKey?.trim();
+  const requestedSessionKey = normalizeSessionKeyParam(params.sessionKey);
+  if (requestedSessionKey.error) {
+    return {
+      allConversations: false,
+      delegated: false,
+      error: requestedSessionKey.error,
+    };
+  }
+  const explicitSessionKey = requestedSessionKey.sessionKey ?? input.sessionKey?.trim();
   const normalizedInputSessionId = input.sessionId?.trim();
   const sessionIdAsSessionKey =
     !explicitSessionKey
@@ -119,10 +180,15 @@ export async function resolveLcmConversationScope(input: {
   const isolateCurrentSessionFamily = isIsolatedCronSessionKey(normalizedSessionKey);
   let allowedConversationIds: number[] = [];
 
-  const explicitConversationId =
-    typeof params.conversationId === "number" && Number.isFinite(params.conversationId)
-      ? Math.trunc(params.conversationId)
-      : undefined;
+  const requestedConversationId = normalizeConversationIdParam(params.conversationId);
+  if (requestedConversationId.error) {
+    return {
+      allConversations: false,
+      delegated: isDelegatedSession,
+      error: requestedConversationId.error,
+    };
+  }
+  const explicitConversationId = requestedConversationId.conversationId;
 
   if (isDelegatedSession) {
     const delegatedGrantId = resolveDelegatedExpansionGrantId(normalizedSessionKey!);
@@ -248,7 +314,7 @@ export async function resolveLcmConversationScope(input: {
   if (!normalizedSessionId && normalizedSessionKey && input.deps) {
     normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(normalizedSessionKey);
   }
-  if (!normalizedSessionId && !input.sessionKey?.trim()) {
+  if (!normalizedSessionId && !normalizedSessionKey) {
     return {
       conversationId:
         isDelegatedSession && allowedConversationIds.length === 1
@@ -263,7 +329,7 @@ export async function resolveLcmConversationScope(input: {
   const conversation = await lookupConversationForSession({
     lcm,
     sessionId: normalizedSessionId,
-    sessionKey: input.sessionKey,
+    sessionKey: normalizedSessionKey,
   });
   if (!conversation) {
     return {
@@ -284,7 +350,7 @@ export async function resolveLcmConversationScope(input: {
       ? await store.getConversationFamilyIds({
           conversationId: conversation.conversationId,
           sessionId: normalizedSessionId,
-          sessionKey: input.sessionKey,
+          sessionKey: normalizedSessionKey,
         })
       : [conversation.conversationId];
 

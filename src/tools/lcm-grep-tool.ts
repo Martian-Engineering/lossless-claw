@@ -42,9 +42,15 @@ const LcmGrepSchema = Type.Object({
     }),
   ),
   conversationId: Type.Optional(
-    Type.Number({
+    Type.Union([Type.Number(), Type.String()], {
       description:
-        "Physical conversation ID to search within. If omitted, defaults to the current session family.",
+        "LCM database conversation_id to search within. Accepts a small integer number or integer string. Do not pass a Discord snowflake; use sessionKey or allConversations instead. If omitted, defaults to the current session family.",
+    }),
+  ),
+  sessionKey: Type.Optional(
+    Type.String({
+      description:
+        "Stable LCM session key to search within. Use this for resumed Discord/thread sessions instead of passing a Discord snowflake as conversationId.",
     }),
   ),
   allConversations: Type.Optional(
