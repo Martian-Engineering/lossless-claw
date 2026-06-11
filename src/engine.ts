@@ -3280,6 +3280,22 @@ export class LcmContextEngine implements ContextEngine {
       const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
         conversation.conversationId,
       );
+      const bootstrapState = await this.summaryStore.getConversationBootstrapState(
+        conversation.conversationId,
+      );
+      const forkBoundedBootstrap = bootstrapState?.forkBounded === true;
+      const forkSourceMessageCount = bootstrapState?.forkSourceMessageCount ?? 0;
+      const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+      const hasSummaryItems = contextItems.some((item) => item.itemType === "summary");
+      const placeholderBootstrapState =
+        bootstrapState !== null &&
+        bootstrapState.lastSeenSize === 0 &&
+        bootstrapState.lastSeenMtimeMs === 0 &&
+        bootstrapState.lastProcessedOffset === 0 &&
+        bootstrapState.lastProcessedEntryHash === null;
+      const incompleteTranscriptCoverage =
+        !hasSummaryItems &&
+        placeholderBootstrapState;
       let deferredAssemblyDegradation:
         | {
             reason:
@@ -3297,7 +3313,11 @@ export class LcmContextEngine implements ContextEngine {
           liveContextTokens,
           maintenance,
         });
-        if (pressure.pressureTokenCount > tokenBudget) {
+        if (incompleteTranscriptCoverage) {
+          this.deps.log.warn(
+            `[lcm] assemble: deferred compaction debt ignored for assembly conversation=${conversation.conversationId} ${sessionLabel} reason=incomplete-transcript-coverage contextItems=${contextItems.length} liveMessages=${liveMessages.length} placeholderBootstrapState=${placeholderBootstrapState} hasSummaryItems=${hasSummaryItems} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget}`,
+          );
+        } else if (pressure.pressureTokenCount > tokenBudget) {
           this.deps.log.warn(
             `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
           );
@@ -3361,12 +3381,6 @@ export class LcmContextEngine implements ContextEngine {
         return degraded;
       }
 
-      const bootstrapState = await this.summaryStore.getConversationBootstrapState(
-        conversation.conversationId,
-      );
-      const forkBoundedBootstrap = bootstrapState?.forkBounded === true;
-      const forkSourceMessageCount = bootstrapState?.forkSourceMessageCount ?? 0;
-      const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       if (contextItems.length === 0) {
         if (forkBoundedBootstrap) {
           const boundedFallback = buildForkBoundedLiveFallback({
@@ -3389,7 +3403,6 @@ export class LcmContextEngine implements ContextEngine {
       // Guard against incomplete bootstrap/coverage: if the DB only has
       // raw context items and clearly trails the current live history, keep
       // the live path to avoid dropping prompt context.
-      const hasSummaryItems = contextItems.some((item) => item.itemType === "summary");
       if (!hasSummaryItems && contextItems.length < liveMessages.length) {
         if (forkBoundedBootstrap) {
           this.deps.log.debug(
