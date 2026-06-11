@@ -37,6 +37,7 @@ import { runLcmMigrations } from "../src/db/migration.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import type { CreateMessageInput, MessageRole } from "../src/store/conversation-store.js";
+import { createTestConfig } from "./helpers.js";
 
 let __seqCounter = 0;
 function msg(
@@ -62,79 +63,6 @@ import type { LcmDependencies } from "../src/types.js";
 
 const tempDirs: string[] = [];
 
-function createTestConfig(databasePath: string): LcmConfig {
-  return {
-    enabled: true,
-    databasePath,
-    ignoreSessionPatterns: [],
-    statelessSessionPatterns: [],
-    skipStatelessSessions: true,
-    contextThreshold: 0.75,
-    freshTailCount: 8,
-    newSessionRetainDepth: 2,
-    leafMinFanout: 8,
-    condensedMinFanout: 4,
-    condensedMinFanoutHard: 2,
-    incrementalMaxDepth: 0,
-    leafChunkTokens: 20_000,
-    leafTargetTokens: 600,
-    condensedTargetTokens: 900,
-    maxExpandTokens: 4000,
-    largeFileTokenThreshold: 25_000,
-    summaryProvider: "",
-    summaryModel: "",
-    largeFileSummaryProvider: "",
-    largeFileSummaryModel: "",
-    timezone: "UTC",
-    pruneHeartbeatOk: false,
-    transcriptGcEnabled: false,
-    enableSummaryThinking: true,
-    proactiveThresholdCompactionMode: "deferred",
-    autoRotateSessionFiles: {
-      enabled: true,
-      createBackups: false,
-      sizeBytes: 2 * 1024 * 1024,
-      startup: "rotate",
-      runtime: "rotate",
-    },
-    independentLogFile: {
-      enabled: false,
-      maxFileBytes: 100 * 1024 * 1024,
-    },
-    summaryMaxOverageFactor: 3,
-    customInstructions: "",
-    expansionProvider: "",
-    expansionModel: "",
-    circuitBreakerThreshold: 5,
-    circuitBreakerCooldownMs: 1_800_000,
-    replayFloodThresholdExternal: 3,
-    replayFloodThresholdInternal: 32,
-    largeFilesDir: join(databasePath, "..", "lcm-files"),
-    promptAwareEviction: false,
-    stubLargeToolPayloads: false,
-    sweepMaxDepth: 1,
-    maxSweepIterations: 12,
-    sweepDeadlineMs: 120_000,
-    compactUntilUnderDeadlineMs: 300_000,
-    delegationTimeoutMs: 120_000,
-    summaryTimeoutMs: 60_000,
-    fallbackProviders: [],
-    cacheAwareCompaction: {
-      enabled: true,
-      cacheTTLSeconds: 300,
-      maxColdCacheCatchupPasses: 2,
-      hotCachePressureFactor: 4,
-      hotCacheBudgetHeadroomRatio: 0.2,
-      coldCacheObservationThreshold: 3,
-      criticalBudgetPressureRatio: 0.90,
-    },
-    dynamicLeafChunkTokens: {
-      enabled: true,
-      max: 40_000,
-    },
-    stripInjectedContextTags: [],
-  };
-}
 
 function createTestDeps(config: LcmConfig): LcmDependencies {
   return {
