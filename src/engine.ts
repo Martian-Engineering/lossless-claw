@@ -986,7 +986,7 @@ export class LcmContextEngine implements ContextEngine {
     resolved: ResolvedContextThreshold;
     phase: string;
   }): void {
-    this.deps.log.info(
+    this.deps.log.debug(
       `[lcm] threshold: selected phase=${params.phase} conversation=${params.conversationId} session=${params.sessionId} ${params.sessionKey?.trim() ? `sessionKey=${params.sessionKey.trim()} ` : ""}thresholdTokens=${params.thresholdTokens} tokenBudget=${params.tokenBudget} ${describeResolvedContextThreshold(params.resolved)}`,
     );
   }
