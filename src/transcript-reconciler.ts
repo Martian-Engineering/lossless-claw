@@ -626,190 +626,16 @@ export class TranscriptReconciler {
 
       if (anchorIndex < 0) {
         if (params.allowNoAnchorImport) {
-          if (
-            (params.noAnchorImportReason === "path-mismatch" ||
-              params.noAnchorImportReason === "checkpoint-missing-recovery") &&
-            isLikelyInjectedDeliveryOnlyTranscript(historicalMessages)
-          ) {
-            this.host.deps.log.warn(
-              `[lcm] reconcileSessionTail: blocked delivery-only path-mismatched transcript for ${sessionContext}; preserving existing checkpoint because the rotated transcript contains only injected delivery/config traffic`,
-            );
-            this.host.deps.log.debug(
-              `[lcm] reconcileSessionTail: blocked delivery-only path mismatch for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} overlap=false`,
-            );
-            return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
-          }
-
-          const replayAnalysis = await this.analyzePersistedTranscriptIdentityOverlaps({
+          return this.importNoAnchorEpoch({
+            sessionId,
+            sessionKey: params.sessionKey,
             conversationId,
-            messages: historicalMessages,
-          });
-          const persistedIdentityOverlaps = replayAnalysis.overlaps;
-          let noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
-            messages: historicalMessages,
+            historicalMessages,
+            noAnchorImportReason: params.noAnchorImportReason,
+            existingDbCount,
             sessionContext,
-            source: "reconcileSessionTail no-anchor",
+            startedAt,
           });
-          // A fully id-bearing batch resolves identity overlaps exactly:
-          // identity matches adopt the re-issued entry id (host rewrites and
-          // rotations re-append the surviving suffix under new ids) and only
-          // genuinely-new entries import. The replay-overlap block below
-          // exists for id-less ambiguity, where overlap could equally mean a
-          // replayed file; applying it here would freeze rewritten-epoch
-          // transcripts instead of healing them.
-          const allEntryIdBearing =
-            noAnchorImportMessages.length > 0 &&
-            noAnchorImportMessages.every((message) => getTranscriptEntryId(message) !== null);
-          const replayThreshold = Math.max(3, Math.ceil(historicalMessages.length * 0.5));
-          if (!allEntryIdBearing && persistedIdentityOverlaps >= replayThreshold) {
-            if (replayAnalysis.firstNonOverlappingIndex < 0) {
-              this.host.deps.log.warn(
-                `[lcm] reconcileSessionTail: duplicate transcript replay blocked for ${sessionContext} - ${persistedIdentityOverlaps}/${historicalMessages.length} candidate messages already exist (reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent replay flood.`,
-              );
-              this.host.deps.log.debug(
-                `[lcm] reconcileSessionTail: blocked duplicate transcript replay for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} persistedIdentityOverlaps=${persistedIdentityOverlaps} overlap=false`,
-              );
-              return {
-                blockedByImportCap: true,
-                blockedReason: "duplicate-transcript-replay",
-                importedMessages: 0,
-                hasOverlap: false,
-              };
-            }
-
-            if (replayAnalysis.firstNonOverlappingIndex > 0) {
-              noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
-                messages: historicalMessages.slice(replayAnalysis.firstNonOverlappingIndex),
-                sessionContext,
-                source: "reconcileSessionTail no-anchor replay-prefix",
-              });
-              this.host.deps.log.warn(
-                `[lcm] reconcileSessionTail: duplicate transcript replay guard dropped ${replayAnalysis.firstNonOverlappingIndex}/${historicalMessages.length} already-persisted prefix messages for ${sessionContext} before no-anchor import (reason: ${params.noAnchorImportReason ?? "unspecified"})`,
-              );
-            }
-          }
-
-          const importCap = transcriptImportCap(existingDbCount);
-          let noAnchorImportCapped = false;
-          if (noAnchorImportMessages.length > importCap) {
-            if (allEntryIdBearing) {
-              // A fully id-bearing new epoch is exact (every entry adopts or
-              // imports by verified id), so a large rollover — e.g. a host
-              // rewrite or compaction successor with a kept tail beyond the
-              // cap — drains in bounded oldest-first chunks instead of
-              // freezing before adoption can heal it. After the first chunk
-              // persists ids, the entry-id anchor takes over on later passes.
-              noAnchorImportCapped = true;
-              this.host.deps.log.warn(
-                `[lcm] reconcileSessionTail: no-anchor entry-id import cap chunking for ${sessionContext} — importing ${importCap}/${noAnchorImportMessages.length} new-epoch messages this pass (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}); remaining backlog continues next pass`,
-              );
-              noAnchorImportMessages = noAnchorImportMessages.slice(0, importCap);
-            } else {
-              this.host.deps.log.warn(
-                `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${noAnchorImportMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
-              );
-              this.host.deps.log.debug(
-                `[lcm] reconcileSessionTail: blocked no-anchor import for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} existingDbCount=${existingDbCount} cap=${importCap} overlap=false`,
-              );
-              return {
-                blockedByImportCap: true,
-                blockedReason: "import-cap",
-                importedMessages: 0,
-                hasOverlap: false,
-              };
-            }
-          }
-
-          if (params.noAnchorImportReason === "same-path-shrink") {
-            const rawIdMatches = this.countActiveCrossConversationRawIdMatches({
-              conversationId,
-              sessionId,
-              messages: noAnchorImportMessages,
-            });
-            if (rawIdMatches.matchedRawIds > 0) {
-              this.host.deps.log.warn(
-                `[lcm] reconcileSessionTail: blocked same-path-shrink no-anchor import for ${sessionContext} because ${rawIdMatches.matchedRawIds}/${rawIdMatches.candidateRawIds} candidate raw ids already exist in other active conversations`,
-              );
-              this.host.deps.log.debug(
-                `[lcm] reconcileSessionTail: blocked cross-conversation raw-id duplicate for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateRawIds=${rawIdMatches.candidateRawIds} matchedRawIds=${rawIdMatches.matchedRawIds} overlap=false`,
-              );
-              return {
-                blockedByImportCap: true,
-                blockedReason: "cross-conversation-raw-id",
-                importedMessages: 0,
-                hasOverlap: false,
-              };
-            }
-          }
-
-          // Ids on the current leaf path, for stale-id re-stamping of rows
-          // stranded by the rewrite/rotation that produced this new epoch.
-          const noAnchorLeafEntryIds = new Set(
-            historicalMessages
-              .map((message) => getTranscriptEntryId(message))
-              .filter((id): id is string => id !== null),
-          );
-          let importedMessages = 0;
-          let adoptedMessages = 0;
-          for (const message of noAnchorImportMessages) {
-            const entryId = getTranscriptEntryId(message);
-            if (entryId) {
-              const alreadyPersisted = await this.host.conversationStore.hasMessageByTranscriptEntryId(
-                conversationId,
-                entryId,
-              );
-              if (alreadyPersisted) {
-                continue;
-              }
-              const stored = toStoredMessage(message);
-              const adopted =
-                (await this.host.conversationStore.adoptTranscriptEntryId(
-                  conversationId,
-                  stored.role,
-                  stored.content,
-                  entryId,
-                )) ||
-                (await this.adoptStaleTranscriptEntryId({
-                  conversationId,
-                  leafEntryIds: noAnchorLeafEntryIds,
-                  role: stored.role,
-                  content: stored.content,
-                  entryId,
-                }));
-              if (adopted) {
-                adoptedMessages += 1;
-                continue;
-              }
-            }
-            const result = await this.host.ingestSingle({
-              sessionId,
-              sessionKey: params.sessionKey,
-              message,
-              skipReplayTimestampFloodGuard: true,
-            });
-            if (result.ingested) {
-              importedMessages += 1;
-            }
-          }
-          this.host.deps.log.warn(
-            `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} capped=${noAnchorImportCapped} overlap=${adoptedMessages > 0}`,
-          );
-          if (noAnchorImportCapped) {
-            // Partial pass: keep the checkpoint un-advanced so the next pass
-            // continues the drain (via the entry-id anchor once this chunk's
-            // ids are persisted).
-            return {
-              blockedByImportCap: true,
-              blockedReason: "import-cap",
-              importedMessages,
-              hasOverlap: adoptedMessages > 0,
-            };
-          }
-          // Adoption proves the "new epoch" overlaps persisted history (the
-          // host re-issued ids for messages we already hold), so report the
-          // overlap — the caller then refreshes the checkpoint instead of
-          // re-entering this path every turn.
-          return { blockedByImportCap: false, importedMessages, hasOverlap: adoptedMessages > 0 };
         }
         this.host.deps.log.debug(
           `[lcm] reconcileSessionTail: no anchor for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=false`,
@@ -877,6 +703,215 @@ export class TranscriptReconciler {
       `[lcm] reconcileSessionTail: slow path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages}`,
     );
     return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+  }
+
+  /**
+   * No-anchor recovery: the transcript shares no anchor with persisted
+   * history, but the caller has lineage evidence (path mismatch, declared
+   * epoch rollover, same-path shrink, checkpoint recovery) that this file is
+   * still this conversation's continuation. Import it as a bounded new
+   * epoch: delivery-only and replay-flood transcripts are blocked, the
+   * import cap chunks oversized batches (entry-id-bearing epochs drain
+   * oldest-first), and identity matches adopt re-issued entry ids instead of
+   * duplicating rows.
+   */
+  private async importNoAnchorEpoch(params: {
+    sessionId: string;
+    sessionKey?: string;
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+    noAnchorImportReason?: string;
+    existingDbCount: number;
+    sessionContext: string;
+    startedAt: number;
+  }): Promise<TranscriptReconcileResult> {
+    const { sessionId, conversationId, historicalMessages, existingDbCount } = params;
+    const { startedAt, sessionContext } = params;
+
+    if (
+      (params.noAnchorImportReason === "path-mismatch" ||
+        params.noAnchorImportReason === "checkpoint-missing-recovery") &&
+      isLikelyInjectedDeliveryOnlyTranscript(historicalMessages)
+    ) {
+      this.host.deps.log.warn(
+        `[lcm] reconcileSessionTail: blocked delivery-only path-mismatched transcript for ${sessionContext}; preserving existing checkpoint because the rotated transcript contains only injected delivery/config traffic`,
+      );
+      this.host.deps.log.debug(
+        `[lcm] reconcileSessionTail: blocked delivery-only path mismatch for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} overlap=false`,
+      );
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
+    }
+
+    const replayAnalysis = await this.analyzePersistedTranscriptIdentityOverlaps({
+      conversationId,
+      messages: historicalMessages,
+    });
+    const persistedIdentityOverlaps = replayAnalysis.overlaps;
+    let noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
+      messages: historicalMessages,
+      sessionContext,
+      source: "reconcileSessionTail no-anchor",
+    });
+    // A fully id-bearing batch resolves identity overlaps exactly:
+    // identity matches adopt the re-issued entry id (host rewrites and
+    // rotations re-append the surviving suffix under new ids) and only
+    // genuinely-new entries import. The replay-overlap block below
+    // exists for id-less ambiguity, where overlap could equally mean a
+    // replayed file; applying it here would freeze rewritten-epoch
+    // transcripts instead of healing them.
+    const allEntryIdBearing =
+      noAnchorImportMessages.length > 0 &&
+      noAnchorImportMessages.every((message) => getTranscriptEntryId(message) !== null);
+    const replayThreshold = Math.max(3, Math.ceil(historicalMessages.length * 0.5));
+    if (!allEntryIdBearing && persistedIdentityOverlaps >= replayThreshold) {
+      if (replayAnalysis.firstNonOverlappingIndex < 0) {
+        this.host.deps.log.warn(
+          `[lcm] reconcileSessionTail: duplicate transcript replay blocked for ${sessionContext} - ${persistedIdentityOverlaps}/${historicalMessages.length} candidate messages already exist (reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent replay flood.`,
+        );
+        this.host.deps.log.debug(
+          `[lcm] reconcileSessionTail: blocked duplicate transcript replay for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} persistedIdentityOverlaps=${persistedIdentityOverlaps} overlap=false`,
+        );
+        return {
+          blockedByImportCap: true,
+          blockedReason: "duplicate-transcript-replay",
+          importedMessages: 0,
+          hasOverlap: false,
+        };
+      }
+
+      if (replayAnalysis.firstNonOverlappingIndex > 0) {
+        noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
+          messages: historicalMessages.slice(replayAnalysis.firstNonOverlappingIndex),
+          sessionContext,
+          source: "reconcileSessionTail no-anchor replay-prefix",
+        });
+        this.host.deps.log.warn(
+          `[lcm] reconcileSessionTail: duplicate transcript replay guard dropped ${replayAnalysis.firstNonOverlappingIndex}/${historicalMessages.length} already-persisted prefix messages for ${sessionContext} before no-anchor import (reason: ${params.noAnchorImportReason ?? "unspecified"})`,
+        );
+      }
+    }
+
+    const importCap = transcriptImportCap(existingDbCount);
+    let noAnchorImportCapped = false;
+    if (noAnchorImportMessages.length > importCap) {
+      if (allEntryIdBearing) {
+        // A fully id-bearing new epoch is exact (every entry adopts or
+        // imports by verified id), so a large rollover — e.g. a host
+        // rewrite or compaction successor with a kept tail beyond the
+        // cap — drains in bounded oldest-first chunks instead of
+        // freezing before adoption can heal it. After the first chunk
+        // persists ids, the entry-id anchor takes over on later passes.
+        noAnchorImportCapped = true;
+        this.host.deps.log.warn(
+          `[lcm] reconcileSessionTail: no-anchor entry-id import cap chunking for ${sessionContext} — importing ${importCap}/${noAnchorImportMessages.length} new-epoch messages this pass (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}); remaining backlog continues next pass`,
+        );
+        noAnchorImportMessages = noAnchorImportMessages.slice(0, importCap);
+      } else {
+        this.host.deps.log.warn(
+          `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${noAnchorImportMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
+        );
+        this.host.deps.log.debug(
+          `[lcm] reconcileSessionTail: blocked no-anchor import for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} existingDbCount=${existingDbCount} cap=${importCap} overlap=false`,
+        );
+        return {
+          blockedByImportCap: true,
+          blockedReason: "import-cap",
+          importedMessages: 0,
+          hasOverlap: false,
+        };
+      }
+    }
+
+    if (params.noAnchorImportReason === "same-path-shrink") {
+      const rawIdMatches = this.countActiveCrossConversationRawIdMatches({
+        conversationId,
+        sessionId,
+        messages: noAnchorImportMessages,
+      });
+      if (rawIdMatches.matchedRawIds > 0) {
+        this.host.deps.log.warn(
+          `[lcm] reconcileSessionTail: blocked same-path-shrink no-anchor import for ${sessionContext} because ${rawIdMatches.matchedRawIds}/${rawIdMatches.candidateRawIds} candidate raw ids already exist in other active conversations`,
+        );
+        this.host.deps.log.debug(
+          `[lcm] reconcileSessionTail: blocked cross-conversation raw-id duplicate for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateRawIds=${rawIdMatches.candidateRawIds} matchedRawIds=${rawIdMatches.matchedRawIds} overlap=false`,
+        );
+        return {
+          blockedByImportCap: true,
+          blockedReason: "cross-conversation-raw-id",
+          importedMessages: 0,
+          hasOverlap: false,
+        };
+      }
+    }
+
+    // Ids on the current leaf path, for stale-id re-stamping of rows
+    // stranded by the rewrite/rotation that produced this new epoch.
+    const noAnchorLeafEntryIds = new Set(
+      historicalMessages
+        .map((message) => getTranscriptEntryId(message))
+        .filter((id): id is string => id !== null),
+    );
+    let importedMessages = 0;
+    let adoptedMessages = 0;
+    for (const message of noAnchorImportMessages) {
+      const entryId = getTranscriptEntryId(message);
+      if (entryId) {
+        const alreadyPersisted = await this.host.conversationStore.hasMessageByTranscriptEntryId(
+          conversationId,
+          entryId,
+        );
+        if (alreadyPersisted) {
+          continue;
+        }
+        const stored = toStoredMessage(message);
+        const adopted =
+          (await this.host.conversationStore.adoptTranscriptEntryId(
+            conversationId,
+            stored.role,
+            stored.content,
+            entryId,
+          )) ||
+          (await this.adoptStaleTranscriptEntryId({
+            conversationId,
+            leafEntryIds: noAnchorLeafEntryIds,
+            role: stored.role,
+            content: stored.content,
+            entryId,
+          }));
+        if (adopted) {
+          adoptedMessages += 1;
+          continue;
+        }
+      }
+      const result = await this.host.ingestSingle({
+        sessionId,
+        sessionKey: params.sessionKey,
+        message,
+        skipReplayTimestampFloodGuard: true,
+      });
+      if (result.ingested) {
+        importedMessages += 1;
+      }
+    }
+    this.host.deps.log.warn(
+      `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} capped=${noAnchorImportCapped} overlap=${adoptedMessages > 0}`,
+    );
+    if (noAnchorImportCapped) {
+      // Partial pass: keep the checkpoint un-advanced so the next pass
+      // continues the drain (via the entry-id anchor once this chunk's
+      // ids are persisted).
+      return {
+        blockedByImportCap: true,
+        blockedReason: "import-cap",
+        importedMessages,
+        hasOverlap: adoptedMessages > 0,
+      };
+    }
+    // Adoption proves the "new epoch" overlaps persisted history (the
+    // host re-issued ids for messages we already hold), so report the
+    // overlap — the caller then refreshes the checkpoint instead of
+    // re-entering this path every turn.
+    return { blockedByImportCap: false, importedMessages, hasOverlap: adoptedMessages > 0 };
   }
 
   /** Count candidate raw event IDs that already belong to another active conversation. */
