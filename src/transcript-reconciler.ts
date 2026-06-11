@@ -50,6 +50,7 @@ import {
   readLastJsonlEntryBeforeOffset,
   readLeafPathMessages,
   readTranscriptHeader,
+  resolveTranscriptMessageCreatedAt,
 } from "./transcript.js";
 import { asRecord, formatDurationMs, isMissingFileError, safeString } from "./value-utils.js";
 
@@ -105,6 +106,7 @@ export type ReconcileHost = {
     sessionKey?: string;
     message: AgentMessage;
     isHeartbeat?: boolean;
+    createdAt?: Date | string;
     skipReplayTimestampFloodGuard?: boolean;
   }): Promise<IngestResult>;
 };
@@ -423,6 +425,7 @@ export class TranscriptReconciler {
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         message,
+        createdAt: resolveTranscriptMessageCreatedAt(message),
         skipReplayTimestampFloodGuard: true,
       });
       if (result.ingested) {
@@ -887,6 +890,7 @@ export class TranscriptReconciler {
         sessionId,
         sessionKey: params.sessionKey,
         message,
+        createdAt: resolveTranscriptMessageCreatedAt(message),
         skipReplayTimestampFloodGuard: true,
       });
       if (result.ingested) {
@@ -1423,6 +1427,7 @@ export class TranscriptReconciler {
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         message,
+        createdAt: resolveTranscriptMessageCreatedAt(message),
         skipReplayTimestampFloodGuard: index < params.replayGuardExemptPrefixLength,
       });
       if (result.ingested) {

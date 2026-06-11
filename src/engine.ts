@@ -44,7 +44,7 @@ import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProvide
 import type { LcmDependencies } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import { buildDeterministicFallbackSummary } from "./summary-fallback.js";
-import { getTranscriptEntryId, readAppendedLeafPathMessages, readLastJsonlEntryBeforeOffset, readLeafPathMessages, readSessionParentSessionReference } from "./transcript.js";
+import { getTranscriptEntryId, readAppendedLeafPathMessages, readLastJsonlEntryBeforeOffset, readLeafPathMessages, readSessionParentSessionReference, resolveTranscriptMessageCreatedAt } from "./transcript.js";
 import { type TranscriptReconcileResult } from "./reconcile-plan.js";
 import { checkpointIsPastTranscriptEof, TranscriptReconciler } from "./transcript-reconciler.js";
 import { AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON, SessionRolloverDetector } from "./session-rollover.js";
@@ -1901,6 +1901,7 @@ export class LcmContextEngine implements ContextEngine {
                       sessionId: params.sessionId,
                       sessionKey: params.sessionKey,
                       message,
+                      createdAt: resolveTranscriptMessageCreatedAt(message),
                       skipReplayTimestampFloodGuard:
                         index < replayFiltered.replayGuardExemptPrefixLength,
                     });
@@ -1991,6 +1992,7 @@ export class LcmContextEngine implements ContextEngine {
                 sessionId: params.sessionId,
                 sessionKey: params.sessionKey,
                 message,
+                createdAt: resolveTranscriptMessageCreatedAt(message),
                 skipReplayTimestampFloodGuard: true,
               });
               if (result.ingested) {
@@ -2412,9 +2414,10 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     message: AgentMessage;
     isHeartbeat?: boolean;
+    createdAt?: Date | string;
     skipReplayTimestampFloodGuard?: boolean;
   }): Promise<IngestResult> {
-    const { sessionId, sessionKey, message, isHeartbeat, skipReplayTimestampFloodGuard } = params;
+    const { sessionId, sessionKey, message, isHeartbeat, createdAt, skipReplayTimestampFloodGuard } = params;
     if (isHeartbeat) {
       return { ingested: false };
     }
@@ -2562,6 +2565,7 @@ export class LcmContextEngine implements ContextEngine {
       content: stored.content,
       tokenCount: stored.tokenCount,
       transcriptEntryId,
+      createdAt,
       skipReplayTimestampFloodGuard,
     });
     await this.conversationStore.createMessageParts(
