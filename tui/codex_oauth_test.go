@@ -294,7 +294,7 @@ func TestSummarizeOpenAICodexOAuthRejectsEmptyCLIOutput(t *testing.T) {
 	}
 }
 
-func TestSummarizeOpenAICodexOAuthRejectsOversizeCLIOutput(t *testing.T) {
+func TestSummarizeOpenAICodexOAuthCapsOversizeCLIOutput(t *testing.T) {
 	seedCodexAuth(t)
 	stubCodexCLI(t)
 
@@ -309,12 +309,15 @@ func TestSummarizeOpenAICodexOAuthRejectsOversizeCLIOutput(t *testing.T) {
 		http:     &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) { return nil, nil })},
 	}
 
-	_, err := client.summarize(context.Background(), "prompt", 32)
-	if err == nil {
-		t.Fatal("expected error when codex CLI output exceeds token budget")
+	summary, err := client.summarize(context.Background(), "prompt", 32)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "exceeded target token budget") {
-		t.Fatalf("expected token-budget error, got %v", err)
+	if estimateTokenCount(summary) > 32+cliOutputTokenSlack {
+		t.Fatalf("expected capped summary within slack limit, got %d tokens", estimateTokenCount(summary))
+	}
+	if !strings.Contains(summary, "[Capped") {
+		t.Fatalf("expected capped marker, got %q", summary)
 	}
 }
 
