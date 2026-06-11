@@ -998,6 +998,83 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=near-budget"));
   });
 
+  it("assemble() ignores deferred debt while placeholder transcript coverage recovers", async () => {
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDepsOverrides({ log });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-placeholder-checkpoint-ignores-debt";
+    const sessionFile = createSessionFilePath("assemble-placeholder-checkpoint-ignores-debt");
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "only metadata anchor, not usable transcript coverage",
+        tokenCount: 12,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 2_000,
+      currentTokenCount: 1_900,
+    });
+    const executeCompactionCoreSpy = vi.spyOn(privateEngine, "executeCompactionCore");
+    const liveMessages = [
+      makeMessage({ role: "system", content: "critical runtime policy" }),
+      makeMessage({
+        role: "user",
+        content: `older live context that would be lost ${"x ".repeat(250)}`,
+      }),
+      makeMessage({
+        role: "assistant",
+        content: `assistant reply in live context ${"y ".repeat(250)}`,
+      }),
+      makeMessage({ role: "user", content: "current delivery turn" }),
+    ];
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 2_000,
+    });
+
+    expect(executeCompactionCoreSpy).not.toHaveBeenCalled();
+    expect(assembleResult.messages.map((message) => message.content)).toEqual(
+      liveMessages.map((message) => message.content),
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] assemble: degraded live fallback"),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("deferred compaction debt ignored for assembly"),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("reason=incomplete-transcript-coverage"),
+    );
+  });
+
   it("assemble() intercepts large tool results in live messages before degraded fallback", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
