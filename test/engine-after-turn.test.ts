@@ -843,7 +843,9 @@ describe("LcmContextEngine afterTurn", () => {
       },
     });
 
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 4_096, 500);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 4_096, 500, {
+      contextThreshold: 0.75,
+    });
   });
 
   it("afterTurn falls back to local message token estimates when runtimeContext.currentTokenCount is absent", async () => {
@@ -884,6 +886,7 @@ describe("LcmContextEngine afterTurn", () => {
       expect.any(Number),
       4_096,
       estimateSerializedMessageTokens(turnMessage),
+      { contextThreshold: 0.75 },
     );
   });
 
@@ -1041,6 +1044,167 @@ describe("LcmContextEngine afterTurn", () => {
       .getConversationCompactionMaintenance(conversation!.conversationId);
     expect(maintenance?.pending ?? false).toBe(false);
     expect(compactSpy).not.toHaveBeenCalled();
+  });
+
+  it("afterTurn does not use tokenBudget as a model context-window override fallback", async () => {
+    const engine = createEngineWithConfig({
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.1,
+        },
+      ],
+    });
+    const sessionId = "after-turn-window-override-requires-explicit-window";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+          options?: { contextThreshold?: number },
+        ) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 50_000,
+      threshold: 150_000,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-window-override-requires-explicit-window"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 200_000,
+      runtimeContext: {
+        currentTokenCount: 50_000,
+        provider: "openai",
+        model: "gpt-5.5",
+      },
+    });
+
+    // No explicit window metadata: the window rule must not match, so the
+    // resolved threshold falls back to the global 0.75 default.
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000, 50_000, {
+      contextThreshold: 0.75,
+    });
+  });
+
+  it("afterTurn falls back to legacy model context-window metadata for threshold overrides", async () => {
+    const engine = createEngineWithConfig({
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.1,
+        },
+      ],
+    });
+    const sessionId = "after-turn-window-override-legacy-metadata";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+          options?: { contextThreshold?: number },
+        ) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 80_000,
+      threshold: 50_000,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-window-override-legacy-metadata"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 500_000,
+      runtimeContext: {
+        currentTokenCount: 80_000,
+      },
+      legacyCompactionParams: {
+        modelContextWindow: 200_000,
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 500_000, 80_000, {
+      contextThreshold: 0.1,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance).toMatchObject({
+      pending: true,
+      contextThreshold: 0.1,
+      contextThresholdSource: "override",
+    });
+  });
+
+  it("afterTurn forwards legacy-only resolved threshold overrides into inline compaction", async () => {
+    const engine = createEngineWithConfig({
+      proactiveThresholdCompactionMode: "inline",
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.1,
+        },
+      ],
+    });
+    const sessionId = "after-turn-inline-threshold-override-legacy-metadata";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+          options?: { contextThreshold?: number },
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 80_000,
+      threshold: 50_000,
+    });
+    const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-inline-threshold-override-legacy-metadata"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 500_000,
+      runtimeContext: {
+        currentTokenCount: 80_000,
+      },
+      legacyCompactionParams: {
+        modelContextWindow: 200_000,
+      },
+    });
+
+    expect(compactSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        compactionTarget: "threshold",
+        contextThresholdOverride: expect.objectContaining({
+          contextThreshold: 0.1,
+          source: "override",
+        }),
+      }),
+    );
   });
 
   it("afterTurn schedules a deferred threshold drain even when compactionTelemetry has no provider/model", async () => {
@@ -3046,7 +3210,9 @@ describe("LcmContextEngine afterTurn", () => {
       },
     });
 
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), expect.any(Number), 204_800);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), expect.any(Number), 204_800, {
+      contextThreshold: 0.75,
+    });
     expect(debugLog).toHaveBeenCalledWith(
       expect.stringContaining("using runtime prompt token count currentTokenCount=204800"),
     );

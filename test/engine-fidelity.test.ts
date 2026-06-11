@@ -571,7 +571,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(false);
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 123);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 123, undefined, { contextThreshold: 0.75 });
     expect(compactSpy).not.toHaveBeenCalled();
   });
 

@@ -184,6 +184,12 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   const hasNextAttemptAfter = maintenanceColumns.some(
     (col) => col.name === "next_attempt_after",
   );
+  const hasContextThreshold = maintenanceColumns.some(
+    (col) => col.name === "context_threshold",
+  );
+  const hasContextThresholdSource = maintenanceColumns.some(
+    (col) => col.name === "context_threshold_source",
+  );
 
   if (!hasProjectedTokenCount) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN projected_token_count INTEGER`);
@@ -198,6 +204,12 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   }
   if (!hasNextAttemptAfter) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN next_attempt_after TEXT`);
+  }
+  if (!hasContextThreshold) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN context_threshold REAL`);
+  }
+  if (!hasContextThresholdSource) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN context_threshold_source TEXT`);
   }
 }
 
@@ -1133,6 +1145,8 @@ export function runLcmMigrations(
       current_token_count INTEGER,
       projected_token_count INTEGER,
       raw_tokens_outside_tail INTEGER,
+      context_threshold REAL,
+      context_threshold_source TEXT,
       retry_attempts INTEGER NOT NULL DEFAULT 0,
       next_attempt_after TEXT,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))

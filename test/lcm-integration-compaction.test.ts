@@ -2009,6 +2009,29 @@ describe("LCM integration: compaction", () => {
     expect(decision.threshold).toBe(450);
   });
 
+  it("evaluate accepts a per-call contextThreshold override", async () => {
+    await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) => `Override ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    const defaultDecision = await compactionEngine.evaluate(CONV_ID, 600);
+    expect(defaultDecision).toMatchObject({
+      shouldCompact: false,
+      threshold: 450,
+      currentTokens: 400,
+    });
+
+    const overrideDecision = await compactionEngine.evaluate(CONV_ID, 600, undefined, {
+      contextThreshold: 0.5,
+    });
+    expect(overrideDecision).toMatchObject({
+      shouldCompact: true,
+      threshold: 300,
+      currentTokens: 400,
+    });
+  });
+
   it("evaluate compacts when observed tokens plus raw backlog exceed the threshold", async () => {
     const backlogEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
@@ -2076,6 +2099,40 @@ describe("LCM integration: compaction", () => {
       currentTokens: 300,
       threshold: 450,
     });
+  });
+
+  it("compactFullSweep accepts a per-call contextThreshold override", async () => {
+    const thresholdAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      contextThreshold: 0.75,
+      leafChunkTokens: 20_000,
+      condensedTargetTokens: 100,
+      summaryPrefixTargetTokens: undefined,
+      freshTailCount: 1,
+    });
+    await ingestMessages(convStore, sumStore, 3, {
+      contentFn: (i) => `Threshold target ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    const defaultResult = await thresholdAwareEngine.compactFullSweep({
+      conversationId: CONV_ID,
+      tokenBudget: 1_000,
+      summarize: async () => "leaf summary",
+    });
+    expect(defaultResult.actionTaken).toBe(false);
+    expect(defaultResult.tokensBefore).toBe(300);
+
+    const overrideResult = await thresholdAwareEngine.compactFullSweep({
+      conversationId: CONV_ID,
+      tokenBudget: 1_000,
+      contextThreshold: 0.2,
+      summarize: async () => "leaf summary",
+    });
+
+    expect(overrideResult.actionTaken).toBe(true);
+    expect(overrideResult.tokensBefore).toBe(300);
+    expect(overrideResult.tokensAfter).toBeLessThan(300);
   });
 
   it("compactUntilUnder uses currentTokens when stored tokens are stale", async () => {

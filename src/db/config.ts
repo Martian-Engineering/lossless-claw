@@ -61,6 +61,19 @@ export type IndependentLogFileConfig = {
   maxFileBytes: number;
 };
 
+export type ContextThresholdOverrideMatch = {
+  model?: string;
+  modelContextWindowMin?: number;
+  modelContextWindowMax?: number;
+  sessionPattern?: string;
+};
+
+export type ContextThresholdOverride = {
+  name?: string;
+  match: ContextThresholdOverrideMatch;
+  contextThreshold: number;
+};
+
 export type LcmConfigSource = "env" | "plugin-config" | "default";
 
 export type LcmConfigDiagnostics = {
@@ -82,6 +95,8 @@ export type LcmConfig = {
   /** When true, stateless session pattern matching is enforced. */
   skipStatelessSessions: boolean;
   contextThreshold: number;
+  /** Optional ordered rules that override contextThreshold for matching runtime contexts. */
+  contextThresholdOverrides?: ContextThresholdOverride[];
   freshTailCount: number;
   /** Optional token cap for the protected fresh tail; newest message is always preserved. */
   freshTailMaxTokens?: number;
@@ -360,6 +375,108 @@ function toRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function parseContextThresholdOverrideThreshold(value: unknown, path: string): number {
+  const threshold = toNumber(value);
+  if (
+    threshold === undefined ||
+    !Number.isFinite(threshold) ||
+    threshold < 0 ||
+    threshold > 1
+  ) {
+    throw new Error(`${path}.contextThreshold must be a finite number between 0 and 1`);
+  }
+  return threshold;
+}
+
+function parsePositiveIntegerMatcher(value: unknown, path: string): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = toNumber(value);
+  if (
+    parsed === undefined ||
+    !Number.isFinite(parsed) ||
+    !Number.isInteger(parsed) ||
+    parsed < 1
+  ) {
+    throw new Error(`${path} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function parseNonEmptyStringMatcher(value: unknown, path: string): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = toStr(value);
+  if (parsed === undefined) {
+    throw new Error(`${path} must be a non-empty string`);
+  }
+  return parsed;
+}
+
+function toContextThresholdOverrides(value: unknown): ContextThresholdOverride[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("contextThresholdOverrides must be an array");
+  }
+
+  return value.map((entry, index) => {
+    const path = `contextThresholdOverrides[${index}]`;
+    const record = toRecord(entry);
+    if (!record) {
+      throw new Error(`${path} must be an object`);
+    }
+    const matchRecord = toRecord(record.match);
+    if (!matchRecord) {
+      throw new Error(`${path}.match must be an object`);
+    }
+
+    const model = parseNonEmptyStringMatcher(matchRecord.model, `${path}.match.model`);
+    const sessionPattern = parseNonEmptyStringMatcher(
+      matchRecord.sessionPattern,
+      `${path}.match.sessionPattern`,
+    );
+    const modelContextWindowMin = parsePositiveIntegerMatcher(
+      matchRecord.modelContextWindowMin,
+      `${path}.match.modelContextWindowMin`,
+    );
+    const modelContextWindowMax = parsePositiveIntegerMatcher(
+      matchRecord.modelContextWindowMax,
+      `${path}.match.modelContextWindowMax`,
+    );
+
+    if (
+      model === undefined &&
+      sessionPattern === undefined &&
+      modelContextWindowMin === undefined &&
+      modelContextWindowMax === undefined
+    ) {
+      throw new Error(`${path}.match must include at least one matcher`);
+    }
+    if (
+      modelContextWindowMin !== undefined &&
+      modelContextWindowMax !== undefined &&
+      modelContextWindowMin > modelContextWindowMax
+    ) {
+      throw new Error(`${path}.match.modelContextWindowMin must be <= modelContextWindowMax`);
+    }
+
+    return {
+      ...(toStr(record.name) ? { name: toStr(record.name) } : {}),
+      match: {
+        ...(model ? { model } : {}),
+        ...(modelContextWindowMin !== undefined ? { modelContextWindowMin } : {}),
+        ...(modelContextWindowMax !== undefined ? { modelContextWindowMax } : {}),
+        ...(sessionPattern ? { sessionPattern } : {}),
+      },
+      contextThreshold: parseContextThresholdOverrideThreshold(record.contextThreshold, path),
+    };
+  });
+}
+
 function parseEnvStrArray(value: string | undefined): string[] | undefined {
   if (value === undefined) {
     return undefined;
@@ -556,6 +673,7 @@ export function resolveLcmConfigWithDiagnostics(
       contextThreshold:
         parseFiniteNumber(env.LCM_CONTEXT_THRESHOLD)
           ?? toNumber(pc.contextThreshold) ?? 0.75,
+      contextThresholdOverrides: toContextThresholdOverrides(pc.contextThresholdOverrides),
       freshTailCount:
         parseFiniteInt(env.LCM_FRESH_TAIL_COUNT)
           ?? toNumber(pc.freshTailCount) ?? 64,

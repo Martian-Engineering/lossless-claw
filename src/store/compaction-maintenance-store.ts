@@ -15,6 +15,8 @@ export type ConversationCompactionMaintenanceRecord = {
   currentTokenCount: number | null;
   projectedTokenCount: number | null;
   rawTokensOutsideTail: number | null;
+  contextThreshold: number | null;
+  contextThresholdSource: "global" | "override" | null;
   retryAttempts: number;
   nextAttemptAfter: Date | null;
   updatedAt: Date;
@@ -33,6 +35,8 @@ type ConversationCompactionMaintenanceRow = {
   current_token_count: number | null;
   projected_token_count: number | null;
   raw_tokens_outside_tail: number | null;
+  context_threshold: number | null;
+  context_threshold_source: string | null;
   retry_attempts: number;
   next_attempt_after: string | null;
   updated_at: string;
@@ -72,6 +76,14 @@ function toMaintenanceRecord(
     currentTokenCount: row.current_token_count,
     projectedTokenCount: row.projected_token_count,
     rawTokensOutsideTail: row.raw_tokens_outside_tail,
+    contextThreshold:
+      typeof row.context_threshold === "number" && Number.isFinite(row.context_threshold)
+        ? row.context_threshold
+        : null,
+    contextThresholdSource:
+      row.context_threshold_source === "override" || row.context_threshold_source === "global"
+        ? row.context_threshold_source
+        : null,
     retryAttempts:
       typeof row.retry_attempts === "number" && Number.isFinite(row.retry_attempts)
         ? Math.max(0, Math.floor(row.retry_attempts))
@@ -111,6 +123,14 @@ function mergeMaintenanceRecord(
       patch.rawTokensOutsideTail !== undefined
         ? patch.rawTokensOutsideTail
         : existing?.rawTokensOutsideTail ?? null,
+    contextThreshold:
+      patch.contextThreshold !== undefined
+        ? patch.contextThreshold
+        : existing?.contextThreshold ?? null,
+    contextThresholdSource:
+      patch.contextThresholdSource !== undefined
+        ? patch.contextThresholdSource
+        : existing?.contextThresholdSource ?? null,
     retryAttempts:
       patch.retryAttempts !== undefined
         ? Math.max(0, Math.floor(patch.retryAttempts))
@@ -157,6 +177,8 @@ export class CompactionMaintenanceStore {
            current_token_count,
            projected_token_count,
            raw_tokens_outside_tail,
+           context_threshold,
+           context_threshold_source,
            retry_attempts,
            next_attempt_after,
            updated_at
@@ -185,10 +207,12 @@ export class CompactionMaintenanceStore {
            current_token_count,
            projected_token_count,
            raw_tokens_outside_tail,
+           context_threshold,
+           context_threshold_source,
            retry_attempts,
            next_attempt_after,
            updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(conversation_id) DO UPDATE SET
            pending = excluded.pending,
            requested_at = excluded.requested_at,
@@ -201,6 +225,8 @@ export class CompactionMaintenanceStore {
            current_token_count = excluded.current_token_count,
            projected_token_count = excluded.projected_token_count,
            raw_tokens_outside_tail = excluded.raw_tokens_outside_tail,
+           context_threshold = excluded.context_threshold,
+           context_threshold_source = excluded.context_threshold_source,
            retry_attempts = excluded.retry_attempts,
            next_attempt_after = excluded.next_attempt_after,
            updated_at = datetime('now')`,
@@ -218,6 +244,8 @@ export class CompactionMaintenanceStore {
         record.currentTokenCount ?? null,
         record.projectedTokenCount ?? null,
         record.rawTokensOutsideTail ?? null,
+        record.contextThreshold ?? null,
+        record.contextThresholdSource ?? null,
         record.retryAttempts,
         record.nextAttemptAfter?.toISOString() ?? null,
       );
@@ -232,6 +260,8 @@ export class CompactionMaintenanceStore {
     currentTokenCount?: number | null;
     projectedTokenCount?: number | null;
     rawTokensOutsideTail?: number | null;
+    contextThreshold?: number | null;
+    contextThresholdSource?: "global" | "override" | null;
   }): Promise<void> {
     const existing = await this.getConversationCompactionMaintenance(input.conversationId);
     await this.saveConversationCompactionMaintenance(
@@ -244,6 +274,12 @@ export class CompactionMaintenanceStore {
         currentTokenCount: input.currentTokenCount ?? existing?.currentTokenCount ?? null,
         projectedTokenCount: input.projectedTokenCount ?? existing?.projectedTokenCount ?? null,
         rawTokensOutsideTail: input.rawTokensOutsideTail ?? existing?.rawTokensOutsideTail ?? null,
+        // Unlike the token diagnostics above, the persisted threshold is NOT
+        // carried over from the previous row: a stale threshold must not
+        // outlive the debt that resolved it, so new debt without a threshold
+        // resets both columns to null.
+        contextThreshold: input.contextThreshold ?? null,
+        contextThresholdSource: input.contextThresholdSource ?? null,
       }),
     );
   }

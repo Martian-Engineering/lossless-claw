@@ -2156,7 +2156,7 @@ describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 5000);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 5000, undefined, { contextThreshold: 0.75 });
     expect(compactFullSweepSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: expect.any(Number),

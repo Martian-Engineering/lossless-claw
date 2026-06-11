@@ -1146,7 +1146,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 400, 500);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 400, 500, { contextThreshold: 0.75 });
     expect(compactFullSweepSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: expect.any(Number),
@@ -1201,7 +1201,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
     expect(result.reason).toBe("compacted");
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000, undefined, { contextThreshold: 0.75 });
     expect(compactFullSweepSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: expect.any(Number),
@@ -1244,7 +1244,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(false);
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 123);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 123, undefined, { contextThreshold: 0.75 });
     expect(compactSpy).not.toHaveBeenCalled();
   });
 
@@ -1313,7 +1313,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
     expect(result.reason).toBe("compacted");
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000, undefined, { contextThreshold: 0.75 });
     expect(compactFullSweepSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: expect.any(Number),
@@ -1366,7 +1366,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 400);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 400, undefined, { contextThreshold: 0.75 });
     expect(compactFullSweepSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: expect.any(Number),
@@ -1423,7 +1423,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 400, 500);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 400, 500, { contextThreshold: 0.75 });
     expect(compactFullSweepSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: expect.any(Number),
@@ -1834,7 +1834,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
         targetTokens: 200_000,
       }),
     );
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000, 277_403);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 200_000, 277_403, { contextThreshold: 0.75 });
     expect(compactFullSweepSpy).not.toHaveBeenCalled();
     expect(compactUntilUnderSpy).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1892,7 +1892,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(result.reason).toBe("compacted");
     expect(result.result?.tokensBefore).toBe(150_000);
     expect(result.result?.tokensAfter).toBe(118_000);
-    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 120_000);
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 120_000, undefined, { contextThreshold: 0.75 });
     expect(compactFullSweepSpy).not.toHaveBeenCalled();
     expect(compactUntilUnderSpy).toHaveBeenCalledWith(
       expect.objectContaining({

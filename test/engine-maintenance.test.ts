@@ -123,7 +123,14 @@ describe("LcmContextEngine maintain and assemble budget", () => {
   });
 
   it("maintain() consumes deferred threshold debt when the host opts in", async () => {
-    const engine = createEngine();
+    const engine = createEngineWithConfig({
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.1,
+        },
+      ],
+    });
     const sessionId = "maintain-deferred-compaction-enabled";
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
@@ -131,8 +138,10 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
-      tokenBudget: 4_096,
-      currentTokenCount: 3_500,
+      tokenBudget: 500_000,
+      currentTokenCount: 80_000,
+      contextThreshold: 0.1,
+      contextThresholdSource: "override",
     });
     const privateEngine = engine as unknown as {
       executeCompactionCore: (params: unknown) => Promise<unknown>;
@@ -151,8 +160,8 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       sessionFile: createSessionFilePath("maintain-deferred-compaction-enabled-maintain"),
       runtimeContext: {
         allowDeferredCompactionExecution: true,
-        tokenBudget: 4_096,
-        currentTokenCount: 3_500,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
       },
     });
 
@@ -163,9 +172,13 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       expect.objectContaining({
         conversationId: conversation.conversationId,
         sessionId,
-        tokenBudget: 4_096,
-        currentTokenCount: 3_500,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
         compactionTarget: "threshold",
+        contextThresholdOverride: expect.objectContaining({
+          contextThreshold: 0.1,
+          source: "override",
+        }),
       }),
     );
     expect(maintenance?.pending).toBe(false);
@@ -212,7 +225,9 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(evaluateSpy).toHaveBeenCalledWith(conversation.conversationId, 4_096, 1_024);
+    expect(evaluateSpy).toHaveBeenCalledWith(conversation.conversationId, 4_096, 1_024, {
+      contextThreshold: 0.75,
+    });
     expect(executeCompactionCoreSpy).not.toHaveBeenCalled();
     expect(maintenance?.pending).toBe(false);
     expect(maintenance?.running).toBe(false);

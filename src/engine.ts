@@ -19,7 +19,14 @@ import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import { BatchDeduplicator } from "./batch-dedup.js";
 import { CompactionGuards } from "./compaction-guards.js";
 import { CompactionTelemetryRecorder } from "./compaction-telemetry.js";
+import {
+  ContextThresholdResolver,
+  describeResolvedContextThreshold,
+  persistedContextThresholdOverride,
+  type ResolvedContextThreshold,
+} from "./context-threshold.js";
 import { LargeFileInterceptor } from "./large-file-interceptor.js";
+import { readRuntimeModelContext } from "./runtime-model.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
@@ -91,6 +98,8 @@ type CompactionExecutionParams = {
   tokenBudget?: number;
   currentTokenCount?: number;
   compactionTarget?: "budget" | "threshold";
+  /** Caller-resolved threshold; skips re-resolving from runtime metadata. */
+  contextThresholdOverride?: ResolvedContextThreshold;
   customInstructions?: string;
   /** OpenClaw runtime param name (preferred). */
   runtimeContext?: Record<string, unknown>;
@@ -264,6 +273,9 @@ export class LcmContextEngine implements ContextEngine {
   // ── Compaction telemetry + deferred-debt recording ───────────────────────
   private readonly telemetryRecorder: CompactionTelemetryRecorder;
 
+  // ── Scoped context-threshold override resolution ─────────────────────────
+  private readonly contextThresholdResolver: ContextThresholdResolver;
+
   // ── Managed session-file rotation ────────────────────────────────────────
   private readonly sessionRotation: SessionRotationService;
 
@@ -366,6 +378,10 @@ export class LcmContextEngine implements ContextEngine {
       this.compactionTelemetryStore,
       this.compactionMaintenanceStore,
       this.deps,
+    );
+    this.contextThresholdResolver = new ContextThresholdResolver(
+      this.config.contextThreshold,
+      this.config.contextThresholdOverrides,
     );
 
     if (!this.fts5Available) {
@@ -779,6 +795,18 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
         maintenance.projectedTokenCount ?? undefined,
       );
+      // Prefer the threshold persisted with the debt row: a background drain
+      // may lack the runtime model metadata that originally selected it, and
+      // re-resolving could silently flip the compaction decision.
+      const resolvedContextThreshold =
+        persistedContextThresholdOverride(maintenance)
+        ?? this.contextThresholdResolver.resolve({
+          sessionKey: params.sessionKey,
+          runtime: readRuntimeModelContext(
+            asRecord(params.runtimeContext),
+            asRecord(params.legacyParams),
+          ),
+        });
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
@@ -786,7 +814,17 @@ export class LcmContextEngine implements ContextEngine {
           params.conversationId,
           resolvedTokenBudget,
           resolvedCurrentTokenCount,
+          { contextThreshold: resolvedContextThreshold.contextThreshold },
         );
+        this.logContextThresholdSelection({
+          conversationId: params.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget: resolvedTokenBudget,
+          thresholdTokens: thresholdDecision.threshold,
+          resolved: resolvedContextThreshold,
+          phase: "maintain",
+        });
         if (!thresholdDecision.shouldCompact) {
           const result: CompactResult = {
             ok: true,
@@ -818,6 +856,7 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget: resolvedTokenBudget,
         currentTokenCount: resolvedCurrentTokenCount,
         compactionTarget: "threshold",
+        contextThresholdOverride: resolvedContextThreshold,
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
       });
@@ -937,6 +976,21 @@ export class LcmContextEngine implements ContextEngine {
     return drainResult;
   }
 
+  /** Log which context threshold was selected for a compaction decision. */
+  private logContextThresholdSelection(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    tokenBudget: number;
+    thresholdTokens: number;
+    resolved: ResolvedContextThreshold;
+    phase: string;
+  }): void {
+    this.deps.log.info(
+      `[lcm] threshold: selected phase=${params.phase} conversation=${params.conversationId} session=${params.sessionId} ${params.sessionKey?.trim() ? `sessionKey=${params.sessionKey.trim()} ` : ""}thresholdTokens=${params.thresholdTokens} tokenBudget=${params.tokenBudget} ${describeResolvedContextThreshold(params.resolved)}`,
+    );
+  }
+
   /** Run the actual compaction body without taking the per-session queue. */
   private async executeCompactionCore(params: CompactionExecutionParams): Promise<CompactResult> {
     const startedAt = Date.now();
@@ -1005,10 +1059,18 @@ export class LcmContextEngine implements ContextEngine {
           }
         ).currentTokenCount,
     );
-    const decision =
-      observedTokens !== undefined
-        ? await this.compaction.evaluate(conversationId, tokenBudget, observedTokens)
-        : await this.compaction.evaluate(conversationId, tokenBudget);
+    // The resolved threshold is passed unconditionally: when no override rule
+    // matches, the resolved value equals the global config.contextThreshold,
+    // so the call is behavior-identical to omitting it.
+    const resolvedContextThreshold =
+      params.contextThresholdOverride
+      ?? this.contextThresholdResolver.resolve({
+        sessionKey: params.sessionKey,
+        runtime: readRuntimeModelContext(asRecord(params.runtimeContext), asRecord(params.legacyParams)),
+      });
+    const decision = await this.compaction.evaluate(conversationId, tokenBudget, observedTokens, {
+      contextThreshold: resolvedContextThreshold.contextThreshold,
+    });
     const targetTokens =
       params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
     // Codex can report a live prompt count that includes runtime framing,
@@ -1058,6 +1120,16 @@ export class LcmContextEngine implements ContextEngine {
         : observedTokens;
     const liveContextStillExceedsTarget =
       thresholdPressureTokens !== undefined && thresholdPressureTokens >= targetTokens;
+
+    this.logContextThresholdSelection({
+      conversationId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      tokenBudget,
+      thresholdTokens: decision.threshold,
+      resolved: resolvedContextThreshold,
+      phase: "compact",
+    });
 
     this.deps.log.info(
       `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} projectedTokens=${decisionProjectedTokens ?? "none"} rawTokensOutsideTail=${decisionRawTokensOutsideTail ?? "none"} thresholdPressureTokens=${thresholdPressureTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} shouldCompact=${decision.shouldCompact}`,
@@ -1113,6 +1185,7 @@ export class LcmContextEngine implements ContextEngine {
         this.compaction.compact({
           conversationId,
           tokenBudget,
+          contextThreshold: resolvedContextThreshold.contextThreshold,
           summarize,
           force: forceThresholdSweep,
           hardTrigger: false,
@@ -1323,6 +1396,7 @@ export class LcmContextEngine implements ContextEngine {
       compactResult = await this.compaction.compactUntilUnder({
         conversationId,
         tokenBudget,
+        contextThreshold: resolvedContextThreshold.contextThreshold,
         targetTokens: convergenceTargetTokens,
         ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
         summarize,
@@ -2939,7 +3013,11 @@ export class LcmContextEngine implements ContextEngine {
     };
     const recordAfterTurnCompactionRetry = async (
       reason: string,
-      diagnostics?: { projectedTokenCount?: number; rawTokensOutsideTail?: number },
+      diagnostics?: {
+        projectedTokenCount?: number;
+        rawTokensOutsideTail?: number;
+        contextThreshold?: ResolvedContextThreshold;
+      },
     ): Promise<void> => {
       try {
         await this.telemetryRecorder.recordDeferredCompactionDebt({
@@ -2949,6 +3027,7 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: observedCurrentTokenCount,
           projectedTokenCount: diagnostics?.projectedTokenCount,
           rawTokensOutsideTail: diagnostics?.rawTokensOutsideTail,
+          contextThreshold: diagnostics?.contextThreshold,
         });
       } catch (err) {
         this.deps.log.warn(
@@ -2980,14 +3059,32 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
+      const resolvedContextThreshold = this.contextThresholdResolver.resolve({
+        sessionKey: params.sessionKey,
+        runtime: readRuntimeModelContext(
+          asRecord(params.runtimeContext),
+          asRecord(params.legacyCompactionParams),
+        ),
+      });
       const thresholdDecision = await this.compaction.evaluate(
         conversation.conversationId,
         tokenBudget,
         observedCurrentTokenCount,
+        { contextThreshold: resolvedContextThreshold.contextThreshold },
       );
+      this.logContextThresholdSelection({
+        conversationId: conversation.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget,
+        thresholdTokens: thresholdDecision.threshold,
+        resolved: resolvedContextThreshold,
+        phase: "afterTurn",
+      });
       const thresholdDiagnostics = {
         projectedTokenCount: thresholdDecision.projectedTokens,
         rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
+        contextThreshold: resolvedContextThreshold,
       };
       if (this.config.proactiveThresholdCompactionMode === "inline") {
         if (thresholdDecision.shouldCompact) {
@@ -2998,6 +3095,7 @@ export class LcmContextEngine implements ContextEngine {
             tokenBudget,
             currentTokenCount: observedCurrentTokenCount,
             compactionTarget: "threshold",
+            contextThresholdOverride: resolvedContextThreshold,
             legacyParams,
           });
           if (!compactResult.ok) {
@@ -3013,6 +3111,7 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: observedCurrentTokenCount,
           projectedTokenCount: thresholdDecision.projectedTokens,
           rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
+          contextThreshold: resolvedContextThreshold,
         });
         deferredCompactionDrain = {
           tokenBudget,
@@ -3732,6 +3831,8 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget?: number;
     currentTokenCount?: number;
     compactionTarget?: "budget" | "threshold";
+    /** Caller-resolved threshold; skips re-resolving from runtime metadata. */
+    contextThresholdOverride?: ResolvedContextThreshold;
     customInstructions?: string;
     /** OpenClaw runtime param name (preferred). */
     runtimeContext?: Record<string, unknown>;
@@ -3785,6 +3886,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget: params.tokenBudget,
           currentTokenCount: params.currentTokenCount,
           compactionTarget: params.compactionTarget,
+          contextThresholdOverride: params.contextThresholdOverride,
           customInstructions: params.customInstructions,
           runtimeContext: params.runtimeContext,
           legacyParams: params.legacyParams,
