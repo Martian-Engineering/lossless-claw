@@ -453,6 +453,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
   it("honors configured leafTargetTokens for normal leaf summaries", async () => {
     const deps = makeDeps();
     deps.config.leafTargetTokens = 2400;
+    deps.config.enableSummaryThinking = false;
 
     const summarize = await createSummarizeFn({
       deps,
@@ -1676,7 +1677,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(diagnostics).toContain("retry succeeded");
     });
 
-    it("uses leafTargetTokens as maxTokens on retry when targetTokens is small", async () => {
+    it("grants reasoning headroom on the first call and doubles the budget on retry", async () => {
       let callCount = 0;
       const deps = makeDeps({
         resolveModel: vi.fn(() => ({
@@ -1697,7 +1698,9 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
       });
 
-      // Very short input so targetTokens floor (192) is well below leafTargetTokens (600)
+      // Very short input so the targetTokens floor (192) applies. With summary
+      // thinking enabled (default), the first call gets reasoning headroom on
+      // top of the target, and the retry doubles the first attempt's budget.
       const summary = await summarize!("Hi", false);
 
       expect(summary).toBe("Recovered summary with larger maxTokens.");
@@ -1706,9 +1709,62 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       const firstArgs = vi.mocked(deps.complete).mock.calls[0]?.[0];
       const retryArgs = vi.mocked(deps.complete).mock.calls[1]?.[0];
 
-      expect(firstArgs?.maxTokens).toBe(192);
-      expect(retryArgs?.maxTokens).toBe(deps.config.leafTargetTokens);
+      expect(firstArgs?.maxTokens).toBe(192 + 2048);
+      expect(retryArgs?.maxTokens).toBe((192 + 2048) * 2);
       expect(retryArgs?.reasoning).toBe("low");
+    });
+
+    it("retry budget strictly exceeds the first attempt's when targetTokens hits the leaf cap", async () => {
+      let callCount = 0;
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "openai",
+          model: "gpt-5.3-codex",
+        })),
+        complete: vi.fn(async () => {
+          callCount++;
+          if (callCount === 1) {
+            return { content: [] };
+          }
+          return { content: [{ type: "text", text: "Recovered long-segment summary." }] };
+        }),
+      });
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+      });
+
+      // Long input so targetTokens saturates at leafTargetTokens (600). The
+      // retry must still send a strictly larger budget than the first call —
+      // a verbatim replay of an exhausted budget would fail identically.
+      const summary = await summarize!("A".repeat(40_000), false);
+
+      expect(summary).toBe("Recovered long-segment summary.");
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+
+      const firstMaxTokens = Number(vi.mocked(deps.complete).mock.calls[0]?.[0]?.maxTokens);
+      const retryMaxTokens = Number(vi.mocked(deps.complete).mock.calls[1]?.[0]?.maxTokens);
+
+      expect(firstMaxTokens).toBe(600 + 2048);
+      expect(retryMaxTokens).toBeGreaterThan(firstMaxTokens);
+      expect(retryMaxTokens).toBe((600 + 2048) * 2);
+    });
+
+    it("omits reasoning headroom when summary thinking is disabled", async () => {
+      const deps = makeDeps();
+      deps.config.enableSummaryThinking = false;
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: { provider: "anthropic", model: "claude-opus-4-5" },
+      });
+
+      await summarize!("Hi", false);
+
+      const firstArgs = vi.mocked(deps.complete).mock.calls[0]?.[0];
+      expect(firstArgs?.maxTokens).toBe(192);
+      expect(firstArgs?.reasoningIfSupported).toBeUndefined();
     });
 
     it("falls back to truncation when retry also returns empty for non-text-only blocks", async () => {
