@@ -1432,6 +1432,345 @@ describe("LcmContextEngine afterTurn", () => {
     ).toBe(false);
   });
 
+  it("recovers a placeholder-checkpoint conversation with a multi-row non-anchoring metadata frontier, importing the full transcript past the no-anchor cap (#822)", async () => {
+    // #822 generalized beyond #837's single-row frontier: conv-3893 in
+    // production was stuck with TWO non-anchoring injected-metadata rows and a
+    // transcript far larger than the no-anchor cap (50). The fix keys on the
+    // PROPERTY "the persisted frontier holds no real content" (any count of
+    // injected-metadata rows), not a magic count, and lifts the cap for that
+    // proven-safe case so a transcript larger than the cap still recovers fully.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "placeholder-multi-metadata-frontier-recovery";
+    const sessionKey = "agent:opsos:telegram:placeholder-multi-metadata-frontier";
+
+    // Two non-anchoring injected-metadata rows (generalizes #837's count===1).
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble one",
+      }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble two",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    // A real transcript of 60 messages (> the no-anchor cap of 50) that does NOT
+    // anchor to the metadata rows.
+    const sessionFile = createSessionFilePath("placeholder-multi-metadata-frontier");
+    const bigTranscript: Array<{ role: AgentMessage["role"]; content: string }> = Array.from(
+      { length: 60 },
+      (_, i) => ({
+        role: (i % 2 === 0 ? "user" : "assistant") as AgentMessage["role"],
+        content: `general recovery transcript turn ${i}`,
+      }),
+    );
+    writeLeafTranscript(sessionFile, bigTranscript);
+
+    // Seed the all-zero placeholder checkpoint pointing at the transcript.
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "general recovery transcript turn 58" }),
+        makeMessage({ role: "assistant", content: "general recovery transcript turn 59" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const contents = messages.map((m) => m.content);
+    // Full transcript imported, including content PAST the cap of 50 — proving
+    // the cap bypass for the proven-non-anchoring frontier.
+    expect(contents).toContain("general recovery transcript turn 0");
+    expect(contents).toContain("general recovery transcript turn 59");
+    expect(messages.length).toBeGreaterThan(50);
+
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    // The cap-abort must NOT have fired, and the conversation must not be frozen.
+    expect(warns.some((m) => m.includes("no anchor import cap exceeded"))).toBe(false);
+    expect(warns.some((m) => m.includes("did not cover the transcript frontier"))).toBe(false);
+
+    // Checkpoint advanced off the placeholder so future turns take the fast path.
+    const advancedState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(advancedState?.lastProcessedOffset).toBeGreaterThan(0);
+  });
+
+  it("does NOT import an unrelated transcript onto a placeholder-checkpoint conversation that already holds real anchoring rows (#824 contamination guard)", async () => {
+    // The failure that closed PR #824: a placeholder checkpoint can coexist with
+    // real persisted rows; blindly opening an unbounded no-anchor import would
+    // stitch an unrelated/rotated transcript onto real history. Eligibility is
+    // gated on the frontier being entirely non-anchoring, so a real DB tail must
+    // freeze (#649) rather than import.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "placeholder-real-frontier-no-contaminate";
+    const sessionKey = "agent:main:placeholder-real-frontier-no-contaminate";
+
+    // Real (anchoring) conversation rows — NOT injected metadata.
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "real history turn zero" }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "real history turn one" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    // An UNRELATED transcript sharing zero identity with the real DB rows.
+    const sessionFile = createSessionFilePath("placeholder-real-frontier-no-contaminate");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "alien transcript turn zero" },
+      { role: "assistant", content: "alien transcript turn one" },
+      { role: "user", content: "alien transcript turn two" },
+    ]);
+
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "alien transcript turn one" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    // The real rows are untouched and NONE of the alien transcript was imported.
+    expect(contents.slice(0, 2)).toEqual(["real history turn zero", "real history turn one"]);
+    expect(contents.some((c) => c.startsWith("alien transcript turn zero"))).toBe(false);
+    expect(contents.some((c) => c.startsWith("alien transcript turn two"))).toBe(false);
+
+    // The placeholder checkpoint must NOT have advanced (conversation frozen, safe).
+    const state = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(state?.lastProcessedOffset).toBe(0);
+  });
+
+  it("freezes a placeholder-checkpoint recovery whose transcript is only injected delivery/config traffic (#822 parity with #837)", async () => {
+    // Parity with the checkpoint-missing and path-mismatch lanes: a recovery
+    // transcript that is purely injected delivery-only traffic must be blocked,
+    // not imported as conversation content.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "placeholder-delivery-only-frozen";
+    const sessionKey = "agent:main:signal:placeholder-delivery-only-frozen";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    const sessionFile = createSessionFilePath("placeholder-delivery-only-frozen");
+    writeLeafTranscript(sessionFile, [
+      { role: "system", content: "delivery-mirror config-audit: refreshed host policy" },
+      { role: "system", content: "config-audit delivery-mirror: no user turn" },
+    ]);
+
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "assistant delta" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("delivery-only path-mismatched transcript")),
+    ).toBe(true);
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).toContain("Conversation info (untrusted metadata): injected preamble");
+    expect(contents.some((c) => c.includes("delivery-mirror"))).toBe(false);
+  });
+
+  it("recovers a checkpoint-missing metadata frontier whose transcript exceeds the no-anchor import cap (#822)", async () => {
+    // Sibling of the placeholder cap-lift: a checkpoint-missing conversation (#837)
+    // with a single injected-metadata frontier and a transcript LARGER than the
+    // no-anchor cap (50) would otherwise import 0 (cap-blocked), so the host keeps
+    // sending the raw transcript every turn until the provider context window
+    // overflows. The proven non-anchoring metadata frontier lifts the cap so the
+    // full real history recovers and becomes compactable — without losing it.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "checkpoint-missing-large-transcript";
+    const sessionKey = "agent:main:checkpoint-missing-large-transcript";
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getConversationStore().markConversationBootstrapped(conversation!.conversationId);
+    // checkpoint-missing: deliberately do NOT seed a bootstrap_state row.
+    const sessionFile = createSessionFilePath("checkpoint-missing-large-transcript");
+    const bigTranscript: Array<{ role: AgentMessage["role"]; content: string }> = Array.from(
+      { length: 64 },
+      (_, i) => ({
+        role: (i % 2 === 0 ? "user" : "assistant") as AgentMessage["role"],
+        content: `checkpoint-missing recovery turn ${i}`,
+      }),
+    );
+    writeLeafTranscript(sessionFile, bigTranscript);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "checkpoint-missing recovery turn 63" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).toContain("checkpoint-missing recovery turn 0");
+    expect(contents).toContain("checkpoint-missing recovery turn 63");
+    expect(contents.length).toBeGreaterThan(50);
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(warns.some((m) => m.includes("no anchor import cap exceeded"))).toBe(false);
+  });
+
+  it("recovers a checkpoint-missing conversation whose frontier holds MULTIPLE non-anchoring metadata rows (#822 generalizes #837's count===1 gate)", async () => {
+    // Hosts inject one metadata preamble per delivery, so a stuck conversation
+    // can accumulate several non-anchoring rows before anything real persists.
+    // #837's gate required exactly ONE frontier row, so this shape looped
+    // forever ("found no anchor and imported 0 messages") despite holding no
+    // real content a recovery could damage.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "checkpoint-missing-multi-metadata-frontier";
+    const sessionKey = "agent:main:checkpoint-missing-multi-metadata-frontier";
+    for (const suffix of ["delivery one", "delivery two"]) {
+      await engine.ingest({
+        sessionId,
+        sessionKey,
+        message: makeMessage({
+          role: "user",
+          content: `Conversation info (untrusted metadata): injected preamble ${suffix}`,
+        }),
+      });
+    }
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getConversationStore().markConversationBootstrapped(conversation!.conversationId);
+    // checkpoint-missing: deliberately no bootstrap_state row.
+    const sessionFile = createSessionFilePath("checkpoint-missing-multi-metadata-frontier");
+    const transcript: Array<{ role: AgentMessage["role"]; content: string }> = Array.from(
+      { length: 64 },
+      (_, i) => ({
+        role: (i % 2 === 0 ? "user" : "assistant") as AgentMessage["role"],
+        content: `multi-frontier recovery turn ${i}`,
+      }),
+    );
+    writeLeafTranscript(sessionFile, transcript);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "multi-frontier recovery turn 63" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).toContain("multi-frontier recovery turn 0");
+    expect(contents).toContain("multi-frontier recovery turn 63");
+    expect(contents.length).toBeGreaterThan(50);
+  });
+
   it("afterTurn recovers a checkpoint-missing conversation with a non-anchoring frontier instead of looping forever (#837)", async () => {
     // #837: a conversation with bootstrapped_at set but NO
     // conversation_bootstrap_state row classifies as reason="checkpoint-missing"
